@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Evan Darwin <evan@relta.net>"]
 license = "FSL-1.1-ALv2"
-description = "Native C-ABI kernels for Burn the Bus: a bf16 / 12-bit-packed rows mat-vec, a gated DeltaNet step, and an unbuffered sequential file reader."
+description = "Native C-ABI kernels for Beyond the Box"
 
 # cdylib: the C-ABI shared library the Python datapath loads via ctypes.
 # rlib:   so the integration tests can link it as a normal crate.
