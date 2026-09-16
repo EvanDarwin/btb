@@ -27,3 +27,6 @@ vtune_*
 # the test fixtures' configs and tokenizers are JSON and must be tracked (a fixture model without its
 # config.json is unloadable); this negation must follow the *.json rule above to override it
 !tests/fixtures/**/*.json
+
+# personal scratch, never tracked
+TODO.md
