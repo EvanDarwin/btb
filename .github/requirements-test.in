@@ -1,0 +1,17 @@
+# The certify and checks environments: the package's runtime deps (pyproject.toml [project] dependencies)
+# plus the test and lint tools. torch comes as the CPU build from the PyTorch index, which is made uv's
+# primary index at compile time (see the command in the .txt header): that index rehosts common packages
+# (markupsafe, jinja2, ...) as byte-different files, so it must be primary for the recorded hashes to match
+# the files a --require-hashes pip install actually fetches from it. Everything the index does not host
+# resolves from PyPI (the extra index). The index URLs are emitted into the lock, so no --extra-index-url
+# is needed at install time.
+torch
+transformers>=5.16
+huggingface_hub>=0.20
+numpy>=1.26
+safetensors>=0.4
+setproctitle>=1.3.7
+gguf>=0.19
+pytest
+ruff
+mypy

@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=77", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "burnthebus"  # the distribution; the import and the command stay `btb`
-version = "0.1.0"
+dynamic = ["version"]  # from the git tag via setuptools-scm ([tool.setuptools_scm] below)
 description = "Convenient LLM inference on consumer PCs"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -147,6 +147,14 @@ reportUnknownMemberType = false
 reportUnknownArgumentType = false
 reportUnknownVariableType = false
 reportUnknownParameterType = false
+
+[tool.setuptools_scm]
+# the release version is the git tag: v0.1.0rc1 -> 0.1.0rc1, a bare v0.1.0 -> 0.1.0. CI exports
+# SETUPTOOLS_SCM_PRETEND_VERSION from the tag so the wheel never depends on how deep the checkout fetched
+# history; `no-local-version` keeps the +g<hash> local segment (which PyPI rejects) off CI builds, and the
+# fallback lets a tag-less local `python build.py build` still produce a wheel.
+local_scheme = "no-local-version"
+fallback_version = "0.0.0"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,0 +1,2 @@
+# `twine check` on the sdist (the publish action runs its own check again before an upload)
+twine
