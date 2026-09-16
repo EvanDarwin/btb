@@ -572,8 +572,11 @@ class _ForwardMixin(_State):
         c = self.cfg
         H = int(c.hidden_size) * int(self.fam.streams)
         I = int(getattr(c, "intermediate_size", None) or 4 * H)
-        if getattr(c, "moe_intermediate_size", None):
-            I = max(I, int(c.moe_intermediate_size) * int(getattr(c, "num_experts_per_tok", 1) or 1))
+        if self.fam.moe:
+            # a token routes to num_experts_per_tok experts, each of the expert width: moe_intermediate_size
+            # where the config names one (Qwen MoE), else the plain intermediate (gpt-oss names only that)
+            expert_i = int(getattr(c, "moe_intermediate_size", None) or I)
+            I = max(I, expert_i * int(getattr(c, "num_experts_per_tok", 1) or 1))
         Hq = int(c.num_attention_heads)
         Hk = int(getattr(c, "num_key_value_heads", None) or Hq)
         d = int(getattr(c, "head_dim", None) or H // Hq)
@@ -588,10 +591,27 @@ class _ForwardMixin(_State):
             per_token *= 2
         free = self.prefill_room()
         scores = 0
-        if getattr(self, "mlx", None) is not None and d not in self.MLX_FUSED_HEAD:
-            scores = 4 * Hq  # bytes per (row, key) pair of materialized scores, float32 through the softmax
+        buf_cap = free  # the single attention buffer must fit the reserve-aware room (--ram/--vram-reserve, via
+        if getattr(self, "mlx", None) is not None:  # prefill_room) and, on MLX, Metal's hard per-buffer ceiling
+            hard = int((getattr(self.mlx, "info", None) or {}).get("max_buffer_length", 0) or 0)
+            if hard:
+                buf_cap = min(buf_cap, hard)
+            if d not in self.MLX_FUSED_HEAD:
+                scores = 4 * Hq  # bytes per (row, key) pair of materialized scores, float32 through the softmax
+            else:
+                # the fused kernel's per-key-block partials, (T, Hk, splits*8, g, D) float32 and two without D,
+                # folded after: about half the materialized figure a (row, key), and still growing with every key
+                # the chunk sees
+                from ..mlx.attn import ATTN_BLOCK
+
+                scores = -(-32 * Hq * (d + 2) // ATTN_BLOCK)
         rows = 4096
-        while rows > 64 and rows * (per_token + scores * (int(past) + rows)) > free:
+        # shrink until the whole working set fits the room, and until the attention's own buffer at these rows
+        # fits buf_cap - so a free reading that runs high never passes a single buffer the GPU cannot allocate,
+        # the oversized ask that faults it
+        while rows > 64 and (
+            rows * (per_token + scores * (int(past) + rows)) > free or scores * rows * (int(past) + rows) > buf_cap
+        ):
             rows //= 2
         return int(rows)
 
