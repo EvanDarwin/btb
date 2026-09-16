@@ -1,0 +1,17 @@
+# The comparison environment (.venv-compare): the rival engines and what they run on, pinned to the versions
+# the README's rows were measured with. bench/matrix.py checks this file against the venv and offers to set
+# it up; torch goes in first from the CUDA index that matches the card, then the rest of this file.
+# llama-cpp-python builds from source with GGML_CUDA on a machine with a card (needs the CUDA toolkit).
+torch==2.14.0
+transformers==5.16.1
+huggingface_hub==1.30.0
+tokenizers==0.23.2
+safetensors==0.8.0
+numpy==2.5.3
+sentencepiece==0.2.2
+accelerate==1.15.0
+protobuf==7.36.1
+gguf==0.19.0
+airllm==4.0.0
+llama-cpp-python==0.3.35
+mlx-lm; sys_platform == "darwin"

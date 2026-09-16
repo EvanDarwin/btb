@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="254" viewBox="0 0 960 254" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#222">
+<rect width="960" height="254" fill="#fff" rx="6"/>
+<text x="14" y="24" font-size="16" font-weight="700">Qwen/Qwen3-4B-Instruct-2507 on Intel i7-13700K, 64 GB RAM, NVIDIA RTX 4070 Ti 12 GB, Windows 11</text>
+<text x="14" y="44" fill="#555">tok/s after the first token</text>
+<rect x="350" y="34" width="12" height="11" fill="#9ecae1"/><text x="366" y="44" fill="#555">64 new tokens</text><rect x="480" y="34" width="12" height="11" fill="#4292c6"/><text x="496" y="44" fill="#555">256 new tokens</text><rect x="610" y="34" width="12" height="11" fill="#08519c"/><text x="626" y="44" fill="#555">1024 new tokens</text>
+<text x="14" y="70" font-weight="600">btb · GPU</text>
+<text x="14" y="84" fill="#555">bf16</text>
+<rect x="350" y="61" width="446.7" height="11" fill="#9ecae1"/>
+<text x="800.7" y="70">59.5</text>
+<rect x="350" y="73" width="475.9" height="11" fill="#4292c6"/>
+<text x="829.9" y="82">63.4</text>
+<rect x="350" y="85" width="530.0" height="11" fill="#08519c"/>
+<text x="884.0" y="94">70.6</text>
+<text x="350" y="107" fill="#777" font-size="11">first token 0.05 s · RAM 9.4 GB · VRAM 11.1 GB</text>
+<line x1="14" y1="116" x2="946" y2="116" stroke="#eee"/>
+<text x="14" y="134" font-weight="600">AirLLM · CPU</text>
+<text x="14" y="148" fill="#555">bf16</text>
+<rect x="350" y="125" width="1.5" height="11" fill="#9ecae1"/>
+<text x="355.5" y="134">0.20</text>
+<rect x="350" y="137" width="1.5" height="11" fill="#4292c6"/>
+<text x="355.5" y="146">0.20</text>
+<text x="354" y="158" fill="#999">—</text>
+<text x="350" y="171" fill="#777" font-size="11">first token 7.80 s · RAM 4.1 GB · VRAM 0</text>
+<line x1="14" y1="180" x2="946" y2="180" stroke="#eee"/>
+<text x="14" y="198" font-weight="600">llama.cpp · GPU</text>
+<text x="14" y="212" fill="#555">bf16</text>
+<rect x="350" y="189" width="396.4" height="11" fill="#9ecae1"/>
+<text x="750.4" y="198">52.8</text>
+<rect x="350" y="201" width="385.9" height="11" fill="#4292c6"/>
+<text x="739.9" y="210">51.4</text>
+<rect x="350" y="213" width="384.4" height="11" fill="#08519c"/>
+<text x="738.4" y="222">51.2</text>
+<text x="350" y="235" fill="#777" font-size="11">first token 0.03 s · RAM 8.6 GB · VRAM 8.4 GB</text>
+<line x1="14" y1="244" x2="946" y2="244" stroke="#eee"/>
+</svg>

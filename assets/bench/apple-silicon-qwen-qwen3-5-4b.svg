@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="530" viewBox="0 0 960 530" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#222">
+<rect width="960" height="530" fill="#fff" rx="6"/>
+<text x="14" y="24" font-size="16" font-weight="700">Qwen/Qwen3.5-4B on Apple M3 Pro, 36 GB unified memory, macOS 26.6.2</text>
+<text x="14" y="44" fill="#555">tok/s after the first token</text>
+<rect x="350" y="34" width="12" height="11" fill="#9ecae1"/><text x="366" y="44" fill="#555">64 new tokens</text><rect x="480" y="34" width="12" height="11" fill="#4292c6"/><text x="496" y="44" fill="#555">256 new tokens</text><rect x="610" y="34" width="12" height="11" fill="#08519c"/><text x="626" y="44" fill="#555">1024 new tokens</text>
+<text x="14" y="70" font-weight="600">btb · CPU</text>
+<text x="14" y="84" fill="#555">fp32, the 12-bit store, 32 host, head host, drafter</text>
+<text x="14" y="98" fill="#555">cpu</text>
+<rect x="350" y="61" width="113.1" height="11" fill="#9ecae1"/>
+<text x="467.1" y="70">5.92</text>
+<rect x="350" y="73" width="114.1" height="11" fill="#4292c6"/>
+<text x="468.1" y="82">5.98</text>
+<rect x="350" y="85" width="104.2" height="11" fill="#08519c"/>
+<text x="458.2" y="94">5.46</text>
+<text x="350" y="107" fill="#777" font-size="11">first token 4.52 s · RAM 12.4 GB · MLX 0</text>
+<line x1="14" y1="116" x2="946" y2="116" stroke="#eee"/>
+<text x="14" y="134" font-weight="600">btb · MLX</text>
+<text x="14" y="148" fill="#555">bf16, 32 host, 32 mlx, head host, drafter cpu</text>
+<rect x="350" y="125" width="468.6" height="11" fill="#9ecae1"/>
+<text x="822.6" y="134">24.5</text>
+<rect x="350" y="137" width="508.1" height="11" fill="#4292c6"/>
+<text x="862.1" y="146">26.6</text>
+<rect x="350" y="149" width="530.0" height="11" fill="#08519c"/>
+<text x="884.0" y="158">27.8</text>
+<text x="350" y="171" fill="#777" font-size="11">tokens per pass 2.40 / 2.47 / 2.58 · first token 0.20 s · RAM 9.8 GB · MLX 9.1 GB</text>
+<line x1="14" y1="180" x2="946" y2="180" stroke="#eee"/>
+<text x="14" y="198" font-weight="600">btb · MLX</text>
+<text x="14" y="212" fill="#555">bf16, the 12-bit store, 32 host, 32 mlx, head host,</text>
+<text x="14" y="226" fill="#555">drafter cpu</text>
+<rect x="350" y="189" width="325.1" height="11" fill="#9ecae1"/>
+<text x="679.1" y="198">17.0</text>
+<rect x="350" y="201" width="260.0" height="11" fill="#4292c6"/>
+<text x="614.0" y="210">13.6</text>
+<rect x="350" y="213" width="265.2" height="11" fill="#08519c"/>
+<text x="619.2" y="222">13.9</text>
+<text x="350" y="235" fill="#777" font-size="11">tokens per pass 2.28 / 2.35 / 2.55 · first token 0.31 s · RAM 9.7 GB · MLX 8.7 GB</text>
+<line x1="14" y1="244" x2="946" y2="244" stroke="#eee"/>
+<text x="14" y="262" font-weight="600">AirLLM · CPU</text>
+<text x="14" y="276" fill="#555">bf16</text>
+<text x="354" y="262" fill="#999" font-style="italic">no result</text>
+<line x1="14" y1="286" x2="946" y2="286" stroke="#eee"/>
+<text x="14" y="304" font-weight="600">AirLLM · GPU</text>
+<text x="14" y="318" fill="#555">bf16</text>
+<text x="354" y="304" fill="#999" font-style="italic">no result</text>
+<line x1="14" y1="328" x2="946" y2="328" stroke="#eee"/>
+<text x="14" y="346" font-weight="600">llama.cpp · CPU</text>
+<text x="14" y="360" fill="#555">bf16</text>
+<rect x="350" y="337" width="35.4" height="11" fill="#9ecae1"/>
+<text x="389.4" y="346">1.86</text>
+<rect x="350" y="349" width="34.6" height="11" fill="#4292c6"/>
+<text x="388.6" y="358">1.81</text>
+<rect x="350" y="361" width="34.7" height="11" fill="#08519c"/>
+<text x="388.7" y="370">1.82</text>
+<text x="350" y="383" fill="#777" font-size="11">first token 1.29 s · RAM 8.9 GB · MLX 0</text>
+<line x1="14" y1="392" x2="946" y2="392" stroke="#eee"/>
+<text x="14" y="410" font-weight="600">llama.cpp · GPU</text>
+<text x="14" y="424" fill="#555">bf16</text>
+<rect x="350" y="401" width="271.6" height="11" fill="#9ecae1"/>
+<text x="625.6" y="410">14.2</text>
+<rect x="350" y="413" width="269.6" height="11" fill="#4292c6"/>
+<text x="623.6" y="422">14.1</text>
+<rect x="350" y="425" width="267.4" height="11" fill="#08519c"/>
+<text x="621.4" y="434">14.0</text>
+<text x="350" y="447" fill="#777" font-size="11">first token 0.13 s · RAM 8.6 GB · MLX 0</text>
+<line x1="14" y1="456" x2="946" y2="456" stroke="#eee"/>
+<text x="14" y="474" font-weight="600">mlx-lm · MLX</text>
+<text x="14" y="488" fill="#555">bf16</text>
+<rect x="350" y="465" width="255.5" height="11" fill="#9ecae1"/>
+<text x="609.5" y="474">13.4</text>
+<rect x="350" y="477" width="265.3" height="11" fill="#4292c6"/>
+<text x="619.3" y="486">13.9</text>
+<rect x="350" y="489" width="252.9" height="11" fill="#08519c"/>
+<text x="606.9" y="498">13.2</text>
+<text x="350" y="511" fill="#777" font-size="11">first token 0.40 s · RAM 8.6 GB · MLX 8.0 GB</text>
+<line x1="14" y1="520" x2="946" y2="520" stroke="#eee"/>
+</svg>

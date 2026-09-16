@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="318" viewBox="0 0 960 318" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#222">
+<rect width="960" height="318" fill="#fff" rx="6"/>
+<text x="14" y="24" font-size="16" font-weight="700">microsoft/Phi-4-mini-instruct on Intel i7-13700K, 64 GB RAM, NVIDIA RTX 4070 Ti 12 GB, Windows 11</text>
+<text x="14" y="44" fill="#555">tok/s after the first token</text>
+<rect x="350" y="34" width="12" height="11" fill="#9ecae1"/><text x="366" y="44" fill="#555">64 new tokens</text><rect x="480" y="34" width="12" height="11" fill="#4292c6"/><text x="496" y="44" fill="#555">256 new tokens</text><rect x="610" y="34" width="12" height="11" fill="#08519c"/><text x="626" y="44" fill="#555">1024 new tokens</text>
+<text x="14" y="70" font-weight="600">btb · CPU</text>
+<text x="14" y="84" fill="#555">fp32</text>
+<rect x="350" y="61" width="43.9" height="11" fill="#9ecae1"/>
+<text x="397.9" y="70">3.00</text>
+<rect x="350" y="73" width="48.3" height="11" fill="#4292c6"/>
+<text x="402.3" y="82">3.30</text>
+<rect x="350" y="85" width="49.8" height="11" fill="#08519c"/>
+<text x="403.8" y="94">3.40</text>
+<text x="350" y="107" fill="#777" font-size="11">first token 0.69 s · RAM 8.7 GB · VRAM 0</text>
+<line x1="14" y1="116" x2="946" y2="116" stroke="#eee"/>
+<text x="14" y="134" font-weight="600">btb · CPU + GPU</text>
+<text x="14" y="148" fill="#555">fp32</text>
+<rect x="350" y="125" width="82.0" height="11" fill="#9ecae1"/>
+<text x="436.0" y="134">5.60</text>
+<rect x="350" y="137" width="82.0" height="11" fill="#4292c6"/>
+<text x="436.0" y="146">5.60</text>
+<rect x="350" y="149" width="76.1" height="11" fill="#08519c"/>
+<text x="430.1" y="158">5.20</text>
+<text x="350" y="171" fill="#777" font-size="11">first token 0.54 s · RAM 8.7 GB · VRAM 1.5 GB</text>
+<line x1="14" y1="180" x2="946" y2="180" stroke="#eee"/>
+<text x="14" y="198" font-weight="600">btb · GPU</text>
+<text x="14" y="212" fill="#555">bf16</text>
+<rect x="350" y="189" width="516.8" height="11" fill="#9ecae1"/>
+<text x="870.8" y="198">35.3</text>
+<rect x="350" y="201" width="530.0" height="11" fill="#4292c6"/>
+<text x="884.0" y="210">36.2</text>
+<rect x="350" y="213" width="530.0" height="11" fill="#08519c"/>
+<text x="884.0" y="222">36.2</text>
+<text x="350" y="235" fill="#777" font-size="11">first token 0.04 s · RAM 8.6 GB · VRAM 7.4 GB</text>
+<line x1="14" y1="244" x2="946" y2="244" stroke="#eee"/>
+<text x="14" y="262" font-weight="600">btb · GPU</text>
+<text x="14" y="276" fill="#555">fp32</text>
+<rect x="350" y="253" width="137.6" height="11" fill="#9ecae1"/>
+<text x="491.6" y="262">9.40</text>
+<rect x="350" y="265" width="137.6" height="11" fill="#4292c6"/>
+<text x="491.6" y="274">9.40</text>
+<rect x="350" y="277" width="131.8" height="11" fill="#08519c"/>
+<text x="485.8" y="286">9.00</text>
+<text x="350" y="299" fill="#777" font-size="11">first token 0.13 s · RAM 8.4 GB · VRAM 8.4 GB</text>
+<line x1="14" y1="308" x2="946" y2="308" stroke="#eee"/>
+</svg>

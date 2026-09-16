@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="318" viewBox="0 0 960 318" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#222">
+<rect width="960" height="318" fill="#fff" rx="6"/>
+<text x="14" y="24" font-size="16" font-weight="700">Qwen/Qwen3-0.6B on Intel i7-13700K, 64 GB RAM, NVIDIA RTX 4070 Ti 12 GB, Windows 11</text>
+<text x="14" y="44" fill="#555">tok/s after the first token</text>
+<rect x="350" y="34" width="12" height="11" fill="#9ecae1"/><text x="366" y="44" fill="#555">64 new tokens</text><rect x="480" y="34" width="12" height="11" fill="#4292c6"/><text x="496" y="44" fill="#555">256 new tokens</text><rect x="610" y="34" width="12" height="11" fill="#08519c"/><text x="626" y="44" fill="#555">1024 new tokens</text>
+<text x="14" y="70" font-weight="600">btb · CPU</text>
+<text x="14" y="84" fill="#555">fp32</text>
+<rect x="350" y="61" width="22.9" height="11" fill="#9ecae1"/>
+<text x="376.9" y="70">22.1</text>
+<rect x="350" y="73" width="20.0" height="11" fill="#4292c6"/>
+<text x="374.0" y="82">19.3</text>
+<rect x="350" y="85" width="27.2" height="11" fill="#08519c"/>
+<text x="381.2" y="94">26.2</text>
+<text x="350" y="107" fill="#777" font-size="11">tokens per pass 1.42 / 1.35 / 2.01 · first token 0.20 s · RAM 2.5 GB · VRAM 0</text>
+<line x1="14" y1="116" x2="946" y2="116" stroke="#eee"/>
+<text x="14" y="134" font-weight="600">btb · GPU</text>
+<text x="14" y="148" fill="#555">bf16</text>
+<rect x="350" y="125" width="387.3" height="11" fill="#9ecae1"/>
+<text x="741.3" y="134">373</text>
+<rect x="350" y="137" width="370.9" height="11" fill="#4292c6"/>
+<text x="724.9" y="146">357</text>
+<rect x="350" y="149" width="530.0" height="11" fill="#08519c"/>
+<text x="884.0" y="158">510</text>
+<text x="350" y="171" fill="#777" font-size="11">tokens per pass 1.49 / 1.45 / 2.33 · first token 0.04 s · RAM 2.9 GB · VRAM 2.8 GB</text>
+<line x1="14" y1="180" x2="946" y2="180" stroke="#eee"/>
+<text x="14" y="198" font-weight="600">AirLLM · CPU</text>
+<text x="14" y="212" fill="#555">bf16</text>
+<rect x="350" y="189" width="1.0" height="11" fill="#9ecae1"/>
+<text x="355.0" y="198">0.33</text>
+<rect x="350" y="201" width="1.0" height="11" fill="#4292c6"/>
+<text x="355.0" y="210">0.33</text>
+<text x="354" y="222" fill="#999">—</text>
+<text x="350" y="235" fill="#777" font-size="11">first token 3.40 s · RAM 0.9 GB · VRAM 0</text>
+<line x1="14" y1="244" x2="946" y2="244" stroke="#eee"/>
+<text x="14" y="262" font-weight="600">llama.cpp · GPU</text>
+<text x="14" y="276" fill="#555">bf16</text>
+<rect x="350" y="253" width="268.2" height="11" fill="#9ecae1"/>
+<text x="622.2" y="262">258</text>
+<rect x="350" y="265" width="255.2" height="11" fill="#4292c6"/>
+<text x="609.2" y="274">246</text>
+<rect x="350" y="277" width="241.2" height="11" fill="#08519c"/>
+<text x="595.2" y="286">232</text>
+<text x="350" y="299" fill="#777" font-size="11">first token 0.01 s · RAM 2.2 GB · VRAM 1.9 GB</text>
+<line x1="14" y1="308" x2="946" y2="308" stroke="#eee"/>
+</svg>

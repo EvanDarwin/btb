@@ -1,0 +1,33 @@
+[package]
+name = "btb_native"
+version = "0.1.0"
+edition = "2021"
+authors = ["Evan Darwin <evan@relta.net>"]
+license = "FSL-1.1-ALv2"
+description = "Native C-ABI kernels for Burn the Bus: a bf16 / 12-bit-packed rows mat-vec, a gated DeltaNet step, and an unbuffered sequential file reader."
+
+# cdylib: the C-ABI shared library the Python datapath loads via ctypes.
+# rlib:   so the integration tests can link it as a normal crate.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# rayon parallelizes the mat-vec across output rows and the DeltaNet step across
+# (node, key head). The partition is a scheduling choice only: both kernels are
+# bit-identical for every thread count.
+rayon = "1"
+
+# Whole-crate inlining across the `#[target_feature]` task bodies and no per-CGU
+# duplication of the hot loops. No `target-cpu` flag: the SIMD paths are selected at
+# runtime by `is_x86_feature_detected!`, so one binary runs the AVX-512, AVX2 or
+# scalar kernel on whatever machine loads it.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# `cargo test --profile guard`: the release codegen (thin LTO, one codegen unit) for the fenced
+# kernel tests, built into target/guard so the release DLL a running process may hold is never
+# rewritten.
+[profile.guard]
+inherits = "release"
+debug = 1

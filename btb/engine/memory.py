@@ -1,0 +1,330 @@
+# Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
+"""The VRAM policy: what the card and the host hold, and when a layer or the head is shed to the host, regrown
+onto the card, reallocated after a bleed, or the card's cache trimmed. The raw machine sensors it reads (host
+RAM, the GPU pressure counter) live in `btb.sysinfo`; the free-memory ledger it consults is `Device.free`."""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+import torch
+
+from ..kinds import Log
+from ..options import Device
+from ..sysinfo import (
+    _darwin_available_bytes,
+    hard_page_faults,
+    host_commit_bytes,
+    host_free_bytes,
+    host_total_bytes,
+    memory_pressure,
+    vram_pressure,
+    vram_pressure_line,
+)
+from .state import _State
+from .tiers import ColdRing
+
+
+@dataclass
+class VramPolicyState:
+    """The VRAM policy's own bookkeeping between steps: how much slower than its best a card step must be to
+    count as contended, how many free checks precede a regrow, how often pressure is read, the shared-memory
+    floor learned on the first read, and the counters and the held reason it carries from one read to the next."""
+
+    contention: float = 4.0
+    regrow_after: int = 3
+    period: float = 1.0
+    contended: int = 0
+    free_checks: int = 0
+    shared_floor: int | None = None
+    realloc_tried: bool = False
+    last_t: float = 0.0
+    total: int | None = None
+    held: str | None = None
+
+
+@dataclass
+class RamPolicyState:
+    """Counters for `ram_policy`: consecutive short and clean readings, the last fault count, the layers shed."""
+
+    period: float = 1.0
+    regrow_after: int = 5
+    last_t: float = 0.0
+    faults: int | None = None
+    paging: int = 0
+    clean: int = 0
+    shed: list[int] = field(default_factory=list)
+
+
+class _MemoryMixin(_State):
+    vram_pressure = staticmethod(vram_pressure)
+    vram_pressure_line = staticmethod(vram_pressure_line)
+    host_free_bytes = staticmethod(host_free_bytes)
+    _darwin_available_bytes = staticmethod(_darwin_available_bytes)
+    host_total_bytes = staticmethod(host_total_bytes)
+    host_commit_bytes = staticmethod(host_commit_bytes)
+
+    def vram_realloc(self, log: Log | None = None) -> list[str]:
+        log = log or self.log
+        done = []
+        if self.resident_head and self.head is not None and self.dev.type == Device.CUDA:
+            self.head = None
+            torch.cuda.empty_cache()
+            with self._meta:
+                self.head = torch.nn.Linear(self.cfg.hidden_size, self.cfg.vocab_size, bias=False)
+            self._adopt(self.head, "weight", self._get(self.head_key))
+            done.append("head")
+        aj = getattr(self, "aj", None)
+        if aj is not None and aj.dev.type == Device.CUDA:
+            self.aj = None
+            torch.cuda.empty_cache()
+            done.append("drafter")
+        log(f"[vram] REALLOC {done or 'nothing'} (bled with room on the card); " + vram_pressure_line())
+        return done
+
+    def vram_shed(self, cache: Any = None, log: Log | None = None) -> str | None:
+        log = log or self.log
+        moved = None
+        aj = getattr(self, "aj", None)
+        if aj is not None and aj.dev.type == Device.CUDA:
+            self.aj = None
+            self.drafter_dev = torch.device("cpu")
+            moved = "drafter"
+        elif self.resident:
+            i = max(self.resident)
+            tmpl = self.resident.pop(i)
+            del tmpl
+            self.host[i] = self._make_host_layer(i)
+            self._cache_to(cache, i, "cpu")
+            moved = f"layer {i}"
+        elif self.resident_head and self.dev.type == Device.CUDA:
+            self._head_host()
+            self.head = None
+            self.resident_head = False
+            moved = "head"
+        if moved is None:
+            return None
+        self._shed.append(moved)
+        if self.dev.type == Device.CUDA:
+            torch.cuda.empty_cache()
+        log(f"[vram] SHED {moved} -> host (shed so far: {self._shed}); " + vram_pressure_line())
+        return moved
+
+    def vram_regrow(self, cache: Any = None, log: Log | None = None) -> Any:
+        log = log or self.log
+        if not self._shed:
+            return None
+        what = self._shed.pop()
+        if what == "head":
+            with self._meta:
+                self.head = torch.nn.Linear(self.cfg.hidden_size, self.cfg.vocab_size, bias=False)
+            self._adopt(self.head, "weight", self._get(self.head_key))
+            self.resident_head = True
+        elif what == "drafter":
+            self.drafter_dev = None
+            self.aj = None
+        else:
+            i = int(what.split()[1])
+            tmpl = self._new_layer(i)
+            self._load_layer(i, tmpl, first=True)
+            if self.resident_fp32 and self.compute_dtype is not None and self.compute_dtype != torch.bfloat16:
+                for p in tmpl.parameters():
+                    p.data = p.data.to(self.compute_dtype)
+            self.resident[i] = tmpl
+            self.host.pop(i, None)
+            self._cache_to(cache, i, self.dev)
+        log(f"[vram] REGROW {what} -> card (still shed: {self._shed}); " + vram_pressure_line())
+        return what
+
+    def vram_trim(self, tag: str = "") -> Any:
+        if self.dev.type != Device.CUDA:
+            return 0.0, 0.0
+        before = torch.cuda.memory_reserved() / 2**30
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        alloc, res = torch.cuda.memory_allocated() / 2**30, torch.cuda.memory_reserved() / 2**30
+        if before - res > 0.05 or getattr(self, "vram_watch", False):
+            self.log(
+                f"[vram] trim{(' ' + tag) if tag else ''}: reserved {before:.2f} -> {res:.2f} GB (allocated {alloc:.2f})"
+            )
+        return alloc, res
+
+    def vram_policy(self, cache: Any = None, log: Log | None = None) -> None:
+        if not self.vram_watch or self.dev.type != Device.CUDA:
+            return
+        # a batched decode is sized by the scheduler (the one OOM guard), so the per-step streaming policy stands
+        # aside: shedding mid-batch only slows it, and the triggers fire on a large batch's legitimate KV growth
+        if cache is not None and getattr(cache, "layers", None):
+            k0 = getattr(cache.layers[0], "keys", None)
+            if k0 is not None and k0.numel() and int(k0.shape[0]) > 1:
+                return
+        # the pressure read is a PDH query (4.4 ms on this machine) - longer than a small model's whole step on
+        # the card graph. A model holding every layer on the card with a quarter of the card still free has
+        # nothing to shed, so the policy stands aside for it; elsewhere it reads pressure once a second, which
+        # is how fast pressure moves, not once a token
+        now = time.time()
+        if now - self.vram_state.last_t < self.vram_state.period:
+            return
+        self.vram_state.last_t = now
+        resident, L = getattr(self, "resident", None), getattr(self, "L", None)
+        if (
+            resident is not None
+            and L is not None
+            and len(resident) == L
+            and not getattr(self, "host", None)
+            and not getattr(self, "cold", None)
+        ):
+            total = self.vram_state.total
+            if total is None:
+                try:
+                    total = int(torch.cuda.get_device_properties(self.dev).total_memory)
+                except Exception:
+                    total = 0
+                self.vram_state.total = total
+            room = self.device.free(unreserved=True)
+            if total and room is not None and room > total // 4:
+                return
+        p = vram_pressure()
+        if not p:
+            return
+        shared = p["process"]["shared"]
+        floor = self.vram_state.shared_floor
+        if floor is None:
+            floor = self.vram_state.shared_floor = shared + (128 << 20)
+        bled = shared > floor
+        last, best = getattr(self, "_last_card_ms", 0.0), getattr(self, "_card_ms_min", None)
+        contended = best is not None and last > 200.0 and last > self.vram_state.contention * best
+        if contended:
+            self.vram_state.contended += 1
+        else:
+            self.vram_state.contended = 0
+        if not bled:
+            self.vram_state.realloc_tried = False
+        if bled and not self.vram_state.realloc_tried:
+            room = self.device.free(unreserved=True)
+            if room is not None and room > self._realloc_bytes():
+                self.vram_state.realloc_tried = True
+                self.device.request("realloc", lambda: self.vram_realloc(log))
+                return
+        if bled or self.vram_state.contended >= 2:
+            self.vram_state.free_checks = 0
+            self.vram_state.contended = 0
+            why = (
+                f"bled ({(shared - floor) / 2**20:.0f} MB above the floor)"
+                if bled
+                else f"card contended ({last:.0f} ms vs best {best:.0f})"
+            )
+            # shedding is a memory decision and the signals above are proxies for one (the PDH counter is noisy
+            # under WDDM; a tree's verify pass looks contended next to a graphed one-token step): a resident
+            # layer leaves the card only when the card is short of its margin; else the signal is logged once
+            room = self.device.free(unreserved=True)
+            if room is not None and room > 0:
+                kind = why.split(" ")[0]
+                if self.vram_state.held != kind:
+                    (log or self.log)(
+                        f"[vram] {why}, {room / 2**30:.1f} GB free above the margin: holding the card's layers"
+                    )
+                self.vram_state.held = kind
+                return
+            self.vram_state.held = None
+            if self.device.request("shed", lambda: self.vram_shed(cache, log)) is not None:
+                (log or self.log)(f"[vram] reason: {why}")
+            self._card_ms_min = None
+        elif self._shed:
+            room = self.device.free(unreserved=True)
+            if room is not None and room > self._regrow_bytes():
+                self.vram_state.free_checks += 1
+            else:
+                self.vram_state.free_checks = 0
+            if self.vram_state.free_checks >= self.vram_state.regrow_after:
+                self.vram_state.free_checks = 0
+                self.device.request("regrow", lambda: self.vram_regrow(cache, log))
+
+    def ram_policy(self, log: Log | None = None) -> None:
+        """Once a second: shed one warm layer to the ring after two consecutive readings with no free host memory
+        above the reserve (or an OS low-memory signal). Regrow the last shed layer after `regrow_after`
+        consecutive clean readings with room for it."""
+        if not getattr(self, "ram_watch", False) or self.mlx is not None:
+            return
+        st = self.ram_state
+        now = time.time()
+        if now - st.last_t < st.period:
+            return
+        st.last_t = now
+        faults = hard_page_faults()
+        delta = faults - st.faults if st.faults is not None else 0
+        st.faults = faults
+        low = bool(memory_pressure().get("low"))
+        room = self.device.free(torch.device("cpu"), unreserved=True)
+        if low or (room is not None and room <= 0):
+            st.paging += 1
+            st.clean = 0
+        else:
+            st.clean += 1
+            st.paging = 0
+        warm = [i for i in sorted(self.host) if i not in self.cold]
+        if st.paging >= 2 and warm:
+            st.paging = 0
+            why = f"{0 if room is None else room / 2**30:.2f} GB free above the reserve, hard faults +{delta}" + (
+                ", the OS short of memory" if low else ""
+            )
+            self.device.request("ram-shed", lambda: self.ram_shed(why, log))
+        elif st.shed and st.clean >= st.regrow_after:
+            room = self.device.free(torch.device("cpu"), unreserved=True)
+            need = self._layer_bytes_stored(st.shed[-1], bool(getattr(self, "_packed", None)))
+            if room is not None and room > need:
+                st.clean = 0
+                self.device.request("ram-regrow", lambda: self.ram_regrow(log))
+
+    def ram_shed(self, why: str = "", log: Log | None = None) -> int | None:
+        """the last warm layer to the ring: its weights read each pass from the drive, its pages in RAM given back
+        to the OS, the ring rebuilt over the new order (the next pass restarts its reader)"""
+        log = log or self.log
+        warm = [i for i in sorted(self.host) if i not in self.cold]
+        if not warm:
+            return None
+        i = warm[-1]
+        self._cold_stop()
+        self.cold.add(i)
+        self.ram_state.shed.append(i)
+        self._bind_cold()
+        log(f"[ram] SHED layer {i} -> drive ({why or 'asked'}); {len(self.cold)} layers from the drive each pass")
+        return i
+
+    def ram_regrow(self, log: Log | None = None) -> int | None:
+        """the last layer shed back into RAM: its linears on the store's mapped bytes again, the ring rebuilt
+        without it (emptied when it was the last cold layer)"""
+        log = log or self.log
+        if not self.ram_state.shed:
+            return None
+        i = self.ram_state.shed.pop()
+        self._cold_stop()
+        self.cold.discard(i)
+        self._rebind_warm(i)
+        if self.cold:
+            self._bind_cold()
+        else:
+            self.cold_ring = ColdRing()
+        log(f"[ram] REGROW layer {i} -> RAM (still shed: {self.ram_state.shed}); {len(self.cold)} from the drive")
+        return i
+
+    def layer_bytes(self) -> dict[int, int]:
+        sizes: dict[int, int] = {}
+        by_shard: dict[str, Any] = {}
+        for k, sh in self.weight_map.items():
+            by_shard.setdefault(sh, []).append(k)
+        for sh, keys in by_shard.items():
+            _, hdr, _ = self._shard(sh)
+            for k in keys:
+                if not k.startswith(self.prefix + "layers.") or not self._dense_key(k):
+                    continue
+                i = int(k[len(self.prefix) + len("layers.") :].split(".")[0])
+                info = hdr[k]
+                n = 1
+                for d in info["shape"]:
+                    n *= int(d)
+                b = torch.empty(0, dtype=self.ST_DTYPES[info["dtype"]]).element_size()
+                sizes[i] = sizes.get(i, 0) + n * b
+        return sizes
