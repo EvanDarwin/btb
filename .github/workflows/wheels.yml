@@ -148,6 +148,10 @@ jobs:
             fatbin: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Trust the checkout (the manylinux container runs as a different uid than the mounted workspace,
+          so git refuses it and setuptools-scm's file finder fails during the build)
+        if: matrix.container != ''
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: CPython (host runners)
         if: matrix.container == ''
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0

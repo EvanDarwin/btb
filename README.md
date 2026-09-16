@@ -1,6 +1,6 @@
 ![btb logo](assets/banner.png)
 
-# btb (Burn the Bus)
+# btb (Beyond the Box)
 
 `btb` is a x86_64 / ARM / CUDA / MLX / NEON optimized harness that prioritizes using all available hardware on the machine, semi-greedily.  
 
@@ -50,7 +50,8 @@ It implements a **tiered access system**, prioritizing VRAM, RAM, and disk in th
 
 ## Commercial Use
 
-For commercial use, please contact [sales@relta.net](mailto:sales@relta.net). Please see the license file for more information.
+For commercial use, please contact [sales@relta.net](mailto:sales@relta.net). 
+See the [LICENSE](./LICENSE.md) file for more information about the FSL-v1.1-ALv2 license.
 
 ## Installing
 
@@ -59,8 +60,8 @@ This package provides both wheel files for common platforms/architectures, as we
 ### pip
 
 ```sh
-pip install burnthebus
-pip install burnthebus[mlx]      # Apple silicon: adds MLX, and the GPU is used by default
+pip install beyondthebox
+pip install beyondthebox[mlx]      # Apple silicon: adds MLX, and the GPU is used by default
 ```
 
 ### From Source

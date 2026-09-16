@@ -3,7 +3,7 @@ requires = ["setuptools>=77", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "burnthebus"  # the distribution; the import and the command stay `btb`
+name = "beyondthebox"  # the distribution; the import and the command stay `btb`
 dynamic = ["version"]  # from the git tag via setuptools-scm ([tool.setuptools_scm] below)
 description = "Convenient LLM inference on consumer PCs"
 readme = "README.md"
@@ -90,7 +90,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"btb/cli.py" = ["T20"]
+"btb/cli.py" = ["T20", "RUF001"]  # RUF001: the banner art's box-drawing diagonals are intentional, not typos
 "btb/serve.py" = ["T20"]        # the server's console lines are its output, not stray debugging
 "bench/*" = ["T20", "SIM105"]   # a try/except/pass around a cleanup remove() reads fine in the bench harness
 "tests/*" = ["T20", "E402", "RUF059"]  # sys.path before btb; an unused shape unpack in a test is not a defect
