@@ -6,6 +6,8 @@ answers agree."""
 from __future__ import annotations
 
 import contextlib
+import importlib.util
+import platform
 import subprocess
 import sys
 import time
@@ -88,6 +90,25 @@ def mlx_reason() -> str:
     return "Metal reports no device (an Intel Mac, or a headless session)"
 
 
+_MLX_WARNED = False
+
+
+def _warn_mlx_missing() -> None:
+    """A loud one-time note when a load falls to the CPU on an Apple silicon Mac only because the mlx package
+    is absent - the machine has the fast path, this install is just missing it (the common `pip install
+    beyondthebox` without MLX). Silent on an Intel Mac or where mlx is present but Metal reports no device."""
+    global _MLX_WARNED
+    if _MLX_WARNED or sys.platform != "darwin" or platform.machine() != "arm64":
+        return
+    if importlib.util.find_spec("mlx") is not None:
+        return
+    _MLX_WARNED = True
+    sys.stderr.write(
+        "\n  ⚠️  btb is running on the CPU: this is an Apple silicon Mac, but the `mlx` package is not\n"
+        "      installed, so the Metal GPU path is off and inference is far slower. Turn it on:  pip install mlx\n\n"
+    )
+
+
 def resolve_device(device: Any) -> DeviceName:
     """The device a load runs on: None (or 'auto') picks the card when one is visible, else MLX on Apple
     silicon, else the CPU; a device named must exist here - 'mlx' off Apple silicon or 'cuda' without a card
@@ -100,7 +121,10 @@ def resolve_device(device: Any) -> DeviceName:
     if d is None:
         if card:
             return DeviceName(DeviceKind.CUDA)
-        return DeviceName(DeviceKind.MLX if (sys.platform == "darwin" and mlx_available()) else DeviceKind.CPU)
+        if sys.platform == "darwin" and mlx_available():
+            return DeviceName(DeviceKind.MLX)
+        _warn_mlx_missing()  # on Apple silicon without the mlx package: the fast path is a pip install away
+        return DeviceName(DeviceKind.CPU)
     if d.kind is DeviceKind.CPU:
         return d
     if d.kind is DeviceKind.MLX:
