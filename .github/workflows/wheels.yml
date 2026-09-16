@@ -250,12 +250,9 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
-  # attest + publish only when classify said this ref may publish (a valid tag, or a manual run). Every job
-  # here pulls only the dist-* artifacts (the wheels and the sdist), never the fatbin build artifact, so only
-  # publishable files reach the attestation and the upload.
   attest:
     needs: [classify, wheel, sdist]
-    if: needs.classify.outputs.publish == 'true'
+    if: false
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -275,7 +272,7 @@ jobs:
   # a pre-release tag (vX.Y.ZrcN / aN / bN / .devN) and every manual run land on TestPyPI. skip-existing keeps a
   # re-run of the same version from failing (a manual run with no tag builds the fallback version each time).
   publish-testpypi:
-    needs: [classify, attest]
+    needs: [classify, wheel, sdist]
     if: needs.classify.outputs.prerelease == 'true'
     runs-on: ubuntu-latest
     environment: testpypi
@@ -287,18 +284,19 @@ jobs:
           path: dist
           pattern: "dist-*"
           merge-multiple: true
-      - name: Publish to TestPyPI (also attaches PEP 740 attestations)
+      - name: Publish to TestPyPI
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           repository-url: https://test.pypi.org/legacy/
           skip-existing: true
+          attestations: false
 
   # every valid tag lands on real PyPI, pre-release (rcN/aN/bN/.devN) or final. The `pypi` environment carries a
   # required reviewer, so this job waits for a human to approve before the irreversible upload; no skip-existing,
   # so a duplicate version fails loudly. pip installs a pre-release only under --pre or when it is the sole
   # release, so a later final X.Y.Z becomes the default install and supersedes the rc.
   publish-pypi:
-    needs: [classify, attest]
+    needs: [classify, wheel, sdist]
     if: needs.classify.outputs.pypi == 'true'
     runs-on: ubuntu-latest
     environment: pypi
@@ -310,5 +308,7 @@ jobs:
           path: dist
           pattern: "dist-*"
           merge-multiple: true
-      - name: Publish to PyPI (also attaches PEP 740 attestations)
+      - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          attestations: false
