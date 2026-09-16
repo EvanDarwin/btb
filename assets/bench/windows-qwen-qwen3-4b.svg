@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="446" viewBox="0 0 960 446" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#222">
+<rect width="960" height="446" fill="#fff" rx="6"/>
+<text x="14" y="24" font-size="16" font-weight="700">Qwen/Qwen3-4B on Intel i7-13700K, 64 GB RAM, NVIDIA RTX 4070 Ti 12 GB, Windows 11</text>
+<text x="14" y="44" fill="#555">tok/s after the first token</text>
+<rect x="350" y="34" width="12" height="11" fill="#9ecae1"/><text x="366" y="44" fill="#555">64 new tokens</text><rect x="480" y="34" width="12" height="11" fill="#4292c6"/><text x="496" y="44" fill="#555">256 new tokens</text><rect x="610" y="34" width="12" height="11" fill="#08519c"/><text x="626" y="44" fill="#555">1024 new tokens</text>
+<text x="14" y="70" font-weight="600">btb · CPU</text>
+<text x="14" y="84" fill="#555">fp32</text>
+<rect x="350" y="61" width="22.4" height="11" fill="#9ecae1"/>
+<text x="376.4" y="70">3.30</text>
+<rect x="350" y="73" width="23.0" height="11" fill="#4292c6"/>
+<text x="377.0" y="82">3.40</text>
+<rect x="350" y="85" width="23.0" height="11" fill="#08519c"/>
+<text x="377.0" y="94">3.40</text>
+<text x="350" y="107" fill="#777" font-size="11">first token 0.95 s · RAM 9.1 GB · VRAM 0</text>
+<line x1="14" y1="116" x2="946" y2="116" stroke="#eee"/>
+<text x="14" y="134" font-weight="600">btb · CPU + GPU</text>
+<text x="14" y="148" fill="#555">bf16</text>
+<rect x="350" y="125" width="180.3" height="11" fill="#9ecae1"/>
+<text x="534.3" y="134">26.6</text>
+<rect x="350" y="137" width="183.0" height="11" fill="#4292c6"/>
+<text x="537.0" y="146">27.0</text>
+<rect x="350" y="149" width="178.2" height="11" fill="#08519c"/>
+<text x="532.2" y="158">26.3</text>
+<text x="350" y="171" fill="#777" font-size="11">first token 0.07 s · RAM 9.2 GB · VRAM 7.6 GB</text>
+<line x1="14" y1="180" x2="946" y2="180" stroke="#eee"/>
+<text x="14" y="198" font-weight="600">btb · GPU</text>
+<text x="14" y="212" fill="#555">bf16</text>
+<rect x="350" y="189" width="411.4" height="11" fill="#9ecae1"/>
+<text x="765.4" y="198">60.7</text>
+<rect x="350" y="201" width="425.6" height="11" fill="#4292c6"/>
+<text x="779.6" y="210">62.8</text>
+<rect x="350" y="213" width="530.0" height="11" fill="#08519c"/>
+<text x="884.0" y="222">78.2</text>
+<text x="350" y="235" fill="#777" font-size="11">first token 0.04 s · RAM 9.4 GB · VRAM 11.1 GB</text>
+<line x1="14" y1="244" x2="946" y2="244" stroke="#eee"/>
+<text x="14" y="262" font-weight="600">btb · GPU</text>
+<text x="14" y="276" fill="#555">fp32</text>
+<rect x="350" y="253" width="55.6" height="11" fill="#9ecae1"/>
+<text x="409.6" y="262">8.20</text>
+<rect x="350" y="265" width="54.9" height="11" fill="#4292c6"/>
+<text x="408.9" y="274">8.10</text>
+<rect x="350" y="277" width="42.7" height="11" fill="#08519c"/>
+<text x="396.7" y="286">6.30</text>
+<text x="350" y="299" fill="#777" font-size="11">first token 0.14 s · RAM 16.8 GB · VRAM 9.4 GB</text>
+<line x1="14" y1="308" x2="946" y2="308" stroke="#eee"/>
+<text x="14" y="326" font-weight="600">AirLLM · CPU</text>
+<text x="14" y="340" fill="#555">bf16</text>
+<rect x="350" y="317" width="1.4" height="11" fill="#9ecae1"/>
+<text x="355.4" y="326">0.20</text>
+<rect x="350" y="329" width="1.4" height="11" fill="#4292c6"/>
+<text x="355.4" y="338">0.20</text>
+<text x="354" y="350" fill="#999">—</text>
+<text x="350" y="363" fill="#777" font-size="11">first token 8.00 s · RAM 4.1 GB · VRAM 0</text>
+<line x1="14" y1="372" x2="946" y2="372" stroke="#eee"/>
+<text x="14" y="390" font-weight="600">llama.cpp · GPU</text>
+<text x="14" y="404" fill="#555">bf16</text>
+<rect x="350" y="381" width="357.2" height="11" fill="#9ecae1"/>
+<text x="711.2" y="390">52.7</text>
+<rect x="350" y="393" width="349.0" height="11" fill="#4292c6"/>
+<text x="703.0" y="402">51.5</text>
+<rect x="350" y="405" width="339.6" height="11" fill="#08519c"/>
+<text x="693.6" y="414">50.1</text>
+<text x="350" y="427" fill="#777" font-size="11">first token 0.03 s · RAM 8.6 GB · VRAM 8.3 GB</text>
+<line x1="14" y1="436" x2="946" y2="436" stroke="#eee"/>
+</svg>

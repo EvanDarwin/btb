@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="466" viewBox="0 0 960 466" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#222">
+<rect width="960" height="466" fill="#fff" rx="6"/>
+<text x="14" y="24" font-size="16" font-weight="700">Qwen/Qwen3-1.7B on Apple M3 Pro, 36 GB unified memory, macOS 26.6.2</text>
+<text x="14" y="44" fill="#555">tok/s after the first token</text>
+<rect x="350" y="34" width="12" height="11" fill="#9ecae1"/><text x="366" y="44" fill="#555">64 new tokens</text><rect x="480" y="34" width="12" height="11" fill="#4292c6"/><text x="496" y="44" fill="#555">256 new tokens</text><rect x="610" y="34" width="12" height="11" fill="#08519c"/><text x="626" y="44" fill="#555">1024 new tokens</text>
+<text x="14" y="70" font-weight="600">btb · CPU</text>
+<text x="14" y="84" fill="#555">fp32, 28 host, head host</text>
+<rect x="350" y="61" width="196.3" height="11" fill="#9ecae1"/>
+<text x="550.3" y="70">18.3</text>
+<rect x="350" y="73" width="191.9" height="11" fill="#4292c6"/>
+<text x="545.9" y="82">17.9</text>
+<rect x="350" y="85" width="164.8" height="11" fill="#08519c"/>
+<text x="518.8" y="94">15.3</text>
+<text x="350" y="107" fill="#777" font-size="11">first token 0.44 s · RAM 5.0 GB · MLX 0</text>
+<line x1="14" y1="116" x2="946" y2="116" stroke="#eee"/>
+<text x="14" y="134" font-weight="600">btb · MLX</text>
+<text x="14" y="148" fill="#555">bf16, 28 host, 28 mlx, head host</text>
+<rect x="350" y="125" width="377.7" height="11" fill="#9ecae1"/>
+<text x="731.7" y="134">35.2</text>
+<rect x="350" y="137" width="391.3" height="11" fill="#4292c6"/>
+<text x="745.3" y="146">36.4</text>
+<rect x="350" y="149" width="530.0" height="11" fill="#08519c"/>
+<text x="884.0" y="158">49.4</text>
+<text x="350" y="171" fill="#777" font-size="11">tokens per pass 1.23 / 1.29 / 1.69 · first token 0.11 s · RAM 5.0 GB · MLX 6.3 GB</text>
+<line x1="14" y1="180" x2="946" y2="180" stroke="#eee"/>
+<text x="14" y="198" font-weight="600">AirLLM · CPU</text>
+<text x="14" y="212" fill="#555">bf16</text>
+<text x="354" y="198" fill="#999" font-style="italic">no result</text>
+<line x1="14" y1="222" x2="946" y2="222" stroke="#eee"/>
+<text x="14" y="240" font-weight="600">AirLLM · GPU</text>
+<text x="14" y="254" fill="#555">bf16</text>
+<text x="354" y="240" fill="#999" font-style="italic">no result</text>
+<line x1="14" y1="264" x2="946" y2="264" stroke="#eee"/>
+<text x="14" y="282" font-weight="600">llama.cpp · CPU</text>
+<text x="14" y="296" fill="#555">bf16</text>
+<rect x="350" y="273" width="47.3" height="11" fill="#9ecae1"/>
+<text x="401.3" y="282">4.40</text>
+<rect x="350" y="285" width="47.1" height="11" fill="#4292c6"/>
+<text x="401.1" y="294">4.39</text>
+<rect x="350" y="297" width="46.2" height="11" fill="#08519c"/>
+<text x="400.2" y="306">4.30</text>
+<text x="350" y="319" fill="#777" font-size="11">first token 0.56 s · RAM 4.7 GB · MLX 0</text>
+<line x1="14" y1="328" x2="946" y2="328" stroke="#eee"/>
+<text x="14" y="346" font-weight="600">llama.cpp · GPU</text>
+<text x="14" y="360" fill="#555">bf16</text>
+<rect x="350" y="337" width="306.6" height="11" fill="#9ecae1"/>
+<text x="660.6" y="346">28.6</text>
+<rect x="350" y="349" width="331.7" height="11" fill="#4292c6"/>
+<text x="685.7" y="358">30.9</text>
+<rect x="350" y="361" width="332.2" height="11" fill="#08519c"/>
+<text x="686.2" y="370">30.9</text>
+<text x="350" y="383" fill="#777" font-size="11">first token 0.07 s · RAM 4.6 GB · MLX 0</text>
+<line x1="14" y1="392" x2="946" y2="392" stroke="#eee"/>
+<text x="14" y="410" font-weight="600">mlx-lm · MLX</text>
+<text x="14" y="424" fill="#555">bf16</text>
+<rect x="350" y="401" width="342.5" height="11" fill="#9ecae1"/>
+<text x="696.5" y="410">31.9</text>
+<rect x="350" y="413" width="355.7" height="11" fill="#4292c6"/>
+<text x="709.7" y="422">33.1</text>
+<rect x="350" y="425" width="330.6" height="11" fill="#08519c"/>
+<text x="684.6" y="434">30.8</text>
+<text x="350" y="447" fill="#777" font-size="11">first token 0.20 s · RAM 3.8 GB · MLX 3.4 GB</text>
+<line x1="14" y1="456" x2="946" y2="456" stroke="#eee"/>
+</svg>

@@ -1,0 +1,161 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "burnthebus"  # the distribution; the import and the command stay `btb`
+version = "0.1.0"
+description = "Convenient LLM inference on consumer PCs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "LicenseRef-FSL-1.1-ALv2"
+license-files = ["LICENSE.md", "NOTICE"]
+authors = [{ name = "Evan Darwin" }]
+keywords = ["llm", "inference", "cpu", "cuda", "mlx", "speculative-decoding", "openai-api", "ollama"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: End Users/Desktop",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Rust",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Environment :: GPU :: NVIDIA CUDA",
+]
+dependencies = [
+  "torch>=2.4",
+  "transformers>=5.16",
+  "huggingface_hub>=0.20",
+  "numpy>=1.26",
+  "safetensors>=0.4",
+  "setproctitle>=1.3.7",
+  "gguf>=0.19",  # GGUF models (llama.cpp's format): the reader, the name table and the dequantization
+]
+
+[project.urls]
+Homepage = "https://github.com/EvanDarwin/btb"
+Repository = "https://github.com/EvanDarwin/btb"
+Issues = "https://github.com/EvanDarwin/btb/issues"
+
+[project.optional-dependencies]
+mlx = ["mlx>=0.32.2"]
+
+[project.scripts]
+btb = "btb.cli:main"
+
+[tool.setuptools]
+packages = ["btb", "btb.engine", "btb.mlx"]
+
+[tool.setuptools.package-data]
+"btb" = ["native/*/*.dll", "native/*/*.so", "native/*/*.dylib", "native/*/*.fatbin"]
+
+# --- code quality -------------------------------------------------------------------------------------------
+# `python build.py check` runs all of it: ruff (lint + format), mypy, cargo fmt and clippy; `python build.py test` the suites.
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = [".venv", ".venv-compare", "native", "bench/results"]
+
+[tool.ruff.lint]
+select = [
+  "E", "W",      # pycodestyle
+  "F",           # pyflakes: unused imports and variables, undefined names
+  "I",           # import order
+  "UP",          # modern syntax for the python this targets
+  "B",           # bugbear: likely bugs (mutable defaults, loop variables in closures...)
+  "C4",          # comprehensions
+  "SIM",         # simplifications
+  "RUF",         # ruff's own (unused noqa, mutable class defaults...)
+  "PLE",         # pylint errors
+  "T20",         # print() outside the CLI and the bench (they log through their own functions)
+]
+ignore = [
+  "E501",        # line length: the formatter decides
+  "E741",        # single-letter names: the kernels' math reads as the papers write it (l, I)
+  "SIM108",      # a ternary is not always clearer than an if/else
+  "SIM102",      # nested ifs are sometimes the clearer shape
+  "SIM103",      # `return cond` hides the branches a reader wants to see
+  "B905",        # zip() without strict=: the callers know their lengths
+  "RUF012",      # class-level dict defaults are the engine's tables, not mutable state
+  "UP015",       # explicit open modes read fine
+  "E731",        # a lambda bound to a name is the local helper it looks like
+  "SIM115",      # json.load(open(...)) on a small file: the handle closes with the call
+  "SIM300",      # a Yoda condition reads as the math does; not worth rewriting
+  "RUF005",      # list concatenation over unpacking is a style choice, not a defect
+]
+
+[tool.ruff.lint.per-file-ignores]
+"btb/cli.py" = ["T20"]
+"btb/serve.py" = ["T20"]        # the server's console lines are its output, not stray debugging
+"bench/*" = ["T20", "SIM105"]   # a try/except/pass around a cleanup remove() reads fine in the bench harness
+"tests/*" = ["T20", "E402", "RUF059"]  # sys.path before btb; an unused shape unpack in a test is not a defect
+"setup.py" = ["T20"]
+"examples/*" = ["T20"]         # the examples print what they show
+# the card kernels: an unused shape unpack (H, Hq, I) reads as the launch math; suppressed rather than
+# renaming the dimensions in the optimization path
+"btb/engine/cuda.py" = ["RUF059"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["btb"]
+
+[tool.ruff.format]
+quote-style = "double"
+line-ending = "lf"
+
+[tool.mypy]
+# the interpreter the checks run under (numpy's stubs use 3.12 syntax); ruff keeps the code itself at 3.11
+python_version = "3.13"
+files = ["btb", "bench", "tests", "setup.py"]
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+disallow_incomplete_defs = true
+disallow_untyped_defs = true
+disallow_untyped_decorators = true
+disallow_subclassing_any = true
+disallow_any_generics = true
+strict_equality = true
+extra_checks = true
+exclude = ["\\.venv", "\\.venv-compare", "native/", "bench/results/"]
+
+[[tool.mypy.overrides]]
+# the only unstubbed imports: mlx (no Linux wheel, absent on the CI checker), the bench comparison
+# backends, and the build tooling. Scoped so a mistyped or missing first-party import still errors
+# instead of being silently ignored, which a global ignore_missing_imports would hide.
+module = ["mlx.*", "mlx_lm.*", "llama_cpp.*", "airllm.*", "wheel.*", "setuptools.*"]
+ignore_missing_imports = true
+
+[tool.pyright]
+# Pylance/Pyright in the editor, matched to the mypy gate in build.py so a contributor's IDE does not light
+# up over the same unstubbed imports (mlx, the bench backends) that ignore_missing_imports tells mypy to
+# allow. mypy stays the source of truth for CI; this only quiets Pyright's IDE-only reports and gates nothing.
+pythonVersion = "3.13"
+venvPath = "."
+venv = ".venv"
+include = ["btb", "bench", "tests", "setup.py"]
+exclude = [".venv", ".venv-compare", "native", "bench/results"]
+typeCheckingMode = "basic"
+reportMissingModuleSource = false   # mlx and the bench backends ship no stubs
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportUnknownVariableType = false
+reportUnknownParameterType = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
+markers = ["timing: asserts on wall-clock rates or a process-wide limit; not run on shared CI runners"]
+
+[tool.pylint.messages_control]
+# W0603 global-statement: the lazy kernel caches (btb/mlx/*), the CUDA flag and MEM_START are module state
+# set once by design, not accidental mutable globals; the warning is only noise on them. ruff still gates the
+# real pylint errors through its PLE rules.
+disable = ["global-statement"]

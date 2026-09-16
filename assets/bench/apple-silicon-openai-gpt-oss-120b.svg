@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="232" viewBox="0 0 960 232" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#222">
+<rect width="960" height="232" fill="#fff" rx="6"/>
+<text x="14" y="24" font-size="16" font-weight="700">openai/gpt-oss-120b on Apple M3 Pro, 36 GB unified memory, macOS 26.6.2</text>
+<text x="14" y="44" fill="#555">tok/s after the first token</text>
+<rect x="350" y="34" width="12" height="11" fill="#9ecae1"/><text x="366" y="44" fill="#555">64 new tokens</text><rect x="480" y="34" width="12" height="11" fill="#4292c6"/><text x="496" y="44" fill="#555">256 new tokens</text><rect x="610" y="34" width="12" height="11" fill="#08519c"/><text x="626" y="44" fill="#555">1024 new tokens</text>
+<text x="14" y="70" font-weight="600">btb · CPU</text>
+<text x="14" y="84" fill="#555">fp32</text>
+<rect x="350" y="61" width="449.2" height="11" fill="#9ecae1"/>
+<text x="803.2" y="70">3.58</text>
+<rect x="350" y="73" width="471.4" height="11" fill="#4292c6"/>
+<text x="825.4" y="82">3.75</text>
+<rect x="350" y="85" width="482.3" height="11" fill="#08519c"/>
+<text x="836.3" y="94">3.84</text>
+<text x="350" y="107" fill="#777" font-size="11">first token 7.91 s · RAM 16.6 GB · MLX 0</text>
+<line x1="14" y1="116" x2="946" y2="116" stroke="#eee"/>
+<text x="14" y="134" font-weight="600">btb · MLX</text>
+<text x="14" y="148" fill="#555">bf16</text>
+<rect x="350" y="125" width="483.7" height="11" fill="#9ecae1"/>
+<text x="837.7" y="134">3.85</text>
+<rect x="350" y="137" width="530.0" height="11" fill="#4292c6"/>
+<text x="884.0" y="146">4.22</text>
+<rect x="350" y="149" width="514.5" height="11" fill="#08519c"/>
+<text x="868.5" y="158">4.10</text>
+<text x="350" y="171" fill="#777" font-size="11">first token 5.08 s · RAM 17.9 GB · MLX 17.0 GB</text>
+<line x1="14" y1="180" x2="946" y2="180" stroke="#eee"/>
+<text x="14" y="198" font-weight="600">mlx-lm · MLX</text>
+<text x="14" y="212" fill="#555">bf16</text>
+<text x="354" y="198" fill="#999" font-style="italic">no result</text>
+<line x1="14" y1="222" x2="946" y2="222" stroke="#eee"/>
+</svg>

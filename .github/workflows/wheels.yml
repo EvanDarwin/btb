@@ -1,0 +1,235 @@
+# Compile the Python wheel for each platform:
+#   * Linux x86_64 and aarch64 (manylinux_2_28)
+#   * Windows x86_64 and arm64
+#   * macOS arm64 (Apple Silicon)
+#
+# The CUDA fatbin is compiled in a separate job for platforms that require it. All wheels
+# include GitHub attestation.
+#
+# Every action is pinned to its latest release commit SHA (see .github/dependabot.yml for updates); rustup-init
+# is pinned by version and per-target sha256; pip is the image's own.
+name: wheels
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wheels-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: "3.11"
+  CUDA_VERSION: "13.2.0"
+  RUSTUP_VERSION: "1.29.1"
+
+jobs:
+  checks:
+    # ruff, mypy, cargo fmt and clippy: `python build.py check`, the gate a change must pass. The dev venv is
+    # installed so mypy sees the same types as a local run (mlx has no Linux wheel, so btb/mlx is checked as Any
+    # here). Standalone by design: no wheel, attest or publish job waits on it, so a red check never blocks a build.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13" # mypy targets 3.13 (numpy's stubs use newer syntax); match it here
+      - name: Dev venv (the package's deps, so mypy resolves real types, plus the check tools)
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install torch transformers huggingface_hub numpy safetensors setproctitle gguf ruff mypy pytest \
+            --extra-index-url https://download.pytorch.org/whl/cpu
+      - name: Rust check tools
+        run: rustup component add rustfmt clippy
+      - name: Checks (ruff, mypy, cargo fmt, clippy)
+        run: python build.py check
+
+  fatbin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: CUDA toolkit (nvcc only, no driver - device code needs no GPU)
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: "${{ env.CUDA_VERSION }}"
+          method: network
+          sub-packages: '["nvcc", "cudart"]'
+      - name: Build the fatbin from source
+        run: python build.py build --cuda-only
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fatbin
+          path: native/cuda/btb_kernels.fatbin
+          if-no-files-found: error
+
+  # One job, five platforms. The differences live in the matrix; build and certify run under bash on every OS
+  # (Windows has Git Bash), so those steps are shared verbatim. Linux builds in the manylinux container of its
+  # architecture (its own CPython, Rust bootstrapped with rustup); the host runners take CPython from
+  # setup-python and ship Rust, except the Windows arm64 image, which gets it the way the containers do. No
+  # macOS x86_64: PyPI's last torch there is 2.2 and btb needs 2.4.
+  wheel:
+    name: ${{ matrix.id }}-wheel
+    needs: [fatbin]
+    runs-on: ${{ matrix.runs-on }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux
+            runs-on: ubuntu-latest
+            container: quay.io/pypa/manylinux_2_28_x86_64
+            rustup: x86_64-unknown-linux-gnu
+            build: python build.py build # the fatbin artifact is packaged as built; the container's AUDITWHEEL_PLAT is honored
+            torch: torch --index-url https://download.pytorch.org/whl/cpu
+            fatbin: true
+          - id: linux-arm
+            runs-on: ubuntu-24.04-arm
+            container: quay.io/pypa/manylinux_2_28_aarch64
+            rustup: aarch64-unknown-linux-gnu
+            build: python build.py build
+            torch: torch --index-url https://download.pytorch.org/whl/cpu
+            fatbin: true
+          - id: windows
+            runs-on: windows-latest
+            container: ""
+            rustup: ""
+            build: python build.py build
+            torch: torch --index-url https://download.pytorch.org/whl/cpu
+            fatbin: true
+          - id: windows-arm
+            runs-on: windows-11-arm
+            container: ""
+            rustup: aarch64-pc-windows-msvc # the arm64 image ships no Rust
+            build: python build.py build
+            torch: torch --index-url https://download.pytorch.org/whl/cpu
+            fatbin: true
+          - id: macos
+            runs-on: macos-14 # Apple Silicon (arm64)
+            container: ""
+            rustup: ""
+            build: python build.py build
+            torch: torch # macOS torch is on PyPI (CPU/MPS); the /whl/cpu index has no mac wheels
+            fatbin: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: CPython (host runners)
+        if: matrix.container == ''
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "${{ env.PYTHON_VERSION }}"
+      - name: Rust via pinned rustup-init (the containers, and the Windows arm64 image)
+        if: matrix.rustup != ''
+        shell: bash
+        env:
+          RUSTUP_TARGET: ${{ matrix.rustup }}
+        run: |
+          # rustup-init pinned by version and per-target checksum (never `curl | sh`); the toolchain is stable
+          case "$RUSTUP_TARGET" in
+            x86_64-unknown-linux-gnu)  bin=rustup-init;     sum=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71 ;;
+            aarch64-unknown-linux-gnu) bin=rustup-init;     sum=15f6e4ce9f583b929c996c91562bad6d4454f3281de858b02cdfdef615fac433 ;;
+            aarch64-pc-windows-msvc)   bin=rustup-init.exe; sum=01aa49cf9574a8bd0ae52005d7de2590e8f27181ded6748236e702c92aef826d ;;
+            *) echo "no pinned rustup-init for $RUSTUP_TARGET" >&2; exit 1 ;;
+          esac
+          curl --proto '=https' --tlsv1.2 -sSf -o "$bin" \
+            "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${RUSTUP_TARGET}/${bin}"
+          echo "${sum} *${bin}" | sha256sum -c -
+          chmod +x "$bin"
+          "./$bin" -y --default-toolchain stable
+          rm "$bin"
+          if command -v cygpath >/dev/null 2>&1; then cygpath -w "$HOME/.cargo/bin" >> "$GITHUB_PATH"; \
+          else echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"; fi
+      - name: The container's CPython on PATH (manylinux)
+        if: matrix.container != ''
+        run: echo "/opt/python/cp311-cp311/bin" >> "$GITHUB_PATH"
+      - name: Fetch the from-source fatbin (CUDA device code, host-agnostic)
+        if: matrix.fatbin
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fatbin
+          path: native/cuda
+      - name: Rust tests (the kernel suites; the fenced guard-page suites build on Windows only)
+        shell: bash
+        run: |
+          cd native
+          cargo test --release
+          case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) cargo test --profile guard ;; esac
+      - name: Build the wheel
+        shell: bash
+        run: ${{ matrix.build }}
+      - name: Certify (install the wheel, run the CPU suite)
+        shell: bash
+        run: |
+          python -m pip install ${{ matrix.torch }}
+          python -m pip install ./dist/*.whl pytest
+          mv btb btb.src   # so `import btb` resolves to the installed wheel, not the source tree
+          python -m pytest tests -q -m "not timing"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-${{ matrix.id }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "${{ env.PYTHON_VERSION }}"
+      - name: Build the sdist and check it (tests/fixtures excluded by setuptools' default)
+        run: |
+          python -m pip install build twine
+          python -P -m build --sdist
+          twine check dist/*
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # attest + publish only on a version tag or a manual run. Both pull only the dist-* artifacts (the wheels and
+  # the sdist), never the fatbin build artifact, so only publishable files reach the attestation and the upload.
+  attest:
+    needs: [wheel, sdist]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          pattern: "dist-*"
+          merge-multiple: true
+      - name: Attest build provenance for every artifact
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: "dist/*"
+
+  publish-testpypi:
+    needs: [attest]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write # Trusted Publishing (OIDC); no token secret
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          pattern: "dist-*"
+          merge-multiple: true
+      - name: Dry-run publish to TestPyPI (also attaches PEP 740 attestations)
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          repository-url: https://test.pypi.org/legacy/
