@@ -190,18 +190,18 @@ def test_the_step_graph_loop_gives_the_step_by_step_tokens(
     sm, _ = engine
     ids, toks, _ = greedy_reference
     assert sm._card_greedy_ok(None, 1, None, None, False, None)
-    out, _ = sm.generate(ids, len(toks), eos=(), greedy=True)
+    out, _ = sm.generate(ids, len(toks), eos=(), speculate=False)
     assert out == toks
     # against the step loop itself, with the pipeline switched off, and with an eos that stops it early
     for pid in prompt_ids:
         sm.card_pipeline = False
         try:
-            ref, _ = sm.generate(pid, 40, eos=(), greedy=True)
+            ref, _ = sm.generate(pid, 40, eos=(), speculate=False)
         finally:
             sm.card_pipeline = True
-        got, _ = sm.generate(pid, 40, eos=(), greedy=True)
+        got, _ = sm.generate(pid, 40, eos=(), speculate=False)
         assert got == ref
-        cut, _ = sm.generate(pid, 40, eos=(ref[20],), greedy=True)
+        cut, _ = sm.generate(pid, 40, eos=(ref[20],), speculate=False)
         assert cut == ref[: ref.index(ref[20]) + 1]
 
 
@@ -266,7 +266,7 @@ def test_the_default_engine_takes_one_gemv_for_every_width_and_is_exact(default_
     with open(os.path.join(here, "bench", "questions.jsonl"), encoding="utf-8") as fh:
         prompts = [sm.prompt_ids(json.loads(line)["prompt"]) for line in fh if line.strip()][:3]
     for ids in prompts:
-        g = sm.generate(ids, 128, eos=(), greedy=True).tokens
+        g = sm.generate(ids, 128, eos=(), speculate=False).tokens
         with torch.inference_mode():
             cache = sm.new_cache()
             forward_logits(sm, [ids], cache=cache)
@@ -292,14 +292,14 @@ def test_the_step_graph_samples_as_the_step_loop_and_repeats_under_a_seed(
     sm, _ = engine
     s1, s2 = Sampling(temperature=0.8, top_p=0.9, seed=1), Sampling(temperature=0.8, top_p=0.9, seed=2)
     ids = prompt_ids[0]
-    a, _ = sm.generate(ids, 40, eos=(), greedy=True, sampling=s1)
-    b, _ = sm.generate(ids, 40, eos=(), greedy=True, sampling=s1)
-    c, _ = sm.generate(ids, 40, eos=(), greedy=True, sampling=s2)
-    g, _ = sm.generate(ids, 40, eos=(), greedy=True)
+    a, _ = sm.generate(ids, 40, eos=(), speculate=False, sampling=s1)
+    b, _ = sm.generate(ids, 40, eos=(), speculate=False, sampling=s1)
+    c, _ = sm.generate(ids, 40, eos=(), speculate=False, sampling=s2)
+    g, _ = sm.generate(ids, 40, eos=(), speculate=False)
     assert a == b and a != c and a != g
     sm.card_pipeline = False
     try:
-        ref, _ = sm.generate(ids, 40, eos=(), greedy=True, sampling=s1)
+        ref, _ = sm.generate(ids, 40, eos=(), speculate=False, sampling=s1)
     finally:
         sm.card_pipeline = True
     spec, census = sm.generate(ids, 40, eos=(), sampling=s1)
@@ -311,7 +311,7 @@ def test_the_speculative_answer_is_the_greedy_answer(engine: EngineTok, prompt_i
 
     sm, _ = engine
     for ids in prompt_ids:
-        g, _ = sm.generate(ids, 128, eos=(), greedy=True)
+        g, _ = sm.generate(ids, 128, eos=(), speculate=False)
         o, census = sm.generate(ids, 128, eos=())
         assert o == g, f"diverged at token {next(i for i, (a, b) in enumerate(zip(g, o)) if a != b)} of {len(g)}"
         assert census["forwards"] < len(o)

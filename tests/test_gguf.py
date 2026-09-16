@@ -41,7 +41,7 @@ def _tokens(path: str, device: str = "cpu") -> list[int]:
     import btb
 
     with btb.load(path, device=device, log=None) as sm:
-        out, _ = sm.generate(PROMPT, 8, eos=(), greedy=True)
+        out, _ = sm.generate(PROMPT, 8, eos=(), speculate=False)
     return [int(t) for t in out]
 
 
@@ -222,7 +222,7 @@ def test_a_gpt_oss_gguf_streams_its_experts_as_stored_and_decodes_as_its_twin(tm
         assert "blk.0.ffn_gate_exps.weight" in sm.weight_map
         bias = sm._get("model.layers.0.mlp.experts.gate_up_proj_bias")
         assert tuple(bias.shape) == (want["num_local_experts"], 2 * want["intermediate_size"])
-        out, _ = sm.generate(PROMPT, 8, eos=(), greedy=True)
+        out, _ = sm.generate(PROMPT, 8, eos=(), speculate=False)
         store = sm.expert_store
         if store is not None:
             assert store.ggml and isinstance(store._views(store.last_slots[next(iter(store.last_slots))])[0], MxGateUp)
@@ -363,13 +363,13 @@ def test_real_qwen3_gguf_files_when_cached() -> None:
             assert tok.chat_template and tok("hello world")["input_ids"], q
             assert sm.stop_ids, q
             ids = sm.prompt_ids(prompt)
-            out, _ = sm.generate(ids, 8, greedy=True)
+            out, _ = sm.generate(ids, 8, speculate=False)
             answers[q] = (ids, [int(t) for t in out], sm.tokenizer.decode(out, skip_special_tokens=True))
     print({q: a[2] for q, a in answers.items()})
     if ref and "BF16" in answers:
         with btb.load(ref, device="cpu", log=None) as sm:
             ids = sm.prompt_ids(prompt)
-            out, _ = sm.generate(ids, 8, greedy=True)
+            out, _ = sm.generate(ids, 8, speculate=False)
         assert answers["BF16"][0] == ids and answers["BF16"][1] == [int(t) for t in out]
 
 

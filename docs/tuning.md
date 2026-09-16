@@ -91,8 +91,9 @@ Each step drafts a small tree of candidate tokens (from the model's MTP drafting
 an n-gram drafter), then the model verifies the whole tree in one pass. Accepted drafts are free tokens; the
 metric is **tokens per pass**, which `-v` and `btb bench` report. On by default for every model that can do it.
 
-- `--tree-budget N` — tree size per step. Bigger tree, more candidates per pass, more verify cost. `0` turns
-  speculation off (same as `--greedy`). Default 14–16 depending on device/head.
+- `--no-spec` — decode one token at a time, no tree: the off switch for speculation. Same tokens, slower.
+- `--tree-budget N` — tree size per step. Bigger tree, more candidates per pass, more verify cost. `0` turns it
+  off. Default 14–16 depending on device/head.
 - `--v-max N` — drafted tokens verified per step; `0` decodes one at a time. Default 4, `0` for MoE.
 - `--tree-min-prob P` — drop draft branches below this path probability (default 0.15). Lower keeps more
   speculative branches alive.
@@ -108,9 +109,6 @@ metric is **tokens per pass**, which `-v` and `btb bench` report. On by default 
 - `--ngram-p P` — acceptance threshold for the n-gram drafter (default 0.9), the proposer used when the model
   has no drafting head.
 
-Turn speculation off with `--tree-budget 0` (the `run` command also takes `--greedy` for this). That switches
-off the tree, not sampling — it is unrelated to greedy token selection below.
-
 ## Token selection: greedy and sampling
 
 How each token is picked, independent of speculation: the same knobs apply whether or not the tree is on, and on
@@ -122,10 +120,6 @@ the servers a request's own fields override them.
 - `--top-k K` — draw only from the K likeliest tokens (default 0: all tokens).
 - `--seed N` — the draw's seed; a prompt and a seed reproduce their answer exactly (default: drawn per call and
   reported in the stats). Sampling is deterministic given a seed.
-
-The `run --greedy` flag names speculation (decode one token at a time), not selection. Greedy selection is just
-the default, `--temperature 0`, and speculation stays on under a temperature — `--draft-temperature` above tunes
-how the drafter samples its tree.
 
 ## Environment variables
 

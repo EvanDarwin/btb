@@ -25,25 +25,25 @@ def main(argv=None):
     with btb.load(path, device=a.device, v_max=0) as model:
         ids = model.prompt_ids("The same answer, wherever the layer lives:")
         decode = lambda toks: model.tokenizer.decode(toks, skip_special_tokens=True)
-        before = model.generate(ids, a.new, greedy=True).tokens
+        before = model.generate(ids, a.new, speculate=False).tokens
         print(f"{'from RAM:':<26} {decode(before)}")
         moves = []
         if model.host and packed:
             i = model.ram_shed("the example")
-            during = model.generate(ids, a.new, greedy=True).tokens
+            during = model.generate(ids, a.new, speculate=False).tokens
             print(f"{f'layer {i} on the ring:':<26} {decode(during)}")
             back = model.ram_regrow()
-            after = model.generate(ids, a.new, greedy=True).tokens
+            after = model.generate(ids, a.new, speculate=False).tokens
             print(f"{f'layer {back} back in RAM:':<26} {decode(after)}")
             moves.append(("ram", i, during == before, back, after == before))
         elif not packed:
             print("no 12-bit store beside the model: the host move is skipped")
         if model.resident and model.dev.type == "cuda":
             what = model.vram_shed()
-            during = model.generate(ids, a.new, greedy=True).tokens
+            during = model.generate(ids, a.new, speculate=False).tokens
             print(f"{f'{what} off the card:':<26} {decode(during)}")
             model.vram_regrow()
-            after = model.generate(ids, a.new, greedy=True).tokens
+            after = model.generate(ids, a.new, speculate=False).tokens
             print(f"{'regrown:':<26} {decode(after)}")
             moves.append(("vram", what, during == before, None, after == before))
         return {"before": before, "moves": moves}

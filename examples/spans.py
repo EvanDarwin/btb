@@ -19,7 +19,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     with btb.load(a.model, device=a.device) as model:
         ids = model.prompt_ids("Repeat the passage exactly as written.")
-        greedy = model.generate(ids, a.new, greedy=True).tokens
+        greedy = model.generate(ids, a.new, speculate=False).tokens
         bank = btb.SpanBank()
         bank.add("the passage", greedy)  # what the answer will say, banked ahead; a real use banks the document quoted
         spec, stats = model.generate(ids, a.new, spans=bank.spans())

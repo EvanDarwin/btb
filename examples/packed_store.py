@@ -27,9 +27,9 @@ def main(argv=None):
     print(f"packed the layers into {packed_bytes / 2**20:.1f} MB of shards at {out}")
     with btb.load(src, device=a.device, v_max=0) as plain:
         ids = plain.prompt_ids("From the checkpoint and from the store:")
-        base = plain.generate(ids, a.new, greedy=True).tokens
+        base = plain.generate(ids, a.new, speculate=False).tokens
     with btb.load(out, device=a.device, v_max=0) as packed:
-        from_store = packed.generate(ids, a.new, greedy=True).tokens
+        from_store = packed.generate(ids, a.new, speculate=False).tokens
         print(f"identical: {from_store == base}; the parent it names: {btb.pack_format(out)['source']}")
     return {"out": out, "identical": from_store == base, "packed_bytes": packed_bytes, "format": btb.pack_format(out)}
 

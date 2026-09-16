@@ -294,16 +294,16 @@ def test_the_ram_policy_sheds_a_warm_layer_to_the_ring_and_takes_it_back() -> No
     sm = btb.load(fixture("tiny_qwen3-pack12"), device="cpu", v_max=0)
     try:
         assert sm.host and not sm.cold and sm.ram_watch
-        before, _ = sm.generate(REPEATING, 12, greedy=True)
+        before, _ = sm.generate(REPEATING, 12, speculate=False)
         i = sm.ram_shed("the test")
         assert i == max(sm.host) and sm.cold == {i} and sm.ram_state.shed == [i]
         assert sm.cold_ring.slots and i in sm.cold_ring.slot_of
         lins = [m for m in sm.host[i].modules() if isinstance(m, _HostLinear) and m.key]
         assert lins and all(m.packed is not None for m in lins)
-        during, _ = sm.generate(REPEATING, 12, greedy=True)
+        during, _ = sm.generate(REPEATING, 12, speculate=False)
         assert during == before, "a layer read from the drive each pass answers as it did from RAM"
         assert sm.ram_regrow() == i and not sm.cold and not sm.ram_state.shed and not sm.cold_ring.slots
-        after, _ = sm.generate(REPEATING, 12, greedy=True)
+        after, _ = sm.generate(REPEATING, 12, speculate=False)
         assert after == before
     finally:
         sm.close()
@@ -334,14 +334,14 @@ def test_the_12_bit_model_answers_as_its_parent_with_and_without_the_native_kern
     src, pack = fixture("tiny_qwen3"), fixture("tiny_qwen3-pack12")
     with btb.load(src, device="cpu", v_max=0) as a, btb.load(pack, device="cpu", v_max=0) as b:
         assert b.pack is not None and b._packed
-        assert a.generate(REPEATING, 12, greedy=True)[0] == b.generate(REPEATING, 12, greedy=True)[0]
+        assert a.generate(REPEATING, 12, speculate=False)[0] == b.generate(REPEATING, 12, speculate=False)[0]
     code = (
         "import json, sys, btb\n"
         "src, pack, ids = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])\n"
         "out = []\n"
         "for p in (src, pack):\n"
         "    with btb.load(p, device='cpu', native='', v_max=0) as m:\n"
-        "        out.append(m.generate(ids, 12, greedy=True)[0])\n"
+        "        out.append(m.generate(ids, 12, speculate=False)[0])\n"
         "from btb.engine.native import Native\n"
         "assert Native.gemv is None and Native.gemv_p12 is None, 'the torch-alone arm loaded a kernel library'\n"
         "print(json.dumps(out))\n"

@@ -297,23 +297,24 @@ class _TextMixin(_State):
         session: Session | None = None,
         on_token: Callable[[int], Any] | None = None,
         spans: Spans = (),
-        greedy: bool = False,
+        speculate: bool = True,
         sampling: Sampling | None = None,
     ) -> Generation:
         """
         Decode a row of ids with the engine's configured loop: speculative where it pays, the same answer either
-        way; several rows go through the batched loop, each row as its own greedy decode. One decode runs at a
+        way; several rows go through the batched loop, each row as its own plain decode. One decode runs at a
         time on an engine: a second caller waits. `max_new` defaults to what the window leaves; `eos` to
-        `stop_ids`; `spans` are (tag, ids) texts banked for the n-gram proposer (`btb.SpanBank`); `greedy` takes
-        the one-token loop; `sampling` (a `btb.Sampling`) the pick of every token, the engine's default when
-        None (greedy unless loaded with a temperature)
+        `stop_ids`; `spans` are (tag, ids) texts banked for the n-gram proposer (`btb.SpanBank`); `speculate`
+        False forces the plain one-token loop (no tree), the same tokens more slowly; `sampling` (a
+        `btb.Sampling`) the pick of every token - greedy (argmax) or a temperature, and orthogonal to
+        speculation - the engine's default when None (greedy unless loaded with a temperature)
         """
         if getattr(self, "mlx", None) is not None and threading.current_thread() is not getattr(
             self, "_worker_thread", None
         ):
-            return self.on_worker(self.generate, ids, max_new, eos, session, on_token, spans, greedy, sampling)
+            return self.on_worker(self.generate, ids, max_new, eos, session, on_token, spans, speculate, sampling)
         with self._decode_lock:
-            return self._generate(ids, max_new, eos, session, on_token, spans, greedy, sampling)
+            return self._generate(ids, max_new, eos, session, on_token, spans, speculate, sampling)
 
     def _generate(
         self,
@@ -323,7 +324,7 @@ class _TextMixin(_State):
         session: Session | None,
         on_token: Callable[[int], Any] | None,
         spans: Spans,
-        greedy: bool,
+        speculate: bool,
         sampling: Sampling | None,
     ) -> Generation:
         if ids and isinstance(ids[0], (list, tuple)):
@@ -337,8 +338,8 @@ class _TextMixin(_State):
         stop = tuple(self.stop_ids if eos is None else (int(e) for e in eos))
         smp = (sampling if sampling is not None else getattr(self, "sampling", None) or GREEDY).seeded()
         seed: dict[str, Any] = {} if smp.greedy else {"seed": smp.seed}
-        if greedy or len(rows) > 1 or (self.v_max <= 0 and session is None):
-            # several rows take the batched loop: the speculative loop decodes one row
+        if not speculate or len(rows) > 1 or (self.v_max <= 0 and session is None):
+            # not speculating, several rows, or no verify budget: the plain loop (the speculative loop is one row)
             out = self.generate_greedy(rows, max_new, eos_ids=stop, on_token=on_token, sampling=smp)
             return Generation(out, cast(GenerateStats, dict(cap=max_new, proposer="greedy", **seed)))
         if (

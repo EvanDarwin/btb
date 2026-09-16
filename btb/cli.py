@@ -435,6 +435,11 @@ def _common(ap: argparse.ArgumentParser, path_required: bool = True) -> None:
         default=None,
         help="acceptance threshold of the n-gram drafter",
     )
+    s.add_argument(
+        "--no-spec",
+        action="store_true",
+        help="turn speculation off: decode one token at a time. The off switch; the flags above tune the tree",
+    )
     d = ap.add_argument_group("sampling (how every token is picked; on the servers a request's own fields win)")
     d.add_argument(
         "--temperature",
@@ -544,7 +549,7 @@ def cmd_run(a: argparse.Namespace) -> None:
         for idx, prompt in enumerate(prompts):
             ids = sm.prompt_ids(prompt)
             t0 = time.perf_counter()
-            out, c = sm.generate(ids, a.new, eos=es, greedy=a.greedy)
+            out, c = sm.generate(ids, a.new, eos=es, speculate=not a.no_spec)
             s = time.perf_counter() - t0
             stop = "eos" if (out and out[-1] in eset) else "length"
             tpp = round(len(out) / c["forwards"], 3) if (c and "forwards" in c) else 1.0
@@ -660,7 +665,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
                 m.append(time.perf_counter())
 
             t0 = time.perf_counter()
-            g, _ = sm.generate(ids, n_new, eos=(), greedy=True, on_token=mark, sampling=GREEDY)
+            g, _ = sm.generate(ids, n_new, eos=(), speculate=False, on_token=mark, sampling=GREEDY)
             t1 = time.perf_counter()
             firsts.append(marks[0] - t0)
             tg = (t1 - marks[0]) / max(1, len(g) - 1)
@@ -908,7 +913,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="cap on new tokens (default: until the model ends its turn or the context is full)",
     )
-    p.add_argument("--greedy", action="store_true", help="decode one token at a time even if the model can speculate")
     p.add_argument(
         "--raw",
         action="store_true",

@@ -163,6 +163,7 @@ Every command that loads a model takes these. The placement is planned from the 
 | `--ram-reserve GB\|%` | specifies how much RAM to keep free on the host for other apps | 10% of RAM, or OS floor + growth; whichever is more |
 | `--vram-reserve GB\|%` | specifies how much VRAM to keep free on the host for other apps | 0.5 GB, or 8% of a smaller card |
 | `--vram-watch 0\|1`<br/><sub>This option describes enables/disables `btb`'s behavior under contention. When true, it aims for no apps OOMing. When false, it plans once and sticks to it - making other apps take the OOM. | `1`: free RAM/VRAM under contention, reclaim it when available again<br/>`0`: fit the model to the hardware once and don't readjust | `1` |
+| `--no-spec` | disables speculative decoding | _disabled_ |
 | `--tree-budget N` | the draft tree's size per pass; `0` turns the tree off | with drafting head: mlx = `14`, cuda = `15`, cpu = `16`<br/>without: on a card holding every layer, `15`; otherwise `0` |
 | `--v-max N` | drafted tokens verified per pass; `0` decodes one token at a time | `4`; `0` for a mixture of experts |
 | `--tree-min-prob P` | minimum draft path probability kept in the tree | `0.15` |
@@ -179,7 +180,7 @@ Every command that loads a model takes these. The placement is planned from the 
 
 Each command's own arguments (`btb <command> --help` lists them):
 
-- `run PATH`: `-p, --prompt` (else stdin, else a sample prompt), `--file JSONL` (one `{"prompt": ...}` per line, a fresh context each), `--new N`, `--greedy` (one token at a time even if the model can speculate), `--raw` (keep special tokens), `-q, --quiet`, `--json` (one record per prompt), `--out PATH`.
+- `run PATH`: `-p, --prompt` (else stdin, else a sample prompt), `--file JSONL` (one `{"prompt": ...}` per line, a fresh context each), `--new N`, `--raw` (keep special tokens), `-q, --quiet`, `--json` (one record per prompt), `--out PATH`.
 - `chat PATH`: `--file JSONL` (scripted turns, one `{"user": ...}` per line), `--new N`; `/reset` clears, `/quit` exits.
 - `bench PATH --prompts JSONL`: `--rows I,J,...` (default all), `--new N,N,...` (default `64,256,1024`), `--label LABEL`, `--out JSONL`; always greedy.
 - `serve [PATH]`: `--host` (default `127.0.0.1`), `--port` (default `8000`), `--new N` (a ceiling per request), `--api-key KEY` (required on every request as `Authorization: Bearer KEY`; default `BTB_API_KEY` from the environment, else none), `--models-dir DIR` (repeatable), `--models-filter REGEX`; no path starts empty.
