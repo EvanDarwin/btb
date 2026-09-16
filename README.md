@@ -114,11 +114,11 @@ Starts the server and runs `ollama run qwen3-4b`; anything after the options goe
 ### One prompt, or a chat in the terminal
 
 ```sh
-btb run  Qwen/Qwen3-4B --prompt -q "What is the capital of France?"
-# 
+btb run Qwen/Qwen3-4B -q -p "What is the capital of France?"
+# The capital of France is **Paris**.
 
-btb run  Qwen/Qwen3-4B --device -q --json cpu -p "What does CPU stand for?"
-# 
+btb run Qwen/Qwen3-4B -q --json -p "What does CPU stand for?"
+# {"answer": "CPU stands for **Central Processing Unit**. …", "took": 4.25, "stop": "eos", "stats": {"tokens_per_sec": 13.9, "tokens_in": 18, "tokens_out": 59, "tokens_per_pass": 1.0}}
 
 btb chat Qwen/Qwen3-4B
 # Basic interactive chat window
