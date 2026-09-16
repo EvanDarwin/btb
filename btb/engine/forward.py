@@ -26,6 +26,17 @@ if TYPE_CHECKING:
     from .device import Placement
 
 
+_GPU_PREFILL_RETRIES = 3
+
+
+def _is_gpu_recovery(e: BaseException) -> bool:
+    """A transient Metal reset: a command buffer discarded as the innocent victim of a GPU error/recovery. The
+    card reset and threw away in-flight work; nothing this pass wrote committed, so it can be replayed once the
+    GPU settles - as opposed to a guilty fault (an out-of-memory, an invalid resource) that would recur."""
+    s = str(e).lower()
+    return "innocentvictim" in s or "victim of gpu error" in s
+
+
 class _Pass:
     """One forward's frame, handed to every layer by the device: the cache, the positions and masks, the flags the
     tiers read, the placement the pass holds, and the CPU copies a host layer needs, made once."""
@@ -662,7 +673,37 @@ class _ForwardMixin(_State):
                         f"({self.prefill_room() / 2**30:.1f} GB of room); every chunk reads the weights again"
                     )
                 b = min(T, a + C)
-                out = self.forward(ids[:, a:b], cache=cache, on_layer=hook)
+                # WAL/checkpoint: the chunk boundary is the commit, the cache length the log. A transient GPU
+                # reset discards the chunk's in-flight work; roll the cache back to `ckpt` (crop the KV rows the
+                # chunk began past - idempotently overwritten on replay, never read below ckpt) and replay once
+                # the scheduler has eased the card off. Only where the rollback is complete and side-effect free:
+                # crop covers every layer, no per-layer hook to re-fire, no hybrid recurrent state to restore.
+                ckpt = int(cache.get_seq_length())
+                attempt = 0
+                while True:
+                    try:
+                        out = self.forward(ids[:, a:b], cache=cache, on_layer=hook)
+                        break
+                    except Exception as e:
+                        sched = getattr(self, "scheduler", None)
+                        if not (
+                            _is_gpu_recovery(e)
+                            and attempt < _GPU_PREFILL_RETRIES
+                            and sched is not None
+                            and on_layer is None
+                            and LayerKind.LINEAR not in self.layer_types
+                            and all(hasattr(cl, "crop") for cl in cache.layers)
+                        ):
+                            raise
+                        for cl in cache.layers:
+                            cl.crop(ckpt)
+                        attempt += 1
+                        wait = sched.gpu_recovered()
+                        self.log(
+                            f"[prefill] transient GPU recovery at {a}/{T}: chunk rolled back to {ckpt}, "
+                            f"replay {attempt}/{_GPU_PREFILL_RETRIES} in {wait:.2f}s"
+                        )
+                        time.sleep(wait)
                 if b >= T:
                     break
                 self.log(f"[prefill] {b}/{T} (chunks of {C})")

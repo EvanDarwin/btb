@@ -278,6 +278,11 @@ class BatchScheduler:
     warn_fraction: float = 0.25
     # the drive probe's clock; a simulated drive's in the tests, the wall's when None
     _disk_clock: Callable[[], float] | None = None
+    # GPU backpressure: a transient Metal recovery (a discarded command buffer) is the card's own signal to ease
+    # off for a few cycles, the compute-side analogue of a saturated drive. The streak escalates the pause and a
+    # clean stretch forgets it.
+    _gpu_streak: int = 0
+    _gpu_cool_until: float = 0.0
 
     @staticmethod
     def growth_estimate(probe: Any, rows: int = 16) -> int:
@@ -374,6 +379,18 @@ class BatchScheduler:
         self.reserve: int | None = None  # the KV length reserved for it
         self._caches: dict[str, int] | None = None
         self.granted: dict[str, int] = {}  # bytes granted so far by kind and device ("kv@cuda"): the report's ledger
+
+    def gpu_recovered(self) -> float:
+        """Register a transient GPU recovery and return the seconds to pause before the retry: escalating with a
+        recent streak (0.1, 0.2, 0.4, ... capped at 2s), so a one-off blip costs about one pause and sustained
+        pressure backs off harder. A stretch of clean passes past the last cooldown clears the streak."""
+        now = time.monotonic()
+        if now > self._gpu_cool_until + 5.0:
+            self._gpu_streak = 0
+        self._gpu_streak += 1
+        wait = min(2.0, 0.1 * float(2 ** (self._gpu_streak - 1)))
+        self._gpu_cool_until = now + wait
+        return wait
 
     def caches(self) -> dict[str, int]:
         """The memory hierarchy's sizes, read once and held here: the card's L2, the most of it the driver
