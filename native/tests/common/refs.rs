@@ -298,7 +298,12 @@ pub fn pack_bf16(w: &[u16]) -> Packed {
     if code.len() % 2 == 1 {
         code.push(0);
     }
-    let hi4: Vec<u8> = code.chunks_exact(2).map(|p| p[0] | (p[1] << 4)).collect();
+    let hi4: Vec<u8> = code
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|p| p[0] | (p[1] << 4))
+        .collect();
     Packed {
         lo,
         hi4,
