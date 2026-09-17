@@ -639,8 +639,8 @@ def cmd_chat(a: argparse.Namespace) -> None:
 
 
 def cmd_bench(a: argparse.Namespace) -> None:
-    from . import device_name, peak_memory
-    from .sampling import GREEDY
+    from . import peak_memory
+    from .sampling import GREEDY, Sampling
 
     sm, _tok = _open(a)
     rows = [json.loads(l) for l in open(a.prompts, encoding="utf-8") if l.strip()]
@@ -650,6 +650,11 @@ def cmd_bench(a: argparse.Namespace) -> None:
         raise BadValue("rows", f"{a.prompts} has {len(rows)} rows (0..{len(rows) - 1})", ",".join(str(i) for i in bad))
     counts = list(a.new)
     spec = sm.v_max > 0
+    # both passes run at the cell's sampling (greedy unless --temperature was given), seeded so the baseline
+    # and the speculative pass agree token for token and `identical` stays meaningful at any temperature
+    samp = Sampling.from_request(
+        {f: getattr(a, f, None) for f in ("temperature", "top_p", "top_k", "seed")}, GREEDY
+    ).seeded()
     label = a.label or os.path.basename(os.path.normpath(a.path))
     cells = {}
     from .sysinfo import hard_page_faults, page_faults, process_read_bytes
@@ -665,18 +670,18 @@ def cmd_bench(a: argparse.Namespace) -> None:
                 m.append(time.perf_counter())
 
             t0 = time.perf_counter()
-            g, _ = sm.generate(ids, n_new, eos=(), speculate=False, on_token=mark, sampling=GREEDY)
+            g, _ = sm.generate(ids, n_new, eos=(), speculate=False, on_token=mark, sampling=samp)
             t1 = time.perf_counter()
             firsts.append(marks[0] - t0)
             tg = (t1 - marks[0]) / max(1, len(g) - 1)
             g_all.append(tg)
             line = f"[bench] {label} new={n_new} row {ri}: prompt {len(ids)}, first token {firsts[-1]:.2f}s, then {tg:.3f} s/token"
             if spec:
-                # timed as every engine's greedy row is: the first token from the prompt, the rate after it
+                # timed as every engine's baseline row is: the first token from the prompt, the rate after it
                 marks_s: list[float] = []
                 t0 = time.perf_counter()
                 o, c = sm.generate(
-                    ids, n_new, eos=(), on_token=lambda _t, m=marks_s: m.append(time.perf_counter()), sampling=GREEDY
+                    ids, n_new, eos=(), on_token=lambda _t, m=marks_s: m.append(time.perf_counter()), sampling=samp
                 )
                 t1 = time.perf_counter()
                 ts = (t1 - marks_s[0]) / max(1, len(o) - 1)
@@ -692,7 +697,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
         cell: Json = {
             "new": n_new,
             "first_s": sum(firsts) / k,
-            "greedy_s_tok": sum(g_all) / k,
+            "base_s_tok": sum(g_all) / k,
             "spec_s_tok": (sum(s_all) / k) if spec else None,
             "tokens_per_pass": (sum(tpp) / k) if spec else 1.0,
             "identical": f"{same}/{k}" if spec else "",
@@ -704,8 +709,8 @@ def cmd_bench(a: argparse.Namespace) -> None:
         }
         cells[n_new] = cell
         _p(
-            f"[bench] {label} new={n_new}: first token {cell['first_s']:.2f}s; greedy {cell['greedy_s_tok']:.3f} s/token "
-            f"= {1 / cell['greedy_s_tok']:.2f} tok/s"
+            f"[bench] {label} new={n_new}: first token {cell['first_s']:.2f}s; baseline {cell['base_s_tok']:.3f} s/token "
+            f"= {1 / cell['base_s_tok']:.2f} tok/s"
             + (
                 f"; speculative {cell['spec_s_tok']:.3f} s/token = {1 / cell['spec_s_tok']:.2f} tok/s, "
                 f"{cell['tokens_per_pass']:.2f} tokens/pass, identical {cell['identical']}"
@@ -731,9 +736,6 @@ def cmd_bench(a: argparse.Namespace) -> None:
                         "label": label,
                         "path": a.path,
                         "model": cache_repo_id(a.path) or os.path.basename(os.path.normpath(a.path)),
-                        "tool": None,
-                        "dtype": ((rep or {}).get("placement") or {}).get("compute_dtype"),
-                        "device": device_name(sm),
                         "report": rep,
                         "cells": list(cells.values()),
                     }

@@ -101,35 +101,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         tool.load()
         cells = bench(tool, prompts(a.prompts, a.rows or None), counts, a.budget)
-        device = tool.device()
     finally:
         tool.close()
     for c in cells:
         log(
-            f"{a.tool} new={c['new']}: first token {c['first_s']:.2f}s; {c['greedy_s_tok']:.3f} s/token = "
-            f"{1 / c['greedy_s_tok']:.2f} tok/s; peak RAM {c['peak_ram_gb']:.1f} GB, peak MLX {c['peak_vram_gb']:.1f} GB"
+            f"{a.tool} new={c['new']}: first token {c['first_s']:.2f}s; {c['base_s_tok']:.3f} s/token = "
+            f"{1 / c['base_s_tok']:.2f} tok/s; peak RAM {c['peak_ram_gb']:.1f} GB, peak MLX {c['peak_vram_gb']:.1f} GB"
         )
     from btb.hf import cache_repo_id  # after the rival has run: the checkout's btb is last on the path
 
     model = cache_repo_id(a.path) or os.path.basename(os.path.normpath(a.path))
-    # the device regime the flags forced, in btb's names (the matrix's column): mlx-lm's one regime, airllm's
-    # --device, llama-cpp's --n-gpu-layers
-    if a.tool == "mlx-lm":
-        regime = "mlx"
-    elif a.tool == "airllm":
-        regime = "gpu" if a.device == "cuda" else "cpu"
-    else:
-        regime = "cpu" if int(a.n_gpu_layers) == 0 else "gpu"
-    rec = BenchRecord(
-        label=a.label or a.tool,
-        path=a.path,
-        model=model,
-        device=device,
-        device_regime=regime,
-        tool=a.tool,
-        dtype="bf16",
-        cells=cells,
-    )
+    # the matrix owns the axes (tool and its regime are the cell's own); the record carries only the numbers
+    rec = BenchRecord(label=a.label or a.tool, path=a.path, model=model, cells=cells)
     with open(a.out, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec) + "\n")
     return 0

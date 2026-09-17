@@ -72,9 +72,10 @@ class BenchTool:
         self.opts = opts
 
     @classmethod
-    def cannot(cls, regime: str, model_type: str | None, cuda: bool) -> str | None:
+    def cannot(cls, regime: str, model_type: str | None, cuda: bool, gguf: bool) -> str | None:
         """
-        Why a regime is a planned skip for a model here (None: it runs)
+        Why a regime is a planned skip for this model here (None: it runs); `gguf` is set when the model is a
+        GGUF file, which only the engines that read that format can run
         """
         return None
 
@@ -110,6 +111,10 @@ class BenchMlxLm(BenchTool):
     name = "mlx-lm"
     module = "mlx_lm"
     regimes = (("mlx", ()),)  # unified memory, one regime
+
+    @classmethod
+    def cannot(cls, regime: str, model_type: str | None, cuda: bool, gguf: bool) -> str | None:
+        return "mlx-lm loads MLX or HF weights, not a GGUF" if gguf else None
 
     def load(self) -> None:
         from mlx_lm import load
@@ -149,7 +154,9 @@ class BenchAirLLM(BenchTool):
     regimes = (("gpu", ("--device", "cuda")), ("cpu", ("--device", "cpu")))
 
     @classmethod
-    def cannot(cls, regime: str, model_type: str | None, cuda: bool) -> str | None:
+    def cannot(cls, regime: str, model_type: str | None, cuda: bool, gguf: bool) -> str | None:
+        if gguf:
+            return "AirLLM loads an HF checkpoint, not a GGUF"
         if model_type == "gpt_oss":
             return "AirLLM's path dequantizes the MXFP4 experts (240 GB)"
         if regime == "gpu" and not cuda:
@@ -299,17 +306,22 @@ class BenchLlamaCpp(BenchTool):
         gguf_type = o.get("gguf_type") or "bf16"
         self.made = False
         gguf = o.get("gguf")
-        if gguf and os.path.exists(gguf):
-            self.gguf_path: str = gguf
+        if path.lower().endswith(".gguf"):
+            # the model already is a GGUF: run the file as it is, tokenizer and chat template off the file itself
+            self.gguf_path: str = path
+            self.hf_tok = AutoTokenizer.from_pretrained(os.path.dirname(path), gguf_file=os.path.basename(path))
         else:
-            base = os.path.basename(os.path.normpath(path))
-            gdir = o.get("gguf_dir") or scratch_dir("BTB_GGUF_DIR", r"F:\_ggufcache")
-            self.gguf_path = os.path.join(gdir, f"{base}.{gguf_type}.gguf")
-            if not os.path.exists(self.gguf_path):
-                convert_gguf(path, self.gguf_path, gguf_type, llama_cpp_dir, log)
-                self.made = True
+            if gguf and os.path.exists(gguf):
+                self.gguf_path = gguf
+            else:
+                base = os.path.basename(os.path.normpath(path))
+                gdir = o.get("gguf_dir") or scratch_dir("BTB_GGUF_DIR", r"F:\_ggufcache")
+                self.gguf_path = os.path.join(gdir, f"{base}.{gguf_type}.gguf")
+                if not os.path.exists(self.gguf_path):
+                    convert_gguf(path, self.gguf_path, gguf_type, llama_cpp_dir, log)
+                    self.made = True
+            self.hf_tok = AutoTokenizer.from_pretrained(path)
         self.llm: Any = None
-        self.hf_tok = AutoTokenizer.from_pretrained(path)
         self.ngl = int(o.get("ngl", -1))
         n_ctx = max(2048, 1024 + int(o.get("max_new", 1024)) + 256)
         self.vram_base = gpu_used_gb()
@@ -393,7 +405,7 @@ def bench(tool: BenchTool, prompts: Sequence[str], counts: Sequence[int], budget
             BenchCell(
                 new=n,
                 first_s=sum(firsts) / k,
-                greedy_s_tok=sum(rates) / k,
+                base_s_tok=sum(rates) / k,
                 spec_s_tok=None,
                 tokens_per_pass=1.0,
                 identical="",

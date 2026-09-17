@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
-"""The benchmark matrix: every device configuration this machine can run against every complete model on it, one `btb bench` process per cell, a table and a JSON file at the end. See --help."""
+"""The benchmark matrix: the cross-product of the axes (device, dtype, pack-12, sampling, mega, tool) this machine can run against every complete model on it, one `btb bench` process per cell, a table and a JSON file at the end. Select with --only / --not / --config; see --help."""
 
 from __future__ import annotations
 
@@ -18,29 +18,30 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib import COMPARE_PY, QUESTIONS, RESULTS, git_commit, say
 from lib.env import ensure_compare_env
 from lib.host import host_specs
-from lib.plan import CONFIGS, chosen_configs, machine_configs, pick_models, plan_cells, resume_cells
-from lib.records import BenchGuard, BenchRunDoc
+from lib.plan import (
+    axes_manifest,
+    machine_devices,
+    machine_tools,
+    parse_selection,
+    pick_models,
+    plan_cells,
+    resume_cells,
+)
+from lib.records import BenchGuard, BenchRunDoc, BenchStatus
 from lib.run import run_cell
-from lib.table import cell_line, specs_line, tables
-from lib.tools import TOOLS
+from lib.table import cell_label, cell_line, specs_line, tables
+
+_KINDS = "a device (cpu, cpu+gpu, gpu, cpu+mlx, mlx), a dtype (bf16, fp32), pack12/nopack12, mega/nomega, a tool (btb, mlx-lm, airllm, llama-cpp), greedy, t<T> (e.g. t0.7), or axis=value (the only form for model=GLOB)"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument(
-        "--devices",
-        default=None,
-        metavar="LIST",
-        help="device configurations to run, comma-separated, from: "
-        + ", ".join(CONFIGS)
-        + " (default: every one this machine can run, in that order)",
-    )
-    ap.add_argument(
         "--models",
         default=None,
         metavar="LIST",
-        help="models to run, comma-separated: names from the cache (see `btb serve` / `/v1/models`), "
-        "repo ids, or model directories (default: every complete model in the cache)",
+        help="models to run, comma-separated: names from the cache (see `btb serve` / `/v1/models`), repo ids, "
+        "local paths, or a glob over the cache names/repo ids (qwen3-*, *4b*); default: every complete model",
     )
     ap.add_argument(
         "--filter",
@@ -50,7 +51,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="keep the cached models whose name or repo id matches (repeatable; any match keeps)",
     )
     ap.add_argument(
-        "--fp32", action="store_true", help="also time every bf16 cell in float32 arithmetic over the bf16 weights"
+        "--exclude-models",
+        action="append",
+        default=[],
+        metavar="GLOB",
+        help="drop models matching these globs over the name/repo id (comma-separated, repeatable)",
+    )
+    ap.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="KINDS",
+        help="keep only cells whose axis carries one of these kinds (repeatable, comma-separated): " + _KINDS,
+    )
+    ap.add_argument(
+        "--not",
+        dest="nots",
+        action="append",
+        default=[],
+        metavar="KINDS",
+        help="drop cells carrying one of these kinds (same vocabulary as --only); applied after --only",
+    )
+    ap.add_argument(
+        "--config",
+        action="append",
+        default=[],
+        metavar="A+B+...",
+        help="run exactly this combination, kinds joined by + (mlx+fp32+nomega); repeatable, the plan is their "
+        "union - unnamed axes stay free",
     )
     ap.add_argument(
         "--new", default="64,256,1024", metavar="N,N,...", help="answer lengths to time (default: 64,256,1024)"
@@ -96,6 +124,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="kill a cell when the results' volume has less than this free (default 8 GB)",
     )
     ap.add_argument("--markdown", action="store_true", help="also print the table in the README's markdown shape")
+    ap.add_argument("--strict", action="store_true", help="treat any skipped cell as a failure (exit non-zero); for CI")
     ap.add_argument(
         "--compare-python",
         default=COMPARE_PY,
@@ -128,19 +157,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         tables(doc["cells"], ",".join(str(n) for n in doc["new"]), a.markdown)
         return 0
 
-    # the comparison environment is looked at only when a comparison row could run: every configuration (the
-    # default), or one named
-    wants_compare = a.devices is None or any(c.strip() in TOOLS for c in a.devices.split(","))
+    allow, deny, points = parse_selection(a.only, a.nots, a.config, ap.error)
+    # the comparison environment is looked at (and its prompt shown) only when a comparison row could run: a
+    # selection pinned to btb alone wants none
+    tool_only = allow.get("tool", set()) | {p["tool"] for p in points if "tool" in p}
+    wants_compare = not (tool_only and tool_only <= {"btb"})
     compare_py = ensure_compare_env(a.compare_python, ask=not a.dry_run) if wants_compare else None
-    configs = chosen_configs(a.devices, machine_configs(compare_py), ap.error)
+    devices = machine_devices()
+    tools = machine_tools(compare_py) if wants_compare else []
     names = [n.strip() for n in a.models.split(",") if n.strip()] if a.models else []
-    entries = pick_models(names, a.filter)
+    entries = pick_models(names, a.filter, a.exclude_models)
     if not entries:
         say("no models to run (nothing complete in the Hugging Face cache matched)")
         return 1
     specs = host_specs()
     new = [int(x) for x in a.new.split(",") if x.strip()]
-    cells = plan_cells(entries, configs, a.fp32)
+    cells = plan_cells(entries, devices, tools, allow, deny, points)
+    if not cells:
+        say("no cells to run (the selection matched nothing on this machine)")
+        return 1
     if a.resume:
         resume_cells(cells, json.load(open(a.resume, encoding="utf-8")), new, a.resume)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M")
@@ -148,20 +183,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     logdir = a.logs or os.path.join(os.path.dirname(os.path.abspath(out)), "logs-" + os.path.basename(out)[:-5])
     say(specs_line(specs))
     say(
-        f"btb {git_commit()}; {len(entries)} model(s) x {', '.join(configs)}{' (+ fp32)' if a.fp32 else ''}: "
-        f"{sum(1 for c in cells if not c['skip'] and not c.get('resumed'))} cells to run, "
-        f"{sum(1 for c in cells if c['skip'])} skipped, {sum(1 for c in cells if c.get('resumed'))} reused; "
-        f"answers of {a.new} tokens"
+        f"btb {git_commit()}; {len(entries)} model(s) x {', '.join(devices)}"
+        f"{' + ' + ', '.join(tools) if tools else ''}: "
+        f"{sum(1 for c in cells if not c.get('status') and not c.get('resumed'))} cells to run, "
+        f"{sum(1 for c in cells if c.get('status') == BenchStatus.DNR)} not run, "
+        f"{sum(1 for c in cells if c.get('resumed'))} reused; answers of {a.new} tokens"
     )
     for c in cells:
         what = (
-            f"skipped: {c['skip']}"
-            if c["skip"]
+            f"DNR: {c.get('reason')}"
+            if c.get("status") == BenchStatus.DNR
             else "reused from the earlier run"
             if c.get("resumed")
             else " ".join(c["args"])
         )
-        say(f"  {c['model']:<24} {c['config']:<8} {c['dtype']:<5} {what}")
+        say(f"  {c['model']:<24} {cell_label(c):<18} {c['dtype']:<5} {what}")
     if a.dry_run:
         return 0
     os.makedirs(logdir, exist_ok=True)
@@ -177,19 +213,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             "new": new,
             "prompts": os.path.abspath(a.prompts),
             "rows": a.rows or "all",
-            "configs": configs,
+            "axes": axes_manifest(cells),
             "cells": cells,
         }
         with open(out, "w", encoding="utf-8") as f:
             json.dump(doc, f, indent=1, ensure_ascii=False)
 
     for i, c in enumerate(cells):
-        if c["skip"]:
-            c["status"] = "skipped"
+        if c.get("resumed") or c.get("status") == BenchStatus.DNR:  # reused, or ruled out at planning
             continue
-        if c.get("resumed"):
-            continue
-        say(f"[{i + 1}/{len(cells)}] {c['model']} {c['config']} {c['dtype']} ...")
+        say(f"[{i + 1}/{len(cells)}] {c['model']} {cell_label(c)} {c['dtype']} ...")
         run_cell(
             c,
             a.prompts,
@@ -210,7 +243,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         save()
     tables(cells, a.new, a.markdown)
     say(out)
-    return 0 if all(c.get("status") in ("ok", "skipped") for c in cells) else 1
+    # OOM / DNF / DNR are valid recorded outcomes, so a plain run reports them and still succeeds; --strict
+    # (for CI) turns any cell that produced no numbers into a non-zero exit
+    incomplete = [c for c in cells if c.get("status") and c.get("status") != BenchStatus.OK]
+    if a.strict and incomplete:
+        say(f"strict: {len(incomplete)} cell(s) did not produce numbers")
+    return 1 if (a.strict and incomplete) else 0
 
 
 if __name__ == "__main__":
