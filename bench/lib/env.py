@@ -12,8 +12,29 @@ import re
 import subprocess
 import sys
 
-from lib import REQUIREMENTS, capture, say
+from lib import REQUIREMENTS, ROOT, capture, say
 from lib.tools import TOOLS
+
+# the HF architecture names in a --print-supported-models dump; llama.cpp registers them as `...ForCausalLM`,
+# `...ForConditionalGeneration`, or a bare `...Model`
+_ARCH = re.compile(r"\b[A-Z][A-Za-z0-9_]*(?:ForCausalLM|ForConditionalGeneration|Model)\b")
+
+
+def llama_cpp_supported(compare_py: str | None) -> frozenset[str] | None:
+    """The HF architectures llama.cpp's converter can turn into a GGUF, read once from a checkout's
+    `--print-supported-models` (its registry, printed through logging on stderr). None when no checkout is
+    found or it cannot be asked - the planner then cannot judge support and only says a GGUF is needed. The
+    checkout is $LLAMA_CPP_DIR or ./llama.cpp, matching where convert_gguf and prepare.py put it."""
+    conv = os.path.join(os.environ.get("LLAMA_CPP_DIR") or os.path.join(ROOT, "llama.cpp"), "convert_hf_to_gguf.py")
+    if not compare_py or not os.path.isfile(conv):
+        return None
+    try:
+        r = subprocess.run(
+            [compare_py, conv, "--print-supported-models"], capture_output=True, text=True, timeout=180, check=False
+        )
+    except Exception:
+        return None
+    return frozenset(_ARCH.findall((r.stdout or "") + (r.stderr or ""))) or None
 
 
 def compare_tools(py: str | None) -> list[str]:

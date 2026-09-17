@@ -138,7 +138,8 @@ def _variant(cell: BenchMatrixCell) -> str:
     """The off-default axes as prose, the way an old cell's `variant` named a setup: the megakernel turned off
     where it would apply, and a sampling temperature. Empty for the default (greedy, the megakernel on)."""
     bits: list[str] = []
-    if not cell.get("mega") and mega_capable(cell.get("device") or "", cell.get("dtype") or "", cell.get("type")):
+    # the megakernel is btb's own MLX path; a rival has no such thing, so the variant is meaningless there
+    if not cell.get("tool") and not cell.get("mega") and mega_capable(cell.get("device") or "", cell.get("dtype") or "", cell.get("type")):
         bits.append("no megakernel")
     samp = cell.get("sampling") or "greedy"
     if samp != "greedy":
@@ -158,10 +159,12 @@ def _rows(cell: BenchMatrixCell, when: str) -> list[Row]:
     variant = _variant(cell)
     device = " + ".join(p.upper() for p in str(cell.get("device") or "").split("+"))
     status = cell.get("status")
-    # a cell that was launched (it has a wall time) but produced no numbers gets a labeled note row for what
-    # went wrong; a planning-stage skip never ran, so it is not charted at all
+    # a cell that was launched (it has a wall time) but produced no numbers gets a labeled note row: the state
+    # and the reason it carries. A planning-stage skip never ran, so it is not charted at all
     if status in (BenchStatus.OOM, BenchStatus.DNF, BenchStatus.DNR) and cell.get("seconds") is not None:
-        return [Row(model, engine, device, dtype, packed, variant, dtype, [], [], None, 0.0, 0.0, str(status).upper(), when)]
+        why = str(cell.get("reason") or "")
+        note = f"{str(status).upper()}: {why}" if why else str(status).upper()
+        return [Row(model, engine, device, dtype, packed, variant, dtype, [], [], None, 0.0, 0.0, note, when)]
     cs: list[BenchCell] = sorted(cell.get("cells") or [], key=lambda c: c.get("new", 0))
     if status != BenchStatus.OK or not cs:
         return []
@@ -296,7 +299,8 @@ def chart(model: str, machine: Machine, rows: Sequence[Row]) -> str:
         for i, ln in enumerate(_wrap(r.how, 26, 2)):
             g.append(f'<text x="{PAD}" y="{y + 34 + i * 15}" font-size="13" fill="{MUTED}">{escape(ln)}</text>')
         if not r.speeds:
-            g.append(f'<text x="{BARS_X}" y="{y + 14}" font-size="14" font-style="italic" fill="{MUTED}">{escape(r.note)}</text>')
+            for i, ln in enumerate(_wrap(r.note, 74, 2)):
+                g.append(f'<text x="{BARS_X}" y="{y + 14 + i * 16}" font-size="13" font-style="italic" fill="{MUTED}">{escape(ln)}</text>')
             body.append("".join(g))
             y += 46
             continue

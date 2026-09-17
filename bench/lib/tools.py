@@ -72,10 +72,19 @@ class BenchTool:
         self.opts = opts
 
     @classmethod
-    def cannot(cls, regime: str, model_type: str | None, cuda: bool, gguf: bool) -> str | None:
+    def cannot(
+        cls,
+        regime: str,
+        model_type: str | None,
+        cuda: bool,
+        gguf: bool,
+        arch: str | None = None,
+        supported: frozenset[str] | None = None,
+    ) -> str | None:
         """
-        Why a regime is a planned skip for this model here (None: it runs); `gguf` is set when the model is a
-        GGUF file, which only the engines that read that format can run
+        Why a regime is a planned skip for this model here (None: it runs). `gguf` marks a GGUF file (only the
+        engines that read it run); `arch` is the checkpoint's architectures[0] and `supported` llama.cpp's
+        convertible set, both read by the tools that need them
         """
         return None
 
@@ -113,7 +122,15 @@ class BenchMlxLm(BenchTool):
     regimes = (("mlx", ()),)  # unified memory, one regime
 
     @classmethod
-    def cannot(cls, regime: str, model_type: str | None, cuda: bool, gguf: bool) -> str | None:
+    def cannot(
+        cls,
+        regime: str,
+        model_type: str | None,
+        cuda: bool,
+        gguf: bool,
+        arch: str | None = None,
+        supported: frozenset[str] | None = None,
+    ) -> str | None:
         return "mlx-lm loads MLX or HF weights, not a GGUF" if gguf else None
 
     def load(self) -> None:
@@ -154,7 +171,15 @@ class BenchAirLLM(BenchTool):
     regimes = (("gpu", ("--device", "cuda")), ("cpu", ("--device", "cpu")))
 
     @classmethod
-    def cannot(cls, regime: str, model_type: str | None, cuda: bool, gguf: bool) -> str | None:
+    def cannot(
+        cls,
+        regime: str,
+        model_type: str | None,
+        cuda: bool,
+        gguf: bool,
+        arch: str | None = None,
+        supported: frozenset[str] | None = None,
+    ) -> str | None:
         if gguf:
             return "AirLLM loads an HF checkpoint, not a GGUF"
         if model_type == "gpt_oss":
@@ -293,6 +318,28 @@ class BenchLlamaCpp(BenchTool):
     name = "llama-cpp"
     module = "llama_cpp"
     regimes = (("gpu", ("--n-gpu-layers", "-1")), ("cpu", ("--n-gpu-layers", "0")))
+
+    @classmethod
+    def cannot(
+        cls,
+        regime: str,
+        model_type: str | None,
+        cuda: bool,
+        gguf: bool,
+        arch: str | None = None,
+        supported: frozenset[str] | None = None,
+    ) -> str | None:
+        # llama.cpp's runtime loads a GGUF; a checkpoint runs only once converted, and only when its
+        # architecture is one the converter knows. The matrix never converts on its own, so a checkpoint is
+        # always a skip - but the reason tells the truth: convertible, an arch the converter lacks, or (no
+        # checkout to ask) simply that a GGUF is needed
+        if gguf:
+            return None
+        if supported is None:
+            return "llama.cpp needs a GGUF; run bench/prepare.py, then convert this checkpoint"
+        if arch and arch in supported:
+            return f"llama.cpp converts {arch}, but not on its own - run bench/prepare.py, then convert it to a GGUF"
+        return f"llama.cpp's converter has no entry for {arch or 'this architecture'}"
 
     def load(self) -> None:
         add_cuda_dll_dirs()

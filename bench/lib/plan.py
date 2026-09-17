@@ -15,9 +15,9 @@ from typing import Any, cast
 
 import torch
 
-from btb.hf import ModelEntry, ModelInfo, is_gguf, model_info
+from btb.hf import ModelEntry, ModelInfo, _config, is_gguf, model_info
 from lib import say
-from lib.env import compare_tools
+from lib.env import compare_tools, llama_cpp_supported
 from lib.records import Axes, BenchDevice, BenchDtype, BenchMatrixCell, BenchRunDoc, BenchStatus
 from lib.tools import TOOLS
 
@@ -320,15 +320,25 @@ def _btb_cell(
     return cell
 
 
-def compare_cells(e: ModelEntry, tool: str) -> list[BenchMatrixCell]:
+def _arch(e: ModelEntry) -> str | None:
+    """The checkpoint's architectures[0] (`Qwen3ForCausalLM`, ...), which llama.cpp keys its converter on;
+    None for a GGUF or a model without a config."""
+    c = _config(e["path"])
+    archs = (c or {}).get("architectures") or []
+    return str(archs[0]) if archs else None
+
+
+def compare_cells(e: ModelEntry, tool: str, supported: frozenset[str] | None) -> list[BenchMatrixCell]:
     """
     A comparison tool runs in the same device regimes btb does, each forced through the tool's own flags
     (`BenchTool.regimes`). Its `device` axis is that regime in btb's names; a regime it cannot honestly hold
-    (a model past the card, everything forced onto the card) carries the gate note rather than a silent drop.
+    (no CUDA, a GGUF a rival cannot read, an architecture llama.cpp's converter lacks) carries the gate note
+    rather than a silent drop. `supported` is llama.cpp's convertible-architecture set (None when unknown).
     """
     spec = TOOLS[tool]
     cuda = torch.cuda.is_available()
     gguf = is_gguf(e["path"])
+    arch = None if gguf else _arch(e)
     cells = []
     for regime, flags in spec.regimes:
         cell = base_cell(e)
@@ -343,7 +353,7 @@ def compare_cells(e: ModelEntry, tool: str) -> list[BenchMatrixCell]:
                 args=["--tool", tool, *flags],
             )
         )
-        if r := spec.cannot(regime, e["type"], cuda, gguf):
+        if r := spec.cannot(regime, e["type"], cuda, gguf, arch, supported):
             cell["status"] = BenchStatus.DNR
             cell["reason"] = r
         cells.append(cell)
@@ -357,13 +367,17 @@ def plan_cells(
     allow: Kinds,
     deny: Kinds,
     points: Sequence[Point],
+    compare_py: str | None = None,
 ) -> list[BenchMatrixCell]:
     """
     Every cell of the cross-product the selection asks for, each with its `btb bench` arguments or the reason
     a gate skips it. `devices`/`tools` are what the machine has; `allow` (--only) and `points` (--config)
-    widen or narrow each axis, `deny` (--not) subtracts, then the gates mark what cannot run.
+    widen or narrow each axis, `deny` (--not) subtracts, then the gates mark what cannot run. `compare_py`
+    reads llama.cpp's convertible-architecture set once, so a checkpoint's llama.cpp cell says whether the
+    converter knows its architecture rather than only that a GGUF is needed.
     """
     want_btb = "btb" in allow["tool"] if allow.get("tool") else True
+    supported = llama_cpp_supported(compare_py) if "llama-cpp" in tools else None
     cells: list[BenchMatrixCell] = []
     for e in entries:
         if want_btb:
@@ -390,7 +404,7 @@ def plan_cells(
         for tool in tools:
             if allow.get("tool") and tool not in allow["tool"]:
                 continue
-            for c in compare_cells(e, tool):
+            for c in compare_cells(e, tool, supported):
                 if not _denied(c, deny) and _in_points(c, points):
                     cells.append(c)
     return cells

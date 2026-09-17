@@ -172,7 +172,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     specs = host_specs()
     new = [int(x) for x in a.new.split(",") if x.strip()]
-    cells = plan_cells(entries, devices, tools, allow, deny, points)
+    cells = plan_cells(entries, devices, tools, allow, deny, points, compare_py=compare_py)
     if not cells:
         say("no cells to run (the selection matched nothing on this machine)")
         return 1

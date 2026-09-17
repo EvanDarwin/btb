@@ -141,11 +141,16 @@ def test_matrix_gives_a_comparison_tool_a_cell_per_device_regime(monkeypatch: Mo
     cells = plan.plan_cells([big], [BD.CPU], ["mlx-lm", "airllm", "llama-cpp"], {}, {}, [])
     by = {table.cell_label(c): c for c in cells}
     assert set(by) == {"cpu", "mlx-lm", "airllm-gpu", "airllm-cpu", "llama-cpp-gpu", "llama-cpp-cpu"}
-    assert all(c.get("status") is None for c in cells), "every regime runs here; none is a planned skip"
     assert by["airllm-gpu"]["args"] == ["--tool", "airllm", "--device", "cuda"]
     assert by["airllm-cpu"]["args"] == ["--tool", "airllm", "--device", "cpu"]
     assert by["llama-cpp-cpu"]["args"] == ["--tool", "llama-cpp", "--n-gpu-layers", "0"]
     assert by["mlx-lm"]["tool"] == "mlx-lm" and not by["cpu"].get("tool")
+    # a safetensors checkpoint: the streaming rivals run at any size (cuda is up in this block), but llama.cpp
+    # needs a GGUF, so it is a planned skip here rather than a silent conversion
+    assert by["mlx-lm"].get("status") is None and by["airllm-gpu"].get("status") is None
+    assert by["airllm-cpu"].get("status") is None
+    assert by["llama-cpp-gpu"]["status"] is BS.DNR and "GGUF" in by["llama-cpp-gpu"]["reason"]
+    assert by["llama-cpp-cpu"]["status"] is BS.DNR and "GGUF" in by["llama-cpp-cpu"]["reason"]
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     by = {table.cell_label(c): c for c in plan.plan_cells([big], [], ["airllm"], {}, {}, [])}
     assert by["airllm-gpu"]["status"] is BS.DNR and "no CUDA" in by["airllm-gpu"]["reason"]
@@ -343,6 +348,25 @@ def test_matrix_checks_the_comparison_environment_against_its_requirements(tmp_p
     assert env.marker_holds("python_version >= '3'"), "an unknown marker is taken as holding"
 
 
+def test_llama_cpp_supported_reads_the_converter_registry(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    """llama.cpp's convertible-architecture set, read from a checkout's --print-supported-models (which logs
+    the names to stderr): None without an interpreter or a checkout, the arch names parsed out otherwise."""
+    env = _bench("env")
+    monkeypatch.setenv("LLAMA_CPP_DIR", str(tmp_path))
+    assert env.llama_cpp_supported(None) is None, "no interpreter, nothing to ask"
+    assert env.llama_cpp_supported("/venv/python") is None, "no convert_hf_to_gguf.py in the checkout"
+    (tmp_path / "convert_hf_to_gguf.py").write_text("", encoding="utf-8")
+
+    class _Done:
+        stdout = ""
+        stderr = "INFO:hf-to-gguf:Qwen3ForCausalLM\nGemma3ForConditionalGeneration\nLlamaForCausalLM\n"
+
+    monkeypatch.setattr(env.subprocess, "run", lambda *a, **k: _Done())
+    assert env.llama_cpp_supported("/venv/python") == frozenset(
+        {"Qwen3ForCausalLM", "Gemma3ForConditionalGeneration", "LlamaForCausalLM"}
+    )
+
+
 def test_every_tool_speaks_the_one_signature_and_says_what_the_matrix_plans_for_it() -> None:
     """each rival class fills the whole signature itself, names the module its environment is probed for and
     its device regimes with the flags that force them; the matrix's configuration list ends with the same
@@ -357,14 +381,21 @@ def test_every_tool_speaks_the_one_signature_and_says_what_the_matrix_plans_for_
             assert regime in ("gpu", "cpu", "mlx") and isinstance(flags, tuple), name
         cls("/nowhere", lambda s: None).close()
     assert plan.TOOL_NAMES == tuple(tools.TOOLS)
-    assert tools.TOOLS["llama-cpp"].cannot("gpu", "qwen3", cuda=False, gguf=False) is None
     assert "CUDA" in tools.TOOLS["airllm"].cannot("gpu", "qwen3", cuda=False, gguf=False)
     assert tools.TOOLS["airllm"].cannot("cpu", "qwen3", cuda=False, gguf=False) is None
     assert "MXFP4" in tools.TOOLS["airllm"].cannot("cpu", "gpt_oss", cuda=True, gguf=False)
-    # a GGUF: only llama.cpp reads it; mlx-lm and airllm load HF/MLX weights, so they are planned skips
-    assert tools.TOOLS["llama-cpp"].cannot("gpu", "qwen3", cuda=False, gguf=True) is None
+    # a GGUF: only llama.cpp reads it directly; mlx-lm and airllm load HF/MLX weights, so they are planned skips
     assert "GGUF" in tools.TOOLS["mlx-lm"].cannot("mlx", "qwen3", cuda=False, gguf=True)
     assert "GGUF" in tools.TOOLS["airllm"].cannot("cpu", "qwen3", cuda=False, gguf=True)
+    # llama.cpp is the mirror: a GGUF runs; a checkpoint is a skip whose reason depends on the converter's
+    # registry - convertible when it knows the arch, unsupported when it does not, "needs a GGUF" when there
+    # is no checkout to ask
+    lc = tools.TOOLS["llama-cpp"]
+    assert lc.cannot("gpu", "qwen3", cuda=False, gguf=True) is None
+    assert "GGUF" in lc.cannot("gpu", "qwen3", cuda=False, gguf=False)
+    reg = frozenset({"Qwen3ForCausalLM"})
+    assert "converts Qwen3ForCausalLM" in lc.cannot("gpu", "qwen3", cuda=False, gguf=False, arch="Qwen3ForCausalLM", supported=reg)
+    assert "no entry" in lc.cannot("gpu", "x", cuda=False, gguf=False, arch="WeirdForCausalLM", supported=reg)
 
 
 def test_the_timing_loop_measures_first_token_and_rate_and_keeps_the_budget(monkeypatch: MonkeyPatch) -> None:
@@ -728,9 +759,12 @@ def test_charts_draw_one_svg_per_model_from_the_run_docs(tmp_path: Path) -> None
     assert [(r.engine, r.device, r.variant, r.note) for r in a] == [
         ("btb", "MLX", "", ""),
         ("btb", "MLX", "no megakernel", ""),  # a nomega cell is its own row, the off-default axis its variant
-        ("AirLLM", "CPU", "", "DNR"),  # the older failure dropped, its state shown, the reason (a log tail) never
+        ("AirLLM", "CPU", "", "DNR: Boom: new"),  # the older failure dropped; the state and its reason are shown
         ("llama.cpp", "GPU", "", ""),
     ]
+    # the megakernel variant is btb's own MLX path; a rival on MLX never carries a "no megakernel" note
+    assert charts._variant({"tool": None, "device": BD.MLX, "dtype": BT.BF16, "type": "qwen3", "mega": False}) == "no megakernel"
+    assert charts._variant({"tool": "mlx-lm", "device": BD.MLX, "dtype": BT.BF16, "type": "qwen3", "mega": False}) == ""
     assert a[0].speeds == [10.0, 10.0, 10.0]  # as it runs: the newer run's 0.1 s/token, not the older run's 0.2
     assert a[0].how == "bf16, 2 layers on the GPU" and a[0].per_pass == [1.2, 1.2, 1.2]
     assert a[1].how == "bf16, 2 layers on the GPU, no megakernel" and a[1].speeds == [2.0, 2.0, 2.0]
@@ -744,5 +778,5 @@ def test_charts_draw_one_svg_per_model_from_the_run_docs(tmp_path: Path) -> None
     # the dark ground rect, the legend panel + its 3 engine swatches, then 3 data rows of a track and a bar per
     # length; the DNR note row draws none
     assert svg.count("<rect") == 1 + 1 + 3 + 3 * 6
-    assert "DNR" in svg and "Boom" not in svg  # the state is drawn, the reason (a log tail) never
+    assert "DNR: Boom: new" in svg  # the note row draws the state and its reason
     assert "MLX <tspan" in svg and "9.0 GB" in svg  # the MLX peak: a muted label with an inked value
