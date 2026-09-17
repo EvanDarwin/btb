@@ -200,6 +200,14 @@ def load(
     options.check_layers(c, L)
     dev = resolve_device(device)
     fp32 = bool(int(c.get("fp32", 0)))
+    if dev.kind is Device.MLX and fp32:
+        # MLX has no fp32 path - its registers are too narrow, and bf16 already saturates them; refuse it here
+        # rather than let the KV cache reshape blow up mid-load
+        raise options.BadValue(
+            "fp32",
+            f"MLX runs bf16 only; --device {Device.CPU} for the fp32 tier, or --device {Device.CUDA} for a card",
+            c.get("fp32"),
+        )
     if dev.kind is Device.CPU and not fp32 and kw.get("fp32") is None:
         # the CPU computes in float32 over the bf16 weights either way (no native bf16 matmul), so fp32
         # is the default there unless the caller asks for bf16 activations outright
