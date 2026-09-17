@@ -148,7 +148,8 @@ jobs:
             fatbin: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Trust the checkout (the manylinux container runs as a different uid than the mounted workspace,
+      - name:
+          Trust the checkout (the manylinux container runs as a different uid than the mounted workspace,
           so git refuses it and setuptools-scm's file finder fails during the build)
         if: matrix.container != ''
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -248,9 +249,12 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
+  # attest + publish only when classify said this ref may publish (a valid tag, or a manual run). Every job
+  # here pulls only the dist-* artifacts (the wheels and the sdist), never the fatbin build artifact, so only
+  # publishable files reach the attestation and the upload.
   attest:
     needs: [classify, wheel, sdist]
-    if: false
+    if: needs.classify.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -270,7 +274,7 @@ jobs:
   # a pre-release tag (vX.Y.ZrcN / aN / bN / .devN) and every manual run land on TestPyPI. skip-existing keeps a
   # re-run of the same version from failing (a manual run with no tag builds the fallback version each time).
   publish-testpypi:
-    needs: [classify, wheel, sdist]
+    needs: [classify, attest]
     if: needs.classify.outputs.prerelease == 'true'
     runs-on: ubuntu-latest
     environment: testpypi
@@ -282,18 +286,17 @@ jobs:
           path: dist
           pattern: "dist-*"
           merge-multiple: true
-      - name: Publish to TestPyPI
+      - name: Publish to TestPyPI (also attaches PEP 740 attestations)
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           repository-url: https://test.pypi.org/legacy/
           skip-existing: true
-          attestations: false
 
   # a final tag (vX.Y.Z, no pre-release suffix) lands on real PyPI. The `pypi` environment carries a required
   # reviewer, so this job waits for a human to approve before the irreversible upload; no skip-existing, so a
   # duplicate version fails loudly.
   publish-pypi:
-    needs: [classify, wheel, sdist]
+    needs: [classify, attest]
     if: needs.classify.outputs.final == 'true'
     runs-on: ubuntu-latest
     environment: pypi
@@ -305,7 +308,5 @@ jobs:
           path: dist
           pattern: "dist-*"
           merge-multiple: true
-      - name: Publish to PyPI
+      - name: Publish to PyPI (also attaches PEP 740 attestations)
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
-        with:
-          attestations: false
