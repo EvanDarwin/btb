@@ -301,6 +301,9 @@ class StreamedTextModel(
         self.cold_slots = int(cold_slots)
         self._mega = None
         self._mlx_attn_slope = None
+        self.tail_draft = None
+        self._tail_h = None
+        self._tail_ids = []
         self.cold_chunk = int(cold_chunk_mb) << 20
         self.cold_ring = ColdRing()
         self.host = {}

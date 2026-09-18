@@ -172,7 +172,12 @@ class _StubEngine(_GenerateMixin):
         return out
 
     def _prefill(
-        self, ids: torch.Tensor, cache: Any, on_layer: Any = None, attention_mask: torch.Tensor | None = None
+        self,
+        ids: torch.Tensor,
+        cache: Any,
+        on_layer: Any = None,
+        attention_mask: torch.Tensor | None = None,
+        tap: int | None = None,
     ) -> torch.Tensor:
         ids = torch.as_tensor(ids, dtype=torch.long)
         B, T = int(ids.shape[0]), int(ids.shape[1])

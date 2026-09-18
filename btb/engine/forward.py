@@ -146,15 +146,19 @@ class _ForwardMixin(_State):
         positions: Any = None,
         head: bool = True,
         pick: Any = None,
+        tap: int | None = None,
     ) -> torch.Tensor | None:
         """`pick` (True: greedy; a Sampling: its draw, keyed by each row's cache position): the fused MLX path
         returns [B, T] int32 token ids picked in the graph instead of logits; the other paths ignore it and
-        return logits, so a caller checks the dtype."""
+        return logits, so a caller checks the dtype. `tap` keeps the rows' residual after that layer for the
+        tail drafter (the fused MLX path; the megakernel cannot)."""
         pick = as_pick(pick)
         ids = torch.as_tensor(ids, dtype=torch.long, device=self.dev)
         if ids.dim() == 1:
             ids = ids.view(1, -1)
         B, T = ids.shape
+        if tap is not None:
+            self._tail_ids = ids[0].tolist()
         if self.mlx is not None and cache is not None:
             self._mlx_flush_states(cache)
         past = cache.get_seq_length() if cache is not None else 0
@@ -169,6 +173,7 @@ class _ForwardMixin(_State):
             and not own
             and B == 1
             and n_layers == self.L
+            and tap is None
             and self._mega_ok(cache, T, on_layer, head, pick, positions)
         ):
             return self._forward_mega(ids[0].tolist(), cache, T, pick)
@@ -178,7 +183,7 @@ class _ForwardMixin(_State):
             hm = self._mlx_embed_rows(m.array(ids[0].tolist(), dtype=m.int32))
             if self.compute_dtype is not None and self.compute_dtype != torch.bfloat16:
                 hm = hm.astype(m.float32)
-            return self._forward_mlx(None, None, cache, on_layer, last_only, head, n_layers, hm=hm, pick=pick)
+            return self._forward_mlx(None, None, cache, on_layer, last_only, head, n_layers, hm=hm, pick=pick, tap=tap)
         h = self.embed(ids)
         if self.compute_dtype is not None:
             h = h.to(self.compute_dtype)
@@ -627,7 +632,12 @@ class _ForwardMixin(_State):
         return int(rows)
 
     def _prefill(
-        self, ids: torch.Tensor, cache: Any, on_layer: Any = None, attention_mask: torch.Tensor | None = None
+        self,
+        ids: torch.Tensor,
+        cache: Any,
+        on_layer: Any = None,
+        attention_mask: torch.Tensor | None = None,
+        tap: int | None = None,
     ) -> Any:
         ids = torch.as_tensor(ids, dtype=torch.long, device=self.dev)
         if ids.dim() == 1:
@@ -636,11 +646,11 @@ class _ForwardMixin(_State):
         # the host path's DeltaNet takes a prompt whole; the MLX path continues a chunk from the stored states
         whole_hybrid = LayerKind.LINEAR in self.layer_types and not self.fam.own and self.mlx is None
         if cache is None or attention_mask is not None or getattr(self, "aq", False) or whole_hybrid:
-            return self.forward(ids, cache=cache, on_layer=on_layer, attention_mask=attention_mask)
+            return self.forward(ids, cache=cache, on_layer=on_layer, attention_mask=attention_mask, tap=tap)
         past = int(cache.get_seq_length())
         C = int(self.prefill_chunk or self._auto_chunk(past))
         if T <= C:
-            return self.forward(ids, cache=cache, on_layer=on_layer)
+            return self.forward(ids, cache=cache, on_layer=on_layer, tap=tap)
         # a mixture of experts with the whole trunk resident prefills layer by layer, so a layer's experts
         # are read once for the whole prompt instead of once per chunk
         if self.fam.moe and not self.host and len(self.resident) == self.L and on_layer is None:
@@ -682,7 +692,7 @@ class _ForwardMixin(_State):
                 attempt = 0
                 while True:
                     try:
-                        out = self.forward(ids[:, a:b], cache=cache, on_layer=hook)
+                        out = self.forward(ids[:, a:b], cache=cache, on_layer=hook, tap=tap)
                         break
                     except Exception as e:
                         sched = getattr(self, "scheduler", None)

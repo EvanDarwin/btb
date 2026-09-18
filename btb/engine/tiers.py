@@ -106,6 +106,8 @@ class _TiersMixin(_State):
         context: int = 0,
         kv_host: bool = False,
         drive_bps: float | None = None,
+        unified: bool = False,
+        resident_end: bool = False,
     ) -> Json:
         L = self.L
         cfg = self.cfg
@@ -170,6 +172,11 @@ class _TiersMixin(_State):
         rest = [i for i in range(L) if i not in resident]
         slot_b = max(stored[i] for i in rest) if rest else 0
         ram = int(ram_gb * 2**30) - int(working_ram_gb * 2**30) - int(os_reserve_gb * 2**30) - slots * slot_b
+        # unified memory: the card's working room and reserve come out of the RAM the warm layers fill, and so do
+        # two layer-sized buffers the load holds beside them (the staging, the warm-up's own rows); reported, so
+        # the ring's slots are sized without it too
+        headroom_b = int((working_vram_gb + vram_reserve_gb) * 2**30) + 2 * slot_b if unified else 0
+        ram -= headroom_b
         if not head_on_card:
             ram -= head_host_b
         if drafter and not drafter_on_card:
@@ -193,7 +200,14 @@ class _TiersMixin(_State):
         if card and n_cold and not staging_b:
             staging_b = stage_b
             n_cold = cold_for(ram - staging_b)
-        cold = sorted({rest[round(j * len(rest) / n_cold)] for j in range(n_cold)}) if n_cold else []
+        # the streamed layers spread through the rest, so the drive reads under the warm layers' compute; or the
+        # first of the rest, leaving the warm ones a block at the model's end (the tail drafter's)
+        if not n_cold:
+            cold = []
+        elif resident_end:
+            cold = rest[:n_cold]
+        else:
+            cold = sorted({rest[round(j * len(rest) / n_cold)] for j in range(n_cold)})
         k = 0
         while len(cold) < n_cold and k < len(rest):
             if rest[k] not in cold:
@@ -226,6 +240,7 @@ class _TiersMixin(_State):
                 "kv_card": kv_card_b,
                 "kv_host": kv_host_b,
                 "staging": staging_b,
+                "headroom": headroom_b,
             },
             "predicted_ms_per_token": max(warm_ms, cold_ms)
             + (3.0 * len(resident))
