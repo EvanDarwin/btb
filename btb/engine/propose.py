@@ -53,9 +53,19 @@ class TailDraft(NamedTuple):
             raise ValueError(f"tail_draft: inject is one of {', '.join(INJECT)}, not {td.inject!r}")
         if td.sample not in SAMPLE:
             raise ValueError(f"tail_draft: sample is one of {', '.join(SAMPLE)}, not {td.sample!r}")
-        if td.layers < 1 or td.k < 1 or td.depth < 1 or td.temp <= 0 or td.noise < 0 or not 0 <= td.minp < 1:
+        if (
+            td.layers < 1
+            or td.k < 1
+            or td.depth < 1
+            or td.temp <= 0
+            or td.noise < 0
+            or td.alpha < 0
+            or not 0 <= td.minp < 1
+            or td.race not in (0, 1)
+        ):
             raise ValueError(
-                "tail_draft: layers, k and depth are 1 or more, temp above 0, noise 0 or more, minp in [0, 1)"
+                "tail_draft: layers, k and depth are 1 or more, alpha and noise 0 or more, temp above 0, "
+                "minp in [0, 1), race 0 or 1"
             )
         return td
 
