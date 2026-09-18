@@ -445,7 +445,9 @@ class _TiersMixin(_State):
             cls = getattr(quants, q.name)
             cls.init_grid()
             grid = torch.from_numpy(np.ascontiguousarray(cls.grid).reshape(-1).astype(np.int8))
-            ks = torch.from_numpy(np.frombuffer(quants.IQ2_XXS.ksigns, np.uint8).copy()) if q.cpu in CPU_KSIGNS else None
+            ks = (
+                torch.from_numpy(np.frombuffer(quants.IQ2_XXS.ksigns, np.uint8).copy()) if q.cpu in CPU_KSIGNS else None
+            )
             got = cache[q.name] = (grid, ks)
         return got
 
