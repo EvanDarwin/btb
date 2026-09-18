@@ -202,9 +202,40 @@ def _confirm_or_exit(path: str | None) -> None:
         raise SystemExit(1)
 
 
+def _pick_gguf_quant(path: str) -> str:
+    """`path` unchanged for a local model, a normal Hub repo, or an explicit repo/id:file.gguf; a bare GGUF repo
+    id (a repo of .gguf files and no config.json) turned into repo/id:file.gguf by asking which quant. On a
+    terminal that is a menu; with no terminal to ask, the file list is printed and the run exits, since there is
+    no safe default quant to pick."""
+    from . import resolve
+    from .confirm import select
+    from .hf import _gb, is_gguf, repo_gguf_files
+
+    _, _, tail = path.rpartition(":")
+    if is_gguf(tail) or os.path.exists(path) or "/" not in path:
+        return path  # an explicit .gguf file, a local path, or nothing with a repo id's shape
+    # already cached as a normal HF model (it has a config.json): load it as-is, and offline, with no Hub probe
+    with contextlib.suppress(Exception):
+        if os.path.exists(os.path.join(resolve(path, local=True), "config.json")):
+            return path
+    files = repo_gguf_files(path)
+    if not files:
+        return path  # not a GGUF repo, or the Hub is unreachable: let the normal resolve/download path handle it
+    labels = [f"{n}  ({_gb(sz)})" if sz else n for n, sz in files]
+    i = select(f"{path} is a GGUF repo - choose a quant to download:", labels)
+    if i is None:
+        _e(f"[btb] {path} is a GGUF repo; name a file, e.g. {path}:{files[0][0]}")
+        _e("[btb] available files:")
+        for n, sz in files:
+            _e(f"         {n}" + (f"  ({_gb(sz)})" if sz else ""))
+        raise SystemExit(1)
+    return f"{path}:{files[i][0]}"
+
+
 def _open(a: argparse.Namespace) -> Any:
     from . import load, resolve
 
+    a.path = _pick_gguf_quant(a.path)  # a bare GGUF repo id becomes repo/id:file.gguf (asks which quant on a tty)
     a._model = a.path  # the model as the user named it, for the reproduction command (resolve rewrites a.path)
     _confirm_or_exit(a.path)
     if not a.draft_model and not getattr(a, "quiet", False):

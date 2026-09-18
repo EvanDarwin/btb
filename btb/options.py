@@ -101,6 +101,14 @@ class NotPackable(OptionError):
         super().__init__(f"{path}: {why}")
 
 
+class NotAModel(OptionError):
+    """`path` is a directory but not a model btb can load (no config.json); `why` says what to do instead"""
+
+    def __init__(self, path: str, why: str) -> None:
+        self.path, self.why = path, why
+        super().__init__(f"{path}: {why}")
+
+
 class BadPack(OptionError):
     """the 12-bit model at `path` cannot be read by this btb; `why` says so (its version, or not a pack at all)"""
 
