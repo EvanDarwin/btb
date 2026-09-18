@@ -204,6 +204,9 @@ class _State:
     def _bind_host_packed_layer(self, layer: Any) -> Any:
         raise NotImplementedError
 
+    def _bind_host_quant_layer(self, i: int, layer: Any) -> None:
+        raise NotImplementedError
+
     @staticmethod
     def _cache_to(cache: Any, i: int, dev: str | torch.device) -> None:
         raise NotImplementedError

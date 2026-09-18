@@ -27,14 +27,16 @@ def card_width(rows: int) -> int:
 class QuantType:
     """One ggml storage type: `name` as gguf spells it, `block_weights` weights a block of `block_bytes`. `card`
     is the card kernel's stem (btb_gemv_<card>_bf16_m{M}) or None where the card reads the tensor dequantized;
-    `mlx` the MLX binder kind (`Backend.weight_packed`) or None where MLX does; `affine_bits` the bit width of the
-    type's affine repack (`gguf.affine_of`, MLX's `quantized_matmul`) where the format has one."""
+    `mlx` the MLX binder kind (`Backend.weight_packed`) or None where MLX does; `cpu` the native CPU gemv stem
+    (`btb_gemv_<cpu>_rows`, `Native.gemv_<cpu>`) that multiplies the type as stored; `affine_bits` the bit width
+    of the type's affine repack (`gguf.affine_of`, MLX's `quantized_matmul`) where the format has one."""
 
     name: str
     block_weights: int
     block_bytes: int
     card: str | None = None
     mlx: str | None = None
+    cpu: str | None = None
     affine_bits: int | None = None
 
     @property
@@ -61,23 +63,23 @@ QUANTS: Mapping[str, QuantType] = MappingProxyType(
     {
         t.name: t
         for t in (
-            QuantType("Q2_K", 256, 84, card="q2k", mlx="q2k"),
-            QuantType("Q3_K", 256, 110, card="q3k", mlx="q3k"),
-            QuantType("Q4_K", 256, 144, card="q4k", mlx="q4k", affine_bits=4),
-            QuantType("Q5_K", 256, 176, card="q5k", mlx="q5k"),
-            QuantType("Q6_K", 256, 210, card="q6k", mlx="q6k"),
-            QuantType("Q4_0", 32, 18, mlx="affine", affine_bits=4),
-            QuantType("Q4_1", 32, 20, mlx="affine", affine_bits=4),
-            QuantType("Q8_0", 32, 34, mlx="affine", affine_bits=8),
-            QuantType("IQ4_NL", 32, 18, mlx="iq4nl"),
-            QuantType("IQ4_XS", 256, 136, mlx="iq4xs"),
-            QuantType("IQ1_S", 256, 50, mlx="iq1s"),
-            QuantType("IQ1_M", 256, 56, mlx="iq1m"),
-            QuantType("IQ2_XXS", 256, 66, mlx="iq2xxs"),
-            QuantType("IQ2_XS", 256, 74, mlx="iq2xs"),
-            QuantType("IQ2_S", 256, 82, mlx="iq2s"),
-            QuantType("IQ3_XXS", 256, 98, mlx="iq3xxs"),
-            QuantType("IQ3_S", 256, 110, mlx="iq3s"),
+            QuantType("Q2_K", 256, 84, card="q2k", mlx="q2k", cpu="q2k"),
+            QuantType("Q3_K", 256, 110, card="q3k", mlx="q3k", cpu="q3k"),
+            QuantType("Q4_K", 256, 144, card="q4k", mlx="q4k", cpu="q4k", affine_bits=4),
+            QuantType("Q5_K", 256, 176, card="q5k", mlx="q5k", cpu="q5k"),
+            QuantType("Q6_K", 256, 210, card="q6k", mlx="q6k", cpu="q6k"),
+            QuantType("Q4_0", 32, 18, mlx="affine", cpu="q40", affine_bits=4),
+            QuantType("Q4_1", 32, 20, mlx="affine", cpu="q41", affine_bits=4),
+            QuantType("Q8_0", 32, 34, mlx="affine", cpu="q80", affine_bits=8),
+            QuantType("IQ4_NL", 32, 18, mlx="iq4nl", cpu="iq4nl"),
+            QuantType("IQ4_XS", 256, 136, mlx="iq4xs", cpu="iq4xs"),
+            QuantType("IQ1_S", 256, 50, mlx="iq1s", cpu="iq1s"),
+            QuantType("IQ1_M", 256, 56, mlx="iq1m", cpu="iq1m"),
+            QuantType("IQ2_XXS", 256, 66, mlx="iq2xxs", cpu="iq2xxs"),
+            QuantType("IQ2_XS", 256, 74, mlx="iq2xs", cpu="iq2xs"),
+            QuantType("IQ2_S", 256, 82, mlx="iq2s", cpu="iq2s"),
+            QuantType("IQ3_XXS", 256, 98, mlx="iq3xxs", cpu="iq3xxs"),
+            QuantType("IQ3_S", 256, 110, mlx="iq3s", cpu="iq3s"),
         )
     }
 )
@@ -103,3 +105,9 @@ AFFINE_TYPES: Mapping[str, int] = MappingProxyType(
 CARD_KERNELS: frozenset[str] = frozenset(
     q.card_kernel(m) for q in QUANTS.values() if q.card is not None for m in CARD_WIDTHS
 )
+
+# the CPU grid-codebook types: their native gemv takes the type's int8 grid as a buffer, and the ksigns subset
+# also the shared 128-entry sign table (the others carry explicit signs, or none). The engine reads both from
+# the gguf package and passes them to `Native.gemv_<cpu>`.
+CPU_LATTICE: frozenset[str] = frozenset({"iq3xxs", "iq2xxs", "iq2xs", "iq2s", "iq1s", "iq1m", "iq3s"})
+CPU_KSIGNS: frozenset[str] = frozenset({"iq3xxs", "iq2xxs", "iq2xs"})

@@ -5,6 +5,7 @@ the MoE router and experts, and the n-gram proposer's row table."""
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -19,6 +20,20 @@ if TYPE_CHECKING:
     pass
 
 
+@dataclass
+class HostQuant:
+    """a host linear kept as its GGUF bytes for a native as-stored gemv: `raw` the uint8 superblocks, `fn` the
+    `Native.gemv_<fn>` stem, `rows`/`cols` the shape, and (grid-codebook types only) the int8 `grid` and the
+    shared `ksigns` sign table the kernel indexes."""
+
+    raw: torch.Tensor
+    fn: str
+    rows: int
+    cols: int
+    grid: torch.Tensor | None = None
+    ksigns: torch.Tensor | None = None
+
+
 class _HostLinear(torch.nn.Module):
     _cpu_shared: Any
     bias: torch.Tensor | None
@@ -26,6 +41,7 @@ class _HostLinear(torch.nn.Module):
     key: str | None
     mx: Any
     packed: tuple[Any, ...] | None
+    quant: HostQuant | None
     weight: torch.Tensor
 
     def __init__(self, weight: torch.Tensor, key: str | None = None, bias: torch.Tensor | None = None) -> None:
@@ -36,6 +52,7 @@ class _HostLinear(torch.nn.Module):
         self.bias = None if bias is None else torch.nn.Parameter(bias, requires_grad=False)
         self.key = key
         self.packed = None
+        self.quant = None
         self.mx = None
         # on a Mac's CPU tier: the same bytes as an MLX bf16 array, for the prefill's GEMM on MLX's CPU
         # stream (`bind_cpu_gemm`); the one-row step keeps the native kernel
@@ -48,6 +65,18 @@ class _HostLinear(torch.nn.Module):
     def _matmul(self, x: torch.Tensor) -> torch.Tensor:
         if self.mx is not None:
             return Native.mlx.linear(x, self.mx)
+        q = self.quant
+        if q is not None:
+            # the GGUF tensor multiplied as stored on its native kernel (f32 arithmetic), no bf16 copy
+            shp = x.shape
+            x2 = x.reshape(-1, q.cols).to(torch.float32).contiguous()
+            y = torch.empty(x2.shape[0], q.rows, dtype=torch.float32)
+            fn = getattr(Native, "gemv_" + q.fn)
+            if q.grid is not None:
+                fn(q.raw, q.grid, q.ksigns, q.rows, q.cols, x2, y)
+            else:
+                fn(q.raw, q.rows, q.cols, x2, y)
+            return y.view(*shp[:-1], q.rows)
         rows, cols = self.weight.shape
         if x.dtype == torch.float32 and (Native.gemv is not None):
             shp = x.shape

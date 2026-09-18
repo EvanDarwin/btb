@@ -220,6 +220,237 @@ pub unsafe extern "C" fn btb_gemv_mxfp4_ggml_group(
     })
 }
 
+/// [`btb_gemv_bf16_rows`] over a GGUF Q4_K matrix, multiplied as stored (no bf16 copy). `raw` is the
+/// file's bytes for `[rows, cols]`: `rows * cols / 256` superblocks of 144 bytes, row-major, each a delta
+/// and min (f16), 12 packed 6-bit scale/min bytes, then 128 nibble bytes. `cols` must be a multiple of
+/// 256. Bit-identical for every `threads` and every `b`, and row `r` is the same at any `b`.
+///
+/// # Safety
+/// `raw` readable for `rows * cols / 256 * 144` bytes, `x` for `b * cols` f32, `y` writable for
+/// `b * rows` f32; `y` must not overlap an input.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn btb_gemv_q4k_rows(
+    raw: *const u8,
+    rows: usize,
+    cols: usize,
+    x: *const f32,
+    b: usize,
+    y: *mut f32,
+    threads: usize,
+) -> i32 {
+    guard(|| unsafe { gemv::gemv_q4k_core(raw, rows, cols, x, b, y, threads) })
+}
+
+/// [`btb_gemv_q4k_rows`] over a GGUF Q6_K matrix. `raw` is `rows * cols / 256` superblocks of 210 bytes,
+/// row-major: 128 low-nibble bytes, 64 high-2-bit bytes, 16 int8 scales, then the f16 delta. `cols` must
+/// be a multiple of 256.
+///
+/// # Safety
+/// `raw` readable for `rows * cols / 256 * 210` bytes, `x` for `b * cols` f32, `y` writable for
+/// `b * rows` f32; `y` must not overlap an input.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn btb_gemv_q6k_rows(
+    raw: *const u8,
+    rows: usize,
+    cols: usize,
+    x: *const f32,
+    b: usize,
+    y: *mut f32,
+    threads: usize,
+) -> i32 {
+    guard(|| unsafe { gemv::gemv_q6k_core(raw, rows, cols, x, b, y, threads) })
+}
+
+/// [`btb_gemv_q4k_rows`] over a GGUF Q5_K matrix (176-byte superblocks: the delta, min, 12 scale/min bytes,
+/// a 32-byte high-bit plane, then 128 nibble bytes). `cols` a multiple of 256.
+///
+/// # Safety
+/// `raw` readable for `rows * cols / 256 * 176` bytes, `x` for `b * cols` f32, `y` writable for `b * rows` f32.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn btb_gemv_q5k_rows(
+    raw: *const u8,
+    rows: usize,
+    cols: usize,
+    x: *const f32,
+    b: usize,
+    y: *mut f32,
+    threads: usize,
+) -> i32 {
+    guard(|| unsafe { gemv::gemv_q5k_core(raw, rows, cols, x, b, y, threads) })
+}
+
+/// [`btb_gemv_q4k_rows`] over a GGUF Q2_K matrix (84-byte superblocks: 16 scale/min bytes, 64 2-bit weight
+/// bytes, then the delta and min). `cols` a multiple of 256.
+///
+/// # Safety
+/// `raw` readable for `rows * cols / 256 * 84` bytes, `x` for `b * cols` f32, `y` writable for `b * rows` f32.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn btb_gemv_q2k_rows(
+    raw: *const u8,
+    rows: usize,
+    cols: usize,
+    x: *const f32,
+    b: usize,
+    y: *mut f32,
+    threads: usize,
+) -> i32 {
+    guard(|| unsafe { gemv::gemv_q2k_core(raw, rows, cols, x, b, y, threads) })
+}
+
+/// [`btb_gemv_q4k_rows`] over a GGUF Q3_K matrix (110-byte superblocks: a 32-byte high-bit mask, 64 low-2-bit
+/// weight bytes, 12 packed 6-bit scale bytes, then the delta). `cols` a multiple of 256.
+///
+/// # Safety
+/// `raw` readable for `rows * cols / 256 * 110` bytes, `x` for `b * cols` f32, `y` writable for `b * rows` f32.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn btb_gemv_q3k_rows(
+    raw: *const u8,
+    rows: usize,
+    cols: usize,
+    x: *const f32,
+    b: usize,
+    y: *mut f32,
+    threads: usize,
+) -> i32 {
+    guard(|| unsafe { gemv::gemv_q3k_core(raw, rows, cols, x, b, y, threads) })
+}
+
+/// [`btb_gemv_q4k_rows`] over a GGUF IQ4_NL matrix (18-byte blocks of 32: an f16 delta then 16 nibble bytes,
+/// a weight `d * KV[code]` through the fixed non-linear codebook). `cols` a multiple of 32.
+///
+/// # Safety
+/// `raw` readable for `rows * cols / 32 * 18` bytes, `x` for `b * cols` f32, `y` writable for `b * rows` f32.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn btb_gemv_iq4nl_rows(
+    raw: *const u8,
+    rows: usize,
+    cols: usize,
+    x: *const f32,
+    b: usize,
+    y: *mut f32,
+    threads: usize,
+) -> i32 {
+    guard(|| unsafe { gemv::gemv_iq4nl_core(raw, rows, cols, x, b, y, threads) })
+}
+
+/// [`btb_gemv_q4k_rows`] over a GGUF IQ4_XS matrix (136-byte superblocks: an f16 delta, a high-scale word,
+/// four low-scale bytes, 128 nibble bytes; a weight `d*(scale-32)*KV[code]`). `cols` a multiple of 256.
+///
+/// # Safety
+/// `raw` readable for `rows * cols / 256 * 136` bytes, `x` for `b * cols` f32, `y` writable for `b * rows` f32.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn btb_gemv_iq4xs_rows(
+    raw: *const u8,
+    rows: usize,
+    cols: usize,
+    x: *const f32,
+    b: usize,
+    y: *mut f32,
+    threads: usize,
+) -> i32 {
+    guard(|| unsafe { gemv::gemv_iq4xs_core(raw, rows, cols, x, b, y, threads) })
+}
+
+/// [`btb_gemv_q4k_rows`] over a GGUF Q4_0 matrix (18-byte blocks of 32: an f16 delta then 16 nibble bytes, a
+/// weight `d*(code-8)`). `cols` a multiple of 32.
+///
+/// # Safety
+/// `raw` readable for `rows * cols / 32 * 18` bytes, `x` for `b * cols` f32, `y` writable for `b * rows` f32.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn btb_gemv_q40_rows(
+    raw: *const u8,
+    rows: usize,
+    cols: usize,
+    x: *const f32,
+    b: usize,
+    y: *mut f32,
+    threads: usize,
+) -> i32 {
+    guard(|| unsafe { gemv::gemv_q40_core(raw, rows, cols, x, b, y, threads) })
+}
+
+/// [`btb_gemv_q4k_rows`] over a GGUF Q4_1 matrix (20-byte blocks of 32: a delta and min, then 16 nibble bytes,
+/// a weight `d*code + m`). `cols` a multiple of 32.
+///
+/// # Safety
+/// `raw` readable for `rows * cols / 32 * 20` bytes, `x` for `b * cols` f32, `y` writable for `b * rows` f32.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn btb_gemv_q41_rows(
+    raw: *const u8,
+    rows: usize,
+    cols: usize,
+    x: *const f32,
+    b: usize,
+    y: *mut f32,
+    threads: usize,
+) -> i32 {
+    guard(|| unsafe { gemv::gemv_q41_core(raw, rows, cols, x, b, y, threads) })
+}
+
+/// [`btb_gemv_q4k_rows`] over a GGUF Q8_0 matrix (34-byte blocks of 32: an f16 delta then 32 int8 weights, a
+/// weight `d*code`). `cols` a multiple of 32.
+///
+/// # Safety
+/// `raw` readable for `rows * cols / 32 * 34` bytes, `x` for `b * cols` f32, `y` writable for `b * rows` f32.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn btb_gemv_q80_rows(
+    raw: *const u8,
+    rows: usize,
+    cols: usize,
+    x: *const f32,
+    b: usize,
+    y: *mut f32,
+    threads: usize,
+) -> i32 {
+    guard(|| unsafe { gemv::gemv_q80_core(raw, rows, cols, x, b, y, threads) })
+}
+
+/// [`btb_gemv_q4k_rows`] over a GGUF IQ lattice matrix (256-weight superblocks): `raw` the file's bytes,
+/// `grid` the type's int8 codebook flattened (entries * values), `ksigns` the shared 128-entry sign table
+/// (null for the types that carry explicit signs or none). A weight is a signed, scaled grid entry. `cols`
+/// a multiple of 256.
+macro_rules! latt_rows {
+    ($name:ident, $core:ident) => {
+        /// A GGUF IQ lattice matvec: see [`latt_rows`]'s documentation for the layout.
+        ///
+        /// # Safety
+        /// `raw`, `grid` and (where read) `ksigns` valid for the type; `x` readable for `b * cols` f32, `y`
+        /// writable for `b * rows` f32; `y` must not overlap an input.
+        #[no_mangle]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe extern "C" fn $name(
+            raw: *const u8,
+            grid: *const i8,
+            ksigns: *const u8,
+            rows: usize,
+            cols: usize,
+            x: *const f32,
+            b: usize,
+            y: *mut f32,
+            threads: usize,
+        ) -> i32 {
+            guard(|| unsafe { gemv::$core(raw, grid, ksigns, rows, cols, x, b, y, threads) })
+        }
+    };
+}
+latt_rows!(btb_gemv_iq3xxs_rows, gemv_iq3xxs_core);
+latt_rows!(btb_gemv_iq2xxs_rows, gemv_iq2xxs_core);
+latt_rows!(btb_gemv_iq2xs_rows, gemv_iq2xs_core);
+latt_rows!(btb_gemv_iq2s_rows, gemv_iq2s_core);
+latt_rows!(btb_gemv_iq1s_rows, gemv_iq1s_core);
+latt_rows!(btb_gemv_iq3s_rows, gemv_iq3s_core);
+latt_rows!(btb_gemv_iq1m_rows, gemv_iq1m_core);
+
 /// One decode step of grouped-query attention over a bf16 key/value cache, f32 arithmetic throughout.
 /// Unlike every other kernel here, the result is not bit-identical across `threads`: the rows are split by
 /// the thread count and merged, so the last bits vary with `threads`, not the value. `q` and `out` are

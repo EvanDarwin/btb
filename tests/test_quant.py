@@ -6,7 +6,16 @@ from __future__ import annotations
 
 import pytest
 
-from btb.quant import AFFINE_TYPES, CARD_KERNELS, CARD_WIDTHS, QUANTS, card_width, quant_of
+from btb.quant import (
+    AFFINE_TYPES,
+    CARD_KERNELS,
+    CARD_WIDTHS,
+    CPU_KSIGNS,
+    CPU_LATTICE,
+    QUANTS,
+    card_width,
+    quant_of,
+)
 
 gguf = pytest.importorskip("gguf")
 
@@ -32,6 +41,18 @@ def test_the_derived_lists_are_the_hand_written_ones() -> None:
     with pytest.raises(ValueError):
         QUANTS["Q8_0"].card_kernel(1)
     assert quant_of("BF16") is None and quant_of("Q6_K") is QUANTS["Q6_K"]
+    # every type has a native CPU gemv; the lattice subset takes the grid buffer, the ksigns subset the sign table
+    assert all(q.cpu is not None for q in QUANTS.values())
+    assert CPU_KSIGNS < CPU_LATTICE and CPU_LATTICE < {q.cpu for q in QUANTS.values()}
+    assert {q.name for q in QUANTS.values() if q.cpu in CPU_LATTICE} == {
+        "IQ1_S",
+        "IQ1_M",
+        "IQ2_XXS",
+        "IQ2_XS",
+        "IQ2_S",
+        "IQ3_XXS",
+        "IQ3_S",
+    }
     assert abs(QUANTS["Q4_K"].bits - 4.5) < 1e-9
     assert [card_width(t) for t in (1, 2, 3, 5, 9, 17, 32)] == [1, 2, 4, 8, 16, 32, 32]
     with pytest.raises(ValueError):

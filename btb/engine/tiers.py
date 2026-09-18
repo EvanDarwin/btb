@@ -22,9 +22,9 @@ from .. import mlx as mlxdev
 from ..kinds import Json, LayerKind, SlotKind, Tier
 from ..options import Device
 from ..pack12 import entries, unpack_bf16
-from ..quant import quant_of
+from ..quant import QuantType, quant_of
 from ..sysinfo import process_working_set_bytes
-from .host import _Experts, _HostLinear
+from .host import HostQuant, _Experts, _HostLinear
 from .native import Native
 from .state import DRAFT_VOCAB, _State
 
@@ -428,6 +428,57 @@ class _TiersMixin(_State):
         self._bind_cold()
         return n_b
 
+    def _latt_tables(self, q: QuantType) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """(grid, ksigns) for a CPU lattice type, read once from the gguf package and cached; (None, None) for
+        the non-lattice types (their native gemv takes no tables)."""
+        from ..quant import CPU_KSIGNS, CPU_LATTICE
+
+        if q.cpu not in CPU_LATTICE:
+            return None, None
+        cache: dict[str, tuple[torch.Tensor | None, torch.Tensor | None]] = getattr(self, "_latt_cache", None) or {}
+        self._latt_cache = cache
+        got = cache.get(q.name)
+        if got is None:
+            import numpy as np
+            from gguf import quants
+
+            cls = getattr(quants, q.name)
+            cls.init_grid()
+            grid = torch.from_numpy(np.ascontiguousarray(cls.grid).reshape(-1).astype(np.int8))
+            ks = torch.from_numpy(np.frombuffer(quants.IQ2_XXS.ksigns, np.uint8).copy()) if q.cpu in CPU_KSIGNS else None
+            got = cache[q.name] = (grid, ks)
+        return got
+
+    def _bind_host_quant_layer(self, i: int, layer: Any) -> None:
+        """each host linear of resident layer `i` whose GGUF tensor is a type with a native CPU gemv bound as its
+        stored bytes for the as-stored matvec; the bf16 the loader dequantized is freed. CPU tier only, not a
+        cold layer (the ring streams those), and only where the library carries the type's kernel (else the bf16
+        path stands)."""
+        gg = self.gguf
+        if gg is None or self.mlx is not None or self.dev.type != Device.CPU or i in self.cold:
+            return
+        if not bool(int(getattr(self, "gguf_packed", 1))):
+            return
+        for m in layer.modules():
+            if not (isinstance(m, _HostLinear) and m.key and m.quant is None):
+                continue
+            name = self._gguf_names.get(m.key)
+            t = None if name is None else gg.tensors.get(name)
+            if t is None:
+                continue
+            q = quant_of(t.tensor_type.name)
+            shape = tuple(int(v) for v in reversed(list(t.shape)))
+            if q is None or q.cpu is None or not q.packable(shape):
+                continue
+            if getattr(Native, "gemv_" + q.cpu, None) is None:
+                continue  # an older native library: keep the dequantized bf16 slot
+            assert name is not None  # gg.tensors held it
+            grid, ksigns = self._latt_tables(q)
+            raw = gg.raw(name).reshape(-1).contiguous()
+            m.quant = HostQuant(raw, q.cpu, shape[0], shape[1], grid, ksigns)
+            # free the bf16 the loader made; the matvec reads `quant.raw`, and `rows`/`cols` come from it
+            m.weight = torch.nn.Parameter(torch.zeros(1, dtype=torch.bfloat16), requires_grad=False)
+
     def _head_host(self) -> Any:
         if self.head_host is None:
             self.head_host = _HostLinear(self._get(self.head_key), key=self.head_key)
@@ -481,6 +532,7 @@ class _TiersMixin(_State):
                 for m in lins
                 if m.mx is None
                 and m.packed is None
+                and m.quant is None  # a GGUF tensor bound as stored runs the native gemv, prefill included
                 and m.cpu_gemm is None
                 and m.key in self.weight_map
                 and m.weight.dtype == torch.bfloat16
