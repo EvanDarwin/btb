@@ -20,6 +20,7 @@ from .. import pool as _pool
 from ..gguf import GGUFModel
 from ..hf import is_gguf, pack_format, shard_map
 from ..kinds import LayerKind, Log, Tokens
+from ..mlx.q6k import gather_q6k
 from ..options import Device as DeviceKind
 from ..options import DeviceName
 from ..pack12 import parent_dir
@@ -215,7 +216,6 @@ class StreamedTextModel(
                 self.norm = self.fam.norm(cfg.hidden_size, eps=cfg.rms_norm_eps)
             else:
                 self.mixer = self.fam.mod.Qwen4ExpTextGatedResidual(cfg, use_combine=False)
-        self.embed_table = self._get(self.prefix + "embed_tokens.weight")
         if self.norm is not None:
             self._adopt(self.norm, "weight", self._get(self.prefix + "norm.weight"))
         else:
@@ -225,12 +225,21 @@ class StreamedTextModel(
         self.head = None
         self.head_host = None
         if resident_head and self.mlx is not None:
-            self.head_host = _HostLinear(self._get(self.head_key), key=self.head_key)
+            # `gguf_shortcut`: this weight rebinds packed right below, so a wasted bf16 dequant would be
+            # discarded immediately -- unlike the embed table below, which needs real values for row-gather
+            self.head_host = _HostLinear(self._get(self.head_key, gguf_shortcut=True), key=self.head_key)
             self._bind_mlx_linears([self.head_host])
         elif resident_head:
             with self._meta:
                 self.head = torch.nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
             self._adopt(self.head, "weight", self._get(self.head_key))
+        # the embedding table, unless the tied head is Q6_K: then its packed bytes are the table, gathered on demand
+        # (embed / _mlx_embed_rows) instead of a bf16 copy of the whole vocabulary
+        tied_q6k = self.head_host is not None and getattr(self.head_host.mx, "q6k", None) is not None
+        if tied_q6k and self.head_key == self.prefix + "embed_tokens.weight":
+            self.embed_table = None
+        else:
+            self.embed_table = self._get(self.prefix + "embed_tokens.weight")
         native = int(getattr(cfg, "max_position_embeddings", 0) or 0)
         self.context = int(context) if context else None
         rp = dict(getattr(cfg, "rope_parameters", None) or {})
@@ -397,7 +406,13 @@ class StreamedTextModel(
         ):
             # tied embeddings: the head on the card is the table - one gather there, no host round trip
             return torch.nn.functional.embedding(ids.to(head.weight.device), head.weight)
-        assert self.embed_table is not None  # embed() runs before any unload
+        if self.embed_table is None:  # tied Q6_K: gather the rows straight from the head's packed bytes
+            hh = self.head_host
+            assert hh is not None
+            raw, _rows, cols = hh.mx.q6k
+            tok = mlxdev.mx().array(ids.reshape(-1).to(torch.int32).cpu().numpy())
+            rows = mlxdev.from_mx(gather_q6k(raw, tok, cols))
+            return rows.view(*ids.shape, cols).to(self.dev)
         rows = self.embed_table[ids.reshape(-1).cpu()]
         return rows.view(*ids.shape, self.embed_table.shape[1]).to(self.dev)
 

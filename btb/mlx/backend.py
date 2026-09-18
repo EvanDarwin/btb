@@ -14,6 +14,18 @@ import numpy as np
 from ..kinds import Log
 from .core import bf16_weight, from_mx, info, mx, to_mx
 from .gemv import GEMV_ROWS, gemv, matmul_mxfp4, matmul_mxfp4_pair, unpack_bf16
+from .iquant import (
+    dequant_iq4nl,
+    dequant_iq4xs,
+    dequant_lattice,
+    matvec_iq4nl,
+    matvec_iq4xs,
+    matvec_lattice,
+    repack_iq4nl,
+    repack_lattice,
+)
+from .kquant import dequant_q2k, dequant_q3k, dequant_q4k, dequant_q5k, matvec_q2k, matvec_q3k, matvec_q4k, matvec_q5k
+from .q6k import dequant_q6k, matvec_q6k
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -36,6 +48,14 @@ class Weight:
     a: Any
 
     quant: tuple[Any, Any, Any, int, int] | None  # (wq, scales, biases, bits, group): affine, multiplied as stored
+    q6k: tuple[Any, int, int] | None  # (raw bytes, rows, cols): a GGUF Q6_K weight, multiplied by its own kernel
+    q4k: tuple[Any, int, int] | None  # (raw bytes, rows, cols): a GGUF Q4_K weight, multiplied by its own kernel
+    q5k: tuple[Any, int, int] | None  # (raw bytes, rows, cols): a GGUF Q5_K weight, multiplied by its own kernel
+    q2k: tuple[Any, int, int] | None  # (raw bytes, rows, cols): a GGUF Q2_K weight, multiplied by its own kernel
+    q3k: tuple[Any, int, int] | None  # (raw bytes, rows, cols): a GGUF Q3_K weight, multiplied by its own kernel
+    iq4nl: tuple[Any, Any, int, int] | None  # (d f16, nibble bytes, rows, cols): IQ4_NL repacked struct-of-arrays
+    iq4xs: tuple[Any, int, int] | None  # (raw bytes, rows, cols): a GGUF IQ4_XS weight, multiplied by its own kernel
+    latt: tuple[str, Any, int, int, tuple[Any, ...]] | None  # (kind, raw bytes, rows, cols, side streams): IQ lattice
 
     def __init__(
         self,
@@ -43,6 +63,14 @@ class Weight:
         packed: tuple[Any, ...] | None = None,
         shape: Sequence[int] | None = None,
         quant: tuple[Any, Any, Any, int, int] | None = None,
+        q6k: tuple[Any, int, int] | None = None,
+        q4k: tuple[Any, int, int] | None = None,
+        q5k: tuple[Any, int, int] | None = None,
+        q2k: tuple[Any, int, int] | None = None,
+        q3k: tuple[Any, int, int] | None = None,
+        iq4nl: tuple[Any, Any, int, int] | None = None,
+        iq4xs: tuple[Any, int, int] | None = None,
+        latt: tuple[str, Any, int, int, tuple[Any, ...]] | None = None,
     ) -> None:
         # every array made here is evaluated at once: a lazy node made on one thread cannot be evaluated by
         # another (MLX's default stream is per thread), and the server runs each request on its own thread
@@ -53,13 +81,77 @@ class Weight:
             m.eval(*[x for x in packed[:5] if x is not None])
         if quant is not None:
             m.eval(*quant[:3])
+        if q6k is not None:
+            m.eval(q6k[0])
+        if q4k is not None:
+            m.eval(q4k[0])
+        if q5k is not None:
+            m.eval(q5k[0])
+        if q2k is not None:
+            m.eval(q2k[0])
+        if q3k is not None:
+            m.eval(q3k[0])
+        if iq4nl is not None:
+            m.eval(iq4nl[0], iq4nl[1])
+        if iq4xs is not None:
+            m.eval(iq4xs[0])
+        if latt is not None:
+            m.eval(latt[1], *latt[4])
         self.a = a
         self.packed = packed
         self.quant = quant
+        self.q6k = q6k
+        self.q4k = q4k
+        self.q5k = q5k
+        self.q2k = q2k
+        self.q3k = q3k
+        self.iq4nl = iq4nl
+        self.iq4xs = iq4xs
+        self.latt = latt
         self.shape = tuple(shape) if shape is not None else tuple(int(s) for s in a.shape)
 
     def get(self) -> mx_.array:
         if self.a is None:
+            if self.q6k is not None:
+                raw, rows, cols = self.q6k
+                self.a = dequant_q6k(raw, rows, cols)
+                mx().eval(self.a)
+                return self.a
+            if self.q4k is not None:
+                raw, rows, cols = self.q4k
+                self.a = dequant_q4k(raw, rows, cols)
+                mx().eval(self.a)
+                return self.a
+            if self.q5k is not None:
+                raw, rows, cols = self.q5k
+                self.a = dequant_q5k(raw, rows, cols)
+                mx().eval(self.a)
+                return self.a
+            if self.q2k is not None:
+                raw, rows, cols = self.q2k
+                self.a = dequant_q2k(raw, rows, cols)
+                mx().eval(self.a)
+                return self.a
+            if self.q3k is not None:
+                raw, rows, cols = self.q3k
+                self.a = dequant_q3k(raw, rows, cols)
+                mx().eval(self.a)
+                return self.a
+            if self.iq4nl is not None:
+                d, q, rows, cols = self.iq4nl
+                self.a = dequant_iq4nl(d, q, rows, cols)
+                mx().eval(self.a)
+                return self.a
+            if self.iq4xs is not None:
+                raw, rows, cols = self.iq4xs
+                self.a = dequant_iq4xs(raw, rows, cols)
+                mx().eval(self.a)
+                return self.a
+            if self.latt is not None:
+                kind, raw, rows, cols, _side = self.latt
+                self.a = dequant_lattice(kind, raw, rows, cols)
+                mx().eval(self.a)
+                return self.a
             if self.quant is not None:
                 wq, sc, bi, bits, group = self.quant
                 self.a = mx().dequantize(wq, sc, bi, group_size=group, bits=bits).astype(mx().bfloat16)
@@ -171,15 +263,91 @@ class Backend:
         return Weight(packed=(lo, hi4, table, esc_idx, esc_val, int(e["n"])), shape=shape)
 
     # -- the linear --
-    def weight_affine(self, wq: Any, scales: Any, biases: Any, bits: int, group: int, shape: Sequence[int]) -> Weight:
-        """a weight the kernels multiply as stored: the affine form (`mx.quantized_matmul`), never a bf16 copy"""
+    def weight_affine(
+        self, wq: Any, scales: Any, biases: Any, bits: int, group: int, shape: Sequence[int], dtype: Any = None
+    ) -> Weight:
+        """a weight the kernels multiply as stored: the affine form (`mx.quantized_matmul`), never a bf16 copy.
+        The scales and biases are held at `dtype` (the compute dtype, bf16): matching the activations is the path
+        MLX's kernel runs fastest, and on an already-quantized weight their rounding is inside the file's own loss.
+        `dtype` None keeps them float32 (an `--fp32` run, where the repack stays exact)."""
         m = mx()
-        q = (m.array(wq), m.array(scales), m.array(biases), int(bits), int(group))
+        sd = dtype or m.float32
+        q = (m.array(wq), m.array(scales).astype(sd), m.array(biases).astype(sd), int(bits), int(group))
         return Weight(quant=q, shape=shape)
+
+    def weight_q6k(self, raw: Any, shape: Sequence[int]) -> Weight:
+        """a GGUF Q6_K weight kept as its own bytes (`matvec_q6k` reads the superblocks as stored), never a bf16
+        copy. `raw` the file's uint8 bytes for `shape` [rows, cols]."""
+        rows, cols = int(shape[0]), int(shape[1])
+        return Weight(q6k=(mx().array(raw), rows, cols), shape=shape)
+
+    def weight_q5k(self, raw: Any, shape: Sequence[int]) -> Weight:
+        """a GGUF Q5_K weight kept as its own bytes (`matvec_q5k` reads the superblocks as stored)."""
+        rows, cols = int(shape[0]), int(shape[1])
+        return Weight(q5k=(mx().array(raw), rows, cols), shape=shape)
+
+    def weight_q2k(self, raw: Any, shape: Sequence[int]) -> Weight:
+        """a GGUF Q2_K weight kept as its own bytes (`matvec_q2k` reads the superblocks as stored)."""
+        rows, cols = int(shape[0]), int(shape[1])
+        return Weight(q2k=(mx().array(raw), rows, cols), shape=shape)
+
+    def weight_q3k(self, raw: Any, shape: Sequence[int]) -> Weight:
+        """a GGUF Q3_K weight kept as its own bytes (`matvec_q3k` reads the superblocks as stored)."""
+        rows, cols = int(shape[0]), int(shape[1])
+        return Weight(q3k=(mx().array(raw), rows, cols), shape=shape)
+
+    def weight_iq4nl(self, raw: Any, shape: Sequence[int]) -> Weight:
+        """a GGUF IQ4_NL weight repacked once into struct-of-arrays (the f16 scales and the nibble bytes as two
+        contiguous streams): ggml's 18-byte blocks straddle cache lines, the split streams read at DRAM speed."""
+        rows, cols = int(shape[0]), int(shape[1])
+        d, q = repack_iq4nl(raw)
+        return Weight(iq4nl=(d, q, rows, cols), shape=shape)
+
+    def weight_iq4xs(self, raw: Any, shape: Sequence[int]) -> Weight:
+        """a GGUF IQ4_XS weight kept as its own bytes (`matvec_iq4xs` reads the superblocks as stored)."""
+        rows, cols = int(shape[0]), int(shape[1])
+        return Weight(iq4xs=(mx().array(raw), rows, cols), shape=shape)
+
+    def weight_lattice(self, kind: str, raw: Any, shape: Sequence[int]) -> Weight:
+        """a GGUF IQ lattice weight (IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M) kept as its own bytes, multiplied by
+        `matvec_lattice` reading the grid-codebook superblocks as stored."""
+        rows, cols = int(shape[0]), int(shape[1])
+        side = repack_lattice(kind, raw)
+        return Weight(latt=(kind, mx().array(raw), rows, cols, side), shape=shape)
+
+    def weight_q4k(self, raw: Any, shape: Sequence[int]) -> Weight:
+        """a GGUF Q4_K weight kept as its own bytes (`matvec_q4k` reads the superblocks as stored), never a bf16
+        or affine-repacked copy. `raw` the file's uint8 bytes for `shape` [rows, cols]."""
+        rows, cols = int(shape[0]), int(shape[1])
+        return Weight(q4k=(mx().array(raw), rows, cols), shape=shape)
 
     def matmul(self, x: mx_.array, w: Weight) -> mx_.array:
         """x [b, cols] MLX (bf16 or float32), w a `Weight`: y [b, rows] in x's dtype, lazily."""
         m = mx()
+        if w.q6k is not None:
+            raw, rows, cols = w.q6k
+            return matvec_q6k(raw, x, rows, cols)
+        if w.q4k is not None:
+            raw, rows, cols = w.q4k
+            return matvec_q4k(raw, x, rows, cols)
+        if w.q5k is not None:
+            raw, rows, cols = w.q5k
+            return matvec_q5k(raw, x, rows, cols)
+        if w.q2k is not None:
+            raw, rows, cols = w.q2k
+            return matvec_q2k(raw, x, rows, cols)
+        if w.q3k is not None:
+            raw, rows, cols = w.q3k
+            return matvec_q3k(raw, x, rows, cols)
+        if w.iq4nl is not None:
+            d, q, rows, cols = w.iq4nl
+            return matvec_iq4nl(d, q, x, rows, cols)
+        if w.iq4xs is not None:
+            raw, rows, cols = w.iq4xs
+            return matvec_iq4xs(raw, x, rows, cols)
+        if w.latt is not None:
+            kind, raw, rows, cols, side = w.latt
+            return matvec_lattice(kind, raw, x, rows, cols, side)
         if w.quant is not None:
             wq, sc, bi, bits, group = w.quant
             y = m.quantized_matmul(x, wq, sc, bi, transpose=True, group_size=group, bits=bits)

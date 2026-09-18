@@ -175,7 +175,7 @@ class _ForwardMixin(_State):
         if attention_mask is None and not own and self._mlx_ok(cache, B, T, None, positions, n_layers):
             # the fused path from the embedding gathered on the graph: no torch embed, rope tables or mask
             m = mlxdev.mx()
-            hm = m.take(self._mlx_embed(), m.array(ids[0].tolist(), dtype=m.int32), axis=0)
+            hm = self._mlx_embed_rows(m.array(ids[0].tolist(), dtype=m.int32))
             if self.compute_dtype is not None and self.compute_dtype != torch.bfloat16:
                 hm = hm.astype(m.float32)
             return self._forward_mlx(None, None, cache, on_layer, last_only, head, n_layers, hm=hm, pick=pick)

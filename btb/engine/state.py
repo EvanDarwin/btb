@@ -400,6 +400,9 @@ class _State:
     def _mlx_embed(self) -> Any:
         raise NotImplementedError
 
+    def _mlx_embed_rows(self, tok: Any) -> Any:
+        raise NotImplementedError
+
     def _mlx_flush_states(self, cache: Any) -> None:
         raise NotImplementedError
 

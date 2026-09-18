@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from .. import mlx as mlxdev
+from ..gguf import GROUP
+from ..hf import AFFINE_TYPES
 from ..kinds import Json, LayerKind, Tier
 from ..options import Device
 from ..pack12 import entries, unpack_bf16
@@ -984,7 +986,39 @@ class _TiersMixin(_State):
         self.bytes_streamed += nb
         return blob, torch.tensor(e["table"], dtype=torch.uint8), e
 
-    def _get(self, key: str) -> torch.Tensor:
+    def _gguf_binds_packed(self, name: str) -> bool:
+        """Whether the GGUF tensor `name` binds to a packed MLX kernel (mlx_forward.py's `_bind_gguf_q4k`/
+        `_affine`/`_q6k`) instead of a plain bf16 slot, so `_get` can skip the bf16 dequant they would
+        immediately discard for their own raw-byte read. The type/shape gate `affine_of` (`gguf.py`) and
+        `_bind_gguf_q6k` apply, without `affine_of`'s block decode: that decode is wasted work here since
+        `_bind_gguf_affine`/`_bind_gguf_q4k` run it again from the raw bytes right after this returns."""
+        if self.mlx is None or not bool(int(getattr(self, "gguf_packed", 1))):
+            return False
+        assert self.gguf is not None
+        t = self.gguf.tensors.get(name)
+        if t is None:  # a synthesized name, not a file tensor (gpt-oss's interleaved expert biases): read for real
+            return False
+        shape = tuple(int(x) for x in reversed(list(t.shape)))
+        if len(shape) != 2:
+            return False
+        kind = t.tensor_type.name
+        # own-kernel binders' shape gate; no fallback binder catches a miss
+        if kind in ("Q6_K", "Q5_K", "Q3_K", "Q2_K", "IQ4_XS",
+                    "IQ3_XXS", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ1_S", "IQ3_S", "IQ1_M"):
+            return shape[1] % 256 == 0
+        if kind == "IQ4_NL":
+            return shape[1] % 32 == 0
+        return kind in AFFINE_TYPES and shape[1] % GROUP == 0
+
+    def _gguf_layer_index(self, key: str) -> int | None:
+        """The layer index a weight key names, or None for a non-layer tensor (head, embed, norm, ...)."""
+        pre = self.prefix + "layers."
+        if not key.startswith(pre):
+            return None
+        head, _, _ = key[len(pre) :].partition(".")
+        return int(head) if head.isdigit() else None
+
+    def _get(self, key: str, gguf_shortcut: bool = False) -> torch.Tensor:
         import warnings
 
         shard = self.weight_map.get(key)
@@ -993,7 +1027,16 @@ class _TiersMixin(_State):
         mm, hdr, base = self._shard(shard)
         if mm is None:  # the GGUF file: dequantized on read by the gguf package
             assert self.gguf is not None  # a shard with no mmap is the GGUF's own tensor
-            t = self.gguf.get(self._gguf_names[key])
+            name = self._gguf_names[key]
+            i = self._gguf_layer_index(key)
+            # a layer bound to MLX always runs its linears through `_bind_mlx_resident` right after loading
+            # (`families.py`'s `i in self.mlx_layers and i not in self.cold`); `gguf_shortcut` lets a caller that
+            # knows its own tensor rebinds immediately (the resident head) claim the same skip
+            resolved = gguf_shortcut or (i is not None and i in self.mlx_layers and i not in getattr(self, "cold", ()))
+            if resolved and self._gguf_binds_packed(name):
+                shape = tuple(int(x) for x in hdr[key]["shape"])
+                return torch.zeros((), dtype=torch.bfloat16).expand(*shape)
+            t = self.gguf.get(name)
             self.bytes_streamed += t.numel() * t.element_size()
             return t
         info = hdr[key]

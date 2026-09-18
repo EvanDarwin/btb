@@ -373,10 +373,124 @@ def test_real_qwen3_gguf_files_when_cached() -> None:
         assert answers["BF16"][0] == ids and answers["BF16"][1] == [int(t) for t in out]
 
 
+def test_a_q6k_gguf_multiplies_its_blocks_as_stored_on_mlx() -> None:
+    """the Q6_K release, when cached: on MLX its Q6_K tensors (every weight of a pure-Q6_K file, the head and
+    ffn_down of a mixed one) bind to the Q6_K matvec as stored, no bf16 copy, and the first-step logits sit
+    within bf16 rounding of the dequantized path's - the same greedy tokens"""
+    need_mlx()
+    import btb
+
+    path = cached(f"{REAL_REPO}:Qwen3-0.6B-Q6_K.gguf")
+    if path is None:
+        pytest.skip("Qwen3-0.6B-Q6_K.gguf is not cached")
+    logits, toks = {}, {}
+    for packed in (1, 0):
+        with btb.load(path, device="mlx", gguf_packed=packed, log=None) as sm:
+            if packed:
+                assert any(getattr(m.mx, "q6k", None) is not None for m in sm.host[0].modules() if hasattr(m, "mx"))
+            logits[packed] = sm.forward(PROMPT, cache=sm.new_cache()).float()[0, -1]
+            out, _ = sm.generate(PROMPT, 8, speculate=False)
+            toks[packed] = [int(t) for t in out]
+    a, b = logits[1], logits[0]
+    assert torch.allclose(a, b, atol=0.05 * b.abs().max().item()), (a - b).abs().max().item()
+    assert toks[1] == toks[0]
+
+
+@pytest.mark.parametrize(
+    ("quant", "kind", "stable"),
+    [
+        ("Q2_K", "q2k", True),
+        ("Q3_K_M", "q3k", True),
+        ("Q5_K_M", "q5k", True),
+        ("IQ4_NL", "iq4nl", True),
+        ("IQ4_XS", "iq4xs", True),
+        ("UD-IQ3_XXS", "latt", True),
+        ("UD-IQ2_M", "latt", True),
+        ("UD-IQ1_M", "latt", False),
+    ],
+)
+def test_a_native_kernel_gguf_multiplies_its_blocks_as_stored_on_mlx(quant: str, kind: str, stable: bool) -> None:
+    """each release whose tensors have their own Metal matvec (the k-quants, the IQ4 codebooks, the IQ lattice
+    mixes behind the Unsloth dynamic files), when cached. The kernel contract is checked directly: one tensor of
+    every quantized type in the file multiplied as stored equals the package's fp32 dequantization to fp32
+    rounding. Then on MLX the tensors bind as their raw bytes to that kernel (no bf16 copy), and on a numerically
+    stable file the first-step logits sit within bf16 rounding of the dequantized path's with the same greedy
+    tokens. `stable` is False for the 1-bit file: with exact kernels its two paths still drift 43% of max-logit
+    by the first token (2% on the 2- and 3-bit siblings on the same code), a smooth per-layer amplification of
+    rounding order that the CPU path also fails to agree with - token equality is no implementation's property
+    there, so it asks only that the paths agree on the first token."""
+    need_mlx()
+    import mlx.core as mx
+    from gguf import dequantize
+
+    import btb
+    from btb.gguf import GGUFModel
+    from btb.mlx.iquant import matvec_iq4nl, matvec_iq4xs, matvec_lattice, repack_iq4nl, repack_lattice
+    from btb.mlx.kquant import matvec_q2k, matvec_q3k, matvec_q4k, matvec_q5k
+    from btb.mlx.q6k import matvec_q6k
+
+    path = cached(f"{REAL_REPO}:Qwen3-0.6B-{quant}.gguf")
+    if path is None:
+        pytest.skip(f"Qwen3-0.6B-{quant}.gguf is not cached")
+    latt = {"IQ3_XXS": "iq3xxs", "IQ2_XXS": "iq2xxs", "IQ2_XS": "iq2xs", "IQ2_S": "iq2s",
+            "IQ1_S": "iq1s", "IQ3_S": "iq3s", "IQ1_M": "iq1m"}
+    kq = {"Q2_K": matvec_q2k, "Q3_K": matvec_q3k, "Q4_K": matvec_q4k, "Q5_K": matvec_q5k, "Q6_K": matvec_q6k}
+    seen: set[str] = set()
+    for name, t in GGUFModel(path).tensors.items():
+        tn = t.tensor_type.name
+        if tn in seen or tn == "F32" or len(t.shape) != 2:
+            continue
+        rows, cols = int(t.shape[1]), int(t.shape[0])
+        if cols % (32 if tn == "IQ4_NL" else 256):
+            continue
+        raw = np.ascontiguousarray(np.asarray(t.data)).view(np.uint8).reshape(-1)
+        ref = dequantize(np.asarray(t.data), t.tensor_type).astype(np.float32).reshape(rows, cols)
+        x = np.random.default_rng(0).standard_normal((1, cols)).astype(np.float32)
+        wb, xm = mx.array(raw), mx.array(x)
+        if tn in latt:
+            y = matvec_lattice(latt[tn], wb, xm, rows, cols, repack_lattice(latt[tn], raw))
+        elif tn in kq:
+            y = kq[tn](wb, xm, rows, cols)
+        elif tn == "IQ4_NL":
+            d, q = repack_iq4nl(raw)
+            y = matvec_iq4nl(d, q, xm, rows, cols)
+        elif tn == "IQ4_XS":
+            y = matvec_iq4xs(wb, xm, rows, cols)
+        else:
+            continue
+        gold = x @ ref.T
+        rel = float(np.abs(np.array(y)[0] - gold[0]).max() / (np.abs(gold[0]).max() + 1e-9))
+        assert rel < 1e-4, (quant, tn, name, rel)
+        seen.add(tn)
+    assert seen, quant
+
+    logits, toks = {}, {}
+    for packed in (1, 0):
+        with btb.load(path, device="mlx", gguf_packed=packed, log=None) as sm:
+            if packed:
+                bound = any(
+                    getattr(m.mx, kind, None) is not None
+                    for layer in sm.host.values()
+                    for m in layer.modules()
+                    if hasattr(m, "mx")
+                )
+                assert bound, f"{quant}: no tensor bound to the {kind} kernel"
+            logits[packed] = sm.forward(PROMPT, cache=sm.new_cache()).float()[0, -1]
+            out, _ = sm.generate(PROMPT, 8, speculate=False)
+            toks[packed] = [int(t) for t in out]
+    a, b = logits[1], logits[0]
+    assert a.argmax().item() == b.argmax().item()
+    if stable:
+        assert torch.allclose(a, b, atol=0.05 * b.abs().max().item()), (a - b).abs().max().item()
+        assert toks[1] == toks[0]
+
+
 def test_the_packed_mlx_path_multiplies_as_stored() -> None:
     """on MLX a Q4_0 / Q8_0 fixture binds its matrices in the affine form and the packed kernel multiplies them
-    as stored: the affine repack equals the package's dequantization to the number, the report counts the
-    packed tensors, and the first-step logits sit within bf16 rounding of the dequantized path's"""
+    as stored: the affine repack equals the package's dequantization to the number, and Q4_K (which leaves the
+    affine path for its own native matvec) is within bf16 rounding of the dequantization and batch-invariant.
+    The report counts the packed tensors, and the first-step logits sit within bf16 rounding of the dequantized
+    path's"""
     _need()
     need_mlx()
     from gguf import dequantize
@@ -396,6 +510,35 @@ def test_the_packed_mlx_path_multiplies_as_stored() -> None:
         )
         ref = dequantize(np.asarray(t.data), t.tensor_type).astype(np.float32)
         assert np.array_equal(np.array(deq.astype(mx.float32)), ref), name
+
+    # Q4_K leaves the affine repack for its own native matvec (batch-invariant, so affine speculation is exact):
+    # over a synthetic superblock weight the matvec sits within bf16 rounding of the package's dequantization,
+    # and a row is bit-identical alone and inside a 16-row tile - what `quantized_matmul` does not guarantee.
+    import mlx.core as mx
+    from gguf import GGMLQuantizationType
+
+    from btb.mlx.kquant import matvec_q4k
+
+    rng = np.random.default_rng(0)
+    rows, cols, nsb = 40, 512, 512 // 256
+    blk = np.zeros((rows, nsb, 144), np.uint8)
+    d = (rng.random((rows, nsb)).astype(np.float32) * 0.05 + 0.01).astype(np.float16)
+    dm = (rng.random((rows, nsb)).astype(np.float32) * 0.03).astype(np.float16)
+    blk[:, :, 0:2] = np.frombuffer(np.ascontiguousarray(d).tobytes(), np.uint8).reshape(rows, nsb, 2)
+    blk[:, :, 2:4] = np.frombuffer(np.ascontiguousarray(dm).tobytes(), np.uint8).reshape(rows, nsb, 2)
+    blk[:, :, 4:] = rng.integers(0, 256, size=(rows, nsb, 140), dtype=np.uint8)
+    raw = blk.reshape(-1)
+    ref_w = dequantize(raw, GGMLQuantizationType.Q4_K).astype(np.float32).reshape(rows, cols)
+    xf = rng.standard_normal((16, cols)).astype(np.float32)
+    want = xf @ ref_w.T
+    wb = mx.array(raw)
+    xb = mx.array(xf).astype(mx.bfloat16)
+    got = np.array(matvec_q4k(wb, xb, rows, cols).astype(mx.float32))
+    rel = np.abs(got - want).max() / (np.abs(want).max() + 1e-9)
+    assert rel < 0.02, rel  # bf16 rounding of x and the weight
+    one = np.array(matvec_q4k(wb, xb[:1], rows, cols).astype(mx.float32))
+    assert np.array_equal(one[0], got[0]), "Q4_K matvec row 0 differs alone vs in a tile"
+
     ids = [PROMPT]
     logits = {}
     for packed in (1, 0):
