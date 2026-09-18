@@ -1,0 +1,6 @@
+# The tools `python build.py check` and `test` run, on top of the package itself. Set up a dev venv with:
+#   python3 -m venv .venv
+#   .venv/bin/pip install -e . -r requirements-dev.txt   # add the [mlx] extra on Apple silicon: -e ".[mlx]"
+ruff==0.16.7
+mypy==2.3.1
+pytest==9.1.1
