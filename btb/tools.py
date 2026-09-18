@@ -6,6 +6,7 @@ with `arguments` a JSON string. `tool_format(kind)` picks the family's; an unkno
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from collections.abc import Sequence
@@ -62,6 +63,24 @@ def _unframed(text: str) -> str:
 def _arguments(args: Any) -> str:
     """arguments as the wire carries them: a JSON string (an object serialized, a string kept as it is)"""
     return args if isinstance(args, str) else json.dumps(args if args is not None else {})
+
+
+def _loaded(value: Any) -> Any:
+    """a wire value as data: a JSON string parsed, any other value (an object already, plain text) as it is"""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return value
+    return value
+
+
+def _value(node: ast.expr) -> Any:
+    """a python-form argument as data: a literal evaluated, anything else its source text"""
+    try:
+        return ast.literal_eval(node)
+    except ValueError:
+        return ast.unparse(node)
 
 
 class ToolFormat:
@@ -268,11 +287,165 @@ class Harmony(ToolFormat):
         return dec(content).strip() if out else dec(content), dec(thinking), out
 
 
+class GemmaJson(ToolFormat):
+    """Gemma 3: no tool tokens, and a template that takes no tools and alternates user/model turns only, so the
+    prompt carries the convention Google documents - the setup line and the function schemas in the system
+    message (the template folds it into the first user turn). A call is the WHOLE answer, fenced or not: one
+    `{"name": ..., "parameters": {...}}`, several, an array, or the guide's python list `[name(key=value, ...)]`,
+    naming a tool the request offered. A call inside prose is prose - the model quoting one it was shown runs
+    nothing - so no text a user or a tool result plants reaches a tool unless the model answers with it and
+    nothing else. The results go back as one user turn of `{"name": ..., "response": ...}` lines, framed as
+    results to reply from (a bare object drew an empty reply from 4b-it)."""
+
+    kinds = (FamilyKind.GEMMA3,)
+    setup = (
+        "You have access to functions. If you decide to invoke any of the function(s), you MUST put it in the "
+        'format of\n{"name": function name, "parameters": dictionary of argument name and its value}\n\n'
+        "You SHOULD NOT include any other text in the response if you call a function\n"
+        "Call a function only when the request needs one; otherwise reply in plain text\n"
+    )
+    results = ("Function results:", "Reply to the user with them.")
+    _opener = re.compile(r"\s*(?:```[A-Za-z_]*\s*)?[\[{]")  # an answer that opens as a call, at its start
+    _forming = re.compile(r"\s*(?:`{1,3}[A-Za-z_]*\s*)?$")  # a start that may still open as one: blank, a fence tag
+    _fence = re.compile(r"```[A-Za-z_]*[ \t]*\n?")  # a code fence's opening line
+
+    def prepare(self, messages: Sequence[Json], tools: Any) -> tuple[list[Json], Any]:
+        out: list[Json] = []
+        names: dict[str, str] = {}  # a call's id -> its function, for the result that answers it
+        pending: list[str] = []  # results awaiting their one user turn
+        head, tail = self.results
+
+        def flush() -> None:
+            if pending:
+                out.append({"role": "user", "content": "\n".join([head, *pending, tail])})
+                pending.clear()
+
+        for m in messages:
+            m = dict(m)
+            tcs = m.pop("tool_calls", None)
+            if m.get("role") == "tool":
+                name = m.get("name") or names.get(str(m.get("tool_call_id")), "")
+                pending.append(json.dumps({"name": name, "response": _loaded(m.get("content") or "")}))
+                continue
+            flush()
+            if m.get("role") == "assistant" and tcs:
+                lines = [str(m.get("content") or "").strip()]
+                for tc in tcs:
+                    fn = tc.get("function") or {}
+                    names[str(tc.get("id"))] = str(fn.get("name") or "")
+                    lines.append(json.dumps({"name": fn.get("name"), "parameters": _loaded(fn.get("arguments")) or {}}))
+                m["content"] = "\n".join(x for x in lines if x)
+            out.append(m)
+        flush()
+        if tools:
+            block = (
+                self.setup + "\n" + json.dumps([t.get("function", t) for t in tools if isinstance(t, dict)], indent=2)
+            )
+            if out and out[0].get("role") == "system":
+                c = out[0].get("content") or ""
+                head = c if isinstance(c, str) else " ".join(str(i.get("text", "")) for i in c if isinstance(i, dict))
+                out[0]["content"] = (head.strip() + "\n\n" + block).strip()
+            else:
+                out.insert(0, {"role": "system", "content": block})
+        return out, None
+
+    @staticmethod
+    def _call_of(obj: Any) -> ToolCall | None:
+        if not isinstance(obj, dict) or not obj.get("name"):
+            return None
+        return {"name": str(obj["name"]), "arguments": _arguments(obj.get("parameters", obj.get("arguments")))}
+
+    def _json_calls(self, body: str) -> list[ToolCall] | None:
+        """the body as call objects - one, several, or an array - or None where any part of it is not one"""
+        dec = json.JSONDecoder()
+        out: list[ToolCall] = []
+        i = 0
+        while True:
+            while i < len(body) and (body[i].isspace() or body[i] == ","):
+                i += 1
+            if i >= len(body):
+                break
+            try:
+                obj, i = dec.raw_decode(body, i)
+            except ValueError:
+                return None
+            for o in obj if isinstance(obj, list) else [obj]:
+                c = self._call_of(o)
+                if c is None:
+                    return None
+                out.append(c)
+        return out or None
+
+    @staticmethod
+    def _py_call(call: ast.Call, tools: Any) -> ToolCall | None:
+        f = call.func
+        name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else ""
+        if not name:
+            return None
+        order = list(_schema_of(tools, name))  # a positional argument takes the schema's parameter at its place
+        args: Json = {}
+        for k, a in enumerate(call.args):
+            args[order[k] if k < len(order) else f"arg{k}"] = _value(a)
+        for kw in call.keywords:
+            if kw.arg:
+                args[kw.arg] = _value(kw.value)
+        return {"name": name, "arguments": json.dumps(args, default=str)}
+
+    def _py_calls(self, body: str, tools: Any) -> list[ToolCall] | None:
+        """the body as the guide's python list of calls, parsed as an expression and never run, or None"""
+        try:
+            node = ast.parse(body, mode="eval").body
+        except SyntaxError:
+            return None
+        if not isinstance(node, ast.List) or not node.elts or not all(isinstance(e, ast.Call) for e in node.elts):
+            return None
+        return [c for e in node.elts if isinstance(e, ast.Call) and (c := self._py_call(e, tools)) is not None] or None
+
+    def _body(self, text: str) -> str:
+        """the answer without the one code fence around it, if any, and the blank space about it"""
+        body = text.strip()
+        m = self._fence.match(body)
+        if m and body.endswith("```"):
+            body = body[m.end() : -3].strip()
+        return body
+
+    def calls(self, text: str, tools: Any = None) -> list[ToolCall]:
+        body = self._body(text)
+        if not body or body[0] not in "[{":
+            return []
+        found = self._json_calls(body)
+        if found is None:
+            found = self._py_calls(body, tools)
+        if not found:
+            return []
+        if tools:  # a tool the request offered, or it is not a call
+            offered = {str((t.get("function") or {}).get("name")) for t in tools if isinstance(t, dict)}
+            found = [c for c in found if c["name"] in offered]
+        return found
+
+    def strip(self, text: str) -> str:
+        return "" if self.calls(text) else text
+
+    def opener_at(self, text: str, start: int = 0) -> int | None:
+        # a call is the whole answer: it opens at the start or not at all
+        return 0 if start == 0 and self._opener.match(text) else None
+
+    def holdback(self, text: str) -> int:
+        # nothing streams while the answer could still open as a call
+        return len(text) if self._forming.match(text) else 0
+
+
 class AnyText(ToolFormat):
     """A family this module does not know: every text form tried in turn, the first that finds a call wins."""
 
-    forms: tuple[ToolFormat, ...] = (HermesJson(), QwenXml(), PhiJson())
-    openers = tuple(dict.fromkeys(op for f in forms for op in f.openers))
+    forms: tuple[ToolFormat, ...] = (HermesJson(), QwenXml(), PhiJson(), GemmaJson())
+
+    def opener_at(self, text: str, start: int = 0) -> int | None:
+        hits = [p for p in (f.opener_at(text, start) for f in self.forms) if p is not None]
+        return min(hits) if hits else None
+
+    def holdback(self, text: str) -> int:
+        return max(f.holdback(text) for f in self.forms)
 
     def calls(self, text: str, tools: Any = None) -> list[ToolCall]:
         for f in self.forms:
@@ -288,7 +461,7 @@ class AnyText(ToolFormat):
         return text
 
 
-FORMATS: tuple[ToolFormat, ...] = (HermesJson(), QwenXml(), PhiJson(), Harmony())
+FORMATS: tuple[ToolFormat, ...] = (HermesJson(), QwenXml(), PhiJson(), GemmaJson(), Harmony())
 
 
 def tool_format(kind: FamilyKind | str | None) -> ToolFormat:

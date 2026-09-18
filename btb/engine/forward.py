@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from .. import mlx as mlxdev
-from ..kinds import LayerKind, TokenRows
+from ..kinds import LayerKind, Parents, TokenRows
 from ..options import Device
 from ..sampling import as_pick
 from ..sysinfo import host_free_bytes, host_total_bytes
@@ -26,7 +26,44 @@ if TYPE_CHECKING:
     from .device import Placement
 
 
+# a rope table (cos, sin) over a pass's positions
+Rope = tuple[torch.Tensor, torch.Tensor]
+# a pass's rope: one table for every layer, or one per layer type (a dual-rope family's local/global split)
+PassRope = Rope | dict[str, Rope]
+
 _GPU_PREFILL_RETRIES = 3
+
+
+def pe_for(pe: PassRope | None, lt: str) -> Rope | None:
+    """the rope a layer of type `lt` reads: a dual-rope family carries one per type, the rest one for every layer"""
+    return pe[lt] if isinstance(pe, dict) else pe
+
+
+def layer_window(cfg: Any, lt: str) -> int:
+    """a sliding layer's window in rows; 0 for a layer that sees the whole prefix"""
+    return int(getattr(cfg, "sliding_window", 0) or 0) if lt == LayerKind.SLIDING else 0
+
+
+def node_mask(base: int, p: int, parents: Parents, win: int) -> torch.Tensor | None:
+    """Which of the base + p + 1 cache rows node p of a pass attends, as a bool row: the prefix (its last `win`
+    rows under a window), its ancestors among the pass's rows, and itself. None where every row would do - a
+    chain with no window - so the attention's own causal form serves."""
+    anc = []
+    q = parents[p]
+    while q >= 0:
+        anc.append(q)
+        q = parents[q]
+    depth = len(anc)
+    first = max(0, base + depth + 1 - win) if win else 0
+    if first == 0 and depth == p:
+        return None
+    allow = torch.zeros(base + p + 1, dtype=torch.bool)
+    allow[first:base] = True
+    allow[base + p] = True
+    for k, q in enumerate(anc):  # the k-th ancestor up sits at depth - 1 - k: logical row base + that
+        if base + depth - 1 - k >= first:
+            allow[base + q] = True
+    return allow
 
 
 def _is_gpu_recovery(e: BaseException) -> bool:
@@ -71,7 +108,7 @@ class _Pass:
     linear_mask: torch.Tensor | None
     ple_ids: torch.Tensor | None
     text_pos: torch.Tensor
-    pe: tuple[torch.Tensor, torch.Tensor] | None
+    pe: PassRope | None
     causal: torch.Tensor | dict[LayerKind, torch.Tensor] | None
     on_layer: Callable[[int, torch.Tensor], Any] | None
     place: Placement | None
@@ -85,8 +122,12 @@ class _Pass:
     def host_side(self) -> dict[str, Any]:
         hc = self._host
         if "pe" not in hc:
-            assert self.pe is not None  # a host layer's pass always carries the rope
-            hc["pe"] = (self.pe[0].cpu(), self.pe[1].cpu())
+            pe = self.pe
+            assert pe is not None  # a host layer's pass always carries the rope
+            if isinstance(pe, dict):
+                hc["pe"] = {lt: (p[0].cpu(), p[1].cpu()) for lt, p in pe.items()}
+            else:
+                hc["pe"] = (pe[0].cpu(), pe[1].cpu())
             hc["pos"] = self.text_pos.cpu()
             hc["lin"] = None if self.linear_mask is None else self.linear_mask.cpu()
             hc["ple"] = None if self.ple_ids is None else self.ple_ids.cpu()
@@ -236,6 +277,9 @@ class _ForwardMixin(_State):
             else:
                 rope_all = self._positions(B, past + T, 0, am)[1]
             pe = self.rotary(h, rope_all)
+        elif self.fam.dual_rope:
+            # one rope per layer type (Gemma 3's local/global split); each layer reads its own from the pass
+            pe = {lt: self.rotary(h, text_pos, lt) for lt in set(self.layer_types)}
         else:
             pe = self.rotary(h, rope_pos if self.fam.mrope else text_pos)
         n_layers = self.L if stop_after is None else min(self.L, int(stop_after))
@@ -386,7 +430,7 @@ class _ForwardMixin(_State):
         # standard module forward instead - which stores [B, heads, ...] as prefill does and is the streaming
         # path that scales to huge models, now batched
         if (spec or step1 or cont) and not pas.own and self.fam.fast and h.shape[0] == 1:
-            h = self.ai(tmpl, i, h, hc["pe"], hc["pos"], cache)
+            h = self.ai(tmpl, i, h, pe_for(hc["pe"], lt), hc["pos"], cache)
         else:
             kw = self._layer_kw(
                 lt,
@@ -395,7 +439,13 @@ class _ForwardMixin(_State):
                 hc["pos"],
                 hc["ple"],
             )
-            h = tmpl(h, position_embeddings=hc["pe"], past_key_values=cache, use_cache=cache is not None, **kw)
+            h = tmpl(
+                h,
+                position_embeddings=pe_for(hc["pe"], lt),
+                past_key_values=cache,
+                use_cache=cache is not None,
+                **kw,
+            )
         self.compute_s += time.time() - t0
         if i in self.cold:
             self._cold_release(i)
@@ -434,7 +484,7 @@ class _ForwardMixin(_State):
         else:
             h = tmpl(
                 h,
-                position_embeddings=pas.pe,
+                position_embeddings=pe_for(pas.pe, lt),
                 past_key_values=cache,
                 use_cache=cache is not None,
                 **self._layer_kw(lt, pas.causal, pas.linear_mask, pas.text_pos, pas.ple_ids),
@@ -742,8 +792,12 @@ class _ForwardMixin(_State):
                     h = h_all[:, a:b].to(self.dev, non_blocking=True)
                     past = past0 + a
                     text_pos = torch.arange(past, past + (b - a), device=self.dev).view(1, -1).expand(B, -1)
-                    # the own-layer family's rotary takes every position up to here, the others this chunk's
-                    pe = self.rotary(h, rope_all[:, :, : past + (b - a)] if self.fam.own else text_pos)
+                    # the own-layer family's rotary takes every position up to here, the others this chunk's; a
+                    # dual-rope family reads the rope for this layer's type
+                    if self.fam.dual_rope:
+                        pe = self.rotary(h, text_pos, lt)
+                    else:
+                        pe = self.rotary(h, rope_all[:, :, : past + (b - a)] if self.fam.own else text_pos)
                     causal = None
                     if lt != LayerKind.LINEAR:
                         causal = self._causal(h, None, cache, text_pos, True, layer_idx=i)
@@ -835,11 +889,15 @@ class _ForwardMixin(_State):
         fold(o, l)
         return acc.to(q.dtype)
 
-    def _kv_split(self, tmpl: Any, i: int, h: torch.Tensor, pe: Any, cache: Any) -> torch.Tensor:
+    def _kv_split(self, tmpl: Any, i: int, h: torch.Tensor, pe: PassRope, cache: Any) -> torch.Tensor:
         apply_rotary_pos_emb = self.fam.mod.apply_rotary_pos_emb
         B, T, _ = h.shape
         cl = cache.layers[i]
         past = cl.keys.shape[-2] if getattr(cl, "keys", None) is not None and cl.keys.numel() else 0
+        lt = self.layer_types[i]
+        win = layer_window(self.cfg, lt)
+        rope = pe_for(pe, lt)
+        assert rope is not None  # a resident layer's pass always carries the rope
         residual = h
         x = tmpl.input_layernorm(h)
         at = tmpl.self_attn
@@ -863,7 +921,7 @@ class _ForwardMixin(_State):
             q = at.q_norm(at.q_proj(x).view(B, T, -1, hd))
             k = at.k_norm(at.k_proj(x).view(B, T, -1, hd))
             v = at.v_proj(x).view(B, T, -1, hd)
-        q, k = apply_rotary_pos_emb(q.transpose(1, 2), k.transpose(1, 2), pe[0], pe[1])
+        q, k = apply_rotary_pos_emb(q.transpose(1, 2), k.transpose(1, 2), rope[0], rope[1])
         v = v.transpose(1, 2)
         kc, vc = k.cpu(), v.cpu()
         kf, vf = cache.update(kc, vc, i)
@@ -872,19 +930,15 @@ class _ForwardMixin(_State):
             probe(i, q, kf, vf, at.scaling)
         parents: Any = getattr(self, "ap", None) if getattr(self, "aq", False) else None
         tree = parents is not None and any(parents[j] != j - 1 for j in range(T))
-        if T > 1 and not tree and q.device.type == "cuda":
+        if T > 1 and not tree and q.device.type == "cuda" and not win:
             attn = self._attn_card_blocks(q, k, v, kf, vf, past, at.scaling).transpose(1, 2)
         elif tree:
             qc = q.cpu()
             outs = []
             for p in range(T):
                 allow = torch.zeros(past + T, dtype=torch.bool)
-                allow[:past] = True
-                allow[past + p] = True
-                q_ = parents[p]
-                while q_ >= 0:
-                    allow[past + q_] = True
-                    q_ = parents[q_]
+                rows = node_mask(past, p, parents, win)
+                allow[: past + p + 1] = True if rows is None else rows
                 neg = torch.zeros(past + T, dtype=qc.dtype).masked_fill(~allow, float("-inf"))
                 a = F.scaled_dot_product_attention(
                     qc[:, :, p : p + 1], kf, vf, attn_mask=neg.view(1, 1, 1, -1), enable_gqa=True, scale=at.scaling
@@ -905,14 +959,19 @@ class _ForwardMixin(_State):
         ):
             qf = q[0, :, 0].float().cpu().contiguous()
             out = torch.empty(qf.shape, dtype=torch.float32)
+            first = max(0, past + 1 - win) if win else 0  # a sliding layer's last rows alone
             with torch.profiler.record_function("btb_attn_decode"):
-                Native.attn_decode(qf, kf[0], vf[0], at.scaling, out)
+                Native.attn_decode(qf, kf[0][:, first:], vf[0][:, first:], at.scaling, out)
             attn = out.view(1, 1, qf.shape[0], qf.shape[1])
         else:
             qc = q.cpu()
             mask = None
-            if T > 1:
-                allow = torch.ones(T, past + T, dtype=torch.bool).tril(past)
+            if T > 1 or win:
+                pos = torch.arange(past, past + T)[:, None]
+                j = torch.arange(past + T)[None, :]
+                allow = j <= pos
+                if win:
+                    allow &= j > pos - win
                 mask = (
                     torch.zeros(T, past + T, dtype=qc.dtype).masked_fill(~allow, float("-inf")).view(1, 1, T, past + T)
                 )
@@ -922,5 +981,9 @@ class _ForwardMixin(_State):
         a1 = attn.reshape(B, T, -1).to(h.device, dtype=x.dtype)
         if gate is not None:
             a1 = a1 * torch.sigmoid(gate)
-        h = residual + at.o_proj(a1)
+        mix = at.o_proj(a1)
+        if self.fam.sandwich:
+            h = residual + tmpl.post_attention_layernorm(mix)
+            return h + tmpl.post_feedforward_layernorm(tmpl.mlp(tmpl.pre_feedforward_layernorm(h)))
+        h = residual + mix
         return h + tmpl.mlp(tmpl.post_attention_layernorm(h))

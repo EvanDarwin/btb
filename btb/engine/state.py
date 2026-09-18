@@ -70,6 +70,7 @@ class _State:
     cold: set[int]
     drafter_dev: torch.device | None
     embed_table: torch.Tensor | None
+    embed_scale: float | None
     head: torch.nn.Linear | None
     head_host: _HostLinear | None
     host: dict[int, Any]
