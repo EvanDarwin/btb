@@ -1,0 +1,18 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/precommit.sh",
+            "if": "Bash(git *)",
+            "timeout": 120,
+            "statusMessage": "CI gate: ruff + mypy before commit"
+          }
+        ]
+      }
+    ]
+  }
+}
