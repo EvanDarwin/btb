@@ -17,6 +17,7 @@ from .kinds import Json
 # every BTB_* environment variable the package reads, with what it does; `btb --help` prints this table
 ENV_KNOBS: dict[str, str] = {
     "BTB_API_KEY": "the servers' key (the --api-key default)",
+    "BTB_CONFIRM": "1: answer yes to prompts, as --confirm (fetch a model in a non-interactive run)",
     "BTB_POOL": "0: no MLX memory pool seeded at load",
     "BTB_CPU_GEMM": "0: a Mac's CPU tier keeps float32 prefill matmuls (else bf16 on MLX's CPU stream)",
     "BTB_HEAD_GEMV": "0: the head multiplies through a float32 copy instead of the native bf16 gemv",

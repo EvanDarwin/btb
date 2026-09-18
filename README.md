@@ -124,7 +124,7 @@ btb chat Qwen/Qwen3-4B
 # Basic interactive chat window
 ```
 
-The model path is a local directory or a Hugging Face repo id (downloaded into the cache if missing).
+The model path is a local directory or a Hugging Face repo id. A repo not already in the cache is downloaded, and btb asks first, naming the size where the Hub reports it; pass `--confirm` (or set `BTB_CONFIRM=1`) to answer yes ahead of time, which a non-interactive run needs to fetch anything.
 
 ### From code
 
@@ -149,6 +149,7 @@ Every command that loads a model takes these. The placement is planned from the 
 |---|---|---|
 | `-d, --device <cuda\|cuda:N\|mlx\|cpu>` | `cuda`: the card (and CPU) (`cuda:N` a specific card);<br/>`mlx`: Apple silicon's GPU over unified memory;<br/>`cpu`: the CPU alone | the card, else `mlx` on Apple silicon, else `cpu` |
 | `-v, --verbose` | enable verbose output, prints placement, tiers, and each turn's timings | off |
+| `--confirm` | answer yes to prompts, such as downloading an uncached model from the Hub; required to fetch one in a non-interactive run | ask at a terminal, refuse without one |
 | `--profile DIR` | write the run's profile to DIR: `report.json` (the engine's ledger) and `events.npz` (the expert-store trace of a mixture of experts); attach it to an issue beside the crash report a failed run prints | off |
 | `--native LIB` | path to the native library; `none` runs on torch alone | use btb's bundled native kernels |
 | `--cpu-layers N` | the first $N$ layers run on the CPU from RAM | auto-configured |
@@ -186,7 +187,7 @@ Each command's own arguments (`btb <command> --help` lists them):
 - `serve [PATH]`: `--host` (default `127.0.0.1`), `--port` (default `8000`), `--new N` (a ceiling per request), `--api-key KEY` (required on every request as `Authorization: Bearer KEY`; default `BTB_API_KEY` from the environment, else none), `--models-dir DIR` (repeatable), `--models-filter REGEX`; no path starts empty.
 - `ollama [PATH]`: `serve`'s arguments, `--port` default `11435`, `--gui` (the desktop app instead of the terminal chat); anything unrecognized goes to `ollama run`.
 - `pi [PATH]`: `serve`'s arguments (`--api-key` included, written into the provider entry), `--no-configure` (print the provider entry instead of writing `~/.pi/agent/models.json`), `--config PATH` (write it elsewhere).
-- `pack PATH [OUT]`: the lossless 12-bit model beside the model (`<model>-pack12`, a model like any other), or at `OUT`.
+- `pack PATH [OUT]`: the lossless 12-bit model beside the model (`<model>-pack12`, a model like any other), or at `OUT`; `--confirm` to fetch an uncached repo without a terminal.
 - `devices`: `-q` (one name per line), `--json`.
 
 ## The 12-bit store

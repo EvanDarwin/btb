@@ -188,10 +188,23 @@ def _kw(a: argparse.Namespace) -> tuple[Json, Any]:
     return kw, nat
 
 
+def _confirm_or_exit(path: str | None) -> None:
+    """Consent before a command may download a model from the Hub: a no-op for a missing, local, or
+    already-cached path; exits when the user declines an uncached repo (see hf.confirm_download)."""
+    if not path:
+        return
+    from .hf import confirm_download
+
+    if not confirm_download(path):
+        _e("[btb] aborted; nothing downloaded")
+        raise SystemExit(1)
+
+
 def _open(a: argparse.Namespace) -> Any:
     from . import load, resolve
 
     a._model = a.path  # the model as the user named it, for the reproduction command (resolve rewrites a.path)
+    _confirm_or_exit(a.path)
     a.path = resolve(a.path)
     kw, nat = _kw(a)
     out = _e if a.cmd == "run" else _p  # run keeps stdout for the model's text
@@ -238,6 +251,12 @@ def _common(ap: argparse.ArgumentParser, path_required: bool = True) -> None:
     )
     ap.add_argument(
         "-v", "--verbose", action="store_true", help="print the placement, the tiers and each turn's timings"
+    )
+    ap.add_argument(
+        "--confirm",
+        action="store_true",
+        help="answer yes to prompts (e.g. downloading a model from the Hub); required to fetch one in a "
+        "non-interactive run",
     )
     ap.add_argument(
         "--profile",
@@ -486,6 +505,7 @@ def cmd_pack(a: argparse.Namespace) -> None:
     from . import resolve
     from .engine import pack_model
 
+    _confirm_or_exit(a.path)
     out = pack_model(resolve(a.path), a.out, log=_p)
     _p(f"[pack] done -> {out}")
 
@@ -748,6 +768,8 @@ def cmd_bench(a: argparse.Namespace) -> None:
 def cmd_serve(a: argparse.Namespace) -> Any:
     from .serve import serve
 
+    _confirm_or_exit(a.path)
+
     kw, nat = _kw(a)
     return serve(
         a.path,
@@ -766,6 +788,8 @@ def cmd_serve(a: argparse.Namespace) -> Any:
 
 def cmd_ollama(a: argparse.Namespace) -> Any:
     from .serve import ollama
+
+    _confirm_or_exit(a.path)
 
     kw, nat = _kw(a)
     return ollama(
@@ -787,6 +811,8 @@ def cmd_ollama(a: argparse.Namespace) -> Any:
 
 def cmd_pi(a: argparse.Namespace) -> Any:
     from .serve import pi
+
+    _confirm_or_exit(a.path)
 
     kw, nat = _kw(a)
     return pi(
@@ -1071,6 +1097,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     p.add_argument("path", help="model directory, or a Hugging Face repo id")
     p.add_argument("out", nargs="?", default=None, help="write here instead (a plain model directory)")
+    p.add_argument(
+        "--confirm",
+        action="store_true",
+        help="answer yes to prompts; required to fetch a repo in a non-interactive run",
+    )
     p.set_defaults(fn=cmd_pack)
     p = sub.add_parser(
         "devices",
@@ -1100,6 +1131,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if as_json:
         a.quiet = True
     quiet = as_json or getattr(a, "quiet", False)
+    from .confirm import set_assume_yes
+
+    set_assume_yes(getattr(a, "confirm", False))
     run = a.cmd == "run"  # run's stdout carries the model's text alone; the rest goes to stderr
     if a.cmd in _MODES:
         set_title(a.path or "(btb)", _MODES[a.cmd])

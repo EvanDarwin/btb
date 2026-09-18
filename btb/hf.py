@@ -10,13 +10,17 @@ import glob
 import json
 import os
 import re
+import shutil
 import struct
 import sys
-from collections.abc import Iterable
+import time
+from collections.abc import Callable, Iterable
 from enum import StrEnum
-from typing import Any, TypedDict
+from typing import Any, TypedDict, TypeVar
 
 from .kinds import Json
+
+T = TypeVar("T")
 
 # model_types the engine can actually serve (mirrors StreamedTextModel.family); a downloaded repo of any other
 # type is skipped by the discovery below so it never shows up as a servable model
@@ -412,6 +416,35 @@ def available_models(paths: Iterable[str] = (), pattern: str | None = None) -> l
     return [out[k] for k in sorted(out)]
 
 
+def _transient(e: OSError) -> bool:
+    """Whether a Hub failure is worth retrying: a 5xx or a rate-limit from the server, or a dropped connection
+    or timeout. A 4xx (a missing or gated repo, a malformed id) and a plain local disk error are not."""
+    code = getattr(getattr(e, "response", None), "status_code", None)
+    if code is not None:
+        return code in (408, 429) or code >= 500
+    return type(e).__module__.split(".")[0] in ("requests", "urllib3", "http") or isinstance(
+        e, (TimeoutError, ConnectionError)
+    )
+
+
+def _retry(fn: Callable[[], T], tries: int = 5, base: float = 1.5) -> T:
+    """Run `fn`, retrying a transient Hub/network failure with exponential backoff (1.5s, 3s, 6s...). A
+    permanent error (a missing repo, a bad id, a disk fault) raises on the first try. The Hub's own per-file
+    resume means a re-driven download picks up where it stopped rather than starting the large files over."""
+    last: OSError | None = None
+    for i in range(tries):
+        try:
+            return fn()
+        except OSError as e:
+            if not _transient(e):
+                raise
+            last = e
+            if i < tries - 1:
+                time.sleep(base * 2**i)
+    assert last is not None
+    raise last
+
+
 def _download(path: str) -> str:
     from huggingface_hub import snapshot_download
 
@@ -422,7 +455,7 @@ def _download(path: str) -> str:
     try:
         return snapshot_download(path, local_files_only=True, **kw)
     except Exception:
-        return snapshot_download(path, **kw)
+        return _retry(lambda: snapshot_download(path, **kw))
 
 
 def _hard_exit(code: int) -> None:  # abandons the download threads at once, past concurrent.futures' atexit join
@@ -471,7 +504,7 @@ def resolve(path: str, local: bool = False) -> str:
         from huggingface_hub import hf_hub_download
 
         try:
-            return hf_hub_download(head, tail, local_files_only=local)
+            return _retry(lambda: hf_hub_download(head, tail, local_files_only=local))
         except Exception as e:
             if local:
                 raise FileNotFoundError(path) from e
@@ -490,3 +523,114 @@ def resolve(path: str, local: bool = False) -> str:
         except Exception as e:  # the bare path: the CLI's not-found report keys on it
             raise FileNotFoundError(path) from e
     raise FileNotFoundError(path)
+
+
+def would_download(path: str) -> bool:
+    """Whether resolving `path` would fetch from the Hub: a repo id with no snapshot in the cache yet. A local
+    directory or GGUF file, or an already-cached repo, is False - resolving it touches no network."""
+    try:
+        resolve(path, local=True)
+        return False
+    except FileNotFoundError:
+        return True
+
+
+def _repo_file(path: str) -> tuple[str, str | None]:
+    """A model path split into (repo id, single file): `org/repo:model.gguf` -> ('org/repo', 'model.gguf'); a
+    plain repo id -> (path, None)."""
+    head, _, tail = path.rpartition(":")
+    return (head, tail) if head and is_gguf(tail) else (path, None)
+
+
+def hub_info(path: str) -> tuple[int, int] | None:
+    """What resolving repo id `path` would download, from the Hub: (total bytes, file count) over the files
+    btb keeps. Raise FileNotFoundError when the repo does not exist or its id is malformed, so a missing model
+    is surfaced as one rather than a prompt for something unfetchable. Return None when the Hub cannot be
+    reached (after retries), so a flaky network still lets the user try the download."""
+    import fnmatch
+
+    from huggingface_hub import HfApi
+    from huggingface_hub.errors import DisabledRepoError, HFValidationError, RepositoryNotFoundError
+
+    repo, one = _repo_file(path)
+    try:
+        info = _retry(lambda: HfApi().model_info(repo, files_metadata=True))
+    except (RepositoryNotFoundError, DisabledRepoError, HFValidationError) as e:
+        raise FileNotFoundError(path) from e
+    except OSError:
+        return None  # an outage that outlasted the retries: fall back to a size-less prompt
+    total = n = 0
+    for s in info.siblings or []:
+        name = getattr(s, "rfilename", "")
+        sz = int(getattr(s, "size", None) or 0)
+        if one is not None:  # a single GGUF file: its own size, nothing else
+            if name == one:
+                return (sz, 1)
+            continue
+        if "/" in name:  # ignore_patterns=["*/*"]: the repo root only, matching _download
+            continue
+        if any(fnmatch.fnmatch(name, pat) for pat in MODEL_FILES):
+            total += sz
+            n += 1
+    return (total, n)
+
+
+def _gb(n: int) -> str:
+    """bytes as a rough size for a prompt: one decimal under 10 GB, whole gigabytes past it"""
+    gb = n / 1e9
+    return f"~{gb:.0f} GB" if gb >= 10 else f"~{gb:.1f} GB"
+
+
+def download_target(path: str) -> str:
+    """The directory resolving repo id `path` writes into: huggingface_hub's cache (HF_HOME / HF_HUB_CACHE
+    honored) and the repo's own folder under it. btb passes no cache_dir to the Hub, so this is where the
+    files land - shown in the prompt so a download does not end up on the wrong drive unnoticed."""
+    from huggingface_hub import constants
+
+    repo, _ = _repo_file(path)
+    return os.path.join(constants.HF_HUB_CACHE, "models--" + repo.replace("/", "--"))
+
+
+def _free_bytes(path: str) -> int | None:
+    """Free bytes on the volume holding `path`, read at its nearest existing ancestor (the target folder is
+    not there before the first download); None when even that cannot be read."""
+    p = os.path.abspath(path)
+    while not os.path.exists(p):
+        parent = os.path.dirname(p)
+        if parent == p:
+            return None
+        p = parent
+    try:
+        return shutil.disk_usage(p).free
+    except OSError:
+        return None
+
+
+def confirm_download(path: str) -> bool:
+    """Gate a Hub download before it starts. A local or already-cached model returns True without asking; a
+    repo that does not exist raises FileNotFoundError (surfaced as a missing model, no prompt); otherwise ask
+    the user (see confirm()), naming the size and file count when the Hub reports them, the directory the
+    files will land in, the space free there, and the shortfall when the download would not fit."""
+    if not would_download(path):
+        return True
+    from .confirm import confirm
+
+    info = hub_info(path)
+    total = 0
+    bits = []
+    if info is not None:
+        total, n = info
+        if total:
+            bits.append(_gb(total))
+        if n:
+            bits.append(f"{n} file{'s' if n != 1 else ''}")
+    detail = f" ({', '.join(bits)})" if bits else ""
+    target = download_target(path)
+    free = _free_bytes(target)
+    where = f" into {target}"
+    if free is not None:
+        where += f" ({_gb(free)} free"
+        if total and free < total:
+            where += f" - short by {_gb(total - free)}"
+        where += ")"
+    return confirm(f"download {path} from Hugging Face{detail}{where}?")

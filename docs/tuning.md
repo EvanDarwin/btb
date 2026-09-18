@@ -130,6 +130,7 @@ ignored elsewhere.
 | variable | default | effect |
 |---|---|---|
 | `BTB_API_KEY` | none | bearer key the servers require, and the `--api-key` default |
+| `BTB_CONFIRM` | off | `1`: answer yes to prompts, as `--confirm`, so a non-interactive run may fetch an uncached model |
 | `BTB_POOL` | 1 | seed an MLX memory pool at load (Apple silicon); `0` skips it |
 | `BTB_CPU_GEMM` | 1 | Mac CPU tier: bf16 prefill matmuls on MLX's CPU stream; `0` (or `--fp32 1`) keeps float32 |
 | `BTB_FUSED_NORM` | 1 | CUDA: fused RMSNorm; `0` restores the module's |

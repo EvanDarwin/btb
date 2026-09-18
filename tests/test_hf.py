@@ -73,6 +73,38 @@ def test_a_hub_download_stays_interruptible(monkeypatch: MonkeyPatch) -> None:
     assert time.time() - t0 < 3, "the wait was not interruptible"
 
 
+def test_a_download_prompt_names_where_it_writes_and_the_space_there(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    """the download gate's question says what the Hub reports (size, file count), the directory the files land
+    in (the Hub cache's repo folder, so a wrong HF_HOME shows before a byte is written), the space free on that
+    volume, and the shortfall when the download would not fit; a cached or local model is never asked about"""
+    import btb.confirm
+
+    asked: list[str] = []
+    monkeypatch.setattr(btb.confirm, "confirm", lambda q, **kw: asked.append(q) or True)
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_CACHE", str(tmp_path))
+    monkeypatch.setattr(hf, "would_download", lambda path: True)
+    monkeypatch.setattr(hf, "hub_info", lambda path: (8_100_000_000, 12))
+    target = os.path.join(str(tmp_path), "models--Qwen--Qwen3-4B")
+    assert hf.download_target("Qwen/Qwen3-4B") == target
+    assert hf.download_target("Qwen/Qwen3-4B:model.gguf") == target, "a single file lands in the repo's folder"
+
+    monkeypatch.setattr(hf, "_free_bytes", lambda path: 412_000_000_000)
+    assert hf.confirm_download("Qwen/Qwen3-4B")
+    assert asked[-1] == f"download Qwen/Qwen3-4B from Hugging Face (~8.1 GB, 12 files) into {target} (~412 GB free)?"
+
+    monkeypatch.setattr(hf, "_free_bytes", lambda path: 4_000_000_000)
+    hf.confirm_download("Qwen/Qwen3-4B")
+    assert asked[-1].endswith(f"into {target} (~4.0 GB free - short by ~4.1 GB)?")
+
+    monkeypatch.setattr(hf, "_free_bytes", lambda path: None)  # a volume that cannot be read: no space claim
+    hf.confirm_download("Qwen/Qwen3-4B")
+    assert asked[-1].endswith(f"into {target}?")
+
+    monkeypatch.setattr(hf, "would_download", lambda path: False)
+    n = len(asked)
+    assert hf.confirm_download("Qwen/Qwen3-4B") and len(asked) == n, "a cached model is not asked about"
+
+
 def test_available_models_finds_the_fixture_by_path() -> None:
     hits = hf.available_models(paths=[FIXTURE])
     names = {h["name"] for h in hits}
