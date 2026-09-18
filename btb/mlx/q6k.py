@@ -7,10 +7,10 @@ whole matrix, for the rare path that wants a bf16 copy."""
 
 from __future__ import annotations
 
-import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from .core import mx
+from .launch import BlockKernel, RowKernel
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -91,95 +91,28 @@ _GATHER = r"""
     q6k_decode_block<T>(W + ((size_t)row * NSB + (size_t)c) * 210, out + ((size_t)t * NSB + (size_t)c) * 256);
 """
 
-_matvec_kernels: dict[Any, Any] = {}
-_deq_kernel = None
-_gather_kernels: dict[int, Any] = {}
-_lock = threading.Lock()
-ROWS_MAX = 16  # a call takes up to 16 rows (acc[TR] in registers); a wider pass is chunked
-
-
-def _matvec_kernel(rows: int, nsb: int, tr: int) -> Any:
-    m = mx()
-    key = (rows, nsb, tr)
-    with _lock:
-        k = _matvec_kernels.get(key)
-        if k is None:
-            k = _matvec_kernels[key] = m.fast.metal_kernel(
-                name=f"btb_q6k_mv_{rows}_{nsb}_{tr}",
-                input_names=["W", "x"],
-                output_names=["out"],
-                header=f"#define ROWS {rows}\n#define NSB {nsb}\n#define TR {tr}\n",
-                source=_MATVEC,
-            )
-    return k
+_MV = RowKernel("q6k_mv", ["W", "x"], "", _MATVEC)
+_DEQ = BlockKernel("q6k_dequant", ["W"], _DECODE, _DEQUANT)
+_gathers: dict[int, BlockKernel] = {}  # by superblocks a row: the gather's source reads NSB as a define
 
 
 def matvec_q6k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:
     """y[T, rows] = x[T, cols] . W[rows, cols]^T, W the raw Q6_K bytes (rows * cols / 256 row-major superblocks).
     float32 accumulation over the blocks as stored, y in x's dtype; 1..16 rows a launch, a wider pass chunked."""
-    m = mx()
-    nsb = cols // 256
-    grid = ((rows * 32 + 255) // 256) * 256
-    outs = []
-    for s in range(0, int(x.shape[0]), ROWS_MAX):
-        xr = x[s : s + ROWS_MAX]
-        tr = int(xr.shape[0])
-        outs.append(
-            _matvec_kernel(rows, nsb, tr)(
-                inputs=[w_bytes, xr],
-                grid=(grid, 1, 1),
-                threadgroup=(256, 1, 1),
-                output_shapes=[(tr, rows)],
-                output_dtypes=[x.dtype],
-                template=[("T", x.dtype)],
-            )[0]
-        )
-    return outs[0] if len(outs) == 1 else m.concatenate(outs, axis=0)
+    return _MV.matvec([w_bytes], x, [], rows, cols // 256)
 
 
 def gather_q6k(w_bytes: mx_.array, tok: mx_.array, cols: int) -> mx_.array:
     """the embedding rows for token ids `tok` [T] (int32): [T, cols] bf16, each row's superblocks dequantized
     straight from the packed bytes - no bf16 copy of the whole table."""
-    m = mx()
     nsb = cols // 256
-    with _lock:
-        k = _gather_kernels.get(nsb)
-        if k is None:
-            k = _gather_kernels[nsb] = m.fast.metal_kernel(
-                name=f"btb_q6k_gather_{nsb}",
-                input_names=["W", "tok"],
-                output_names=["out"],
-                header=_DECODE + f"#define NSB {nsb}\n",
-                source=_GATHER,
-            )
-    n = int(tok.shape[0]) * nsb
-    grid = ((n + 255) // 256) * 256
-    return k(
-        inputs=[w_bytes, tok.astype(m.int32)],
-        grid=(grid, 1, 1),
-        threadgroup=(256, 1, 1),
-        output_shapes=[(int(tok.shape[0]), cols)],
-        output_dtypes=[m.bfloat16],
-        template=[("T", m.bfloat16)],
-    )[0]
+    k = _gathers.get(nsb)
+    if k is None:
+        k = _gathers[nsb] = BlockKernel(f"q6k_gather_{nsb}", ["W", "tok"], _DECODE + f"#define NSB {nsb}\n", _GATHER)
+    n = int(tok.shape[0])
+    return k.run([w_bytes, tok.astype(mx().int32)], n * nsb, (n, cols), nblk=False)
 
 
 def dequant_q6k(w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
     """the full [rows, cols] bf16 weight, the numbers llama.cpp dequantizes (for a path that wants a bf16 copy)."""
-    global _deq_kernel
-    m = mx()
-    nblk = rows * cols // 256
-    with _lock:
-        if _deq_kernel is None:
-            _deq_kernel = m.fast.metal_kernel(
-                name="btb_q6k_dequant", input_names=["W"], output_names=["out"], header=_DECODE, source=_DEQUANT
-            )
-    grid = ((nblk + 255) // 256) * 256
-    return _deq_kernel(
-        inputs=[w_bytes],
-        grid=(grid, 1, 1),
-        threadgroup=(256, 1, 1),
-        output_shapes=[(rows, cols)],
-        output_dtypes=[m.bfloat16],
-        template=[("T", m.bfloat16), ("NBLK", nblk)],
-    )[0]
+    return _DEQ.run([w_bytes], rows * cols // 256, (rows, cols))

@@ -24,6 +24,7 @@ from ..mlx.q6k import gather_q6k
 from ..options import Device as DeviceKind
 from ..options import DeviceName
 from ..pack12 import parent_dir
+from ..quant import Q6_K
 from ..sysinfo import host_commit_bytes, host_free_bytes
 from .cache import GrowLayer
 from .cuda import _CudaMixin
@@ -230,12 +231,10 @@ class StreamedTextModel(
             self.head_host = _HostLinear(self._get(self.head_key, gguf_shortcut=True), key=self.head_key)
             self._bind_mlx_linears([self.head_host])
         elif resident_head:
-            with self._meta:
-                self.head = torch.nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
-            self._adopt(self.head, "weight", self._get(self.head_key))
+            self.head = self._make_head()
         # the embedding table, unless the tied head is Q6_K: then its packed bytes are the table, gathered on demand
         # (embed / _mlx_embed_rows) instead of a bf16 copy of the whole vocabulary
-        tied_q6k = self.head_host is not None and getattr(self.head_host.mx, "q6k", None) is not None
+        tied_q6k = self.head_host is not None and self.head_host.mx is not None and self.head_host.mx.is_stored(Q6_K)
         if tied_q6k and self.head_key == self.prefix + "embed_tokens.weight":
             self.embed_table = None
         else:
@@ -402,17 +401,19 @@ class StreamedTextModel(
         if (
             head is not None
             and self.head_key == self.prefix + "embed_tokens.weight"
+            and isinstance(head, torch.nn.Linear)  # a packed head has no table to gather from: the embed_table below
             and head.weight.device.type != "cpu"
         ):
             # tied embeddings: the head on the card is the table - one gather there, no host round trip
             return torch.nn.functional.embedding(ids.to(head.weight.device), head.weight)
         if self.embed_table is None:  # tied Q6_K: gather the rows straight from the head's packed bytes
             hh = self.head_host
-            assert hh is not None
-            raw, _rows, cols = hh.mx.q6k
+            assert hh is not None and hh.mx is not None
+            s = hh.mx.stored
+            assert s is not None  # embed_table is None only for a tied Q6_K head kept as stored
             tok = mlxdev.mx().array(ids.reshape(-1).to(torch.int32).cpu().numpy())
-            rows = mlxdev.from_mx(gather_q6k(raw, tok, cols))
-            return rows.view(*ids.shape, cols).to(self.dev)
+            rows = mlxdev.from_mx(gather_q6k(s.streams[0], tok, s.cols))
+            return rows.view(*ids.shape, s.cols).to(self.dev)
         rows = self.embed_table[ids.reshape(-1).cpu()]
         return rows.view(*ids.shape, self.embed_table.shape[1]).to(self.dev)
 

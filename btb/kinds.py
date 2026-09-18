@@ -87,3 +87,13 @@ class LayerTier(StrEnum):
     HOST = "host"
     COLD = "cold"
     STREAMED = "streamed"
+
+
+class SlotKind(StrEnum):
+    """what a cold ring slot holds for one linear: the checkpoint's bf16 bytes read off the drive, a 12-bit store
+    entry read off the drive, or bf16 the engine dequantizes into the slot each pass (a GGUF tensor of another
+    storage type, which is not on the drive as bf16)"""
+
+    BF16 = "bf16"
+    P12 = "p12"
+    MEM = "mem"

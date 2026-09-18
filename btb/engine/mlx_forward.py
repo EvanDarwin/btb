@@ -17,6 +17,7 @@ from .. import pool
 from ..kinds import LayerKind, NodePath, Parents, TokenRows, Tokens
 from ..mlx import fused as fk
 from ..mlx.q6k import gather_q6k
+from ..quant import Q6_K, quant_of
 from ..sampling import GREEDY
 from ..session import Session
 from .cache import GrowLayer
@@ -134,28 +135,7 @@ class _MlxMixin(_State):
         lins = [m for m in lins if m.mx is None]
         if not lins:
             return 0
-        lins = [m for m in lins if not self._bind_gguf_q4k(m)]
-        if not lins:
-            return 0
-        lins = [m for m in lins if not self._bind_gguf_q5k(m)]
-        if not lins:
-            return 0
-        lins = [m for m in lins if not self._bind_gguf_q2k(m)]
-        if not lins:
-            return 0
-        lins = [m for m in lins if not self._bind_gguf_q3k(m)]
-        if not lins:
-            return 0
-        lins = [m for m in lins if not self._bind_gguf_iq4(m)]
-        if not lins:
-            return 0
-        lins = [m for m in lins if not self._bind_gguf_lattice(m)]
-        if not lins:
-            return 0
-        lins = [m for m in lins if not self._bind_gguf_affine(m)]
-        if not lins:
-            return 0
-        lins = [m for m in lins if not self._bind_gguf_q6k(m)]
+        lins = [m for m in lins if not self._bind_gguf(m)]
         if not lins:
             return 0
         be = self.mlx
@@ -207,203 +187,45 @@ class _MlxMixin(_State):
         self.mlx_state.bytes += cur
         return cur
 
-    def _bind_gguf_affine(self, m: Any) -> bool:
-        """a GGUF tensor of an affine storage type bound as stored for the packed kernels (`gguf_packed`): the
-        torch weight becomes a shape-only placeholder, so the bf16 copy `_get` made is released; False when the
-        linear is not such a tensor"""
+    def _bind_gguf(self, m: _HostLinear) -> bool:
+        """a GGUF tensor of a type MLX multiplies as stored (the registry's `QuantType.mlx`) bound to its kernel
+        instead of a bf16 slot: the affine types repacked for `quantized_matmul` (`gguf.affine`), every other
+        kind as its own bytes (`Backend.weight_packed`, batch-invariant, so speculation over it is bit-exact).
+        The torch weight becomes a shape-only placeholder, so the bf16 copy `_get` made is released. False when
+        the linear is not such a tensor."""
         gg = getattr(self, "gguf", None)
-        if gg is None or not getattr(self, "gguf_packed", True) or m.key not in getattr(self, "_gguf_names", {}):
+        key = m.key
+        if gg is None or not getattr(self, "gguf_packed", True) or key is None:
             return False
-        aff = gg.affine(self._gguf_names[m.key])
-        if aff is None:
+        if key not in getattr(self, "_gguf_names", {}):
             return False
-        be = self.mlx
-        assert be is not None
-        # bf16 scales on the bf16 path (the fast MLX kernel, half the metadata bytes); float32 kept for an --fp32 run
-        fp32 = self.compute_dtype is not None and self.compute_dtype != torch.bfloat16
-        m.mx = be.weight_affine(
-            aff.wq, aff.scales, aff.biases, aff.bits, aff.group, aff.shape, None if fp32 else mlxdev.mx().bfloat16
-        )
-        shape = tuple(m.weight.shape)
-        m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*shape), requires_grad=False)
-        self.mlx_state.affine = True
-        meta = aff.scales.nbytes + aff.biases.nbytes
-        self.mlx_state.bytes += int(aff.wq.nbytes + (meta if fp32 else meta // 2))
-        return True
-
-    def _bind_gguf_q4k(self, m: Any) -> bool:
-        """a GGUF Q4_K tensor bound as its own native bytes for `matvec_q4k` (batch-invariant, so affine
-        speculation is bit-exact) instead of the bf16-scale affine repack: the 144 B/256 superblocks stay packed
-        and the torch weight becomes a placeholder, so the bf16 copy `_get` made is released. Runs before the
-        affine binder, which would otherwise repack Q4_K. False when the linear is not a Q4_K tensor."""
-        gg = getattr(self, "gguf", None)
-        if gg is None or not getattr(self, "gguf_packed", True) or m.key not in getattr(self, "_gguf_names", {}):
-            return False
-        name = self._gguf_names[m.key]
-        t = gg.tensors.get(name)
-        if t is None or t.tensor_type.name != "Q4_K":
-            return False
-        shape = tuple(m.weight.shape)
-        if len(shape) != 2 or shape[1] % 256:
-            return False
-        be = self.mlx
-        assert be is not None
-        raw = gg.raw(name).numpy()
-        m.mx = be.weight_q4k(raw, shape)
-        m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*shape), requires_grad=False)
-        self.mlx_state.affine = True  # not a plain bf16 slot: stays on the per-op path, off the megakernel
-        self.mlx_state.bytes += int(raw.nbytes)
-        return True
-
-    def _bind_gguf_q5k(self, m: Any) -> bool:
-        """a GGUF Q5_K tensor bound as its own native bytes for `matvec_q5k` (batch-invariant, and beats the
-        bf16-dequant path that lost to llama.cpp): the 176 B/256 superblocks stay packed, the torch weight a
-        placeholder. False when the linear is not a Q5_K tensor."""
-        gg = getattr(self, "gguf", None)
-        if gg is None or not getattr(self, "gguf_packed", True) or m.key not in getattr(self, "_gguf_names", {}):
-            return False
-        name = self._gguf_names[m.key]
-        t = gg.tensors.get(name)
-        if t is None or t.tensor_type.name != "Q5_K":
-            return False
-        shape = tuple(m.weight.shape)
-        if len(shape) != 2 or shape[1] % 256:
-            return False
-        be = self.mlx
-        assert be is not None
-        raw = gg.raw(name).numpy()
-        m.mx = be.weight_q5k(raw, shape)
-        m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*shape), requires_grad=False)
-        self.mlx_state.affine = True  # not a plain bf16 slot: stays on the per-op path, off the megakernel
-        self.mlx_state.bytes += int(raw.nbytes)
-        return True
-
-    def _bind_gguf_q2k(self, m: Any) -> bool:
-        """a GGUF Q2_K tensor bound as its own native bytes for `matvec_q2k` (batch-invariant, beats the
-        bf16-dequant path): the 84 B/256 superblocks stay packed, the torch weight a placeholder."""
-        gg = getattr(self, "gguf", None)
-        if gg is None or not getattr(self, "gguf_packed", True) or m.key not in getattr(self, "_gguf_names", {}):
-            return False
-        name = self._gguf_names[m.key]
-        t = gg.tensors.get(name)
-        if t is None or t.tensor_type.name != "Q2_K":
-            return False
-        shape = tuple(m.weight.shape)
-        if len(shape) != 2 or shape[1] % 256:
-            return False
-        be = self.mlx
-        assert be is not None
-        raw = gg.raw(name).numpy()
-        m.mx = be.weight_q2k(raw, shape)
-        m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*shape), requires_grad=False)
-        self.mlx_state.affine = True  # not a plain bf16 slot: stays on the per-op path, off the megakernel
-        self.mlx_state.bytes += int(raw.nbytes)
-        return True
-
-    def _bind_gguf_q3k(self, m: Any) -> bool:
-        """a GGUF Q3_K tensor bound as its own native bytes for `matvec_q3k` (batch-invariant, beats the
-        bf16-dequant path): the 110 B/256 superblocks stay packed, the torch weight a placeholder."""
-        gg = getattr(self, "gguf", None)
-        if gg is None or not getattr(self, "gguf_packed", True) or m.key not in getattr(self, "_gguf_names", {}):
-            return False
-        name = self._gguf_names[m.key]
-        t = gg.tensors.get(name)
-        if t is None or t.tensor_type.name != "Q3_K":
-            return False
-        shape = tuple(m.weight.shape)
-        if len(shape) != 2 or shape[1] % 256:
-            return False
-        be = self.mlx
-        assert be is not None
-        raw = gg.raw(name).numpy()
-        m.mx = be.weight_q3k(raw, shape)
-        m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*shape), requires_grad=False)
-        self.mlx_state.affine = True  # not a plain bf16 slot: stays on the per-op path, off the megakernel
-        self.mlx_state.bytes += int(raw.nbytes)
-        return True
-
-    def _bind_gguf_iq4(self, m: Any) -> bool:
-        """a GGUF IQ4_NL/IQ4_XS tensor bound as its own native bytes for `matvec_iq4nl`/`matvec_iq4xs`
-        (batch-invariant, beats the bf16-dequant path): the codebook blocks stay packed, the torch weight a
-        placeholder."""
-        gg = getattr(self, "gguf", None)
-        if gg is None or not getattr(self, "gguf_packed", True) or m.key not in getattr(self, "_gguf_names", {}):
-            return False
-        name = self._gguf_names[m.key]
-        t = gg.tensors.get(name)
-        if t is None or t.tensor_type.name not in ("IQ4_NL", "IQ4_XS"):
-            return False
-        shape = tuple(m.weight.shape)
-        blkw = 32 if t.tensor_type.name == "IQ4_NL" else 256
-        if len(shape) != 2 or shape[1] % blkw:
-            return False
-        be = self.mlx
-        assert be is not None
-        raw = gg.raw(name).numpy()
-        m.mx = be.weight_iq4nl(raw, shape) if t.tensor_type.name == "IQ4_NL" else be.weight_iq4xs(raw, shape)
-        m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*shape), requires_grad=False)
-        self.mlx_state.affine = True  # not a plain bf16 slot: stays on the per-op path, off the megakernel
-        self.mlx_state.bytes += int(raw.nbytes)
-        return True
-
-    # GGUF IQ lattice type name -> the backend's lattice-kernel kind
-    _LATT_KINDS = {
-        "IQ3_XXS": "iq3xxs",
-        "IQ2_XXS": "iq2xxs",
-        "IQ2_XS": "iq2xs",
-        "IQ2_S": "iq2s",
-        "IQ1_S": "iq1s",
-        "IQ3_S": "iq3s",
-        "IQ1_M": "iq1m",
-    }
-
-    def _bind_gguf_lattice(self, m: Any) -> bool:
-        """a GGUF IQ lattice tensor (the grid-codebook quants behind the Unsloth dynamic mixes) bound as its own
-        native bytes for `matvec_lattice` (batch-invariant, beats the bf16-dequant path); the torch weight a
-        placeholder."""
-        gg = getattr(self, "gguf", None)
-        if gg is None or not getattr(self, "gguf_packed", True) or m.key not in getattr(self, "_gguf_names", {}):
-            return False
-        name = self._gguf_names[m.key]
+        name = self._gguf_names[key]
         t = gg.tensors.get(name)
         if t is None:
             return False
-        kind = self._LATT_KINDS.get(t.tensor_type.name)
-        if kind is None:
-            return False
-        shape = tuple(m.weight.shape)
-        if len(shape) != 2 or shape[1] % 256:
+        q = quant_of(t.tensor_type.name)
+        shape = tuple(int(x) for x in m.weight.shape)
+        if q is None or q.mlx is None or not q.packable(shape):
             return False
         be = self.mlx
         assert be is not None
-        raw = gg.raw(name).numpy()
-        m.mx = be.weight_lattice(kind, raw, shape)
+        if q.mlx == "affine":
+            aff = gg.affine(name)
+            if aff is None:
+                return False
+            # bf16 scales on the bf16 path (the fast MLX kernel, half the metadata bytes); float32 kept for an --fp32 run
+            fp32 = self.compute_dtype is not None and self.compute_dtype != torch.bfloat16
+            m.mx = be.weight_affine(
+                aff.wq, aff.scales, aff.biases, aff.bits, aff.group, aff.shape, None if fp32 else mlxdev.mx().bfloat16
+            )
+            meta = aff.scales.nbytes + aff.biases.nbytes
+            self.mlx_state.bytes += int(aff.wq.nbytes + (meta if fp32 else meta // 2))
+        else:
+            raw = gg.raw(name).numpy()
+            m.mx = be.weight_packed(q, raw, shape)
+            self.mlx_state.bytes += int(raw.nbytes)
         m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*shape), requires_grad=False)
         self.mlx_state.affine = True  # not a plain bf16 slot: stays on the per-op path, off the megakernel
-        self.mlx_state.bytes += int(raw.nbytes)
-        return True
-
-    def _bind_gguf_q6k(self, m: Any) -> bool:
-        """a GGUF Q6_K tensor bound as its own bytes for `matvec_q6k` (the head and every ffn_down of a k-quant
-        file): the 6-bit blocks stay packed instead of a bf16 copy, and the torch weight becomes a placeholder so
-        the bf16 copy `_get` made is released. False when the linear is not a Q6_K tensor."""
-        gg = getattr(self, "gguf", None)
-        if gg is None or not getattr(self, "gguf_packed", True) or m.key not in getattr(self, "_gguf_names", {}):
-            return False
-        name = self._gguf_names[m.key]
-        t = gg.tensors.get(name)
-        if t is None or t.tensor_type.name != "Q6_K":
-            return False
-        shape = tuple(m.weight.shape)
-        if len(shape) != 2 or shape[1] % 256:
-            return False
-        be = self.mlx
-        assert be is not None
-        raw = gg.raw(name).numpy()
-        m.mx = be.weight_q6k(raw, shape)
-        m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*shape), requires_grad=False)
-        self.mlx_state.affine = True  # not a plain bf16 slot: stays on the per-op path, off the megakernel
-        self.mlx_state.bytes += int(raw.nbytes)
         return True
 
     def _mlx_act(self) -> Any:
@@ -1332,11 +1154,12 @@ class _MlxMixin(_State):
         hh = self.head_host
         if (
             hh is not None
-            and getattr(hh.mx, "q6k", None) is not None
+            and hh.mx is not None
+            and hh.mx.is_stored(Q6_K)
             and self.head_key == self.prefix + "embed_tokens.weight"
         ):
-            raw, _rows, cols = hh.mx.q6k
-            return gather_q6k(raw, tok, cols)
+            s = hh.mx.stored
+            return gather_q6k(s.streams[0], tok, s.cols)
         return mlxdev.mx().take(self._mlx_embed(), tok, axis=0)
 
     def _mlx_batch_ok(self, B: int, on_layer: Any, prefill_only: bool) -> bool:

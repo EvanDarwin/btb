@@ -15,9 +15,10 @@ from typing import Any
 import numpy as np
 import torch
 
-from .hf import AFFINE_TYPES, ARCH_MODEL_TYPES, gguf_lib, is_gguf
+from .hf import ARCH_MODEL_TYPES, gguf_lib, is_gguf
 from .kinds import Json
 from .options import NotAModel, UnsupportedModel
+from .quant import AFFINE_TYPES
 
 
 class GGUFModel:
@@ -294,7 +295,7 @@ class GGUFModel:
         return torch.from_numpy(np.ascontiguousarray(arr)).to(torch.bfloat16)
 
 
-# The affine storage types (hf.AFFINE_TYPES) are read from the block layouts the GGUF format documents into
+# The affine storage types (quant.AFFINE_TYPES) are read from the block layouts the GGUF format documents into
 # the form MLX's quantized_matmul multiplies as stored; held to the package's own dequantization by the tests.
 GROUP = 32
 

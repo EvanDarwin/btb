@@ -389,4 +389,5 @@ class _FamiliesMixin(_State):
             self._mlx_fuse(layer)
         if getattr(self, "_packed", None):
             self._bind_host_packed_layer(layer)
+        self._bind_host_quant_layer(i, layer)
         return layer
