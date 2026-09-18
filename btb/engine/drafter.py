@@ -420,7 +420,8 @@ class MTPDrafter:
         head = getattr(self, "_head_t", None)
         if head is None:
             sm = self.sm
-            W = (sm.head.weight if sm.resident_head else sm._get(sm.head_key)).detach()
+            # a head resident as packed bytes has no bf16 weight to slice: the file's dequant, as a host head
+            W = (sm.head.weight if isinstance(sm.head, torch.nn.Linear) else sm._get(sm.head_key)).detach()
             n = int(getattr(sm, "draft_vocab", 0) or 0)
             whole = not (0 < n < int(W.shape[0]))
             if whole and W.device.type != self.dev.type:
@@ -530,7 +531,7 @@ class MTPDrafter:
         else:
             head = self._torch_head()
             if head is None:
-                W = (sm.head.weight if sm.resident_head else sm._get(sm.head_key)).detach()
+                W = (sm.head.weight if isinstance(sm.head, torch.nn.Linear) else sm._get(sm.head_key)).detach()
                 step = 32768
                 logits = torch.cat(
                     [hn.to(self.cd) @ W[c : c + step].to(self.dev, self.cd).T for c in range(0, W.shape[0], step)],

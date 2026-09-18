@@ -18,8 +18,9 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from .hf import AFFINE_TYPES, is_gguf
+from .hf import is_gguf
 from .kinds import Log
+from .quant import AFFINE_TYPES
 
 if TYPE_CHECKING:
     from .mlx import Shared

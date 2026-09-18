@@ -15,6 +15,7 @@ from typing import Any
 import torch
 
 from .. import mlx as mlxdev
+from ..quant import CARD_KERNELS
 from ..sysinfo import raise_file_limit
 
 # -- where the built library and the CUDA kernels ship: btb/native/<platform-tag>/ ---------------------------
@@ -563,7 +564,8 @@ class _Cuda:
     of the cache the weights' streaming loads never evict) and `persist_limit()` the card's ceiling for it."""
 
     _NAMES = {"windows": "nvcuda.dll", "linux": "libcuda.so.1"}
-    KERNELS = (
+    # every fatbin carries these; the packed gemvs (quant.CARD_KERNELS) are bound when the fatbin has them
+    _REQUIRED = (
         "btb_gemv_bf16_m1",
         "btb_gemv_bf16_m2",
         "btb_gemv_bf16_m4",
@@ -594,6 +596,10 @@ class _Cuda:
         "btb_sample_keys",
         "btb_sample_verify",
     )
+    # a fatbin built before a packed type was added lacks its entries: bound when present, skipped when not, and
+    # the feature that needs one reads `name in fn` (`card_quant_avail`) - so an older fatbin keeps the card graph
+    OPTIONAL = CARD_KERNELS
+    KERNELS = _REQUIRED + tuple(sorted(CARD_KERNELS))
     # cuda.h
     _LIMIT_PERSISTING_L2 = 0x06
     _ATTR_L2_SIZE = 38
@@ -631,7 +637,12 @@ class _Cuda:
         self.fn: dict[str, ctypes.c_void_p] = {}
         for k in self.KERNELS:
             f = ctypes.c_void_p()
-            self._call("cuModuleGetFunction", ctypes.byref(f), self.module, ctypes.c_char_p(k.encode()))
+            try:
+                self._call("cuModuleGetFunction", ctypes.byref(f), self.module, ctypes.c_char_p(k.encode()))
+            except RuntimeError:
+                if k not in self.OPTIONAL:
+                    raise
+                continue
             self.fn[k] = f
         dev = ctypes.c_int()
         self._call("cuCtxGetDevice", ctypes.byref(dev))

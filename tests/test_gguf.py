@@ -32,6 +32,13 @@ GGUF = GGUF_FIXTURES
 PROMPT = [3, 17, 42, 99, 7, 250, 11, 64]
 
 
+def _stored_kind(m: torch.nn.Module) -> str | None:
+    """the MLX kernel kind a host linear's weight is bound to as stored; None for a bf16 slot or a non-linear"""
+    w = getattr(m, "mx", None)
+    s = None if w is None else w.stored
+    return None if s is None else str(s.q.mlx)
+
+
 def _need() -> None:
     if not os.path.isfile(os.path.join(GGUF, "tiny_qwen3-bf16.gguf")):
         pytest.skip("the GGUF fixtures are not here (tests/make_fixtures.py gguf)")
@@ -387,7 +394,7 @@ def test_a_q6k_gguf_multiplies_its_blocks_as_stored_on_mlx() -> None:
     for packed in (1, 0):
         with btb.load(path, device="mlx", gguf_packed=packed, log=None) as sm:
             if packed:
-                assert any(getattr(m.mx, "q6k", None) is not None for m in sm.host[0].modules() if hasattr(m, "mx"))
+                assert any(_stored_kind(m) == "q6k" for m in sm.host[0].modules())
             logits[packed] = sm.forward(PROMPT, cache=sm.new_cache()).float()[0, -1]
             out, _ = sm.generate(PROMPT, 8, speculate=False)
             toks[packed] = [int(t) for t in out]
@@ -425,7 +432,14 @@ def test_a_native_kernel_gguf_multiplies_its_blocks_as_stored_on_mlx(quant: str,
 
     import btb
     from btb.gguf import GGUFModel
-    from btb.mlx.iquant import matvec_iq4nl, matvec_iq4xs, matvec_lattice, repack_iq4nl, repack_lattice
+    from btb.mlx.iquant import (
+        LATTICE_KINDS,
+        matvec_iq4nl,
+        matvec_iq4xs,
+        matvec_lattice,
+        repack_iq4nl,
+        repack_lattice,
+    )
     from btb.mlx.kquant import matvec_q2k, matvec_q3k, matvec_q4k, matvec_q5k
     from btb.mlx.q6k import matvec_q6k
 
@@ -476,10 +490,9 @@ def test_a_native_kernel_gguf_multiplies_its_blocks_as_stored_on_mlx(quant: str,
         with btb.load(path, device="mlx", gguf_packed=packed, log=None) as sm:
             if packed:
                 bound = any(
-                    getattr(m.mx, kind, None) is not None
+                    (_stored_kind(m) in LATTICE_KINDS) if kind == "latt" else (_stored_kind(m) == kind)
                     for layer in sm.host.values()
                     for m in layer.modules()
-                    if hasattr(m, "mx")
                 )
                 assert bound, f"{quant}: no tensor bound to the {kind} kernel"
             logits[packed] = sm.forward(PROMPT, cache=sm.new_cache()).float()[0, -1]
@@ -525,7 +538,7 @@ def test_a_q4k_self_draft_speculates_to_the_greedy_tokens_on_mlx() -> None:
         pytest.skip("Qwen3-0.6B-Q4_K_M.gguf is not cached")
     with btb.load(path, device="mlx", gguf_packed=1, draft_model=path, log=None) as sm:
         assert sm.draft_engine is not None
-        assert any(getattr(m.mx, "q4k", None) is not None for m in sm.host[0].modules() if hasattr(m, "mx"))
+        assert any(_stored_kind(m) == "q4k" for m in sm.host[0].modules())
         ids = sm.prompt_ids("Write a detailed paragraph about the ocean and its depths.")
         greedy = sm.generate(ids, 48, speculate=False)
         spec = sm.generate(ids, 48, speculate=True)

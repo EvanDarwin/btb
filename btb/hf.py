@@ -78,9 +78,6 @@ def draft_notice(model: str | None) -> str | None:
 GGUF_EXT = ".gguf"
 # btb's families by their llama.cpp architecture name (general.architecture), an explicit table
 ARCH_MODEL_TYPES = {"qwen3": "qwen3", "phi3": "phi3", "gpt-oss": "gpt_oss"}
-# the GGUF storage types whose blocks are an affine quantization at group 32 (a scale and an offset per 32
-# values), the form the packed kernels multiply as stored; the value is the bits an integer takes
-AFFINE_TYPES = {"Q4_0": 4, "Q4_1": 4, "Q8_0": 8, "Q4_K": 4}
 
 
 def is_gguf(path: Any) -> bool:
