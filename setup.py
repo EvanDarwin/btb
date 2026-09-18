@@ -7,10 +7,12 @@
 # arm64 build on a Linux box. The library is loaded by ctypes, not linked to the Python ABI, so the tag is
 # `py3-none-<platform>`: any Python 3, that platform. `build.py` sets BTB_WHEEL_PLAT to the target it built
 # the library for (accurate across a cross-build); a bare `pip install .` falls back to the host platform.
+import datetime
 import glob
 import os
 
 from setuptools import setup
+from setuptools.command.build_py import build_py as _build_py
 
 try:
     from setuptools.command.bdist_wheel import bdist_wheel as _bdist_wheel
@@ -42,4 +44,20 @@ class bdist_wheel(_bdist_wheel):  # type: ignore[misc]  # wheel ships no stubs
         return "py3", "none", os.environ.get("BTB_WHEEL_PLAT", plat)
 
 
-setup(cmdclass={"bdist_wheel": bdist_wheel})
+class build_py(_build_py):  # type: ignore[misc]  # setuptools ships no stubs for its commands
+    def run(self) -> None:
+        super().run()
+        # bake the build date into the package so the FSL notice's two-year window keys off the actual build,
+        # not a constant someone must remember to bump. Written into build_lib (never the source tree), and
+        # SOURCE_DATE_EPOCH honored so a reproducible build stays reproducible.
+        epoch = os.environ.get("SOURCE_DATE_EPOCH")
+        day = datetime.datetime.fromtimestamp(int(epoch), datetime.UTC).date() if epoch else datetime.date.today()
+        target = os.path.join(self.build_lib, "btb", "_build.py")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(
+                f'# generated at build time by setup.py; the FSL notice keys its window off this\nBUILD_DATE = "{day.isoformat()}"\n'
+            )
+
+
+setup(cmdclass={"bdist_wheel": bdist_wheel, "build_py": build_py})

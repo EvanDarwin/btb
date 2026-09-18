@@ -56,21 +56,35 @@ def banner(err: bool = False) -> None:
         print(ART, file=sys.stderr if err else sys.stdout, flush=True)
 
 
-# the day this version was released; bump it each release. Under the FSL the code converts to Apache 2.0
-# two years after this date, at which point the notice below stops.
-RELEASE_DATE = datetime.date(2026, 9, 10)
 FRIEND_FILE = os.path.expanduser("~/.config/btb.friend")
 
 
-def _license_notice() -> None:
-    """Print the FSL commercial-use notice to stderr while this release is inside its two-year window; silent
-    once the window has passed, and silent for anyone who has `~/.config/btb.friend`."""
+def _build_date() -> datetime.date | None:
+    """The day this wheel was built, baked into btb/_build.py at build time (setup.py). None in a source
+    checkout, where the module is never generated - the FSL window then can't be measured, so the notice shows."""
     try:
-        change = RELEASE_DATE.replace(year=RELEASE_DATE.year + 2)
-    except ValueError:  # a Feb 29 release
-        change = RELEASE_DATE.replace(year=RELEASE_DATE.year + 2, day=28)
-    if datetime.date.today() >= change or os.path.exists(FRIEND_FILE):
+        from importlib import import_module
+
+        return datetime.date.fromisoformat(import_module("btb._build").BUILD_DATE)
+    except Exception:
+        return None
+
+
+def _license_notice() -> None:
+    """Print the FSL commercial-use notice to stderr while this build is inside its two-year window; silent once
+    the window has passed, and silent for anyone who has `~/.config/btb.friend`. The window is measured from the
+    build date (not a hand-bumped constant), so it stops on its own two years after the wheel was built. Under
+    the FSL the code converts to Apache 2.0 at that point."""
+    if os.path.exists(FRIEND_FILE):
         return
+    built = _build_date()
+    if built is not None:
+        try:
+            change = built.replace(year=built.year + 2)
+        except ValueError:  # a Feb 29 build
+            change = built.replace(year=built.year + 2, day=28)
+        if datetime.date.today() >= change:
+            return
     _e("btb is free for personal and academic use. For commercial use, consider a paid license.")
 
 
