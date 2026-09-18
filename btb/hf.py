@@ -499,14 +499,42 @@ def _download(path: str) -> str:
     # weights under original/ (61 GB) and a third under metal/. A cached repo is taken as it is: the hub's
     # revalidation rewrites its refs/main, and a load must not touch a file under the model's directory
     kw: dict[str, Any] = {"allow_patterns": list(MODEL_FILES), "ignore_patterns": ["*/*"]}
-    try:
+    # use the cached snapshot when it is complete; the probe raises LocalEntryNotFoundError on a miss, so
+    # suppress it rather than catch it - from inside an `except` a real download failure below would chain
+    # onto the miss and surface as the misleading "outgoing traffic has been disabled"
+    with contextlib.suppress(Exception):
         return snapshot_download(path, local_files_only=True, **kw)
-    except Exception:
-        return _retry(lambda: snapshot_download(path, **kw))
+    return _retry(lambda: snapshot_download(path, **kw))
 
 
 def _hard_exit(code: int) -> None:  # abandons the download threads at once, past concurrent.futures' atexit join
     os._exit(code)
+
+
+_SYMLINK_WARNED = False
+
+
+def _warn_windows_symlinks() -> None:
+    """One note, on Windows where the cache cannot symlink (no Developer Mode / admin): the Hub then stores
+    each file as a copy, so a model takes about twice the disk and a download can run a low drive out near its
+    end. The Hub's own per-operation warning is silenced in __init__; this replaces it, once and in ASCII (a
+    cp1252 console cannot encode more)."""
+    global _SYMLINK_WARNED
+    if _SYMLINK_WARNED or sys.platform != "win32":
+        return
+    _SYMLINK_WARNED = True
+    try:
+        from huggingface_hub.file_download import are_symlinks_supported
+    except Exception:
+        return
+    if are_symlinks_supported():
+        return
+    sys.stderr.write(
+        "\n  btb: Windows without symlink support - model files cache as copies (about twice the disk), and a\n"
+        "       download can fill a low drive near its end. Enable Developer Mode or run as admin for efficient\n"
+        "       caching: https://learn.microsoft.com/windows/apps/get-started/enable-your-device-for-development\n\n"
+    )
+    sys.stderr.flush()
 
 
 def _fetch(path: str) -> str:
@@ -515,6 +543,7 @@ def _fetch(path: str) -> str:
     finishes). On Ctrl-C the process exits 130 and the partial files stay resumable."""
     import threading
 
+    _warn_windows_symlinks()
     got: list[str] = []
     err: list[BaseException] = []
 

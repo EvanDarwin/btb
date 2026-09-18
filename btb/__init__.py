@@ -37,6 +37,9 @@ from .options import Device
 
 os.environ.setdefault("KMP_BLOCKTIME", "0")
 os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+# the Hub prints this on every cache op when symlinks are off (Windows without Developer Mode); btb says it
+# once, clearly, at download time instead (see hf._warn_windows_symlinks)
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 from .draft import SpanBank
 from .session import Session
