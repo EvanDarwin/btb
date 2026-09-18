@@ -100,14 +100,21 @@ class _GenerateMixin(_State):
         r.copy_(rec)
 
     def _session_prefill(
-        self, ids: torch.Tensor, cache: Any, reuse: int, session: Session | None, on_layer: Any = None
+        self,
+        ids: torch.Tensor,
+        cache: Any,
+        reuse: int,
+        session: Session | None,
+        on_layer: Any = None,
+        tap: int | None = None,
     ) -> tuple[Any, Any]:
         """Prefill ids[:, reuse:]; for a hybrid in a session returns the DeltaNet state snapshots the next turn can
-        resume from (the prompt's end, and the point the re-rendering will diverge at once the tail is known)."""
+        resume from (the prompt's end, and the point the re-rendering will diverge at once the tail is known).
+        `tap` as `forward` takes it."""
         n = int(ids.shape[1])
         hybrid = LayerKind.LINEAR in self.layer_types
         if session is None or not hybrid:
-            return self._prefill(ids[:, reuse:], cache, on_layer=on_layer), None
+            return self._prefill(ids[:, reuse:], cache, on_layer=on_layer, tap=tap), None
         hs = []
 
         def collect(i: int, h: torch.Tensor) -> None:
@@ -128,11 +135,11 @@ class _GenerateMixin(_State):
         d = int(session.tail)
         cut = n - d
         if d > 0 and reuse < cut:
-            self._prefill(ids[:, reuse:cut], cache, on_layer=hook)
+            self._prefill(ids[:, reuse:cut], cache, on_layer=hook, tap=tap)
             anchors.append(snap(cut))
-            logits = self._prefill(ids[:, cut:], cache, on_layer=hook)
+            logits = self._prefill(ids[:, cut:], cache, on_layer=hook, tap=tap)
         else:
-            logits = self._prefill(ids[:, reuse:], cache, on_layer=hook)
+            logits = self._prefill(ids[:, reuse:], cache, on_layer=hook, tap=tap)
         anchors.append(snap(n))
         if on_layer is not None:
             on_layer(self.L - 1, hs[0] if len(hs) == 1 else torch.cat(hs, dim=1))
@@ -192,8 +199,20 @@ class _GenerateMixin(_State):
         cache, reuse, anchored = session.open(self, prompt) if session is not None else (None, 0, None)
         if cache is None:
             cache = self.new_cache()
+        # the model's own last layers draft: the prefill and every verify pass keep the residual at the tail's
+        # boundary for it, the prompt's rows seeding its memory
+        tail = getattr(self, "tail_draft", None)
+        tail_prop = None
+        tap = None
+        if tail is not None and getattr(self, "mlx", None) is not None and not use_mtp:
+            from .propose import TailProposer
+
+            tail_prop = TailProposer(self, tail, cache)
+            tap = tail_prop.tap
         logits: Any
-        logits, anchors = self._session_prefill(ids, cache, reuse, session, on_layer=aw if use_mtp else None)
+        logits, anchors = self._session_prefill(ids, cache, reuse, session, on_layer=aw if use_mtp else None, tap=tap)
+        if tail_prop is not None:
+            tail_prop.seed()
         first = int(smp.pick_torch(logits[0, -1:], [smp.key_for(n - 1)])[0])
         t_prefill = time.time() - t0
         # without a drafting head the n-gram continuations at every order and follower verify as one tree where the
@@ -228,6 +247,10 @@ class _GenerateMixin(_State):
 
             ks = getattr(self, "draft_ks", None) or (3, 2, 1)
             prop = UnionProposer(ModelProposer(draft, prompt, ks=ks), prop)
+        if tail_prop is not None:
+            from .propose import UnionProposer
+
+            prop = UnionProposer(tail_prop, prop)  # its chains ahead of the others'
         by_src: dict[str, dict[str, int]] = {"drafted": {}, "accepted": {}}
         last_base = n
         if use_mtp:
@@ -289,6 +312,7 @@ class _GenerateMixin(_State):
         dr_step_s0 = float(getattr(getattr(self, "aj", None), "step_s", 0.0) or 0.0)
         while len(committed) < max_new and not self.abort.is_set():
             tp = time.perf_counter()
+            tail_acc0 = by_src["accepted"].get("tag:tail", 0)
             v = min(v_max, max_new - len(committed) - 1)
             budget = self._spec_budget(ema_tokens, census["forwards"], v_max, cache.get_seq_length())
             v = max(0, min(v, budget - 1))
@@ -365,6 +389,8 @@ class _GenerateMixin(_State):
                     guesses, where = prop.propose_with_source(v)
                     guesses = [int(g) for g in guesses]
                     src = where[0] if isinstance(where, tuple) else "self"
+            # the tail drafter's pass keeps the residual only when the draft after it is worth its cost
+            tap_now = tail_prop.tap if (tail_prop is not None and tail_prop.arm()) else None
             self.aa(parents if tree_now else None)
             pick: Any = smp
             if tree_now and qrows is not None:
@@ -379,6 +405,7 @@ class _GenerateMixin(_State):
                     on_layer=aw if (use_mtp or use_tree) else None,
                     positions=([[base_len + d for d in depth]] if tree_now else None),
                     pick=pick,
+                    tap=tap_now,
                 )[0]
             finally:
                 self.ab()
@@ -452,6 +479,10 @@ class _GenerateMixin(_State):
                 by_src["drafted"][src] = by_src["drafted"].get(src, 0) + len(guesses)
                 by_src["accepted"][src] = by_src["accepted"].get(src, 0) + a
             self.ad(cache, base_len, path)
+            if tail_prop is not None:
+                if tap_now is not None:
+                    prop.anchor(path, [cur, *guesses])
+                tail_prop.observe(tc - tf, by_src["accepted"].get("tag:tail", 0) - tail_acc0)
             if use_mtp or use_tree:
                 pend_toks, pend_h = new[:a], last["h"][:, path]
             phase["commit"] += time.perf_counter() - tc
@@ -482,6 +513,9 @@ class _GenerateMixin(_State):
             )
             + "; accepted by depth "
             + " ".join(f"{a_}/{d_}" for a_, d_ in zip(census["accepted_by_pos"], census["drafted_by_pos"]) if d_)
+            + "".join(
+                f"; {k[4:]} {by_src['accepted'].get(k, 0)}/{d}" for k, d in by_src["drafted"].items() if k[:4] == "tag:"
+            )
         )
         return committed, census
 

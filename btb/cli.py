@@ -82,6 +82,7 @@ PLACEMENT = (
     "fp32",
     "resident_head",
     "kv_host",
+    "resident_end",
     "context",
     "kv_bits",
     "tree_min_prob",
@@ -92,6 +93,7 @@ PLACEMENT = (
     "draft_bits",
     "draft_model",
     "draft_ks",
+    "tail_draft",
     "ngram_p",
     "expert_cache_gb",
     "ram_reserve_gb",
@@ -360,6 +362,15 @@ def _common(ap: argparse.ArgumentParser, path_required: bool = True) -> None:
         "prices both and keeps it on the card unless the layers it would evict cost more to stream",
     )
     g.add_argument(
+        "--resident-end",
+        dest="resident_end",
+        type=int,
+        choices=(0, 1),
+        default=None,
+        help="the layers kept in memory as a block at the model's end (1), or spread among the streamed ones "
+        "(0, the default: the drive reads under their compute); --tail-draft turns it on, drafting from them",
+    )
+    g.add_argument(
         "--kv-bits",
         dest="kv_bits",
         type=int,
@@ -515,6 +526,16 @@ def _common(ap: argparse.ArgumentParser, path_required: bool = True) -> None:
         default=None,
         help="the draft model's branching per tree depth (default 4,3,2): pass one reads the root's top-K0, "
         "each later pass the leaves' top-Kd",
+    )
+    s.add_argument(
+        "--tail-draft",
+        dest="tail_draft",
+        metavar="SPEC",
+        default=None,
+        help="the model's own last layers draft (experimental, MLX): 'layers=8,inject=embed,sample=topk,k=4', "
+        "any subset, or 1 for the defaults. inject: zero, noise, stale, embed, delta, unembed, memory (alpha=A "
+        "scales it); sample: topk (minp=P keeps only candidates above P), temp (temp=T), cloud (noise=F); depth=D "
+        "chains the tail's top pick under each candidate. Rides ahead of the n-gram drafter and a --draft-model.",
     )
     d = ap.add_argument_group("sampling (how every token is picked; on the servers a request's own fields win)")
     d.add_argument(

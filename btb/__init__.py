@@ -114,6 +114,7 @@ def plan(
     vram_reserve_gb: float | None = None,
     context: int = 0,
     kv_host: bool | None = None,
+    resident_end: bool = False,
 ) -> Plan:
     """The placement the engine would take for the model at `path` on `device`, priced against the memory free
     right now. Opens the model on the CPU to size its layers, measures the card, and hands the budgeting to the
@@ -152,6 +153,7 @@ def plan(
             vram_reserve_gb=vram_reserve_gb,
             context=context,
             kv_host=kv_host,
+            resident_end=resident_end,
         )
     finally:
         p.close()
@@ -236,6 +238,8 @@ def load(
         "fp32": fp32,
         "context": int(c.get("context", 0) or 0),
         "kv_host": (None if c.get("kv_host") is None else bool(int(c["kv_host"]))) if dev.kind.card else False,
+        # the warm layers a block at the model's end where the tail drafter runs on them, unless named otherwise
+        "resident_end": bool(int(c.get("resident_end", 1 if c.get("tail_draft") else 0))),
         **reserves,
     }
     mlx_layers = None
@@ -248,8 +252,10 @@ def load(
         mlx_layers = [i for i in cpu if i >= n_cpu]
         c.setdefault("resident_head", 1)
         c["prefill_card"] = 0
-        # Metal's matvec serves up to 15 rows at the cost of one; the tree's verify is 1 + budget rows
-        c.setdefault("tree_budget", 14 if pl.has_mtp else 0)
+        # Metal's matvec serves up to 15 rows at the cost of one; the tree's verify is 1 + budget rows. A drafter
+        # that can fill them (a drafting head, the tail) gets the tile; the budget's live rule then sizes each
+        # pass against the warm-up's cost curve. The n-gram drafter alone leaves it, streamed: it cannot fill it
+        c.setdefault("tree_budget", 14 if (pl.has_mtp or c.get("tail_draft")) else 0)
         if log:
             b = pl.bytes
             if pl.free.settle_s:
@@ -523,6 +529,16 @@ def load(
             )
         sm.draft_engine = draft_sm
         sm.log(f"[draft] {os.path.basename(str(dm))} proposing, tree {sm.draft_ks}")
+    td = c.get("tail_draft")
+    if td:
+        from .engine.propose import TailDraft
+
+        try:
+            sm.tail_draft = TailDraft.parse(str(td))
+        except ValueError as e:
+            raise options.OptionError(str(e)) from None
+        t = sm.tail_draft
+        sm.log(f"[tail] the last {t.layers} layers drafting: inject {t.inject}, sample {t.sample}, k {t.k}")
     return sm
 
 

@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from .memory import RamPolicyState, VramPolicyState
     from .mlx_forward import MlxState
     from .model import StreamedTextModel
+    from .propose import TailDraft
     from .scheduler import BatchScheduler, Plan
     from .tiers import ColdRing
 
@@ -175,6 +176,9 @@ class _State:
     ngram_tree: bool
     proposer: str
     sampling: Sampling  # the engine's default: greedy unless loaded with temperature/top_p/top_k/seed
+    tail_draft: TailDraft | None  # the model's own last layers drafting (--tail-draft)
+    _tail_h: Any  # the tapped rows' residual at the tail's boundary, an MLX array the tail drafter reads
+    _tail_ids: list[int]  # those rows' tokens
     tree_budget: int
     tree_min_prob: float
     tree_read: str
@@ -365,6 +369,9 @@ class _State:
         rows: Sequence[int] | None = None,
         forest: dict[str, Any] | None = None,
         pick: Any = None,
+        start: int = 0,
+        tap: int | None = None,
+        past: int | None = None,
     ) -> Any:
         raise NotImplementedError
 
@@ -428,7 +435,12 @@ class _State:
         raise NotImplementedError
 
     def _prefill(
-        self, ids: torch.Tensor, cache: Any, on_layer: Any = None, attention_mask: torch.Tensor | None = None
+        self,
+        ids: torch.Tensor,
+        cache: Any,
+        on_layer: Any = None,
+        attention_mask: torch.Tensor | None = None,
+        tap: int | None = None,
     ) -> Any:
         raise NotImplementedError
 
@@ -444,6 +456,7 @@ class _State:
         positions: Any = None,
         head: bool = True,
         pick: Any = None,
+        tap: int | None = None,
     ) -> Any:
         raise NotImplementedError
 
@@ -501,7 +514,13 @@ class _State:
         raise NotImplementedError
 
     def _session_prefill(
-        self, ids: torch.Tensor, cache: Any, reuse: int, session: Session | None, on_layer: Any = None
+        self,
+        ids: torch.Tensor,
+        cache: Any,
+        reuse: int,
+        session: Session | None,
+        on_layer: Any = None,
+        tap: int | None = None,
     ) -> tuple[Any, Any]:
         raise NotImplementedError
 

@@ -783,6 +783,73 @@ def check_host_tree() -> str:
     return f"spec == greedy on the host with the tree and the chain (passes {out[True][2]} vs {out[False][2]}, accepted {out[True][3]} vs {out[False][3]}; the curve {len(curve)} widths)"
 
 
+def check_tail_draft() -> str:
+    """the tail drafter (the model's own last layers) proposes and the verify pass commits the greedy loop's own
+    tokens exactly, across the inject modes, a depth-2 tree, and a single-layer tail (the whole resident tail on
+    the 4-layer fixture is 3; layers=1 is the one-layer edge). Byte-exactness over 16 tokens is what proves the
+    per-pass crop of the tail's rows and the tree's rollback: a wrong crop would drift the output from greedy."""
+    from btb.engine.propose import TailDraft
+
+    fx = fixture("tiny_qwen3")
+    with torch.inference_mode():
+        sm = host_model(fx, device="mlx", dtype=torch.bfloat16)
+        speculation(sm, tree_budget=14, v_max=4, tree_read="step")
+        g = sm.generate_greedy(PROMPT_DENSE, 16)
+        specs = [
+            TailDraft(layers=3, inject="memory", alpha=0.5),
+            TailDraft(layers=3, inject="embed"),
+            TailDraft(layers=3, inject="stale"),
+            TailDraft(layers=3, inject="zero"),
+            TailDraft(layers=3, inject="memory", alpha=0.5, depth=2),
+            TailDraft(layers=1, inject="memory", alpha=0.5),  # the single-layer tail
+        ]
+        out = []
+        for td in specs:
+            sm.tail_draft = td
+            sm._tail_h = None  # cleared so a set value proves this run's tap fired, not a prior run's
+            s_, census = sm.generate_speculative(PROMPT_DENSE, 16, proposer="ngram", v_max=4)
+            out.append((td, s_, getattr(sm, "_tail_h", None) is not None, int(census["proposed"])))
+        sm.close()
+    for td, s_, engaged, _prop in out:
+        assert s_ == g, f"tail_draft inject={td.inject} layers={td.layers} depth={td.depth}: {s_} != greedy {g}"
+        # the tap keeps the tail's residual; unset means the tail path was silently skipped, not exercised
+        assert engaged, f"tail_draft inject={td.inject} layers={td.layers}: the tail's tap never fired"
+    props = ", ".join(str(p) for *_, p in out)
+    return (
+        f"spec == greedy for {len(out)} tail configs (inject modes, depth 2, single layer; tap fired; proposed {props})"
+    )
+
+
+def test_tail_draft_ranges() -> None:
+    """the tail-draft spec parser (the CLI's `--tail-draft key=value,...`) accepts a valid spec and refuses every
+    out-of-range knob. No MLX: runs everywhere, unlike the exactness check below."""
+    from btb.engine.propose import TailDraft
+
+    ok = TailDraft.parse("layers=8,inject=memory,alpha=0.5,k=4,depth=2,minp=0.1,race=1")
+    assert ok.layers == 8 and ok.depth == 2 and ok.minp == 0.1 and ok.inject == "memory"
+    assert TailDraft.parse("1") == TailDraft(), "the bare '1' spec is the defaults"
+    for spec in (
+        "layers=0",
+        "k=0",
+        "depth=0",
+        "temp=0",
+        "noise=-1",
+        "alpha=-0.5",
+        "minp=1",
+        "minp=-0.1",
+        "race=2",
+        "inject=bogus",
+        "sample=bogus",
+        "nope=1",
+        "layers",
+    ):
+        try:
+            TailDraft.parse(spec)
+        except ValueError:
+            continue
+        raise AssertionError(f"tail_draft accepted the out-of-range spec {spec!r}")
+
+
 def check_rope_rows() -> str:
     """`rope_rows` (B rows at B positions in one launch) is bit-identical to `rope_fast` at each row's
     position - bf16 and float32, head_dim 128 and 64, full and partial rotary dims, with an attention
@@ -1110,6 +1177,7 @@ def main() -> int:
         check_hybrid_warm,
         check_draft_bits,
         check_host_tree,
+        check_tail_draft,
         check_kv_bits,
         check_rope_rows,
         check_attn_rows,

@@ -72,6 +72,7 @@ class PlanBytes:
     kv_card: int = 0
     kv_host: int = 0
     staging: int = 0
+    headroom: int = 0  # unified memory: the working room the plan kept out of the warm fill
 
 
 @dataclass(frozen=True)
@@ -223,6 +224,7 @@ class Plan:
             - self.bytes.slots
             - self.bytes.kv_host
             - self.bytes.staging
+            - self.bytes.headroom
         )
         if named:
             wanted = cold
@@ -489,6 +491,11 @@ class BatchScheduler:
         if free is None:
             return
         dev = self.sm.dev if device is None else torch.device(device)
+        mlx = getattr(self.sm, "mlx", None)
+        if nbytes > free and mlx is not None and dev.type != Device.CUDA:
+            # the ledger counts MLX's allocator cache as held: give it back before refusing over it
+            mlx.clear_cache()
+            free = self.free_for(device) or 0
         # the card's margin is its OOM guard and the host's floor is the OS's own (or the one --ram-reserve
         # names): a request past either is refused
         if nbytes > free:
@@ -556,6 +563,7 @@ class BatchScheduler:
         kv_host: bool | None = None,
         settle_s: float = 30.0,
         drive: DriveBenchmark | None = None,
+        resident_end: bool = False,
     ) -> Plan:
         """The placement for `probe` (an engine opened on the CPU to price its layers) against the host budget
         (`budget`, else `measure_host` now, with `os_reserve_gb` as the floor where one is named) and
@@ -588,6 +596,8 @@ class BatchScheduler:
             context=int(context or 0),
             kv_host=kv,
             drive_bps=bps,
+            unified=name is not None and name.kind is Device.MLX,
+            resident_end=resident_end,
         )
 
         def choose(ram: float, bps: float | None = None) -> tuple[dict[str, Any], bool]:
@@ -663,6 +673,7 @@ class BatchScheduler:
                 kv_card=int(b.get("kv_card", 0)),
                 kv_host=int(b.get("kv_host", 0)),
                 staging=int(b.get("staging", 0)),
+                headroom=int(b.get("headroom", 0)),
             ),
             caps=PlanCaps(
                 ram_gb=float(cp["ram_gb"]),

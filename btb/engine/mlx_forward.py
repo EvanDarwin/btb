@@ -1020,11 +1020,17 @@ class _MlxMixin(_State):
         rows: Sequence[int] | None = None,
         forest: dict[str, Any] | None = None,
         pick: Any = None,
+        start: int = 0,
+        tap: int | None = None,
+        past: int | None = None,
     ) -> Any:
         """The dense families on the GPU: one MLX graph per forward, the K/V appended in unified memory inside it.
         `hm` an MLX hidden state in place of `h`; `lazy` returns the logits unevaluated; `rows` a batched decode
         step (hm[b] at position rows[b]); `forest` a batched prefill (the logits each row's last token's); `pick`
-        the ids picked in the graph (a chain's rows at past + j, a tree's at past + depth)."""
+        the ids picked in the graph (a chain's rows at past + j, a tree's at past + depth); `start` runs layers
+        start..n_layers-1 alone over `hm`, their residual after `start`-1 (the tail drafter), `past` their length
+        where the cache's first layers are ahead of them (a pass in flight); `tap` keeps the rows' residual after
+        that layer in `_tail_h`."""
         if self.fam.hybrid:
             return self._forward_mlx_hybrid(
                 h, pe, cache, on_layer, last_only, head, n_layers, hm=hm, lazy=lazy, pick=pick
@@ -1043,13 +1049,15 @@ class _MlxMixin(_State):
         act = self._mlx_act()
         Hq = int(c.num_attention_heads)
         Hk = int(getattr(c, "num_key_value_heads", None) or Hq)
-        past = cache.get_seq_length() if cache is not None else 0
+        if past is None:
+            past = cache.get_seq_length() if cache is not None else 0
         freqs, rd, rscale = self._mlx_rope()
-        if self.cold:
+        if self.cold and start == 0:
             self._cold_start(n_layers)
         t0 = time.time()
         attn_pa = None
         taps = []
+        extra: list[Any] = []
         # under speculation a chain or a tree of drafted tokens attends through the decode kernel node by node, as the
         # one-row step would, so its verdicts are the greedy loop's
         spec_chain = bool(getattr(self, "aq", False)) and past > 0
@@ -1081,7 +1089,7 @@ class _MlxMixin(_State):
                 segs=cl0._seg if getattr(cl0, "_dec_cap", 0) else None,
                 pbases=cl0._offs if getattr(cl0, "_flat", False) else None,
             )
-        for i in range(n_layers):
+        for i in range(start, n_layers):
             tmpl = self.host[i]
             if i in self.cold:
                 self._cold_wait(i)
@@ -1203,18 +1211,21 @@ class _MlxMixin(_State):
             if i in self.cold:
                 m.eval(hm)
                 self._cold_release(i)
+            if tap is not None and i == tap:
+                self._tail_h = hm
+                extra.append(hm)
             if on_layer is not None:
                 # handed over after the one eval at the end: an eval here would sync the GPU every layer
                 taps.append((i, hm))
-        if taps:
+        if taps or extra:
             return self._mlx_finish(
                 hm,
                 last_only,
                 head,
                 n_layers,
                 t0,
-                extra=[h_ for _, h_ in taps],
-                after=lambda: [on_layer(i_, mlxdev.from_mx(h_)[None]) for i_, h_ in taps],
+                extra=[*extra, *(h_ for _, h_ in taps)],
+                after=(lambda: [on_layer(i_, mlxdev.from_mx(h_)[None]) for i_, h_ in taps]) if taps else None,
                 pick=pick,
                 keys=keys,
             )

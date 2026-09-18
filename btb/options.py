@@ -165,6 +165,7 @@ FLAGS = (
     "fp32",
     "resident_head",
     "kv_host",
+    "resident_end",
     "vram_watch",
     "mlx_mega",
     "gguf_packed",
@@ -196,8 +197,10 @@ PASS = (
     "rope_scaling",
     "draft_model",
     "draft_ks",
+    "tail_draft",
 )  # seed a whole number of any size; the rest the engine's own shapes (lookahead* the per-depth picks,
-# draft_model a path/repo for a sibling proposer, draft_ks its tree fan-out per depth)
+# draft_model a path/repo for a sibling proposer, draft_ks its tree fan-out per depth, tail_draft the
+# model's own last layers drafting, key=value,...)
 KNOWN = frozenset((*FLAGS, *COUNTS, *UNIT, *POSITIVE, *NONNEG, *RESERVE, *CHOICES, *PASS))
 SAMPLING = ("temperature", "top_p", "top_k", "seed")
 
