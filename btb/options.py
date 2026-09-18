@@ -93,6 +93,15 @@ class UnsupportedModel(OptionError):
         super().__init__(f"{path}: a {arch!r} GGUF; btb runs {', '.join(self.supported)} GGUF models")
 
 
+class UnsupportedModelType(OptionError):
+    """`mt` is an unsupported model_type, `supported` is the list of friendly names support"""
+
+    def __init__(self, mt: str, supported: Iterable[str]) -> None:
+        self.model_type, self.supported = mt, list(supported)
+        names = ", ".join(self.supported[:-1]) + f", and {self.supported[-1]}" if len(self.supported) > 1 else ""
+        super().__init__(f"btb doesn't support this model family ({mt!r}) yet. Currently supported families: {names}.")
+
+
 class NotPackable(OptionError):
     """the model at `path` is not one `btb pack` writes a 12-bit model for; `why` says so"""
 

@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 from .. import mlx as mlxdev
 from ..kinds import FamilyKind, LayerKind
+from ..options import UnsupportedModelType
 from .cache import GrowLayer
 from .fused import _fuse_mlp_cls, _fuse_norm_cls
 from .host import _Experts, _HostLinear, _NGramRows, _Router
@@ -233,6 +234,20 @@ def act_name(cfg: Any) -> str:
     return str(getattr(cfg, "hidden_activation", None) or getattr(cfg, "hidden_act", "silu"))
 
 
+# the model_types family() builds a Family for, each mapped to the name a user would recognize (the "_text"
+# variants are the same family). hf.SERVE_TYPES mirrors these keys, and an unsupported load lists the values.
+FAMILY_NAMES = {
+    "qwen3": "Qwen3",
+    "qwen3_5": "Qwen3.5",
+    "qwen3_5_text": "Qwen3.5",
+    "phi3": "Phi-3",
+    "qwen4_exp": "Qwen4 (experimental)",
+    "qwen4_exp_text": "Qwen4 (experimental)",
+    "gpt_oss": "GPT-OSS",
+}
+SUPPORTED_MODEL_TYPES = tuple(FAMILY_NAMES)
+
+
 def family(cfg: Any) -> Family:
     import importlib
 
@@ -335,7 +350,7 @@ def family(cfg: Any) -> Family:
             sandwich=True,
             flat_cache=True,
         )
-    raise RuntimeError(f"unsupported model_type {mt!r}")
+    raise UnsupportedModelType(mt, list(dict.fromkeys(FAMILY_NAMES.values())))
 
 
 class _FamiliesMixin(_State):
