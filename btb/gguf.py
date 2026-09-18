@@ -17,7 +17,7 @@ import torch
 
 from .hf import ARCH_MODEL_TYPES, gguf_lib, is_gguf
 from .kinds import Json
-from .options import UnsupportedModel
+from .options import NotAModel, UnsupportedModel
 from .quant import AFFINE_TYPES
 
 
@@ -415,6 +415,10 @@ def config_of(path: str) -> Any:
     """the model's config: a `.gguf` file's off its metadata, a directory's off its config.json"""
     if is_gguf(path):
         return GGUFModel(path).config()
+    if os.path.isdir(path) and not os.path.exists(os.path.join(path, "config.json")):
+        # no config.json is not a loadable HF directory - most often a GGUF repo fetched by its bare id, whose
+        # .gguf files load one at a time; say that instead of transformers' opaque "unrecognized model" error
+        raise NotAModel(path, "no config.json; a GGUF repo loads one file at a time, as repo/id:file.gguf")
     from transformers import AutoConfig
 
     return AutoConfig.from_pretrained(path)

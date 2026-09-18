@@ -606,7 +606,11 @@ class StreamedTextModel(
         # a session grows past it takes a buffer of its own and the pass leaves the megakernel)
         arena = None
         mg = getattr(self, "_mega", None)
-        if mg is not None and self.mlx is not None and not self.kv_bits and not flat:
+        # the arena and its megakernel are bf16-only (`per` counts two bytes a row, and `_mega_ok` refuses any
+        # other compute dtype); an fp32 pass would store float32 into these bf16-sized slots, so it keeps its own
+        # per-layer buffers instead
+        bf16_compute = self.compute_dtype in (None, torch.bfloat16)
+        if mg is not None and bf16_compute and self.mlx is not None and not self.kv_bits and not flat:
             from .. import mlx as mlxdev
             from ..mlx.attn import ATTN_BLOCK
 

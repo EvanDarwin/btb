@@ -654,6 +654,27 @@ def _gb(n: int) -> str:
     return f"~{gb:.0f} GB" if gb >= 10 else f"~{gb:.1f} GB"
 
 
+def repo_gguf_files(repo: str) -> list[tuple[str, int]]:
+    """The `.gguf` files at the root of Hub repo `repo`, each with its size in bytes, sorted by name. A repo of
+    these and no config.json is a GGUF repo, whose quants load one at a time as `repo/id:file.gguf`; this lists
+    them so a bare repo id can be turned into a choice. Empty when the repo has none, or when the Hub cannot be
+    reached (after retries) - the caller then falls back to its normal path rather than failing on the listing."""
+    from huggingface_hub import HfApi
+    from huggingface_hub.errors import HFValidationError, RepositoryNotFoundError
+
+    try:
+        info = _retry(lambda: HfApi().model_info(repo, files_metadata=True))
+    except (RepositoryNotFoundError, HFValidationError, OSError):
+        return []
+    out = [
+        (name, int(getattr(s, "size", None) or 0))
+        for s in (info.siblings or [])
+        if "/" not in (name := getattr(s, "rfilename", "")) and is_gguf(name)
+    ]
+    out.sort()
+    return out
+
+
 def download_target(path: str) -> str:
     """The directory resolving repo id `path` writes into: huggingface_hub's cache (HF_HOME / HF_HUB_CACHE
     honored) and the repo's own folder under it. btb passes no cache_dir to the Hub, so this is where the

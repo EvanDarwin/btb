@@ -45,3 +45,27 @@ def confirm(question: str, *, default: bool = False) -> bool:
         if reply in ("n", "no"):
             return False
         _say("[btb] please answer y or n\n")
+
+
+def select(question: str, options: list[str]) -> int | None:
+    """Ask the user to pick one of `options` on the terminal, returning its index, or None where a person cannot
+    be asked - a non-interactive run, an empty line, or EOF. A list has no safe default the way a yes/no does, so
+    --confirm / BTB_CONFIRM=1 does not answer it either: an unattended run bails rather than guess a choice."""
+    if not options:
+        return None
+    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+        return None
+    _say(question + "\n")
+    for i, opt in enumerate(options, 1):
+        _say(f"  {i:>3}. {opt}\n")
+    while True:
+        _say(f"[1-{len(options)}, or blank to cancel] ")
+        try:
+            reply = input().strip()
+        except EOFError:
+            return None
+        if not reply:
+            return None
+        if reply.isdigit() and 1 <= int(reply) <= len(options):
+            return int(reply) - 1
+        _say(f"[btb] please enter a number from 1 to {len(options)}\n")
