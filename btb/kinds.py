@@ -69,6 +69,7 @@ class FamilyKind(StrEnum):
     QWEN4 = "qwen4"
     PHI3 = "phi3"
     GPT_OSS = "gpt_oss"
+    GEMMA3 = "gemma3"
 
 
 class Tier(StrEnum):

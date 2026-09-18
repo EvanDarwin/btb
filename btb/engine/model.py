@@ -169,6 +169,9 @@ class StreamedTextModel(
         cfg._attn_implementation = attn_impl
         self.cfg = cfg
         self.fam = family(cfg)
+        # Gemma scales the input embedding by sqrt(hidden); the engine gathers rows itself, so it applies the
+        # scale the module's scaled embedding would (the tied head's output projection stays unscaled)
+        self.embed_scale = float(cfg.hidden_size) ** 0.5 if self.fam.embed_scale else None
         if self.fam.eager:
             # gpt-oss's sinks are not expressible through sdpa: `attention_sinks` runs the reference's arithmetic on
             # the CPU, the engine's kernels over an MLX cache
@@ -397,7 +400,10 @@ class StreamedTextModel(
             )
 
     def embed(self, ids: Any) -> torch.Tensor:
-        ids = torch.as_tensor(ids, dtype=torch.long)
+        rows = self._embed_rows(torch.as_tensor(ids, dtype=torch.long))
+        return rows if self.embed_scale is None else rows * self.embed_scale
+
+    def _embed_rows(self, ids: torch.Tensor) -> torch.Tensor:
         head = self.head
         if (
             head is not None

@@ -197,7 +197,11 @@ class Family:
     gate/up/down, the layout the compiled kernels (the MLX megakernel and fused step, the CUDA step graph) are
     written for; `own`: the engine drives the layer; `fast`: the per-position host paths know the attention;
     `moe`: experts through the store; `mxfp4`: as MXFP4; `eager`: the module's own attention; `flat_cache`:
-    one cache row per layer. Fused q/k/v and gate/up projections are read off the module, not declared."""
+    one cache row per layer; `embed_scale`: the input embedding is scaled by sqrt(hidden_size) (Gemma);
+    `dual_rope`: rope frequencies differ by layer type, so the pass carries one rope per type and each layer
+    reads its own (Gemma 3's local/global split); `sandwich`: the block norms the attention and MLP outputs
+    before their residual add (four norms a layer) rather than the pre-norm block's two, so the fused MLX path
+    takes its own norm ordering. Fused q/k/v and gate/up projections are read off the module, not declared."""
 
     kind: FamilyKind
     mod: Any = None
@@ -218,6 +222,15 @@ class Family:
     hybrid: bool = False
     norm_centered: bool = False
     kernel_layout: bool = False
+    embed_scale: bool = False
+    dual_rope: bool = False
+    sandwich: bool = False
+
+
+def act_name(cfg: Any) -> str:
+    """the MLP activation's name: Gemma's config calls it `hidden_activation` (gelu_pytorch_tanh), the rest
+    `hidden_act`"""
+    return str(getattr(cfg, "hidden_activation", None) or getattr(cfg, "hidden_act", "silu"))
 
 
 def family(cfg: Any) -> Family:
@@ -299,6 +312,27 @@ def family(cfg: Any) -> Family:
             moe=True,
             mxfp4=True,
             eager=True,
+            flat_cache=True,
+        )
+    if mt in ("gemma3", "gemma3_text"):
+        mod = importlib.import_module("transformers.models.gemma3.modeling_gemma3")
+        # Gemma 3's block is a sandwich norm (the attention and MLP outputs normed before their residual add) with
+        # q/k norms, its embedding scaled by sqrt(hidden), rope split local/global by layer type, and sliding
+        # layers; the host and card paths take each under `sandwich`, `dual_rope` and the layer's window (the
+        # softcapping earlier Gemmas had is gone, so SDPA is exact). Its RMSNorm scales by 1 + weight.
+        return Family(
+            kind=FamilyKind.GEMMA3,
+            mod=mod,
+            layer=mod.Gemma3DecoderLayer,
+            norm=mod.Gemma3RMSNorm,
+            rotary=mod.Gemma3RotaryEmbedding,
+            mrope=False,
+            attn_gate=False,
+            fast=True,
+            norm_centered=True,
+            embed_scale=True,
+            dual_rope=True,
+            sandwich=True,
             flat_cache=True,
         )
     raise RuntimeError(f"unsupported model_type {mt!r}")

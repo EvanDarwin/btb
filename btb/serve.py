@@ -443,8 +443,8 @@ class _ToolGate:
     the text is buffered (a partial call never leaks as content); `finish` emits the prose that followed the
     call once the blocks are known and struck."""
 
-    def __init__(self, fmt: ToolFormat, emit: Callable[..., Any]) -> None:
-        self.fmt, self.emit = fmt, emit
+    def __init__(self, fmt: ToolFormat, emit: Callable[..., Any], tools: Any = None) -> None:
+        self.fmt, self.emit, self.tools = fmt, emit, tools
         self.buf, self.sent, self.in_call = "", 0, False
 
     def push(self, delta: str) -> Any:
@@ -464,7 +464,9 @@ class _ToolGate:
 
     def finish(self) -> Any:
         """the prose after the last call, and whatever a holdback kept, with the call blocks struck"""
-        prose = self.fmt.strip(self.buf) if self.fmt.calls(self.buf) else self.buf  # struck only where calls parsed
+        prose = (
+            self.fmt.strip(self.buf) if self.fmt.calls(self.buf, self.tools) else self.buf
+        )  # struck where calls parsed
         sent = self.buf[: self.sent]
         tail = prose[len(sent) :] if prose.startswith(sent) else ""
         if self.in_call:
@@ -927,7 +929,7 @@ class Handler(BaseHTTPRequestHandler):
 
             if tools:
                 # the prose streams as it decodes; from a call's opener the text is buffered and parsed whole
-                gate = _ToolGate(fmt, emit)
+                gate = _ToolGate(fmt, emit, tools)
                 t0 = time.perf_counter()
                 ids2, toks, c, t_first = self._decode(
                     engine, messages, max_new, emit, ids=ids, on_content=gate.push, sampling=smp

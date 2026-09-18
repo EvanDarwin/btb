@@ -20,6 +20,7 @@ from ..mlx.q6k import gather_q6k
 from ..sampling import GREEDY
 from ..session import Session
 from .cache import GrowLayer
+from .families import act_name
 from .host import _HostLinear
 from .native import Native
 from .state import _State
@@ -52,6 +53,15 @@ class MlxState:
     rope_cache: tuple[Any, ...] | None = None
     embed_w: Any = None
     embed_lin: _HostLinear | None = None
+
+
+@dataclass
+class _AttnParams:
+    """A forward's `attn_params` for the decode row over `n` cache rows, one per window the layers read (None for
+    a full-attention layer): built once a forward, not once a layer."""
+
+    n: int
+    by_window: dict[int | None, tuple[mx_.array, int]] = field(default_factory=dict)
 
 
 def _pick_keys(pick: Any, positions: Any, last_only: bool) -> list[int] | None:
@@ -409,7 +419,7 @@ class _MlxMixin(_State):
     def _mlx_act(self) -> Any:
         if self.mlx is None:
             return None
-        return self.mlx.act(str(getattr(self.cfg, "hidden_act", "silu")))
+        return self.mlx.act(act_name(self.cfg))
 
     def _mlx_ok(
         self, cache: Any, B: int, T: int, am: torch.Tensor | None, positions: torch.Tensor | None, n_layers: int
@@ -424,13 +434,20 @@ class _MlxMixin(_State):
         fam = self.fam
         ok = self.mlx_state.family_ok
         if ok is None:
-            if fam.dense:
+            if fam.dense or fam.sandwich:
                 attn = next((self.host[i].self_attn for i in self.host if hasattr(self.host[i], "self_attn")), None)
+                # a sandwich family (Gemma 3) runs its sliding layers through the fused path too, windowed per layer;
+                # the plain dense path has no window, so it stays whole-prefix only
                 ok = (
                     self._mlx_act() is not None
-                    and all(lt == LayerKind.FULL for lt in self.layer_types)
                     and attn is not None
-                    and getattr(attn, "sliding_window", None) is None
+                    and (
+                        fam.sandwich
+                        or (
+                            all(lt == LayerKind.FULL for lt in self.layer_types)
+                            and getattr(attn, "sliding_window", None) is None
+                        )
+                    )
                 )
             elif fam.hybrid:
                 # the DeltaNet step per position runs through the native kernel; without it the host path
@@ -601,6 +618,12 @@ class _MlxMixin(_State):
             w = {}
             w["ln1"], w["eps1"] = norm(tmpl.input_layernorm)
             w["ln2"], w["eps2"] = norm(tmpl.post_attention_layernorm)
+            if self.fam.sandwich:
+                # the sandwich block norms the attention output (post_attention == ln2, reused), the MLP input, and
+                # the MLP output before each residual add
+                w["post_attn"], w["eps_pa"] = w["ln2"], w["eps2"]
+                w["pre_ff"], w["eps_pf"] = norm(tmpl.pre_feedforward_layernorm)
+                w["post_ff"], w["eps_pf2"] = norm(tmpl.post_feedforward_layernorm)
             at = getattr(tmpl, "self_attn", None)
             if at is not None and getattr(at, "q_norm", None) is not None:
                 w["qn"], w["epsq"] = norm(at.q_norm)
@@ -704,9 +727,12 @@ class _MlxMixin(_State):
         )
         return core, conv_new, S
 
-    def _mlx_rope(self) -> tuple[mx_.array, int, float]:
+    def _mlx_rope(self) -> tuple[mx_.array | dict[str, mx_.array], int, float]:
         """The rotary module's frequencies for `Backend.rope_fast`: (freqs, rotary dims, attention scaling),
-        refreshed when the module swaps its table (longrope switches past the original window)."""
+        refreshed when the module swaps its table (longrope switches past the original window). For a dual-rope
+        family (Gemma 3) `freqs` is a dict keyed by layer type; rotary dims and scaling are shared across types."""
+        if self.fam.dual_rope:
+            return self._mlx_rope_dual()
         inv = self.rotary.inv_freq
         cur = self.mlx_state.rope_cache
         if cur is None or cur[3] is not inv:
@@ -718,6 +744,23 @@ class _MlxMixin(_State):
                 float(getattr(self.rotary, "attention_scaling", 1.0)),
                 inv,
             )
+        return cur[:3]
+
+    def _mlx_rope_dual(self) -> tuple[dict[str, mx_.array], int, float]:
+        """Gemma 3's local/global rope: one freqs array per layer type, keyed by the type the layer reads; the
+        rotary dims and the attention scaling must be one for every type (the fused rope takes a single pair)."""
+        types = sorted(set(self.layer_types))
+        invs = tuple(getattr(self.rotary, f"{lt}_inv_freq") for lt in types)
+        cur = self.mlx_state.rope_cache
+        if cur is None or len(cur[3]) != len(invs) or any(a is not b for a, b in zip(cur[3], invs, strict=False)):
+            freqs = {
+                lt: mlxdev.to_mx((1.0 / inv.detach().float()).contiguous()) for lt, inv in zip(types, invs, strict=True)
+            }
+            mlxdev.mx().eval(*freqs.values())
+            dims = {int(inv.shape[0]) * 2 for inv in invs}
+            scales = {float(getattr(self.rotary, f"{lt}_attention_scaling", 1.0)) for lt in types}
+            assert len(dims) == 1 and len(scales) == 1, f"the layer types' ropes differ: dims {dims}, scaling {scales}"
+            cur = self.mlx_state.rope_cache = (freqs, dims.pop(), scales.pop(), invs)
         return cur[:3]
 
     def _mlx_norm(self, a: mx_.array, wt: mx_.array, eps: float) -> mx_.array:
@@ -757,13 +800,16 @@ class _MlxMixin(_State):
         Hk: int,
         scale: float,
         mask: Any,
-        attn_pa: Any,
+        attn_pa: _AttnParams | None,
         nodes: Any = None,
         prepared: Any = None,
-    ) -> tuple[mx_.array, Any]:
+        win: int | None = None,
+    ) -> tuple[mx_.array, _AttnParams | None]:
         """Attention for the fused paths: the node kernel for a decode row past `mlx_attn_rows` (0 with speculation
         on: every row and node computes as the one-row step would) and for `nodes` = (past, parents) of a
-        verify pass; MLX's fused attention otherwise. Returns ([T, Hq*hd], attn_pa)."""
+        verify pass; MLX's fused attention otherwise. `win` is a sliding layer's window (Gemma 3), passed to the
+        node kernels and, on the SDPA fallback (a small-cache decode, a sliding prefill), applied as the mask.
+        Returns ([T, Hq*hd], attn_pa)."""
         m = mlxdev.mx()
         able = (
             cl is not None
@@ -791,6 +837,7 @@ class _MlxMixin(_State):
                 past,
                 parents,
                 scale,
+                window=win,
                 prepared=prepared if not b else None,
                 **place,
                 **kq,
@@ -798,17 +845,25 @@ class _MlxMixin(_State):
             return a.astype(qh.dtype).reshape(T, Hq * hd), attn_pa
         if able and T == 1 and mask is None and cl._n >= self.mlx_attn_rows:
             if b:
-                pa = mlxdev.attn_params(cl._n, **place)
+                pa = mlxdev.attn_params(cl._n, win, **place)
             else:
-                if attn_pa is None or attn_pa[2] != cl._n:
-                    attn_pa = (*mlxdev.attn_params(cl._n), cl._n)
-                pa = attn_pa[:2]
+                if attn_pa is None or attn_pa.n != cl._n:
+                    attn_pa = _AttnParams(cl._n)
+                if win not in attn_pa.by_window:
+                    attn_pa.by_window[win] = mlxdev.attn_params(cl._n, win)
+                pa = attn_pa.by_window[win]
             a = mlxdev.attn_decode(qh[0, :, 0].astype(m.float32), cl._mx[0], cl._mx[1], cl._n, scale, params=pa, **kq)
             return a.astype(qh.dtype).reshape(1, Hq * hd), attn_pa
-        if able and mask == "causal" and self._mlx_prefill_able(cl, T, hd, Hq, Hk):
+        if able and mask == "causal" and win is None and self._mlx_prefill_able(cl, T, hd, Hq, Hk):
             # the chunk's rows are appended already: row t at cache row past + t
             a = mlxdev.attn_prefill(qh[0].transpose(1, 0, 2), cl._mx[0], cl._mx[1], cl._n - T, scale, odt=qh.dtype)
             return a.reshape(T, Hq * hd), attn_pa
+        if win is not None and (mask is None or isinstance(mask, str)):
+            # SDPA over the whole cache, masked to a sliding window: row t (at past + t) keeps keys (p - win, p]
+            n = int(K.shape[-2])
+            p = (n - T) + m.arange(T, dtype=m.int32)[:, None]
+            j = m.arange(n, dtype=m.int32)[None, :]
+            mask = ((j <= p) & (j > p - win))[None, None]
         a = m.fast.scaled_dot_product_attention(qh, K, V, scale=scale, mask=mask)
         return a[0].transpose(1, 0, 2).reshape(T, Hq * hd), attn_pa
 
@@ -1041,14 +1096,17 @@ class _MlxMixin(_State):
             T = int(hm.shape[0])
             dt = mlxdev.torch_dtype(hm.dtype)
         act = self._mlx_act()
+        silu = act_name(c) in ("silu", "swish")  # the fused gate/up kernel is silu's; gelu keeps `act`
         Hq = int(c.num_attention_heads)
         Hk = int(getattr(c, "num_key_value_heads", None) or Hq)
         past = cache.get_seq_length() if cache is not None else 0
         freqs, rd, rscale = self._mlx_rope()
+        # a sandwich family's sliding layers attend through their window; the dense families have none
+        sw = int(getattr(c, "sliding_window", 0) or 0) if self.fam.sandwich else 0
         if self.cold:
             self._cold_start(n_layers)
         t0 = time.time()
-        attn_pa = None
+        attn_pa: _AttnParams | None = None
         taps = []
         # under speculation a chain or a tree of drafted tokens attends through the decode kernel node by node, as the
         # one-row step would, so its verdicts are the greedy loop's
@@ -1066,7 +1124,7 @@ class _MlxMixin(_State):
             and rows is None
             and forest is None
             and T <= 16
-            and self.fam.kernel_layout
+            and (self.fam.kernel_layout or self.fam.sandwich)
             and rd == int(self.host[0].self_attn.head_dim)
             and hm.dtype == m.bfloat16
         )
@@ -1088,7 +1146,9 @@ class _MlxMixin(_State):
             w = self._mlx_consts(i, tmpl, dt)
             at, mlp = tmpl.self_attn, tmpl.mlp
             hd = int(at.head_dim)
-            x = x_next if x_next is not None else m.fast.rms_norm(hm, w["ln1"], w["eps1"])
+            fq = freqs[self.layer_types[i]] if isinstance(freqs, dict) else freqs
+            win = sw if sw and self.layer_types[i] == LayerKind.SLIDING else None
+            x = x_next if x_next is not None else self._mlx_norm(hm, w["ln1"], w["eps1"])
             roped = False
             if hasattr(at, "qkv_proj"):  # q, k and v as one projection (Phi-3's layout)
                 qkv = be.matmul(x, at.qkv_proj.mx)
@@ -1102,13 +1162,13 @@ class _MlxMixin(_State):
                     # the q/k norms and the rope in one launch: row t at past + t (a chain), or at its depth (a tree)
                     qk_pos = tree_pos if tree else [past + t for t in range(T)]
                     q, k = fk.qk_norm_rope(
-                        qkv[:, :Hq], qkv[:, Hq : Hq + Hk], w["qn"], w["kn"], w["epsq"], rd, freqs, rscale, qk_pos
+                        qkv[:, :Hq], qkv[:, Hq : Hq + Hk], w["qn"], w["kn"], w["epsq"], rd, fq, rscale, qk_pos
                     )
                     v = qkv[:, Hq + Hk :]
                     roped = True
                 else:
-                    q = m.fast.rms_norm(qkv[:, :Hq], w["qn"], w["epsq"])
-                    k = m.fast.rms_norm(qkv[:, Hq : Hq + Hk], w["kn"], w["epsq"])
+                    q = self._mlx_norm(qkv[:, :Hq], w["qn"], w["epsq"])
+                    k = self._mlx_norm(qkv[:, Hq : Hq + Hk], w["kn"], w["epsq"])
                     v = qkv[:, Hq + Hk :]
             else:
                 # separate q/k/v projections (a GGUF file's tensors, or an unfused layout): the q/k norms and the
@@ -1118,27 +1178,27 @@ class _MlxMixin(_State):
                 v = be.matmul(x, at.v_proj.mx).reshape(T, Hk, hd)
                 if fuse and not batched:
                     qk_pos = tree_pos if tree else [past + t for t in range(T)]
-                    q, k = fk.qk_norm_rope(q, k, w["qn"], w["kn"], w["epsq"], rd, freqs, rscale, qk_pos)
+                    q, k = fk.qk_norm_rope(q, k, w["qn"], w["kn"], w["epsq"], rd, fq, rscale, qk_pos)
                     roped = True
                 else:
-                    q = m.fast.rms_norm(q, w["qn"], w["epsq"])
-                    k = m.fast.rms_norm(k, w["kn"], w["epsq"])
+                    q = self._mlx_norm(q, w["qn"], w["epsq"])
+                    k = self._mlx_norm(k, w["kn"], w["epsq"])
             if rows is not None:
                 # B rows, one token each at its own position: the weights read once for all, each row rotated,
                 # appended and attended over its own slice as its single decode would be
                 cl = cache.layers[i]
                 if self.mlx_state.rope_rows:
-                    qr, kr = mlxdev.rope_rows2(q, k, rd, freqs, rscale, rows)  # both in one launch
+                    qr, kr = mlxdev.rope_rows2(q, k, rd, fq, rscale, rows)  # both in one launch
                 else:
-                    qr = self._mlx_rope_rows(q, rows, rd, freqs, rscale)
-                    kr = self._mlx_rope_rows(k, rows, rd, freqs, rscale)
+                    qr = self._mlx_rope_rows(q, rows, rd, fq, rscale)
+                    kr = self._mlx_rope_rows(k, rows, rd, fq, rscale)
                 cl.mx_update_rows(kr[:, :, None, :], v[:, :, None, :])
                 a = self._mlx_attend_rows(qr, cl, float(at.scaling), prepared=rows_prep)
             elif forest is not None:
                 # a group of rows' prompts end to end: one gemm at the group's size, each token rotated at its
                 # position in its row, the rows one slab in the flat buffer, every token attending its row's prefix
                 cl = cache.layers[i]
-                qr, kr = mlxdev.rope_rows2(q, k, rd, freqs, rscale, forest["pos"])
+                qr, kr = mlxdev.rope_rows2(q, k, rd, fq, rscale, forest["pos"])
                 cl.forest_store(kr, v, forest["node0"])
                 a = self._mlx_attend_forest(qr, kr, v, cl, float(at.scaling), forest)
             elif roped:
@@ -1147,12 +1207,12 @@ class _MlxMixin(_State):
             elif tree:
                 # every node rotated at its own position (past + depth) in one launch for q and k, the bits
                 # of the one-row step's rope at that position
-                qr, kr = mlxdev.rope_rows2(q, k, rd, freqs, rscale, tree_pos)
+                qr, kr = mlxdev.rope_rows2(q, k, rd, fq, rscale, tree_pos)
                 qh, kh = qr.transpose(1, 0, 2)[None], kr.transpose(1, 0, 2)[None]
                 vh = v.transpose(1, 0, 2)[None]
             else:
-                qh = be.rope_fast(q.transpose(1, 0, 2), rd, freqs, rscale, past)[None]
-                kh = be.rope_fast(k.transpose(1, 0, 2), rd, freqs, rscale, past)[None]
+                qh = be.rope_fast(q.transpose(1, 0, 2), rd, fq, rscale, past)[None]
+                kh = be.rope_fast(k.transpose(1, 0, 2), rd, fq, rscale, past)[None]
                 vh = v.transpose(1, 0, 2)[None]
             if not batched:
                 cl, K, V = self._mlx_cache(cache, i, kh, vh)
@@ -1170,12 +1230,22 @@ class _MlxMixin(_State):
                     attn_pa,
                     nodes=(past, parents if tree else list(range(-1, T - 1))) if (spec_chain and T > 1) else None,
                     prepared=tree_prep,
+                    win=win,
                 )
-            if fuse:
-                hm, x2 = fk.add_rmsnorm(hm, be.matmul(a, at.o_proj.mx), w["ln2"], w["eps2"])
+            attn_out = be.matmul(a, at.o_proj.mx)
+            if self.fam.sandwich:
+                # Gemma norms the attention output, then adds it to the residual; the MLP reads its own pre-norm
+                hm = (
+                    fk.sandwich_add(hm, attn_out, w["post_attn"], w["eps_pa"])
+                    if fuse
+                    else hm + self._mlx_norm(attn_out, w["post_attn"], w["eps_pa"])
+                )
+                x2 = self._mlx_norm(hm, w["pre_ff"], w["eps_pf"])
+            elif fuse:
+                hm, x2 = fk.add_rmsnorm(hm, attn_out, w["ln2"], w["eps2"])
             else:
-                hm = hm + be.matmul(a, at.o_proj.mx)
-                x2 = m.fast.rms_norm(hm, w["ln2"], w["eps2"])
+                hm = hm + attn_out
+                x2 = self._mlx_norm(hm, w["ln2"], w["eps2"])
             gu_w = getattr(mlp, "_mx_gu", None)
             if hasattr(mlp, "gate_up_proj"):  # gate and up as one projection (Phi-3's layout)
                 gate, up = m.split(be.matmul(x2, mlp.gate_up_proj.mx), 2, axis=-1)
@@ -1184,7 +1254,7 @@ class _MlxMixin(_State):
             elif gu_w is not None and (batched or T <= 16):
                 # gate and up as one matvec
                 gu = be.matmul(x2, gu_w)
-                if fuse:
+                if fuse and silu:
                     mid = fk.silu_mul(gu)
                 else:
                     half = int(gu.shape[1]) // 2
@@ -1193,7 +1263,15 @@ class _MlxMixin(_State):
             else:
                 mid = act(be.matmul(x2, mlp.gate_proj.mx)) * be.matmul(x2, mlp.up_proj.mx)
                 down = be.matmul(mid, mlp.down_proj.mx)
-            if fuse and i + 1 < n_layers and self.layer_types[i + 1] == LayerKind.FULL:
+            if self.fam.sandwich:
+                # norm the MLP output, then add; the next layer takes its own input norm (no fusion across the add)
+                hm = (
+                    fk.sandwich_add(hm, down, w["post_ff"], w["eps_pf2"])
+                    if fuse
+                    else hm + self._mlx_norm(down, w["post_ff"], w["eps_pf2"])
+                )
+                x_next = None
+            elif fuse and i + 1 < n_layers and self.layer_types[i + 1] == LayerKind.FULL:
                 # the residual add fused with the next layer's input norm
                 w_next = self._mlx_consts(i + 1, self.host[i + 1], dt)
                 hm, x_next = fk.add_rmsnorm(hm, down, w_next["ln1"], w_next["eps1"])
@@ -1229,7 +1307,7 @@ class _MlxMixin(_State):
         mg = getattr(self, "_mega", None)
         if mg is None or cache is None or not (1 <= T <= 16) or on_layer is not None or not head or pick is None:
             return False
-        if self.cold or not self.fam.kernel_layout or self.mlx_state.affine:
+        if self.cold or not self.fam.kernel_layout or self.fam.sandwich or self.mlx_state.affine:
             return False
         if positions is not None and not self._mega_positions_ok(cache, T, positions):
             return False
@@ -1328,7 +1406,8 @@ class _MlxMixin(_State):
 
     def _mlx_embed_rows(self, tok: Any) -> mx_.array:
         """the embedding rows for token ids `tok` (an MLX int array): gathered straight from the packed bytes when
-        the tied head is Q6_K (no bf16 copy of the whole table), else a take on the resident table."""
+        the tied head is Q6_K (no bf16 copy of the whole table), else a take on the resident table; scaled as
+        `embed` scales them (Gemma's sqrt(hidden)), so every graph entry embeds alike"""
         hh = self.head_host
         if (
             hh is not None
@@ -1336,8 +1415,10 @@ class _MlxMixin(_State):
             and self.head_key == self.prefix + "embed_tokens.weight"
         ):
             raw, _rows, cols = hh.mx.q6k
-            return gather_q6k(raw, tok, cols)
-        return mlxdev.mx().take(self._mlx_embed(), tok, axis=0)
+            rows = gather_q6k(raw, tok, cols)
+        else:
+            rows = mlxdev.mx().take(self._mlx_embed(), tok, axis=0)
+        return rows if self.embed_scale is None else rows * self.embed_scale
 
     def _mlx_batch_ok(self, B: int, on_layer: Any, prefill_only: bool) -> bool:
         """B > 1 rows decode together on the MLX device: the dense families through the fused forward, each
@@ -1497,7 +1578,7 @@ class _MlxMixin(_State):
             and attention_mask is None
             and on_layer is None
             and not prefill_only
-            and (self.fam.dense or self.fam.hybrid)
+            and (self.fam.dense or self.fam.hybrid or self.fam.sandwich)
             and not self.cold
             and self.norm is not None
             and self.head_host is not None
@@ -1625,7 +1706,7 @@ class _MlxMixin(_State):
             T = int(hm.shape[0])
             dt = mlxdev.torch_dtype(hm.dtype)
         act = self._mlx_act()
-        silu = str(getattr(self.cfg, "hidden_act", "silu")) in ("silu", "swish")
+        silu = act_name(c) in ("silu", "swish")
         past = cache.get_seq_length() if cache is not None else 0
         Hq = int(c.num_attention_heads)
         Hk = int(getattr(c, "num_key_value_heads", None) or Hq)
@@ -1633,6 +1714,7 @@ class _MlxMixin(_State):
         parents: Any = getattr(self, "ap", None) if spec_on else None
         tree = parents is not None and any(parents[j] != j - 1 for j in range(T))
         freqs, rd, rscale = self._mlx_rope()
+        assert not isinstance(freqs, dict)  # the hybrid families (Qwen3.5) carry a single rope, never Gemma's dual
         tree_prep, tree_pos = self._mlx_tree_prep(cache, past, parents) if tree else (None, [])
         keys = _pick_keys(pick, tree_pos if tree else range(past, past + T), last_only)
         # as the host path: after a prefix, positions step one at a time through the kernel (a chain, a tree, a
@@ -1660,7 +1742,7 @@ class _MlxMixin(_State):
         if self.cold:
             self._cold_start(n_layers)
         t0 = time.time()
-        attn_pa = None
+        attn_pa: _AttnParams | None = None
         pending: list[Any] = []
         pend_inplace: set[int] = set()
         fresh: list[Any] = []
