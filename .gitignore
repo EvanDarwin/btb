@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 dist/
 .venv/
+btb/_build.py
 
 # Claude Code's local state and worktrees
 .claude/
