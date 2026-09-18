@@ -71,11 +71,17 @@ def run_cell(
             if time.time() - t0 > timeout:
                 kind, why = BenchStatus.DNF, f"did not finish within {timeout:.0f}s"
             elif st["level"] < g.get("mem_floor", 0):
-                kind, why = BenchStatus.OOM, f"the kernel's free memory fell to {st['level']:.0f}% (floor {g['mem_floor']:.0f}%)"
+                kind, why = (
+                    BenchStatus.OOM,
+                    f"the kernel's free memory fell to {st['level']:.0f}% (floor {g['mem_floor']:.0f}%)",
+                )
             elif st["swap_gb"] > g.get("swap_cap", float("inf")):
                 kind, why = BenchStatus.OOM, f"swap in use reached {st['swap_gb']:.1f} GB (cap {g['swap_cap']:.0f} GB)"
             elif st["disk_gb"] < g.get("disk_floor", 0):
-                kind, why = BenchStatus.DNR, f"stopped: {st['disk_gb']:.1f} GB left on the disk (floor {g['disk_floor']:.0f} GB)"
+                kind, why = (
+                    BenchStatus.DNR,
+                    f"stopped: {st['disk_gb']:.1f} GB left on the disk (floor {g['disk_floor']:.0f} GB)",
+                )
             if kind:
                 if sys.platform == "win32":
                     proc.kill()

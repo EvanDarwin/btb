@@ -348,8 +348,13 @@ class _MlxMixin(_State):
 
     # GGUF IQ lattice type name -> the backend's lattice-kernel kind
     _LATT_KINDS = {
-        "IQ3_XXS": "iq3xxs", "IQ2_XXS": "iq2xxs", "IQ2_XS": "iq2xs", "IQ2_S": "iq2s",
-        "IQ1_S": "iq1s", "IQ3_S": "iq3s", "IQ1_M": "iq1m",
+        "IQ3_XXS": "iq3xxs",
+        "IQ2_XXS": "iq2xxs",
+        "IQ2_XS": "iq2xs",
+        "IQ2_S": "iq2s",
+        "IQ1_S": "iq1s",
+        "IQ3_S": "iq3s",
+        "IQ1_M": "iq1m",
     }
 
     def _bind_gguf_lattice(self, m: Any) -> bool:

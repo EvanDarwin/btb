@@ -432,8 +432,15 @@ def test_a_native_kernel_gguf_multiplies_its_blocks_as_stored_on_mlx(quant: str,
     path = cached(f"{REAL_REPO}:Qwen3-0.6B-{quant}.gguf")
     if path is None:
         pytest.skip(f"Qwen3-0.6B-{quant}.gguf is not cached")
-    latt = {"IQ3_XXS": "iq3xxs", "IQ2_XXS": "iq2xxs", "IQ2_XS": "iq2xs", "IQ2_S": "iq2s",
-            "IQ1_S": "iq1s", "IQ3_S": "iq3s", "IQ1_M": "iq1m"}
+    latt = {
+        "IQ3_XXS": "iq3xxs",
+        "IQ2_XXS": "iq2xxs",
+        "IQ2_XS": "iq2xs",
+        "IQ2_S": "iq2s",
+        "IQ1_S": "iq1s",
+        "IQ3_S": "iq3s",
+        "IQ1_M": "iq1m",
+    }
     kq = {"Q2_K": matvec_q2k, "Q3_K": matvec_q3k, "Q4_K": matvec_q4k, "Q5_K": matvec_q5k, "Q6_K": matvec_q6k}
     seen: set[str] = set()
     for name, t in GGUFModel(path).tensors.items():

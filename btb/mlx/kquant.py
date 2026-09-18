@@ -187,7 +187,11 @@ def _dequant(kind: str, w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
         k = _deq_kernels.get(kind)
         if k is None:
             k = _deq_kernels[kind] = m.fast.metal_kernel(
-                name=f"btb_{kind}_dequant", input_names=["W"], output_names=["out"], header=f"{_SM}{_defs(kind)}", source=_DEQUANT
+                name=f"btb_{kind}_dequant",
+                input_names=["W"],
+                output_names=["out"],
+                header=f"{_SM}{_defs(kind)}",
+                source=_DEQUANT,
             )
     grid = ((nblk + 255) // 256) * 256
     return k(
@@ -303,8 +307,14 @@ def matvec_q2k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.ar
                     source=_MATVEC_Q2K,
                 )
         outs.append(
-            k(inputs=[w_bytes, xr], grid=(grid, 1, 1), threadgroup=(256, 1, 1),
-              output_shapes=[(tr, rows)], output_dtypes=[x.dtype], template=[("T", x.dtype)])[0]
+            k(
+                inputs=[w_bytes, xr],
+                grid=(grid, 1, 1),
+                threadgroup=(256, 1, 1),
+                output_shapes=[(tr, rows)],
+                output_dtypes=[x.dtype],
+                template=[("T", x.dtype)],
+            )[0]
         )
     return outs[0] if len(outs) == 1 else m.concatenate(outs, axis=0)
 
@@ -321,8 +331,12 @@ def dequant_q2k(w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
             )
     grid = ((nblk * 32 + 255) // 256) * 256
     return _q2k_deq(
-        inputs=[w_bytes], grid=(grid, 1, 1), threadgroup=(256, 1, 1),
-        output_shapes=[(rows, cols)], output_dtypes=[m.bfloat16], template=[("T", m.bfloat16), ("NBLK", nblk)]
+        inputs=[w_bytes],
+        grid=(grid, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, cols)],
+        output_dtypes=[m.bfloat16],
+        template=[("T", m.bfloat16), ("NBLK", nblk)],
     )[0]
 
 
@@ -426,8 +440,14 @@ def matvec_q3k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.ar
                     source=_MATVEC_Q3K,
                 )
         outs.append(
-            k(inputs=[w_bytes, xr], grid=(grid, 1, 1), threadgroup=(256, 1, 1),
-              output_shapes=[(tr, rows)], output_dtypes=[x.dtype], template=[("T", x.dtype)])[0]
+            k(
+                inputs=[w_bytes, xr],
+                grid=(grid, 1, 1),
+                threadgroup=(256, 1, 1),
+                output_shapes=[(tr, rows)],
+                output_dtypes=[x.dtype],
+                template=[("T", x.dtype)],
+            )[0]
         )
     return outs[0] if len(outs) == 1 else m.concatenate(outs, axis=0)
 
@@ -444,6 +464,10 @@ def dequant_q3k(w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
             )
     grid = ((nblk * 32 + 255) // 256) * 256
     return _q3k_deq(
-        inputs=[w_bytes], grid=(grid, 1, 1), threadgroup=(256, 1, 1),
-        output_shapes=[(rows, cols)], output_dtypes=[m.bfloat16], template=[("T", m.bfloat16), ("NBLK", nblk)]
+        inputs=[w_bytes],
+        grid=(grid, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, cols)],
+        output_dtypes=[m.bfloat16],
+        template=[("T", m.bfloat16), ("NBLK", nblk)],
     )[0]

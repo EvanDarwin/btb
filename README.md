@@ -85,9 +85,11 @@ btb serve Qwen/Qwen3-4B --port 8000
 
 ```python
 from openai import OpenAI
+
 client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="btb")
-for chunk in client.chat.completions.create(model="qwen3-4b", stream=True,
-        messages=[{"role": "user", "content": "Why is the sky blue?"}]):
+for chunk in client.chat.completions.create(
+    model="qwen3-4b", stream=True, messages=[{"role": "user", "content": "Why is the sky blue?"}]
+):
     print(chunk.choices[0].delta.content or "", end="", flush=True)
 ```
 

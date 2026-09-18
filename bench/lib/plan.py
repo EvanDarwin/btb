@@ -250,9 +250,7 @@ def _in_points(c: BenchMatrixCell, points: Sequence[Point]) -> bool:
     if not points:
         return True
     for p in points:
-        if all(
-            (_matches(c["model"], c["repo"], v) if ax == "model" else cell_kind(c, ax) == v) for ax, v in p.items()
-        ):
+        if all((_matches(c["model"], c["repo"], v) if ax == "model" else cell_kind(c, ax) == v) for ax, v in p.items()):
             return True
     return False
 

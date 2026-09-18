@@ -510,7 +510,15 @@ def load(
         ks = c.get("draft_ks")
         if ks is not None:
             sm.draft_ks = tuple(int(x) for x in (ks.split(",") if isinstance(ks, str) else ks) if str(x).strip())
-        draft_sm = load(resolve(str(dm)), device=device, native=native, log=None, v_max=0, tree_budget=0, gguf_packed=int(c.get("gguf_packed", 1)))
+        draft_sm = load(
+            resolve(str(dm)),
+            device=device,
+            native=native,
+            log=None,
+            v_max=0,
+            tree_budget=0,
+            gguf_packed=int(c.get("gguf_packed", 1)),
+        )
         if int(draft_sm.cfg.vocab_size) != int(sm.cfg.vocab_size):
             draft_sm.close()
             raise options.OptionError(

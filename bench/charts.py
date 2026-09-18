@@ -139,7 +139,11 @@ def _variant(cell: BenchMatrixCell) -> str:
     where it would apply, and a sampling temperature. Empty for the default (greedy, the megakernel on)."""
     bits: list[str] = []
     # the megakernel is btb's own MLX path; a rival has no such thing, so the variant is meaningless there
-    if not cell.get("tool") and not cell.get("mega") and mega_capable(cell.get("device") or "", cell.get("dtype") or "", cell.get("type")):
+    if (
+        not cell.get("tool")
+        and not cell.get("mega")
+        and mega_capable(cell.get("device") or "", cell.get("dtype") or "", cell.get("type"))
+    ):
         bits.append("no megakernel")
     samp = cell.get("sampling") or "greedy"
     if samp != "greedy":
@@ -300,13 +304,17 @@ def chart(model: str, machine: Machine, rows: Sequence[Row]) -> str:
             g.append(f'<text x="{PAD}" y="{y + 34 + i * 15}" font-size="13" fill="{MUTED}">{escape(ln)}</text>')
         if not r.speeds:
             for i, ln in enumerate(_wrap(r.note, 74, 2)):
-                g.append(f'<text x="{BARS_X}" y="{y + 14 + i * 16}" font-size="13" font-style="italic" fill="{MUTED}">{escape(ln)}</text>')
+                g.append(
+                    f'<text x="{BARS_X}" y="{y + 14 + i * 16}" font-size="13" font-style="italic" fill="{MUTED}">{escape(ln)}</text>'
+                )
             body.append("".join(g))
             y += 46
             continue
         for i, v in enumerate(r.speeds):
             by = y + i * (BAR_H + BAR_GAP)
-            g.append(f'<text x="{BARS_X - 10}" y="{by + BAR_H - 4}" font-size="11" fill="{MUTED}" text-anchor="end">{LENGTHS[i]}</text>')
+            g.append(
+                f'<text x="{BARS_X - 10}" y="{by + BAR_H - 4}" font-size="11" fill="{MUTED}" text-anchor="end">{LENGTHS[i]}</text>'
+            )
             g.append(f'<rect x="{BARS_X}" y="{by}" width="{span}" height="{BAR_H}" rx="4" fill="{TRACK}"/>')
             if v is None:
                 g.append(f'<text x="{BARS_X + 8}" y="{by + BAR_H - 4}" font-size="11" fill="{MUTED}">no run</text>')
@@ -314,7 +322,9 @@ def chart(model: str, machine: Machine, rows: Sequence[Row]) -> str:
             w = max(3.0, v / top * span)
             g.append(f'<rect x="{BARS_X}" y="{by}" width="{w:.1f}" height="{BAR_H}" rx="4" fill="{_color(r.engine)}"/>')
             deco = ' text-decoration="underline"' if winner.get(i) == ri else ""
-            g.append(f'<text x="{BARS_X + w + 8:.1f}" y="{by + BAR_H - 4}" font-size="14" fill="{INK}"{deco}>{_fmt(v)}</text>')
+            g.append(
+                f'<text x="{BARS_X + w + 8:.1f}" y="{by + BAR_H - 4}" font-size="14" fill="{INK}"{deco}>{_fmt(v)}</text>'
+            )
         caps = [
             ("tok/pass", " · ".join(f"{t:.2f}" for t in r.per_pass) if r.per_pass else "1.00"),
             ("first", f"{r.first:.2f}s" if r.first is not None else "—"),
@@ -323,7 +333,9 @@ def chart(model: str, machine: Machine, rows: Sequence[Row]) -> str:
         ]
         cy = y + len(r.speeds) * (BAR_H + BAR_GAP) + 8
         for (lbl, val), off in zip(caps, CAP_COLS):
-            g.append(f'<text x="{BARS_X + off}" y="{cy}" font-size="12" fill="{MUTED}">{lbl} <tspan fill="{INK}">{escape(val)}</tspan></text>')
+            g.append(
+                f'<text x="{BARS_X + off}" y="{cy}" font-size="12" fill="{MUTED}">{lbl} <tspan fill="{INK}">{escape(val)}</tspan></text>'
+            )
         body.append("".join(g))
         y += len(r.speeds) * (BAR_H + BAR_GAP) + 32
     height = y + 6

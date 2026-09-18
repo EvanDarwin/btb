@@ -80,7 +80,12 @@ def test_a_download_prompt_names_where_it_writes_and_the_space_there(monkeypatch
     import btb.confirm
 
     asked: list[str] = []
-    monkeypatch.setattr(btb.confirm, "confirm", lambda q, **kw: asked.append(q) or True)
+
+    def _yes(q: str, **kw: object) -> bool:
+        asked.append(q)
+        return True
+
+    monkeypatch.setattr(btb.confirm, "confirm", _yes)
     monkeypatch.setattr("huggingface_hub.constants.HF_HUB_CACHE", str(tmp_path))
     monkeypatch.setattr(hf, "would_download", lambda path: True)
     monkeypatch.setattr(hf, "hub_info", lambda path: (8_100_000_000, 12))

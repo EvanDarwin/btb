@@ -1003,8 +1003,20 @@ class _TiersMixin(_State):
             return False
         kind = t.tensor_type.name
         # own-kernel binders' shape gate; no fallback binder catches a miss
-        if kind in ("Q6_K", "Q5_K", "Q3_K", "Q2_K", "IQ4_XS",
-                    "IQ3_XXS", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ1_S", "IQ3_S", "IQ1_M"):
+        if kind in (
+            "Q6_K",
+            "Q5_K",
+            "Q3_K",
+            "Q2_K",
+            "IQ4_XS",
+            "IQ3_XXS",
+            "IQ2_XXS",
+            "IQ2_XS",
+            "IQ2_S",
+            "IQ1_S",
+            "IQ3_S",
+            "IQ1_M",
+        ):
             return shape[1] % 256 == 0
         if kind == "IQ4_NL":
             return shape[1] % 32 == 0

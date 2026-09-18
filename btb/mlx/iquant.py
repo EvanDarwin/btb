@@ -51,6 +51,7 @@ def _ksigns() -> Any:
             mx().eval(k)
     return k
 
+
 # the fixed IQ4 non-linear codebook (ggml's kvalues_iq4nl): a 4-bit index maps to one of these 16 levels.
 _KV = "constant int KV[16] = {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113};\n"
 
@@ -193,8 +194,14 @@ def _matvec(kind: str, w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -
                     source=src,
                 )
         outs.append(
-            k(inputs=[w_bytes, xr], grid=(grid, 1, 1), threadgroup=(256, 1, 1),
-              output_shapes=[(tr, rows)], output_dtypes=[x.dtype], template=[("T", x.dtype)])[0]
+            k(
+                inputs=[w_bytes, xr],
+                grid=(grid, 1, 1),
+                threadgroup=(256, 1, 1),
+                output_shapes=[(tr, rows)],
+                output_dtypes=[x.dtype],
+                template=[("T", x.dtype)],
+            )[0]
         )
     return outs[0] if len(outs) == 1 else m.concatenate(outs, axis=0)
 
@@ -211,8 +218,12 @@ def _dequant(kind: str, w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
             )
     grid = ((nblk * 32 + 255) // 256) * 256
     return k(
-        inputs=[w_bytes], grid=(grid, 1, 1), threadgroup=(256, 1, 1),
-        output_shapes=[(rows, cols)], output_dtypes=[m.bfloat16], template=[("T", m.bfloat16), ("NBLK", nblk)]
+        inputs=[w_bytes],
+        grid=(grid, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, cols)],
+        output_dtypes=[m.bfloat16],
+        template=[("T", m.bfloat16), ("NBLK", nblk)],
     )[0]
 
 
@@ -253,8 +264,14 @@ def matvec_iq4nl(d: mx_.array, q: mx_.array, x: mx_.array, rows: int, cols: int)
                     source=_MATVEC_IQ4NL,
                 )
         outs.append(
-            k(inputs=[d, q, xr], grid=(grid, 1, 1), threadgroup=(256, 1, 1),
-              output_shapes=[(tr, rows)], output_dtypes=[x.dtype], template=[("T", x.dtype)])[0]
+            k(
+                inputs=[d, q, xr],
+                grid=(grid, 1, 1),
+                threadgroup=(256, 1, 1),
+                output_shapes=[(tr, rows)],
+                output_dtypes=[x.dtype],
+                template=[("T", x.dtype)],
+            )[0]
         )
     return outs[0] if len(outs) == 1 else m.concatenate(outs, axis=0)
 
@@ -267,12 +284,20 @@ def dequant_iq4nl(d: mx_.array, q: mx_.array, rows: int, cols: int) -> mx_.array
     with _lock:
         if _iq4nl_deq is None:
             _iq4nl_deq = m.fast.metal_kernel(
-                name="btb_iq4nl_dequant", input_names=["Dd", "Qq"], output_names=["out"], header=_KV, source=_DEQUANT_IQ4NL
+                name="btb_iq4nl_dequant",
+                input_names=["Dd", "Qq"],
+                output_names=["out"],
+                header=_KV,
+                source=_DEQUANT_IQ4NL,
             )
     grid = ((nblk + 255) // 256) * 256
     return _iq4nl_deq(
-        inputs=[d, q], grid=(grid, 1, 1), threadgroup=(256, 1, 1),
-        output_shapes=[(rows, cols)], output_dtypes=[m.bfloat16], template=[("T", m.bfloat16), ("NBLK", nblk)]
+        inputs=[d, q],
+        grid=(grid, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, cols)],
+        output_dtypes=[m.bfloat16],
+        template=[("T", m.bfloat16), ("NBLK", nblk)],
     )[0]
 
 
@@ -691,13 +716,20 @@ _DEQUANT_IQ1M = r"""
     }
 """
 
+
 def _side_iq1m(raw: Any) -> tuple[Any, Any]:
     """IQ1_M's matvec side stream, built once at bind from the raw 56-byte superblocks: the block f16 d
     reassembled here rather than in the kernel, and the sixteen 3-bit sub-scales packed as nibble pairs (8 B)."""
     b = np.ascontiguousarray(np.asarray(raw, dtype=np.uint8)).reshape(-1, 56)
     scb = np.ascontiguousarray(b[:, 48:56]).view(np.uint16).reshape(-1, 4).astype(np.uint32)
-    dbits = ((scb[:, 0] >> 12) | ((scb[:, 1] >> 12) << 4) | ((scb[:, 2] >> 12) << 8) | ((scb[:, 3] >> 12) << 12)).astype(np.uint16)
-    sub = ((scb.reshape(-1, 4, 1) >> np.array([0, 3, 6, 9], np.uint32).reshape(1, 1, 4)) & 7).reshape(-1, 16).astype(np.uint8)
+    dbits = (
+        (scb[:, 0] >> 12) | ((scb[:, 1] >> 12) << 4) | ((scb[:, 2] >> 12) << 8) | ((scb[:, 3] >> 12) << 12)
+    ).astype(np.uint16)
+    sub = (
+        ((scb.reshape(-1, 4, 1) >> np.array([0, 3, 6, 9], np.uint32).reshape(1, 1, 4)) & 7)
+        .reshape(-1, 16)
+        .astype(np.uint8)
+    )
     sb = (sub[:, 0::2] | (sub[:, 1::2] << 4)).astype(np.uint8).reshape(-1)
     m = mx()
     return m.array(dbits.view(np.float16)), m.array(sb)
@@ -715,8 +747,15 @@ _LATT: dict[str, dict[str, Any]] = {
     "iq2s": {"bytes": 82, "grid": "IQ2_S", "ksigns": False, "mv": _MATVEC_IQ2S, "deq": _DEQUANT_IQ2S},
     "iq1s": {"bytes": 50, "grid": "IQ1_S", "ksigns": False, "mv": _MATVEC_IQ1S, "deq": _DEQUANT_IQ1S},
     "iq3s": {"bytes": 110, "grid": "IQ3_S", "ksigns": False, "mv": _MATVEC_IQ3S, "deq": _DEQUANT_IQ3S},
-    "iq1m": {"bytes": 56, "grid": "IQ1_M", "ksigns": False, "mv": _MATVEC_IQ1M, "deq": _DEQUANT_IQ1M,
-             "side": _side_iq1m, "side_names": ["Dd", "SB"]},
+    "iq1m": {
+        "bytes": 56,
+        "grid": "IQ1_M",
+        "ksigns": False,
+        "mv": _MATVEC_IQ1M,
+        "deq": _DEQUANT_IQ1M,
+        "side": _side_iq1m,
+        "side_names": ["Dd", "SB"],
+    },
 }
 
 
@@ -724,6 +763,8 @@ def repack_lattice(kind: str, raw: Any) -> tuple[Any, ...]:
     """the side streams `matvec_lattice` wants beside the raw bytes for this kind (empty for most), built once."""
     side = _LATT[kind].get("side")
     return tuple(side(raw)) if side is not None else ()
+
+
 _latt_mv: dict[Any, Any] = {}
 _latt_deq: dict[str, Any] = {}
 
@@ -756,8 +797,14 @@ def matvec_lattice(
                     source=spec["mv"],
                 )
         outs.append(
-            k(inputs=[w_bytes, xr, *tbls], grid=(g, 1, 1), threadgroup=(256, 1, 1),
-              output_shapes=[(tr, rows)], output_dtypes=[x.dtype], template=[("T", x.dtype)])[0]
+            k(
+                inputs=[w_bytes, xr, *tbls],
+                grid=(g, 1, 1),
+                threadgroup=(256, 1, 1),
+                output_shapes=[(tr, rows)],
+                output_dtypes=[x.dtype],
+                template=[("T", x.dtype)],
+            )[0]
         )
     return outs[0] if len(outs) == 1 else m.concatenate(outs, axis=0)
 
@@ -777,6 +824,10 @@ def dequant_lattice(kind: str, w_bytes: mx_.array, rows: int, cols: int) -> mx_.
             )
     g = ((nblk * 32 + 255) // 256) * 256
     return k(
-        inputs=[w_bytes, *tbls], grid=(g, 1, 1), threadgroup=(256, 1, 1),
-        output_shapes=[(rows, cols)], output_dtypes=[m.bfloat16], template=[("T", m.bfloat16), ("NBLK", nblk)]
+        inputs=[w_bytes, *tbls],
+        grid=(g, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, cols)],
+        output_dtypes=[m.bfloat16],
+        template=[("T", m.bfloat16), ("NBLK", nblk)],
     )[0]
