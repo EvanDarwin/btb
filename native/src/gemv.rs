@@ -4612,16 +4612,20 @@ mod tests {
     /// thread count, and row 0 of a 3-row pass is its own one-row call, bit for bit (the verify pass's contract).
     fn latt_invariance(core: LattCore, bytes: usize, entries: usize, vals: usize, seed: u64) {
         let (rows, cols) = (37usize, 768usize);
-        let raw = latt_bytes(rows * cols / KQ_SB * bytes, seed);
+        // bit 6 of every raw byte cleared: it is the top exponent bit of each type's f16 delta (the leading
+        // f16's high byte; for IQ1_M the nibble its delta is assembled from), so every delta is finite.
+        let raw: Vec<u8> = latt_bytes(rows * cols / KQ_SB * bytes, seed)
+            .iter()
+            .map(|&u| u & 0xBF)
+            .collect();
         let grid: Vec<i8> = latt_bytes(entries * vals, seed ^ 0x9e37)
             .iter()
             .map(|&u| u as i8)
             .collect();
         let ks = latt_bytes(128, seed ^ 0x1234);
-        let xb = latt_bytes(3 * cols * 4, seed ^ 0xabcd);
-        let x: Vec<f32> = xb
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) * 1e-3)
+        let x: Vec<f32> = latt_bytes(3 * cols, seed ^ 0xabcd)
+            .iter()
+            .map(|&u| (u as i8) as f32 * 0.01)
             .collect();
         let call = |b: usize, xs: &[f32], threads: usize| -> Vec<f32> {
             let mut y = vec![0.0f32; b * rows];
@@ -4644,6 +4648,9 @@ mod tests {
             y
         };
         let base = call(3, &x, 1);
+        // a NaN pass would certify nothing, and is not even stable: x86 picks a NaN's payload by operand order,
+        // which the 4-row and 1-row kernels need not share. The contract is over finite results.
+        assert!(base.iter().all(|v| v.is_finite()), "non-finite pass");
         for t in [2usize, 5, 0] {
             assert_eq!(
                 call(3, &x, t)
