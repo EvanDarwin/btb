@@ -36,10 +36,11 @@ class ModelProposer:
     def extend(self, tok_id: int) -> None:
         self.pending.append(int(tok_id))
 
-    def _logits(self, toks: list[int], parents: list[int]) -> Any:
-        """one pass of the drafter over `toks` with the tree `parents` (-1 a root): the rows' logits [T, V] as
-        a torch tensor on any tier; on the MLX megakernel the pass keeps its argmax in the graph and the
-        logits are read from the kernel's scratch"""
+    def _topk(self, toks: list[int], parents: list[int], k: int) -> list[list[int]]:
+        """one pass of the drafter over `toks` with the tree `parents` (-1 a root): the top-k token ids [T, k] a
+        row, sorted by logit descending. On the MLX megakernel the top-k reduction runs on the graph over the
+        kernel's scratch logits - k ids a row cross to the host, never the whole vocab; the torch tiers top-k the
+        pass's logits directly."""
         sm = self.sm
         T = len(toks)
         mg = getattr(sm, "_mega", None)
@@ -55,14 +56,18 @@ class ModelProposer:
                 sm.ab()
         self.passes += 1
         if not fast:
-            return lg[0].float()
+            return torch.topk(lg[0].float(), min(k, lg.shape[-1]), dim=-1).indices.tolist()
         assert mg is not None  # fast is set only when the megakernel is present
         import mlx.core as mx
         import numpy as np
 
+        from .drafter import mlx_topk_ids
+
         V = mg.V
         raw = mg.scr[mg.toff["logits"] : mg.toff["logits"] + T * V * 4].view(mx.float32).reshape(T, V)
-        return torch.from_numpy(np.array(raw))
+        ids = mlx_topk_ids(raw, k)
+        mx.eval(ids)
+        return np.array(ids).tolist()
 
     def _crop(self) -> None:
         for cl in self.cache.layers:
@@ -77,20 +82,20 @@ class ModelProposer:
         toks = self.pending
         self.pending = []
         # pass 1: the committed tokens as a chain; the last row's top-k are the depth-1 nodes
-        lg = self._logits(toks, list(range(-1, len(toks) - 1)))
-        self.n += len(toks)
         k = min(ks[0], self.nodes)
-        nodes_t = [int(t) for t in torch.topk(lg[-1], k).indices.tolist()]  # the tree's tokens, node order
+        row = self._topk(toks, list(range(-1, len(toks) - 1)), k)[-1]
+        self.n += len(toks)
+        nodes_t = [int(t) for t in row]  # the tree's tokens, node order
         nodes_p = [-1] * k  # each node's parent in the tree (-1 the root, which sits in the cache)
         leaves = list(range(k))
         for d in range(1, len(ks)):
             if len(nodes_t) >= self.nodes:
                 break
             # the tree so far as one pass; the leaves' top-k are the next depth
-            lg = self._logits(nodes_t, nodes_p)
-            self._crop()
             kd = ks[d]
-            top = torch.topk(lg[leaves], kd, dim=-1).indices.tolist()
+            rows = self._topk(nodes_t, nodes_p, kd)
+            self._crop()
+            top = [rows[leaf] for leaf in leaves]
             new_leaves = []
             for leaf, row in zip(leaves, top):
                 for t in row:

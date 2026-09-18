@@ -28,6 +28,53 @@ SERVE_TYPES = frozenset({"qwen3", "qwen3_5", "qwen3_5_text", "phi3", "qwen4_exp"
 
 # the files a model is: what `resolve` downloads of a repo, and what `btb pack` copies beside its packed weights
 MODEL_FILES = ("*.json", "*.safetensors", "*.txt", "*.model", "*.jinja", "*.tiktoken")
+
+# a small, same-tokenizer model that drafts for a larger one: `--draft-model auto` fetches this into the HF
+# cache (partial, resumable, like any model) and speculates with it, the big model verifying every token
+# (propose.py). Keyed by the target's repo id, lowercased; each pair must share the target's tokenizer -
+# the condition for the verify to be exact - so entries are added only once that is checked.
+DRAFT_MODELS = {
+    "qwen/qwen3-4b": "Qwen/Qwen3-0.6B",
+    "qwen/qwen3-8b": "Qwen/Qwen3-0.6B",
+    "qwen/qwen3-14b": "Qwen/Qwen3-1.7B",
+    "qwen/qwen3-32b": "Qwen/Qwen3-1.7B",
+}
+
+
+def _repo_id(model: str) -> str | None:
+    """The Hugging Face repo id for `model`: a repo id ('Org/Name') passed through, or one parsed from a cache
+    snapshot path ('.../models--Org--Name/snapshots/<hash>'); None otherwise. A plain local directory has no
+    id to recover (the config does not carry one), and a wrong guess would only pair the wrong draft."""
+    m = str(model).replace("\\", "/")
+    i = m.find("models--")
+    if i >= 0:
+        seg = m[i + len("models--") :].split("/", 1)[0]  # 'Org--Name'
+        return seg.replace("--", "/", 1) if "--" in seg else None
+    if "/" in m and not os.path.isdir(m):  # 'Org/Name', not a local path
+        return m
+    return None
+
+
+def draft_for(model: str) -> str | None:
+    """The curated draft model's repo id for `model` (a repo id or a cache path), or None if none is known."""
+    rid = _repo_id(model)
+    return DRAFT_MODELS.get(rid.lower()) if rid else None
+
+
+def draft_notice(model: str | None) -> str | None:
+    """Announce `model`'s curated draft once on stderr, if it has one: the speedup is opt-in (it downloads a
+    file) so the user asks for it with --draft-model auto. Returns the draft repo id, or None with no pair.
+    The caller gates the noise (no notice when --draft-model was already given, or under --quiet)."""
+    d = draft_for(model) if model else None
+    if d is not None:
+        sys.stderr.write(
+            f"[btb] {model} has a matching draft model ({d}) - add --draft-model auto to speculate with it "
+            "(a one-time download into the Hugging Face cache).\n"
+        )
+        sys.stderr.flush()
+    return d
+
+
 GGUF_EXT = ".gguf"
 # btb's families by their llama.cpp architecture name (general.architecture), an explicit table
 ARCH_MODEL_TYPES = {"qwen3": "qwen3", "phi3": "phi3", "gpt-oss": "gpt_oss"}

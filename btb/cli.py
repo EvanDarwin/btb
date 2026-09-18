@@ -90,6 +90,8 @@ PLACEMENT = (
     "tree_step_mass",
     "draft_vocab",
     "draft_bits",
+    "draft_model",
+    "draft_ks",
     "ngram_p",
     "expert_cache_gb",
     "ram_reserve_gb",
@@ -205,6 +207,10 @@ def _open(a: argparse.Namespace) -> Any:
 
     a._model = a.path  # the model as the user named it, for the reproduction command (resolve rewrites a.path)
     _confirm_or_exit(a.path)
+    if not a.draft_model and not getattr(a, "quiet", False):
+        from .hf import draft_notice
+
+        draft_notice(a._model)
     a.path = resolve(a.path)
     kw, nat = _kw(a)
     out = _e if a.cmd == "run" else _p  # run keeps stdout for the model's text
@@ -458,6 +464,26 @@ def _common(ap: argparse.ArgumentParser, path_required: bool = True) -> None:
         "--no-spec",
         action="store_true",
         help="turn speculation off: decode one token at a time. The off switch; the flags above tune the tree",
+    )
+    s.add_argument(
+        "--draft-model",
+        dest="draft_model",
+        metavar="PATH",
+        default=None,
+        help="what drafts for this model, its output verified so the answer is unchanged: 'auto' picks and "
+        "downloads the curated small model for it (a one-time HF-cache download), a model directory or Hugging "
+        "Face repo id is a draft model, and a single file is a custom MTP drafting head (unsupported - it must "
+        "match this model). --draft-ks sets a draft model's branching, --draft-bits packs it. Without one the "
+        "n-gram drafter proposes.",
+    )
+    s.add_argument(
+        "--draft-ks",
+        dest="draft_ks",
+        type=_ints(1),
+        metavar="K,K,...",
+        default=None,
+        help="the draft model's branching per tree depth (default 4,3,2): pass one reads the root's top-K0, "
+        "each later pass the leaves' top-Kd",
     )
     d = ap.add_argument_group("sampling (how every token is picked; on the servers a request's own fields win)")
     d.add_argument(
@@ -769,7 +795,10 @@ def cmd_serve(a: argparse.Namespace) -> Any:
     from .serve import serve
 
     _confirm_or_exit(a.path)
+    if not a.draft_model:
+        from .hf import draft_notice
 
+        draft_notice(a.path)
     kw, nat = _kw(a)
     return serve(
         a.path,
@@ -790,7 +819,6 @@ def cmd_ollama(a: argparse.Namespace) -> Any:
     from .serve import ollama
 
     _confirm_or_exit(a.path)
-
     kw, nat = _kw(a)
     return ollama(
         a.path,
@@ -813,7 +841,6 @@ def cmd_pi(a: argparse.Namespace) -> Any:
     from .serve import pi
 
     _confirm_or_exit(a.path)
-
     kw, nat = _kw(a)
     return pi(
         a.path,
@@ -867,9 +894,6 @@ def _require_deps(device: DeviceName | None) -> None:
         return
     _p(f"[btb] missing required package(s): {', '.join(missing)}")
     raise SystemExit(2)
-
-
-_MODES = {"serve": "openai", "ollama": "ollama", "pi": "pi", "chat": "chat", "run": "run", "bench": "bench"}
 
 
 def title_name(model: str | None) -> str:
@@ -1135,8 +1159,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     set_assume_yes(getattr(a, "confirm", False))
     run = a.cmd == "run"  # run's stdout carries the model's text alone; the rest goes to stderr
-    if a.cmd in _MODES:
-        set_title(a.path or "(btb)", _MODES[a.cmd])
+    if a.cmd not in ("pack", "devices"):  # the model-loading commands: title and banner
+        set_title(a.path or "(btb)", "openai" if a.cmd == "serve" else a.cmd)  # serve speaks the OpenAI API
         if not quiet:
             banner(err=run)
     if a.cmd not in ("pack", "devices") and getattr(a, "native", None) is None and not quiet:

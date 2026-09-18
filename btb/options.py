@@ -186,7 +186,10 @@ PASS = (
     "lookahead",
     "lookahead_rows",
     "rope_scaling",
-)  # seed a whole number of any size; the rest the engine's own shapes (lookahead* the per-depth picks)
+    "draft_model",
+    "draft_ks",
+)  # seed a whole number of any size; the rest the engine's own shapes (lookahead* the per-depth picks,
+# draft_model a path/repo for a sibling proposer, draft_ks its tree fan-out per depth)
 KNOWN = frozenset((*FLAGS, *COUNTS, *UNIT, *POSITIVE, *NONNEG, *RESERVE, *CHOICES, *PASS))
 SAMPLING = ("temperature", "top_p", "top_k", "seed")
 

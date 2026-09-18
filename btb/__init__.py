@@ -23,6 +23,7 @@ from .hf import (
     _model_complete,  # noqa: F401
     _model_type,  # noqa: F401
     available_models,
+    draft_for,
     is_packed,
     model_stem,
     pack_format,
@@ -471,7 +472,50 @@ def load(
             )
         except ValueError as e:
             sm.log(f"[mega] off: {e}")
+    sm.draft_engine = None
+    sm.draft_ks = (4, 3, 2)
     sm.warm()
+    # a sibling model drafts the speculative tree, verified exactly by this model's tree pass: far better than the
+    # n-gram proposer on fresh prose, and the memory-bound single-stream lever. Same tokenizer required.
+    from .hf import confirm_download, is_gguf
+
+    dm = c.get("draft_model")
+    if dm == "auto":
+        # the curated draft for this model (hf.DRAFT_MODELS); refused by name when this one has no known pair
+        dm = draft_for(path)
+        if dm is None:
+            raise options.OptionError(
+                "--draft-model auto: no curated draft model for this one - pass an explicit --draft-model PATH"
+            )
+    if dm and os.path.isfile(str(dm)) and not is_gguf(str(dm)):
+        # a custom MTP drafting-head file (experimental): drafter.py reads its mtp.* keys, this model's own
+        # weights for the rest. Unchecked - a head that is not this model's blows up at first use.
+        sys.stderr.write(
+            "[btb] custom drafting-head file for speculative decoding - unsupported, I hope you know what "
+            "you're doing!\n"
+        )
+        sm.drafter_weights = str(dm)
+        sm.proposer = "mtp_dyn"
+        if not sm.tree_budget:
+            sm.tree_budget = 14 if sm.mlx is not None else 16
+    elif dm:
+        # a small model of the family (a directory, repo id, or GGUF) drafts for this one, loaded as its own
+        # engine on the same device with its speculation off (v_max=0) - it proposes, never verified against.
+        # An uncached repo is gated like any download; the vocabularies must match for its tokens to verify.
+        if not confirm_download(str(dm)):
+            raise options.OptionError(f"draft_model {dm!r}: download declined")
+        ks = c.get("draft_ks")
+        if ks is not None:
+            sm.draft_ks = tuple(int(x) for x in (ks.split(",") if isinstance(ks, str) else ks) if str(x).strip())
+        draft_sm = load(resolve(str(dm)), device=device, native=native, log=None, v_max=0, tree_budget=0, gguf_packed=int(c.get("gguf_packed", 1)))
+        if int(draft_sm.cfg.vocab_size) != int(sm.cfg.vocab_size):
+            draft_sm.close()
+            raise options.OptionError(
+                f"draft_model {dm!r} has vocab {draft_sm.cfg.vocab_size}, the model's is {sm.cfg.vocab_size}: "
+                "a draft must share the model's tokenizer for its tokens to verify"
+            )
+        sm.draft_engine = draft_sm
+        sm.log(f"[draft] {os.path.basename(str(dm))} proposing, tree {sm.draft_ks}")
     return sm
 
 

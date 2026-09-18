@@ -24,6 +24,17 @@ if TYPE_CHECKING:
     pass
 
 
+def mlx_topk_ids(logits: Any, k: int) -> Any:
+    """the top-k ids [T, k] a row of an MLX logits array, sorted by value descending, the reduction (argpartition
+    then sort) on the graph so a caller reads k ids a row instead of the whole vocab; lazy."""
+    m = mlxdev.mx()
+    k = min(int(k), int(logits.shape[-1]))
+    part = m.argpartition(-logits, kth=k - 1, axis=-1)[:, :k]
+    vals = m.take_along_axis(logits, part, axis=-1)
+    order = m.argsort(-vals, axis=-1)
+    return m.take_along_axis(part, order, axis=-1)
+
+
 class _Int8Linear(torch.nn.Module):
     """A linear over int8 weights with one scale a row, packed in memory from a bf16/float linear: the
     drafter's weights on the torch tiers (`draft_bits` 8; 4 runs as 8 here). torch's packed int8 matmul where
@@ -400,11 +411,8 @@ class MTPDrafter:
         hn = m.fast.rms_norm(out, wd["n"], wd["eps"]).reshape(B, H)
         lp = self._mm(hn, self._mx_head()).astype(m.float32)
         lp = lp - m.logsumexp(lp, axis=-1, keepdims=True)
-        k = min(int(k), int(lp.shape[-1]))
-        part = m.argpartition(-lp, kth=k - 1, axis=-1)[:, :k]
-        vals = m.take_along_axis(lp, part, axis=-1)
-        order = m.argsort(-vals, axis=-1)
-        return m.take_along_axis(vals, order, axis=-1), m.take_along_axis(part, order, axis=-1)
+        ids = mlx_topk_ids(lp, k)
+        return m.take_along_axis(lp, ids, axis=-1), ids
 
     def _torch_head(self) -> Any:
         """Return rows `[:draft_vocab]` of the lm_head for drafting, int8-quantized if `draft_bits` < 16.

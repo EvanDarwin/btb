@@ -502,6 +502,10 @@ class StreamedTextModel(
         is unusable afterwards. `with btb.load(...) as model:` calls it on exit."""
         if getattr(self, "_closed", False):
             return
+        draft = getattr(self, "draft_engine", None)
+        if draft is not None:
+            self.draft_engine = None
+            draft.close()
         self.abort.set()
         # the MLX tier's teardown runs on the model's worker thread, where its arrays were built (see `on_worker`),
         # then the worker itself is retired
@@ -518,6 +522,10 @@ class StreamedTextModel(
             self._worker = None
             return
         self._closed = True
+        draft = getattr(self, "draft_engine", None)
+        if draft is not None:
+            self.draft_engine = None  # the draft model is its own engine (a --draft-model load): release it too
+            draft.close()
         if getattr(self, "_pending", None) is not None:
             self._pending[3].join()
             self._pending = None

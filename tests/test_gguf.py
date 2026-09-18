@@ -485,6 +485,46 @@ def test_a_native_kernel_gguf_multiplies_its_blocks_as_stored_on_mlx(quant: str,
         assert toks[1] == toks[0]
 
 
+def test_a_draft_model_proposes_a_tree_verified_exactly_on_mlx() -> None:
+    """Qwen3-0.6B drafting for Qwen3-4B (both cached): `--draft-model` loads the sibling and wires the
+    ModelProposer, the speculative tree it proposes verifies to the plain greedy tokens exactly, and the pass
+    count drops well below one a token (drafts accepted). Skipped without both files or MLX."""
+    need_mlx()
+    import btb
+
+    draft = cached(f"{REAL_REPO}:Qwen3-0.6B-Q4_K_M.gguf")
+    target = cached("unsloth/Qwen3-4B-GGUF:Qwen3-4B-Q4_K_M.gguf")
+    if draft is None or target is None:
+        pytest.skip("Qwen3-4B and 0.6B Q4_K_M GGUFs are not both cached")
+    with btb.load(target, device="mlx", gguf_packed=1, draft_model=draft, log=None) as sm:
+        assert sm.draft_engine is not None and sm.draft_ks == (4, 3, 2)
+        ids = sm.prompt_ids("Write a detailed paragraph about the ocean and its depths.")
+        greedy = sm.generate(ids, 48, speculate=False)
+        spec = sm.generate(ids, 48, speculate=True)
+    assert list(spec.tokens) == list(greedy.tokens), (spec.tokens, greedy.tokens)
+    assert spec.stats["forwards"] < len(spec.tokens), spec.stats["forwards"]
+
+
+def test_a_q4k_self_draft_speculates_to_the_greedy_tokens_on_mlx() -> None:
+    """Qwen3-0.6B-Q4_K_M drafting for itself (`--draft-model` the same file): with Q4_K on the batch-invariant
+    native matvec a verify pass computes each row exactly as the one-row draft step did, so the speculative
+    tree verifies to the plain greedy tokens - the divergence the non-invariant `quantized_matmul` caused is
+    gone. Skipped without the file or MLX."""
+    need_mlx()
+    import btb
+
+    path = cached(f"{REAL_REPO}:Qwen3-0.6B-Q4_K_M.gguf")
+    if path is None:
+        pytest.skip("Qwen3-0.6B-Q4_K_M.gguf is not cached")
+    with btb.load(path, device="mlx", gguf_packed=1, draft_model=path, log=None) as sm:
+        assert sm.draft_engine is not None
+        assert any(getattr(m.mx, "q4k", None) is not None for m in sm.host[0].modules() if hasattr(m, "mx"))
+        ids = sm.prompt_ids("Write a detailed paragraph about the ocean and its depths.")
+        greedy = sm.generate(ids, 48, speculate=False)
+        spec = sm.generate(ids, 48, speculate=True)
+    assert list(spec.tokens) == list(greedy.tokens), (spec.tokens, greedy.tokens)
+
+
 def test_the_packed_mlx_path_multiplies_as_stored() -> None:
     """on MLX a Q4_0 / Q8_0 fixture binds its matrices in the affine form and the packed kernel multiplies them
     as stored: the affine repack equals the package's dequantization to the number, and Q4_K (which leaves the
