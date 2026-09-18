@@ -72,6 +72,7 @@ class _State:
     cold: set[int]
     drafter_dev: torch.device | None
     embed_table: torch.Tensor | None
+    embed_scale: float | None
     head: torch.nn.Linear | _CardQuantLinear | None  # packed on the card: a GGUF tensor's bytes, no bf16 weight
     head_host: _HostLinear | None
     host: dict[int, Any]

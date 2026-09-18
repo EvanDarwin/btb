@@ -24,7 +24,9 @@ T = TypeVar("T")
 
 # model_types the engine can actually serve (mirrors StreamedTextModel.family); a downloaded repo of any other
 # type is skipped by the discovery below so it never shows up as a servable model
-SERVE_TYPES = frozenset({"qwen3", "qwen3_5", "qwen3_5_text", "phi3", "qwen4_exp", "qwen4_exp_text", "gpt_oss"})
+SERVE_TYPES = frozenset(
+    {"qwen3", "qwen3_5", "qwen3_5_text", "phi3", "qwen4_exp", "qwen4_exp_text", "gpt_oss", "gemma3", "gemma3_text"}
+)
 
 # the files a model is: what `resolve` downloads of a repo, and what `btb pack` copies beside its packed weights
 MODEL_FILES = ("*.json", "*.safetensors", "*.txt", "*.model", "*.jinja", "*.tiktoken")

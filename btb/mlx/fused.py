@@ -72,13 +72,61 @@ def add_rmsnorm(h: mx_.array, y: mx_.array, w: mx_.array, eps: float) -> tuple[m
     k = _kernel("btb_add_rmsnorm", ["h", "y", "w", "eps"], ["h2", "x"], _ADD_RMSNORM_SRC)
     T, H = int(h.shape[0]), int(h.shape[1])
     return k(
-        inputs=[h, y, w.astype(h.dtype) if w.dtype != h.dtype else w, m.array([float(eps)], dtype=m.float32)],
+        inputs=[h, y, w, m.array([float(eps)], dtype=m.float32)],
         template=[("T", h.dtype)],
         grid=(256 * T, 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(T, H), (T, H)],
         output_dtypes=[h.dtype, h.dtype],
     )
+
+
+# --- RMSNorm the sub-block output, then residual add (Gemma's sandwich norm) ---------------------------------
+# out = h + rmsnorm(y) * w: the mirror of add_rmsnorm, which norms the sum. Here y (an attention or MLP output) is
+# RMS-normed over the row in float32, scaled by w, cast back and added to the residual h. Same reduction shape.
+_SANDWICH_ADD_SRC = """
+    uint row = threadgroup_position_in_grid.x;
+    uint tid = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint H = h_shape[1];
+    threadgroup float part[8];
+    const device T* hr = h + (size_t)row * H;
+    const device T* yr = y + (size_t)row * H;
+    device T* outr = out + (size_t)row * H;
+    float ss = 0.0f;
+    for (uint i = tid; i < H; i += 256) {
+        float v = static_cast<float>(yr[i]);
+        ss = fma(v, v, ss);
+    }
+    ss = simd_sum(ss);
+    if (lane == 0) part[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (uint g = 0; g < 8; ++g) tot += part[g];
+    float scale = metal::rsqrt(tot / (float)H + eps[0]);
+    for (uint i = tid; i < H; i += 256) {
+        float normed = static_cast<float>(yr[i]) * scale * static_cast<float>(w[i]);
+        outr[i] = static_cast<T>(static_cast<float>(hr[i]) + static_cast<float>(static_cast<T>(normed)));
+    }
+"""
+
+
+def sandwich_add(h: mx_.array, y: mx_.array, w: mx_.array, eps: float) -> mx_.array:
+    """h + rmsnorm(y) * w for h, y [T, H] in one launch, in h's dtype — Gemma's sandwich residual, the delta
+    normed before it is added rather than after. `w` is read as stored (float32 for a 1 + weight family, the
+    product the module takes)."""
+    m = mx()
+    k = _kernel("btb_sandwich_add", ["h", "y", "w", "eps"], ["out"], _SANDWICH_ADD_SRC)
+    T, H = int(h.shape[0]), int(h.shape[1])
+    return k(
+        inputs=[h, y, w, m.array([float(eps)], dtype=m.float32)],
+        template=[("T", h.dtype)],
+        grid=(256 * T, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(T, H)],
+        output_dtypes=[h.dtype],
+    )[0]
 
 
 # --- q/k RMSNorm + rope --------------------------------------------------------------------------------------
@@ -100,9 +148,9 @@ _QK_NORM_ROPE_SRC = """
     threadgroup float normed[256];
     bool isq = hh < Hq;
     const device T* src = isq ? (q + ((size_t)t * Hq + hh) * D) : (k + ((size_t)t * Hk + (hh - Hq)) * D);
-    const device T* wv = isq ? qn : kn;
     device T* dst = isq ? (oq + ((size_t)t * Hq + hh) * D) : (ok + ((size_t)t * Hk + (hh - Hq)) * D);
     float v = i < D ? static_cast<float>(src[i]) : 0.0f;
+    float wv = i < D ? (isq ? static_cast<float>(qn[i]) : static_cast<float>(kn[i])) : 0.0f;
     float ss = simd_sum(v * v);
     if (lane == 0) part[sg] = ss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -110,7 +158,7 @@ _QK_NORM_ROPE_SRC = """
     uint nsg = (D + 31) / 32;
     for (uint g = 0; g < nsg; ++g) tot += part[g];
     float scale = metal::rsqrt(tot / (float)D + eps[0]);
-    if (i < D) normed[i] = static_cast<float>(static_cast<T>(v * scale * static_cast<float>(wv[i])));
+    if (i < D) normed[i] = static_cast<float>(static_cast<T>(v * scale * wv));
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (i >= D) return;
     if (i < hd2) {
@@ -140,8 +188,9 @@ def qk_norm_rope(
     scaling: float,
     pos: Sequence[int] | mx_.array,
 ) -> tuple[mx_.array, mx_.array]:
-    """RMSNorm over each head of q [T, Hq, D] and k [T, Hk, D] (weights qn, kn [D]) then rope on the first `rd`
-    dims at pos[t], in one launch; the rotation is rope_rows' to the bit. Returns (q, k) in q's dtype, lazily."""
+    """RMSNorm over each head of q [T, Hq, D] and k [T, Hk, D] (weights qn, kn [D], read as stored) then rope on
+    the first `rd` dims at pos[t], in one launch; the rotation is rope_rows' to the bit. Returns (q, k) in q's
+    dtype, lazily."""
     m = mx()
     kern = _kernel("btb_qk_norm_rope", ["q", "k", "qn", "kn", "eps", "freqs", "pos"], ["oq", "ok"], _QK_NORM_ROPE_SRC)
     T, Hq, D = (int(s) for s in q.shape)
@@ -153,8 +202,8 @@ def qk_norm_rope(
         inputs=[
             q,
             k,
-            qn.astype(dt) if qn.dtype != dt else qn,
-            kn.astype(dt) if kn.dtype != dt else kn,
+            qn,
+            kn,
             m.array([float(eps)], dtype=m.float32),
             freqs,
             p,

@@ -10,7 +10,7 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
 
 import torch
 import torch.nn.functional as F
@@ -21,9 +21,14 @@ from ..options import Device
 from ..quant import CARD_WIDTHS, QuantType, card_width, quant_of
 from ..sampling import GREEDY
 from .cache import GrowLayer
+from .families import act_name
+from .forward import layer_window, node_mask, pe_for
 from .fused import _fused_rope
 from .native import Native, _Cuda, kernels_path
 from .state import _State
+
+if TYPE_CHECKING:
+    from .forward import PassRope, Rope
 
 _KERNELS_WARNED = False
 
@@ -142,6 +147,9 @@ class CardLayerWeights(TypedDict):
     wk: torch.Tensor
     scale: float
     eps: float
+    win: int
+    pre_ff: NotRequired[torch.Tensor]  # the sandwich block's feed-forward norms (Gemma), set only when sandwich
+    post_ff: NotRequired[torch.Tensor]
 
 
 class _CudaMixin(_State):
@@ -156,11 +164,14 @@ class _CudaMixin(_State):
         self.aq = False
         self.ap = None
 
-    def ac(self, tmpl: Any, i: int, h: torch.Tensor, pe: Any, text_pos: Any, cache: Any) -> torch.Tensor:
+    def ac(self, tmpl: Any, i: int, h: torch.Tensor, pe: PassRope, text_pos: Any, cache: Any) -> torch.Tensor:
         T = h.shape[1]
         outs = []
         layer = cache.layers[i]
         lt = self.layer_types[i]
+        rope = pe_for(pe, lt)
+        assert rope is not None  # a resident layer's pass always carries the rope
+        win = layer_window(self.cfg, lt)
         ap: Parents | None = getattr(self, "ap", None)
         parents: Parents = ap if ap is not None else range(-1, T - 1)  # no tree: the chain's own map
         tree = any(parents[j] != j - 1 for j in range(T))
@@ -170,12 +181,12 @@ class _CudaMixin(_State):
         if lt == LayerKind.LINEAR and tree:
             pre = tuple(x.clone() for x in self._lin(layer))
         base: Any = None
-        if lt == LayerKind.FULL and tree:
+        if lt != LayerKind.LINEAR and (tree or win):
             base = layer.keys.shape[-2] if getattr(layer, "keys", None) is not None else 0
         for p in range(T):
             hp = h[:, p : p + 1]
             pos_p = text_pos[:, p : p + 1]
-            pe_p = (pe[0][:, p : p + 1], pe[1][:, p : p + 1])
+            pe_p = (rope[0][:, p : p + 1], rope[1][:, p : p + 1])
             mask_p = None
             branch = tree and parents[p] != p - 1
             dev = h.device
@@ -184,21 +195,9 @@ class _CudaMixin(_State):
                 c, r = self._lin(layer)
                 c.copy_(conv)
                 r.copy_(rec)
-            if lt == LayerKind.FULL:
-                if tree:
-                    anc = []
-                    q = parents[p]
-                    while q >= 0:
-                        anc.append(q)
-                        q = parents[q]
-                    allow = torch.zeros(base + p + 1, dtype=torch.bool, device=dev)
-                    allow[:base] = True
-                    allow[base + p] = True
-                    for q in anc:
-                        allow[base + q] = True
-                    mask_p = allow.view(1, 1, 1, -1)
-                else:
-                    mask_p = None
+            if base is not None:
+                rows = node_mask(base, p, parents, win)
+                mask_p = None if rows is None else rows.view(1, 1, 1, -1).to(dev)
             outs.append(
                 tmpl(
                     hp,
@@ -236,8 +235,12 @@ class _CudaMixin(_State):
             and LayerKind.LINEAR not in self.layer_types
             and len(self.resident) == self.L
             and getattr(self, "_probe", None) is None
-            and self.fam.dense
+            and (self.fam.dense or self.fam.sandwich)
         )
+
+    def _rope_by_type(self, pe: PassRope) -> dict[str, Rope]:
+        """the pass's rope as one (cos, sin) per layer type: a dual-rope family's own, the others' one for all"""
+        return pe if isinstance(pe, dict) else dict.fromkeys(set(self.layer_types), pe)
 
     def _seg_a(self, g: dict[str, Any], i: int) -> None:
         apply_rotary_pos_emb = _fused_rope if self._frope else self.fam.mod.apply_rotary_pos_emb
@@ -263,7 +266,8 @@ class _CudaMixin(_State):
             q = at.q_norm(at.q_proj(x).view(1, 1, -1, hd))
             k = at.k_norm(at.k_proj(x).view(1, 1, -1, hd))
             v = at.v_proj(x).view(1, 1, -1, hd)
-        q, k = apply_rotary_pos_emb(q.transpose(1, 2), k.transpose(1, 2), g["cos"], g["sin"])
+        cos, sin = g["rope"][self.layer_types[i]]
+        q, k = apply_rotary_pos_emb(q.transpose(1, 2), k.transpose(1, 2), cos, sin)
         hk = k.shape[1]
         g["q_pin"].copy_(q[0, :, 0].float(), non_blocking=True)
         g["kv_pin"][:hk].copy_(k[0, :, 0], non_blocking=True)
@@ -276,7 +280,12 @@ class _CudaMixin(_State):
         a1 = g["a_dev"].to(g["h"].dtype).view(1, 1, -1)
         if g["gate"] is not None:
             a1 = a1 * g["gate"]
-        if self._fmlp:
+        if self.fam.sandwich:
+            # each sub-block's output normed before its add, the MLP's own input norm of the sum between
+            h = g["h"] + tmpl.post_attention_layernorm(at.o_proj(a1))
+            h = h + tmpl.post_feedforward_layernorm(tmpl.mlp(tmpl.pre_feedforward_layernorm(h)))
+            g["h"].copy_(h)
+        elif self._fmlp:
             # both residual adds folded into the persistent buffer: h = (h + attn) + mlp(norm(h + attn)) bit for bit,
             # three fewer nodes a layer
             g["h"].add_(at.o_proj(a1))
@@ -296,11 +305,18 @@ class _CudaMixin(_State):
         hq = int(c.num_attention_heads)
         hk = int(getattr(c, "num_key_value_heads", None) or hq)
         d = int(self.resident[0].self_attn.head_dim)
-        rd = int(pe[0].shape[-1])
+        rope = self._rope_by_type(pe)
+        rd = int(next(iter(rope.values()))[0].shape[-1])
         g = {
             "h": torch.zeros(1, 1, int(c.hidden_size), dtype=dt, device=self.dev),
-            "cos": torch.zeros(1, 1, rd, dtype=pe[0].dtype, device=self.dev),
-            "sin": torch.zeros(1, 1, rd, dtype=pe[1].dtype, device=self.dev),
+            # the step's rope row per layer type: the graphs read it in place, the step copies it in
+            "rope": {
+                lt: (
+                    torch.zeros(1, 1, rd, dtype=p[0].dtype, device=self.dev),
+                    torch.zeros(1, 1, rd, dtype=p[1].dtype, device=self.dev),
+                )
+                for lt, p in rope.items()
+            },
             "q_pin": torch.zeros(hq, d, dtype=torch.float32, pin_memory=True),
             "kv_pin": torch.zeros(2 * hk, d, dtype=dt, pin_memory=True),
             "out_pin": torch.zeros(hq, d, dtype=torch.float32, pin_memory=True),
@@ -363,7 +379,8 @@ class _CudaMixin(_State):
             # the family first: another family's config need not carry the fields the shapes are read from
             # (a mixture of experts names its width moe_intermediate_size)
             ok = (
-                self.fam.kernel_layout
+                (self.fam.kernel_layout or self.fam.sandwich)
+                and act_name(self.cfg) in ("silu", "swish", "gelu_pytorch_tanh")  # the kernels' activations
                 and not self.fam.own
                 and self.mlx is None
                 and not getattr(self, "resident_fp32", False)
@@ -406,7 +423,9 @@ class _CudaMixin(_State):
         segs: list[tuple[int, int]] = []
         a: int | None = None
         for i in range(self.L):
-            ok = i in self.resident and self.layer_types[i] == LayerKind.FULL
+            lt = self.layer_types[i]
+            # a sliding layer joins a run where its window rides the attention kernel (a sandwich family's)
+            ok = i in self.resident and (lt == LayerKind.FULL or (lt == LayerKind.SLIDING and self.fam.sandwich))
             if ok and a is None:
                 a = i
             if not ok and a is not None:
@@ -556,18 +575,29 @@ class _CudaMixin(_State):
             "wk": at.k_norm.weight,
             "scale": float(at.scaling),
             "eps": float(self.cfg.rms_norm_eps),
+            "win": layer_window(self.cfg, self.layer_types[i]),
         }
+        if self.fam.sandwich:
+            L["pre_ff"] = tmpl.pre_feedforward_layernorm.weight
+            L["post_ff"] = tmpl.post_feedforward_layernorm.weight
         st["layers"][i] = L
         return L
 
-    def _card_tables(self, st: dict[str, Any], cap: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _card_tables(self, st: dict[str, Any], cap: int) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+        """the rope's cos/sin over `cap` positions on the card in bf16, by layer type: a dual-rope family's own
+        per type (Gemma 3's local/global), the others' one pair under every type"""
         tb = st["tables"]
-        if tb is not None and tb[0].shape[0] >= cap:
+        if tb is not None and next(iter(tb.values()))[0].shape[0] >= cap:
             return tb
         H = int(self.cfg.hidden_size)
         x = torch.zeros(1, 1, H, dtype=torch.bfloat16, device=self.dev)
-        cos, sin = self.rotary(x, torch.arange(cap, device=self.dev)[None])
-        tb = (cos[0].to(torch.bfloat16).contiguous(), sin[0].to(torch.bfloat16).contiguous())
+        pos = torch.arange(cap, device=self.dev)[None]
+        types = sorted(set(self.layer_types))
+        pairs = [self.rotary(x, pos, lt) for lt in types] if self.fam.dual_rope else [self.rotary(x, pos)] * len(types)
+        tb = {
+            lt: (cos[0].to(torch.bfloat16).contiguous(), sin[0].to(torch.bfloat16).contiguous())
+            for lt, (cos, sin) in zip(types, pairs, strict=True)
+        }
         st["tables"] = tb
         return tb
 
@@ -780,12 +810,15 @@ class _CudaMixin(_State):
         ar = st["arena"]
         H, Hq, Hk, D, I = self._card_dims()
         M = 32 if g.get("mma") else self._card_m(T)
-        cos_t, sin_t = self._card_tables(st, ar["cap"])
+        tables = self._card_tables(st, ar["cap"])
         P, ci, cf = k.ptr, ctypes.c_int, ctypes.c_float
         Ls = [self._card_weights(st, i) for i in range(a, b)]
         mma = bool(g.get("mma"))
+        sandwich = self.fam.sandwich
+        cen = ci(1 if self.fam.norm_centered else 0)  # the norms scale by 1 + w
+        act = "gelu" if act_name(self.cfg) == "gelu_pytorch_tanh" else "silu"
         gemv = f"btb_gemv_bf16_m{M}"
-        gemv_silu = f"btb_gemv_silu_bf16_m{M}"
+        gemv_act = f"btb_gemv_{act}_bf16_m{M}"
         attn = f"btb_attn_split_d{D}"
         nrk = f"btb_norm_rope_kv_d{D}"
         if attn not in k.fn or nrk not in k.fn:
@@ -823,11 +856,13 @@ class _CudaMixin(_State):
         for n, L in enumerate(Ls):
             j = ar["slot"][a + n]
             kb, vb = ar["A"][j, 0], ar["A"][j, 1]
+            cos_t, sin_t = tables[self.layer_types[a + n]]
+            # the last layer's MLP output folded into this input norm's add (a sandwich layer added its own)
             k.launch(
                 "btb_add_rmsnorm",
                 (T, 1, 1),
                 (256, 1, 1),
-                [P(g["h"]), P(y_prev), P(L["ln1"]), cf(L["eps"]), P(g["x"]), ci(H), ci(0)],
+                [P(g["h"]), P(y_prev), P(L["ln1"]), cf(L["eps"]), P(g["x"]), ci(H), cen],
             )
             matvec(L["qkv"], g["x"], g["qkv"], H)
             k.launch(
@@ -850,7 +885,7 @@ class _CudaMixin(_State):
                     ci(Hq),
                     ci(Hk),
                     ci(ar["cap"]),
-                    ci(0),
+                    cen,
                 ],
             )
             k.launch(
@@ -874,35 +909,60 @@ class _CudaMixin(_State):
                     P(g["part_acc"]),
                     P(g["cnt"]),
                     ci(S),
+                    ci(L["win"]),
                 ],
             )
             matvec(L["o"], g["att"], g["y"], Hq * D)
-            k.launch(
-                "btb_add_rmsnorm",
-                (T, 1, 1),
-                (256, 1, 1),
-                [P(g["h"]), P(g["y"]), P(L["ln2"]), cf(L["eps"]), P(g["x"]), ci(H), ci(0)],
-            )
+            if sandwich:
+                # the attention output normed, then added; the MLP reads its own input norm of the sum
+                k.launch(
+                    "btb_sandwich_add",
+                    (T, 1, 1),
+                    (256, 1, 1),
+                    [P(g["h"]), P(g["y"]), P(L["ln2"]), cf(L["eps"]), ci(H), cen],
+                )
+                k.launch(
+                    "btb_add_rmsnorm",
+                    (T, 1, 1),
+                    (256, 1, 1),
+                    [P(g["h"]), P(None), P(L["pre_ff"]), cf(L["eps"]), P(g["x"]), ci(H), cen],
+                )
+            else:
+                k.launch(
+                    "btb_add_rmsnorm",
+                    (T, 1, 1),
+                    (256, 1, 1),
+                    [P(g["h"]), P(g["y"]), P(L["ln2"]), cf(L["eps"]), P(g["x"]), ci(H), cen],
+                )
             matvec(L["gu"], g["x"], g["gu"], H)
             if mma or L["down"][0].q is not None:
                 # neither the tensor-core kernel nor the packed ones has a silu fold: the two kernels, the same bits
                 k.launch(
-                    "btb_silu_mul",
+                    f"btb_{act}_mul",
                     (min(4096, (M * I + 255) // 256), 1, 1),
                     (256, 1, 1),
                     [P(g["gu"]), P(g["m"]), ci(M), ci(I)],
                 )
                 matvec(L["down"], g["m"], g["y"], I)
             else:
-                # silu(gate) * up folded into the down projection's x load: the same bits as the two kernels
+                # act(gate) * up folded into the down projection's x load: the same bits as the two kernels
                 k.launch(
-                    gemv_silu,
+                    gemv_act,
                     ((H + 3) // 4, 1, 1),
                     (128, 1, 1),
                     [P(L["down"][0].w), P(g["gu"]), P(g["y"]), ci(H), ci(I)],
                 )
-            y_prev = g["y"]
-        assert y_prev is not None  # the segment holds at least one layer, so the loop set the residual
+            if sandwich:
+                # the MLP output normed, then added: the residual is whole, nothing carries into the next norm
+                k.launch(
+                    "btb_sandwich_add",
+                    (T, 1, 1),
+                    (256, 1, 1),
+                    [P(g["h"]), P(g["y"]), P(L["post_ff"]), cf(L["eps"]), ci(H), cen],
+                )
+            else:
+                y_prev = g["y"]
+        assert sandwich or y_prev is not None  # the segment holds at least one layer, so the loop set the residual
         if tail:
             assert self.head is not None  # the tail runs the final head
             norm_w = self.norm.weight
@@ -913,10 +973,10 @@ class _CudaMixin(_State):
                 "btb_add_rmsnorm",
                 (T, 1, 1),
                 (256, 1, 1),
-                [P(g["h"]), P(y_prev), P(norm_w), cf(float(self.cfg.rms_norm_eps)), P(g["x"]), ci(H), ci(0)],
+                [P(g["h"]), P(y_prev), P(norm_w), cf(float(self.cfg.rms_norm_eps)), P(g["x"]), ci(H), cen],
             )
             matvec(head_spec, g["x"], g["logits"], H)
-        else:
+        elif y_prev is not None:
             g["h"][:T].add_(y_prev[:T])
 
     def _card_record(self, st: dict[str, Any], g: dict[str, Any], body: Any, what: str) -> None:
@@ -1419,15 +1479,21 @@ class _CudaMixin(_State):
     def _forward_fast(self, h: torch.Tensor, pe: Any, cache: Any, last_only: bool, head: bool) -> torch.Tensor:
         g = self._graphs(h.dtype, pe)
         g["h"].copy_(h[:, -1:, :])
-        g["cos"].copy_(pe[0][:, -1:, :])
-        g["sin"].copy_(pe[1][:, -1:, :])
+        rope = self._rope_by_type(pe)
+        for lt, (cos, sin) in g["rope"].items():
+            cos.copy_(rope[lt][0][:, -1:, :])
+            sin.copy_(rope[lt][1][:, -1:, :])
         hk, d = g["hk"], g["d"]
         stream = torch.cuda.current_stream()
         for i in range(self.L):
             g["A"][i].replay()
             stream.synchronize()
             kf, vf = cache.update(g["kv_pin"][:hk].view(1, hk, 1, d), g["kv_pin"][hk:].view(1, hk, 1, d), i)
-            Native.attn_decode(g["q_pin"], kf[0], vf[0], self.resident[i].self_attn.scaling, g["out_pin"])
+            win = layer_window(self.cfg, self.layer_types[i])
+            first = max(0, int(kf.shape[-2]) - win) if win else 0  # a sliding layer reads its last rows alone
+            Native.attn_decode(
+                g["q_pin"], kf[0][:, first:], vf[0][:, first:], self.resident[i].self_attn.scaling, g["out_pin"]
+            )
             g["B"][i].replay()
         return self._finish(g["h"].clone(), last_only, head)
 
@@ -1826,6 +1892,7 @@ class _CudaMixin(_State):
             v_all = at.v_proj(x).view(1, T, -1, hd)
             gate_all = None
         base = cl.keys.shape[-2] if getattr(cl, "keys", None) is not None else 0
+        win = layer_window(self.cfg, self.layer_types[i])
         attn_fn = ALL_ATTENTION_FUNCTIONS.get_interface(self.cfg._attn_implementation, eager_attention_forward)
         q_rot, k_rot = apply_rotary_pos_emb(q_all.transpose(1, 2), k_all.transpose(1, 2), pe[0], pe[1])
         k_full, v_full = cache.update(k_rot, v_all.transpose(1, 2), i)
@@ -1845,37 +1912,28 @@ class _CudaMixin(_State):
         if kernel:
             qf = q_rot[0, :, 0].float().contiguous()
             out = torch.empty(qf.shape, dtype=torch.float32)
-            Native.attn_decode(qf, k_full[0], v_full[0], at.scaling, out)
+            first = max(0, int(k_full.shape[-2]) - win) if win else 0  # a sliding layer's last rows alone
+            Native.attn_decode(qf, k_full[0][:, first:], v_full[0][:, first:], at.scaling, out)
             a1 = out.view(1, 1, -1).to(h.dtype)
             outs.append(a1 if gate_all is None else a1 * torch.sigmoid(gate_all[:, 0:1]))
         for p in range(T) if not kernel else range(0):
             qs = q_rot[:, :, p : p + 1]
             ks = k_full[..., : base + p + 1, :]
             vs = v_full[..., : base + p + 1, :]
-            if tree:
-                anc = []
-                q_ = parents[p]
-                while q_ >= 0:
-                    anc.append(q_)
-                    q_ = parents[q_]
-                allow = torch.zeros(base + p + 1, dtype=torch.bool, device=h.device)
-                allow[:base] = True
-                allow[base + p] = True
-                for q_ in anc:
-                    allow[base + q_] = True
-                mask_p = allow.view(1, 1, 1, -1)
-            else:
-                mask_p = None
+            rows = node_mask(base, p, parents, win)
+            mask_p = None if rows is None else rows.view(1, 1, 1, -1).to(h.device)
             attn, _ = attn_fn(at, qs, ks, vs, mask_p, dropout=0.0, scaling=at.scaling)
             a1 = attn.reshape(1, 1, -1).contiguous()
             outs.append(a1 if gate_all is None else a1 * torch.sigmoid(gate_all[:, p : p + 1]))
         mix = at.o_proj(torch.cat(outs, dim=1))
-        h = residual + mix
-        return self._ai_mlp(layer, h)
+        if self.fam.sandwich:
+            mix = layer.post_attention_layernorm(mix)  # the sandwich block norms the delta before its add
+        return self._ai_mlp(layer, residual + mix)
 
     def _ai_mlp(self, layer: Any, h: torch.Tensor) -> torch.Tensor:
         residual = h
-        x2 = layer.post_attention_layernorm(h)
+        sandwich = self.fam.sandwich
+        x2 = layer.pre_feedforward_layernorm(h) if sandwich else layer.post_attention_layernorm(h)
         mlp = layer.mlp
         if hasattr(mlp, "gate_up_proj"):  # gate and up as one projection (Phi-3's layout)
             gate, up = mlp.gate_up_proj(x2).chunk(2, dim=-1)
@@ -1883,5 +1941,5 @@ class _CudaMixin(_State):
         else:
             gate, up = mlp.gate_proj(x2), mlp.up_proj(x2)
             fn = mlp.act_fn
-        act = fn(gate)
-        return residual + mlp.down_proj(act * up)
+        out = mlp.down_proj(fn(gate) * up)
+        return residual + (layer.post_feedforward_layernorm(out) if sandwich else out)

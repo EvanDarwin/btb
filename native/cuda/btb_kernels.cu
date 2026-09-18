@@ -6,10 +6,13 @@
 //   btb_gemv_bf16_m{1,..,32}      y[m][r] = sum_c w[r][c] * x[m][c]      (bf16 in, f32 accumulate, bf16 out)
 //   btb_gemv_q{2,3,4,5,6}k_bf16_m{1,..,32}  the same over raw k-quant weights (ggml's superblocks as stored),
 //                                 dequantised in registers; the same warp-a-row shape and fixed order
-//   btb_attn_split_d{64,128,256}  one pass of T queries over the cache, a tree of T rows at its end, split over the sequence
+//   btb_gemv_{silu,gelu}_bf16_m{1,..,32}  the down projection with act(g) * u folded into its x load
+//   btb_attn_split_d{64,128,256}  one pass of T queries over the cache (a sliding layer's window of it), a tree of
+//                                 T rows at its end, split over the sequence
 //   btb_norm_rope_kv_d{64,128,256} q/k RMSNorm, rope, the pass's rows written into the cache
 //   btb_add_rmsnorm               h += y; x = rmsnorm(h) * w   (or * (1 + w), the zero-centred norm)
-//   btb_silu_mul                  m = silu(g) * u  over a [T, 2I] gate/up block
+//   btb_sandwich_add              h += rmsnorm(y) * w          (the sandwich block: the delta normed, then added)
+//   btb_{silu,gelu}_mul           m = act(g) * u  over a [T, 2I] gate/up block
 //
 // The weights stream with evict-first loads (read once a step); the cache and the activations take the
 // default policy, so a persisting-L2 window over the cache's front keeps a short context's attention in L2.
@@ -133,12 +136,23 @@ GEMV(8)
 GEMV(16)
 GEMV(32)
 
-// the down projection with silu * up folded into its x load: gu [M, 2C] (gate then up), x[m][c] =
-// bf16(bf16(silu(g)) * u) - the same values, bit for bit, as btb_silu_mul would have written, so the kernel
-// and the buffer between them go away. The elementwise math is per lane, per element, in index order.
-template <int M>
-__device__ __forceinline__ void gemv_silu_rows(const bf16* __restrict__ w, const bf16* __restrict__ gu,
-                                               bf16* __restrict__ y, int R, int C) {
+// the MLP's gate activation in fp32 as torch computes it: silu x / (1 + e^-x), or gelu in its tanh form,
+// 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3))) (Gemma's gelu_pytorch_tanh)
+__device__ __forceinline__ float act_silu(float g) { return g / (1.f + expf(-g)); }
+__device__ __forceinline__ float act_gelu(float g) {
+    return 0.5f * g * (1.f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g)));
+}
+template <int ACT>
+__device__ __forceinline__ float act_of(float g) {
+    return ACT == 0 ? act_silu(g) : act_gelu(g);
+}
+
+// the down projection with act(g) * up folded into its x load: gu [M, 2C] (gate then up), x[m][c] =
+// bf16(bf16(act(g)) * u) - the same values, bit for bit, as btb_{silu,gelu}_mul would have written, so the
+// kernel and the buffer between them go away. The elementwise math is per lane, per element, in index order.
+template <int M, int ACT>
+__device__ __forceinline__ void gemv_act_rows(const bf16* __restrict__ w, const bf16* __restrict__ gu,
+                                              bf16* __restrict__ y, int R, int C) {
     const int lane = threadIdx.x & 31;
     const int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (r >= R) return;
@@ -161,7 +175,7 @@ __device__ __forceinline__ void gemv_silu_rows(const bf16* __restrict__ w, const
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
                 const float g = bf2f(gp[e]);
-                const float s = bfround(g / (1.f + expf(-g)));
+                const float s = bfround(act_of<ACT>(g));
                 const float xe = bfround(s * bf2f(up[e]));
                 a = fmaf(bf2f(wp[e]), xe, a);
             }
@@ -176,17 +190,21 @@ __device__ __forceinline__ void gemv_silu_rows(const bf16* __restrict__ w, const
     }
 }
 
-#define GEMV_SILU(M)                                                                                         \
+#define GEMV_ACT(M)                                                                                          \
     extern "C" __global__ void __launch_bounds__(128) btb_gemv_silu_bf16_m##M(                               \
         const bf16* __restrict__ w, const bf16* __restrict__ gu, bf16* __restrict__ y, int R, int C) {        \
-        gemv_silu_rows<M>(w, gu, y, R, C);                                                                   \
+        gemv_act_rows<M, 0>(w, gu, y, R, C);                                                                 \
+    }                                                                                                        \
+    extern "C" __global__ void __launch_bounds__(128) btb_gemv_gelu_bf16_m##M(                               \
+        const bf16* __restrict__ w, const bf16* __restrict__ gu, bf16* __restrict__ y, int R, int C) {        \
+        gemv_act_rows<M, 1>(w, gu, y, R, C);                                                                 \
     }
-GEMV_SILU(1)
-GEMV_SILU(2)
-GEMV_SILU(4)
-GEMV_SILU(8)
-GEMV_SILU(16)
-GEMV_SILU(32)
+GEMV_ACT(1)
+GEMV_ACT(2)
+GEMV_ACT(4)
+GEMV_ACT(8)
+GEMV_ACT(16)
+GEMV_ACT(32)
 
 // ---------------------------------------------------------------------------------------------------------
 // gemv over Q4_K weights: w the raw ggml Q4_K bytes [R, C/256] row-major superblocks of 144 B, x [M, C] bf16,
@@ -597,7 +615,8 @@ __device__ __forceinline__ void attn_decode_split(const bf16* __restrict__ q, co
                                                   const int* __restrict__ n0p, const int* __restrict__ par,
                                                   int T, int Hq, int Hk, int cap, float scale,
                                                   float* __restrict__ part_m, float* __restrict__ part_l,
-                                                  float* __restrict__ part_acc, int* __restrict__ cnt, int S) {
+                                                  float* __restrict__ part_acc, int* __restrict__ cnt, int S,
+                                                  int win) {
     constexpr int E = D / 32;
     const int h = blockIdx.x, t = blockIdx.y, s = blockIdx.z;
     const int g = h / (Hq / Hk);
@@ -628,6 +647,9 @@ __device__ __forceinline__ void attn_decode_split(const bf16* __restrict__ q, co
 #pragma unroll
     for (int e = 0; e < E; ++e) acc[e] = 0.f;
     const int n = n0 + d + 1;
+    // a sliding layer (win > 0) sees the last win logical keys, [first, n): the walk below keeps its key -> warp
+    // map and passes over the keys before first, so a windowed row folds as the full row's tail would
+    const int first = win > 0 ? max(n - win, 0) : 0;
     // the splits this query needs: a single one writes its row directly, without the partials
     const int S_active = (n + ATTN_SPLIT - 1) / ATTN_SPLIT;
     if (s >= S_active) return;
@@ -639,7 +661,7 @@ __device__ __forceinline__ void attn_decode_split(const bf16* __restrict__ q, co
             Vec<E> kv[4], vv[4];
 #pragma unroll
             for (int u = 0; u < 4; ++u) {
-                if (u < c4) {
+                if (u < c4 && j + u >= first) {
                     const int jj = j + u;
                     const int slot = jj < n0 ? jj : n0 + anc[jj - n0];
                     kv[u].load(Kg + (size_t)slot * rowstride);
@@ -648,7 +670,7 @@ __device__ __forceinline__ void attn_decode_split(const bf16* __restrict__ q, co
             }
 #pragma unroll
             for (int u = 0; u < 4; ++u) {
-                if (u < c4) {
+                if (u < c4 && j + u >= first) {
                     float sc = 0.f;
 #pragma unroll
                     for (int e = 0; e < E; ++e) sc = fmaf(qf[e], kv[u].at(e), sc);
@@ -753,8 +775,9 @@ __device__ __forceinline__ void attn_decode_split(const bf16* __restrict__ q, co
         const bf16* __restrict__ q, const bf16* __restrict__ K, const bf16* __restrict__ V,                  \
         bf16* __restrict__ out, const int* __restrict__ n0p, const int* __restrict__ par, int T, int Hq,     \
         int Hk, int cap, float scale, float* __restrict__ part_m, float* __restrict__ part_l,                \
-        float* __restrict__ part_acc, int* __restrict__ cnt, int S) {                                        \
-        attn_decode_split<D>(q, K, V, out, n0p, par, T, Hq, Hk, cap, scale, part_m, part_l, part_acc, cnt, S); \
+        float* __restrict__ part_acc, int* __restrict__ cnt, int S, int win) {                               \
+        attn_decode_split<D>(q, K, V, out, n0p, par, T, Hq, Hk, cap, scale, part_m, part_l, part_acc, cnt, S,   \
+                             win);                                                                           \
     }
 ATTN_SPLIT_K(64)
 ATTN_SPLIT_K(128)
@@ -873,6 +896,36 @@ extern "C" __global__ void __launch_bounds__(256) btb_add_rmsnorm(bf16* __restri
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// the sandwich block's residual (Gemma): h [T, H] bf16 += bf16(y * rstd * w) (or * (1 + w)), the delta normed
+// before it is added rather than after; the add rounded as torch's bf16 add. The row's reduction as above.
+// ---------------------------------------------------------------------------------------------------------
+extern "C" __global__ void __launch_bounds__(256) btb_sandwich_add(bf16* __restrict__ h, const bf16* __restrict__ y,
+                                                                   const bf16* __restrict__ w, float eps, int H,
+                                                                   int centered) {
+    const int t = blockIdx.x, tid = threadIdx.x;
+    bf16* hr = h + (size_t)t * H;
+    const bf16* yr = y + (size_t)t * H;
+    float ss = 0.f;
+    for (int i = tid; i < H; i += 256) {
+        const float v = bf2f(yr[i]);
+        ss = fmaf(v, v, ss);
+    }
+    __shared__ float red[256];
+    red[tid] = ss;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        __syncthreads();
+    }
+    const float rstd = rsqrtf(red[0] / (float)H + eps);
+    for (int i = tid; i < H; i += 256) {
+        const float wv = bf2f(w[i]);
+        const float normed = bfround(bf2f(yr[i]) * rstd * (centered ? 1.f + wv : wv));
+        hr[i] = f2bf(bf2f(hr[i]) + normed);
+    }
+}
+
 // the tensor-core matvec for wide passes (one kernel for every row count, so a one-row step and a 32-row
 // verify pass share their bits): btb_gemv_mma.cuh
 #include "btb_gemv_mma.cuh"
@@ -893,18 +946,26 @@ extern "C" __global__ void btb_publish(const int* __restrict__ n0, const long lo
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// silu * up over a [T, 2I] block: m[t][i] = bf16(bf16(silu(g)) * u), silu in fp32 as torch's (x / (1 + e^-x)).
+// act(g) * up over a [T, 2I] block: m[t][i] = bf16(bf16(act(g)) * u), the activation in fp32 as torch's.
 // ---------------------------------------------------------------------------------------------------------
-extern "C" __global__ void __launch_bounds__(256) btb_silu_mul(const bf16* __restrict__ gu, bf16* __restrict__ m,
-                                                               int T, int I) {
+template <int ACT>
+__device__ __forceinline__ void act_mul(const bf16* __restrict__ gu, bf16* __restrict__ m, int T, int I) {
     const size_t n = (size_t)T * I;
     for (size_t k = (size_t)blockIdx.x * 256 + threadIdx.x; k < n; k += (size_t)gridDim.x * 256) {
         const size_t t = k / I, i = k - t * I;
         const float g = bf2f(gu[t * (2 * (size_t)I) + i]);
         const float u = bf2f(gu[t * (2 * (size_t)I) + I + i]);
-        const float s = bfround(g / (1.f + expf(-g)));
+        const float s = bfround(act_of<ACT>(g));
         m[k] = f2bf(s * u);
     }
+}
+extern "C" __global__ void __launch_bounds__(256) btb_silu_mul(const bf16* __restrict__ gu, bf16* __restrict__ m,
+                                                               int T, int I) {
+    act_mul<0>(gu, m, T, I);
+}
+extern "C" __global__ void __launch_bounds__(256) btb_gelu_mul(const bf16* __restrict__ gu, bf16* __restrict__ m,
+                                                               int T, int I) {
+    act_mul<1>(gu, m, T, I);
 }
 
 // ---------------------------------------------------------------------------------------------------------
