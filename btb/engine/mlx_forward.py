@@ -163,12 +163,28 @@ class _MlxMixin(_State):
         rd = Native.read_direct
         direct = checkpoint and rd is not None and all(m.key in self.weight_map for m in lins)
         if not direct:
-            n = 0
+            # no direct reader (or the weights are not the checkpoint's, e.g. a dequantized GGUF): copy the
+            # tensors, but into a pool block like the reader path, not a fresh MLX array each. A fresh array
+            # beside the seeded-but-unused pool was the reader-less path's whole model held twice in MLX.
+            sized, cur = [], 0
             for m in lins:
-                m.mx = be.weight(m.weight.data)
-                n += m.weight.numel() * m.weight.element_size()
-            self.mlx_state.bytes += n
-            return n
+                rows, cols = (int(x) for x in m.weight.shape)
+                nb = rows * cols * 2  # bf16
+                sized.append((m, rows, cols, nb, cur))
+                cur += (nb + 63) // 64 * 64
+            sh, base = self._shared_ahead(cur)
+            for m, rows, cols, nb, so in sized:
+                w = m.weight.data
+                if w.dtype != torch.bfloat16:
+                    w = w.to(torch.bfloat16)
+                region = sh.torch[base + so : base + so + nb]
+                region.copy_(w.reshape(-1).view(torch.uint8))
+                m.mx = be.weight_slot(sh, base + so, nb, (rows, cols))
+                # the torch weight becomes a view of the pool block: the original tensor's bytes are freed, the
+                # shape kept for any host path that still reads it
+                m.weight = torch.nn.Parameter(region.view(torch.bfloat16).view(rows, cols), requires_grad=False)
+            self.mlx_state.bytes += cur
+            return cur
         items, cur = self._layer_items(lins)
         sh, base = self._shared_ahead(cur)
         chunk = getattr(self, "cold_chunk", 16 << 20)

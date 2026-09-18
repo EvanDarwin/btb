@@ -11,7 +11,7 @@ import importlib.util
 import json
 import os
 import sys
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from types import ModuleType
 from typing import IO, TYPE_CHECKING, ClassVar, Protocol, cast
@@ -24,6 +24,7 @@ from btb.kinds import Json
 from tests.helpers import ROOT, checkout
 
 if TYPE_CHECKING:
+    from lib.records import BenchDevice, BenchDtype, BenchStatus
     from lib.tools import BenchTool
 
 
@@ -44,6 +45,13 @@ def _script(name: str) -> ModuleType:
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     return m
+
+
+def _enums() -> tuple[type[BenchStatus], type[BenchDevice], type[BenchDtype]]:
+    """The bench's (BenchStatus, BenchDevice, BenchDtype) enum classes, from the records module loaded the way
+    the scripts do."""
+    r = _bench("records")
+    return r.BenchStatus, r.BenchDevice, r.BenchDtype
 
 
 class _Clock:
@@ -124,54 +132,189 @@ def _timed(monkeypatch: MonkeyPatch) -> tuple[ModuleType, _Clock]:
 def test_matrix_gives_a_comparison_tool_a_cell_per_device_regime(monkeypatch: MonkeyPatch) -> None:
     """a rival runs in every device regime btb does, through its own flags, never skipped for its size (both
     rivals stream); AirLLM's card regime is a planned skip only where there is no CUDA; gpt-oss on AirLLM
-    carries the MXFP4 note in each regime"""
+    carries the MXFP4 note in each regime. Devices and tools are separate axes now, composed in the matrix."""
     plan = _bench("plan")
+    table = _bench("table")
+    BS, BD, BT = _enums()
     big = {"name": "big", "repo": "x/big", "path": "/nowhere", "type": "qwen3", "size": 61 * 2**30, "packed": False}
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    cells = plan.plan_cells([big], ["cpu", "mlx-lm", "airllm", "llama-cpp"], False)
-    by = {c["config"]: c for c in cells}
+    cells = plan.plan_cells([big], [BD.CPU], ["mlx-lm", "airllm", "llama-cpp"], {}, {}, [])
+    by = {table.cell_label(c): c for c in cells}
     assert set(by) == {"cpu", "mlx-lm", "airllm-gpu", "airllm-cpu", "llama-cpp-gpu", "llama-cpp-cpu"}
-    assert all(c["skip"] is None for c in cells)
     assert by["airllm-gpu"]["args"] == ["--tool", "airllm", "--device", "cuda"]
     assert by["airllm-cpu"]["args"] == ["--tool", "airllm", "--device", "cpu"]
     assert by["llama-cpp-cpu"]["args"] == ["--tool", "llama-cpp", "--n-gpu-layers", "0"]
     assert by["mlx-lm"]["tool"] == "mlx-lm" and not by["cpu"].get("tool")
+    # a safetensors checkpoint: the streaming rivals run at any size (cuda is up in this block), but llama.cpp
+    # needs a GGUF, so it is a planned skip here rather than a silent conversion
+    assert by["mlx-lm"].get("status") is None and by["airllm-gpu"].get("status") is None
+    assert by["airllm-cpu"].get("status") is None
+    assert by["llama-cpp-gpu"]["status"] is BS.DNR and "GGUF" in by["llama-cpp-gpu"]["reason"]
+    assert by["llama-cpp-cpu"]["status"] is BS.DNR and "GGUF" in by["llama-cpp-cpu"]["reason"]
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    by = {c["config"]: c for c in plan.plan_cells([big], ["airllm"], False)}
-    assert "no CUDA" in by["airllm-gpu"]["skip"] and by["airllm-cpu"]["skip"] is None
+    by = {table.cell_label(c): c for c in plan.plan_cells([big], [], ["airllm"], {}, {}, [])}
+    assert by["airllm-gpu"]["status"] is BS.DNR and "no CUDA" in by["airllm-gpu"]["reason"]
+    assert by["airllm-cpu"].get("status") is None
     gpt = dict(big, type="gpt_oss")
-    cells = plan.plan_cells([gpt], ["airllm"], False)
-    assert len(cells) == 2 and all("MXFP4" in c["skip"] for c in cells), (
+    cells = plan.plan_cells([gpt], [], ["airllm"], {}, {}, [])
+    assert len(cells) == 2 and all(c["status"] is BS.DNR and "MXFP4" in c["reason"] for c in cells), (
         "gpt-oss on AirLLM is skipped on its own ground"
     )
-    # btb's own cells: the CPU is float32, --fp32 adds a float32 row to each bf16 cell, cpu+mlx is a planned skip
-    cells = plan.plan_cells([big], ["cpu", "gpu", "cpu+mlx"], True)
-    assert [(c["config"], c["dtype"], c["args"]) for c in cells] == [
-        ("cpu", "fp32", ["--device", "cpu"]),
-        ("gpu", "bf16", ["--device", "cuda", "--cpu-layers", "0"]),
-        ("gpu", "fp32", ["--device", "cuda", "--cpu-layers", "0", "--fp32", "1"]),
-        ("cpu+mlx", "bf16", []),
-    ]
-    assert "--cpu-layers" in cells[-1]["skip"]
+    # btb's own cells: the CPU tier is fp32 (its native), naming fp32 adds the fp32-over-bf16 variant on a card
+    # device, cpu+mlx is a planned skip
+    cells = plan.plan_cells([big], [BD.CPU, BD.GPU, BD.CPU_MLX], [], {"dtype": {"fp32"}}, {}, [])
+    run = {(c["device"], c["dtype"]): c for c in cells if c.get("status") is None}
+    assert run[(BD.CPU, BT.FP32)]["args"] == ["--device", "cpu"]
+    assert run[(BD.GPU, BT.FP32)]["args"] == ["--device", "cuda", "--cpu-layers", "0", "--fp32", "1"]
+    cpumlx = next(c for c in cells if c["device"] is BD.CPU_MLX)
+    assert cpumlx["status"] is BS.DNR and "--cpu-layers" in cpumlx["reason"]
 
 
 def test_matrix_resume_reuses_only_finished_cells_of_the_same_lengths() -> None:
     plan = _bench("plan")
+    BS, BD, BT = _enums()
     e = {"name": "m", "repo": "x/m", "path": "/nowhere", "type": "qwen3", "size": 1, "packed": False}
-    cells = plan.plan_cells([e], ["cpu", "mlx"], False)
+    cells = plan.plan_cells([e], [BD.CPU, BD.MLX], [], {}, {}, [])
+    axes = {"pack12": False, "sampling": "greedy", "tool": None}
     prev = {
         "new": [64, 256],
         "cells": [
-            {"model": "m", "config": "cpu", "dtype": "fp32", "status": "ok", "seconds": 5, "cells": [{"new": 64}]},
-            {"model": "m", "config": "mlx", "dtype": "bf16", "status": "failed", "seconds": 1},
+            {"model": "m", "device": BD.CPU, "dtype": BT.FP32, "mega": False, **axes,
+             "status": BS.OK, "seconds": 5, "cells": [{"new": 64}]},
+            {"model": "m", "device": BD.MLX, "dtype": BT.BF16, "mega": True, **axes, "status": BS.DNR, "seconds": 1},
         ],
     }
     assert plan.resume_cells(cells, prev, [64, 256], "prev.json") == 1
-    cpu = next(c for c in cells if c["config"] == "cpu")
-    assert cpu.get("resumed") == "prev.json" and cpu["status"] == "ok" and cpu["args"] == ["--device", "cpu"]
-    assert not next(c for c in cells if c["config"] == "mlx").get("resumed")
-    cells = plan.plan_cells([e], ["cpu"], False)
+    cpu = next(c for c in cells if c["device"] is BD.CPU)
+    assert cpu.get("resumed") == "prev.json" and cpu["status"] is BS.OK and cpu["args"] == ["--device", "cpu"]
+    assert not next(c for c in cells if c["device"] is BD.MLX).get("resumed")
+    cells = plan.plan_cells([e], [BD.CPU], [], {}, {}, [])
     assert plan.resume_cells(cells, prev, [64, 256, 1024], "prev.json") == 0, "other answer lengths are another run"
+
+
+class _Bail(Exception):
+    """what a raising error callback throws, standing in for argparse.error's SystemExit."""
+
+
+def _bail(msg: str) -> None:
+    raise _Bail(msg)
+
+
+def test_the_kind_parser_names_each_axis_and_the_selection_composes() -> None:
+    """a bare kind names its axis by the disjoint vocabulary, axis=value is explicit (and the only form for a
+    model glob), an unknown kind or a --config naming one axis twice is an error; --only/--not/--config parse
+    into the allow, deny and points the planner reads"""
+    plan = _bench("plan")
+    assert plan.parse_kind("mlx", _bail) == ("device", "mlx")
+    assert plan.parse_kind("fp32", _bail) == ("dtype", "fp32")
+    assert plan.parse_kind("nomega", _bail) == ("mega", "nomega")
+    assert plan.parse_kind("pack12", _bail) == ("pack12", "pack12")
+    assert plan.parse_kind("llama-cpp", _bail) == ("tool", "llama-cpp")
+    assert plan.parse_kind("greedy", _bail) == ("sampling", "greedy")
+    assert plan.parse_kind("t0.7", _bail) == ("sampling", "t0.7")
+    assert plan.parse_kind("model=qwen3-*", _bail) == ("model", "qwen3-*")
+    assert plan.parse_kind("device=mlx", _bail) == ("device", "mlx")
+    with pytest.raises(_Bail, match="unknown kind"):
+        plan.parse_kind("nonsense", _bail)
+    with pytest.raises(_Bail, match="not a dtype kind"):
+        plan.parse_kind("dtype=int4", _bail)
+    with pytest.raises(_Bail, match="not a sampling kind"):
+        plan.parse_kind("sampling=hot", _bail)
+    allow, deny, points = plan.parse_selection(["mlx,fp32", "gpu"], ["nomega"], ["mlx+fp32"], _bail)
+    assert allow == {"device": {"mlx", "gpu"}, "dtype": {"fp32"}} and deny == {"mega": {"nomega"}}
+    assert points == [{"device": "mlx", "dtype": "fp32"}]
+    with pytest.raises(_Bail, match="two device values"):
+        plan.parse_selection([], [], ["mlx+cpu"], _bail)
+
+
+def _points(plan: ModuleType, e: Json, devices: Sequence[BenchDevice], **sel: object) -> list[tuple[str, str, bool, str]]:
+    """The (device, dtype, mega, sampling) of the cells a selection plans and does not gate, sorted."""
+    cells = plan.plan_cells([e], devices, [], sel.get("allow", {}), sel.get("deny", {}), sel.get("points", []))
+    return sorted((c["device"], c["dtype"], c["mega"], c["sampling"]) for c in cells if c.get("status") is None)
+
+
+def test_the_selection_widens_narrows_and_names_points() -> None:
+    """--only replaces an axis's default, --not subtracts, and --config widens the grid to reach its points
+    then filters to their combinations - so naming fp32 in one config keeps the bf16 cell another asks for,
+    and two configs are a union with no cross terms. A temperature carries --temperature and names the cell."""
+    plan = _bench("plan")
+    table = _bench("table")
+    BS, BD, BT = _enums()
+    e = {"name": "m", "repo": "x/m", "path": "/nowhere", "type": "qwen3", "size": 1, "packed": False}
+    devs = [BD.CPU, BD.CPU_MLX, BD.MLX]
+    # the default: each device its native dtype, mega on where the megakernel lays it out, cpu+mlx a skip
+    assert _points(plan, e, devs) == [(BD.CPU, BT.FP32, False, "greedy"), (BD.MLX, BT.BF16, True, "greedy")]
+    # --only replaces the device set; --not subtracts (allow/deny carry kind tokens, the axis vocabulary)
+    assert _points(plan, e, devs, allow={"device": {"mlx"}}) == [(BD.MLX, BT.BF16, True, "greedy")]
+    assert _points(plan, e, devs, deny={"device": {"cpu"}}) == [(BD.MLX, BT.BF16, True, "greedy")]
+    # --config gpu+fp32 alongside --config gpu: the fp32 config widens the grid, the plain gpu keeps its bf16.
+    # fp32 is a card variant - MLX has no fp32 path, so mlx+fp32 would be a planned skip (see the gates test)
+    assert _points(plan, e, [BD.GPU], points=[{"device": "gpu", "dtype": "fp32"}, {"device": "gpu"}]) == [
+        (BD.GPU, BT.BF16, False, "greedy"),
+        (BD.GPU, BT.FP32, False, "greedy"),
+    ]
+    # two configs are a union, never their cross: no gpu bf16, no cpu that neither names
+    assert _points(plan, e, [BD.CPU, BD.GPU], points=[{"device": "gpu", "dtype": "fp32"}, {"device": "cpu"}]) == [
+        (BD.CPU, BT.FP32, False, "greedy"),
+        (BD.GPU, BT.FP32, False, "greedy"),
+    ]
+    # a temperature is its own sampling cell, with the flag and the label
+    cells = plan.plan_cells([e], [BD.MLX], [], {"sampling": {"t0.7"}}, {}, [])
+    c = next(c for c in cells if c.get("status") is None)
+    assert c["sampling"] == "t0.7" and c["args"][-2:] == ["--temperature", "0.7"]
+    assert table.cell_label(c) == "mlx·t0.7"
+    # the manifest is the axis values the grid actually spanned
+    cells = plan.plan_cells([e], [BD.CPU, BD.MLX], [], {}, {}, [])
+    m = plan.axes_manifest(cells)
+    assert m["device"] == [BD.CPU, BD.MLX] and m["dtype"] == [BT.BF16, BT.FP32]
+    assert m["mega"] == ["mega", "nomega"] and m["pack12"] == ["nopack12"] and m["tool"] == ["btb"]
+
+
+def test_the_gates_skip_what_cannot_run_with_a_reason() -> None:
+    """a gate marks a cell DNR with why it cannot run rather than dropping it: bf16 on the CPU tier, fp32 on
+    MLX (no fp32 path there), the megakernel off its MLX/bf16/dense ground, and pack-12 with no 12-bit store
+    beside the model. The megakernel label and flag appear only where it applies, never on a mixture of
+    experts."""
+    plan = _bench("plan")
+    table = _bench("table")
+    BS, BD, BT = _enums()
+    e = {"name": "m", "repo": "x/m", "path": "/nowhere", "type": "qwen3", "size": 1, "packed": False}
+    moe = dict(e, type="gpt_oss")
+    reason = lambda cells, dev: next(c["reason"] for c in cells if c["device"] == dev and c["status"] is BS.DNR)
+    assert "CPU tier is fp32" in reason(plan.plan_cells([e], [BD.CPU], [], {"dtype": {"bf16"}}, {}, []), BD.CPU)
+    assert "MLX runs bf16 only" in reason(plan.plan_cells([e], [BD.MLX], [], {"dtype": {"fp32"}}, {}, []), BD.MLX)
+    assert "MLX" in reason(plan.plan_cells([e], [BD.CPU], [], {"mega": {"mega"}}, {}, []), BD.CPU)
+    assert "mixture of experts" in reason(plan.plan_cells([moe], [BD.MLX], [], {"mega": {"mega"}}, {}, []), BD.MLX)
+    assert "12-bit store" in reason(plan.plan_cells([e], [BD.MLX], [], {"pack12": {"pack12"}}, {}, []), BD.MLX)
+    # a MoE on MLX is a plain cell (mega does not apply): no --mlx-mega flag, no nomega label
+    moe_cell = next(c for c in plan.plan_cells([moe], [BD.MLX], [], {}, {}, []) if c.get("status") is None)
+    assert "--mlx-mega" not in moe_cell["args"] and table.cell_label(moe_cell) == "mlx"
+
+
+def test_pick_models_globs_the_cache_and_excludes(monkeypatch: MonkeyPatch) -> None:
+    """--models takes cache names, repo ids and globs over them; --exclude-models drops glob matches from
+    whatever was chosen; the default is the whole cache."""
+    plan = _bench("plan")
+    import btb
+
+    have = [
+        {"name": n, "repo": r, "path": "/c/" + n, "type": "qwen3", "size": 1, "packed": False}
+        for n, r in [
+            ("qwen3-0.6b", "Qwen/Qwen3-0.6B"),
+            ("qwen3-4b", "Qwen/Qwen3-4B"),
+            ("phi-4-mini-instruct", "microsoft/Phi-4-mini-instruct"),
+        ]
+    ]
+    monkeypatch.setattr(btb, "available_models", lambda: have)
+    names = lambda **kw: sorted(
+        e["name"] for e in plan.pick_models(kw.get("names", []), kw.get("filters", []), kw.get("exclude", []))
+    )
+    assert names() == ["phi-4-mini-instruct", "qwen3-0.6b", "qwen3-4b"]
+    assert names(names=["qwen3-*"]) == ["qwen3-0.6b", "qwen3-4b"]
+    assert names(names=["*4b*"]) == ["qwen3-4b"]
+    assert names(names=["qwen/qwen3-4b"]) == ["qwen3-4b"], "a repo id matches by its lowercased id"
+    assert names(exclude=["phi*"]) == ["qwen3-0.6b", "qwen3-4b"]
+    assert names(names=["qwen3-*"], exclude=["*0.6b*"]) == ["qwen3-4b"]
 
 
 def test_matrix_checks_the_comparison_environment_against_its_requirements(tmp_path: Path) -> None:
@@ -205,6 +348,25 @@ def test_matrix_checks_the_comparison_environment_against_its_requirements(tmp_p
     assert env.marker_holds("python_version >= '3'"), "an unknown marker is taken as holding"
 
 
+def test_llama_cpp_supported_reads_the_converter_registry(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    """llama.cpp's convertible-architecture set, read from a checkout's --print-supported-models (which logs
+    the names to stderr): None without an interpreter or a checkout, the arch names parsed out otherwise."""
+    env = _bench("env")
+    monkeypatch.setenv("LLAMA_CPP_DIR", str(tmp_path))
+    assert env.llama_cpp_supported(None) is None, "no interpreter, nothing to ask"
+    assert env.llama_cpp_supported("/venv/python") is None, "no convert_hf_to_gguf.py in the checkout"
+    (tmp_path / "convert_hf_to_gguf.py").write_text("", encoding="utf-8")
+
+    class _Done:
+        stdout = ""
+        stderr = "INFO:hf-to-gguf:Qwen3ForCausalLM\nGemma3ForConditionalGeneration\nLlamaForCausalLM\n"
+
+    monkeypatch.setattr(env.subprocess, "run", lambda *a, **k: _Done())
+    assert env.llama_cpp_supported("/venv/python") == frozenset(
+        {"Qwen3ForCausalLM", "Gemma3ForConditionalGeneration", "LlamaForCausalLM"}
+    )
+
+
 def test_every_tool_speaks_the_one_signature_and_says_what_the_matrix_plans_for_it() -> None:
     """each rival class fills the whole signature itself, names the module its environment is probed for and
     its device regimes with the flags that force them; the matrix's configuration list ends with the same
@@ -218,11 +380,22 @@ def test_every_tool_speaks_the_one_signature_and_says_what_the_matrix_plans_for_
         for regime, flags in cls.regimes:
             assert regime in ("gpu", "cpu", "mlx") and isinstance(flags, tuple), name
         cls("/nowhere", lambda s: None).close()
-    assert plan.CONFIGS[-len(tools.TOOLS) :] == tuple(tools.TOOLS)
-    assert tools.TOOLS["llama-cpp"].cannot("gpu", "qwen3", cuda=False) is None
-    assert "CUDA" in tools.TOOLS["airllm"].cannot("gpu", "qwen3", cuda=False)
-    assert tools.TOOLS["airllm"].cannot("cpu", "qwen3", cuda=False) is None
-    assert "MXFP4" in tools.TOOLS["airllm"].cannot("cpu", "gpt_oss", cuda=True)
+    assert plan.TOOL_NAMES == tuple(tools.TOOLS)
+    assert "CUDA" in tools.TOOLS["airllm"].cannot("gpu", "qwen3", cuda=False, gguf=False)
+    assert tools.TOOLS["airllm"].cannot("cpu", "qwen3", cuda=False, gguf=False) is None
+    assert "MXFP4" in tools.TOOLS["airllm"].cannot("cpu", "gpt_oss", cuda=True, gguf=False)
+    # a GGUF: only llama.cpp reads it directly; mlx-lm and airllm load HF/MLX weights, so they are planned skips
+    assert "GGUF" in tools.TOOLS["mlx-lm"].cannot("mlx", "qwen3", cuda=False, gguf=True)
+    assert "GGUF" in tools.TOOLS["airllm"].cannot("cpu", "qwen3", cuda=False, gguf=True)
+    # llama.cpp is the mirror: a GGUF runs; a checkpoint is a skip whose reason depends on the converter's
+    # registry - convertible when it knows the arch, unsupported when it does not, "needs a GGUF" when there
+    # is no checkout to ask
+    lc = tools.TOOLS["llama-cpp"]
+    assert lc.cannot("gpu", "qwen3", cuda=False, gguf=True) is None
+    assert "GGUF" in lc.cannot("gpu", "qwen3", cuda=False, gguf=False)
+    reg = frozenset({"Qwen3ForCausalLM"})
+    assert "converts Qwen3ForCausalLM" in lc.cannot("gpu", "qwen3", cuda=False, gguf=False, arch="Qwen3ForCausalLM", supported=reg)
+    assert "no entry" in lc.cannot("gpu", "x", cuda=False, gguf=False, arch="WeirdForCausalLM", supported=reg)
 
 
 def test_the_timing_loop_measures_first_token_and_rate_and_keeps_the_budget(monkeypatch: MonkeyPatch) -> None:
@@ -235,7 +408,7 @@ def test_the_timing_loop_measures_first_token_and_rate_and_keeps_the_budget(monk
     cells = tools.bench(tool, ["a", "b"], [4, 8], budget=1e9)
     assert [c["new"] for c in cells] == [4, 8]
     for c in cells:
-        assert c["first_s"] == pytest.approx(0.5) and c["greedy_s_tok"] == pytest.approx(0.1)
+        assert c["first_s"] == pytest.approx(0.5) and c["base_s_tok"] == pytest.approx(0.1)
         assert (c["peak_ram_gb"], c["peak_vram_gb"], c["spec_s_tok"], c["tokens_per_pass"]) == (3.0, 1.5, None, 1.0)
     assert said.count("fake new=4: prompt 1, 4 tokens, first 0.50s, then 0.100 s/token") == 2
     # a prompt of 4 tokens costs 0.8s and one of 8 costs 1.2s: with 2.0s the 4s finish, the 8s stop after one
@@ -290,13 +463,9 @@ def test_compare_main_runs_a_tool_and_appends_its_record(tmp_path: Path, monkeyp
     assert compare.main([*argv, "--label", "L"]) == 0
     assert fake.made[-1] in fake.closed and fake.made[-1].opts["max_new"] == 8
     rec = json.loads(out.read_text(encoding="utf-8").strip().splitlines()[-1])
-    assert (rec["label"], rec["tool"], rec["device"], rec["model"], rec["path"]) == (
-        "L",
-        "fake",
-        "cpu",
-        "model",
-        "/model",
-    )
+    # the matrix owns the axes now; the record carries only its identity and the numbers
+    assert (rec["label"], rec["model"], rec["path"]) == ("L", "model", "/model")
+    assert "tool" not in rec and "device" not in rec
     assert [c["new"] for c in rec["cells"]] == [4, 8] and rec["cells"][0]["first_s"] == pytest.approx(0.5)
     assert compare.main(argv) == 0
     assert len(out.read_text(encoding="utf-8").strip().splitlines()) == 2, "a record is appended, never overwritten"
@@ -311,6 +480,7 @@ def test_run_cell_reads_the_record_back_and_reports_a_failure_or_a_kill(
     import json
 
     run = _bench("run")
+    BS, BD, BT = _enums()
     monkeypatch.setattr(run.time, "sleep", lambda s: None)
     state = {"level": 90.0, "swap_gb": 0.0, "disk_gb": 100.0}
     monkeypatch.setattr(run, "memory_state", lambda: dict(state))
@@ -354,13 +524,16 @@ def test_run_cell_reads_the_record_back_and_reports_a_failure_or_a_kill(
     monkeypatch.setattr(run.os, "killpg", lambda pid, sig: procs[-1].kill(), raising=False)
 
     def cell(**kw: object) -> Json:
-        base = {"model": "m", "config": "cpu", "dtype": "fp32", "path": "/m", "args": ["--device", "cpu"], "tool": None}
-        return {**base, "skip": None, **kw}
+        base = {
+            "model": "m", "device": BD.CPU, "dtype": BT.FP32, "pack12": False, "sampling": "greedy",
+            "mega": False, "tool": None, "path": "/m", "args": ["--device", "cpu"],
+        }
+        return {**base, **kw}
 
-    popen(record={"device": "cpu", "cells": [{"new": 64, "greedy_s_tok": 0.5}], "report": {"placement": {}}})
+    popen(record={"cells": [{"new": 64, "base_s_tok": 0.5}], "report": {"placement": {}}})
     c = run.run_cell(cell(), "q.jsonl", "64", "0", str(tmp_path), timeout=100)
     assert (
-        c["status"] == "ok" and c["device"] == "cpu" and c["cells"][0]["new"] == 64 and c["report"] == {"placement": {}}
+        c["status"] is BS.OK and c["device"] is BD.CPU and c["cells"][0]["new"] == 64 and c["report"] == {"placement": {}}
     )
     argv = procs[-1].argv
     assert argv[:5] == [sys.executable, "-m", "btb.cli", "bench", "/m"]
@@ -368,43 +541,48 @@ def test_run_cell_reads_the_record_back_and_reports_a_failure_or_a_kill(
     assert c["memory"] == {"min_level": 90.0, "max_swap_gb": 0.0, "min_disk_gb": 100.0}
     assert os.path.basename(c["log"]) == "m-cpu-fp32.log"
     assert open(c["log"], encoding="utf-8").read().startswith(c["command"] + "\n\n")
-    popen(record={"device": "cuda", "cells": []})
+    popen(record={"cells": []})
     tool_cell = cell(
-        config="llama-cpp-gpu", dtype="bf16", tool="llama-cpp", args=["--tool", "llama-cpp", "--n-gpu-layers", "-1"]
+        device=BD.GPU, dtype=BT.BF16, tool="llama-cpp", args=["--tool", "llama-cpp", "--n-gpu-layers", "-1"]
     )
     c = run.run_cell(tool_cell, "q.jsonl", "64", "", str(tmp_path), 100, compare_py="/venv/python")
     assert procs[-1].argv[:2] == ["/venv/python", os.path.join(run.HERE, "compare.py")]
-    assert c["status"] == "ok" and c["report"] is None and "--rows" not in procs[-1].argv
+    assert c["status"] is BS.OK and c["report"] is None and "--rows" not in procs[-1].argv
+    # a child that ends with no record: DNR, its exit code and the log's tail in the reason
     popen(record=None, rc=3)
     c = run.run_cell(cell(), "q.jsonl", "64", "", str(tmp_path), 100)
-    assert c["status"] == "failed" and c["error"].startswith("exit 3;") and "the last line" in c["error"]
+    assert c["status"] is BS.DNR and c["reason"].startswith("errored (exit 3):") and "the last line" in c["reason"]
+    # the guard trips the memory floor: OOM, with the level it fell to
     popen(record=None, polls=5)
     state["level"] = 3.0
     c = run.run_cell(cell(), "q.jsonl", "64", "", str(tmp_path), 100, guard={"mem_floor": 8.0})
-    assert procs[-1].killed and c["status"] == "failed"
-    assert c["error"].startswith("killed: the kernel's free memory fell to 3% (floor 8%)")
-    assert c["memory"]["min_level"] == 3.0
+    assert procs[-1].killed and c["status"] is BS.OOM
+    assert c["reason"].startswith("the kernel's free memory fell to 3% (floor 8%)") and c["memory"]["min_level"] == 3.0
+    # past the time limit: DNF
     state["level"] = 90.0
     popen(record=None, polls=5)
     clock = _Clock()
     monkeypatch.setattr(run.time, "time", lambda: clock.tick(60))
     c = run.run_cell(cell(), "q.jsonl", "64", "", str(tmp_path), timeout=30)
-    assert procs[-1].killed and c["error"] == "timed out after 30s"
+    assert procs[-1].killed and c["status"] is BS.DNF and c["reason"] == "did not finish within 30s"
 
 
 def test_the_table_renders_a_cell_from_its_numbers_and_a_skip_from_its_note() -> None:
     table = _bench("table")
+    BS, BD, BT = _enums()
     ok = {
         "model": "m",
-        "config": "gpu",
-        "dtype": "bf16",
-        "status": "ok",
+        "device": BD.GPU,
+        "dtype": BT.BF16,
+        "tool": None,
+        "mega": False,
+        "status": BS.OK,
         "seconds": 12.5,
         "cells": [
             {
                 "new": 64,
                 "first_s": 0.9,
-                "greedy_s_tok": 0.05,
+                "base_s_tok": 0.05,
                 "spec_s_tok": None,
                 "tokens_per_pass": 1.0,
                 "identical": "",
@@ -414,7 +592,7 @@ def test_the_table_renders_a_cell_from_its_numbers_and_a_skip_from_its_note() ->
             {
                 "new": 256,
                 "first_s": 0.4,
-                "greedy_s_tok": 0.2,
+                "base_s_tok": 0.2,
                 "spec_s_tok": 0.1,
                 "tokens_per_pass": 2.0,
                 "identical": "3/3",
@@ -426,28 +604,31 @@ def test_the_table_renders_a_cell_from_its_numbers_and_a_skip_from_its_note() ->
     }
     s = table.summarize(ok)
     assert s["tok/s"] == "20.0 / 10.0", "the rate as the configuration runs: speculation's where it is on"
-    assert s["greedy tok/s"] == "20.0 / 5.00", "the greedy loop's own rate beside it"
+    assert s["base tok/s"] == "20.0 / 5.00", "the no-spec baseline's own rate beside it"
     assert s["tok/pass"] == "1.00 / 2.00"
     assert s["first token"] == "0.40 s", "from the second length: the first carries the warm-up"
+    assert s["total"] == "12.5 s", "the cell's total wall time"
     assert (s["peak RAM"], s["peak VRAM/MLX"], s["identical"]) == ("2.5 GB", "3.4 GB", "3/3")
-    assert s["placement"] == "3 resident, 1 host, head card"
-    skipped = {"model": "m", "config": "cpu+mlx", "dtype": "bf16", "status": "skipped", "skip": "needs a split"}
-    failed = {
+    assert s["placement"] == "3 layers on the card, 1 on the CPU, the head on the card"
+    # a planning skip is a DNR; a guard kill is an OOM - both render as STATUS: reason, neither summarizes
+    gated = {"model": "m", "device": BD.CPU_MLX, "dtype": BT.BF16, "tool": None, "status": BS.DNR, "reason": "needs a split"}
+    killed = {
         "model": "m",
-        "config": "cpu",
-        "dtype": "fp32",
-        "status": "failed",
+        "device": BD.CPU,
+        "dtype": BT.FP32,
+        "tool": None,
+        "status": BS.OOM,
         "seconds": 3.0,
-        "error": "exit 1; boom",
+        "reason": "swap in use reached 13.0 GB (cap 12 GB)",
     }
-    assert table.summarize(skipped) is None and table.summarize(failed) is None
-    text = table.render([ok, skipped, failed], "64,256")
+    assert table.summarize(gated) is None and table.summarize(killed) is None
+    text = table.render([ok, gated, killed], "64,256")
     assert "tok/s at 64 / 256" in text and "ok (spec identical 3/3)" in text
-    assert "skipped: needs a split" in text and "exit 1; boom" in text
-    md = table.render_markdown([ok, skipped, failed], "64,256")
+    assert "DNR: needs a split" in text and "OOM: swap in use reached 13.0 GB (cap 12 GB)" in text
+    md = table.render_markdown([ok, gated, killed], "64,256")
     assert md.count("\n") == 2, "the markdown carries the rows with numbers only"
-    assert "| m | gpu | bf16 | 20.0 / 10.0 | 20.0 / 5.00 | 1.00 / 2.00 | 0.40 s | 2.5 GB | 3.4 GB |" in md
-    assert table.cell_line(failed) == "failed after 3.0s: exit 1; boom"
+    assert "| m | gpu | bf16 | 20.0 / 10.0 | 20.0 / 5.00 | 1.00 / 2.00 | 0.40 s | 12.5 s | 2.5 GB | 3.4 GB |" in md
+    assert table.cell_line(killed) == "OOM after 3.0s: swap in use reached 13.0 GB (cap 12 GB)"
     assert (
         table.cell_line(ok)
         == "20.0 / 10.0 tok/s, 1.00 / 2.00 tok/pass, first 0.40 s, RAM 2.5 GB, VRAM/MLX 3.4 GB (12.5s)"
@@ -458,7 +639,7 @@ def test_the_table_renders_a_cell_from_its_numbers_and_a_skip_from_its_note() ->
 
 
 def test_the_machine_readers_and_the_environment_probe_parse_what_the_commands_say(
-    monkeypatch: MonkeyPatch, capsys: CaptureFixture[str]
+    monkeypatch: MonkeyPatch,
 ) -> None:
     host = _bench("host")
     env = _bench("env")
@@ -480,53 +661,48 @@ def test_the_machine_readers_and_the_environment_probe_parse_what_the_commands_s
     assert len(asked) == 3 and env.compare_tools(None) == [] and env.compare_tools("/nowhere/python") == []
     monkeypatch.setattr(plan, "compare_tools", lambda py: ["airllm", "llama-cpp"])
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    have = plan.machine_configs("/x")
-    assert have[0] == "cpu" and have[-2:] == ["airllm", "llama-cpp"] and "gpu" not in have
-    errors: list[str] = []
-    assert plan.chosen_configs("gpu, cpu", ["cpu", "cpu+gpu", "gpu"], errors.append) == ["gpu", "cpu"]
-    assert plan.chosen_configs(None, ["cpu", "mlx"], errors.append) == ["cpu", "mlx"]
-    assert plan.chosen_configs("cpu,mlx-lm", ["cpu"], errors.append) == ["cpu"] and not errors
-    assert "cannot run mlx-lm (no comparison environment)" in capsys.readouterr().out
-    plan.chosen_configs("cpu,nope", ["cpu"], errors.append)
-    assert errors and "nope" in errors[0]
+    devs = plan.machine_devices()
+    assert devs[0] == "cpu" and "gpu" not in devs and "cpu+gpu" not in devs, "no CUDA leaves out the card regimes"
+    assert plan.machine_tools("/x") == ["airllm", "llama-cpp"], "the tools whose env is present and device is here"
 
 
 def test_matrix_main_plans_a_dry_run_over_a_model_directory(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
     """the script end to end, running nothing: a model given as a directory is picked up by its config, the
-    named configurations are planned with their arguments, the ones this machine lacks are left out"""
+    selected axes are planned with their arguments, a device this machine lacks yields no cell for it"""
     import json
 
     matrix = _script("matrix")
     model = tmp_path / "tiny-model"
     model.mkdir()
     (model / "config.json").write_text(json.dumps({"model_type": "qwen3"}), encoding="utf-8")
-    rc = matrix.main(["--dry-run", "--devices", "cpu,gpu", "--models", str(model), "--new", "8,16"])
+    rc = matrix.main(["--dry-run", "--only", "btb,cpu,gpu", "--models", str(model), "--new", "8,16"])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "tiny-model" in out and "cpu      fp32  --device cpu" in out and "answers of 8,16 tokens" in out
+    assert "tiny-model" in out and "cpu" in out and "--device cpu" in out and "answers of 8,16 tokens" in out
     if torch.cuda.is_available():
-        assert "gpu      bf16  --device cuda --cpu-layers 0" in out
+        assert "--device cuda --cpu-layers 0" in out
     else:
-        assert "cannot run gpu (no card)" in out
+        assert "--device cuda" not in out, "no card: the gpu cell is simply not planned"
 
 
 def test_charts_draw_one_svg_per_model_from_the_run_docs(tmp_path: Path) -> None:
-    """bench/charts.py: the matrix's and compare.py's JSON and a bench JSONL become a chart a model and machine
-    (btb's speculative and greedy rows, a rival's, a failure as 'no result'), every label off the record's own
-    fields, the newest run of a configuration winning; --embed puts the charts above the folded table once and
-    leaves a section without charts alone"""
+    """bench/charts.py: the matrix's JSON and a standalone bench JSONL become a chart per model and machine
+    (btb's row, a rival's, a rival's failure as its state, a variant off the axes), every label read off the
+    cell's axes, the newest run of a configuration winning; a JSONL's device and dtype come back off its
+    placement"""
     spec = importlib.util.spec_from_file_location("charts", checkout("bench", "charts.py"))
     assert spec is not None and spec.loader is not None
     charts = importlib.util.module_from_spec(spec)
     sys.modules["charts"] = charts  # a dataclass under `from __future__ import annotations` resolves through here
     spec.loader.exec_module(charts)
+    BS, BD, BT = _enums()
 
-    def cells(spec_s: float | None, greedy_s: float, ram: float = 8.0, vram: float = 9.0) -> list[Json]:
+    def cells(spec_s: float | None, base_s: float, ram: float = 8.0, vram: float = 9.0) -> list[Json]:
         return [
             {
                 "new": n,
                 "first_s": 0.25,
-                "greedy_s_tok": greedy_s,
+                "base_s_tok": base_s,
                 "spec_s_tok": spec_s,
                 "tokens_per_pass": 1.2 if spec_s else 1.0,
                 "peak_ram_gb": ram,
@@ -535,72 +711,37 @@ def test_charts_draw_one_svg_per_model_from_the_run_docs(tmp_path: Path) -> None
             for n in (64, 256, 1024)
         ]
 
-    specs = {
-        "platform": "darwin",
-        "os": "macOS 26.6",
-        "cpu": "Apple M3 Pro",
-        "unified_memory_gb": 36,
-        "gpu": "Apple M3 Pro",
-    }
-    report = {
-        "placement": {"mlx": [0, 1], "host": [0, 1], "head": "host", "compute_dtype": "bf16"},
-        "speculation": {"proposer": "ngram", "tree_budget": 0, "ngram_tree": True},
-    }
-    btb_mlx = {"model": "a-1b", "repo": "Org/A-1B", "tool": None, "config": "mlx", "dtype": "bf16", "device": "mlx"}
+    specs = {"platform": "darwin", "os": "macOS 26", "cpu": "Apple M3 Pro", "unified_memory_gb": 36, "gpu": "Apple M3 Pro"}
+    report = {"placement": {"mlx": [0, 1], "host": [0, 1], "head": "host", "compute_dtype": "bf16"}}
+    axes = {"pack12": False, "sampling": "greedy"}
+    mlx = {"model": "a-1b", "repo": "Org/A-1B", "type": "qwen3", "tool": None, "device": BD.MLX, "dtype": BT.BF16, **axes}
+    airllm = {"model": "a-1b", "repo": "Org/A-1B", "type": "qwen3", "tool": "airllm", "device": BD.CPU, "dtype": BT.BF16}
     old = {
         "specs": specs,
         "finished": "2026-09-01T00:00:00",
         "cells": [
-            {**btb_mlx, "status": "ok", "report": report, "cells": cells(0.2, 0.4)},
-            {
-                "model": "a-1b",
-                "repo": "Org/A-1B",
-                "tool": "airllm",
-                "config": "airllm-cpu",
-                "device_regime": "cpu",
-                "dtype": "bf16",
-                "status": "failed",
-                "error": "Boom: old",
-            },
+            {**mlx, "mega": True, "status": BS.OK, "report": report, "cells": cells(0.2, 0.4)},
+            {**airllm, "status": BS.DNR, "reason": "Boom: old", "seconds": 1.0},
         ],
     }
     new = {
         "specs": specs,
         "finished": "2026-09-10T00:00:00",
         "cells": [
-            {**btb_mlx, "status": "ok", "report": report, "cells": cells(0.1, 0.2)},
-            {**btb_mlx, "variant": "the head on the CPU", "status": "ok", "report": report, "cells": cells(0.5, 0.5)},
+            {**mlx, "mega": True, "status": BS.OK, "report": report, "cells": cells(0.1, 0.2)},
+            {**mlx, "mega": False, "status": BS.OK, "report": report, "cells": cells(0.5, 0.5)},  # the nomega variant
             {
-                "model": "a-1b",
-                "repo": "Org/A-1B",
-                "tool": "llama-cpp",
-                "config": "llama-cpp-gpu",
-                "device_regime": "gpu",
-                "dtype": "bf16",
-                "status": "ok",
-                "device": "cuda",
-                "cells": cells(None, 0.05),
+                "model": "a-1b", "repo": "Org/A-1B", "type": "qwen3", "tool": "llama-cpp", "device": BD.GPU,
+                "dtype": BT.BF16, "status": BS.OK, "cells": cells(None, 0.05),
             },
-            {
-                "model": "a-1b",
-                "repo": "Org/A-1B",
-                "tool": "airllm",
-                "config": "airllm-cpu",
-                "device_regime": "cpu",
-                "dtype": "bf16",
-                "status": "failed",
-                "error": "Boom: new",
-            },
+            {**airllm, "status": BS.DNR, "reason": "Boom: new", "seconds": 1.0},
         ],
     }
-    record = {
+    record = {  # a standalone `btb bench` JSONL: the slimmed record, device and dtype off its placement
         "label": "x",
         "path": "/m/B-7B",
         "model": "Org/B-7B",
-        "tool": None,
-        "dtype": "fp32",
-        "device": "cpu",
-        "report": None,
+        "report": {"placement": {"host": [0, 1], "compute_dtype": "fp32"}},
         "cells": cells(None, 1.0, vram=0),
     }
     paths = []
@@ -609,41 +750,33 @@ def test_charts_draw_one_svg_per_model_from_the_run_docs(tmp_path: Path) -> None
         paths.append(str(tmp_path / name))
     (tmp_path / "run.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
     paths.append(str(tmp_path / "run.jsonl"))
-    readme = tmp_path / "README.md"
-    text = (
-        "## Benchmarks (Windows)\n\nintro\n\n| model | engine | device | how it runs | tok/s | pass | first | RAM | VRAM |\n|---|---|---|---|---|---|---|---|---|\n| W | btb | GPU | x | 1 / 2 / 3 | 1.00 | 0.1 s | 1 GB | 1 GB |\n\n"
-        "## Benchmarks (Apple silicon)\n\nintro\n\n| model | engine | device | how it runs | tok/s | pass | first | RAM | MLX |\n|---|---|---|---|---|---|---|---|---|\n| M | btb | MLX | x | 1 / 2 / 3 | 1.00 | 0.1 s | 1 GB | 1 GB |\n\n## Tests\n"
-    )
-    readme.write_text(text, encoding="utf-8")
 
     loaded = charts.load(paths, specs_for_jsonl=specs)
     assert list(loaded) == ["Apple silicon"]
     machine, rows = loaded["Apple silicon"]
-    assert machine.line == "Apple M3 Pro, 36 GB unified memory, macOS 26.6"
+    assert machine.line == "Apple M3 Pro, 36 GB unified memory, macOS 26"
     a = [r for r in rows if r.model == "Org/A-1B"]
     assert [(r.engine, r.device, r.variant, r.note) for r in a] == [
         ("btb", "MLX", "", ""),
-        ("btb", "MLX", "the head on the CPU", ""),  # a variant is its own row
-        ("AirLLM", "CPU", "", "no result"),  # the older failure dropped, the error's text (the log's tail) never shown
+        ("btb", "MLX", "no megakernel", ""),  # a nomega cell is its own row, the off-default axis its variant
+        ("AirLLM", "CPU", "", "DNR: Boom: new"),  # the older failure dropped; the state and its reason are shown
         ("llama.cpp", "GPU", "", ""),
     ]
+    # the megakernel variant is btb's own MLX path; a rival on MLX never carries a "no megakernel" note
+    assert charts._variant({"tool": None, "device": BD.MLX, "dtype": BT.BF16, "type": "qwen3", "mega": False}) == "no megakernel"
+    assert charts._variant({"tool": "mlx-lm", "device": BD.MLX, "dtype": BT.BF16, "type": "qwen3", "mega": False}) == ""
     assert a[0].speeds == [10.0, 10.0, 10.0]  # as it runs: the newer run's 0.1 s/token, not the older run's 0.2
-    assert a[0].how == "bf16, 2 host, 2 mlx, head host" and a[0].per_pass == [1.2, 1.2, 1.2]
-    assert a[1].how == "bf16, 2 host, 2 mlx, head host, the head on the CPU" and a[1].speeds == [2.0, 2.0, 2.0]
+    assert a[0].how == "bf16, 2 layers on the GPU" and a[0].per_pass == [1.2, 1.2, 1.2]
+    assert a[1].how == "bf16, 2 layers on the GPU, no megakernel" and a[1].speeds == [2.0, 2.0, 2.0]
     assert a[3].how == "bf16" and a[3].speeds == [20.0, 20.0, 20.0] and a[3].per_pass == []
     b = [r for r in rows if r.model == "Org/B-7B"]
-    assert [(r.engine, r.device, r.how, r.speeds) for r in b] == [("btb", "CPU", "fp32", [1.0, 1.0, 1.0])]
+    assert [(r.engine, r.device, r.how, r.speeds) for r in b] == [("btb", "CPU", "fp32, 2 layers on the CPU", [1.0, 1.0, 1.0])]
 
-    made = charts.write(paths, str(tmp_path / "out"), str(readme), specs_for_jsonl=specs)
+    made = charts.write(paths, str(tmp_path / "out"), specs_for_jsonl=specs)
     assert [m for m, _ in made["Apple silicon"]] == ["Org/A-1B", "Org/B-7B"]
     svg = (tmp_path / "out" / "apple-silicon-org-a-1b.svg").read_text(encoding="utf-8")
-    assert svg.count("<rect") == 1 + 3 + 3 * 3 and "no result" in svg and "Boom" not in svg and "MLX 9.0 GB" in svg
-    once = charts.embed(text, made)
-    assert (
-        once.index("![Org/A-1B on Apple silicon]")
-        < once.index("![Org/B-7B on Apple silicon]")
-        < once.index("<details>")
-    )
-    assert once.index("<details>") < once.index("| M |") < once.index("</details>") < once.index("## Tests")
-    assert once.split("## Benchmarks (Apple silicon)")[0] == text.split("## Benchmarks (Apple silicon)")[0]
-    assert charts.embed(once, made) == once
+    # the dark ground rect, the legend panel + its 3 engine swatches, then 3 data rows of a track and a bar per
+    # length; the DNR note row draws none
+    assert svg.count("<rect") == 1 + 1 + 3 + 3 * 6
+    assert "DNR: Boom: new" in svg  # the note row draws the state and its reason
+    assert "MLX <tspan" in svg and "9.0 GB" in svg  # the MLX peak: a muted label with an inked value

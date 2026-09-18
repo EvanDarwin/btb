@@ -5,6 +5,7 @@ snapshot."""
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import json
 import os
@@ -12,6 +13,7 @@ import re
 import struct
 import sys
 from collections.abc import Iterable
+from enum import StrEnum
 from typing import Any, TypedDict
 
 from .kinds import Json
@@ -125,6 +127,28 @@ class ModelEntry(TypedDict):
     packed: bool
 
 
+class ModelFormat(StrEnum):
+    """How a model's weights are stored on disk: an HF safetensors checkpoint, a llama.cpp GGUF file, or btb's
+    own 12-bit store (`btb pack`)."""
+
+    SAFETENSORS = "safetensors"
+    GGUF = "gguf"
+    PACK12 = PACK12_FORMAT
+
+
+class ModelInfo(TypedDict, total=False):
+    """How a model is stored, beside its ModelEntry: the on-disk format, the precision the weights are kept at,
+    the parameter count and the trained context length. Read from the files once - a GGUF's metadata, a
+    checkpoint's config and shard headers - so a bench result (or /v1/models) says exactly what ran, quant and
+    all. Every field is best effort, left out when the files are silent."""
+
+    format: ModelFormat
+    quant: str  # the storage precision: a GGUF's file type (Q4_K_M, BF16), a checkpoint's dtype (bf16), 12-bit
+    params: int  # total parameters, embeddings included
+    context: int  # the trained context length, in tokens
+    bytes: int  # weight bytes on disk
+
+
 def serve_name(raw: str | None) -> str:
     """The Ollama/OpenAI id for a model: its name lowercased with anything but [A-Za-z0-9_.-] turned to a dash
     (so `Qwen/Qwen3.5-4B` -> `qwen3.5-4b`). One rule everywhere, so a name from /api/tags round-trips back."""
@@ -234,6 +258,92 @@ def _model_bytes(d: str) -> int:
     if is_gguf(d):
         return os.path.getsize(d) if os.path.isfile(d) else 0
     return sum(os.path.getsize(f) for f in glob.glob(os.path.join(d, "*.safetensors")) if os.path.isfile(f))
+
+
+# transformers' dtype names to the short form the bench and the config speak (an unknown one is kept as it is)
+_DTYPE_LABEL = {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32"}
+
+
+def _safetensors_params(d: str, tied: bool = False) -> int:
+    """Total parameters of a checkpoint, summed from each shard's header (its leading JSON, so the tensors are
+    never read); 0 when none can be read. A tied head is the embedding matrix stored again, so it is left out
+    when `tied` (matching a GGUF, which keeps one copy). A packed layout (gpt-oss' MXFP4 experts) counts stored
+    elements, so the count is a lower bound there."""
+    total = 0
+    for f in glob.glob(os.path.join(d, "*.safetensors")):
+        try:
+            with open(f, "rb") as fh:
+                n = int.from_bytes(fh.read(8), "little")
+                header = json.loads(fh.read(n))
+        except Exception:
+            continue
+        for name, spec in header.items():
+            if name == "__metadata__" or not isinstance(spec, dict):
+                continue
+            if tied and name.endswith("lm_head.weight"):
+                continue
+            count = 1
+            for dim in spec.get("shape") or ():
+                count *= int(dim)
+            total += count
+    return total
+
+
+def _gguf_model_info(path: str) -> ModelInfo:
+    """A GGUF file's storage description from its metadata (the file type and context length) and tensor index
+    (the parameter count, off the logical shapes); an empty info when the file cannot be read."""
+    try:
+        g = gguf_lib()
+        r = g.GGUFReader(path)
+    except Exception:
+        return ModelInfo()
+    info = ModelInfo()
+    ft = r.get_field("general.file_type")
+    if ft is not None:
+        with contextlib.suppress(Exception):
+            info["quant"] = g.LlamaFileType(int(ft.contents())).name.removeprefix("MOSTLY_").removeprefix("ALL_")
+    arch = r.get_field("general.architecture")
+    ctx = r.get_field(f"{arch.contents()}.context_length") if arch is not None else None
+    if ctx is not None:
+        info["context"] = int(ctx.contents())
+    try:
+        params = 0
+        for t in r.tensors:
+            n = 1
+            for dim in t.shape:
+                n *= int(dim)
+            params += n
+        if params:
+            info["params"] = params
+    except Exception:
+        pass
+    return info
+
+
+def model_info(path: str) -> ModelInfo:
+    """The storage description of a resolved model path: its format, the precision the weights are kept at, its
+    parameter count and context length. A GGUF from its metadata; a checkpoint from its config and shard
+    headers; a 12-bit model (`btb pack`) marked as such, its parameters left to the parent it reads from."""
+    if is_gguf(path):
+        info = _gguf_model_info(path)
+        info["format"] = ModelFormat.GGUF
+        info["bytes"] = _model_bytes(path)
+        return info
+    packed = is_packed(path)
+    info = ModelInfo(format=ModelFormat.PACK12 if packed else ModelFormat.SAFETENSORS, bytes=_model_bytes(path))
+    c = _config(path) or {}
+    tc = c.get("text_config")
+    inner: Json = tc if isinstance(tc, dict) else c
+    if packed:
+        info["quant"] = "12-bit"
+    elif dt := str(inner.get("torch_dtype") or c.get("torch_dtype") or ""):
+        info["quant"] = _DTYPE_LABEL.get(dt, dt)
+    if ctx := (inner.get("max_position_embeddings") or c.get("max_position_embeddings")):
+        info["context"] = int(ctx)
+    tied = bool(inner.get("tie_word_embeddings") or c.get("tie_word_embeddings"))
+    if not packed and (params := _safetensors_params(path, tied)):
+        info["params"] = params
+    return info
 
 
 def _cache_model_dirs() -> list[tuple[str, str]]:

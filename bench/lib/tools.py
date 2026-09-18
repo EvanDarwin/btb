@@ -72,9 +72,19 @@ class BenchTool:
         self.opts = opts
 
     @classmethod
-    def cannot(cls, regime: str, model_type: str | None, cuda: bool) -> str | None:
+    def cannot(
+        cls,
+        regime: str,
+        model_type: str | None,
+        cuda: bool,
+        gguf: bool,
+        arch: str | None = None,
+        supported: frozenset[str] | None = None,
+    ) -> str | None:
         """
-        Why a regime is a planned skip for a model here (None: it runs)
+        Why a regime is a planned skip for this model here (None: it runs). `gguf` marks a GGUF file (only the
+        engines that read it run); `arch` is the checkpoint's architectures[0] and `supported` llama.cpp's
+        convertible set, both read by the tools that need them
         """
         return None
 
@@ -110,6 +120,18 @@ class BenchMlxLm(BenchTool):
     name = "mlx-lm"
     module = "mlx_lm"
     regimes = (("mlx", ()),)  # unified memory, one regime
+
+    @classmethod
+    def cannot(
+        cls,
+        regime: str,
+        model_type: str | None,
+        cuda: bool,
+        gguf: bool,
+        arch: str | None = None,
+        supported: frozenset[str] | None = None,
+    ) -> str | None:
+        return "mlx-lm loads MLX or HF weights, not a GGUF" if gguf else None
 
     def load(self) -> None:
         from mlx_lm import load
@@ -149,7 +171,17 @@ class BenchAirLLM(BenchTool):
     regimes = (("gpu", ("--device", "cuda")), ("cpu", ("--device", "cpu")))
 
     @classmethod
-    def cannot(cls, regime: str, model_type: str | None, cuda: bool) -> str | None:
+    def cannot(
+        cls,
+        regime: str,
+        model_type: str | None,
+        cuda: bool,
+        gguf: bool,
+        arch: str | None = None,
+        supported: frozenset[str] | None = None,
+    ) -> str | None:
+        if gguf:
+            return "AirLLM loads an HF checkpoint, not a GGUF"
         if model_type == "gpt_oss":
             return "AirLLM's path dequantizes the MXFP4 experts (240 GB)"
         if regime == "gpu" and not cuda:
@@ -287,6 +319,28 @@ class BenchLlamaCpp(BenchTool):
     module = "llama_cpp"
     regimes = (("gpu", ("--n-gpu-layers", "-1")), ("cpu", ("--n-gpu-layers", "0")))
 
+    @classmethod
+    def cannot(
+        cls,
+        regime: str,
+        model_type: str | None,
+        cuda: bool,
+        gguf: bool,
+        arch: str | None = None,
+        supported: frozenset[str] | None = None,
+    ) -> str | None:
+        # llama.cpp's runtime loads a GGUF; a checkpoint runs only once converted, and only when its
+        # architecture is one the converter knows. The matrix never converts on its own, so a checkpoint is
+        # always a skip - but the reason tells the truth: convertible, an arch the converter lacks, or (no
+        # checkout to ask) simply that a GGUF is needed
+        if gguf:
+            return None
+        if supported is None:
+            return "llama.cpp needs a GGUF; run bench/prepare.py, then convert this checkpoint"
+        if arch and arch in supported:
+            return f"llama.cpp converts {arch}, but not on its own - run bench/prepare.py, then convert it to a GGUF"
+        return f"llama.cpp's converter has no entry for {arch or 'this architecture'}"
+
     def load(self) -> None:
         add_cuda_dll_dirs()
         from llama_cpp import Llama
@@ -299,17 +353,22 @@ class BenchLlamaCpp(BenchTool):
         gguf_type = o.get("gguf_type") or "bf16"
         self.made = False
         gguf = o.get("gguf")
-        if gguf and os.path.exists(gguf):
-            self.gguf_path: str = gguf
+        if path.lower().endswith(".gguf"):
+            # the model already is a GGUF: run the file as it is, tokenizer and chat template off the file itself
+            self.gguf_path: str = path
+            self.hf_tok = AutoTokenizer.from_pretrained(os.path.dirname(path), gguf_file=os.path.basename(path))
         else:
-            base = os.path.basename(os.path.normpath(path))
-            gdir = o.get("gguf_dir") or scratch_dir("BTB_GGUF_DIR", r"F:\_ggufcache")
-            self.gguf_path = os.path.join(gdir, f"{base}.{gguf_type}.gguf")
-            if not os.path.exists(self.gguf_path):
-                convert_gguf(path, self.gguf_path, gguf_type, llama_cpp_dir, log)
-                self.made = True
+            if gguf and os.path.exists(gguf):
+                self.gguf_path = gguf
+            else:
+                base = os.path.basename(os.path.normpath(path))
+                gdir = o.get("gguf_dir") or scratch_dir("BTB_GGUF_DIR", r"F:\_ggufcache")
+                self.gguf_path = os.path.join(gdir, f"{base}.{gguf_type}.gguf")
+                if not os.path.exists(self.gguf_path):
+                    convert_gguf(path, self.gguf_path, gguf_type, llama_cpp_dir, log)
+                    self.made = True
+            self.hf_tok = AutoTokenizer.from_pretrained(path)
         self.llm: Any = None
-        self.hf_tok = AutoTokenizer.from_pretrained(path)
         self.ngl = int(o.get("ngl", -1))
         n_ctx = max(2048, 1024 + int(o.get("max_new", 1024)) + 256)
         self.vram_base = gpu_used_gb()
@@ -393,7 +452,7 @@ def bench(tool: BenchTool, prompts: Sequence[str], counts: Sequence[int], budget
             BenchCell(
                 new=n,
                 first_s=sum(firsts) / k,
-                greedy_s_tok=sum(rates) / k,
+                base_s_tok=sum(rates) / k,
                 spec_s_tok=None,
                 tokens_per_pass=1.0,
                 identical="",
