@@ -568,6 +568,7 @@ def test_a_write_that_raises_mid_stream_stops_the_model_before_the_lock_goes() -
 
     eng = _Slow()
     h = Handler.__new__(Handler)
+    h.command = "POST"  # what parse_request sets on a real handler: the streams answer a POST
 
     def emit(delta: str, kind: str) -> bool:
         raise RuntimeError("the callback failed")

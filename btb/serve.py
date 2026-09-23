@@ -581,7 +581,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Connection", "close")
             self.end_headers()
-            self.wfile.write(body)
+            self._send_body(body)
             return
         self._json(e.code, {"error": str(e)})
 
@@ -595,7 +595,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        self._send_body(body)
+
+    def _send_body(self, data: bytes) -> None:
+        """the one place a response body is written; a HEAD's is dropped (RFC 9110 9.3.2)"""
+        if self.command != "HEAD":
+            self.wfile.write(data)
 
     def _body(self) -> Any:
         """the JSON body: a missing or bad Content-Length is a 400, one past MAX_BODY a 413 (before a byte is
@@ -627,7 +632,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _write(self, s: str) -> bool:
         try:
-            self.wfile.write(s.encode("utf-8"))
+            self._send_body(s.encode("utf-8"))
             self.wfile.flush()
             return True
         except OSError:  # the client is gone, or stopped reading (the socket timeout is an OSError too)
@@ -750,15 +755,9 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "not found"})
 
     def do_HEAD(self) -> None:
-        try:
-            self._guard()
-        except _Reject as e:
-            self.send_response(e.code)
-            self.end_headers()
-            return
-        self.send_response(200 if self._route() in ("/", "/health") else 404)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        """GET's answer without its body: `_send_body` drops the bytes, so the status and every header, the
+        Content-Length GET would send included, are GET's own"""
+        self.do_GET()
 
     def do_POST(self) -> None:
         r = self._route()

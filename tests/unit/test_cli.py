@@ -8,6 +8,7 @@ import argparse
 import json
 import os
 import re
+import socket
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -93,6 +94,42 @@ def test_server_routes_without_a_model() -> None:
         assert code == 404 and "error" in body
         code, body = request_json(base, "POST", "/api/pull", {"name": "x"})
         assert code == 404 and "not supported" in body["error"]
+    finally:
+        server.close()
+
+
+def _raw(host: str, port: int, method: str, path: str, extra: str = "") -> tuple[int, dict[str, str], bytes]:
+    """one request over a raw socket, read to the close: (status, the headers lower-cased, every byte after
+    them). http.client never reads a HEAD response's body, so it cannot show that one was sent."""
+    with socket.create_connection((host, port), timeout=10) as s:
+        s.sendall(f"{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\n{extra}Connection: close\r\n\r\n".encode())
+        raw = b""
+        while chunk := s.recv(65536):
+            raw += chunk
+    head, _, rest = raw.partition(b"\r\n\r\n")
+    status_line, *lines = head.decode("latin-1").split("\r\n")
+    fields = (line.split(":", 1) for line in lines)
+    return int(status_line.split()[1]), {k.strip().lower(): v.strip() for k, v in fields}, rest
+
+
+def test_server_head_is_get_without_the_body() -> None:
+    """HEAD on every route it dispatches, on a path nothing serves, and on a request the guard refuses: GET's
+    status and headers (Content-Length the GET body's, as RFC 9110 8.6 requires) and not one byte of body"""
+    from btb.serve import start
+    from tests.cert.serve_ops import dispatched_routes
+
+    paths = sorted(p for m, p in dispatched_routes() if m == "HEAD")
+    assert paths, "the server dispatches no HEAD route"
+    cases = [(p, "") for p in [*paths, "/no-such-route"]] + [("/health", "Origin: http://example.com\r\n")]
+    server = start(None, host="127.0.0.1", port=0, pattern="^$").start()
+    try:
+        for path, extra in cases:
+            status_get, hs_get, body = _raw(server.host, server.port, "GET", path, extra)
+            status, hs, rest = _raw(server.host, server.port, "HEAD", path, extra)
+            assert int(hs_get["content-length"]) == len(body) > 0, (path, hs_get)
+            assert status == status_get and rest == b"", (path, status, rest)
+            hs.pop("date"), hs_get.pop("date")  # the clock may tick between the two requests
+            assert hs == hs_get, (path, hs, hs_get)
     finally:
         server.close()
 

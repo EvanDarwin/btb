@@ -13,7 +13,7 @@ from . import serve_ops
 @pytest.mark.cert_gap
 def test_no_gaps() -> None:
     """the full gate: handler/registry drift AND a route with no test both fail here - a route reachable but
-    unexercised (e.g. the HEAD liveness probe, /api/ps) is uncertified and gates until it gets a test."""
+    unexercised is uncertified and gates until it gets a test."""
     assert serve_ops.gaps() == [], serve_ops.gaps()
 
 
@@ -44,3 +44,14 @@ def test_a_new_verb_is_parsed_from_the_handler() -> None:
     its routes into the checked set instead of dispatching requests no row claims."""
     assert serve_ops.handler_methods(_SYNTHETIC) == {"do_GET": "GET", "do_PUT": "PUT"}
     assert set(serve_ops.handler_methods(serve_ops._serve_source())) >= {"do_GET", "do_HEAD", "do_POST"}
+
+
+def test_a_handler_answering_through_another_dispatches_its_routes() -> None:
+    """do_HEAD answering through `self.do_GET()` reaches every GET route, so each needs a HEAD row too"""
+    src = _SYNTHETIC + "\n    def do_HEAD(self) -> None:\n        self.do_GET()\n"
+    assert serve_ops.dispatched_routes(src) == {
+        ("GET", "/health"),
+        ("HEAD", "/health"),
+        ("PUT", "/v1/files"),
+        ("PUT", "/api/blobs"),
+    }
