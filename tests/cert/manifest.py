@@ -29,7 +29,7 @@ import argparse
 import os
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import StrEnum
 
 from gguf import GGMLQuantizationType as GQ
@@ -745,39 +745,67 @@ def report() -> int:
     return 0
 
 
+@dataclass(frozen=True)
+class Blocking:
+    """everything the manifest gate fails on, structured once so `check()` and the PR comment
+    (tests/cert/comment.py) read the same set. Empty in every field means the manifest is certified."""
+
+    problems: list[str]  # core family drift and spec totality
+    reasonless: list[Cell]  # "did not run" with no reason: a hidden gap
+    gaps: list[tuple[Missing, int, list[str]]]  # missing_items(): kind, cell count, families
+    unproven: list[str]  # runnable ids no receipt banks (the cross-machine coverage gate's set)
+    orphans: list[str]
+    untagged: tuple[Fork, ...]
+    uncertified: dict[PassTag, str]  # FORK_NOTES: forks the grid does not reach, each with why
+    unnoted: list[PassTag]
+    stale: list[PassTag]
+    uncached: list[Target]  # only under --strict
+
+    def __bool__(self) -> bool:
+        return any(getattr(self, f.name) for f in fields(self))
+
+
+def blocking(strict: bool = False) -> Blocking:
+    cells = compute_cells()
+    return Blocking(
+        problems=core.consistency_problems() + spec.totality_problems(),
+        reasonless=[c for c in cells if c.verdict is Verdict.DNR and not c.reason],
+        gaps=missing_items(),
+        unproven=sorted(runnable_ids() - receipt.merged()),
+        orphans=fixture_gaps(),
+        untagged=UNTAGGED_FORKS,
+        uncertified=dict(FORK_NOTES),
+        unnoted=unnoted_tags(),
+        stale=noted_but_asserted(),
+        uncached=[t for t, ok in target_status() if not ok] if strict else [],
+    )
+
+
 def check(strict: bool = False) -> int:
     """the blocking gate: nonzero while any real path is uncovered. It is MEANT to fail - a gap, a cell no
     receipt proves, an unexplained fork and a stray fixture are all things to close, never to soften."""
-    cells = compute_cells()
-    problems = core.consistency_problems() + spec.totality_problems()
-    reasonless = [c for c in cells if c.verdict is Verdict.DNR and not c.reason]
-    gaps = sorted({(c.kind.value, c.storage.value) for c in cells if c.verdict is Verdict.GAP})
-    unproven = sorted({i for c in cells if c.verdict is Verdict.BOUND for i in c.ids} - receipt.merged())
-    for p in problems:
+    b = blocking(strict)
+    for p in b.problems:
         print(f"FAIL core drift: {p}", file=sys.stderr)
-    if reasonless:
-        print(f"FAIL: {len(reasonless)} DNR cells without a reason", file=sys.stderr)
-    for kind, storage in gaps:
-        print(f"FAIL gap: {kind} :: {storage}", file=sys.stderr)
-    for cid in unproven:
+    if b.reasonless:
+        print(f"FAIL: {len(b.reasonless)} DNR cells without a reason", file=sys.stderr)
+    for kind, n, fams in b.gaps:
+        print(f"FAIL gap: {kind.value} - {n} cells ({', '.join(fams)})", file=sys.stderr)
+    for cid in b.unproven:
         print(f"FAIL unproven: {cid} is runnable but no receipt banks it", file=sys.stderr)
-    orphans = fixture_gaps()
-    for name in orphans:
+    for name in b.orphans:
         print(f"FAIL orphan fixture: {name} is on disk but no cell binds it", file=sys.stderr)
-    for fork in UNTAGGED_FORKS:
+    for fork in b.untagged:
         print(f"FAIL untagged fork: {fork.name} ({fork.where}) - {fork.why}", file=sys.stderr)
-    for tag, note in FORK_NOTES.items():
+    for tag, note in b.uncertified.items():
         print(f"FAIL uncertified fork: {tag.value} - {note}", file=sys.stderr)
-    for tag in unnoted_tags():
+    for tag in b.unnoted:
         print(f"FAIL unexplained fork: {tag.value} is asserted by no sub-path and noted nowhere", file=sys.stderr)
-    for tag in noted_but_asserted():
+    for tag in b.stale:
         print(f"FAIL stale fork note: {tag.value} is asserted by a sub-path but still in FORK_NOTES", file=sys.stderr)
-    missing = [t for t, ok in target_status() if not ok] if strict else []
-    for t in missing:
+    for t in b.uncached:
         print(f"FAIL prereq (strict): {t.spec} not cached", file=sys.stderr)
-    return (
-        1 if (problems or reasonless or gaps or unproven or orphans or UNTAGGED_FORKS or FORK_NOTES or missing) else 0
-    )
+    return 1 if b else 0
 
 
 def main(argv: list[str] | None = None) -> int:
