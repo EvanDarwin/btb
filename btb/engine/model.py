@@ -512,11 +512,14 @@ class StreamedTextModel(
     def _family_tensor_names(self, cfg: Any) -> list[str]:
         """every tensor the family's layers, embedding, norm and head are loaded from, by its HF name: what a
         GGUF file's tensors are matched against"""
+        per: dict[str, list[str]] = {}
         with torch.device("meta"):
-            layer = self.fam.layer(cfg, 0)
-        per = [n for n, _ in layer.named_parameters()] + [n for n, _ in layer.named_buffers()]
+            for i, kind in enumerate(self.layer_types):  # a hybrid's layer types hold different tensors
+                if kind not in per:
+                    layer = self.fam.layer(cfg, i)
+                    per[kind] = [n for n, _ in layer.named_parameters()] + [n for n, _ in layer.named_buffers()]
         names = ["model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"]
-        return names + [f"model.layers.{i}.{n}" for i in range(self.L) for n in per]
+        return names + [f"model.layers.{i}.{n}" for i, kind in enumerate(self.layer_types) for n in per[kind]]
 
     def close(self) -> None:
         """Stop any decode in flight and release the model's memory on every tier; safe to call twice. The engine

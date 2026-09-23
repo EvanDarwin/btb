@@ -43,6 +43,7 @@ from tests.helpers import (
 
 if TYPE_CHECKING:
     import torch
+    from gguf import GGUFWriter
     from transformers import PretrainedConfig
     from transformers._typing import GenerativePreTrainedModel
 
@@ -105,6 +106,8 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
     from gguf import (
         MODEL_ARCH,
         MODEL_ARCH_NAMES,
+        MODEL_TENSOR,
+        TENSOR_NAMES,
         GGMLQuantizationType,
         GGUFWriter,
         RopeScalingType,
@@ -116,7 +119,12 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
     from btb.mxfp4 import hf_to_ggml
 
     cfg = json.load(open(os.path.join(model_dir, "config.json"), encoding="utf-8"))
-    arch = {"qwen3": MODEL_ARCH.QWEN3, "phi3": MODEL_ARCH.PHI3, "gpt_oss": MODEL_ARCH.GPT_OSS}[cfg["model_type"]]
+    arch = {
+        "qwen3": MODEL_ARCH.QWEN3,
+        "phi3": MODEL_ARCH.PHI3,
+        "gpt_oss": MODEL_ARCH.GPT_OSS,
+        "qwen3_5_text": MODEL_ARCH.QWEN35,
+    }[cfg["model_type"]]
     L = int(cfg["num_hidden_layers"])
     heads = int(cfg["num_attention_heads"])
     head_dim = int(cfg.get("head_dim") or cfg["hidden_size"] // heads)
@@ -145,6 +153,8 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
         w.add_rope_scaling_orig_ctx_len(int(scaling["original_max_position_embeddings"]))
         w.add_rope_scaling_yarn_beta_fast(float(scaling.get("beta_fast", 32.0)))
         w.add_rope_scaling_yarn_beta_slow(float(scaling.get("beta_slow", 1.0)))
+    if arch is MODEL_ARCH.QWEN35:
+        _qwen35_metadata(w, cfg, head_dim)
     tok = json.load(open(os.path.join(model_dir, "tokenizer.json"), encoding="utf-8"))
     vocab = tok["model"]["vocab"]
     tokens = [t for t, _ in sorted(vocab.items(), key=lambda kv: kv[1])]
@@ -164,13 +174,17 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
     if tcfg.get("chat_template"):
         w.add_chat_template(tcfg["chat_template"])
     state = safetensors_state(model_dir)
+    if arch is MODEL_ARCH.QWEN35:
+        state = _qwen35_converted(cfg, state)
     tmap = TensorNameMap(arch, L)
     qtype = {
         "f16": None,
         "bf16": GGMLQuantizationType.BF16,
         "q8_0": GGMLQuantizationType.Q8_0,
         "q4_0": GGMLQuantizationType.Q4_0,
+        "q4_1": GGMLQuantizationType.Q4_1,
     }[outtype]
+    conv = {TENSOR_NAMES[MODEL_TENSOR.SSM_CONV1D].format(bid=i) for i in range(L)}  # llama.cpp keeps these f32
     for name in sorted(state):
         if ".mlp.experts." in name:
             continue  # the MXFP4 experts below, in ggml's layout
@@ -178,11 +192,13 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
         gname = tmap.get_name(base) if suffix in ("weight", "bias") else tmap.get_name(name)
         if gname is None:
             raise RuntimeError(f"no GGUF name for {name}")
-        if suffix not in ("weight", "bias"):  # a bare parameter (gpt-oss's attention sinks)
+        if suffix not in ("weight", "bias"):  # a bare parameter (gpt-oss's attention sinks, Qwen3.5's A_log)
             w.add_tensor(gname, state[name].float().numpy())
             continue
         arr = state[name].float().numpy()
-        if arr.ndim == 2 and qtype is not None and arr.shape[-1] % 32 == 0:
+        if gname in conv:
+            w.add_tensor(f"{gname}.{suffix}", arr.astype(np.float32))
+        elif arr.ndim == 2 and qtype is not None and arr.shape[-1] % 32 == 0:
             w.add_tensor(f"{gname}.{suffix}", quantize(arr, qtype), raw_dtype=qtype)
         elif arr.ndim == 2:
             w.add_tensor(f"{gname}.{suffix}", arr.astype(np.float16))  # f16: bf16's small values lose bits here
@@ -208,6 +224,62 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
     w.close()
 
 
+def _qwen35_metadata(w: GGUFWriter, cfg: Json, head_dim: int) -> None:
+    """the keys llama.cpp's Qwen3.5 converter adds (Qwen3NextModel.set_gguf_parameters): the linear attention's
+    widths, the layer pattern and the rotary's width and MRoPE sections (padded to four)"""
+    w.add_ssm_conv_kernel(int(cfg["linear_conv_kernel_dim"]))
+    w.add_ssm_state_size(int(cfg["linear_key_head_dim"]))
+    w.add_ssm_group_count(int(cfg["linear_num_key_heads"]))
+    w.add_ssm_time_step_rank(int(cfg["linear_num_value_heads"]))
+    w.add_ssm_inner_size(int(cfg["linear_value_head_dim"]) * int(cfg["linear_num_value_heads"]))
+    w.add_full_attention_interval(int(cfg.get("full_attention_interval", 4)))
+    rope = cfg.get("rope_parameters") or {}
+    w.add_rope_dimension_count(int(head_dim * float(rope.get("partial_rotary_factor", 0.25))))
+    sections = [int(x) for x in rope.get("mrope_section", [11, 11, 10])]
+    w.add_rope_dimension_sections((sections + [0] * 4)[:4])
+
+
+def _qwen35_converted(cfg: Json, state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """the checkpoint as llama.cpp's Qwen3.5 converter hands it to the writer (Qwen3_5TextModel.modify_tensors,
+    in float32 as it runs): the MTP head left out (its --no-mtp), the value heads reordered from grouped by key
+    head to tiled, A_log as -exp(A_log), dt_bias renamed dt_proj.bias, conv1d squeezed, the norms as 1 + w"""
+    import torch
+
+    nk, nv = int(cfg["linear_num_key_heads"]), int(cfg["linear_num_value_heads"])
+    hk, hv = int(cfg["linear_key_head_dim"]), int(cfg["linear_value_head_dim"])
+
+    def tiled(t: torch.Tensor, dim: int, width: int) -> torch.Tensor:  # _reorder_v_heads
+        if nk == nv:
+            return t
+        shape = list(t.shape)
+        t = t.reshape(*shape[:dim], nk, nv // nk, width, *shape[dim + 1 :])
+        return t.transpose(dim, dim + 1).contiguous().reshape(shape)
+
+    out: dict[str, torch.Tensor] = {}
+    qk = 2 * nk * hk
+    for name, t in state.items():
+        if name.startswith("mtp."):
+            continue
+        t = t.float()
+        if ".in_proj_qkv." in name or ".conv1d." in name:
+            t = t.squeeze() if ".conv1d." in name else t
+            t = torch.cat([t[:qk], tiled(t[qk:], 0, hv)])
+        elif ".in_proj_z." in name:
+            t = tiled(t, 0, hv)
+        elif ".in_proj_a." in name or ".in_proj_b." in name or name.endswith((".A_log", ".dt_bias")):
+            t = tiled(t, 0, 1)
+        elif ".out_proj." in name:
+            t = tiled(t, 1, hv)
+        if name.endswith(".A_log"):
+            t = -torch.exp(t)
+        elif name.endswith(".dt_bias"):
+            name = name.removesuffix(".dt_bias") + ".dt_proj.bias"
+        elif name.endswith("norm.weight") and not name.endswith("linear_attn.norm.weight"):
+            t = t + 1
+        out[name] = t
+    return out
+
+
 def make_gguf() -> None:
     """the GGUF fixtures: tiny_qwen3 in every storage type the reader is tested on, tiny_phi3 as f16 (its fused
     projections exercise the table's other layout)"""
@@ -220,7 +292,20 @@ def make_gguf() -> None:
     for t in ("bf16", "q4_0", "q8_0"):
         write_gguf(os.path.join(FIXTURES, "tiny_phi3"), os.path.join(out, f"tiny_phi3-{t}.gguf"), t)
     write_gguf(os.path.join(FIXTURES, "tiny_gpt_oss"), os.path.join(out, "tiny_gpt_oss-mxfp4.gguf"), "bf16")
+    make_gguf_q35()
     print("[fixture] gguf twins regenerated")
+
+
+def make_gguf_q35() -> None:
+    """tiny_q35 in every float and affine type (the storage cells gguf-py can write a twin for), its linear
+    attention through the converter's rewrites the reader must invert"""
+    from btb.kinds import QuantClass, quants_of
+
+    out = os.path.join(FIXTURES, "gguf")
+    os.makedirs(out, exist_ok=True)
+    for q in (*quants_of(QuantClass.FLOAT), *quants_of(QuantClass.AFFINE)):
+        t = q.value.lower()
+        write_gguf(os.path.join(FIXTURES, "tiny_q35"), os.path.join(out, f"tiny_q35-{t}.gguf"), t)
 
 
 # --- weight builders: a tiny random checkpoint per family in its own shape ---------------------------------
@@ -677,6 +762,9 @@ def make(name: str) -> None:
 
         for stem in spec.FIXTURE_STEM.values():
             write_twins(os.path.join(FIXTURES, stem))
+        return
+    if name == "gguf_q35":
+        make_gguf_q35()
         return
     base = os.path.join(FIXTURES, f"tiny_{name}")
     if name == "qwen3":

@@ -79,7 +79,12 @@ GGUF_EXT = ".gguf"
 # btb's families by their llama.cpp architecture name (general.architecture) -> the ModelType the loader assigns.
 # The keys are llama.cpp's arch strings (its vocabulary, e.g. "gpt-oss" hyphenated); the values are ModelType so
 # a GGUF target is tied to the enum, not a loose string (consistency_problems checks each is served).
-ARCH_MODEL_TYPES = {"qwen3": ModelType.QWEN3, "phi3": ModelType.PHI3, "gpt-oss": ModelType.GPT_OSS}
+ARCH_MODEL_TYPES = {
+    "qwen3": ModelType.QWEN3,
+    "phi3": ModelType.PHI3,
+    "gpt-oss": ModelType.GPT_OSS,
+    "qwen35": ModelType.QWEN3_5_TEXT,
+}
 # the bits an integer takes in each type the affine decoder reads; the only part of the table below that no
 # declaration derives
 _AFFINE_BITS = {Quant.Q4_0: 4, Quant.Q4_1: 4, Quant.Q8_0: 8, Quant.Q4_K: 4}

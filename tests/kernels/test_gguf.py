@@ -303,6 +303,121 @@ def test_a_quantized_gguf_decodes_as_its_dequantized_weights(tmp_path: Path) -> 
         assert _tokens(path) == _tokens(str(twin)), qt
 
 
+def _need_q35() -> None:
+    if not os.path.isfile(os.path.join(GGUF, "tiny_q35-bf16.gguf")):
+        pytest.skip("the Qwen3.5 GGUF fixtures are not here (tests/make_fixtures.py gguf_q35)")
+
+
+def _q35_trunk() -> dict[str, torch.Tensor]:
+    """the tiny_q35 checkpoint without its MTP head, which llama.cpp's converter leaves out under --no-mtp"""
+    state = safetensors_state(os.path.join(FIXTURES, "tiny_q35"))
+    return {k: v for k, v in state.items() if not k.startswith("mtp.")}
+
+
+def test_a_qwen35_gguf_reads_back_its_checkpoint() -> None:
+    """Qwen3.5 through llama.cpp's converter and back: the config off the typed keys (the hybrid's layer pattern,
+    linear attention widths, partial MRoPE), every trunk tensor found and equal as bf16 once the converter's
+    rewrites are inverted (the tiled value heads, -exp(A_log), 1 + norm, the squeezed conv), and a quantized
+    file's reordered blocks (what the packed kernels bind) the same numbers as its reordered dequantization"""
+    _need_q35()
+    from gguf import dequantize
+
+    from btb.gguf import GGUFModel
+
+    g = GGUFModel(os.path.join(GGUF, "tiny_q35-bf16.gguf"))
+    cfg = g.config()
+    want = json.load(open(os.path.join(FIXTURES, "tiny_q35", "config.json")))
+    assert cfg.model_type == want["model_type"] == g.model_type
+    for k in (
+        "num_hidden_layers",
+        "hidden_size",
+        "intermediate_size",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "layer_types",
+        "linear_conv_kernel_dim",
+        "linear_key_head_dim",
+        "linear_value_head_dim",
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+        "partial_rotary_factor",
+        "tie_word_embeddings",
+    ):
+        assert getattr(cfg, k) == want[k], (k, getattr(cfg, k), want[k])
+    for k in ("rope_theta", "mrope_section", "mrope_interleaved"):
+        assert cfg.rope_parameters[k] == want["rope_parameters"][k], k
+    state = _q35_trunk()
+    names, hdr = g.weight_map(list(state), cfg.num_hidden_layers)
+    assert set(names) == set(state), set(state) ^ set(names)
+    for hf, gn in names.items():
+        t = g.get(gn)
+        assert t.dtype == torch.bfloat16 and tuple(t.shape) == tuple(state[hf].shape) == tuple(hdr[hf]["shape"]), hf
+        assert torch.equal(t, state[hf].to(torch.bfloat16)), hf
+    for qt in ("q8_0", "q4_0", "q4_1"):
+        q = GGUFModel(os.path.join(GGUF, f"tiny_q35-{qt}.gguf"))
+        qnames, _ = q.weight_map(list(state), cfg.num_hidden_layers)
+        reordered = [gn for gn in qnames.values() if gn in q.undo and gn in q.tensors]
+        assert any(q.undo[gn][1].cols is not None for gn in reordered), qt  # out_proj binds as stored too
+        for gn in reordered:
+            t = q.tensors[gn]
+            got = dequantize(q.raw(gn).numpy(), t.tensor_type).reshape(q.get(gn).shape)
+            assert torch.equal(torch.from_numpy(np.array(got, dtype=np.float32)).bfloat16(), q.get(gn)), (qt, gn)
+
+
+def test_a_qwen35_bf16_gguf_decodes_as_its_safetensors_twin() -> None:
+    _need_q35()
+    twin = os.path.join(FIXTURES, "tiny_q35")
+    assert _tokens(os.path.join(GGUF, "tiny_q35-bf16.gguf")) == _tokens(twin)
+
+
+def test_a_qwen35_bf16_gguf_decodes_as_its_safetensors_twin_on_mlx() -> None:
+    _need_q35()
+    need_mlx()
+    twin = os.path.join(FIXTURES, "tiny_q35")
+    assert _tokens(os.path.join(GGUF, "tiny_q35-bf16.gguf"), "mlx") == _tokens(twin, "mlx")
+
+
+def test_a_quantized_qwen35_gguf_decodes_as_its_dequantized_weights(tmp_path: Path) -> None:
+    """each affine type: the file decodes exactly as a safetensors model built from the numbers the reader
+    dequantizes and un-rewrites, and those numbers differ from the bf16 twin's as a quantization does"""
+    _need_q35()
+    from safetensors.torch import save_file
+
+    from btb.gguf import GGUFModel
+
+    src = os.path.join(FIXTURES, "tiny_q35")
+    state = _q35_trunk()
+    for qt in ("q8_0", "q4_0", "q4_1"):
+        path = os.path.join(GGUF, f"tiny_q35-{qt}.gguf")
+        g = GGUFModel(path)
+        names, _ = g.weight_map(list(state), g.config().num_hidden_layers)
+        deq = {hf: g.get(gn).contiguous() for hf, gn in names.items()}
+        assert any(not torch.equal(deq[k], state[k].to(torch.bfloat16)) for k in deq), qt
+        twin = tmp_path / f"twin-{qt}"
+        twin.mkdir()
+        for fn in ("config.json", "tokenizer.json", "tokenizer_config.json"):
+            shutil.copy(os.path.join(src, fn), twin / fn)
+        save_file(deq, str(twin / "model.safetensors"), metadata={"format": "pt"})
+        assert _tokens(path) == _tokens(str(twin)), qt
+
+
+def test_a_qwen35_gguf_multiplies_its_reordered_blocks_as_stored_on_mlx() -> None:
+    """the value-head reordering applied to the stored blocks (rows of in_proj_*, whole blocks of out_proj's
+    columns): the packed path's first-step logits sit within bf16 rounding of the dequantized path's"""
+    _need_q35()
+    need_mlx()
+    logits = {}
+    for packed in (1, 0):
+        with loaded_model(os.path.join(GGUF, "tiny_q35-q8_0.gguf"), device="mlx", gguf_packed=packed) as sm:
+            rep = sm.report()["model"]["gguf"]
+            assert (rep["packed"] > 0) == bool(packed), rep
+            lg = sm.forward([PROMPT], cache=sm.new_cache())
+            assert lg is not None
+            logits[packed] = lg.float()[0, -1]
+    assert_close(logits[1], logits[0])
+
+
 def test_gguf_paths_are_discovered_resolved_and_not_packed() -> None:
     _need()
     from btb import available_models, model_stem, resolve

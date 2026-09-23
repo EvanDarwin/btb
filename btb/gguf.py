@@ -2,22 +2,41 @@
 """A GGUF model (llama.cpp's file format) behind the engine's weight map. The file's metadata makes the config
 and the tokenizer through transformers' GGUF support; the family's tensor names map to the file's through
 llama.cpp's own per-architecture table (`gguf.TensorNameMap`, no name parsing); a tensor is read on demand from
-the memmapped file by the `gguf` package, which also dequantizes it. Nothing of that
+the memmapped file by the `gguf` package, which also dequantizes it, and a tensor llama.cpp's converter rewrote
+(Qwen3.5's linear attention and norms) is read back through the inverse (`Undo`). Nothing of that
 package is copied here: this is the glue between it and the engine."""
 
 from __future__ import annotations
 
 import os
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import torch
 
 from .hf import AFFINE_TYPES, ARCH_MODEL_TYPES, gguf_lib, is_gguf
-from .kinds import Json
+from .kinds import Json, ModelType
 from .options import NotAModel, UnsupportedModel
+
+
+@dataclass(frozen=True)
+class Undo:
+    """The inverse of what llama.cpp's converter did to one tensor: `rows`/`cols` gather the checkpoint's order
+    out of the file's, `value` undoes an elementwise rewrite, `shape` restores an axis the converter squeezed."""
+
+    rows: np.ndarray | None = None
+    cols: np.ndarray | None = None
+    value: Callable[[torch.Tensor], torch.Tensor] | None = None
+    shape: tuple[int, ...] | None = None
+
+
+def _grouped(nk: int, per: int, width: int) -> np.ndarray:
+    """the file positions of the checkpoint's value heads (grouped by key head) in the converter's tiled order,
+    which `_LinearAttentionVReorderBase._reorder_v_heads` writes for `nk` key heads of `per` value heads each"""
+    return np.arange(nk * per * width).reshape(per, nk, width).transpose(1, 0, 2).reshape(-1)
 
 
 class GGUFModel:
@@ -34,6 +53,7 @@ class GGUFModel:
         self._reader: Any = None
         self._tensors: dict[str, Any] | None = None
         self.fused: dict[str, tuple[str, str]] = {}  # an HF bias name -> the file's (gate, up) biases it interleaves
+        self.undo: dict[str, tuple[str, Undo]] = {}  # a mapped name -> the file tensor it reads and how to invert it
 
     @property
     def reader(self) -> Any:
@@ -86,10 +106,71 @@ class GGUFModel:
         cfg["tie_word_embeddings"] = "output.weight" not in self.tensors
         return out
 
+    def _ints(self, key: str) -> list[int] | None:
+        """the typed metadata key `key` (a `{arch}` template) as integers, None where the file lacks it"""
+        field = self.reader.get_field(key.format(arch=self.arch))
+        if field is None:
+            return None
+        v = field.contents()
+        return [int(x) for x in v] if isinstance(v, list) else [int(v)]
+
+    def _num(self, key: str) -> float | None:
+        field = self.reader.get_field(key.format(arch=self.arch))
+        return None if field is None else float(field.contents())
+
+    def _qwen35_fields(self) -> Json:
+        """Qwen3.5's config off its typed keys (transformers has no GGUF table for it), inverting what llama.cpp's
+        converter writes: MTP blocks counted into block_count, the value head width folded into ssm.inner_size,
+        the rotary as a dimension count and the layer pattern as full_attention_interval"""
+        g = gguf_lib()
+        llm, att, ssm, rope = g.Keys.LLM, g.Keys.Attention, g.Keys.SSM, g.Keys.Rope
+        out: Json = {}
+        for key, name in (
+            (llm.CONTEXT_LENGTH, "max_position_embeddings"),
+            (llm.EMBEDDING_LENGTH, "hidden_size"),
+            (llm.FEED_FORWARD_LENGTH, "intermediate_size"),
+            (llm.VOCAB_SIZE, "vocab_size"),
+            (att.HEAD_COUNT, "num_attention_heads"),
+            (att.HEAD_COUNT_KV, "num_key_value_heads"),
+            (ssm.CONV_KERNEL, "linear_conv_kernel_dim"),
+            (ssm.STATE_SIZE, "linear_key_head_dim"),
+            (ssm.GROUP_COUNT, "linear_num_key_heads"),
+            (ssm.TIME_STEP_RANK, "linear_num_value_heads"),
+        ):
+            v = self._ints(key)
+            if v is not None:
+                out[name] = v[0]
+        eps = self._num(att.LAYERNORM_RMS_EPS)
+        if eps is not None:
+            out["rms_norm_eps"] = eps
+        n = (self._ints(llm.BLOCK_COUNT) or [0])[0] - (self._ints(llm.NEXTN_PREDICT_LAYERS) or [0])[0]
+        every = (self._ints(llm.FULL_ATTENTION_INTERVAL) or [4])[0]  # llama.cpp's qwen35 loader default
+        out["num_hidden_layers"] = n
+        out["layer_types"] = ["full_attention" if (i + 1) % every == 0 else "linear_attention" for i in range(n)]
+        inner = self._ints(ssm.INNER_SIZE)
+        if inner is not None:
+            out["linear_value_head_dim"] = inner[0] // int(out["linear_num_value_heads"])
+        head = (self._ints(att.KEY_LENGTH) or [int(out["hidden_size"]) // int(out["num_attention_heads"])])[0]
+        dims = self._ints(rope.DIMENSION_COUNT)
+        partial = dims[0] / head if dims is not None else 1.0
+        # llama.cpp runs QWEN35 on interleaved MRoPE; its sections carry a fourth (zero) entry transformers lacks
+        params: Json = {"rope_type": "default", "partial_rotary_factor": partial, "mrope_interleaved": True}
+        theta = self._num(rope.FREQ_BASE)
+        if theta is not None:
+            params["rope_theta"] = theta
+        sections = self._ints(rope.DIMENSION_SECTIONS)
+        if sections is not None:
+            params["mrope_section"] = sections[:3]
+        out["partial_rotary_factor"] = partial
+        out["rope_parameters"] = params
+        return out
+
     def config(self) -> Any:
         from transformers import AutoConfig
 
         fields = self._parsed()["config"]
+        if self.model_type is ModelType.QWEN3_5_TEXT:
+            fields.update(self._qwen35_fields())
         cfg = AutoConfig.for_model(fields.pop("model_type"), **fields)
         # the head size is in the file (attention.key_length) but not in transformers' table for these families,
         # which leaves the family's default: read it off the typed key when the file carries it
@@ -195,24 +276,38 @@ class GGUFModel:
         """The family's tensor names (HF's, `model.layers.0.self_attn.q_proj.weight`) against the file's through
         llama.cpp's table: returns (HF name -> the file's tensor name, for the names the file holds) and a
         safetensors-shaped header (shape, bf16 byte span) the engine's size readers take as they take a shard's."""
-        tmap = gguf_lib().TensorNameMap(self._arch_enum(), int(n_layers))
+        g_lib = gguf_lib()
+        tmap = g_lib.TensorNameMap(self._arch_enum(), int(n_layers))
+        qwen35 = self.model_type is ModelType.QWEN3_5_TEXT
         hf_names = list(hf_names)
         names: dict[str, str] = {}
         hdr: Json = {}
         for hf in hf_names:
             base, suffix = hf, ""
-            if hf.endswith((".weight", ".bias")):
-                base, suffix = hf.rsplit(".", 1)
+            src = hf[: -len(".dt_bias")] + ".dt_proj.bias" if qwen35 and hf.endswith(".dt_bias") else hf  # renamed
+            if src.endswith((".weight", ".bias")):
+                base, suffix = src.rsplit(".", 1)
                 suffix = "." + suffix
             g = tmap.get_name(base)
             if g is None or g + suffix not in self.tensors:
                 continue
             t = self.tensors[g + suffix]
             shape = [int(x) for x in reversed(list(t.shape))]  # the file lists dims innermost first
+            name, kind = g + suffix, t.tensor_type.name
+            undo = self._qwen35_undo(hf, shape) if qwen35 else None
+            if undo is not None:
+                shape = list(undo.shape or shape)
+                block = g_lib.GGML_QUANT_SIZES[t.tensor_type][0]
+                # a pure reordering of whole blocks keeps the file's name, so the packed kernels bind it as stored
+                # (`raw`/`affine` reorder the bytes); anything else is read through `get` under the HF name
+                as_stored = block > 1 and undo.value is None and undo.shape is None
+                if not as_stored or (undo.cols is not None and _block_perm(undo.cols, block) is None):
+                    name, kind = hf, "undone"
+                self.undo[name] = (g + suffix, undo)
             n = 1
             for d in shape:
                 n *= d
-            names[hf] = g + suffix
+            names[hf] = name
             # the span the tensor takes in memory as bf16 (the size readers), and how the file stores it: a BF16
             # tensor is bf16 bytes at `offset`, readable straight off the drive; any other type is read through
             # `get` (dequantized) and lives in memory
@@ -220,10 +315,57 @@ class GGUFModel:
                 "dtype": "BF16",
                 "shape": shape,
                 "data_offsets": [0, 2 * n],
-                "gguf": {"type": t.tensor_type.name, "offset": int(t.data_offset), "nbytes": int(t.n_bytes)},
+                "gguf": {"type": kind, "offset": int(t.data_offset), "nbytes": int(t.n_bytes)},
             }
         self._map_experts(hf_names, n_layers, names, hdr)
         return names, hdr
+
+    def _qwen35_undo(self, hf: str, shape: list[int]) -> Undo | None:
+        """the inverse of llama.cpp's Qwen3.5 converter (`Qwen3_5TextModel.modify_tensors`) on the tensor HF
+        calls `hf`, whose file shape is `shape`: its value heads back from the tiled order to grouped by key head,
+        A_log from -exp(A_log), the centered norms from 1 + weight, conv1d's squeezed middle axis"""
+        ssm = gguf_lib().Keys.SSM
+        nk = (self._ints(ssm.GROUP_COUNT) or [1])[0]
+        nv = (self._ints(ssm.TIME_STEP_RANK) or [nk])[0]
+        hk = (self._ints(ssm.STATE_SIZE) or [0])[0]
+        hv = (self._ints(ssm.INNER_SIZE) or [0])[0] // nv
+        heads = one = qkv = None
+        if nv != nk:  # the converter reorders only where key and value heads differ
+            heads, one = _grouped(nk, nv // nk, hv), _grouped(nk, nv // nk, 1)
+            qkv = np.concatenate([np.arange(2 * nk * hk), 2 * nk * hk + heads])
+        lin = ".linear_attn."
+        if hf.endswith(lin + "in_proj_qkv.weight"):
+            undo = Undo(rows=qkv)
+        elif hf.endswith(lin + "in_proj_z.weight"):
+            undo = Undo(rows=heads)
+        elif hf.endswith((lin + "in_proj_a.weight", lin + "in_proj_b.weight", lin + "dt_bias")):
+            undo = Undo(rows=one)
+        elif hf.endswith(lin + "A_log"):
+            undo = Undo(rows=one, value=lambda x: torch.log(-x))
+        elif hf.endswith(lin + "conv1d.weight"):
+            undo = Undo(rows=qkv, shape=(shape[0], 1, shape[-1]))
+        elif hf.endswith(lin + "out_proj.weight"):
+            undo = Undo(cols=heads)
+        elif hf.endswith("norm.weight") and not hf.endswith(lin + "norm.weight"):
+            undo = Undo(value=lambda x: x - 1)
+        else:
+            return None
+        return None if all(x is None for x in (undo.rows, undo.cols, undo.value, undo.shape)) else undo
+
+    def _stored(self, t: Any, undo: Undo) -> np.ndarray:
+        """a block-typed tensor's bytes [rows, row bytes] in the checkpoint's order: rows gathered whole, columns
+        as whole blocks (weight_map keeps a file name only where they are)"""
+        g = gguf_lib()
+        block, size = g.GGML_QUANT_SIZES[t.tensor_type]
+        rows = int(t.shape[-1])
+        b = np.asarray(t.data).reshape(rows, -1)
+        if undo.rows is not None:
+            b = b[undo.rows]
+        if undo.cols is not None:
+            blocks = _block_perm(undo.cols, block)
+            assert blocks is not None
+            b = b.reshape(rows, -1, size)[:, blocks].reshape(rows, -1)
+        return np.ascontiguousarray(b)
 
     def _map_experts(self, hf_names: Iterable[str], n_layers: int, names: dict[str, str], hdr: Json) -> None:
         """gpt-oss's experts, which llama.cpp's table does not name: the file's `ffn_{gate,up,down}_exps` tensors
@@ -269,12 +411,17 @@ class GGUFModel:
 
     def raw(self, name: str) -> torch.Tensor:
         """the file's tensor `name` as its stored bytes, a uint8 copy (the kernels read ggml's blocks as they are)"""
-        return torch.from_numpy(np.array(np.asarray(self.tensors[name].data), dtype=np.uint8).reshape(-1))
+        t = self.tensors[name]
+        data = self._stored(t, self.undo[name][1]) if name in self.undo else np.asarray(t.data)
+        return torch.from_numpy(np.array(data, dtype=np.uint8).reshape(-1))
 
     def affine(self, name: str) -> Affine | None:
         """the file's tensor `name` for the packed kernels, or None where its storage type has no affine form
-        (it is then read through `get`, dequantized)"""
-        return affine_of(self.tensors[name])
+        or `name` is not a file tensor (it is then read through `get`, dequantized)"""
+        t = self.tensors.get(name)
+        if t is None:
+            return None
+        return affine_of(t, self._stored(t, self.undo[name][1]) if name in self.undo else None)
 
     def packable(self) -> int:
         """how many of the file's tensors the packed kernels take as stored"""
@@ -287,6 +434,17 @@ class GGUFModel:
         if name in self.fused:
             gate, up = (self.get(n) for n in self.fused[name])
             return torch.stack([gate, up], dim=-1).reshape(gate.shape[0], -1)
+        if name in self.undo:
+            src, undo = self.undo[name]
+            t = self.tensors[src]
+            x = torch.from_numpy(np.array(g.dequantize(np.asarray(t.data), t.tensor_type), dtype=np.float32))
+            if undo.rows is not None:
+                x = x[torch.from_numpy(undo.rows)]
+            if undo.cols is not None:
+                x = x[:, torch.from_numpy(undo.cols)]
+            if undo.value is not None:
+                x = undo.value(x)  # in float32, as the converter rewrote it
+            return x.reshape(undo.shape or x.shape).contiguous().to(torch.bfloat16)
         t = self.tensors[name]
         arr = g.dequantize(np.asarray(t.data), t.tensor_type)
         if not arr.flags.writeable:  # a plain-float tensor comes back as a view of the file: torch wants a copy
@@ -392,8 +550,19 @@ class Affine:
         self.wq, self.scales, self.biases, self.bits, self.shape = wq, scales, biases, bits, shape
 
 
-def affine_of(t: Any) -> Affine | None:
-    """the tensor repacked for the packed kernels, or None for a storage type without that form"""
+def _block_perm(perm: np.ndarray, block: int) -> np.ndarray | None:
+    """a column gather `perm` as a gather of whole blocks of `block` values, or None where it splits a block"""
+    if perm.size % block:
+        return None
+    runs = perm.reshape(-1, block)
+    if np.any(runs[:, 0] % block) or np.any(runs - runs[:, :1] != np.arange(block)):
+        return None
+    return runs[:, 0] // block
+
+
+def affine_of(t: Any, data: np.ndarray | None = None) -> Affine | None:
+    """the tensor repacked for the packed kernels, or None for a storage type without that form; `data` its
+    bytes where they are not the file's order (GGUFModel._stored)"""
     kind = t.tensor_type.name
     bits = AFFINE_TYPES.get(kind)
     if bits is None:
@@ -402,7 +571,7 @@ def affine_of(t: Any) -> Affine | None:
     if len(shape) != 2 or shape[1] % GROUP:
         return None
     rows, cols = shape
-    q, scale, bias = _affine_blocks(np.asarray(t.data).reshape(rows, -1), rows, kind)
+    q, scale, bias = _affine_blocks((np.asarray(t.data) if data is None else data).reshape(rows, -1), rows, kind)
     q = q.reshape(rows, cols).astype(np.uint32)
     per = 32 // bits
     words = q.reshape(rows, cols // per, per) << (np.arange(per, dtype=np.uint32) * bits)
