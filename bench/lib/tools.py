@@ -18,9 +18,9 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
-from lib import say
-from lib.host import add_cuda_dll_dirs, gpu_used_gb, peak_rss_bytes
-from lib.records import BenchCell
+from bench.lib import say
+from bench.lib.host import add_cuda_dll_dirs, gpu_used_gb, peak_rss_bytes
+from bench.lib.records import BenchCell
 
 
 def scratch_dir(env: str, win: str) -> str:

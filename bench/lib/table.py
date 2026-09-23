@@ -7,8 +7,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from lib import say
-from lib.records import BenchCell, BenchMatrixCell, BenchSpecs, BenchStatus, Report
+from bench.lib import say
+from bench.lib.records import BenchCell, BenchMatrixCell, BenchSpecs, BenchStatus, Report
 
 # a rendered table row: each column header to its formatted value
 Row = dict[str, str]
@@ -27,7 +27,7 @@ def cell_label(c: BenchMatrixCell) -> str:
     """The cell's display name, composed from its axes; the identity is the axes themselves, never this. A
     comparison tool is its name and, where it distinguishes the regime, the device; a btb cell is the device
     and whatever it turns off or on from the default (`nomega`, `pack12`, a temperature)."""
-    from lib.plan import mega_capable
+    from bench.lib.plan import mega_capable
 
     if c.get("tool"):
         dev = c.get("device") or ""

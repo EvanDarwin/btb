@@ -50,8 +50,8 @@ EXPECTED_GAPS: dict[manifest.Missing, list[str]] = {
 
 
 def _source(*rel: str) -> str:
-    """an engine file's text, read rather than imported: these guards must hold on a machine with no torch."""
-    with open(os.path.join(ROOT, *rel), encoding="utf-8") as f:
+    """a btb file's text, read rather than imported: these guards must hold on a machine with no torch."""
+    with open(os.path.join(core.BTB_SRC, *rel), encoding="utf-8") as f:
         return f.read()
 
 
@@ -286,7 +286,7 @@ def test_the_option_selected_forks_have_cells() -> None:
 def test_card_family_predicate_matches_cuda_source() -> None:
     """core.card_family_ok replicates cuda.py's family clause (the manifest is torch-free, so it cannot call
     it). This holds the two together: the capabilities named in `_card_family_ok` are exactly the ones here."""
-    src = _source("btb", "engine", "cuda.py")
+    src = _source("engine", "cuda.py")
     body = src.split("def _card_family_ok", 1)[1].split("\n    def ", 1)[0]
     named = {c for c in Cap if f"self.fam.{c.value}" in body}
     assert named == core.CARD_FAMILY_CAPS, f"cuda.py's family clause names {sorted(c.value for c in named)}"
@@ -297,7 +297,7 @@ def test_card_family_predicate_matches_cuda_source() -> None:
 
 def test_mega_head_multiple_matches_its_source() -> None:
     """the megakernel's head gate, quoted from mega.py so MEGA_SHAPE cannot outlive the constraint."""
-    assert f"self.hd % {manifest.MEGA_HEAD_MULTIPLE}" in _source("btb", "mlx", "mega.py")
+    assert f"self.hd % {manifest.MEGA_HEAD_MULTIPLE}" in _source("mlx", "mega.py")
     assert spec.head_dim(FamilyKind.QWEN3) == 16, "the tiny fixture changed; MEGA_SHAPE may no longer hold"
 
 

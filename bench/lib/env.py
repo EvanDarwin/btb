@@ -12,8 +12,8 @@ import re
 import subprocess
 import sys
 
-from lib import REQUIREMENTS, ROOT, capture, say
-from lib.tools import TOOLS
+from bench.lib import REQUIREMENTS, ROOT, capture, say
+from bench.lib.tools import TOOLS
 
 # the HF architecture names in a --print-supported-models dump; llama.cpp registers them as `...ForCausalLM`,
 # `...ForConditionalGeneration`, or a bare `...Model`

@@ -26,8 +26,10 @@ import sys
 from dataclasses import dataclass
 from enum import StrEnum
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SERVE_PY = os.path.join(ROOT, "btb", "serve.py")
+from .core import BTB_SRC
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # the tests/ tree
+SERVE_PY = os.path.join(BTB_SRC, "serve.py")
 
 
 class Missing(StrEnum):

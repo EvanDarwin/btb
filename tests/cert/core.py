@@ -9,7 +9,20 @@ a separate runtime check (test_manifest.test_every_served_type_builds)."""
 
 from __future__ import annotations
 
+import importlib.util
+
 from btb.kinds import CAPS, KIND_OF, Cap, FamilyKind
+
+
+def btb_src() -> str:
+    """the btb package directory the matrices reflect on - the checkout's, or the installed wheel's when the
+    checkout's is moved aside (the wheel certify) - located without importing the package (no torch)"""
+    spec = importlib.util.find_spec("btb")
+    assert spec is not None and spec.submodule_search_locations, "btb is not importable"
+    return next(iter(spec.submodule_search_locations))
+
+
+BTB_SRC = btb_src()
 
 # the family clause of the card step graph's gate, `_CudaMixin._card_family_ok` (btb/engine/cuda.py:284): the
 # kernels are written for the dense kernel layout and the sandwich layout, and never for a family that brings

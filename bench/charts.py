@@ -19,11 +19,9 @@ from dataclasses import dataclass
 from typing import cast
 from xml.sax.saxutils import escape
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from lib import RESULTS, ROOT
-from lib.plan import mega_capable
-from lib.records import (
+from bench.lib import RESULTS, ROOT
+from bench.lib.plan import mega_capable
+from bench.lib.records import (
     BenchCell,
     BenchDevice,
     BenchDtype,
@@ -34,7 +32,7 @@ from lib.records import (
     BenchStatus,
     Placement,
 )
-from lib.table import placement_line
+from bench.lib.table import placement_line
 
 OUT = os.path.join(ROOT, "assets", "bench")
 LENGTHS = (64, 256, 1024)
@@ -198,7 +196,7 @@ def load(paths: Sequence[str], specs_for_jsonl: BenchSpecs | None = None) -> dic
         with open(p, encoding="utf-8") as fh:
             if p.endswith(".jsonl"):
                 if specs_for_jsonl is None:
-                    from lib.host import host_specs
+                    from bench.lib.host import host_specs
 
                     specs_for_jsonl = host_specs()
                 machine = _machine(specs_for_jsonl)

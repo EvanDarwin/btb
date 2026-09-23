@@ -178,7 +178,7 @@ META_EXPORTS: tuple[str, ...] = ("btb_isa",)
 
 def op_families() -> list[str]:
     """the native op families, from the bench files on disk (native/benches/<family>.rs) - the same files
-    criterion runs, so bench_compare groups by exactly these and a new family's bench file is a new section with
+    criterion runs, so bench/report.py groups by exactly these and a new family's bench file is a new section with
     no list to edit. `bench_files_without_ops()` fails if such a file has no Op certifying it."""
     return sorted(f[:-3] for f in os.listdir(NATIVE_BENCHES) if f.endswith(".rs"))
 
