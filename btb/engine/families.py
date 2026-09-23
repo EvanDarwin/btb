@@ -6,13 +6,13 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypedDict, cast
 
 import torch
 import torch.nn.functional as F
 
 from .. import mlx as mlxdev
-from ..kinds import FamilyKind, LayerKind
+from ..kinds import CAPS, KIND_OF, Cap, FamilyKind, LayerKind, ModelType
 from ..options import UnsupportedModelType
 from .cache import GrowLayer
 from .fused import _fuse_mlp_cls, _fuse_norm_cls
@@ -234,25 +234,59 @@ def act_name(cfg: Any) -> str:
     return str(getattr(cfg, "hidden_activation", None) or getattr(cfg, "hidden_act", "silu"))
 
 
-# the model_types family() builds a Family for, each mapped to the name a user would recognize (the "_text"
-# variants are the same family). hf.SERVE_TYPES mirrors these keys, and an unsupported load lists the values.
-FAMILY_NAMES = {
-    "qwen3": "Qwen3",
-    "qwen3_5": "Qwen3.5",
-    "qwen3_5_text": "Qwen3.5",
-    "phi3": "Phi-3",
-    "qwen4_exp": "Qwen4 (experimental)",
-    "qwen4_exp_text": "Qwen4 (experimental)",
-    "gpt_oss": "GPT-OSS",
+# the name a user would recognize for each family family() builds; an unsupported load lists these values
+FAMILY_NAMES: dict[FamilyKind, str] = {
+    FamilyKind.QWEN3: "Qwen3",
+    FamilyKind.QWEN3_5: "Qwen3.5",
+    FamilyKind.PHI3: "Phi-3",
+    FamilyKind.QWEN4: "Qwen4 (experimental)",
+    FamilyKind.GPT_OSS: "GPT-OSS",
+    FamilyKind.GEMMA3: "Gemma 3",
 }
-SUPPORTED_MODEL_TYPES = tuple(FAMILY_NAMES)
+# the model_type view of those names, through KIND_OF (the "_text" variants read as their base family)
+NAME_OF: dict[ModelType, str] = {mt: FAMILY_NAMES[fk] for mt, fk in KIND_OF.items()}
+SUPPORTED_MODEL_TYPES = tuple(KIND_OF)  # the served model_types, from the one declaration in kinds.py
+
+
+class Flags(TypedDict):
+    """the capability booleans `family()` spreads into a Family, one field per `Cap` (the field name is the
+    Cap's value). Typed so the spread checks against Family's fields; the field set is held equal to `Cap` by
+    tests/cert/test_runtime_guards.py, which `_flags()` below builds from."""
+
+    dense: bool
+    kernel_layout: bool
+    hybrid: bool
+    moe: bool
+    mxfp4: bool
+    mrope: bool
+    attn_gate: bool
+    own: bool
+    norm_centered: bool
+    embed_scale: bool
+    dual_rope: bool
+    sandwich: bool
+    flat_cache: bool
+    eager: bool
+    fast: bool
+
+
+def _flags(kind: FamilyKind) -> Flags:
+    """the Family capability flags for a family, projected from `CAPS` - the single source of which caps a family
+    has. family() adds the transformers classes (the runtime); the booleans are read here so they never drift."""
+    caps = CAPS[kind]
+    # one entry per Cap, keyed by the Cap's value (the Family field name), so Flags cannot fall behind the enum
+    return cast(Flags, {c.value: c in caps for c in Cap})
 
 
 def family(cfg: Any) -> Family:
     import importlib
 
-    mt = str(getattr(cfg, "model_type", "") or "")
-    if mt in ("qwen3_5", "qwen3_5_text"):
+    raw = str(getattr(cfg, "model_type", "") or "")
+    try:
+        fk = KIND_OF[ModelType(raw)]  # route by FamilyKind, not a model_type string match; "_text" shares a base
+    except (ValueError, KeyError):
+        raise UnsupportedModelType(raw, list(FAMILY_NAMES.values())) from None
+    if fk is FamilyKind.QWEN3_5:
         mod = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
         # Qwen3.5's norm scales by 1 + weight (weights stored around zero), unlike the families below
         _fuse_norm_cls(mod.Qwen3_5RMSNorm, centered=True)
@@ -262,12 +296,9 @@ def family(cfg: Any) -> Family:
             layer=mod.Qwen3_5DecoderLayer,
             norm=mod.Qwen3_5RMSNorm,
             rotary=mod.Qwen3_5TextRotaryEmbedding,
-            mrope=True,
-            attn_gate=True,
-            hybrid=True,
-            norm_centered=True,
+            **_flags(FamilyKind.QWEN3_5),
         )
-    if mt == "qwen3":
+    if fk is FamilyKind.QWEN3:
         mod = importlib.import_module("transformers.models.qwen3.modeling_qwen3")
         _fuse_norm_cls(mod.Qwen3RMSNorm)
         _fuse_mlp_cls(mod.Qwen3MLP)
@@ -277,12 +308,9 @@ def family(cfg: Any) -> Family:
             layer=mod.Qwen3DecoderLayer,
             norm=mod.Qwen3RMSNorm,
             rotary=mod.Qwen3RotaryEmbedding,
-            mrope=False,
-            attn_gate=False,
-            dense=True,
-            kernel_layout=True,
+            **_flags(FamilyKind.QWEN3),
         )
-    if mt == "phi3":
+    if fk is FamilyKind.PHI3:
         mod = importlib.import_module("transformers.models.phi3.modeling_phi3")
         _fuse_norm_cls(mod.Phi3RMSNorm)
         _fuse_mlp_cls(mod.Phi3MLP)
@@ -292,65 +320,46 @@ def family(cfg: Any) -> Family:
             layer=mod.Phi3DecoderLayer,
             norm=mod.Phi3RMSNorm,
             rotary=mod.Phi3RotaryEmbedding,
-            mrope=False,
-            attn_gate=False,
-            dense=True,
+            **_flags(FamilyKind.PHI3),
         )
-    if mt in ("qwen4_exp", "qwen4_exp_text"):
+    if fk is FamilyKind.QWEN4:
         mod = importlib.import_module("transformers.models.qwen4_exp.modeling_qwen4_exp")
+        # streams (hc_count) is per-config runtime; the sparse attention is the family's own
         return Family(
             kind=FamilyKind.QWEN4,
             mod=mod,
             layer=mod.Qwen4ExpTextDecoderLayer,
             norm=None,
             rotary=mod.Qwen4ExpTextRotaryEmbedding,
-            mrope=True,
-            attn_gate=True,
-            own=True,
-            moe=True,
             streams=int(cfg.hc_count),
             attn=LayerKind.QWEN_SPARSE,
+            **_flags(FamilyKind.QWEN4),
         )
-    if mt == "gpt_oss":
+    if fk is FamilyKind.GPT_OSS:
         mod = importlib.import_module("transformers.models.gpt_oss.modeling_gpt_oss")
-        # an attention sink per query head (a logit with no value) is not expressible through sdpa: the module's eager
-        # attention runs (`fast` off)
+        # an attention sink per query head is not expressible through sdpa, so its eager attention runs (fast off)
         return Family(
             kind=FamilyKind.GPT_OSS,
             mod=mod,
             layer=mod.GptOssDecoderLayer,
             norm=mod.GptOssRMSNorm,
             rotary=mod.GptOssRotaryEmbedding,
-            mrope=False,
-            attn_gate=False,
-            fast=False,
-            moe=True,
-            mxfp4=True,
-            eager=True,
-            flat_cache=True,
+            **_flags(FamilyKind.GPT_OSS),
         )
-    if mt in ("gemma3", "gemma3_text"):
+    if fk is FamilyKind.GEMMA3:
         mod = importlib.import_module("transformers.models.gemma3.modeling_gemma3")
-        # Gemma 3's block is a sandwich norm (the attention and MLP outputs normed before their residual add) with
-        # q/k norms, its embedding scaled by sqrt(hidden), rope split local/global by layer type, and sliding
-        # layers; the host and card paths take each under `sandwich`, `dual_rope` and the layer's window (the
-        # softcapping earlier Gemmas had is gone, so SDPA is exact). Its RMSNorm scales by 1 + weight.
+        # sandwich norm with q/k norms, embedding scaled by sqrt(hidden), local/global rope, sliding layers
         return Family(
             kind=FamilyKind.GEMMA3,
             mod=mod,
             layer=mod.Gemma3DecoderLayer,
             norm=mod.Gemma3RMSNorm,
             rotary=mod.Gemma3RotaryEmbedding,
-            mrope=False,
-            attn_gate=False,
-            fast=True,
-            norm_centered=True,
-            embed_scale=True,
-            dual_rope=True,
-            sandwich=True,
-            flat_cache=True,
+            **_flags(FamilyKind.GEMMA3),
         )
-    raise UnsupportedModelType(mt, list(dict.fromkeys(FAMILY_NAMES.values())))
+    # `raw` is served (KIND_OF answered it) but no branch above builds its family: a table this function has
+    # fallen behind, not a model the user cannot run
+    raise RuntimeError(f"{fk} is declared in kinds.KIND_OF but families.family() builds no Family for it")
 
 
 class _FamiliesMixin(_State):

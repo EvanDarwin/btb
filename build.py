@@ -45,7 +45,7 @@ GENCODE = [
     "-gencode",
     "arch=compute_89,code=compute_89",
 ]
-PY_DIRS = ["btb", "bench", "tests", "setup.py", "build.py"]
+PY_DIRS = ["btb", "bench", "tests", ".github/scripts", "setup.py", "build.py"]
 
 
 def say(line: str) -> None:

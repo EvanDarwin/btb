@@ -18,6 +18,7 @@ import numpy as np
 import torch
 
 from .. import mlx as mlxdev
+from ..kinds import PassTag
 from ..mxfp4 import BLOCK, MxGateUp, MxWeight
 from ..options import Device
 from ..sysinfo import host_free_bytes
@@ -433,15 +434,17 @@ class _ExpertStore:
         self.margin = max(self.block_max, self.reserve // 4)
         self.scratch_n = int(scratch)
         # the residency policy: the store's line, or the Bus Pass (the configuration's `bus_pass`, BTB_BUS_PASS
-        # over it); `lru` is the day riders' line, which in the store's own shape is the whole line
+        # over it); `lru` is the day riders' line, which in the store's own shape is the whole line. Read off
+        # the model with no default of its own: a model built without a policy must fail, not run the wrong one
         bp = os.environ.get("BTB_BUS_PASS")
-        bus_pass = bool(int(bp)) if bp not in (None, "") else bool(getattr(sm, "bus_pass", False))
+        bus_pass = bool(int(bp)) if bp not in (None, "") else bool(sm.bus_pass)
         self.res = (BusPass if bus_pass else Riders)(lambda: self.live() - len(self.ring))
+        self.res_tag = PassTag.EXPERT_BUS_PASS if bus_pass else PassTag.EXPERT_LINE
         self.lru = self.res.t1
         # the depot's pages held in RAM (`store_pin`, BTB_STORE_PIN over it: 0 pageable, 1 pinned, "auto" pinned
         # beside a card): a drive writing straight into a page the machine has trimmed pays the fault on the read
         sp: str | int | None = os.environ.get("BTB_STORE_PIN")
-        sp = sp if sp not in (None, "") else getattr(sm, "store_pin", 0)
+        sp = sp if sp not in (None, "") else sm.store_pin
         dev = getattr(sm, "dev", None)
         on_card = dev is not None and getattr(dev, "type", "") == Device.CUDA
         self.pin = on_card if str(sp).strip().lower() == "auto" else bool(int(sp or 0)) and on_card
@@ -1088,6 +1091,7 @@ class _ExpertStore:
             self.rides[key] = self.rides.get(key, 0) + 1
             if self.vram is not None and key in self.vram:
                 # a first-class seat: the card multiplies it, no bytes move
+                self.sm._tag(PassTag.EXPERT_VRAM_SEAT)
                 on_card[e] = self.vram.views(key)
                 self.stat["hit"] += 1
                 if prof is not None:

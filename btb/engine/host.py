@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from .. import mlx as mlxdev
+from ..kinds import PassTag
 from ..mxfp4 import BLOCK, MxGateUp, MxWeight
 from ..options import Device
 from .native import Native
@@ -231,6 +232,8 @@ class _Experts(torch.nn.Module):
         x_card: torch.Tensor | None = None,
     ) -> None:
         dt = x.dtype
+        if self.mx:
+            self.sm._tag(PassTag.EXPERT_MXFP4_ASSTORED)  # `_group()` is the mx4 matvec over the stored blocks
         k = len(hit)
         xf = x.float().contiguous()
         slot = {e: top_k_index[0].tolist().index(e) for e in hit}
@@ -311,6 +314,7 @@ class _Experts(torch.nn.Module):
         if self.mx:
             # MXFP4 experts through the GPU's matvec, each expert its own graph queued as its bytes land, the outputs
             # summed in expert order at the end whichever were ready first
+            self.sm._tag(PassTag.EXPERT_MXFP4_ASSTORED)  # the store's blocks as stored, never widened
             bg, bd = self._mx_biases()
             shp = store.mx_shapes()
             xm = mlxdev.to_mx(x)
@@ -362,14 +366,14 @@ class _Experts(torch.nn.Module):
             self._mx_bias = b
         return b
 
-    @classmethod
-    def _linear(cls, x: torch.Tensor, w: Any) -> torch.Tensor:
+    def _linear(self, x: torch.Tensor, w: Any) -> torch.Tensor:
         if isinstance(w, MxGateUp):
-            return MxGateUp.interleave(cls._linear(x, w.gate), cls._linear(x, w.up))
+            return MxGateUp.interleave(self._linear(x, w.gate), self._linear(x, w.up))
         if isinstance(w, MxWeight):
             # the MXFP4 kernel widens a column tile once and reuses it over the batch tile, so it is the
             # path at every batch size and a row's value does not depend on how many rows travel with it
             kernel = Native.gemv_mx4_ggml if w.ggml else Native.gemv_mx4
+            self.sm._tag(PassTag.EXPERT_MXFP4_ASSTORED if kernel is not None else PassTag.EXPERT_MXFP4_DEQUANT)
             if kernel is not None:
                 y = torch.empty(x.shape[0], w.shape[0], dtype=torch.float32)
                 kernel(w, x.float().contiguous().cpu(), y)
@@ -417,6 +421,7 @@ class _Experts(torch.nn.Module):
         pending = []
         w0 = 0.0
         if store is not None:
+            self.sm._tag(PassTag.EXPERT_STORE, store.res_tag)  # the slots, under the policy the store was built on
             keep = hidden_states.shape[0] < Native.gemm_rows or bool(getattr(self.sm, "_sweep_keep", False))
             if hidden_states.shape[0] < Native.gemm_rows:
                 # the Timetable: the next layers' picks from this layer's input (one row, or a verify pass's few),
@@ -426,6 +431,7 @@ class _Experts(torch.nn.Module):
             per_expert = store.per
             w0 = store.stat["wait_s"]
         else:
+            self.sm._tag(PassTag.EXPERT_TABLES)  # no store: the checkpoint's expert tables, held whole
             gu, dn = self._tables()
             views = {e: (gu[e], dn[e]) for e in hit}
             if self.mx:

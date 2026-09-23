@@ -12,7 +12,7 @@ import torch
 
 from .. import mlx as mlxdev
 from ..draft import NGramProposer, SpanBank, Spans
-from ..kinds import Json, LayerKind, TokenRows, Tokens
+from ..kinds import Json, LayerKind, PassTag, Proposer, TokenRows, Tokens
 from ..options import Device
 from ..sampling import GREEDY, Sampling, Verify
 from ..session import Session
@@ -169,7 +169,9 @@ class _GenerateMixin(_State):
         n_min: int = 2,
         n_max: int = 4,
         on_token: Callable[[int], Any] | None = None,
-        proposer: str = "ngram",
+        # the str half is the public boundary (a CLI/serve value, a test); Proposer.of() normalizes it below and
+        # rejects an unknown name. Internally sm.proposer is already a Proposer.
+        proposer: Proposer | str = Proposer.NGRAM,
         spans: Spans = (),
         session: Session | None = None,
         sampling: Sampling | None = None,
@@ -179,10 +181,14 @@ class _GenerateMixin(_State):
         n = len(prompt)
         eos = {int(e) for e in eos_ids}
         smp = (sampling or GREEDY).seeded()
+        self._tag(PassTag.SAMPLE_GREEDY if smp.greedy else PassTag.SAMPLE_STOCHASTIC)
         t0 = time.time()
-        use_dyn = proposer == "mtp_dyn"
-        use_tree = proposer == "mtp_tree" or use_dyn
-        use_mtp = proposer == "mtp" or use_tree
+        # a string from a caller's config reads into the enum here; an unknown one raises rather than decoding
+        # as n-gram, which no report would have shown
+        prop_kind = Proposer.of(proposer)
+        use_dyn = prop_kind is Proposer.MTP_DYN
+        use_tree = prop_kind in (Proposer.MTP_TREE, Proposer.MTP_DYN)
+        use_mtp = prop_kind.mtp
         last = {}
 
         def aw(i: int, h: torch.Tensor) -> None:
@@ -228,6 +234,7 @@ class _GenerateMixin(_State):
 
             ks = getattr(self, "draft_ks", None) or (3, 2, 1)
             prop = UnionProposer(ModelProposer(draft, prompt, ks=ks), prop)
+        self._tag(PassTag.SPEC_MTP if use_mtp else (PassTag.SPEC_DRAFT if draft is not None else PassTag.SPEC_NGRAM))
         by_src: dict[str, dict[str, int]] = {"drafted": {}, "accepted": {}}
         last_base = n
         if use_mtp:
@@ -266,7 +273,7 @@ class _GenerateMixin(_State):
             "forwards": 1,
             "proposed": 0,
             "accepted": 0,
-            "proposer": proposer,
+            "proposer": prop_kind.value,
             "drafted_by_pos": [0] * v_max,
             "accepted_by_pos": [0] * v_max,
             "reused": reuse,
@@ -447,6 +454,7 @@ class _GenerateMixin(_State):
                     if j < a:
                         census["accepted_by_pos"][j] += 1
             census["accepted"] += a
+            self._tag_spec(len(guesses), a)
             ema_tokens = 0.85 * ema_tokens + 0.15 * (1 + a)
             if guesses:
                 by_src["drafted"][src] = by_src["drafted"].get(src, 0) + len(guesses)
@@ -504,6 +512,7 @@ class _GenerateMixin(_State):
         B = ids.shape[0]
         eos = {int(e) for e in eos_ids}
         smp = (sampling or GREEDY).seeded()
+        self._tag(PassTag.SPEC_OFF, PassTag.SAMPLE_GREEDY if smp.greedy else PassTag.SAMPLE_STOCHASTIC)
         t0 = time.time()
         if self._mlx_greedy_ok(B, attention_mask, on_layer, prefill_only):
             out_s, census = self._generate_greedy_mlx(ids, max_new, eos, on_token, t0, session, smp)

@@ -55,6 +55,17 @@ def kernels_path() -> str | None:
     return None
 
 
+def isa() -> str:
+    """the kernel tier the native library selected for this process (avx512/avx2/neon/scalar; `BTB_NATIVE_ISA`
+    honored) - what a benchmark's numbers belong to"""
+    p = native_path()
+    if p is None:
+        raise NativeError("btb_isa", -1, ": no native library in this install")
+    f = ctypes.CDLL(p).btb_isa
+    f.restype = ctypes.c_char_p
+    return f().decode()
+
+
 class NativeError(RuntimeError):
     """A call into the native library failed: `call` its name, `rc` what it returned, `detail` what it was
     asked (a path, an offset), `errno` the OS error it left when the call reads the OS (else 0)."""

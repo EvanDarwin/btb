@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, NamedTuple, TypedDict, cast
 
 from ..draft import Spans
-from ..kinds import TokenRows, Tokens
+from ..kinds import Proposer, TokenRows, Tokens
 from ..sampling import GREEDY, Sampling
 from ..session import Session
 from ..text import Channels, Messages, TextStream, answer, prompt_ids
@@ -327,6 +327,7 @@ class _TextMixin(_State):
         speculate: bool,
         sampling: Sampling | None,
     ) -> Generation:
+        self._pass_reset()  # one report a generate: its passes' path tags accumulate into it
         if ids and isinstance(ids[0], (list, tuple)):
             rows = [[int(t) for t in r] for r in cast(TokenRows, ids)]
         else:
@@ -351,7 +352,7 @@ class _TextMixin(_State):
             out, c = self.generate_greedy(rows, max_new, eos_ids=stop, on_token=on_token, session=session, sampling=smp)
             return Generation(out, cast(GenerateStats, dict(c, cap=max_new, proposer="greedy", **seed)))
         v = max(0, int(self.v_max))
-        prop = self.proposer if v > 0 else "ngram"
+        prop = self.proposer if v > 0 else Proposer.NGRAM
         out, c = self.generate_speculative(
             rows,
             max_new,

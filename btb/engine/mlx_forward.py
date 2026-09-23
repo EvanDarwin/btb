@@ -14,7 +14,18 @@ import torch
 
 from .. import mlx as mlxdev
 from .. import pool
-from ..kinds import LayerKind, NodePath, Parents, TokenRows, Tokens
+from ..kinds import (
+    LayerKind,
+    NodePath,
+    Parents,
+    PassTag,
+    Quant,
+    QuantClass,
+    TokenRows,
+    Tokens,
+    latt_backend_key,
+    quants_of,
+)
 from ..mlx import fused as fk
 from ..mlx.q6k import gather_q6k
 from ..sampling import GREEDY
@@ -251,7 +262,7 @@ class _MlxMixin(_State):
             return False
         name = self._gguf_names[m.key]
         t = gg.tensors.get(name)
-        if t is None or t.tensor_type.name != "Q4_K":
+        if t is None or t.tensor_type.name != Quant.Q4_K:
             return False
         shape = tuple(m.weight.shape)
         if len(shape) != 2 or shape[1] % 256:
@@ -274,7 +285,7 @@ class _MlxMixin(_State):
             return False
         name = self._gguf_names[m.key]
         t = gg.tensors.get(name)
-        if t is None or t.tensor_type.name != "Q5_K":
+        if t is None or t.tensor_type.name != Quant.Q5_K:
             return False
         shape = tuple(m.weight.shape)
         if len(shape) != 2 or shape[1] % 256:
@@ -296,7 +307,7 @@ class _MlxMixin(_State):
             return False
         name = self._gguf_names[m.key]
         t = gg.tensors.get(name)
-        if t is None or t.tensor_type.name != "Q2_K":
+        if t is None or t.tensor_type.name != Quant.Q2_K:
             return False
         shape = tuple(m.weight.shape)
         if len(shape) != 2 or shape[1] % 256:
@@ -318,7 +329,7 @@ class _MlxMixin(_State):
             return False
         name = self._gguf_names[m.key]
         t = gg.tensors.get(name)
-        if t is None or t.tensor_type.name != "Q3_K":
+        if t is None or t.tensor_type.name != Quant.Q3_K:
             return False
         shape = tuple(m.weight.shape)
         if len(shape) != 2 or shape[1] % 256:
@@ -341,31 +352,24 @@ class _MlxMixin(_State):
             return False
         name = self._gguf_names[m.key]
         t = gg.tensors.get(name)
-        if t is None or t.tensor_type.name not in ("IQ4_NL", "IQ4_XS"):
+        if t is None or t.tensor_type.name not in quants_of(QuantClass.IQ4):
             return False
         shape = tuple(m.weight.shape)
-        blkw = 32 if t.tensor_type.name == "IQ4_NL" else 256
+        blkw = 32 if t.tensor_type.name == Quant.IQ4_NL else 256
         if len(shape) != 2 or shape[1] % blkw:
             return False
         be = self.mlx
         assert be is not None
         raw = gg.raw(name).numpy()
-        m.mx = be.weight_iq4nl(raw, shape) if t.tensor_type.name == "IQ4_NL" else be.weight_iq4xs(raw, shape)
+        m.mx = be.weight_iq4nl(raw, shape) if t.tensor_type.name == Quant.IQ4_NL else be.weight_iq4xs(raw, shape)
         m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*shape), requires_grad=False)
         self.mlx_state.affine = True  # not a plain bf16 slot: stays on the per-op path, off the megakernel
         self.mlx_state.bytes += int(raw.nbytes)
         return True
 
-    # GGUF IQ lattice type name -> the backend's lattice-kernel kind
-    _LATT_KINDS = {
-        "IQ3_XXS": "iq3xxs",
-        "IQ2_XXS": "iq2xxs",
-        "IQ2_XS": "iq2xs",
-        "IQ2_S": "iq2s",
-        "IQ1_S": "iq1s",
-        "IQ3_S": "iq3s",
-        "IQ1_M": "iq1m",
-    }
+    # GGUF IQ lattice type name -> the backend's lattice-kernel kind, from the LATTICE members of kinds.Quant
+    # (the backend's `_LATT` carries the matching keys and their byte layouts); a new lattice quant is one member.
+    _LATT_KINDS = {q.value: latt_backend_key(q) for q in quants_of(QuantClass.LATTICE)}
 
     def _bind_gguf_lattice(self, m: Any) -> bool:
         """a GGUF IQ lattice tensor (the grid-codebook quants behind the Unsloth dynamic mixes) bound as its own
@@ -864,6 +868,7 @@ class _MlxMixin(_State):
             p = (n - T) + m.arange(T, dtype=m.int32)[:, None]
             j = m.arange(n, dtype=m.int32)[None, :]
             mask = ((j <= p) & (j > p - win))[None, None]
+        self._tag(PassTag.MLX_SDPA)
         a = m.fast.scaled_dot_product_attention(qh, K, V, scale=scale, mask=mask)
         return a[0].transpose(1, 0, 2).reshape(T, Hq * hd), attn_pa
 
@@ -990,6 +995,7 @@ class _MlxMixin(_State):
                 **kq,
             )
             return a.reshape(B, Hq * hd)
+        self._tag(PassTag.MLX_SDPA)
         outs = []
         for b in range(B):
             K, V = cl.mx_kv_row(b)
@@ -1012,6 +1018,7 @@ class _MlxMixin(_State):
                 qh, cl._mx[0], cl._mx[1], forest["meta"], forest["path"], scale, forest["splits"], odt=qh.dtype, **kq
             )
             return a.reshape(T, Hq * hd)
+        self._tag(PassTag.MLX_SDPA)
         G, Lm = forest["G"], forest["Lmax"]
         gi = forest["gather"]
 
@@ -1080,10 +1087,13 @@ class _MlxMixin(_State):
         `hm` an MLX hidden state in place of `h`; `lazy` returns the logits unevaluated; `rows` a batched decode
         step (hm[b] at position rows[b]); `forest` a batched prefill (the logits each row's last token's); `pick`
         the ids picked in the graph (a chain's rows at past + j, a tree's at past + depth)."""
+        self._tag_tiers(n_layers)
+        self._tag_quant()
         if self.fam.hybrid:
             return self._forward_mlx_hybrid(
                 h, pe, cache, on_layer, last_only, head, n_layers, hm=hm, lazy=lazy, pick=pick
             )
+        self._tag(PassTag.MLX_STEP)
         m = mlxdev.mx()
         be = self.mlx
         assert be is not None
@@ -1128,6 +1138,7 @@ class _MlxMixin(_State):
             and rd == int(self.host[0].self_attn.head_dim)
             and hm.dtype == m.bfloat16
         )
+        self._tag(PassTag.MLX_STEP_FUSED if fuse else PassTag.MLX_STEP_UNFUSED)
         x_next: Any = None
         rows_prep = None
         batched = rows is not None or forest is not None
@@ -1342,6 +1353,9 @@ class _MlxMixin(_State):
     def _forward_mega(self, ids: Any, cache: Any, T: int, pick: Any = None) -> torch.Tensor:
         """The pass as one dispatch: the picked ids [1, T] int32 (the kernel's argmax, or a sample over the logits
         it leaves in its scratch); the cache's rows appended in the kernel."""
+        self._tag(PassTag.MLX_MEGA)
+        self._tag_tiers(self.L)
+        self._tag_quant()
         m = mlxdev.mx()
         mg = self._mega
         assert mg is not None  # _forward_mega runs only when the megakernel is built
@@ -1694,6 +1708,7 @@ class _MlxMixin(_State):
         """The Qwen3.5 hybrid on the GPU: attention layers and MLPs as MLX graphs, the DeltaNet as one dispatch per
         layer (or per position on the CPU kernel with per-node checkpoints under speculation); a tree attends
         through one mask. `lazy` keeps the new DeltaNet states in the graph."""
+        self._tag(PassTag.MLX_HYBRID)
         m = mlxdev.mx()
         be = self.mlx
         assert be is not None

@@ -1,0 +1,150 @@
+# The certification manifests as a committed check (enforcement lives here, not in gitignored local hooks).
+# Prints the model-cell and native-op matrices into the job summary, then runs the torch-free gates as blocking
+# steps: a gap, a reasonless DNR, core family/quant drift, or a native-op gap fails the job. The engine-dependent
+# guards (the cert runner, the runtime drift guards) need torch, so they run against the wheel in wheels.yml.
+# Model-free, CPU-only, fast.
+name: cert
+
+on:
+  push:
+    branches: [main]
+    paths: ["tests/cert/**", "btb/kinds.py", "btb/engine/families.py", "btb/engine/native.py", "btb/hf.py", "btb/serve.py", "btb/tools.py", "btb/mlx/**", "native/**", "tests/fixtures/**"]
+  pull_request:
+    paths: ["tests/cert/**", "btb/kinds.py", "btb/engine/families.py", "btb/engine/native.py", "btb/hf.py", "btb/serve.py", "btb/tools.py", "btb/mlx/**", "native/**", "tests/fixtures/**"]
+
+concurrency:
+  group: cert-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cert:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      # The manifests import only kinds/hf/spec + gguf + numpy, no torch or engine, so no wheel is needed to
+      # enumerate. (btb can't be pip-installed on a plain runner - setup.py refuses without the native lib - so
+      # the engine-dependent checks run in wheels.yml against the built wheel. Here we keep the torch-free half.)
+      # transformers installs without torch (its frameworks are optional); test_deps only reads its metadata
+      - name: Install torch-free deps
+        run: python -m pip install --quiet gguf numpy pytest transformers
+
+      # Coverage is the UNION of receipts (tests/cert/receipt.py) and receipts are deliberately not committed, so
+      # the run has to collect them: each one a contributor pastes into the PR description as a ```json btb-receipt
+      # block (their GPU box, their Mac). They land in one dir and BTB_CERT_RECEIPTS points the later steps at it.
+      # The PR body is untrusted input: it reaches python only through the environment (never interpolated into
+      # this script, which would be shell injection) and is parsed as JSON, never executed.
+      - name: Collect coverage receipts
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          dir=$(mktemp -d)
+          echo "BTB_CERT_RECEIPTS=$dir" >> "$GITHUB_ENV"
+          python - "$dir" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          dest = sys.argv[1]
+          kept = 0
+          # a receipt's strings are rendered into the job summary and compared to cell ids: keep each one line, a
+          # plain charset and bounded, so a crafted body can neither inject markdown nor grant anything (a mangled
+          # id simply matches no cell). `source` lets the report label a pasted receipt as claimed, not CI-verified.
+          unsafe = re.compile(r"[^A-Za-z0-9 ._/+:-]")
+          link = re.compile(r"://|www\.", re.I)  # the two autolink triggers; ':' itself stays for the timestamp
+
+          def clean(s, limit):
+              return unsafe.sub("?", link.sub("?", s.replace("\n", " ").replace("\r", " ")))[:limit]
+
+          for block in re.findall(r"```json btb-receipt[^\n]*\n(.*?)\n?```", os.environ.get("PR_BODY") or "", re.S):
+              try:
+                  doc = json.loads(block)
+              except (ValueError, RecursionError):  # malformed, or nested past the interpreter's limit
+                  continue
+              if not isinstance(doc, dict):
+                  continue
+              machine, when, covered = doc.get("machine"), doc.get("when"), doc.get("covered")
+              if not isinstance(machine, str) or not isinstance(when, str):
+                  continue
+              if not isinstance(covered, list) or len(covered) > 20000 or not all(isinstance(c, str) for c in covered):
+                  continue
+              kept += 1
+              doc = {
+                  "machine": clean(machine, 120),
+                  "when": clean(when, 40),
+                  "covered": [clean(c, 200) for c in covered],
+                  "source": "pr-body",
+              }
+              with open(os.path.join(dest, f"pr-{kept}.json"), "w", encoding="utf-8") as f:
+                  json.dump(doc, f, indent=2, sort_keys=True)
+          print(f"pasted receipts kept: {kept}")
+          PY
+          echo "receipts in $dir:"; ls -1 "$dir" || true
+
+      - name: Model-cell matrix
+        run: python -m tests.cert.manifest --report | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Native-op matrix
+        run: python -m tests.cert.native_ops --report | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: CUDA card-kernel matrix
+        run: python -m tests.cert.cuda_ops --report | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: MLX kernel matrix
+        run: python -m tests.cert.mlx_ops --report | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Tool-call parser matrix
+        run: python -m tests.cert.tool_ops --report | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Server route matrix
+        run: python -m tests.cert.serve_ops --report | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # blocking: a gap, reasonless DNR, orphan fixture, or core family/quant drift fails --check; a native-op/
+      # export gap, a CUDA or MLX kernel present-but-unregistered, a parser/family or server route with no test,
+      # fails --check; the pytest runs re-assert the same invariants as unit tests.
+      #
+      # One step per gate, not one script: the model-cell gate is expected to stay red while coverage gaps exist,
+      # and under a shared `bash -e` its failure took every gate after it with it - five checks and both pytest
+      # runs never executed. Separate steps keep each gate's own status visible and each one runs regardless.
+      - name: Gate - model-cell manifest
+        run: python -m tests.cert.manifest --check
+
+      - name: Gate - native ops
+        if: ${{ !cancelled() }}
+        run: python -m tests.cert.native_ops --check
+
+      - name: Gate - CUDA card kernels
+        if: ${{ !cancelled() }}
+        run: python -m tests.cert.cuda_ops --check
+
+      - name: Gate - MLX kernels
+        if: ${{ !cancelled() }}
+        run: python -m tests.cert.mlx_ops --check
+
+      - name: Gate - tool-call parsers
+        if: ${{ !cancelled() }}
+        run: python -m tests.cert.tool_ops --check
+
+      - name: Gate - server routes
+        if: ${{ !cancelled() }}
+        run: python -m tests.cert.serve_ops --check
+
+      - name: Gate - matrix unit tests
+        if: ${{ !cancelled() }}
+        run: |
+          python -m pytest tests/cert/test_manifest.py tests/cert/test_native_ops.py tests/cert/test_cuda_ops.py \
+            tests/cert/test_mlx_ops.py tests/cert/test_tool_ops.py tests/cert/test_serve_ops.py \
+            tests/cert/test_deps.py -q
+
+      # the oracle's derivation + staleness gates are torch-free (the reproducibility gate needs the engine
+      # and runs against the wheel in wheels.yml, with the runner's correctness assertions)
+      - name: Gate - oracle derivation and staleness
+        if: ${{ !cancelled() }}
+        run: python -m pytest tests/cert/test_oracle.py -k "not reproducible" -q
