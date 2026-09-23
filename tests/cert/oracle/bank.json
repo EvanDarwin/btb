@@ -1,0 +1,156 @@
+{
+  "decode": {
+    "greedy": true,
+    "n": 6
+  },
+  "families": {
+    "gemma3": {
+      "fixture": "tiny_gemma3",
+      "fixture_hash": "sha256:4ac06bf6ebafc36479ebf20e83a45d2b344eba99e8af02905cf677f18b76953d",
+      "tokens": {
+        "single": [
+          14,
+          14,
+          14,
+          14,
+          14,
+          14
+        ],
+        "standard": [
+          38,
+          38,
+          38,
+          97,
+          97,
+          97
+        ]
+      }
+    },
+    "gpt_oss": {
+      "fixture": "tiny_gpt_oss",
+      "fixture_hash": "sha256:95fb28444336fe58a93f26a72c21d6b0adf1dd93018504b2d47b6c5dec4f744e",
+      "tokens": {
+        "single": [
+          504,
+          229,
+          216,
+          118,
+          60,
+          288
+        ],
+        "standard": [
+          370,
+          339,
+          355,
+          191,
+          185,
+          106
+        ]
+      }
+    },
+    "phi3": {
+      "fixture": "tiny_phi3",
+      "fixture_hash": "sha256:9011e21cd17b691ba7a96776a6eaffd18134907787416412f85f98e8e518cf3d",
+      "tokens": {
+        "single": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "standard": [
+          4,
+          83,
+          83,
+          83,
+          83,
+          83
+        ]
+      }
+    },
+    "qwen3": {
+      "fixture": "tiny_qwen3",
+      "fixture_hash": "sha256:445ed8ebeca8e37e12b20992d3b3dc6c10d15657f8e0113a2a5b59db5f749bbb",
+      "tokens": {
+        "single": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "standard": [
+          91,
+          91,
+          91,
+          91,
+          91,
+          91
+        ]
+      }
+    },
+    "qwen3_5": {
+      "fixture": "tiny_q35",
+      "fixture_hash": "sha256:08486de721444076dad676d7df2bc4e94d5b9001e47f8868d41495ca86770d4a",
+      "tokens": {
+        "single": [
+          0,
+          73,
+          396,
+          387,
+          81,
+          451
+        ],
+        "standard": [
+          390,
+          299,
+          377,
+          441,
+          428,
+          78
+        ]
+      }
+    },
+    "qwen4": {
+      "fixture": "tiny_q4",
+      "fixture_hash": "sha256:93a633c022ef2bf178ef35d4f956a9bc1f847d5a0faa19c5bf5a0b3b2087505c",
+      "tokens": {
+        "single": [
+          45,
+          427,
+          306,
+          291,
+          355,
+          449
+        ],
+        "standard": [
+          477,
+          118,
+          221,
+          79,
+          224,
+          268
+        ]
+      }
+    }
+  },
+  "notes": {
+    "empty": "a zero-length prompt is out of scope: the engine rejects it at the gemv/matvec (1..16 rows) on every device, so there is no decode to bank as a boundary input; the single-token prompt covers boundary prefill instead"
+  },
+  "prompts": {
+    "single": [
+      1
+    ],
+    "standard": [
+      1,
+      2,
+      3,
+      4
+    ]
+  },
+  "reference_device": "cpu",
+  "schema": 1
+}

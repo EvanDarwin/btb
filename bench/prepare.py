@@ -11,13 +11,10 @@ from __future__ import annotations
 import argparse
 import os
 import subprocess
-import sys
 from collections.abc import Sequence
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from lib import COMPARE_PY, ROOT, say
-from lib.env import compare_env_mismatch, compare_tools, setup_compare_env
+from bench.lib import COMPARE_PY, ROOT, say
+from bench.lib.env import compare_env_mismatch, compare_tools, setup_compare_env
 
 # the upstream repo; its convert_hf_to_gguf.py is the only piece llama-cpp-python does not ship (the runtime
 # loads a GGUF, it does not build one)

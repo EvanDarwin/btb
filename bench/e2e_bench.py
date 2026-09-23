@@ -12,8 +12,8 @@ Two kinds of timing, all through pytest-benchmark (a stable, statistically-sound
     fixture or real model needed.
 
 The native CPU ops live in Rust criterion (`native/benches/*.rs`, `cargo bench`) - a different toolchain, not
-pytest. `bench/e2e_delta.py` turns two of this bench's JSON runs into the base-vs-PR deltas the PR comment
-renders, grouped by each entry's bench group.
+pytest. `python -m bench.report` compares two runs of both (the base-vs-PR deltas the PR comment renders),
+grouped by each entry's bench group.
 
 Not part of `pytest tests` (bench/ is outside testpaths); the bench workflow runs it explicitly.
 """
@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import ctypes
 import os
-import sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING, cast
 
@@ -34,12 +33,9 @@ import btb
 from btb import mlx as mlxdev
 from btb.engine.native import Native
 from btb.kinds import Quant, QuantClass, latt_backend_key, quants_of
+from tests.cert.spec import FIXTURE_STEM, Hardware
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# bench/ sits outside testpaths, so the checkout root is not on the path yet; the cert's axes (the fixture stem
-# per family, the hardware names) are the single source the sections and ids here are derived from.
-sys.path.insert(0, ROOT)
-from tests.cert.spec import FIXTURE_STEM, Hardware  # noqa: E402
 
 if TYPE_CHECKING:
     import mlx.core as mx_

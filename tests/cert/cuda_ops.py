@@ -17,9 +17,11 @@ import re
 import sys
 from enum import StrEnum
 
+from .core import BTB_SRC
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CUDA_DIR = os.path.join(ROOT, "native", "cuda")
-NATIVE_PY = os.path.join(ROOT, "btb", "engine", "native.py")
+NATIVE_PY = os.path.join(BTB_SRC, "engine", "native.py")
 
 
 class Missing(StrEnum):

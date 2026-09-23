@@ -110,7 +110,7 @@ line-ending = "lf"
 [tool.mypy]
 # the interpreter the checks run under (numpy's stubs use 3.12 syntax); ruff keeps the code itself at 3.11
 python_version = "3.13"
-files = ["btb", "bench", "tests", ".github/scripts", "setup.py", "build.py"]
+files = ["btb", "bench", "tests", "setup.py", "build.py"]
 check_untyped_defs = true
 warn_unused_ignores = true
 warn_redundant_casts = true
@@ -138,7 +138,7 @@ ignore_missing_imports = true
 pythonVersion = "3.13"
 venvPath = "."
 venv = ".venv"
-include = ["btb", "bench", "tests", ".github/scripts", "setup.py"]
+include = ["btb", "bench", "tests", "setup.py"]
 exclude = [".venv", ".venv-compare", "native", "bench/results"]
 typeCheckingMode = "basic"
 reportMissingModuleSource = false   # mlx and the bench backends ship no stubs

@@ -21,30 +21,23 @@ import torch
 from pytest import CaptureFixture, MonkeyPatch
 
 from btb.kinds import Json
-from tests.helpers import ROOT, checkout
+from tests.helpers import checkout
 
 if TYPE_CHECKING:
-    from lib.records import BenchDevice, BenchDtype, BenchStatus
-    from lib.tools import BenchTool
+    from bench.lib.records import BenchDevice, BenchDtype, BenchStatus
+    from bench.lib.tools import BenchTool
 
 
 def _bench(name: str) -> ModuleType:
-    """A module of bench/lib, imported from the checkout with bench/ first on the path, as the scripts have it."""
+    """A module of bench/lib, imported lazily so a checkout without the bench sources skips rather than errors."""
     checkout("bench", "lib", name + ".py")
-    bench = os.path.join(ROOT, "bench")
-    if bench not in sys.path:
-        sys.path.insert(0, bench)
-    return importlib.import_module("lib." + name)
+    return importlib.import_module("bench.lib." + name)
 
 
 def _script(name: str) -> ModuleType:
-    """bench/matrix.py or bench/compare.py as a module, the way `python bench/<name>.py` loads it."""
-    _bench("records")
-    spec = importlib.util.spec_from_file_location(name, checkout("bench", name + ".py"))
-    assert spec is not None and spec.loader is not None
-    m = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(m)
-    return m
+    """bench/matrix.py or bench/compare.py as a module, the way `python -m bench.<name>` loads it."""
+    checkout("bench", name + ".py")
+    return importlib.import_module("bench." + name)
 
 
 def _enums() -> tuple[type[BenchStatus], type[BenchDevice], type[BenchDtype]]:
@@ -568,7 +561,7 @@ def test_run_cell_reads_the_record_back_and_reports_a_failure_or_a_kill(
         device=BD.GPU, dtype=BT.BF16, tool="llama-cpp", args=["--tool", "llama-cpp", "--n-gpu-layers", "-1"]
     )
     c = run.run_cell(tool_cell, "q.jsonl", "64", "", str(tmp_path), 100, compare_py="/venv/python")
-    assert procs[-1].argv[:2] == ["/venv/python", os.path.join(run.HERE, "compare.py")]
+    assert procs[-1].argv[:3] == ["/venv/python", "-m", "bench.compare"]
     assert c["status"] is BS.OK and c["report"] is None and "--rows" not in procs[-1].argv
     # a child that ends with no record: DNR, its exit code and the log's tail in the reason
     popen(record=None, rc=3)

@@ -16,7 +16,7 @@ from btb.engine.native import Native
 from btb.kinds import PassReport, PassTag
 from tests.helpers import FIXTURES, loaded_model
 
-BTB = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "btb")
+BTB = os.path.dirname(os.path.abspath(btb.__file__))  # the package under test: the checkout's, or the wheel's
 _ENGINE = os.path.join(BTB, "engine")
 QWEN3 = os.path.join(FIXTURES, "tiny_qwen3")
 

@@ -16,10 +16,10 @@ import sys
 import time
 from typing import cast
 
-from lib import HERE, ROOT
-from lib.host import memory_state
-from lib.records import BenchGuard, BenchMatrixCell, BenchRecord, BenchStatus
-from lib.table import cell_label
+from bench.lib import ROOT
+from bench.lib.host import memory_state
+from bench.lib.records import BenchGuard, BenchMatrixCell, BenchRecord, BenchStatus
+from bench.lib.table import cell_label
 
 
 def run_cell(
@@ -45,7 +45,7 @@ def run_cell(
         os.remove(out)
     label = f"{cell['model']} {cell_label(cell)} {cell['dtype']}"
     if cell.get("tool"):
-        argv = [compare_py or sys.executable, os.path.join(HERE, "compare.py"), cell["path"]]
+        argv = [compare_py or sys.executable, "-m", "bench.compare", cell["path"]]
     else:
         argv = [sys.executable, "-m", "btb.cli", "bench", cell["path"]]
     argv += ["--prompts", prompts, "--new", new, "--out", out, "--label", label, *cell["args"]]

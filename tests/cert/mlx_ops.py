@@ -28,8 +28,10 @@ import sys
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from .core import BTB_SRC
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-MLX_DIR = os.path.join(ROOT, "btb", "mlx")
+MLX_DIR = os.path.join(BTB_SRC, "mlx")
 TESTS = os.path.join(ROOT, "tests")
 
 
