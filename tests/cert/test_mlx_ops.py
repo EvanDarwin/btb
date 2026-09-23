@@ -5,9 +5,12 @@ family with no (or an absent) parity test fails here."""
 
 from __future__ import annotations
 
+import pytest
+
 from . import mlx_ops
 
 
+@pytest.mark.cert_gap
 def test_no_gaps() -> None:
     """the full gate: registry/source drift AND a family with no parity test both fail here - a kernel covered
     only indirectly (e.g. kv, run through the engine cache) is uncertified and gates until it gets a parity test."""

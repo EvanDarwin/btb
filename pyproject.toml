@@ -160,7 +160,10 @@ fallback_version = "0.0.0"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-q"
-markers = ["timing: asserts on wall-clock rates or a process-wide limit; not run on shared CI runners"]
+markers = [
+    "timing: asserts on wall-clock rates or a process-wide limit; not run on shared CI runners",
+    "cert_gap: fails while a certification gap is open (cert.yml gates on it); not a code failure, so a wheel build does not stop on it",
+]
 
 [tool.pylint.messages_control]
 # W0603 global-statement: the lazy kernel caches (btb/mlx/*), the CUDA flag and MEM_START are module state

@@ -2,7 +2,7 @@
 on this machine, assert the engine loads it, that the sub-path's OWN `PassTag` engaged, and that greedy decode is
 deterministic (two independent loads of the same fixture produce identical tokens). A greedy cell is also held to
 the banked oracle (`oracle.assert_matches`), so a deterministically-wrong path fails here rather than certifying
-itself; a sampled cell has no greedy reference and rests on determinism plus the sampler tag.
+itself; a sampled cell is held to the oracle's banked seeded draw the same way.
 
 The tag assertion is what makes a receipt worth something: it is the sub-path's own `expect`, carried on
 `spec.DeviceSubpath`, so a renamed key cannot quietly turn it off and a fallback (torch on a card without the
@@ -24,7 +24,6 @@ import pytest
 
 import btb
 from btb.kinds import FamilyKind, PassTag
-from btb.sampling import Sampling
 from tests.helpers import FIXTURES, GGUF_FIXTURES, assert_same_tokens, loaded_model
 
 if TYPE_CHECKING:
@@ -33,11 +32,7 @@ if TYPE_CHECKING:
     from btb.engine.model import StreamedTextModel
 
 from . import core, manifest, oracle, receipt, spec
-from .oracle import PROMPT, N  # the one decode the oracle banks; the cells must not drift from it
-
-# a fixed-seed sampling config: the Gumbel draw is keyed by (seed, row, position), so two loads still match
-# (reproducible) while exercising the sampler kernels a greedy run never touches.
-SAMPLING = Sampling(temperature=0.8, top_p=0.95, top_k=40, seed=20260919)
+from .oracle import PROMPT, SAMPLING, N  # the decodes the oracle banks; the cells must not drift from them
 
 
 def _hardware_here(hw: spec.Hardware) -> bool:
@@ -120,10 +115,9 @@ def test_cell_loads_and_is_deterministic(
             if i == 0:
                 _assert_path_engaged(sm, kind, storage, dev, decode, stem)
     assert_same_tokens(runs[0], runs[1], f"{stem} on {dev.key}/{decode.value} decoded differently across two loads")
-    if decode is spec.Decode.GREEDY:
-        # correctness, not just determinism: the greedy output must match the banked reference (the same tokens
-        # every device produces), so a deterministically-WRONG path fails. Sampled has no greedy reference.
-        oracle.assert_matches(kind, runs[0], dev.hardware.value)
+    # correctness, not just determinism: the output must match the banked reference (the same tokens every device
+    # produces), so a deterministically-WRONG path fails - greedy and seeded-sampled alike
+    oracle.assert_matches(kind, runs[0], dev.hardware.value, sampled=decode is spec.Decode.SAMPLED)
     receipt.record(manifest.safetensors_id(kind, dev.key, decode))  # ran+passed here (cross-machine union)
 
 
@@ -293,6 +287,7 @@ def test_cross_process_determinism() -> None:
     assert outs[0] == outs[1], f"cross-process nondeterminism on {stem}: {outs[0]!r} != {outs[1]!r}"
 
 
+@pytest.mark.cert_gap
 def test_cross_machine_coverage() -> None:
     """the union gate: every runnable cell must appear in some receipt, so a cell no machine has ever run+passed
     fails here. No one machine has every device - CI has no GPU, the Mac no CUDA - so this is the union of the

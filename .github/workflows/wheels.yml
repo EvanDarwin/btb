@@ -215,7 +215,8 @@ jobs:
           python -m pip install --require-hashes -r .github/requirements-test.txt
           python -m pip install --no-deps ./dist/*.whl
           mv btb btb.src   # so `import btb` resolves to the installed wheel, not the source tree
-          python -m pytest tests -q -m "not timing"
+          # an open certification gap is cert.yml's to report; the wheel stops only on a failing test
+          python -m pytest tests -q -m "not timing and not cert_gap"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-${{ matrix.id }}

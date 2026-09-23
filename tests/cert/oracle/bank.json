@@ -1,12 +1,35 @@
 {
   "decode": {
-    "greedy": true,
-    "n": 6
+    "n": 6,
+    "sampled": {
+      "seed": 20260919,
+      "temperature": 0.8,
+      "top_k": 40,
+      "top_p": 0.95
+    }
   },
   "families": {
     "gemma3": {
       "fixture": "tiny_gemma3",
       "fixture_hash": "sha256:4ac06bf6ebafc36479ebf20e83a45d2b344eba99e8af02905cf677f18b76953d",
+      "sampled": {
+        "single": [
+          32,
+          243,
+          242,
+          91,
+          214,
+          110
+        ],
+        "standard": [
+          6,
+          38,
+          44,
+          243,
+          155,
+          31
+        ]
+      },
       "tokens": {
         "single": [
           14,
@@ -29,6 +52,24 @@
     "gpt_oss": {
       "fixture": "tiny_gpt_oss",
       "fixture_hash": "sha256:95fb28444336fe58a93f26a72c21d6b0adf1dd93018504b2d47b6c5dec4f744e",
+      "sampled": {
+        "single": [
+          234,
+          400,
+          271,
+          406,
+          271,
+          271
+        ],
+        "standard": [
+          333,
+          38,
+          110,
+          322,
+          155,
+          330
+        ]
+      },
       "tokens": {
         "single": [
           504,
@@ -51,6 +92,24 @@
     "phi3": {
       "fixture": "tiny_phi3",
       "fixture_hash": "sha256:9011e21cd17b691ba7a96776a6eaffd18134907787416412f85f98e8e518cf3d",
+      "sampled": {
+        "single": [
+          32,
+          227,
+          105,
+          6,
+          207,
+          28
+        ],
+        "standard": [
+          9,
+          214,
+          23,
+          92,
+          161,
+          141
+        ]
+      },
       "tokens": {
         "single": [
           0,
@@ -73,6 +132,24 @@
     "qwen3": {
       "fixture": "tiny_qwen3",
       "fixture_hash": "sha256:445ed8ebeca8e37e12b20992d3b3dc6c10d15657f8e0113a2a5b59db5f749bbb",
+      "sampled": {
+        "single": [
+          32,
+          26,
+          122,
+          9,
+          118,
+          146
+        ],
+        "standard": [
+          91,
+          214,
+          41,
+          12,
+          212,
+          136
+        ]
+      },
       "tokens": {
         "single": [
           0,
@@ -95,6 +172,24 @@
     "qwen3_5": {
       "fixture": "tiny_q35",
       "fixture_hash": "sha256:08486de721444076dad676d7df2bc4e94d5b9001e47f8868d41495ca86770d4a",
+      "sampled": {
+        "single": [
+          499,
+          504,
+          90,
+          284,
+          449,
+          34
+        ],
+        "standard": [
+          146,
+          38,
+          190,
+          74,
+          342,
+          230
+        ]
+      },
       "tokens": {
         "single": [
           0,
@@ -117,6 +212,24 @@
     "qwen4": {
       "fixture": "tiny_q4",
       "fixture_hash": "sha256:93a633c022ef2bf178ef35d4f956a9bc1f847d5a0faa19c5bf5a0b3b2087505c",
+      "sampled": {
+        "single": [
+          32,
+          316,
+          122,
+          333,
+          485,
+          23
+        ],
+        "standard": [
+          344,
+          38,
+          495,
+          274,
+          201,
+          305
+        ]
+      },
       "tokens": {
         "single": [
           45,
@@ -152,5 +265,5 @@
     ]
   },
   "reference_device": "cpu",
-  "schema": 1
+  "schema": 2
 }
