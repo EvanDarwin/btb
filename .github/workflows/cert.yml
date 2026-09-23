@@ -1,16 +1,43 @@
 # The certification manifests as a committed check (enforcement lives here, not in gitignored local hooks).
-# Prints the model-cell and native-op matrices into the job summary, then runs the torch-free gates as blocking
-# steps: a gap, a reasonless DNR, core family/quant drift, or a native-op gap fails the job. The engine-dependent
-# guards (the cert runner, the runtime drift guards) need torch, so they run against the wheel in wheels.yml.
-# Model-free, CPU-only, fast.
+# Renders the gaps in prose (tests/cert/comment.py) into the job summary and, on a PR, a sticky comment; prints
+# the matrices; then runs the torch-free gates as blocking steps: a gap, a reasonless DNR, core family/quant
+# drift, or a native-op gap fails the job. The engine-dependent guards (the cert runner, the runtime drift
+# guards) need torch, so they run against the wheel in wheels.yml. Model-free, CPU-only, fast.
+#
+# The PR's code runs in the `cert` job, which holds a read-only token. Posting the comment needs
+# pull-requests: write, so it is a separate job that checks out nothing and runs no repo code.
 name: cert
 
 on:
   push:
     branches: [main]
-    paths: ["tests/cert/**", "btb/kinds.py", "btb/engine/families.py", "btb/engine/native.py", "btb/hf.py", "btb/serve.py", "btb/tools.py", "btb/mlx/**", "native/**", "tests/fixtures/**"]
+    paths:
+      [
+        "tests/cert/**",
+        "btb/kinds.py",
+        "btb/engine/families.py",
+        "btb/engine/native.py",
+        "btb/hf.py",
+        "btb/serve.py",
+        "btb/tools.py",
+        "btb/mlx/**",
+        "native/**",
+        "tests/fixtures/**",
+      ]
   pull_request:
-    paths: ["tests/cert/**", "btb/kinds.py", "btb/engine/families.py", "btb/engine/native.py", "btb/hf.py", "btb/serve.py", "btb/tools.py", "btb/mlx/**", "native/**", "tests/fixtures/**"]
+    paths:
+      [
+        "tests/cert/**",
+        "btb/kinds.py",
+        "btb/engine/families.py",
+        "btb/engine/native.py",
+        "btb/hf.py",
+        "btb/serve.py",
+        "btb/tools.py",
+        "btb/mlx/**",
+        "native/**",
+        "tests/fixtures/**",
+      ]
 
 concurrency:
   group: cert-${{ github.ref }}
@@ -88,6 +115,18 @@ jobs:
           PY
           echo "receipts in $dir:"; ls -1 "$dir" || true
 
+      # before the gates, so the gaps render whatever they find
+      - name: Generate gaps commentary
+        run: |
+          python -m tests.cert.comment --out cert-comment.md
+          cat cert-comment.md >> "$GITHUB_STEP_SUMMARY"
+      - if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cert-comment
+          path: cert-comment.md
+          retention-days: 1
+
       - name: Model-cell matrix
         run: python -m tests.cert.manifest --report | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -139,7 +178,7 @@ jobs:
       - name: Gate - matrix unit tests
         if: ${{ !cancelled() }}
         run: |
-          python -m pytest tests/cert/test_manifest.py tests/cert/test_native_ops.py tests/cert/test_cuda_ops.py \
+          python -m pytest tests/cert/test_manifest.py tests/cert/test_native_ops.py tests/cert/test_cuda_ops.py tests/cert/test_comment.py \
             tests/cert/test_mlx_ops.py tests/cert/test_tool_ops.py tests/cert/test_serve_ops.py \
             tests/cert/test_deps.py -q
 
@@ -148,3 +187,30 @@ jobs:
       - name: Gate - oracle derivation and staleness
         if: ${{ !cancelled() }}
         run: python -m pytest tests/cert/test_oracle.py -k "not reproducible" -q
+
+  # the only job with a write token: no checkout, no repo code, just the rendered file and the API. It runs
+  # whether or not the gates passed - the gaps are what the comment is for
+  comment:
+    if: github.event_name == 'pull_request' && !cancelled()
+    needs: cert
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: cert-comment
+      # upserts the bot's own marked comment (anyone can post the marker)
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          marker='<!-- btb-cert-gaps -->'
+          id=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | contains(\"$marker\"))) | .id" | head -n1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@cert-comment.md >/dev/null && echo "updated $id"
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@cert-comment.md >/dev/null && echo "posted"
+          fi
