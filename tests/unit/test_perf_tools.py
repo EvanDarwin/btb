@@ -67,13 +67,11 @@ def test_a_zero_or_negative_baseline_median_has_no_delta() -> None:
         assert e["delta"] is None
 
 
-def test_both_runs_isa_tiers_carry_through() -> None:
-    """the tier comes from each run's machine_info (bench/conftest.py); the report, not the delta, judges it"""
+def test_the_pr_runs_isa_tier_carries_through() -> None:
+    """the tier comes from the PR run's machine_info (bench/conftest.py), for the report to state"""
     base = _doc(_bench("b", median=100.0, stddev=1.0, rounds=100), isa="avx2")
     (e,) = e2e_delta.deltas(base, _doc(_bench("b", median=200.0, stddev=1.0, rounds=100), isa="avx512"))
-    assert e["delta"] == pytest.approx(1.0) and (e["isa"], e["baseline_isa"]) == ("avx512", "avx2")
-    (e,) = e2e_delta.deltas(base, _doc(_bench("b", median=200.0, stddev=1.0, rounds=100)))
-    assert (e["isa"], e["baseline_isa"]) == ("", "avx2")
+    assert e["delta"] == pytest.approx(1.0) and e["isa"] == "avx512"
 
 
 def test_a_new_benchmark_lists_and_a_gone_one_drops() -> None:
@@ -203,21 +201,11 @@ def test_render_says_so_when_there_is_nothing_to_compare() -> None:
     assert report.MARKER in body and "_No benchmark results found._" in body
 
 
-def test_a_tier_mismatch_voids_every_row_and_the_gate() -> None:
-    """the e2e entries carry the two tiers; a mismatch voids the criterion rows too (same CPU) so nothing is
-    compared and nothing can trip the gate; a matching tier is just stated"""
-    criterion: Entry = {"id": "gemv/b16", "delta": 0.30, "lo": 0.25, "hi": 0.35}
-    e2e: Entry = {"id": "cpu/tiny_qwen3", "section": "cpu", "delta": 0.30, "lo": 0.25, "hi": 0.35}
-    same = report.comparable([criterion, {**e2e, "isa": "avx2", "baseline_isa": "avx2"}])
-    assert [e["delta"] for e in same] == [0.30, 0.30]
-    body, regressed = report.render(same, 0.05)
-    assert regressed and "at ISA tier `avx2`" in body
-    voided = report.comparable([criterion, {**e2e, "isa": "avx512", "baseline_isa": "avx2"}])
-    assert [e["delta"] for e in voided] == [None, None]
-    assert report.regressions(voided, 0.10) == []
-    body, regressed = report.render(voided, 0.05)
-    assert not regressed and "ran at ISA tier `avx512`, the main baseline's at `avx2`" in body
-    assert "not comparable" in body and "🔴" not in body
+def test_render_states_the_runs_isa_tier() -> None:
+    criterion: Entry = {"id": "gemv/b16", "delta": 0.01, "lo": -0.01, "hi": 0.03}
+    e2e: Entry = {"id": "cpu/tiny_qwen3", "section": "cpu", "delta": 0.0, "lo": -0.02, "hi": 0.02, "isa": "avx2"}
+    body, _ = report.render([criterion, e2e], 0.05)
+    assert "at ISA tier `avx2`" in body
     body, _ = report.render([criterion], 0.05)
     assert "ISA tier" not in body
 

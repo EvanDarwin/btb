@@ -210,6 +210,12 @@ def gaps() -> list[tuple[str, str]]:
     return [(s, _what(k, s)) for k, s in _findings()]
 
 
+def coverage() -> list[tuple[int, int, str]]:
+    """(certified, total, what) for the comment's covered summary"""
+    tested = sum(1 for op in OPS if op.test is not None and _test_exists(op.test))
+    return [(tested, len(OPS), "server routes with a test")]
+
+
 def render_missing() -> list[str]:
     """the gaps in plain language - what is absent and how to close each - the agent-facing to-do a skill wraps."""
     items = _findings()

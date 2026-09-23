@@ -1,8 +1,9 @@
 # The certification manifests as a committed check (enforcement lives here, not in gitignored local hooks).
-# Renders the gaps in prose (tests/cert/comment.py) into the job summary and, on a PR, a sticky comment; prints
-# the matrices; then runs the torch-free gates as blocking steps: a gap, a reasonless DNR, core family/quant
-# drift, or a native-op gap fails the job. The engine-dependent guards (the cert runner, the runtime drift
-# guards) need torch, so they run against the wheel in wheels.yml. Model-free, CPU-only, fast.
+# Renders the cert state in prose (tests/cert/comment.py: closed vs the base branch, covered, the gaps) into the
+# job summary and, on a PR, a sticky comment; prints the matrices; then runs the torch-free gates as blocking
+# steps: a gap, a reasonless DNR, core family/quant drift, or a native-op gap fails the job. The engine-dependent
+# guards (the cert runner, the runtime drift guards) need torch, so they run against the wheel in wheels.yml.
+# Model-free, CPU-only, fast.
 #
 # The PR's code runs in the `cert` job, which holds a read-only token. Posting the comment needs
 # pull-requests: write, so it is a separate job that checks out nothing and runs no repo code.
@@ -115,10 +116,24 @@ jobs:
           PY
           echo "receipts in $dir:"; ls -1 "$dir" || true
 
-      # before the gates, so the gaps render whatever they find
+      # the PR's base branch, whose own findings say what this PR closed; a base that predates tests/cert/delta.py
+      # has none, and the comment leaves the section out
+      - if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.base_ref }}
+          path: base
+      - name: The base branch's findings
+        if: github.event_name == 'pull_request'
+        working-directory: base
+        run: |
+          if [ -f tests/cert/delta.py ]; then python -m tests.cert.delta bank --out ../base-findings.json
+          else echo "the base predates tests/cert/delta.py; nothing to compare"; fi
+
+      # before the gates, so the comment renders whatever they find
       - name: Generate gaps commentary
         run: |
-          python -m tests.cert.comment --out cert-comment.md
+          python -m tests.cert.comment $([ -f base-findings.json ] && echo "--base base-findings.json") --out cert-comment.md
           cat cert-comment.md >> "$GITHUB_STEP_SUMMARY"
       - if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
