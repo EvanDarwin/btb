@@ -174,6 +174,13 @@ def gaps() -> list[tuple[str, str]]:
     return [(s, MISSING[k][0].format(s=s)) for k, s in _findings()]
 
 
+def coverage() -> list[tuple[int, int, str]]:
+    """(certified, total, what) for the comment's covered summary"""
+    defined = defined_parsers()
+    tested = sum(1 for row in PARSERS if _test_covers(row, row.name in defined))
+    return [(tested, len(PARSERS), "tool-call parsers with a test")]
+
+
 def render_missing() -> list[str]:
     """the gaps in plain language - what is absent and how to close each - the agent-facing to-do a skill wraps."""
     items = _findings()

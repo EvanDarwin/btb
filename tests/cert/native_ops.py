@@ -290,6 +290,24 @@ def gaps() -> list[tuple[str, str]]:
     return [(s, _what(k, s)) for k, s in _findings() if k is not Missing.TIER_UNIMPLEMENTED]
 
 
+def coverage() -> list[tuple[int, int, str]]:
+    """(certified, total, what) for the comment's covered summary: the ops carrying every guard they owe, and the
+    ISA tiers implemented across the vector families"""
+    ops = sum(
+        1
+        for op in OPS
+        if _exists(NATIVE_TESTS, op.parity)
+        and (_exists(NATIVE_TESTS, op.guard) or not op.pointer_math)
+        and _exists(NATIVE_BENCHES, op.bench)
+    )
+    fams = _vector_families()
+    tiers = sum(len(family_tiers(f)) for f in fams)
+    return [
+        (ops, len(OPS), "native ops with a parity test, a guard and a bench"),
+        (tiers, len(fams) * len(ISA_TIERS), "ISA tiers implemented across the native kernel families"),
+    ]
+
+
 def render_missing() -> list[str]:
     """the gaps in plain language - what is absent and how to close each - the agent-facing to-do a skill wraps."""
     items = _findings()

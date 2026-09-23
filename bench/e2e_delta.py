@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
-"""Two pytest-benchmark JSON runs (main baseline, this PR) as the {id, delta, lo, hi} list bench/report.py folds
+"""Two pytest-benchmark JSON runs (the base branch, this PR) as the {id, delta, lo, hi} list bench/report.py folds
 into its device sections: the ratio of the two medians and a 95% band from the two runs' standard errors of that
-median. Each entry carries both runs' ISA tiers; the report decides whether they are comparable.
+median. Each entry carries the PR run's ISA tier.
 
 A benchmark the baseline lacks lists with delta None (new); one only the baseline has is dropped. Output ids are
 `<device>/<model>`, taken from each benchmark's params so they land in the right device section.
@@ -53,7 +53,6 @@ class _Delta(TypedDict):
     lo: float
     hi: float
     isa: str
-    baseline_isa: str
 
 
 def isa_of(doc: Doc) -> str:
@@ -81,7 +80,7 @@ def _entries(doc: Doc) -> dict[str, _Entry]:
 
 def deltas(base: Doc, pr: Doc) -> list[_Delta]:
     b, p = _entries(base), _entries(pr)
-    base_isa, pr_isa = isa_of(base), isa_of(pr)
+    pr_isa = isa_of(pr)
     out: list[_Delta] = []
     for key in sorted(p.keys()):
         sec, label = p[key]["section"], p[key]["label"]
@@ -98,7 +97,6 @@ def deltas(base: Doc, pr: Doc) -> list[_Delta]:
                     "lo": 0.0,
                     "hi": 0.0,
                     "isa": pr_isa,
-                    "baseline_isa": base_isa,
                 }
             )
             continue
@@ -119,7 +117,6 @@ def deltas(base: Doc, pr: Doc) -> list[_Delta]:
                 "lo": delta - half,
                 "hi": delta + half,
                 "isa": pr_isa,
-                "baseline_isa": base_isa,
             }
         )
     return out

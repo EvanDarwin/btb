@@ -320,6 +320,12 @@ def gaps() -> list[tuple[str, str]]:
     return [(s, MISSING[k][0].format(s=s)) for k, s in _findings()]
 
 
+def coverage() -> list[tuple[int, int, str]]:
+    """(certified, total, what) for the comment's covered summary"""
+    tested = sum(1 for op in OPS if op.parity is not None and _exists(op.parity))
+    return [(tested, len(OPS), "MLX kernel families with a parity test")]
+
+
 def render_missing() -> list[str]:
     """the gaps in plain language - what is absent and how to close each - the agent-facing to-do a skill wraps."""
     items = _findings()

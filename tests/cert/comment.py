@@ -1,24 +1,27 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
-"""The cert gaps as a PR comment, in prose: what is missing and how to close it, for everything a cert gate
-fails on, then the non-blocking findings as potential improvements. Rendered from the same structures the gates
-read (`manifest.blocking()`, each matrix's `_findings()`/`gaps()`/`MISSING`), so the comment and the gates
-cannot disagree; a new matrix or gap kind appears here without an edit.
+"""The cert state as a PR comment, in prose: what the PR closed against its base branch, what is covered, then
+what is missing and how to close it for everything a cert gate fails on, and the non-blocking findings as
+potential improvements. Rendered from the same structures the gates read (`manifest.blocking()`, each matrix's
+`_findings()`/`gaps()`/`MISSING`/`coverage()`), so the comment and the gates cannot disagree; a new matrix or gap
+kind appears here without an edit. The base branch's findings are its own `tests.cert.delta bank` output.
 
-    python -m tests.cert.comment [--out PATH]
+    python -m tests.cert.comment [--base BASE_FINDINGS_JSON] [--out PATH]
 """
 
 from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import pkgutil
 import re
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from types import ModuleType
 
-from . import manifest, spec
+from . import delta, manifest, receipt, spec
 
 MARKER = "<!-- btb-cert-gaps -->"
 RECEIPT_HOWTO = (
@@ -56,8 +59,10 @@ def _sentence(s: str) -> str:
 @dataclass(frozen=True)
 class Matrix:
     title: str
+    module: ModuleType
     blocking: list[str]  # one prose paragraph per gap the matrix's --check fails on
     improvements: list[str]  # findings it surfaces but never blocks on
+    coverage: list[tuple[int, int, str]]  # (certified, total, what) from the matrix's coverage()
 
 
 def _prose(module: ModuleType, kind: StrEnum, subject: str) -> str:
@@ -84,17 +89,67 @@ def matrices() -> list[Matrix]:
             gates = (subject, mod.MISSING[kind][0].format(s=subject)) in gating
             (blocking if gates else improvements).append(_prose(mod, kind, subject))
         title = re.split(r"[.:]", (mod.__doc__ or info.name).strip(), maxsplit=1)[0].removeprefix("The ")
-        out.append(Matrix(_text(title[:1].upper() + title[1:]), blocking, improvements))
+        coverage = mod.coverage() if hasattr(mod, "coverage") else []
+        out.append(Matrix(_text(title[:1].upper() + title[1:]), mod, blocking, improvements, coverage))
+    return out
+
+
+def _by_device(ids: Iterable[str]) -> dict[str, int]:
+    """cell ids counted by the device sub-path each names"""
+    keys = {d.key for d in spec.DEVICE_SUBPATHS}
+    by: dict[str, int] = {}
+    for cid in ids:
+        dev = next((p for p in cid.split("/") if p in keys), "other")
+        by[dev] = by.get(dev, 0) + 1
+    return by
+
+
+def _mark(done: int, total: int) -> str:
+    return "✅" if total and done == total else ("🟡" if done else "⬜")
+
+
+def _covered(mats: list[Matrix]) -> list[str]:
+    """what is certified: the runnable cells a receipt proves, by device sub-path, then each matrix's coverage()"""
+    runnable = manifest.runnable_ids()
+    proven = runnable & receipt.merged()
+    have, want = _by_device(proven), _by_device(runnable)
+    per = ", ".join(f"{_subject(d)} {have.get(d, 0)}/{n}" for d, n in sorted(want.items()))
+    lines = [
+        f"- {_mark(len(proven), len(runnable))} **{len(proven)} of {len(runnable)} runnable cells proven by a "
+        f"receipt**: {per}"
+    ]
+    for m in mats:
+        lines += [f"- {_mark(done, total)} {done} of {total} {_text(what)}" for done, total, what in m.coverage]
+    return lines
+
+
+_FINDING = re.compile(r"\[([^/\]]+)/([^\]]+)\] (.*)")
+
+
+def _closed(base: list[str], mats: list[Matrix]) -> list[str]:
+    """the base branch's findings this PR no longer has, each struck through in the words it was reported in:
+    the manifest's per-cell findings tallied by kind, a matrix's by its MISSING row, anything else as recorded"""
+    modules = {m.module.__name__.rsplit(".", 1)[-1]: m.module for m in mats}
+    cells: dict[str, int] = {}
+    out: list[str] = []
+    for line in sorted(set(base) - delta.findings()):
+        m = _FINDING.match(line)
+        stem, kind, subject = m.groups() if m else ("", "", line)
+        if stem == "manifest" and kind in {k.value for k in manifest.Missing}:
+            cells[kind] = cells.get(kind, 0) + 1
+            continue
+        mod = modules.get(stem)
+        row = next((w for k, (w, _h) in mod.MISSING.items() if k.value == kind), None) if mod else None
+        what = row.format(s=_subject(subject)) if row else _subject(line)
+        out.append(f"- ✅ ~~{_text(_period(what[:1].upper() + what[1:]))}~~")
+    for kind, n in sorted(cells.items()):
+        what = manifest.MISSING[manifest.Missing(kind)][0]
+        out.append(f"- ✅ **{n} {_subject(kind)} cells**: ~~{_text(_sentence(what))}~~")
     return out
 
 
 def _unproven(ids: list[str]) -> list[str]:
-    keys = {d.key for d in spec.DEVICE_SUBPATHS}
-    by: dict[str, list[str]] = {}
-    for cid in ids:
-        dev = next((p for p in cid.split("/") if p in keys), "other")
-        by.setdefault(dev, []).append(cid)
-    counts = ", ".join(f"{_subject(d)} {len(v)}" for d, v in sorted(by.items()))
+    counts = ", ".join(f"{_subject(d)} {n}" for d, n in sorted(_by_device(ids).items()))
     return [
         "- "
         + _text(
@@ -182,24 +237,30 @@ def _manifest(b: manifest.Blocking) -> list[str]:
     return out
 
 
-def render() -> str:
-    """the comment body"""
+def render(base: list[str] | None = None) -> str:
+    """the comment body; `base` is the base branch's findings (`tests.cert.delta bank`), for what this PR closed"""
     b = manifest.blocking()
     mats = matrices()
+    lines = [MARKER, "## Certification", ""]
+    closed = _closed(base, mats) if base is not None else []
+    if closed:
+        lines += [f"### 🎉 Closed by this PR ({len(closed)})", "", *closed, ""]
+    lines += ["### Covered", "", *_covered(mats), ""]
     sections: list[tuple[str, list[str]]] = [("Coverage manifest", _manifest(b))]
     sections += [(m.title, [f"- {p}" for p in m.blocking]) for m in mats]
     sections = [(t, body) for t, body in sections if body]
-    lines = [MARKER, "## Certification gaps", ""]
     if not sections:
-        lines += ["Nothing blocks: every path the cert knows of is covered and proven by a receipt.", ""]
+        lines += ["### Gaps to close", "", "None: every path the cert knows of is covered and proven by a receipt.", ""]
     else:
         lines += [
+            "### Gaps to close",
+            "",
             "These implementation gaps must be closed before this change is certified; each says what is missing "
             "and how to close it. The cert gates fail until they are.",
             "",
         ]
         for title, body in sections:
-            lines += [f"### {title}", "", *body, ""]
+            lines += [f"#### {title}", "", *body, ""]
     improvements = [(m.title, m.improvements) for m in mats if m.improvements]
     if improvements:
         total = sum(len(i) for _t, i in improvements)
@@ -212,9 +273,14 @@ def render() -> str:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--base", default=None, metavar="JSON", help="the base branch's `tests.cert.delta bank` findings")
     ap.add_argument("--out", default=None, metavar="PATH", help="also write the comment here")
     a = ap.parse_args(argv)
-    body = render()
+    base: list[str] | None = None
+    if a.base:
+        with open(a.base, encoding="utf-8") as f:
+            base = [str(line) for line in json.load(f)]
+    body = render(base)
     sys.stdout.write(body)
     if a.out:
         with open(a.out, "w", encoding="utf-8") as f:

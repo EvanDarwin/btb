@@ -53,8 +53,7 @@ class Entry(TypedDict):
     delta: float | None
     lo: float
     hi: float
-    isa: NotRequired[str]  # the e2e side records the run's ISA tier and the baseline's
-    baseline_isa: NotRequired[str]
+    isa: NotRequired[str]  # the ISA tier the e2e side recorded for this run
 
 
 def _read_json(path: str) -> object | None:
@@ -128,8 +127,6 @@ def _from_e2e(pr_root: str, base_root: str | None) -> list[Entry]:
             entry["section"] = d["section"]
         if d["isa"]:
             entry["isa"] = d["isa"]
-        if d["baseline_isa"]:
-            entry["baseline_isa"] = d["baseline_isa"]
         out.append(entry)
     return out
 
@@ -137,27 +134,6 @@ def _from_e2e(pr_root: str, base_root: str | None) -> list[Entry]:
 def _doc(parsed: object) -> Doc:
     """a run's e2e.json as e2e_delta reads it: what was on disk when it is an object, else an empty run"""
     return cast(Doc, parsed) if isinstance(parsed, dict) else {}
-
-
-def tiers(entries: list[Entry]) -> tuple[str, str]:
-    """(this run's ISA tier, the baseline's) as the e2e entries recorded them, "" when unrecorded"""
-    for e in entries:
-        if e.get("isa") or e.get("baseline_isa"):
-            return e.get("isa", ""), e.get("baseline_isa", "")
-    return "", ""
-
-
-def comparable(entries: list[Entry]) -> list[Entry]:
-    """the entries with every delta voided when the two runs' tiers differ: the criterion rows ran on the same
-    CPU as the e2e rows, so one mismatch voids the whole comparison (and the gate with it)"""
-    isa, base = tiers(entries)
-    if not (isa and base and isa != base):
-        return entries
-    out: list[Entry] = []
-    for e in entries:
-        voided: Entry = {**e, "delta": None, "lo": 0.0, "hi": 0.0}
-        out.append(voided)
-    return out
 
 
 def _section(entry_id: str) -> str:
@@ -195,16 +171,9 @@ def _fmt(e: Entry) -> str:
 
 
 def render(entries: list[Entry], noise: float) -> tuple[str, bool]:
-    head = [MARKER, "## Benchmark comparison (main → PR)", ""]
-    isa, base = tiers(entries)
-    mismatch = bool(isa and base and isa != base)
-    if mismatch:
-        head += [
-            f"⚠️ This run's native/cpu benches ran at ISA tier `{_safe(isa)}`, the main baseline's at "
-            f"`{_safe(base)}` (a different runner CPU): the numbers are not comparable, so no deltas below.",
-            "",
-        ]
-    elif isa:
+    head = [MARKER, "## Benchmark comparison (base → PR)", ""]
+    isa = next((e["isa"] for e in entries if e.get("isa")), "")
+    if isa:
         head += [f"Native and cpu benches at ISA tier `{_safe(isa)}`.", ""]
     if not entries:
         return "\n".join(head + ["_No benchmark results found._", ""]), False
@@ -215,7 +184,7 @@ def render(entries: list[Entry], noise: float) -> tuple[str, bool]:
     any_reg = False
     n_changed = sum(1 for e in entries if e["delta"] is not None)
     lines = head + [
-        f"{n_changed} benchmarks compared vs the main baseline; a change is flagged only when its 95% CI clears "
+        f"{n_changed} benchmarks compared vs the base branch; a change is flagged only when its 95% CI clears "
         f"±{noise * 100:.0f}% (else it reads as runner noise). The perf gate is advisory on the shared runner. Sections "
         "collapsed below.",
         "",
@@ -232,8 +201,7 @@ def render(entries: list[Entry], noise: float) -> tuple[str, bool]:
         lines.append("| benchmark | Δ (median), 95% CI | |")
         lines.append("|---|---:|:--|")
         for e, (lbl, _reg) in zip(rows, flags):
-            cell, verdict = ("—", "not comparable") if mismatch else (_fmt(e), lbl)
-            lines.append(f"| `{_safe(e['id'])}` | {cell} | {verdict} |")
+            lines.append(f"| `{_safe(e['id'])}` | {_fmt(e)} | {lbl} |")
         lines.append("\n</details>\n")
     return "\n".join(lines) + "\n", any_reg
 
@@ -241,7 +209,7 @@ def render(entries: list[Entry], noise: float) -> tuple[str, bool]:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("pr_root", help="this run's result root (the repo, after the benches ran)")
-    ap.add_argument("--baseline", default=None, metavar="ROOT", help="the baseline run's result root")
+    ap.add_argument("--baseline", default=None, metavar="ROOT", help="the base branch run's result root")
     # 0.05: a change is flagged only when its whole 95% CI lower bound clears ±5%. Measured native criterion
     # baselines drift run-to-run up to ~+3.3% (CI lower bound ~+2.4%) on identical code - a 2% floor flagged that
     # as a regression; 5% sits above the observed drift so between-run noise reads as noise.
@@ -261,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
         "native baselines, and above the 0.05 comment noise floor)",
     )
     a = ap.parse_args(argv)
-    entries = comparable(_from_criterion(a.pr_root, a.baseline) + _from_e2e(a.pr_root, a.baseline))
+    entries = _from_criterion(a.pr_root, a.baseline) + _from_e2e(a.pr_root, a.baseline)
     body, regressed = render(entries, a.noise)
     sys.stdout.write(body)
     if a.out:
