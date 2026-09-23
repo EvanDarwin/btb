@@ -32,7 +32,7 @@ from .hf import (
 )
 
 # model discovery lives in hf.py; these names stay importable from here
-from .kinds import Json, Log
+from .kinds import Json, Log, Proposer
 from .options import Device
 
 os.environ.setdefault("KMP_BLOCKTIME", "0")
@@ -356,6 +356,9 @@ def load(
         vram_watch=bool(int(c.get("vram_watch", 1))),
         mlx_layers=mlx_layers,
         host_budget=pl.budget if pl is not None else None,
+        # the expert store is built inside __init__, so its policy travels as an argument, not an assignment after
+        bus_pass=bool(int(c.get("bus_pass", 1))),
+        store_pin=int(c.get("store_pin", 0)),
         log=log or (lambda *_a: None),
     )
     sm.plan = pl
@@ -414,7 +417,7 @@ def load(
     if sm.fam.own:
         sm.tree_budget = 0
         sm.v_max = 0
-    sm.proposer = "mtp_dyn" if (sm.tree_budget > 0 and has_drafter) else "ngram"
+    sm.proposer = Proposer.MTP_DYN if (sm.tree_budget > 0 and has_drafter) else Proposer.NGRAM
     # how every token is picked unless a call says otherwise: greedy, or the loaded temperature / top_p / top_k / seed
     from .sampling import Sampling
 
@@ -439,11 +442,6 @@ def load(
     )
     if sm.lookahead_rows == (0,):
         sm.lookahead_rows = ()
-    # the Bus Pass by default: 1-8% on the token over two pairs on NVMe, 11% fewer misses on the replay's warm
-    # passes (a second a token on a drive that seeks), bookkeeping its only cost
-    sm.bus_pass = bool(int(c.get("bus_pass", 1)))
-    # the store's pages held in RAM: 0 pageable, 1 pinned, "auto" pinned beside a card
-    sm.store_pin = c.get("store_pin", 0)
     # the experts seated on the card: 0 none, "auto" what the card has to spare, or a figure in GB
     ve = os.environ.get("BTB_VRAM_EXPERTS_GB", c.get("vram_experts_gb", 0))
     sm.vram_experts_gb = "auto" if str(ve).strip().lower() == "auto" else float(ve or 0)
@@ -494,7 +492,7 @@ def load(
             "you're doing!\n"
         )
         sm.drafter_weights = str(dm)
-        sm.proposer = "mtp_dyn"
+        sm.proposer = Proposer.MTP_DYN
         if not sm.tree_budget:
             sm.tree_budget = 14 if sm.mlx is not None else 16
     elif dm:

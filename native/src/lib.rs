@@ -38,6 +38,17 @@ fn guard<F: FnOnce() -> i32>(f: F) -> i32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(ERR_PANIC)
 }
 
+/// The kernel tier this process runs (`gemv::isa()`, so `BTB_NATIVE_ISA` is honored) as its lowercase
+/// `Isa` variant name - the tier a benchmark's numbers belong to. A static NUL-terminated string.
+#[no_mangle]
+pub extern "C" fn btb_isa() -> *const std::ffi::c_char {
+    static NAME: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        std::ffi::CString::new(format!("{:?}", gemv::isa()).to_lowercase()).expect("no NUL")
+    })
+    .as_ptr()
+}
+
 /// `y[i][r] = sum_c bf16(w[r][c]) * x[i][c]` in f32. `w` is `[rows, cols]` row-major bf16 bit patterns,
 /// `x` is `[b, cols]` f32, `y` is `[b, rows]` f32. `threads == 0` uses every core. The result is
 /// bit-identical for every `threads` and every `b`.

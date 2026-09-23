@@ -212,7 +212,10 @@ def make_gguf() -> None:
     os.makedirs(out, exist_ok=True)
     for t in GGUF_TYPES:
         write_gguf(os.path.join(FIXTURES, "tiny_qwen3"), os.path.join(out, f"tiny_qwen3-{t}.gguf"), t)
-    write_gguf(os.path.join(FIXTURES, "tiny_phi3"), os.path.join(out, "tiny_phi3-bf16.gguf"), "bf16")
+    # phi3 in bf16 (its fused projections exercise the table's other layout) and the affine quants, so the
+    # affine-as-stored kernels have a phi3 tiny fixture too, not only qwen3
+    for t in ("bf16", "q4_0", "q8_0"):
+        write_gguf(os.path.join(FIXTURES, "tiny_phi3"), os.path.join(out, f"tiny_phi3-{t}.gguf"), t)
     write_gguf(os.path.join(FIXTURES, "tiny_gpt_oss"), os.path.join(out, "tiny_gpt_oss-mxfp4.gguf"), "bf16")
     print("[fixture] gguf twins regenerated")
 
@@ -285,6 +288,26 @@ def build_phi3(out_dir: str) -> None:
         "attention_bias": False, "torch_dtype": "bfloat16",
     }  # fmt: skip
     m = Phi3ForCausalLM(Phi3Config(**kw)).eval().to(torch.bfloat16)
+    os.makedirs(out_dir, exist_ok=True)
+    m.save_pretrained(out_dir, max_shard_size="100KB", safe_serialization=True)
+
+
+def build_gemma3(out_dir: str) -> None:
+    import torch
+    from transformers import Gemma3ForCausalLM, Gemma3TextConfig
+
+    torch.manual_seed(0)
+    # 6 layers so the default 5-sliding : 1-full pattern gives at least one global-attention layer, exercising
+    # the dual (local/global) rope; a small window so the sliding path is real at a tiny context. gelu_pytorch_tanh
+    # and the sandwich norm come from the config's model_type, and the input embedding is scaled by sqrt(hidden).
+    kw: Json = {
+        "vocab_size": 256, "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 6,
+        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16, "max_position_embeddings": 512,
+        "sliding_window": 32, "rms_norm_eps": 1e-6, "tie_word_embeddings": True,
+        "hidden_activation": "gelu_pytorch_tanh", "query_pre_attn_scalar": 16,
+        "pad_token_id": 0, "eos_token_id": 1, "bos_token_id": 2,
+    }  # fmt: skip
+    m = Gemma3ForCausalLM(Gemma3TextConfig(**kw)).eval().to(torch.bfloat16)
     os.makedirs(out_dir, exist_ok=True)
     m.save_pretrained(out_dir, max_shard_size="100KB", safe_serialization=True)
 
@@ -606,7 +629,7 @@ def bank_gpt_oss(base_dir: str, out: str) -> None:
 
 # --- orchestration -----------------------------------------------------------------------------------------
 
-FAMILIES = ("qwen3", "q35", "phi3", "q4", "gpt_oss")
+FAMILIES = ("qwen3", "q35", "phi3", "q4", "gpt_oss", "gemma3")
 
 
 def make(name: str) -> None:
@@ -624,13 +647,16 @@ def make(name: str) -> None:
         build_q35(base)
     elif name == "gpt_oss":
         build_gpt_oss(base)
+    elif name == "gemma3":
+        build_gemma3(base)
     else:
         raise SystemExit(f"unknown family {name!r}; one of {FAMILIES}")
     write_tokenizer(base)
-    if name in ("qwen3", "phi3", "q35"):
-        from btb.engine import pack_model
+    # every family packs to a 12-bit store (btb pack), incl. the MoE and Gemma paths, so the pack12 storage cell
+    # has a tiny fixture for each - verified they load and decode on CPU
+    from btb.engine import pack_model
 
-        pack_model(base, log=NO_LOG)
+    pack_model(base, log=NO_LOG)
     pack = os.path.join(FIXTURES, f"tiny_{name}-pack12")
     if name in ("qwen3", "phi3"):
         bank_dense(name, base, pack, os.path.join(FIXTURES, f"receipts_{name}.pt"))
@@ -643,6 +669,18 @@ def make(name: str) -> None:
     print(f"[fixture] tiny_{name} regenerated")
 
 
+def _rebank_oracle() -> None:
+    """refresh the P5 correctness oracle (tests/cert/oracle) so its banked greedy references and fixture hashes
+    track the fixtures just written; left alone until every banked family's fixture is on disk (a partial run)."""
+    from tests.cert import oracle
+
+    if all(os.path.isdir(oracle.fixture_dir(k)) for k in oracle.banked_kinds()):
+        oracle.write_bank(oracle.bank())
+        print("[fixture] cert oracle bank regenerated")
+    else:
+        print("[fixture] cert oracle bank left as is (not every served family's fixture is built)")
+
+
 def main(argv: list[str] | None = None) -> int:
     names = argv or list(FAMILIES)
     # the receipts are banked by the native gemv kernel, so the suite's 1e-6 tolerance holds
@@ -650,6 +688,7 @@ def main(argv: list[str] | None = None) -> int:
         print("[fixture] warning: no native library found; receipts banked on the torch path", file=sys.stderr)
     for name in names:
         make(name)
+    _rebank_oracle()
     return 0
 
 

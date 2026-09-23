@@ -17,6 +17,33 @@ crate-type = ["cdylib", "rlib"]
 # bit-identical for every thread count.
 rayon = "1"
 
+[dev-dependencies]
+# Per-op benches (`native/benches/`, one group per fused kernel). Each bench sets
+# `harness = false` and drives criterion itself.
+criterion = "0.5"
+
+# One `[[bench]]` per op family, all custom-harness. The benches build inputs with the parity
+# tests' generators (`tests/common/refs.rs`, `fixture.rs`) included by path, so core is untouched.
+[[bench]]
+name = "gemv"
+harness = false
+
+[[bench]]
+name = "attn"
+harness = false
+
+[[bench]]
+name = "delta"
+harness = false
+
+[[bench]]
+name = "sample"
+harness = false
+
+[[bench]]
+name = "direct"
+harness = false
+
 # Whole-crate inlining across the `#[target_feature]` task bodies and no per-CGU
 # duplication of the hot loops. No `target-cpu` flag: the SIMD paths are selected at
 # runtime by `is_x86_feature_detected!`, so one binary runs the AVX-512, AVX2 or

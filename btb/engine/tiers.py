@@ -21,7 +21,7 @@ import torch
 from .. import mlx as mlxdev
 from ..gguf import GROUP
 from ..hf import AFFINE_TYPES
-from ..kinds import Json, LayerKind, Tier
+from ..kinds import Json, LayerKind, Proposer, Tier
 from ..options import Device
 from ..pack12 import entries, unpack_bf16
 from ..sysinfo import process_working_set_bytes
@@ -285,7 +285,7 @@ class _TiersMixin(_State):
         aj = getattr(self, "aj", None)
         dd = aj.dev if aj is not None else getattr(self, "drafter_dev", None)
         drafter = Tier.NONE
-        if aj is not None or (mtp and str(getattr(self, "proposer", "")).startswith("mtp")):
+        if aj is not None or (mtp and Proposer.of(getattr(self, "proposer", Proposer.NGRAM)).mtp):
             drafter = Tier.CARD if (dd if dd is not None else dev).type == Device.CUDA else Tier.HOST
         rss = peak_memory()[0]
         pl = getattr(self, "plan", None)

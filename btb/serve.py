@@ -198,7 +198,7 @@ class ModelRegistry:
                 "name": self.primary_name,
                 "repo": self.primary_path,
                 "path": self.primary_path,
-                "type": _model_type(self.primary_path) or "",
+                "type": _model_type(self.primary_path),
                 "size": _model_bytes(self.primary_path),
                 "packed": is_packed(self.primary_path),
             }

@@ -1,0 +1,178 @@
+# Benchmarks on every PR, built and run ONCE: the native per-op criterion benches (`cargo bench`) plus
+# bench/e2e_bench.py - the one pytest bench that times the end-to-end tiny-model loop AND the MLX/CUDA per-op
+# kernels, each skipping off its backend. A push to main banks both halves as the `bench-baseline` artifact; a PR
+# pulls it, runs the same benches, and does two things off that one run: posts ONE sticky comment (criterion's own
+# CI for the native ops, pytest-benchmark's for everything in e2e.json) AND computes the perf gate.
+#
+# The gate (cert-coverage-gaps #3, cert-anti-drift P6) fails when a benchmark's WHOLE 95% CI clears the threshold
+# - a genuine slowdown, not a CI straddling zero from runner jitter. The hard gate belongs on dedicated hardware
+# (dev/plans/test-certification.md); this repo has none yet, so on the shared runner the gate is computed for real
+# but kept ADVISORY (reported in the job summary, does not fail the job). Two repo vars flip it to blocking with no
+# code change: vars.PERF_RUNNER = a quiesced runner label (defaults ubuntu-latest); vars.PERF_DEDICATED = "1" makes
+# the gate step's exit code fail the job. Actions pinned to wheels.yml's SHAs.
+#
+# TODO(matrix): the repo is public, so macOS (Apple silicon - the mlx ops run) and Windows runners are free; make
+# this a `runs-on` matrix and have a final job merge the per-OS results into one comment.
+name: bench
+
+on:
+  push:
+    branches: [main]
+    paths: ["native/**", "btb/**", "bench/e2e_bench.py", "bench/e2e_delta.py", ".github/workflows/bench.yml", ".github/scripts/bench_compare.py", "tests/fixtures/**", "tests/cert/spec.py", "tests/cert/native_ops.py", "build.py", "setup.py", "pyproject.toml"]
+  pull_request:
+    paths: ["native/**", "btb/**", "bench/e2e_bench.py", "bench/e2e_delta.py", ".github/workflows/bench.yml", ".github/scripts/bench_compare.py", "tests/fixtures/**", "tests/cert/spec.py", "tests/cert/native_ops.py", "build.py", "setup.py", "pyproject.toml"]
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+
+env:
+  ARTIFACT: bench-baseline
+  CRITERION: native/target/criterion
+  MAXTIME: "8"             # per-benchmark wall cap for the e2e: enough rounds that the slow whole-loop benches'
+                           # standard-error band (stddev/sqrt(rounds)) closes to ~2%; the fast micro-ops just
+                           # over-sample. Rounds are floored at 25 by the mark. pytest-benchmark caps by time,
+                           # not CI convergence, so this is a uniform ceiling, not an early stop.
+  GATE_THRESHOLD: "0.10"   # a regression trips only when its WHOLE 95% CI sits above +10% (vs the main baseline)
+
+jobs:
+  bench:
+    runs-on: ${{ vars.PERF_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      # the e2e bench needs a built btb (native lib + wheel); Rust is preinstalled on ubuntu-latest
+      - name: Build and install btb (CPU)
+        run: |
+          python build.py build
+          python -m pip install --quiet dist/*.whl
+          python -m pip install --quiet pytest==9.1.1 pytest-benchmark==5.3.0
+
+      - name: Fetch the main baseline (PR)
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p baseline
+          run_id=$(gh run list --workflow bench.yml --branch main --status success \
+            --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          if [ -n "$run_id" ] && gh run download "$run_id" -n "$ARTIFACT" -D baseline; then
+            echo "HAVE_BASELINE=1" >> "$GITHUB_ENV"
+          else
+            echo "HAVE_BASELINE=0" >> "$GITHUB_ENV"
+            echo "no baseline yet; first main run banks it"
+          fi
+
+      # every native op bench, drift-proof: bare `cargo bench` runs every [[bench]] target, so a new op's bench
+      # is in the mix the moment it exists (no hand-kept list to fall out of sync). Save the baseline on main,
+      # compare against it on a PR (criterion writes each bench's change/).
+      - name: Native op benches (all targets)
+        working-directory: native
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            cargo bench -- --save-baseline main
+          elif [ "$HAVE_BASELINE" = "1" ]; then
+            mkdir -p target/criterion && cp -r ../baseline/criterion/* target/criterion/ 2>/dev/null || true
+            cargo bench -- --baseline main
+          else
+            cargo bench
+          fi
+
+      # the one pytest bench: the end-to-end tiny-model loop on every device the runner has, plus the MLX/CUDA
+      # per-op kernels (empty on the ubuntu runner, populating on a macOS or CUDA one - see the matrix TODO).
+      # e2e_delta groups every entry by its bench group into the comment's sections.
+      # continue-on-error: a known-broken cell (qwen4 on MLX) exits the suite nonzero while pytest-benchmark still
+      # writes e2e.json for everything that did time. The steps below take the file as it comes - partial, or
+      # absent - so one broken cell costs its own numbers, not the whole comparison.
+      - name: End-to-end + op benches
+        continue-on-error: true
+        run: python -m pytest bench/e2e_bench.py --benchmark-json=e2e.json --benchmark-max-time=$MAXTIME -q -p no:cacheprovider
+
+      # main banks both halves (the criterion tree and the e2e JSON) as one artifact; a missing e2e.json banks the
+      # criterion half alone rather than failing - the PR side treats an absent baseline half as "nothing to compare"
+      - name: Bank the baseline (main)
+        if: github.event_name == 'push'
+        run: |
+          mkdir -p out/criterion
+          cp -r "$CRITERION"/. out/criterion/
+          if [ -f e2e.json ]; then
+            cp e2e.json out/e2e-baseline.json
+          else
+            echo "no e2e.json this run; banking the criterion half only"
+          fi
+      - name: Upload baseline (main)
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: out
+          retention-days: 90
+
+      # PR: one delta computation feeds both the comment and the gate
+      - name: Compute the e2e deltas (PR)
+        if: github.event_name == 'pull_request'
+        run: |
+          # both halves have to exist to diff: either can be missing when its run's e2e bench wrote nothing.
+          # e2e_delta intersects the two runs' benchmarks, so a partial e2e.json compares what it does carry.
+          if [ "$HAVE_BASELINE" = "1" ] && [ -f baseline/e2e-baseline.json ] && [ -f e2e.json ]; then
+            python bench/e2e_delta.py baseline/e2e-baseline.json e2e.json --out e2e-delta.json
+          else
+            echo "no e2e pair to diff (missing baseline or this run's e2e.json); criterion half only"
+            echo "[]" > e2e-delta.json
+          fi
+
+      - name: Write and upsert the sticky comment (PR)
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          python .github/scripts/bench_compare.py "$CRITERION" --e2e e2e-delta.json --out bench-comment.md
+          marker='<!-- btb-bench-compare -->'
+          # only the bot's own marked comment is updated (anyone can post the marker)
+          id=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | contains(\"$marker\"))) | .id" | head -n1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@bench-comment.md >/dev/null && echo "updated $id"
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@bench-comment.md >/dev/null && echo "posted"
+          fi
+
+      # the gate off the same deltas: exit nonzero if any whole 95% CI clears the threshold. continue-on-error so
+      # the next step decides whether that exit code blocks the job (dedicated) or is only reported (shared).
+      - name: Perf gate (exit code)
+        if: github.event_name == 'pull_request' && env.HAVE_BASELINE == '1'
+        id: gate
+        continue-on-error: true
+        run: |
+          python .github/scripts/bench_compare.py "$CRITERION" --e2e e2e-delta.json \
+            --gate --gate-threshold "$GATE_THRESHOLD" --out perf-gate.md
+
+      - name: Enforce or report the gate (PR)
+        if: github.event_name == 'pull_request' && env.HAVE_BASELINE == '1'
+        run: |
+          {
+            echo "## Perf gate"
+            echo ""
+            if [ "${{ steps.gate.outcome }}" = "success" ]; then
+              echo "No benchmark's 95% CI cleared +${GATE_THRESHOLD} vs the main baseline."
+            else
+              echo "A benchmark regressed past the +${GATE_THRESHOLD} gate (see the step log)."
+            fi
+            # the gate step is continue-on-error, so its table may not exist; an absent one is not a failure here
+            if [ -f perf-gate.md ]; then echo ""; cat perf-gate.md; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ vars.PERF_DEDICATED }}" = "1" ]; then
+            [ "${{ steps.gate.outcome }}" = "success" ] || { echo "dedicated runner: enforcing the perf gate"; exit 1; }
+          else
+            echo "shared runner: perf gate is advisory (set vars.PERF_DEDICATED=1 on a dedicated runner to enforce)"
+          fi

@@ -17,7 +17,7 @@ from typing import Any
 
 import torch
 
-from ..kinds import LayerTier, Tier
+from ..kinds import LayerTier, Proposer, Tier
 from ..options import BadDevice, DeviceName, check_device
 from ..options import Device as DeviceKind
 from ..sysinfo import host_free_bytes
@@ -212,7 +212,7 @@ class Device:
         drafter = Tier.NONE
         if aj is not None:
             drafter = Tier.CARD if aj.dev.type == DeviceKind.CUDA else Tier.HOST
-        elif str(getattr(sm, "proposer", "") or "").startswith("mtp") and any(
+        elif Proposer.of(getattr(sm, "proposer", Proposer.NGRAM)).mtp and any(
             k.startswith("mtp.") for k in (getattr(sm, "weight_map", None) or {})
         ):
             dd = getattr(sm, "drafter_dev", None)

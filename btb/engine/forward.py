@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from .. import mlx as mlxdev
-from ..kinds import LayerKind, Parents, TokenRows
+from ..kinds import LayerKind, Parents, PassTag, TokenRows
 from ..options import Device
 from ..sampling import as_pick
 from ..sysinfo import host_free_bytes, host_total_bytes
@@ -205,6 +205,10 @@ class _ForwardMixin(_State):
         self.ram_policy()
         own = bool(self.fam.own)
         n_layers = self.L if stop_after is None else min(self.L, int(stop_after))
+        # the placement tiers this pass runs layers on, and its stored-weight path, recorded whatever branch
+        # takes them below (the per-op MLX host path bypasses the fused forwards, so record here too)
+        self._tag_tiers(n_layers)
+        self._tag_quant()
         if (
             attention_mask is None
             and not own
@@ -316,6 +320,8 @@ class _ForwardMixin(_State):
             and bool(self.templates)
             and bool(self.host)
         )
+        if card_pass:
+            self._tag(PassTag.PREFILL_CARD)  # the host layers prefill on the card for this pass
         if card_pass and cache is not None and past > 0:
             for i in self.host:
                 if i < n_layers:
@@ -415,6 +421,12 @@ class _ForwardMixin(_State):
 
     def _run_host_layer(self, i: int, h: torch.Tensor, pas: Any) -> torch.Tensor:
         """layer `i` on the CPU kernels, `h` already fp32 on the host (the device crossed the edge)"""
+        if self.mlx is None and Native.gemv is not None:
+            # a true CPU tier: the host linears run the native gemv. On MLX a host layer's linears carry `.mx`
+            # and run through Native.mlx.linear instead, so it is not the native CPU path
+            self._tag(PassTag.CPU_NATIVE)
+        elif self.mlx is not None:
+            self._tag(PassTag.MLX_PEROP)  # the non-fused MLX path: a MoE family, or a layer offloaded to the host
         tmpl = self.host[i]
         hc = pas.host_side()
         if i in self.cold:
@@ -455,6 +467,10 @@ class _ForwardMixin(_State):
 
     def _run_card_layer(self, i: int, tmpl: Any, h: torch.Tensor, pas: Any) -> torch.Tensor:
         """layer `i` on the card (or the compute device), `h` already there in the layer's dtype"""
+        if self.dev.type == Device.CUDA:
+            # a card layer through the torch modules, not a captured card graph: btb's kernels are absent or the
+            # family is not one they serve, so the pass runs like torch
+            self._tag(PassTag.CUDA_TORCH_FALLBACK)
         lt = self.layer_types[i]
         cache, T, past, am = pas.cache, pas.T, pas.past, pas.am
         t0 = time.time()
@@ -546,6 +562,7 @@ class _ForwardMixin(_State):
         cd = hf.dtype
         step = 32768
         if not self.resident_head:
+            self._tag(PassTag.HEAD_STREAMED)
             # the host's own head: the native matvec reads the bf16 rows once where the chunked form widens each chunk
             # to float32; for the few rows a decode or verify pass carries
             if (
@@ -563,6 +580,7 @@ class _ForwardMixin(_State):
                 parts.append(hf @ wc.to(cd).T)
                 wc = None
             return torch.cat(parts, dim=-1).float()
+        self._tag(PassTag.HEAD_RESIDENT)
         if self.head is None and self.head_host is not None:
             return self.head_host(hf.float().cpu()).float()
         assert self.head is not None  # no head_host means the head is resident

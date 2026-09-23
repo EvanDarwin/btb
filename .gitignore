@@ -29,5 +29,8 @@ vtune_*
 # config.json is unloadable); this negation must follow the *.json rule above to override it
 !tests/fixtures/**/*.json
 
+# macOS
+**/.DS_Store
+
 # personal scratch, never tracked
 TODO.md
