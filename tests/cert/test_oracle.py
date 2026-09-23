@@ -44,7 +44,16 @@ def test_boundary_prompt_is_covered() -> None:
     assert "single" in oracle.PROMPTS and oracle.PROMPTS["single"] == [1]
     assert "empty" in oracle.NOTES  # the out-of-scope edge input is documented, not silently absent
     for kind in oracle.banked_kinds():
-        assert fams[kind.value]["tokens"].get("single"), f"{kind.value}: no boundary (single-token) reference"
+        for key in oracle.DECODES:
+            assert fams[kind.value][key].get("single"), f"{kind.value}: no boundary (single-token) {key} reference"
+
+
+def test_every_banked_family_carries_every_decode() -> None:
+    """a sampled cell is held to the bank like a greedy one, so every family banks every decode for every prompt"""
+    fams = oracle.load_bank()["families"]
+    for kind in oracle.banked_kinds():
+        for key in oracle.DECODES:
+            assert set(fams[kind.value].get(key, {})) == set(oracle.PROMPTS), f"{kind.value}: {key} incomplete"
 
 
 def test_reference_reproducible_on_cpu() -> None:

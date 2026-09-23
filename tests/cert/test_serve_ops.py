@@ -5,9 +5,12 @@ row, or a route no test exercises fails here."""
 
 from __future__ import annotations
 
+import pytest
+
 from . import serve_ops
 
 
+@pytest.mark.cert_gap
 def test_no_gaps() -> None:
     """the full gate: handler/registry drift AND a route with no test both fail here - a route reachable but
     unexercised (e.g. the HEAD liveness probe, /api/ps) is uncertified and gates until it gets a test."""

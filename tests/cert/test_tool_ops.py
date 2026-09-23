@@ -6,11 +6,14 @@ parser with no test, or a served family with no tool-calling story fails here.""
 
 from __future__ import annotations
 
+import pytest
+
 from btb import tools
 
 from . import tool_ops
 
 
+@pytest.mark.cert_gap
 def test_no_gaps() -> None:
     """the full gate: registry/source drift, a parser with no test, AND a served family with no parser all fail
     here - a convention exercised only indirectly is uncertified and gates until it gets a row and a test."""

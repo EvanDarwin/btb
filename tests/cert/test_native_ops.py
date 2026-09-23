@@ -3,6 +3,8 @@ it walks pointers, and every btb_* export in native/src/lib.rs is covered by an 
 
 from __future__ import annotations
 
+import pytest
+
 from . import native_ops
 
 
@@ -21,6 +23,7 @@ def test_matrix_binds_to_real_files() -> None:
                 assert os.path.exists(os.path.join(base, name)), f"{op.name} names a missing file {name!r}"
 
 
+@pytest.mark.cert_gap
 def test_every_crate_export_is_covered() -> None:
     """the drift guard: every btb_* C-ABI export in native/src/lib.rs is claimed by some op, and no op claims a
     stale one. A new native kernel exposed to Python with no matrix row fails here."""
@@ -36,12 +39,14 @@ def test_meta_exports_exist_and_are_not_ops() -> None:
         assert e not in op_claimed, e
 
 
+@pytest.mark.cert_gap
 def test_every_bench_file_is_covered() -> None:
     """the other drift guard: every native/benches/*.rs file is a family some op is certified in (a kernel
     benched but not in the matrix - the gemm placeholder was exactly this), and no op names a missing file."""
     assert native_ops.bench_gaps() == [], native_ops.bench_gaps()
 
 
+@pytest.mark.cert_gap
 def test_no_native_gaps() -> None:
     """Every op carries a parity test, a bench, and a guard-page test where it walks pointers - and no crate
     export is uncovered. Tier gaps are not in gaps(): see test_tier_gaps_are_surfaced_not_blocking."""
@@ -93,6 +98,7 @@ def test_tier_gaps_are_surfaced_not_blocking() -> None:
         assert tier not in native_ops.family_tiers(fam)
 
 
+@pytest.mark.cert_gap
 def test_every_storage_form_is_declared_and_read() -> None:
     """the op table's quants column is checked, not decorative: each Stored form is a btb.kinds.Quant type or a
     NON_QUANT row saying what btb stores under it, and each is read by some op."""

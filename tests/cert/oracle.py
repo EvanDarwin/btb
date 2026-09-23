@@ -1,11 +1,15 @@
-"""P5, the derived correctness oracle: a banked greedy continuation per served family that a cert cell's decode
-must reproduce. Determinism (test_cert_runner) proves a path runs the same twice; it does NOT prove the answer is
+"""P5, the derived correctness oracle: a banked greedy and a banked seeded-sampled continuation per served family
+that a cert cell's decode must reproduce. Determinism (test_cert_runner) proves a path runs the same twice; it does NOT prove the answer is
 right - a deterministically-wrong path passes it. The oracle closes that: the reference is the engine's own greedy
 decode of the tiny fixture, banked per `core.served_kinds()` + `spec.FIXTURE_STEM` (derived from core, never a
 hand list like test_receipts' run_* mirror), content-hashed against the fixture so a fixture change invalidates a
 stale bank, and regenerated deterministically so a fresh bank is byte-identical to the committed one.
 
-The check is EXACT greedy tokens, not a logit-distance tolerance: test_receipts already holds the banked greedy
+A sampled cell is held to its seeded continuation the same way: the Gumbel draw is keyed by (seed, row,
+position), so a fixed seed makes it a deterministic function of the logits, and a wrong path that happens to be
+deterministic fails it just as a greedy cell does.
+
+The check is EXACT tokens, not a logit-distance tolerance: test_receipts already holds the banked greedy
 continuation to exact equality on every device (`g == B["greedy"]` on CPU and MLX alike), so exact tokens are the
 strongest correctness signal that still holds cross-device. A tolerance band would be the very hole P5 exists to
 close - it lets a wrong-but-close path pass. If a real near-tie ever flips a token across devices, that is a
@@ -27,6 +31,7 @@ import sys
 from typing import TYPE_CHECKING, cast
 
 from btb.kinds import FamilyKind, Json
+from btb.sampling import Sampling
 
 from . import core, spec
 
@@ -37,12 +42,14 @@ if TYPE_CHECKING:
 
     CellOutput = Sequence[int] | Tensor  # what a runner cell hands us: the decoded tokens, or a logits row
 
-SCHEMA = 1
+SCHEMA = 2
 REFERENCE_DEVICE = "cpu"  # the always-present tier and the native gemv path make_fixtures banks the receipts on
 # The greedy decode every cert run shares, spelled once here: the runner's cells decode PROMPT for N tokens and
 # this bank holds what that decode must produce, so the two cannot drift into comparing different runs.
 N = 6
 PROMPT: list[int] = [1, 2, 3, 4]
+# the one sampled decode, likewise shared: the runner's sampled cells use it and the bank holds its continuation
+SAMPLING = Sampling(temperature=0.8, top_p=0.95, top_k=40, seed=20260919)
 
 # the reference inputs: "standard" is the runner's prompt, "single" the boundary case (a one-token prefill, gap
 # #30). A zero-length prompt is out of scope: see NOTES.
@@ -88,33 +95,47 @@ def fixture_hash(path: str) -> str:
 # --- banking (runs the engine) -----------------------------------------------------------------------------
 
 
-def reference_tokens(kind: FamilyKind, prompt_ids: list[int], device: str) -> list[int]:
-    """the engine's own greedy continuation of `prompt_ids` from the family's fixture on `device`, N new tokens -
-    the reference a cell must reproduce. Speculation off, so it is the plain greedy path."""
+def reference_tokens(
+    kind: FamilyKind, prompt_ids: list[int], device: str, sampling: Sampling | None = None
+) -> list[int]:
+    """the engine's own continuation of `prompt_ids` from the family's fixture on `device`, N new tokens - greedy,
+    or seeded-sampled with `sampling` - the reference a cell must reproduce. Speculation off."""
     import btb
     from tests.helpers import NO_LOG
 
     sm = btb.load(fixture_dir(kind), device=device, log=NO_LOG)
     try:
-        return [int(t) for t in sm.generate(list(prompt_ids), N, speculate=False).tokens]
+        return [int(t) for t in sm.generate(list(prompt_ids), N, speculate=False, sampling=sampling).tokens]
     finally:
         sm.close()
 
 
+# the banked decodes, by their key in a family's entry: greedy under "tokens", the seeded draw under "sampled"
+DECODES: dict[str, Sampling | None] = {"tokens": None, "sampled": SAMPLING}
+
+
 def bank(kinds: list[FamilyKind] | None = None, device: str = REFERENCE_DEVICE) -> Json:
-    """build the oracle bank: for each banked family, its fixture hash and greedy continuation of every prompt.
-    A pure function of the fixtures, the prompts and the engine (no timestamp), so a rebank is byte-reproducible."""
+    """build the oracle bank: for each banked family, its fixture hash and its greedy and seeded-sampled
+    continuations of every prompt. A pure function of the fixtures, the prompts and the engine (no timestamp), so
+    a rebank is byte-reproducible."""
     families: Json = {}
     for kind in kinds if kinds is not None else banked_kinds():
-        families[kind.value] = {
-            "fixture": spec.FIXTURE_STEM[kind],
-            "fixture_hash": fixture_hash(fixture_dir(kind)),
-            "tokens": {name: reference_tokens(kind, ids, device) for name, ids in PROMPTS.items()},
-        }
+        fam: Json = {"fixture": spec.FIXTURE_STEM[kind], "fixture_hash": fixture_hash(fixture_dir(kind))}
+        for key, sampling in DECODES.items():
+            fam[key] = {name: reference_tokens(kind, ids, device, sampling) for name, ids in PROMPTS.items()}
+        families[kind.value] = fam
     return {
         "schema": SCHEMA,
         "reference_device": device,
-        "decode": {"n": N, "greedy": True},
+        "decode": {
+            "n": N,
+            "sampled": {
+                "temperature": SAMPLING.temperature,
+                "top_p": SAMPLING.top_p,
+                "top_k": SAMPLING.top_k,
+                "seed": SAMPLING.seed,
+            },
+        },
         "prompts": PROMPTS,
         "notes": NOTES,
         "families": families,
@@ -157,19 +178,22 @@ def _to_tokens(output: CellOutput) -> list[int]:
     return [int(x) for x in cast("Sequence[int]", output)]
 
 
-def assert_matches(kind: FamilyKind, output: CellOutput, device: str, *, prompt: str = "standard") -> None:
-    """the correctness gate a runner cell calls: the cell's greedy output must equal the banked reference for
-    `(kind, prompt)`. Tokens are matched exactly; a logits row is matched on its greedy next token. `device` is
-    reported on a mismatch - the reference is device-independent (greedy tokens hold across devices for these
-    fixtures), so a cross-device flip is a real discrepancy, surfaced here rather than hidden by a tolerance.
-    A family with no banked reference fails (a COVERED cell with no oracle is not covered)."""
+def assert_matches(
+    kind: FamilyKind, output: CellOutput, device: str, *, prompt: str = "standard", sampled: bool = False
+) -> None:
+    """the correctness gate a runner cell calls: the cell's output must equal the banked reference for
+    `(kind, prompt)` - the greedy one, or with `sampled` the SAMPLING draw. Tokens are matched exactly; a logits
+    row is matched on its greedy next token. `device` is reported on a mismatch - the reference is
+    device-independent, so a cross-device flip is a real discrepancy, surfaced here rather than hidden by a
+    tolerance. A family with no banked reference fails (a COVERED cell with no oracle is not covered)."""
     fam = load_bank()["families"].get(kind.value)
     assert fam is not None, f"no banked oracle for {kind.value} (run python -m tests.cert.oracle --rebank)"
-    ref = fam["tokens"].get(prompt)
-    assert ref is not None, f"no banked {prompt!r} reference for {kind.value}"
+    key = "sampled" if sampled else "tokens"
+    ref = fam.get(key, {}).get(prompt)
+    assert ref is not None, f"no banked {key}/{prompt!r} reference for {kind.value} (rebank)"
     got = _to_tokens(output)
     assert got == ref[: len(got)], (
-        f"{kind.value}/{prompt} on {device}: decode {got} != banked oracle {ref[: len(got)]} "
+        f"{kind.value}/{key}/{prompt} on {device}: decode {got} != banked oracle {ref[: len(got)]} "
         f"(a deterministically-wrong path, or a real cross-device discrepancy - do not widen a tolerance to hide it)"
     )
 
@@ -205,11 +229,11 @@ def check() -> list[str]:
             continue
         if c["fixture_hash"] != fr["fixture_hash"]:
             problems.append(f"{kind.value}: fixture changed ({c['fixture_hash']} != {fr['fixture_hash']}); rebank")
-        for name in PROMPTS:
-            if c["tokens"].get(name) != fr["tokens"][name]:
-                problems.append(
-                    f"{kind.value}/{name}: tokens drifted ({c['tokens'].get(name)} != {fr['tokens'][name]})"
-                )
+        for key in DECODES:
+            for name in PROMPTS:
+                was, now = c.get(key, {}).get(name), fr[key][name]
+                if was != now:
+                    problems.append(f"{kind.value}/{key}/{name}: tokens drifted ({was} != {now})")
     if _canon(fresh) != _canon(committed) and not problems:
         problems.append("bank bytes differ from a fresh regeneration (metadata/structure changed); rebank")
     return problems
@@ -223,15 +247,16 @@ def validate(device: str) -> list[str]:
     committed = load_bank()["families"]
     problems: list[str] = []
     for kind in banked_kinds():
-        for name, ids in PROMPTS.items():
-            try:
-                got = reference_tokens(kind, ids, device)
-            except Exception as e:  # the engine's failure on a path is itself a finding to report, not to abort on
-                problems.append(f"{kind.value}/{name} on {device}: engine error ({type(e).__name__}: {e})")
-                continue
-            ref = committed[kind.value]["tokens"][name]
-            if got != ref:
-                problems.append(f"{kind.value}/{name} on {device}: {got} != banked {ref}")
+        for key, sampling in DECODES.items():
+            for name, ids in PROMPTS.items():
+                try:
+                    got = reference_tokens(kind, ids, device, sampling)
+                except Exception as e:  # the engine's failure on a path is itself a finding, not a reason to abort
+                    problems.append(f"{kind.value}/{key}/{name} on {device}: engine error ({type(e).__name__}: {e})")
+                    continue
+                ref = committed[kind.value].get(key, {}).get(name)
+                if got != ref:
+                    problems.append(f"{kind.value}/{key}/{name} on {device}: {got} != banked {ref}")
     return problems
 
 
@@ -246,7 +271,7 @@ def _show() -> int:
     )
     for name in sorted(doc["families"]):
         fam = doc["families"][name]
-        toks = ", ".join(f"{p}={fam['tokens'][p]}" for p in sorted(fam["tokens"]))
+        toks = ", ".join(f"{k}/{p}={fam[k][p]}" for k in DECODES for p in sorted(fam.get(k, {})))
         print(f"  {name:<10} {fam['fixture_hash'][:19]}...  {toks}")
     return 0
 

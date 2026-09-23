@@ -4,9 +4,12 @@ card kernel that the engine does not load, or a loaded name with no definition, 
 
 from __future__ import annotations
 
+import pytest
+
 from . import cuda_ops
 
 
+@pytest.mark.cert_gap
 def test_loaded_and_defined_kernels_agree() -> None:
     assert cuda_ops.gaps() == [], cuda_ops.gaps()
 
