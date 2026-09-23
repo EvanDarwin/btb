@@ -88,7 +88,7 @@ OPS: tuple[Route, ...] = (
         "tests/unit/test_pi.py::test_openai_stays_plain_text_without_tools",
     ),
     Route("ollama_tags", ("GET",), ("/api/tags",), "tests/unit/test_cli.py::test_server_routes_without_a_model"),
-    Route("ollama_ps", ("GET",), ("/api/ps",), None),
+    Route("ollama_ps", ("GET",), ("/api/ps",), "tests/unit/test_cli.py::test_ollama_ps_lists_the_loaded_models"),
     Route("ollama_version", ("GET",), ("/api/version",), "tests/unit/test_cli.py::test_server_routes_without_a_model"),
     Route(
         "ollama_chat", ("POST",), ("/api/chat",), "tests/unit/test_pi.py::test_a_bad_request_field_is_a_400_naming_it"

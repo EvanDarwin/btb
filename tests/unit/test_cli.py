@@ -7,7 +7,9 @@ in seconds. The out-of-memory notice and the --profile bundle are the feedback m
 import argparse
 import json
 import os
+import re
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -91,6 +93,33 @@ def test_server_routes_without_a_model() -> None:
         assert code == 404 and "error" in body
         code, body = request_json(base, "POST", "/api/pull", {"name": "x"})
         assert code == 404 and "not supported" in body["error"]
+    finally:
+        server.close()
+
+
+def test_ollama_ps_lists_the_loaded_models() -> None:
+    """Ollama's /api/ps, the models in memory: none before a request loads one, then the fixture a generate
+    loaded - its tag, size and family, with Ollama's expires_at and size_vram (0 on the CPU it runs on)"""
+    from btb.serve import start
+
+    fx = fixture("tiny_qwen3")
+    only = f"^{re.escape(os.path.basename(fx))}$"
+    server = start(None, host="127.0.0.1", port=0, device="cpu", extra_paths=[fx], pattern=only).start()
+    base = server.url
+    try:
+        ((name, entry),) = server.registry.refresh().items()
+        assert request_json(base, "GET", "/api/ps") == (200, {"models": []})
+        gen = {"model": name, "prompt": "hi", "stream": False, "options": {"num_predict": 1}}
+        code, body = request_json(base, "POST", "/api/generate", gen)
+        assert code == 200, body
+        code, body = request_json(base, "GET", "/api/ps")
+        assert code == 200
+        (m,) = body["models"]
+        assert m["name"] == m["model"] == f"{name}:latest" and m["loaded"] is True
+        assert m["size"] == entry["size"] > 0 and isinstance(m["digest"], str)
+        assert m["details"]["family"] == entry["type"] and m["details"]["families"] == [entry["type"]]
+        assert datetime.fromisoformat(m["expires_at"]).utcoffset() == timedelta(0), m["expires_at"]
+        assert m["size_vram"] == 0
     finally:
         server.close()
 
