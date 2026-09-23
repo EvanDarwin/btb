@@ -10,7 +10,7 @@ import os
 import platform
 import sys
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, NoReturn
 
 import torch
 
@@ -74,6 +74,30 @@ class NativeError(RuntimeError):
         self.call, self.rc, self.detail = call, int(rc), detail
         self.errno = ctypes.get_errno() if os_error else 0
         super().__init__(f"{call} returned {rc}{detail}{f': {os.strerror(self.errno)}' if self.errno else ''}")
+
+
+class NativeDtypeError(TypeError):
+    """A tensor handed to a native kernel is not the element type the kernel reads through its pointer: `call`
+    the kernel, `arg` the argument, `got` its dtype and `want` what the kernel was built for. Raised before the
+    call, so a wrong tensor is refused rather than read as another type's bytes."""
+
+    def __init__(self, call: str, arg: str, got: torch.dtype, want: tuple[torch.dtype, ...]) -> None:
+        self.call, self.arg, self.got, self.want = call, arg, got, want
+        super().__init__(f"{call}: {arg} is {got}, the kernel reads {' or '.join(str(w) for w in want)}")
+
+
+_BF16, _F32, _U8, _I32 = torch.bfloat16, torch.float32, torch.uint8, torch.int32
+# what one argument must be: a tensor (or each of a group's tensors) and the dtypes the kernel reads it as
+Want = tuple[torch.Tensor | Sequence[torch.Tensor], tuple[torch.dtype, ...]]
+
+
+def _refuse(call: str, **args: Want) -> NoReturn:
+    """raise for the first argument whose dtype the kernel does not read; called once a cheap test has failed"""
+    for arg, (ts, want) in args.items():
+        for t in [ts] if isinstance(ts, torch.Tensor) else ts:
+            if t.dtype not in want:
+                raise NativeDtypeError(call, arg, t.dtype, want)
+    raise AssertionError(f"{call}: refused with every argument's dtype in order")
 
 
 def quiet_omp() -> None:
@@ -147,6 +171,8 @@ class Native:
         ]
 
         def gemv(w: torch.Tensor, x: torch.Tensor, y: torch.Tensor) -> None:
+            if w.dtype != _BF16 or x.dtype != _F32 or y.dtype != _F32:
+                _refuse("btb_gemv_bf16_rows", w=(w, (_BF16,)), x=(x, (_F32,)), y=(y, (_F32,)))
             rc = f(w.data_ptr(), w.shape[0], w.shape[1], x.data_ptr(), x.shape[0], y.data_ptr(), threads)
             if rc != 0:
                 raise NativeError("btb_gemv_bf16_rows", rc)
@@ -184,6 +210,26 @@ class Native:
                 x: torch.Tensor,
                 y: torch.Tensor,
             ) -> None:
+                if (
+                    lo.dtype != _U8
+                    or hi4.dtype != _U8
+                    or tbl.dtype != _U8
+                    or (n_esc and (esc_idx.dtype != _I32 or esc_val.dtype != _U8))
+                    or x.dtype != _F32
+                    or y.dtype != _F32
+                ):
+                    esc: dict[str, Want] = (
+                        {"esc_idx": (esc_idx, (_I32,)), "esc_val": (esc_val, (_U8,))} if n_esc else {}
+                    )
+                    _refuse(
+                        "btb_gemv_p12_rows",
+                        lo=(lo, (_U8,)),
+                        hi4=(hi4, (_U8,)),
+                        table=(tbl, (_U8,)),
+                        **esc,
+                        x=(x, (_F32,)),
+                        y=(y, (_F32,)),
+                    )
                 rc = g(
                     lo.data_ptr(),
                     hi4.data_ptr(),
@@ -220,6 +266,12 @@ class Native:
             ]
 
             def gemv_group(ws: Sequence[torch.Tensor], xs: Sequence[torch.Tensor], ys: Sequence[torch.Tensor]) -> None:
+                if (
+                    any(w.dtype != _BF16 for w in ws)
+                    or any(x.dtype != _F32 for x in xs)
+                    or any(y.dtype != _F32 for y in ys)
+                ):
+                    _refuse("btb_gemv_bf16_group", w=(ws, (_BF16,)), x=(xs, (_F32,)), y=(ys, (_F32,)))
                 n = len(ws)
                 rc = gg(
                     n,
@@ -244,6 +296,14 @@ class Native:
             mx.argtypes = [P, P, S, S, P, S, P, S]
 
             def gemv_mx4(w: Any, x: torch.Tensor, y: torch.Tensor) -> None:
+                if w.blocks.dtype != _U8 or w.scales.dtype != _U8 or x.dtype != _F32 or y.dtype != _F32:
+                    _refuse(
+                        "btb_gemv_mxfp4_rows",
+                        blocks=(w.blocks, (_U8,)),
+                        scales=(w.scales, (_U8,)),
+                        x=(x, (_F32,)),
+                        y=(y, (_F32,)),
+                    )
                 rows, cols = w.shape
                 rc = mx(
                     w.blocks.data_ptr(),
@@ -278,6 +338,18 @@ class Native:
             ]
 
             def gemv_mx4_group(ws: Sequence[Any], xs: Sequence[torch.Tensor], ys: Sequence[torch.Tensor]) -> None:
+                if (
+                    any(w.blocks.dtype != _U8 or w.scales.dtype != _U8 for w in ws)
+                    or any(x.dtype != _F32 for x in xs)
+                    or any(y.dtype != _F32 for y in ys)
+                ):
+                    _refuse(
+                        "btb_gemv_mxfp4_group",
+                        blocks=([w.blocks for w in ws], (_U8,)),
+                        scales=([w.scales for w in ws], (_U8,)),
+                        x=(xs, (_F32,)),
+                        y=(ys, (_F32,)),
+                    )
                 n = len(ws)
                 rc = mg(
                     n,
@@ -314,12 +386,25 @@ class Native:
             ]
 
             def gemv_mx4_ggml(w: Any, x: torch.Tensor, y: torch.Tensor) -> None:
+                if w.blocks.dtype != _U8 or x.dtype != _F32 or y.dtype != _F32:
+                    _refuse("btb_gemv_mxfp4_ggml_rows", blocks=(w.blocks, (_U8,)), x=(x, (_F32,)), y=(y, (_F32,)))
                 rows, cols = w.shape
                 rc = mgr(w.blocks.data_ptr(), rows, cols, x.data_ptr(), x.shape[0], y.data_ptr(), threads)
                 if rc != 0:
                     raise NativeError("btb_gemv_mxfp4_ggml_rows", rc)
 
             def gemv_mx4_ggml_group(ws: Sequence[Any], xs: Sequence[torch.Tensor], ys: Sequence[torch.Tensor]) -> None:
+                if (
+                    any(w.blocks.dtype != _U8 for w in ws)
+                    or any(x.dtype != _F32 for x in xs)
+                    or any(y.dtype != _F32 for y in ys)
+                ):
+                    _refuse(
+                        "btb_gemv_mxfp4_ggml_group",
+                        blocks=([w.blocks for w in ws], (_U8,)),
+                        x=(xs, (_F32,)),
+                        y=(ys, (_F32,)),
+                    )
                 n = len(ws)
                 rc = mgg(
                     n,
@@ -412,6 +497,26 @@ class Native:
                 eps: float,
                 out: torch.Tensor,
             ) -> None:
+                ts = (mixed, conv_state, conv_w, z, a, b, a_log, dt_bias, state, norm_w, out)
+                if any(t.dtype != _F32 for t in ts) or (conv_b is not None and conv_b.dtype != _F32):
+                    names = (
+                        "mixed",
+                        "conv_state",
+                        "conv_w",
+                        "z",
+                        "a",
+                        "b",
+                        "a_log",
+                        "dt_bias",
+                        "state",
+                        "norm_w",
+                        "out",
+                    )
+                    _refuse(
+                        "btb_delta_step",
+                        conv_b=([] if conv_b is None else conv_b, (_F32,)),
+                        **{k: (t, (_F32,)) for k, t in zip(names, ts, strict=True)},
+                    )
                 rc = ds(
                     mixed.data_ptr(),
                     conv_state.data_ptr(),
@@ -492,7 +597,10 @@ class Native:
                 fns[dt] = fn
 
             def attn_decode(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float, out: torch.Tensor) -> None:
-                fn = fns[k.dtype]
+                fn = fns.get(k.dtype)
+                if fn is None or v.dtype != k.dtype or q.dtype != _F32 or out.dtype != _F32:
+                    kv = (k.dtype,) if fn is not None else tuple(fns)
+                    _refuse("btb_attn_decode", q=(q, (_F32,)), k=(k, tuple(fns)), v=(v, kv), out=(out, (_F32,)))
                 hk, n, d = k.shape
                 rc = fn(
                     q.data_ptr(),

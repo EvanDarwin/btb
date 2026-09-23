@@ -332,13 +332,23 @@ class VramSeats:
     """The first-class seats: the regulars with the most rides copied onto the card, where an expert costs no
     host memory traffic and no read. A rider earns a seat with `min_rides` rides; the seats are given up by
     last ride; at most `per_pass` promotions a pass keep the copies off the token's time. The RAM copy stays
-    (a seat given up falls back to it), so a seat costs the store nothing but the copy. bf16 experts only: the
-    card multiplies the stored tensors as they are."""
+    (a seat given up falls back to it), so a seat costs the store nothing but the copy. bf16-layout experts only:
+    the card multiplies the stored tensors as they are, cast to bf16 on use when stored as `dt`."""
 
-    def __init__(self, n_seats: int, per: int, shapes: Any, device: Any, min_rides: int = 8, per_pass: int = 4) -> None:
+    def __init__(
+        self,
+        n_seats: int,
+        per: int,
+        shapes: Any,
+        device: Any,
+        min_rides: int = 8,
+        per_pass: int = 4,
+        dt: torch.dtype = torch.bfloat16,
+    ) -> None:
         self.n = int(n_seats)
         self.per = int(per)
         self.shapes = shapes
+        self.dt = dt
         self.device = device
         self.min_rides = int(min_rides)
         self.per_pass = int(per_pass)
@@ -357,10 +367,10 @@ class VramSeats:
         assert self.buf is not None  # a seated key implies the depot buffer was allocated
         region = self.buf[j * self.per : (j + 1) * self.per]
         gu_n, gu_shape, dn_shape = self.shapes
-        return (
-            region[:gu_n].view(torch.bfloat16).view(*gu_shape),
-            region[gu_n:].view(torch.bfloat16).view(*dn_shape),
-        )
+        gu, dn = region[:gu_n].view(self.dt).view(*gu_shape), region[gu_n:].view(self.dt).view(*dn_shape)
+        if self.dt != torch.bfloat16:
+            return gu.to(torch.bfloat16), dn.to(torch.bfloat16)
+        return gu, dn
 
     def new_pass(self) -> None:
         self.left = self.per_pass
@@ -396,6 +406,7 @@ class _ExpertStore:
     _os: ModuleType
     blocks: dict[int, tuple[torch.Tensor, list[int]]]
     budget: int
+    dt: torch.dtype  # a bf16-layout checkpoint's expert element type as stored (an fp16/fp32 one is cast on use)
     free: Any
     last_slots: Any
     lru: Any
@@ -424,6 +435,7 @@ class _ExpertStore:
         self.per = None
         self.shapes = None
         self.sizes = None
+        self.dt = torch.bfloat16
         self.mx = bool(sm.fam.mxfp4)
         # a GGUF's experts: gate, up and down in ggml's block layout, multiplied as stored (btb/mxfp4.py)
         self.ggml = self.mx and getattr(sm, "gguf", None) is not None
@@ -654,6 +666,8 @@ class _ExpertStore:
                 if (b - a) % shape[0]:
                     raise RuntimeError(f"[experts] {key}: {b - a} bytes do not divide by {shape[0]} experts")
                 parts.append((self._os.path.join(self.sm.dir, shard), hoff + a, (b - a) // shape[0], shape[1:]))
+                if not (self.ggml or self.mx):
+                    self.dt = self.sm.ST_DTYPES[info["dtype"]]
             r = self.recipes[layer] = parts
             sched = getattr(self.sm, "scheduler", None)
             if sched is not None and hasattr(sched, "disk"):
@@ -712,7 +726,7 @@ class _ExpertStore:
         n = max(0, int(room // self.per))
         if n <= 0:
             return
-        self.vram = VramSeats(n, self.per, self.shapes, dev)
+        self.vram = VramSeats(n, self.per, self.shapes, dev, dt=self.dt)
         self.sm.log(f"[experts] {n} seats on the card ({n * self.per / 2**30:.2f} GB) for the most ridden experts")
 
     @staticmethod
@@ -837,10 +851,12 @@ class _ExpertStore:
                 out.append(MxWeight(self._part(slot, region, i), self._part(slot, region, i + 1), rows, g * BLOCK))
             return out[0], out[1]
         _gu_n, gu_shape, dn_shape = self.shapes
-        return (
-            self._part(slot, region, 0).view(torch.bfloat16).view(*gu_shape),
-            self._part(slot, region, 1).view(torch.bfloat16).view(*dn_shape),
-        )
+        gu = self._part(slot, region, 0).view(self.dt).view(*gu_shape)
+        dn = self._part(slot, region, 1).view(self.dt).view(*dn_shape)
+        if self.dt != torch.bfloat16:
+            # the slot holds the checkpoint's bytes as stored; the expert kernels read bf16
+            return gu.to(torch.bfloat16), dn.to(torch.bfloat16)
+        return gu, dn
 
     def _views_mx(self, slot: Any) -> Any:
         assert self.per is not None  # the store is sized before this runs
@@ -859,6 +875,10 @@ class _ExpertStore:
                 return (parts[0], parts[1]), parts[2]
             n0 = self.sizes[0] + self.sizes[1]
             return region[:n0], region[n0:]
+        if self.dt != torch.bfloat16:
+            # a slot view is read as bf16: an fp16/fp32 expert goes to the GPU as a cast copy
+            gu, dn = self._views(slot)
+            return be.weight(gu), be.weight(dn)
         gu_n, gu_shape, dn_shape = self.shapes
         return be.weight_slot(sh, off, gu_n, gu_shape), be.weight_slot(sh, off + gu_n, self.per - gu_n, dn_shape)
 

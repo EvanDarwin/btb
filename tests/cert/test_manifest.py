@@ -36,8 +36,6 @@ EXPECTED_GAPS: dict[manifest.Missing, list[str]] = {
     manifest.Missing.CARD_GRAPH_SHAPE: ["tiny_gemma3", "tiny_qwen3"],
     manifest.Missing.SPEC_MTP_HEAD: ["tiny_gemma3", "tiny_gpt_oss", "tiny_phi3", "tiny_q4", "tiny_qwen3"],
     manifest.Missing.SPEC_DECODE: ["tiny_gemma3", "tiny_gpt_oss", "tiny_phi3", "tiny_q35", "tiny_q4", "tiny_qwen3"],
-    manifest.Missing.FP16_FIXTURE: ["tiny_gemma3", "tiny_gpt_oss", "tiny_phi3", "tiny_q35", "tiny_q4", "tiny_qwen3"],
-    manifest.Missing.FP32_FIXTURE: ["tiny_gemma3", "tiny_gpt_oss", "tiny_phi3", "tiny_q35", "tiny_q4", "tiny_qwen3"],
     manifest.Missing.FP8_UNIMPLEMENTED: [
         "tiny_gemma3", "tiny_gpt_oss", "tiny_phi3", "tiny_q35", "tiny_q4", "tiny_qwen3",
     ],
@@ -179,13 +177,29 @@ def test_storage_derives_from_quant_kind() -> None:
 
 
 def test_the_f16_gguf_twin_is_bound() -> None:
-    """tests/fixtures/gguf/tiny_qwen3-f16.gguf: the runner ran it while no cell bound it. It binds GGUF_F16 now,
-    and the fp32 safetensors cell binds nothing (it must never read the bf16 checkpoint)."""
+    """tests/fixtures/gguf/tiny_qwen3-f16.gguf: the runner ran it while no cell bound it. It binds GGUF_F16 now."""
     paths = spec.fixture_paths(FamilyKind.QWEN3, spec.Storage.GGUF_F16)
     assert [os.path.basename(p) for p in paths] == ["tiny_qwen3-f16.gguf"]
     assert all(os.path.exists(p) for p in paths)
     assert spec.storage_of_gguf("tiny_qwen3-f16.gguf") is spec.Storage.GGUF_F16
-    assert spec.fixture_paths(FamilyKind.QWEN3, spec.Storage.SAFE_FP32) == ()
+
+
+def test_a_precision_cell_binds_only_its_own_twin(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    """every family's fp16/fp32 cell binds its twin, whose headers carry that precision and no other float - never
+    the bf16 checkpoint - and a twin whose headers say otherwise binds nothing, whatever its name: the cell is then
+    the precision's own gap kind."""
+    for kind in spec.FIXTURE_STEM:
+        for storage in (spec.Storage.SAFE_FP16, spec.Storage.SAFE_FP32):
+            (path,) = spec.fixture_paths(kind, storage)
+            assert path != spec.twin_path(spec.FIXTURE_STEM[kind], spec.Storage.SAFE_BF16)
+            assert spec.header_dtypes(path) & spec.FLOAT_HEADERS == {spec.STORAGE[storage].fp}, path
+    stem = spec.FIXTURE_STEM[FamilyKind.QWEN3]
+    bf16 = spec.twin_path(stem, spec.Storage.SAFE_BF16)
+    monkeypatch.setattr(spec, "FIXTURES", str(tmp_path))
+    os.symlink(bf16, spec.twin_path(stem, spec.Storage.SAFE_FP16))
+    assert spec.fixture_paths(FamilyKind.QWEN3, spec.Storage.SAFE_FP16) == ()
+    why = manifest.gap_reason(FamilyKind.QWEN3, spec.Storage.SAFE_FP16, spec.SUBPATH["cpu"], spec.DecodePath.GREEDY)
+    assert why is manifest.Missing.FP16_FIXTURE
 
 
 def test_decode_paths_derive_from_proposer() -> None:
@@ -341,7 +355,14 @@ def test_the_known_gaps_are_exactly_these() -> None:
     a gap nobody recorded, or one closed without being struck from the list."""
     got = {kind: fams for kind, _n, fams in manifest.missing_items()}
     assert got == EXPECTED_GAPS
-    assert set(got) == set(manifest.Missing), "a Missing kind that no cell uses, or a cell kind not pinned here"
+    # a precision's gap kind is idle while every family has that twin (test_a_precision_cell_binds_only_its_own_twin
+    # holds it live for a family that loses one)
+    idle = {
+        gap
+        for storage, gap in manifest.SAFE_PRECISION_GAP.items()
+        if all(spec.fixture_paths(kind, storage) for kind in spec.FIXTURE_STEM)
+    }
+    assert set(got) | idle == set(manifest.Missing), "a Missing kind that no cell uses, or a cell kind not pinned here"
 
 
 def test_the_gate_stays_red_while_gaps_are_open() -> None:

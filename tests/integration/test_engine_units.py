@@ -9,7 +9,7 @@ import json
 import os
 import shutil
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
@@ -700,3 +700,141 @@ def test_native_open_names_the_os_error_when_the_file_limit_is_hit(tmp_path: Pat
         for h in hs:
             Native.close(h)
         resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
+# --- a checkpoint's float precision against the kernels' (tiers._held, native._refuse) -----------------------
+
+
+def test_an_fp32_checkpoint_is_held_as_bf16_and_read_whole_where_widened() -> None:
+    """an fp32 checkpoint's weights reach the bf16 readers as bf16 (the direct readers take them from memory,
+    cast), while a caller widening to float32 itself reads them at their own precision; a bf16 checkpoint is
+    read straight off the drive as before"""
+    f32, bf16 = host_model(fixture("tiny_qwen3-f32")), host_model(fixture("tiny_qwen3"))
+    try:
+        k = next(k for k in f32.weight_map if k.endswith("q_proj.weight"))
+        assert f32.held_cast and not bf16.held_cast
+        assert f32._get(k).dtype == torch.bfloat16 and f32._get(k, stored=True).dtype == torch.float32
+        assert torch.equal(f32._get(k), bf16._get(k))
+        assert f32._span(k) == (None, 0, f32._get(k).numel() * 2)
+        path, _off, nb = bf16._span(k)
+        assert path is not None and nb == bf16._get(k).numel() * 2
+    finally:
+        f32.close()
+        bf16.close()
+
+
+def test_every_native_kernel_refuses_a_dtype_it_was_not_built_for() -> None:
+    """a kernel reads its tensors through raw pointers: an fp32 weight handed to the bf16 gemv was read as bf16
+    pairs and decoded garbage without a word. Every fixed-type binding now refuses before the call, naming the
+    argument, and writes nothing"""
+    from btb.engine.native import Native, NativeDtypeError, native_path
+    from btb.mxfp4 import MxWeight, ggml_bytes, matrix_bytes
+
+    dll = native_path()
+    if dll is None:
+        pytest.skip("no native library")
+    Native.load_gemv(dll)
+    r, c = 4, 32
+    bf, f32, u8 = torch.bfloat16, torch.float32, torch.uint8
+    w, x = torch.zeros(r, c, dtype=bf), torch.zeros(1, c, dtype=f32)
+    nb, ns = matrix_bytes(r, c)
+    mx = MxWeight(torch.zeros(nb, dtype=u8), torch.zeros(ns, dtype=u8), r, c)
+    mx_bad = MxWeight(torch.zeros(nb, dtype=torch.int8), torch.zeros(ns, dtype=u8), r, c)
+    gg = MxWeight.from_ggml(torch.zeros(ggml_bytes(r, c), dtype=u8), r, c)
+    gg_bad = MxWeight.from_ggml(torch.zeros(ggml_bytes(r, c), dtype=torch.int8), r, c)
+    p12 = (torch.zeros(r * c, dtype=u8), torch.zeros(r * c // 2, dtype=u8), torch.zeros(16, dtype=u8))
+    no_esc = (torch.zeros(0, dtype=torch.int32), torch.zeros(0, dtype=u8), 0)
+    q, kv = torch.zeros(2, 16, dtype=f32), torch.zeros(1, 3, 16, dtype=bf)
+    hk, hv, dk, dv, cd, ks = 1, 1, 4, 4, 12, 4
+
+    def delta(**bad: torch.Tensor) -> Callable[[torch.Tensor], None]:
+        t = {
+            "mixed": torch.zeros(cd, dtype=f32),
+            "conv_state": torch.zeros(cd, ks, dtype=f32),
+            "conv_w": torch.zeros(cd, ks, dtype=f32),
+            "conv_b": torch.zeros(cd, dtype=f32),
+            "z": torch.zeros(hv * dv, dtype=f32),
+            "a": torch.zeros(hv, dtype=f32),
+            "b": torch.zeros(hv, dtype=f32),
+            "a_log": torch.zeros(hv, dtype=f32),
+            "dt_bias": torch.zeros(hv, dtype=f32),
+            "state": torch.zeros(hv, dk, dv, dtype=f32),
+            "norm_w": torch.zeros(dv, dtype=f32),
+            **bad,
+        }
+        return lambda y: Native.delta_step(
+            t["mixed"], t["conv_state"], t["conv_w"], t["conv_b"], t["z"], t["a"], t["b"], t["a_log"],
+            t["dt_bias"], t["state"], hk, hv, dk, dv, t["norm_w"], 1e-6, y,
+        )  # fmt: skip
+
+    # (binding, call, argument, the call with that one argument wrong, the dtype its `y` must be written in)
+    cases: list[tuple[str, str, str, Callable[[torch.Tensor], None], torch.dtype]] = [
+        ("gemv", "btb_gemv_bf16_rows", "w", lambda y: Native.gemv(w.float(), x, y), f32),
+        ("gemv", "btb_gemv_bf16_rows", "w", lambda y: Native.gemv(w.half(), x, y), f32),
+        ("gemv", "btb_gemv_bf16_rows", "x", lambda y: Native.gemv(w, x.bfloat16(), y), f32),
+        ("gemv", "btb_gemv_bf16_rows", "y", lambda y: Native.gemv(w, x, y), torch.float64),
+        ("gemv_group", "btb_gemv_bf16_group", "w", lambda y: Native.gemv_group([w, w.float()], [x, x], [y, y]), f32),
+        ("gemv_p12", "btb_gemv_p12_rows", "x", lambda y: Native.gemv_p12(*p12, *no_esc, r, c, x.half(), y), f32),
+        (
+            "gemv_p12",
+            "btb_gemv_p12_rows",
+            "lo",
+            lambda y: Native.gemv_p12(p12[0].to(torch.int8), *p12[1:], *no_esc, r, c, x, y),
+            f32,
+        ),
+        ("gemv_mx4", "btb_gemv_mxfp4_rows", "blocks", lambda y: Native.gemv_mx4(mx_bad, x, y), f32),
+        (
+            "gemv_mx4_group",
+            "btb_gemv_mxfp4_group",
+            "blocks",
+            lambda y: Native.gemv_mx4_group([mx, mx_bad], [x, x], [y, y]),
+            f32,
+        ),
+        ("gemv_mx4_ggml", "btb_gemv_mxfp4_ggml_rows", "blocks", lambda y: Native.gemv_mx4_ggml(gg_bad, x, y), f32),
+        ("gemv_mx4_ggml", "btb_gemv_mxfp4_ggml_rows", "x", lambda y: Native.gemv_mx4_ggml(gg, x.half(), y), f32),
+        (
+            "gemv_mx4_ggml_group",
+            "btb_gemv_mxfp4_ggml_group",
+            "blocks",
+            lambda y: Native.gemv_mx4_ggml_group([gg, gg_bad], [x, x], [y, y]),
+            f32,
+        ),
+        ("attn_decode", "btb_attn_decode", "k", lambda y: Native.attn_decode(q, kv.half(), kv, 1.0, y), f32),
+        ("attn_decode", "btb_attn_decode", "v", lambda y: Native.attn_decode(q, kv, kv.float(), 1.0, y), f32),
+        ("attn_decode", "btb_attn_decode", "q", lambda y: Native.attn_decode(q.bfloat16(), kv, kv, 1.0, y), f32),
+        ("delta_step", "btb_delta_step", "norm_w", delta(norm_w=torch.zeros(dv, dtype=bf)), f32),
+        ("delta_step", "btb_delta_step", "conv_b", delta(conv_b=torch.zeros(cd, dtype=bf)), f32),
+    ]
+    missing = sorted({b for b, *_ in cases if getattr(Native, b) is None})
+    assert not missing, f"the library built in this tree binds every kernel; unbound: {missing}"
+    for binding, call, arg, run, ydt in cases:
+        y = torch.full((2, 16) if binding == "attn_decode" else (1, r), 7.0, dtype=ydt)
+        if binding == "delta_step":
+            y = torch.full((hv * dv,), 7.0, dtype=f32)
+        with pytest.raises(NativeDtypeError) as e:
+            run(y)
+        assert (e.value.call, e.value.arg) == (call, arg), (binding, arg, str(e.value))
+        assert bool((y == 7.0).all()), f"{call} wrote its output before refusing {arg}"
+
+
+@pytest.mark.parametrize("device", ["cpu", "mlx"])
+@pytest.mark.parametrize("name", ["tiny_qwen3-f16", "tiny_qwen3-f32", "gguf/tiny_qwen3-q8_0.gguf"])
+def test_a_layer_shed_to_the_drive_off_a_weight_not_stored_as_bf16_answers_as_from_ram(name: str, device: str) -> None:
+    """the cold ring over weights it cannot read off the drive as bf16 - a cast twin's floats, a GGUF's Q8_0
+    blocks - takes them from `_get` each pass ("mem"). `_bind_cold` read such a tensor's key as a 12-bit record
+    and raised when a busy machine shed a layer mid-decode; shed under the decode's inference mode, the layer
+    now answers as it did from RAM, and regrown it still does"""
+    path = fixture(name)
+    if device == "mlx":
+        need_mlx()
+    with loaded_model(path, device=device, v_max=0) as sm:
+        before, _ = sm.generate(REPEATING, 12, speculate=False)
+        with torch.inference_mode():
+            i = sm.ram_shed("the test")
+        assert i is not None and sm.cold == {i}
+        assert {it[5] for it in sm.cold_ring.recipe[i]} == {"mem"}, "every linear of the shed layer is read cast"
+        during, _ = sm.generate(REPEATING, 12, speculate=False)
+        assert during == before, "a layer read through the ring each pass answers as it did from RAM"
+        assert sm.ram_regrow() == i and not sm.cold
+        after, _ = sm.generate(REPEATING, 12, speculate=False)
+        assert after == before

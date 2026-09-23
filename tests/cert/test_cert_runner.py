@@ -78,33 +78,41 @@ def _run_twice(
 
 
 def _cells() -> list[ParameterSet]:
-    # every served family x the sub-paths the safetensors surface runs (spec.SURFACE_SUBPATHS - the single
+    # every served family x each safetensors precision it has a fixture for (the BF16 fixture and the twins
+    # spec.fixture_paths binds) x the sub-paths the safetensors surface runs (spec.SURFACE_SUBPATHS - the single
     # table the manifest counts, never a second copy here) x each decode (greedy, sampled), so a new device
-    # sub-path or decode is exercised without editing this file.
+    # sub-path, decode or twin is exercised without editing this file.
     out: list[ParameterSet] = []
     for kind in core.served_kinds():
-        stem = spec.FIXTURE_STEM.get(kind)
-        if stem is None:
+        if kind not in spec.FIXTURE_STEM:
             continue  # no fixture stem - a manifest GAP, not a runner cell
-        for dev in _subpaths(spec.Surface.SAFETENSORS):
-            for decode in spec.Decode:
-                out.append(pytest.param(kind, stem, dev, decode, id=f"{kind.value}-{dev.key}-{decode.value}"))
+        for storage, info in spec.STORAGE.items():
+            if info.container is not spec.Container.SAFETENSORS:
+                continue
+            paths = spec.fixture_paths(kind, storage)
+            if not paths:
+                continue  # no twin at this precision - the manifest's precision gap, not a runner cell
+            subject = manifest.safetensors_subject(kind, storage)
+            for dev in _subpaths(spec.Surface.SAFETENSORS):
+                for decode in spec.Decode:
+                    out.append(
+                        pytest.param(kind, storage, paths[0], dev, decode, id=f"{subject}-{dev.key}-{decode.value}")
+                    )
     return out
 
 
-@pytest.mark.parametrize("kind,stem,dev,decode", _cells())
+@pytest.mark.parametrize("kind,storage,path,dev,decode", _cells())
 def test_cell_loads_and_is_deterministic(
-    kind: FamilyKind, stem: str, dev: spec.DeviceSubpath, decode: spec.Decode
+    kind: FamilyKind, storage: spec.Storage, path: str, dev: spec.DeviceSubpath, decode: spec.Decode
 ) -> None:
     # do not FALSELY pass a device sub-path the engine cannot engage for this family or this fixture (the
     # manifest's gap_reason): running mlx-mega on a head_dim-16 fixture just uses the step path and would pass
     # without exercising anything. Those are gaps the manifest reports and fails --check on; here they skip, so
     # the runner never banks a receipt a fallback earned.
-    storage = spec.Storage.SAFE_BF16
     _skip_unless_distinct(kind, storage, dev)
     if not _hardware_here(dev.hardware):
         pytest.skip(f"{dev.hardware.value} not available on this machine")
-    path = os.path.join(FIXTURES, stem)
+    stem = os.path.basename(path)
     if not os.path.isdir(path):
         pytest.skip(f"fixture {stem} not built")
 
@@ -124,7 +132,7 @@ def test_cell_loads_and_is_deterministic(
         oracle.assert_matches(kind, held, dev.hardware.value)
     else:
         oracle.assert_matches(kind, runs[0], dev.hardware.value, sampled=sampled)
-    receipt.record(manifest.safetensors_id(kind, dev.key, decode))  # ran+passed here (cross-machine union)
+    receipt.record(manifest.safetensors_id(kind, dev.key, decode, storage))  # ran+passed here (cross-machine union)
 
 
 def _assert_path_engaged(

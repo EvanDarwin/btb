@@ -207,6 +207,11 @@ class StreamedTextModel(
         self.prefix = emb_keys[0][: -len("embed_tokens.weight")]
         self.head_key = "lm_head.weight" if "lm_head.weight" in self.weight_map else emb_keys[0]
         self._maps = {}
+        # the embedding carries the checkpoint's own weight precision: an fp16 or fp32 one is held as bf16
+        self.held_cast = False
+        if self.gguf is None:
+            _mm, hdr, _ = self._shard(self.weight_map[emb_keys[0]])
+            self.held_cast = self.ST_DTYPES[hdr[emb_keys[0]]["dtype"]] != torch.bfloat16
         # set by close(): every decode loop ends at its next step, so no thread is mid-pass when the buffers go
         self.abort = threading.Event()
         self._decode_lock = threading.RLock()  # one decode at a time on the engine (MLX's worker serializes too)
@@ -221,11 +226,14 @@ class StreamedTextModel(
                 self.norm = self.fam.norm(cfg.hidden_size, eps=cfg.rms_norm_eps)
             else:
                 self.mixer = self.fam.mod.Qwen4ExpTextGatedResidual(cfg, use_combine=False)
+        # the parameters are widened to a float32 compute dtype below: read at the checkpoint's own precision for it
+        wide = self.compute_dtype is not None and self.compute_dtype != torch.bfloat16
         if self.norm is not None:
-            self._adopt(self.norm, "weight", self._get(self.prefix + "norm.weight"))
+            self._adopt(self.norm, "weight", self._get(self.prefix + "norm.weight", stored=wide))
         else:
             for name, _, is_buf in self._named_tensors(self.mixer):
-                self._adopt(self.mixer, name, self._get(self.prefix + "hyper_connection_mixer." + name), buffer=is_buf)
+                t = self._get(self.prefix + "hyper_connection_mixer." + name, stored=wide and not is_buf)
+                self._adopt(self.mixer, name, t, buffer=is_buf)
         self.resident_head = resident_head
         self.head = None
         self.head_host = None

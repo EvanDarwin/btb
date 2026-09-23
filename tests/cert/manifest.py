@@ -149,17 +149,16 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "a banked greedy oracle; speculation is otherwise entirely uncertified",
     ),
     Missing.FP16_FIXTURE: (
-        "no fp16 safetensors fixture exists - the engine reads fp16 checkpoints (hf._DTYPE_LABEL) but the cert "
-        "has no fp16 twin, so the fp16 storage path is unexercised",
-        "add an fp16 twin of the tiny fixtures in tests/make_fixtures.py; spec.fixture_paths binds it as soon as "
-        "the precision has a fixture of its own (it must never bind the bf16 directory)",
+        "this family has no fp16 safetensors twin (`<stem>-f16`, every float tensor stored F16), so its fp16 "
+        "checkpoint load path is exercised by nothing",
+        "regenerate the precision twins (`python tests/make_fixtures.py twins`); spec.fixture_paths binds a twin "
+        "whose headers carry F16 and no other float dtype",
     ),
     Missing.FP32_FIXTURE: (
-        "no fp32 safetensors fixture exists - every committed fixture's header is BF16, so the fp32 LOAD path "
-        "(a float32 checkpoint read and cast) is exercised by nothing; the `fp32` load option is a compute "
-        "dtype, not this",
-        "add an fp32 twin of the tiny fixtures in tests/make_fixtures.py; until then this cell must not bind the "
-        "bf16 fixture, which is what made it read as covered",
+        "this family has no fp32 safetensors twin (`<stem>-f32`), so its fp32 LOAD path (a float32 checkpoint "
+        "read and cast) is exercised by nothing; the `fp32` load option is a compute dtype, not this",
+        "regenerate the precision twins (`python tests/make_fixtures.py twins`); spec.fixture_paths binds a twin "
+        "whose headers carry F32 and no other float dtype",
     ),
     Missing.FP8_UNIMPLEMENTED: (
         "fp8 checkpoint loading is unimplemented (no float8/e4m3/e5m2 path in the engine), so the fp8 storage "
@@ -184,8 +183,8 @@ MISSING: dict[Missing, tuple[str, str]] = {
     ),
 }
 
-# the safetensors precisions with no committed fixture, each to the gap kind that says why. A precision added to
-# spec.Storage with no row here falls through to NO_FIXTURE; test_manifest holds the table total.
+# each safetensors precision beside the BF16 fixture, to the gap kind a family with no twin of it reports. A
+# precision added to spec.Storage with no row here falls through to NO_FIXTURE; test_manifest holds it total.
 SAFE_PRECISION_GAP: dict[spec.Storage, Missing] = {
     spec.Storage.SAFE_FP16: Missing.FP16_FIXTURE,
     spec.Storage.SAFE_FP32: Missing.FP32_FIXTURE,
@@ -297,8 +296,17 @@ def cell_id(surface: spec.Surface, *parts: str) -> str:
     return "/".join([surface.value, *parts])
 
 
-def safetensors_id(kind: FamilyKind, key: str, decode: spec.Decode) -> str:
-    return cell_id(spec.Surface.SAFETENSORS, kind.value, key, decode.value)
+def safetensors_subject(kind: FamilyKind, storage: spec.Storage = spec.Storage.SAFE_BF16) -> str:
+    """what a safetensors cell loaded: the family's own BF16 fixture, or the family and its twin's header dtype."""
+    if storage is spec.Storage.SAFE_BF16:
+        return kind.value
+    return f"{kind.value}-{spec.STORAGE[storage].fp.lower()}"
+
+
+def safetensors_id(
+    kind: FamilyKind, key: str, decode: spec.Decode, storage: spec.Storage = spec.Storage.SAFE_BF16
+) -> str:
+    return cell_id(spec.Surface.SAFETENSORS, safetensors_subject(kind, storage), key, decode.value)
 
 
 def gguf_id(fname: str, key: str) -> str:
@@ -326,9 +334,7 @@ def cell_ids(
     if dev.key not in spec.SURFACE_SUBPATHS[surface]:
         return ()
     if container is spec.Container.SAFETENSORS:
-        if storage is not spec.Storage.SAFE_BF16:
-            return ()  # the committed fixtures are bf16 headers; no other precision has a run
-        return tuple(safetensors_id(kind, dev.key, d) for d in spec.Decode)
+        return tuple(safetensors_id(kind, dev.key, d, storage) for d in spec.Decode)
     if container is spec.Container.PACK12:
         return (stem_id(surface, stem, dev.key),)
     return tuple(gguf_id(p, dev.key) for p in spec.fixture_paths(kind, storage))
@@ -435,11 +441,11 @@ def gap_reason(
     if refused is not None:
         return refused
     # 3. an artifact the cert does not have
-    if info.container is spec.Container.SAFETENSORS and storage in SAFE_PRECISION_GAP:
+    paths = spec.fixture_paths(kind, storage)
+    if info.container is spec.Container.SAFETENSORS and storage in SAFE_PRECISION_GAP and not paths:
         return SAFE_PRECISION_GAP[storage]
     if qc in (QuantClass.KQUANT, QuantClass.IQ4, QuantClass.LATTICE):
         return Missing.KIQUANT_FIXTURE
-    paths = spec.fixture_paths(kind, storage)
     absent = [p for p in paths if not os.path.exists(p)]
     if not paths or len(absent) == len(paths):
         return Missing.NO_FIXTURE

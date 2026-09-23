@@ -20,6 +20,14 @@ if TYPE_CHECKING:
     pass
 
 
+def copy_bytes(dst: torch.Tensor, t: torch.Tensor) -> None:
+    """`t`'s bytes into the byte buffer `dst`, from any thread. Under inference mode, which takes the write
+    whether `dst` was made in it (a bind or a shed mid-decode) or not: the mode is per thread, and a reader
+    thread outside it refuses to write an inference tensor."""
+    with torch.inference_mode():
+        dst.copy_(t.reshape(-1).view(torch.uint8))
+
+
 class _HostLinear(torch.nn.Module):
     _cpu_shared: Any
     bias: torch.Tensor | None

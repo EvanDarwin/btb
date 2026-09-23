@@ -413,13 +413,13 @@ class _FamiliesMixin(_State):
         layer = self._shape_layer(layer, i)
         base = f"{self.prefix}layers.{i}."
         for name, _p, is_buf in self._named_tensors(layer):
-            t = self._get(base + name)
+            t = self._get(base + name, stored=True)
             # widened once: norms, biases, sinks, the conv, Qwen4's router, gpt-oss's per-expert biases (a few MB,
             # added in float32)
             wide = t.is_floating_point() and (
                 t.dim() <= 1 or "conv1d" in name or ".experts." in name or name.endswith("mlp.gate.weight")
             )
-            self._set_param(layer, name, t.float() if wide else t, buffer=is_buf)
+            self._set_param(layer, name, t.float() if wide else self._held(t), buffer=is_buf)
         for mname, m in list(layer.named_modules()):
             for cname, child in list(m.named_children()):
                 if isinstance(child, torch.nn.Linear) and child.weight.dtype == torch.bfloat16:
