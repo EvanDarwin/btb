@@ -25,10 +25,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # half made explicit: `--check` fails on every one of them, and this test fails when the set MOVES - a new gap
 # nobody wrote down, or a closed gap still claimed here. Update it in the same change that opens or closes one.
 EXPECTED_GAPS: dict[manifest.Missing, list[str]] = {
-    manifest.Missing.GGUF_LOAD: ["tiny_gemma3", "tiny_q4"],
-    manifest.Missing.MXFP4_NON_GPTOSS: ["tiny_phi3", "tiny_q35", "tiny_qwen3"],
+    manifest.Missing.GGUF_LOAD: ["tiny_gemma3"],
+    manifest.Missing.MXFP4_NON_GPTOSS: ["tiny_phi3", "tiny_q35", "tiny_q4", "tiny_qwen3"],
     manifest.Missing.GPTOSS_GGUF_TWIN: ["tiny_gpt_oss"],
-    manifest.Missing.KIQUANT_FIXTURE: ["tiny_phi3", "tiny_q35", "tiny_qwen3"],
+    manifest.Missing.KIQUANT_FIXTURE: ["tiny_phi3", "tiny_q35", "tiny_q4", "tiny_qwen3"],
     manifest.Missing.MEGAKERNEL: ["tiny_gemma3", "tiny_gpt_oss", "tiny_phi3", "tiny_q35", "tiny_q4"],
     manifest.Missing.MEGA_STORAGE: ["tiny_qwen3"],
     manifest.Missing.MEGA_SHAPE: ["tiny_qwen3"],

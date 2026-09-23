@@ -11,10 +11,14 @@ import json
 import os
 import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 import torch
+
+if TYPE_CHECKING:
+    from btb.gguf import GGUFModel
 
 from tests.helpers import (
     FIXTURES,
@@ -416,6 +420,115 @@ def test_a_qwen35_gguf_multiplies_its_reordered_blocks_as_stored_on_mlx() -> Non
             assert lg is not None
             logits[packed] = lg.float()[0, -1]
     assert_close(logits[1], logits[0])
+
+
+# --- qwen4exp: tiny_q4's twins as llama.cpp's own converter writes them (tests/make_fixtures.py make_q4_gguf) ---
+
+Q4 = os.path.join(FIXTURES, "tiny_q4")
+NGRAM = ".ple.ple_embedding.ngram_embedding.shard_"
+
+
+def _q4_state() -> dict[str, torch.Tensor]:
+    """tiny_q4's tensors with its n-gram shards as the one table the GGUF stores (`shard_0`)"""
+    state = safetensors_state(Q4)
+    for pre in sorted({k.partition(NGRAM)[0] for k in state if NGRAM in k}):
+        parts = sorted((k for k in state if k.startswith(pre + NGRAM)), key=lambda k: (len(k), k))
+        state[pre + NGRAM + "0.weight"] = torch.cat([state.pop(k) for k in parts])
+    return state
+
+
+def _q4_names(g: "GGUFModel") -> dict[str, str]:
+    names, _ = g.weight_map(list(safetensors_state(Q4)), g.config().num_hidden_layers)
+    return names
+
+
+def test_the_qwen4exp_table_is_llama_cpps() -> None:
+    """btb's own qwen4exp names and keys are the gguf package's once a release knows the architecture; until
+    then they name exactly the tensors llama.cpp's converter wrote, every one of them read"""
+    _need()
+    from gguf import MODEL_ARCH_NAMES, MODEL_TENSOR, TENSOR_NAMES, TensorNameMap
+
+    from btb.gguf import OWN_KEYS, OWN_NAMES, OWN_TENSOR_NAMES, GGUFModel, knows_arch, meta_key
+    from btb.hf import QWEN4EXP
+
+    g = GGUFModel(os.path.join(GGUF, "tiny_q4-bf16.gguf"))
+    if knows_arch(QWEN4EXP):
+        L = int(g.config().num_hidden_layers)
+        tmap = TensorNameMap(next(a for a, n in MODEL_ARCH_NAMES.items() if n == QWEN4EXP), L)
+        for hf, name in OWN_NAMES[QWEN4EXP].items():
+            assert tmap.get_name(hf.format(bid=1)) == name.format(bid=1), hf
+        for member, name in OWN_TENSOR_NAMES[QWEN4EXP].items():
+            assert TENSOR_NAMES[MODEL_TENSOR[member]] == name, member
+        for path, key in OWN_KEYS.items():
+            assert meta_key(QWEN4EXP, path) == key.format(arch=QWEN4EXP), path
+    names = _q4_names(g)
+    read = {g.undo[n][0] if n in g.undo else n for n in names.values() if n not in g.derived}
+    read |= {f for fs, _ in g.derived.values() for f in fs}
+    assert read == set(g.tensors), set(g.tensors) ^ read
+
+
+def test_the_qwen4exp_reader_inverts_llama_cpps_converter() -> None:
+    """the bf16 twin: the config transformers reads off the checkpoint, rebuilt from llama.cpp's keys; every
+    tensor of the checkpoint equal as bf16 once the converter's rewrites are undone (V heads regrouped, A_log,
+    the +1 gammas, the squeezed convolutions, the split indexer and experts, the n-gram table and its hash
+    constants); the f16 twin within f16's rounding of it"""
+    _need()
+    from transformers import AutoConfig
+
+    from btb.gguf import GGUFModel
+
+    g = GGUFModel(os.path.join(GGUF, "tiny_q4-bf16.gguf"))
+    cfg, want = g.config(), AutoConfig.from_pretrained(Q4)
+    assert g.model_type == cfg.model_type == want.model_type
+    # the n-gram hash's seed and the shard count are not in the file (its constants and its one table stand in),
+    # nor the checkpoint's provenance; the file holds the epsilon as a float32
+    unread = {"seed", "split_ngram_parts", "ngram_vocab_size_base", "dtype", "architectures", "transformers_version"}
+    same = set(want.to_diff_dict()) - unread - {"rms_norm_eps"}
+    assert {k: getattr(cfg, k) for k in same} == {k: getattr(want, k) for k in same}
+    assert np.float32(cfg.rms_norm_eps) == np.float32(want.rms_norm_eps)
+    state = _q4_state()
+    names = _q4_names(g)
+    assert set(names) == set(state), set(state) ^ set(names)
+    for hf, gn in names.items():
+        t = g.get(gn)
+        assert t.dtype == state[hf].dtype and tuple(t.shape) == tuple(state[hf].shape), hf
+        assert torch.equal(t, state[hf]), hf
+    h = GGUFModel(os.path.join(GGUF, "tiny_q4-f16.gguf"))
+    diffs = [max_abs(h.get(gn).float(), state[hf].float()) for hf, gn in _q4_names(h).items()]
+    assert max(diffs) < 1e-3 and any(d > 0 for d in diffs), max(diffs)
+
+
+def test_a_bf16_qwen4exp_gguf_decodes_as_its_safetensors_twin() -> None:
+    _need()
+    assert _tokens(os.path.join(GGUF, "tiny_q4-bf16.gguf")) == _tokens(Q4)
+
+
+def test_a_quantized_qwen4exp_gguf_decodes_as_its_dequantized_weights(tmp_path: Path) -> None:
+    """Q8_0, Q4_0 and Q4_1: the file decodes exactly as a checkpoint of the numbers it dequantizes to, the
+    experts dequantized into the expert store's slots as a checkpoint's are read into them"""
+    _need()
+    from safetensors.torch import save_file
+
+    from btb.gguf import GGUFModel
+
+    shards: dict[str, list[int]] = {}  # the checkpoint's shard rows, in order, by PLE layer
+    for k, v in sorted(safetensors_state(Q4).items(), key=lambda kv: (len(kv[0]), kv[0])):
+        if NGRAM in k:
+            shards.setdefault(k.partition(NGRAM)[0], []).append(int(v.shape[0]))
+    for qt in ("q8_0", "q4_0", "q4_1"):
+        path = os.path.join(GGUF, f"tiny_q4-{qt}.gguf")
+        g = GGUFModel(path)
+        deq = {hf: g.get(gn).contiguous() for hf, gn in _q4_names(g).items()}
+        assert any(not torch.equal(deq[k], v) for k, v in _q4_state().items()), qt
+        for pre, rows in shards.items():
+            for j, part in enumerate(torch.split(deq.pop(pre + NGRAM + "0.weight"), rows)):
+                deq[pre + NGRAM + f"{j}.weight"] = part.contiguous()
+        twin = tmp_path / f"twin-{qt}"
+        twin.mkdir()
+        for fn in ("config.json", "tokenizer.json", "tokenizer_config.json"):
+            shutil.copy(os.path.join(Q4, fn), twin / fn)
+        save_file(deq, str(twin / "model.safetensors"), metadata={"format": "pt"})
+        assert _tokens(path) == _tokens(str(twin)), qt
 
 
 def test_gguf_paths_are_discovered_resolved_and_not_packed() -> None:

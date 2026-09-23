@@ -94,6 +94,11 @@ _AFFINE_BITS = {Quant.Q4_0: 4, Quant.Q4_1: 4, Quant.Q8_0: 8, Quant.Q4_K: 4}
 # by the k-quant kernel it binds through first.
 AFFINE_TYPES: dict[Quant, int] = {q: _AFFINE_BITS[q] for q in [*quants_of(QuantClass.AFFINE), Quant.Q4_K]}
 
+# llama.cpp's architecture for transformers' qwen4_exp, which the gguf package's releases (0.19) do not know yet:
+# btb carries its tensor names until they do (gguf.OWN_NAMES)
+QWEN4EXP = "qwen4exp"
+ARCH_MODEL_TYPES[QWEN4EXP] = ModelType.QWEN4_EXP_TEXT
+
 
 def is_gguf(path: Any) -> bool:
     """whether `path` names a GGUF file (llama.cpp's format)"""

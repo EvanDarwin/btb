@@ -282,7 +282,8 @@ def _qwen35_converted(cfg: Json, state: dict[str, torch.Tensor]) -> dict[str, to
 
 def make_gguf() -> None:
     """the GGUF fixtures: tiny_qwen3 in every storage type the reader is tested on, tiny_phi3 as f16 (its fused
-    projections exercise the table's other layout)"""
+    projections exercise the table's other layout), tiny_q35 in the float and affine types (make_gguf_q35), tiny_q4
+    as llama.cpp's converter writes it (make_q4_gguf)"""
     out = os.path.join(FIXTURES, "gguf")
     os.makedirs(out, exist_ok=True)
     for t in GGUF_TYPES:
@@ -293,6 +294,7 @@ def make_gguf() -> None:
         write_gguf(os.path.join(FIXTURES, "tiny_phi3"), os.path.join(out, f"tiny_phi3-{t}.gguf"), t)
     write_gguf(os.path.join(FIXTURES, "tiny_gpt_oss"), os.path.join(out, "tiny_gpt_oss-mxfp4.gguf"), "bf16")
     make_gguf_q35()
+    make_q4_gguf()
     print("[fixture] gguf twins regenerated")
 
 
@@ -306,6 +308,96 @@ def make_gguf_q35() -> None:
     for q in (*quants_of(QuantClass.FLOAT), *quants_of(QuantClass.AFFINE)):
         t = q.value.lower()
         write_gguf(os.path.join(FIXTURES, "tiny_q35"), os.path.join(out, f"tiny_q35-{t}.gguf"), t)
+
+
+# --- the qwen4exp twins, written by llama.cpp's own converter (a checkout named by $LLAMA_CPP) --------------
+
+# the stored types among convert_hf_to_gguf.py's --outtype choices; the other float and affine types are
+# requantized from its f32 output
+Q4_CONVERTER_TYPES = ("bf16", "f16", "q8_0")
+
+# run in a child process against the checkout's gguf-py, never imported into btb's. Two answers are given, the
+# rest is the converter's: the tiny fixtures' synthetic byte-level vocabulary matches no released tokenizer's hash
+# (it pre-tokenizes as qwen2, write_gguf's choice), and config.json is read as written, since transformers renames
+# the checkpoint's "full_attention" layers and the converter then writes a compression ratio of 0 (dense) for all.
+_CONVERT = """
+import json, runpy, sys
+from pathlib import Path
+llama, model, outtype, out = sys.argv[1:5]
+from conversion.base import ModelBase, TextModel
+TextModel.get_vocab_base_pre = lambda self, tokenizer: "qwen2"
+ModelBase.load_hparams = staticmethod(lambda d, mistral: json.loads((Path(d) / "config.json").read_text()))
+sys.argv = ["convert_hf_to_gguf.py", model, "--outtype", outtype, "--outfile", out]
+runpy.run_path(llama + "/convert_hf_to_gguf.py", run_name="__main__")
+"""
+
+
+def llama_convert(model_dir: str, out: str, outtype: str) -> None:
+    """`model_dir` converted to one GGUF by llama.cpp's convert_hf_to_gguf.py, in a subprocess with the checkout's
+    gguf-py first on the path (and no bytecode written into the checkout)."""
+    import subprocess
+
+    llama = os.environ.get("LLAMA_CPP", "")
+    if not os.path.isfile(os.path.join(llama, "convert_hf_to_gguf.py")):
+        raise SystemExit("[fixture] set LLAMA_CPP to a llama.cpp checkout: the qwen4exp twins are its converter's")
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([llama, os.path.join(llama, "gguf-py")])}
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    subprocess.run([sys.executable, "-c", _CONVERT, llama, model_dir, outtype, out], env=env, check=True)
+
+
+def requantize_gguf(src: str, like: str, out: str, outtype: str) -> None:
+    """`like` (a converter q8_0 output) rewritten as `outtype`: every tensor it stores as Q8_0 quantized to
+    `outtype` from `src`'s (the f32 output's) numbers, every other tensor and every metadata key copied as is."""
+    import numpy as np
+    from gguf import GGMLQuantizationType, GGUFReader, GGUFValueType, GGUFWriter, Keys, LlamaFileType
+    from gguf.quants import quantize
+
+    qtype = GGMLQuantizationType[outtype.upper()]
+    r, f32 = GGUFReader(like), {t.name: t for t in GGUFReader(src).tensors}
+    w = GGUFWriter(out, str(r.fields[Keys.General.ARCHITECTURE].contents()))
+    for f in r.fields.values():
+        if f.name.startswith("GGUF.") or f.name in (Keys.General.ARCHITECTURE, Keys.General.FILE_TYPE):
+            continue
+        sub = f.types[-1] if f.types[0] is GGUFValueType.ARRAY else None
+        w.add_key_value(f.name, f.contents(), f.types[0], sub_type=sub)
+    w.add_file_type(LlamaFileType[f"MOSTLY_{outtype.upper()}"])
+    for t in r.tensors:
+        if t.tensor_type is GGMLQuantizationType.Q8_0:
+            arr = np.asarray(f32[t.name].data).reshape([int(x) for x in reversed(list(t.shape))])
+            w.add_tensor(t.name, quantize(arr, qtype), raw_dtype=qtype)
+        else:
+            w.add_tensor(t.name, np.array(t.data), raw_dtype=t.tensor_type)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
+def make_q4_gguf() -> None:
+    """tiny_q4's GGUF twins as llama.cpp's converter writes them, from a copy of the fixture whose config spells
+    the attention layers "full_attention" as the released checkpoint does (transformers reads both spellings as
+    the same layer; the converter keys the indexer's compression on that one)."""
+    import shutil
+    import tempfile
+
+    from btb.kinds import QuantClass, quants_of
+
+    types = [q.value.lower() for c in (QuantClass.FLOAT, QuantClass.AFFINE) for q in quants_of(c)]
+    src = os.path.join(FIXTURES, "tiny_q4")
+    out = os.path.join(FIXTURES, "gguf")
+    with tempfile.TemporaryDirectory() as tmp:
+        stage = os.path.join(tmp, "tiny_q4")
+        shutil.copytree(src, stage)
+        cfg = json.load(open(os.path.join(stage, "config.json"), encoding="utf-8"))
+        cfg["layer_types"] = ["full_attention" if t != "linear_attention" else t for t in cfg["layer_types"]]
+        with open(os.path.join(stage, "config.json"), "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        for t in Q4_CONVERTER_TYPES:
+            llama_convert(stage, os.path.join(out, f"tiny_q4-{t}.gguf"), t)
+        f32 = os.path.join(tmp, "tiny_q4-f32.gguf")
+        llama_convert(stage, f32, "f32")
+        for t in (t for t in types if t not in Q4_CONVERTER_TYPES):
+            requantize_gguf(f32, os.path.join(out, "tiny_q4-q8_0.gguf"), os.path.join(out, f"tiny_q4-{t}.gguf"), t)
 
 
 # --- weight builders: a tiny random checkpoint per family in its own shape ---------------------------------

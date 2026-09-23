@@ -432,6 +432,10 @@ class _ExpertStore:
         self.mx = bool(sm.fam.mxfp4)
         # a GGUF's experts: gate, up and down in ggml's block layout, multiplied as stored (btb/mxfp4.py)
         self.ggml = self.mx and getattr(sm, "gguf", None) is not None
+        # a GGUF's other experts, which no kernel multiplies as stored: a read dequantizes the expert (its layout
+        # inverted, `GGUFModel.get`) into the slot as the bf16 a checkpoint's read would land there
+        self.dequant = not self.mx and getattr(sm, "gguf", None) is not None
+        self.keys: dict[int, tuple[str, ...]] = {}  # the dequantized experts' tensor names by layer
         self.n_slots = 0
         self.budget = int(budget_bytes)
         self.reserve = int(reserve_bytes)
@@ -661,6 +665,8 @@ class _ExpertStore:
                 parts.append((self._os.path.join(self.sm.dir, shard), hoff + a, (b - a) // shape[0], shape[1:]))
                 if not (self.ggml or self.mx):
                     self.dt = self.sm.ST_DTYPES[info["dtype"]]
+            if self.dequant:
+                self.keys[layer] = tuple(base + name for name in names)
             r = self.recipes[layer] = parts
             sched = getattr(self.sm, "scheduler", None)
             if sched is not None and hasattr(sched, "disk"):
@@ -680,6 +686,7 @@ class _ExpertStore:
                 # reads straight into the slot (padded regions) unless BTB_STORE_PADDED=0 asks for the bounce
                 self.padded = (
                     self.sm.mlx is None
+                    and not self.dequant
                     and Native.read_at is not None
                     and os.environ.get("BTB_STORE_PADDED", "1") != "0"
                 )
@@ -921,14 +928,21 @@ class _ExpertStore:
         for j, (path, off, n_e, _) in enumerate(parts):
             at = self.part_at[j] if self.part_at else sum(self.sizes[:j])
             tp = time.perf_counter_ns()
-            Native.read_direct(path, off + e * n_e, n_e, region[at : at + n_e], self.sm.cold_chunk)
+            if self.dequant:
+                w = self.sm.gguf.get(self.sm._gguf_names[self.keys[layer][j]], expert=int(e))
+                region[at : at + n_e].view(torch.bfloat16).copy_(w.reshape(-1))
+            else:
+                Native.read_direct(path, off + e * n_e, n_e, region[at : at + n_e], self.sm.cold_chunk)
             self._note_read(prof, layer, e, j, path, off + e * n_e, n_e, slot, time.perf_counter_ns() - tp)
 
     def _submit(self, sched: Any, parts: Any, e: Any, slot: Any, layer: int, priority: int) -> Any:
         """the expert's parts queued on the Route, one read each, with the profile's row and the counters
         taken as each lands; returns what `wait` and the layer's forward call `.result()` on. In a padded slot
-        the read is the sector-aligned span around the part, straight into its region."""
+        the read is the sector-aligned span around the part, straight into its region. A dequantized expert is
+        no drive read: the store's own readers fill it."""
         self.as_bf16.discard(slot)
+        if self.dequant:
+            return Parts([self.pool.submit(self._read, parts, e, slot, layer)])
         region = self._region(slot)
         prof = getattr(self.sm, "expert_profile", None)
         futs = []

@@ -510,16 +510,17 @@ class StreamedTextModel(
         return len(cost)
 
     def _family_tensor_names(self, cfg: Any) -> list[str]:
-        """every tensor the family's layers, embedding, norm and head are loaded from, by its HF name: what a
-        GGUF file's tensors are matched against"""
-        per: dict[str, list[str]] = {}
-        with torch.device("meta"):
-            for i, kind in enumerate(self.layer_types):  # a hybrid's layer types hold different tensors
-                if kind not in per:
-                    layer = self.fam.layer(cfg, i)
-                    per[kind] = [n for n, _ in layer.named_parameters()] + [n for n, _ in layer.named_buffers()]
+        """every tensor the family's layers, embedding, norm (Qwen4's closing mixer) and head are loaded from, by
+        its HF name: what a GGUF file's tensors are matched against. Each layer is its own: a hybrid family's
+        layers differ in kind."""
         names = ["model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"]
-        return names + [f"model.layers.{i}.{n}" for i, kind in enumerate(self.layer_types) for n in per[kind]]
+        with torch.device("meta"):
+            if self.fam.norm is None:
+                mixer = self.fam.mod.Qwen4ExpTextGatedResidual(cfg, use_combine=False)
+                names += [f"model.hyper_connection_mixer.{n}" for n, _, _ in self._named_tensors(mixer)]
+            for i in range(self.L):
+                names += [f"model.layers.{i}.{n}" for n, _, _ in self._named_tensors(self.fam.layer(cfg, i))]
+        return names
 
     def close(self) -> None:
         """Stop any decode in flight and release the model's memory on every tier; safe to call twice. The engine
