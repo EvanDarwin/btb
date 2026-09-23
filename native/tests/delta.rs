@@ -103,6 +103,49 @@ fn a_second_step_carries_the_state_forward_correctly() {
     }
 }
 
+/// Head and channel widths that leave a vector tail, from a single element up to the widest head
+/// the kernel accepts, match the f64 reference, with and without the conv bias. The bounds are the
+/// fenced sweep's: an RMS norm over a short head rounds at the 1e-5 level componentwise.
+#[test]
+fn ragged_shapes_match_the_reference() {
+    const TOL_COMP: f64 = 1e-4;
+    for s in [
+        (1, 1, 1, 1, 1),
+        (2, 6, 7, 13, 5),
+        (3, 9, 16, 8, 4),
+        (1, 3, 5, 3, 2),
+        (2, 4, 33, 19, 4),
+        (2, 2, 256, 256, 4),
+    ]
+    .map(|(hk, hv, dk, dv, k)| DeltaShape { hk, hv, dk, dv, k })
+    {
+        for (bias, seed) in [(false, 5u64), (true, 6)] {
+            let n = gen_delta(&s, seed, bias);
+            let e = delta_reference(&s, &n, EPS);
+            for threads in [1usize, 0] {
+                let (mixed, cs, st, out) = run(&s, &n, threads);
+                for (got, want, label) in [
+                    (&mixed, &e.y, "mixed_qkv"),
+                    (&cs, &e.conv_state, "conv_state"),
+                    (&st, &e.state, "state"),
+                    (&out, &e.out, "out"),
+                ] {
+                    let (norm, comp) = err_pair(got, want, label);
+                    assert!(
+                        norm <= TOL && comp <= TOL_COMP,
+                        "{}/{}/{}/{}/{} bias={bias} threads={threads} {label}: {norm:.3e}/{comp:.3e}",
+                        s.hk,
+                        s.hv,
+                        s.dk,
+                        s.dv,
+                        s.k
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// A null buffer, a zero or mismatched dimension, a head count that does not divide, a head
 /// dimension past the kernel's limit and a NaN or negative `eps` are all refused with a code.
 #[test]

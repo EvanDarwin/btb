@@ -2,8 +2,9 @@
 //! The token sampler through the C ABI on plain heap buffers: the greedy argmax is exactly the
 //! lowest-index maximum at every shape and thread count, a (key, row) repeats, a batch picks what
 //! its own single-row calls pick, and the top-k and top-p masks keep exactly the tokens a
-//! straightforward f64 reference keeps. The sampler is pure scalar Rust with no ISA dispatch, so
-//! there is nothing to force; the page-fenced version of the input read lives in `guard_sample.rs`.
+//! straightforward f64 reference keeps. The tier is the one `isa()` selects (`BTB_NATIVE_ISA=scalar`
+//! forces the scalar one); the NEON passes are held to the scalar ones bit for bit by the unit test
+//! in src/sample.rs. The page-fenced version of the input read lives in `guard_sample.rs`.
 
 use btb_native::btb_sample_pick;
 use btb_native::codes::*;
@@ -124,6 +125,42 @@ fn greedy_is_the_lowest_index_maximum() {
         }
         eprintln!("greedy {rows:>3} x {v:<6}: lowest-index max at t<=0");
     }
+}
+
+/// NaNs never win the greedy pick, infinities do, a -0 and a +0 tie (the first wins), and a row of
+/// nothing but -inf and NaN picks token 0, at widths either side of every vector boundary.
+#[test]
+fn greedy_handles_the_special_values() {
+    let levels = [
+        f32::NAN,
+        -f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+    ];
+    let mut rng = Rng::new(0x0DD_BA11);
+    for v in (1..=48).chain([255, 256, 257, 4099]) {
+        for pool in [
+            &levels[..],
+            &levels[..2],
+            &[f32::NAN, f32::NEG_INFINITY],
+            &levels[4..6],
+        ] {
+            let x: Vec<f32> = (0..v).map(|_| pool[rng.below(pool.len())]).collect();
+            let want = argmax(&x);
+            for &threads in &[1usize, 0] {
+                assert_eq!(
+                    run(&x, 1, &[0], 0.0, 0, 1.0, threads)[0],
+                    want,
+                    "v={v} pool={pool:?} threads={threads}"
+                );
+            }
+        }
+    }
+    eprintln!("greedy over NaN, infinities and signed zeros: the lowest-index maximum");
 }
 
 /// A (key, row) draws the same token every time and at every thread count, and a batch draws what

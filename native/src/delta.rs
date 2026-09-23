@@ -1,6 +1,6 @@
 // Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 use crate::codes::{ERR_DOMAIN, ERR_NULL, OK};
-use crate::gemv::{aligned, MAX_ELEMS};
+use crate::gemv::{aligned, Isa, MAX_ELEMS};
 use rayon::prelude::*;
 
 pub const MAX_HEAD_DIM: usize = 256;
@@ -71,6 +71,94 @@ unsafe fn sum_sq(x: *const f32, n: usize) -> f32 {
     (t0 + t1) + (t2 + t3)
 }
 
+#[inline(always)]
+fn recall(row: &[f32], kv: &mut [f32], decay: f32, kd: f32) {
+    for (sv, acc) in row.iter().zip(kv.iter_mut()) {
+        *acc += (*sv * decay) * kd;
+    }
+}
+
+#[inline(always)]
+fn update(row: &mut [f32], delta: &[f32], core: &mut [f32], decay: f32, kd: f32, qd: f32) {
+    for ((sv, dl), acc) in row.iter_mut().zip(delta.iter()).zip(core.iter_mut()) {
+        let x = *sv * decay + kd * *dl;
+        *sv = x;
+        *acc += x * qd;
+    }
+}
+
+// NEON: the scalar loops four lanes wide, the same multiplies and adds in the same order (no fused
+// multiply-add), so every lane rounds as the scalar path does and the step is bit-identical.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn sum_sq_neon(x: *const f32, n: usize) -> f32 {
+    use std::arch::aarch64::*;
+    let nb = n / 8;
+    let (mut lo, mut hi) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+    for j in 0..nb {
+        let (a, b) = (vld1q_f32(x.add(j * 8)), vld1q_f32(x.add(j * 8 + 4)));
+        lo = vaddq_f32(lo, vmulq_f32(a, a));
+        hi = vaddq_f32(hi, vmulq_f32(b, b));
+    }
+    let mut acc = [0.0f32; 8];
+    vst1q_f32(acc.as_mut_ptr(), lo);
+    vst1q_f32(acc.as_mut_ptr().add(4), hi);
+    for i in (nb * 8)..n {
+        let v = *x.add(i);
+        acc[i - nb * 8] += v * v;
+    }
+    let (t0, t1) = (acc[0] + acc[1], acc[2] + acc[3]);
+    let (t2, t3) = (acc[4] + acc[5], acc[6] + acc[7]);
+    (t0 + t1) + (t2 + t3)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn recall_neon(row: &[f32], kv: &mut [f32], decay: f32, kd: f32) {
+    use std::arch::aarch64::*;
+    let n = row.len().min(kv.len());
+    let (src, acc) = (row.as_ptr(), kv.as_mut_ptr());
+    let (dec, k) = (vdupq_n_f32(decay), vdupq_n_f32(kd));
+    let mut j = 0;
+    while j + 4 <= n {
+        let s = vld1q_f32(src.add(j));
+        let a = vld1q_f32(acc.add(j));
+        vst1q_f32(acc.add(j), vaddq_f32(a, vmulq_f32(vmulq_f32(s, dec), k)));
+        j += 4;
+    }
+    recall(&row[j..n], &mut kv[j..n], decay, kd);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn update_neon(
+    row: &mut [f32],
+    delta: &[f32],
+    core: &mut [f32],
+    decay: f32,
+    kd: f32,
+    qd: f32,
+) {
+    use std::arch::aarch64::*;
+    let n = row.len().min(delta.len()).min(core.len());
+    let (st, dl, acc) = (row.as_mut_ptr(), delta.as_ptr(), core.as_mut_ptr());
+    let (dec, k, q) = (vdupq_n_f32(decay), vdupq_n_f32(kd), vdupq_n_f32(qd));
+    let mut j = 0;
+    while j + 4 <= n {
+        let x = vaddq_f32(
+            vmulq_f32(vld1q_f32(st.add(j)), dec),
+            vmulq_f32(k, vld1q_f32(dl.add(j))),
+        );
+        vst1q_f32(st.add(j), x);
+        vst1q_f32(
+            acc.add(j),
+            vaddq_f32(vld1q_f32(acc.add(j)), vmulq_f32(x, q)),
+        );
+        j += 4;
+    }
+    update(&mut row[j..n], &delta[j..n], &mut core[j..n], decay, kd, qd);
+}
+
 #[derive(Clone, Copy)]
 struct Shape {
     c_dim: usize,
@@ -129,70 +217,72 @@ unsafe fn conv_range(p: Tensors, s: Shape, node: usize, c0: usize, c1: usize) {
     }
 }
 
-#[inline(always)]
-#[allow(clippy::needless_range_loop)]
-unsafe fn head_step(p: Tensors, s: Shape, node: usize, h: usize) {
-    let (dk, dv) = (s.dk, s.dv);
-    let y = p.mixed_qkv.add(node * s.c_dim);
-    let hk = h / s.rep;
-    let q_src = y.add(hk * dk);
-    let k_src = y.add(s.key_dim + hk * dk);
-    let v_src = std::slice::from_raw_parts(y.add(2 * s.key_dim + h * dv), dv);
+macro_rules! def_head_step {
+    ($name:ident, $sum_sq:ident, $recall:ident, $update:ident) => {
+        #[inline(always)]
+        #[allow(clippy::needless_range_loop)]
+        unsafe fn $name(p: Tensors, s: Shape, node: usize, h: usize) {
+            let (dk, dv) = (s.dk, s.dv);
+            let y = p.mixed_qkv.add(node * s.c_dim);
+            let hk = h / s.rep;
+            let q_src = y.add(hk * dk);
+            let k_src = y.add(s.key_dim + hk * dk);
+            let v_src = std::slice::from_raw_parts(y.add(2 * s.key_dim + h * dv), dv);
 
-    let mut qbuf = [0.0f32; MAX_HEAD_DIM];
-    let mut kbuf = [0.0f32; MAX_HEAD_DIM];
-    let qn = &mut qbuf[..dk];
-    let kn = &mut kbuf[..dk];
-    let scale = (1.0f64 / (dk as f64).sqrt()) as f32;
-    let qi = 1.0 / (sum_sq(q_src, dk) + L2_EPS).sqrt();
-    let ki = 1.0 / (sum_sq(k_src, dk) + L2_EPS).sqrt();
-    for d in 0..dk {
-        qn[d] = (*q_src.add(d) * qi) * scale;
-        kn[d] = *k_src.add(d) * ki;
-    }
+            let mut qbuf = [0.0f32; MAX_HEAD_DIM];
+            let mut kbuf = [0.0f32; MAX_HEAD_DIM];
+            let qn = &mut qbuf[..dk];
+            let kn = &mut kbuf[..dk];
+            let scale = (1.0f64 / (dk as f64).sqrt()) as f32;
+            let qi = 1.0 / ($sum_sq(q_src, dk) + L2_EPS).sqrt();
+            let ki = 1.0 / ($sum_sq(k_src, dk) + L2_EPS).sqrt();
+            for d in 0..dk {
+                qn[d] = (*q_src.add(d) * qi) * scale;
+                kn[d] = *k_src.add(d) * ki;
+            }
 
-    let beta = 1.0 / (1.0 + (-*p.b.add(node * s.hv + h)).exp());
-    let g = -(*p.a_log.add(h)).exp() * softplus(*p.a.add(node * s.hv + h) + *p.dt_bias.add(h));
-    let decay = g.exp();
+            let beta = 1.0 / (1.0 + (-*p.b.add(node * s.hv + h)).exp());
+            let g =
+                -(*p.a_log.add(h)).exp() * softplus(*p.a.add(node * s.hv + h) + *p.dt_bias.add(h));
+            let decay = g.exp();
 
-    let st = p.state.add((node * s.hv + h) * dk * dv);
+            let st = p.state.add((node * s.hv + h) * dk * dv);
 
-    let mut kvbuf = [0.0f32; MAX_HEAD_DIM];
-    let kv = &mut kvbuf[..dv];
-    for d in 0..dk {
-        let kd = kn[d];
-        let row = std::slice::from_raw_parts(st.add(d * dv), dv);
-        for (sv, acc) in row.iter().zip(kv.iter_mut()) {
-            *acc += (*sv * decay) * kd;
+            let mut kvbuf = [0.0f32; MAX_HEAD_DIM];
+            let kv = &mut kvbuf[..dv];
+            for d in 0..dk {
+                let row = std::slice::from_raw_parts(st.add(d * dv), dv);
+                $recall(row, kv, decay, kn[d]);
+            }
+
+            let mut dbuf = [0.0f32; MAX_HEAD_DIM];
+            let delta = &mut dbuf[..dv];
+            for ((d, vt), m) in delta.iter_mut().zip(v_src.iter()).zip(kv.iter()) {
+                *d = (*vt - *m) * beta;
+            }
+
+            let mut cbuf = [0.0f32; MAX_HEAD_DIM];
+            let core = &mut cbuf[..dv];
+            for d in 0..dk {
+                let row = std::slice::from_raw_parts_mut(st.add(d * dv), dv);
+                $update(row, delta, core, decay, kn[d], qn[d]);
+            }
+
+            let rms = 1.0 / ($sum_sq(core.as_ptr(), dv) / dv as f32 + p.eps).sqrt();
+            let zh = std::slice::from_raw_parts(p.z.add((node * s.hv + h) * dv), dv);
+            let nw = std::slice::from_raw_parts(p.norm_w, dv);
+            let o = std::slice::from_raw_parts_mut(p.out.add((node * s.hv + h) * dv), dv);
+            for (((ov, cv), wv), zv) in o.iter_mut().zip(core.iter()).zip(nw.iter()).zip(zh.iter())
+            {
+                *ov = (*wv * (*cv * rms)) * silu(*zv);
+            }
         }
-    }
-
-    let mut dbuf = [0.0f32; MAX_HEAD_DIM];
-    let delta = &mut dbuf[..dv];
-    for ((d, vt), m) in delta.iter_mut().zip(v_src.iter()).zip(kv.iter()) {
-        *d = (*vt - *m) * beta;
-    }
-
-    let mut cbuf = [0.0f32; MAX_HEAD_DIM];
-    let core = &mut cbuf[..dv];
-    for d in 0..dk {
-        let (kd, qd) = (kn[d], qn[d]);
-        let row = std::slice::from_raw_parts_mut(st.add(d * dv), dv);
-        for ((sv, dl), acc) in row.iter_mut().zip(delta.iter()).zip(core.iter_mut()) {
-            let x = *sv * decay + kd * *dl;
-            *sv = x;
-            *acc += x * qd;
-        }
-    }
-
-    let rms = 1.0 / (sum_sq(core.as_ptr(), dv) / dv as f32 + p.eps).sqrt();
-    let zh = std::slice::from_raw_parts(p.z.add((node * s.hv + h) * dv), dv);
-    let nw = std::slice::from_raw_parts(p.norm_w, dv);
-    let o = std::slice::from_raw_parts_mut(p.out.add((node * s.hv + h) * dv), dv);
-    for (((ov, cv), wv), zv) in o.iter_mut().zip(core.iter()).zip(nw.iter()).zip(zh.iter()) {
-        *ov = (*wv * (*cv * rms)) * silu(*zv);
-    }
+    };
 }
+
+def_head_step!(head_step, sum_sq, recall, update);
+#[cfg(target_arch = "aarch64")]
+def_head_step!(head_step_neon, sum_sq_neon, recall_neon, update_neon);
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -207,18 +297,18 @@ unsafe fn conv_range_avx2(p: Tensors, s: Shape, node: usize, c0: usize, c1: usiz
 }
 
 #[inline]
-unsafe fn key_head_task(p: Tensors, s: Shape, node: usize, kh: usize, avx2: bool) {
+unsafe fn key_head_task(p: Tensors, s: Shape, node: usize, kh: usize, isa: Isa) {
     let (dk, dv, rep) = (s.dk, s.dv, s.rep);
     let h0 = kh * rep;
 
-    conv_dispatch(p, s, node, kh * dk, kh * dk + dk, avx2);
+    conv_dispatch(p, s, node, kh * dk, kh * dk + dk, isa);
     conv_dispatch(
         p,
         s,
         node,
         s.key_dim + kh * dk,
         s.key_dim + kh * dk + dk,
-        avx2,
+        isa,
     );
 
     conv_dispatch(
@@ -227,31 +317,32 @@ unsafe fn key_head_task(p: Tensors, s: Shape, node: usize, kh: usize, avx2: bool
         node,
         2 * s.key_dim + h0 * dv,
         2 * s.key_dim + (h0 + rep) * dv,
-        avx2,
+        isa,
     );
     for h in h0..h0 + rep {
-        head_dispatch(p, s, node, h, avx2);
+        head_dispatch(p, s, node, h, isa);
     }
 }
 
 #[inline]
-unsafe fn head_dispatch(p: Tensors, s: Shape, node: usize, h: usize, avx2: bool) {
-    #[cfg(target_arch = "x86_64")]
-    if avx2 {
-        return head_step_avx2(p, s, node, h);
+unsafe fn head_dispatch(p: Tensors, s: Shape, node: usize, h: usize, isa: Isa) {
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx512 | Isa::Avx2 => head_step_avx2(p, s, node, h),
+        #[cfg(target_arch = "aarch64")]
+        Isa::Neon => head_step_neon(p, s, node, h),
+        _ => head_step(p, s, node, h),
     }
-    let _ = avx2;
-    head_step(p, s, node, h)
 }
 
+/// The conv is a few taps per channel over a strided window: NEON runs the scalar loop.
 #[inline]
-unsafe fn conv_dispatch(p: Tensors, s: Shape, node: usize, c0: usize, c1: usize, avx2: bool) {
-    #[cfg(target_arch = "x86_64")]
-    if avx2 {
-        return conv_range_avx2(p, s, node, c0, c1);
+unsafe fn conv_dispatch(p: Tensors, s: Shape, node: usize, c0: usize, c1: usize, isa: Isa) {
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx512 | Isa::Avx2 => conv_range_avx2(p, s, node, c0, c1),
+        _ => conv_range(p, s, node, c0, c1),
     }
-    let _ = avx2;
-    conv_range(p, s, node, c0, c1)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -382,13 +473,13 @@ pub(crate) unsafe fn delta_step(
         Some(v) => v,
         None => return ERR_DOMAIN,
     };
-    let avx2 = crate::gemv::isa() != crate::gemv::Isa::Scalar;
+    let isa = crate::gemv::isa();
     let tasks = nodes * hk;
 
     if nt <= 1 || tasks == 1 {
         for n in 0..nodes {
             for kh in 0..hk {
-                key_head_task(p, s, n, kh, avx2);
+                key_head_task(p, s, n, kh, isa);
             }
         }
         return OK;
@@ -397,7 +488,7 @@ pub(crate) unsafe fn delta_step(
     let run = || {
         (0..tasks)
             .into_par_iter()
-            .for_each(|t| unsafe { key_head_task(p, s, t / hk, t % hk, avx2) });
+            .for_each(|t| unsafe { key_head_task(p, s, t / hk, t % hk, isa) });
     };
 
     if nt == global {
@@ -499,6 +590,87 @@ mod tests {
                 "n = {n}: {got} vs {want}"
             );
             assert_eq!(got, unsafe { sum_sq(v.as_ptr(), n) } as f64);
+        }
+    }
+
+    /// The NEON sums and head step agree with the scalar ones to the bit, tails included; the C ABI
+    /// runs one tier per process, so the two are compared here.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_is_bit_identical_to_scalar() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut gen = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 3.0
+                })
+                .collect()
+        };
+        for n in (0..=40).chain([127, 128, 129, 255, 256]) {
+            let v = gen(n);
+            let (a, b) = unsafe { (sum_sq(v.as_ptr(), n), sum_sq_neon(v.as_ptr(), n)) };
+            assert_eq!(a.to_bits(), b.to_bits(), "sum_sq n = {n}: {a} vs {b}");
+        }
+        let shapes = [
+            (1, 1, 1, 1),
+            (1, 2, 5, 3),
+            (2, 6, 7, 13),
+            (3, 9, 16, 8),
+            (2, 2, 33, 19),
+            (2, 4, 64, 127),
+            (16, 48, 128, 128),
+            (2, 2, 256, 256),
+        ];
+        for (hk, hv, dk, dv) in shapes {
+            let key_dim = hk * dk;
+            let s = Shape {
+                c_dim: 2 * key_dim + hv * dv,
+                k_size: 1,
+                hv,
+                dk,
+                dv,
+                rep: hv / hk,
+                key_dim,
+            };
+            let (mixed, z, a, b) = (gen(s.c_dim), gen(hv * dv), gen(hv), gen(hv));
+            let (a_log, dt_bias, norm_w, state) = (gen(hv), gen(hv), gen(dv), gen(hv * dk * dv));
+            let run = |neon: bool| {
+                let mut y = mixed.clone();
+                let mut st = state.clone();
+                let mut out = vec![f32::NAN; hv * dv];
+                let p = Tensors {
+                    mixed_qkv: y.as_mut_ptr(),
+                    conv_state: std::ptr::null_mut(),
+                    conv_w: std::ptr::null(),
+                    conv_b: std::ptr::null(),
+                    z: z.as_ptr(),
+                    a: a.as_ptr(),
+                    b: b.as_ptr(),
+                    a_log: a_log.as_ptr(),
+                    dt_bias: dt_bias.as_ptr(),
+                    state: st.as_mut_ptr(),
+                    norm_w: norm_w.as_ptr(),
+                    out: out.as_mut_ptr(),
+                    eps: 1e-6,
+                };
+                for h in 0..hv {
+                    unsafe {
+                        if neon {
+                            head_step_neon(p, s, 0, h)
+                        } else {
+                            head_step(p, s, 0, h)
+                        }
+                    }
+                }
+                let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+                (bits(&st), bits(&out))
+            };
+            let (scalar, neon) = (run(false), run(true));
+            assert_eq!(scalar.0, neon.0, "{hk}/{hv}/{dk}/{dv}: state");
+            assert_eq!(scalar.1, neon.1, "{hk}/{hv}/{dk}/{dv}: out");
         }
     }
 }
