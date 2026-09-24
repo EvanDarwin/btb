@@ -28,6 +28,15 @@ def copy_bytes(dst: torch.Tensor, t: torch.Tensor) -> None:
         dst.copy_(t.reshape(-1).view(torch.uint8))
 
 
+def bf16_in_place(buf: torch.Tensor, dt: torch.dtype) -> None:
+    """the byte buffer `buf`, holding `dt` values, rewritten as those values in bf16 from its start (the first
+    half of it for float32), from any thread as `copy_bytes` is. One cast through a temporary: chunked steps
+    measured slower at every size (torch's per-op cost and thread fan-out outweigh the cache reuse)."""
+    with torch.inference_mode():
+        src = buf.view(dt)
+        buf[: src.numel() * 2].view(torch.bfloat16).copy_(src.to(torch.bfloat16))
+
+
 class _HostLinear(torch.nn.Module):
     _cpu_shared: Any
     bias: torch.Tensor | None

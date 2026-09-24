@@ -702,7 +702,7 @@ def test_native_open_names_the_os_error_when_the_file_limit_is_hit(tmp_path: Pat
         resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
 
-# --- a checkpoint's float precision against the kernels' (tiers._held, native._refuse) -----------------------
+# --- a checkpoint's float precision against the kernels' (tiers._held, native._checked) ----------------------
 
 
 def test_an_fp32_checkpoint_is_held_as_bf16_and_read_whole_where_widened() -> None:
@@ -723,17 +723,19 @@ def test_an_fp32_checkpoint_is_held_as_bf16_and_read_whole_where_widened() -> No
         bf16.close()
 
 
-def test_every_native_kernel_refuses_a_dtype_it_was_not_built_for() -> None:
+def test_every_native_kernel_refuses_a_dtype_it_was_not_built_for(monkeypatch: pytest.MonkeyPatch) -> None:
     """a kernel reads its tensors through raw pointers: an fp32 weight handed to the bf16 gemv was read as bf16
-    pairs and decoded garbage without a word. Every fixed-type binding now refuses before the call, naming the
-    argument, and writes nothing"""
+    pairs and decoded garbage without a word. Loaded `checked`, every fixed-type binding refuses before the call,
+    naming the argument, and writes nothing"""
     from btb.engine.native import Native, NativeDtypeError, native_path
     from btb.mxfp4 import MxWeight, ggml_bytes, matrix_bytes
 
     dll = native_path()
     if dll is None:
         pytest.skip("no native library")
-    Native.load_gemv(dll)
+    for name in Native.HANDLES:  # the unchecked bindings come back after the test
+        monkeypatch.setattr(Native, name, getattr(Native, name))
+    Native.load_gemv(dll, checked=True)
     r, c = 4, 32
     bf, f32, u8 = torch.bfloat16, torch.float32, torch.uint8
     w, x = torch.zeros(r, c, dtype=bf), torch.zeros(1, c, dtype=f32)
@@ -820,10 +822,11 @@ def test_every_native_kernel_refuses_a_dtype_it_was_not_built_for() -> None:
 @pytest.mark.parametrize("device", ["cpu", "mlx"])
 @pytest.mark.parametrize("name", ["tiny_qwen3-f16", "tiny_qwen3-f32", "gguf/tiny_qwen3-q8_0.gguf"])
 def test_a_layer_shed_to_the_drive_off_a_weight_not_stored_as_bf16_answers_as_from_ram(name: str, device: str) -> None:
-    """the cold ring over weights it cannot read off the drive as bf16 - a cast twin's floats, a GGUF's Q8_0
-    blocks - takes them from `_get` each pass ("mem"). `_bind_cold` read such a tensor's key as a 12-bit record
-    and raised when a busy machine shed a layer mid-decode; shed under the decode's inference mode, the layer
-    now answers as it did from RAM, and regrown it still does"""
+    """the cold ring over weights it cannot read off the drive as bf16: a cast twin's floats are read as stored
+    and rewritten as bf16 where they land ("cast"), a GGUF's Q8_0 blocks are taken from `_get` each pass
+    ("mem"). `_bind_cold` read such a tensor's key as a 12-bit record and raised when a busy machine shed a
+    layer mid-decode; shed under the decode's inference mode, the layer now answers as it did from RAM, and
+    regrown it still does"""
     path = fixture(name)
     if device == "mlx":
         need_mlx()
@@ -832,7 +835,8 @@ def test_a_layer_shed_to_the_drive_off_a_weight_not_stored_as_bf16_answers_as_fr
         with torch.inference_mode():
             i = sm.ram_shed("the test")
         assert i is not None and sm.cold == {i}
-        assert {it[5] for it in sm.cold_ring.recipe[i]} == {"mem"}, "every linear of the shed layer is read cast"
+        kind = "mem" if name.startswith("gguf/") else "cast"
+        assert {it[5] for it in sm.cold_ring.recipe[i]} == {kind}, "every linear of the shed layer is read cast"
         during, _ = sm.generate(REPEATING, 12, speculate=False)
         assert during == before, "a layer read through the ring each pass answers as it did from RAM"
         assert sm.ram_regrow() == i and not sm.cold
