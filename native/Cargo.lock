@@ -34,6 +34,7 @@ name = "btb_native"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "libc",
  "rayon",
 ]
 

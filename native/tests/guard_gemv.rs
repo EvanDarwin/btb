@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 //! Page-fenced bf16 and 12-bit-packed rows mat-vec at every host-linear shape, over the batch
 //! widths of the tree pass, threads 1 / 0 / 16, and the grouped dispatch.
-#![cfg(windows)]
 
 mod common;
 

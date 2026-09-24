@@ -4,7 +4,6 @@
 //! own. A read past any input faults, a write past any output faults, and each task's output is
 //! bit-identical to its own single-task rows call. The unfenced correctness of the same entry
 //! point lives in `gemv_group.rs`, and its bf16-rows sibling is fenced in `guard_gemv.rs`.
-#![cfg(windows)]
 
 mod common;
 

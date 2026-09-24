@@ -4,8 +4,8 @@
 //! dispatches (one thread-pool barrier for a whole layer's active experts).
 //!
 //! Inputs are built with the same generators the parity tests use (`tests/common/refs.rs`,
-//! included by path so core is untouched); the fenced `Fence` buffers there are Windows-only, so a
-//! bench allocates plain `Vec`s instead.
+//! included by path so core is untouched), in plain `Vec`s rather than the guard tests' fenced
+//! `Fence` buffers.
 //!
 //! Each group sweeps the batch width (token rows) b in {1, 4, 16} at one realistic hidden width
 //! (rows = cols = 5120), the decode / small-draft regime. Threads is pinned to 1 so a run measures
