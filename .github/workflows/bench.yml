@@ -1,8 +1,9 @@
-# Benchmarks on every PR, base branch against PR on one runner: the native criterion benches (`cargo bench`,
-# every [[bench]] target) plus bench/e2e_bench.py (the end-to-end tiny-model loop and the MLX/CUDA per-op kernels,
-# each skipping off its backend). The PR's base branch is checked out beside it and built and benched first, so
-# both sides run on the same CPU; bench.report compares the two result roots, posts one sticky comment and
-# computes the perf gate. A base that predates the benches is benched as nothing, and every row lists as new.
+# Benchmarks on every PR and every push to main, base against change on one runner: the native criterion benches
+# (`cargo bench`, every [[bench]] target) plus bench/e2e_bench.py (the end-to-end tiny-model loop and the MLX/CUDA
+# per-op kernels, each skipping off its backend). The base - a PR's base branch, a push's previous main commit - is
+# checked out beside it and built and benched first, so both sides run on the same CPU; bench.report compares the
+# two result roots, posts one sticky comment on a PR (a push's goes to the job summary) and computes the perf gate.
+# A base that predates the benches is benched as nothing, and every row lists as new.
 #
 # The PR's code runs in the `bench` job, which holds a read-only token. Posting the comment needs
 # pull-requests: write, so it is a separate job that checks out nothing and runs no repo code.
@@ -15,10 +16,14 @@ name: bench
 on:
   pull_request:
     paths: ["native/**", "btb/**", "bench/e2e_bench.py", "bench/e2e_delta.py", "bench/report.py", "bench/conftest.py", ".github/workflows/bench.yml", "tests/fixtures/**", "tests/cert/spec.py", "tests/cert/native_ops.py", "build.py", "setup.py", "pyproject.toml"]
+  push:
+    branches: [main]
+    paths: ["native/**", "btb/**", "bench/e2e_bench.py", "bench/e2e_delta.py", "bench/report.py", "bench/conftest.py", ".github/workflows/bench.yml", "tests/fixtures/**", "tests/cert/spec.py", "tests/cert/native_ops.py", "build.py", "setup.py", "pyproject.toml"]
 
+# a PR's newer push replaces its run; every push to main is benched, so none is cancelled
 concurrency:
   group: bench-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -31,11 +36,16 @@ env:
 jobs:
   bench:
     runs-on: ${{ vars.PERF_RUNNER || 'ubuntu-latest' }}
+    env:
+      # a push's `before` is all zeros when it created the branch: nothing to compare against
+      BASE: ${{ github.event_name == 'push' && github.event.before || github.base_ref }}
+      HAS_BASE: ${{ github.event_name != 'push' || github.event.before != '0000000000000000000000000000000000000000' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - if: env.HAS_BASE == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.base_ref }}
+          ref: ${{ env.BASE }}
           path: base
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -44,7 +54,8 @@ jobs:
 
       # continue-on-error on the e2e runs: a known-broken cell exits pytest nonzero while pytest-benchmark still
       # writes e2e.json for everything that did time; the report takes the file as it comes
-      - name: Build and bench the base branch
+      - name: Build and bench the base
+        if: env.HAS_BASE == 'true'
         working-directory: base
         run: |
           python build.py build
@@ -57,7 +68,7 @@ jobs:
             echo "the base has no e2e bench"
           fi
 
-      - name: Build and bench the PR
+      - name: Build and bench the change
         run: |
           python build.py build
           python -m pip install --quiet --force-reinstall --no-deps dist/*.whl
@@ -65,20 +76,22 @@ jobs:
           python -m pytest bench/e2e_bench.py --benchmark-json=e2e.json --benchmark-max-time=$MAXTIME -q \
             -p no:cacheprovider || true
 
-      # one render gives the comment body and the gate's exit code; the body goes to the job summary and to the
-      # `comment` job below; the gate fails this job only on a dedicated runner
+      # one render gives the comment body and the gate's exit code; the body goes to the job summary and, on a PR,
+      # to the `comment` job below; the gate fails this job only on a dedicated runner
       - name: Compare and gate
         run: |
           gate=0
-          python -m bench.report . --baseline base --gate --gate-threshold "$GATE_THRESHOLD" --out bench-comment.md || gate=$?
+          baseline=()
+          if [ "$HAS_BASE" = "true" ]; then baseline=(--baseline base); fi
+          python -m bench.report . "${baseline[@]}" --gate --gate-threshold "$GATE_THRESHOLD" --out bench-comment.md || gate=$?
           { echo "## Perf gate"; echo ""
-            if [ "$gate" = "0" ]; then echo "No benchmark's 95% CI cleared +${GATE_THRESHOLD} vs the base branch."
+            if [ "$gate" = "0" ]; then echo "No benchmark's 95% CI cleared +${GATE_THRESHOLD} vs the base."
             else echo "A benchmark regressed past the +${GATE_THRESHOLD} gate (see the step log)."; fi
             echo ""; cat bench-comment.md; } >> "$GITHUB_STEP_SUMMARY"
           if [ "${{ vars.PERF_DEDICATED }}" = "1" ] && [ "$gate" != "0" ]; then
             echo "dedicated runner: enforcing the perf gate"; exit 1
           fi
-      - if: ${{ !cancelled() }}
+      - if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bench-comment
@@ -87,7 +100,7 @@ jobs:
 
   # the only job with a write token: no checkout, no repo code, just the rendered file and the API
   comment:
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
     needs: bench
     runs-on: ubuntu-latest
     permissions:
