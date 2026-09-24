@@ -14,9 +14,20 @@ from typing import cast
 import pytest
 from pytest import CaptureFixture
 
+from btb.draft import SpanBank
 from btb.kinds import Json, Tokens
 from btb.sampling import Sampling
-from btb.serve import Engine, Handler, Message, Server, _content_text, _for_template, _Server, _write_pi_config
+from btb.serve import (
+    Engine,
+    Handler,
+    Message,
+    Server,
+    _content_text,
+    _for_template,
+    _public,
+    _Server,
+    _write_pi_config,
+)
 from btb.tools import tool_calls_of
 from tests.helpers import request
 
@@ -415,6 +426,134 @@ def test_a_bad_request_field_is_a_400_naming_it() -> None:
         server.close()
 
 
+def test_a_nonsense_field_is_a_400_never_a_500() -> None:
+    """values a client should never send - infinities, a list for a string, an object for a flag - each answered
+    400 naming the field, before anything reaches a template or the engine"""
+    server = _server("ok")
+    msgs = [{"role": "user", "content": "hi"}]
+    inf = 1e999  # json.dumps writes Infinity, which json.loads reads back
+    try:
+        for path, body, word in (
+            ("/v1/chat/completions", {"messages": msgs, "max_tokens": inf}, "max_tokens="),
+            ("/v1/chat/completions", {"messages": msgs, "max_tokens": float("nan")}, "max_tokens="),
+            ("/v1/chat/completions", {"messages": [{"role": 1, "content": "hi"}]}, "role"),
+            ("/v1/chat/completions", {"messages": [{"role": "user", "content": 5}]}, "content"),
+            ("/v1/chat/completions", {"messages": [{"role": "user", "content": ["x"]}]}, "content"),
+            ("/v1/chat/completions", {"messages": msgs, "model": ["a"]}, "model="),
+            ("/v1/chat/completions", {"messages": msgs, "stream_options": [1]}, "stream_options="),
+            ("/v1/chat/completions", {"messages": msgs, "tools": [{"type": "function"}]}, "tools:"),
+            (
+                "/v1/chat/completions",
+                {"messages": [{"role": "assistant", "content": None, "tool_calls": [{"function": "x"}]}]},
+                "tool_calls[].function",
+            ),
+            ("/api/chat", {"messages": msgs, "options": {"num_predict": inf}}, "num_predict="),
+            ("/api/chat", {"messages": [{"role": "user", "content": {"a": 1}}]}, "content"),
+            ("/api/generate", {"prompt": ["hi"]}, "prompt="),
+            ("/api/generate", {"prompt": "hi", "system": 3}, "system="),
+            ("/api/generate", {"prompt": "hi", "raw": "yes"}, "raw="),
+            ("/api/show", {"model": {"x": 1}}, "model="),
+        ):
+            code, _, data = request(server.url, "POST", path, body)
+            assert code == 400 and word in json.loads(data)["error"], (path, body, code, data)
+    finally:
+        server.close()
+
+
+@pytest.mark.parametrize(
+    "peer,public",
+    [
+        ("8.8.8.8", True),
+        ("2001:4860:4860::8888", True),
+        ("::ffff:8.8.8.8", True),  # an IPv4-mapped peer is judged as its IPv4
+        ("not-an-address", True),  # fails closed
+        ("127.0.0.1", False),
+        ("::1", False),
+        ("192.168.1.20", False),
+        ("10.0.0.5", False),
+        ("172.20.1.1", False),
+        ("fe80::1%en0", False),
+        ("100.101.102.103", False),  # Tailscale's IPv4 range (carrier-grade NAT)
+        ("fd7a:115c:a1e0::1", False),  # Tailscale's IPv6 range (unique local)
+        ("::ffff:192.168.1.20", False),
+    ],
+)
+def test_only_a_public_peer_is_public(peer: str, public: bool) -> None:
+    assert _public(peer) is public
+
+
+def test_a_public_peer_needs_a_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """a keyless server answers a public peer 403 and closes before it holds a thread; with a key the peer must
+    present it (401), and a private peer needs a key only when one is set"""
+    server = _server("ok")
+    srv = server._srv
+    try:
+        assert request(server.url, "GET", "/health")[0] == 200  # a private peer is served
+        monkeypatch.setattr("btb.serve._public", lambda host: True)
+        code, headers, data = request(server.url, "GET", "/health")
+        assert code == 403 and headers.get("connection") == "close", (code, headers)
+        assert json.loads(data)["error"] == "An API_KEY must be provided"
+        assert request(server.url, "POST", "/v1/chat/completions", {"messages": []})[0] == 403
+        srv.api_key = "k"
+        assert request(server.url, "GET", "/health")[0] == 401
+        assert request(server.url, "GET", "/health", headers={"Authorization": "Bearer k"})[0] == 200
+        monkeypatch.setattr("btb.serve._public", lambda host: False)
+        assert request(server.url, "GET", "/health")[0] == 401  # a set key binds a private peer too
+        srv.api_key = None
+        assert request(server.url, "GET", "/health")[0] == 200
+    finally:
+        server.close()
+
+
+def test_binding_every_interface_or_a_public_address_needs_a_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    from btb import serve
+
+    monkeypatch.setattr(serve, "ModelRegistry", lambda *a, **kw: FakeReg(FakeEngine("ok")))
+    serve.start(None, host="127.0.0.1", port=0)._srv.server_close()
+    with pytest.raises(serve.KeyRequired, match=r"^An API_KEY must be provided to bind 0\.0\.0\.0$"):
+        serve.start(None, host="0.0.0.0", port=0)
+    serve.start(None, host="0.0.0.0", port=0, api_key="k")._srv.server_close()
+    monkeypatch.setattr(serve, "_public", lambda host: True)
+    with pytest.raises(serve.KeyRequired):
+        serve.start(None, host="127.0.0.1", port=0)
+    serve.start(None, host="127.0.0.1", port=0, api_key="k")._srv.server_close()
+
+
+def test_the_fsl_window_is_two_years_from_the_build(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import datetime
+
+    from btb import fsl
+
+    monkeypatch.setattr(fsl, "FRIEND_FILE", str(tmp_path / "friend"))
+    today = datetime.date.today()
+    for built, open_ in ((None, True), (today, True), (today.replace(year=today.year - 3), False)):
+        monkeypatch.setattr(fsl, "build_date", lambda b=built: b)
+        assert fsl.restricted() is open_, built
+    (tmp_path / "friend").write_text("")
+    monkeypatch.setattr(fsl, "build_date", lambda: today)
+    assert fsl.restricted() is False  # a friend is never inside it
+
+
+def test_a_request_never_sizes_a_decode_past_the_window() -> None:
+    """a max_tokens of 10**30 is capped at what fits after the prompt: the engine reserves a cache for the whole
+    decode, so an uncapped one is refused as an impossible allocation"""
+    asked: list[int | None] = []
+
+    class _Model:
+        window = 64
+
+        def generate(self, ids: Tokens, max_new: int | None, **kw: object) -> tuple[list[int], Json]:
+            asked.append(max_new)
+            return [], {"cap": max_new or 0}
+
+    eng = Engine.__new__(Engine)
+    eng.sm, eng.max_new, eng.eos, eng.session = _Model(), None, (), None  # type: ignore[assignment]
+    eng.bank, eng.sampling = SpanBank(), Sampling()
+    eng.run([], 10**30, ids=[1, 2, 3, 4])
+    eng.run([], 8, ids=[1, 2, 3, 4])
+    assert asked == [60, 8]
+
+
 def test_the_server_refuses_a_foreign_host_or_origin() -> None:
     """bound to loopback, a Host that is not this machine (DNS rebinding: a page's name resolving to 127.0.0.1)
     and a cross-origin browser request are 403; local names pass"""
@@ -523,8 +662,8 @@ def test_binding_beyond_loopback_says_so(capsys: CaptureFixture[str]) -> None:
 
     _exposure("serve", "127.0.0.1", None)
     assert capsys.readouterr().out == ""
-    _exposure("serve", "0.0.0.0", None)
-    assert "no API key set" in capsys.readouterr().out
+    _exposure("serve", "192.168.1.20", None)
+    assert "without an API key" in capsys.readouterr().out
     _exposure("serve", "0.0.0.0", "k")
     assert "with an API key" in capsys.readouterr().out
     assert _pi_provider("http://127.0.0.1:8000/v1", ["a"], "k")["apiKey"] == "k"
