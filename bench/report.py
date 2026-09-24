@@ -2,12 +2,14 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 """Render a PR comment from two raw benchmark result sets, grouped into collapsible sections.
 
-A result root holds what one bench run wrote at its repo paths: native/target/criterion/**/new/estimates.json
-(the criterion benches) and e2e.json (bench/e2e_bench.py). The deltas are computed here, from this run's root
-and the baseline's; without a baseline every row lists as new.
+A result root holds what its bench runs wrote at its repo paths: native/target/criterion/**/<run>/estimates.json
+(the criterion benches, `cargo bench -- --save-baseline <run>`) and e2e-<run>.json (bench/e2e_bench.py), for the
+interleaved runs `a` and `b` (base a, PR a, PR b, base b); a root without them is one run, criterion's `new` and
+e2e.json. Each run is compared with the baseline's run of the same name - two pairs adjacent in time, whose mean
+cancels a drift across the job - and without a baseline every row lists as new.
 
-The comment flags a change only when its whole 95% CI clears the noise floor. `--gate` adds the perf-gate exit
-code (1 when a benchmark's whole CI clears the regression threshold).
+The comment flags a change only when its whole 95% CI clears the noise floor in every pair. `--gate` adds the
+perf-gate exit code (1 when a benchmark's whole CI clears the regression threshold in every pair).
 
     python -m bench.report PR_ROOT [--baseline BASE_ROOT] [--noise FRAC] [--out comment.md] [--gate [--gate-threshold FRAC]]
 """
@@ -30,6 +32,7 @@ from tests.cert.spec import Hardware
 MARKER = "<!-- btb-bench-compare -->"
 CRITERION = os.path.join("native", "target", "criterion")
 E2E = "e2e.json"
+RUNS = ("a", "b")  # the interleaved runs of each side, in the order bench.yml's pairs name them
 OP_FAMILIES = tuple(op_families())
 DEVICES = tuple(h.value for h in Hardware)
 # a benchmark id or group is named by the PR's own test code and lands in this comment inside a code span and an
@@ -76,15 +79,15 @@ def _num(doc: object, *path: str) -> float:
     return float(cur) if isinstance(cur, (int, float)) and not isinstance(cur, bool) else 0.0
 
 
-def _criterion_runs(root: str) -> dict[str, object]:
-    """{bench id -> its new/estimates.json} under a result root's criterion tree; the id is the bench's path
-    (`gemv_bf16_group/neon/4`)"""
+def _criterion_runs(root: str, run: str | None = None) -> dict[str, object]:
+    """{bench id -> its <run>/estimates.json (`new` for a root's one run)} under a result root's criterion tree;
+    the id is the bench's path (`gemv_bf16_group/neon/4`)"""
     out: dict[str, object] = {}
     tree = os.path.join(root, CRITERION)
     if not os.path.isdir(tree):
         return out
     for dirpath, _dirs, files in os.walk(tree):
-        if os.path.basename(dirpath) != "new" or "estimates.json" not in files:
+        if os.path.basename(dirpath) != (run or "new") or "estimates.json" not in files:
             continue
         rel = os.path.relpath(os.path.dirname(dirpath), tree).replace(os.sep, "/")
         if rel.startswith("report"):
@@ -93,12 +96,22 @@ def _criterion_runs(root: str) -> dict[str, object]:
     return out
 
 
-def _from_criterion(pr_root: str, base_root: str | None) -> list[Entry]:
-    """the ratio of the two runs' medians per bench, with the two 95% CIs (criterion's bootstrap) combined in
-    quadrature as relative half-widths; a bench the baseline lacks lists as new."""
-    base = _criterion_runs(base_root) if base_root else {}
+def _e2e_path(root: str, run: str | None) -> str:
+    return os.path.join(root, f"e2e-{run}.json" if run else E2E)
+
+
+def runs(root: str) -> tuple[str | None, ...]:
+    """the interleaved runs a result root holds, or (None,) for a root of one run"""
+    held = tuple(r for r in RUNS if os.path.exists(_e2e_path(root, r)) or _criterion_runs(root, r))
+    return held or (None,)
+
+
+def _from_criterion(pr_root: str, base_root: str | None, run: str | None = None) -> list[Entry]:
+    """the ratio of the two roots' `run` medians per bench, with the two 95% CIs (criterion's bootstrap) combined
+    in quadrature as relative half-widths; a bench the baseline lacks lists as new."""
+    base = _criterion_runs(base_root, run) if base_root else {}
     out: list[Entry] = []
-    for rel, pr in sorted(_criterion_runs(pr_root).items()):
+    for rel, pr in sorted(_criterion_runs(pr_root, run).items()):
         pm = _num(pr, "median", "point_estimate")
         bm = _num(base.get(rel), "median", "point_estimate")
         if rel not in base or pm <= 0 or bm <= 0:
@@ -116,10 +129,11 @@ def _half(est: object, median: float) -> float:
     return (_num(est, *ci, "upper_bound") - _num(est, *ci, "lower_bound")) / 2 / median
 
 
-def _from_e2e(pr_root: str, base_root: str | None) -> list[Entry]:
-    """bench/e2e_delta's deltas between the two runs' e2e.json; an absent or unreadable file is an empty run"""
-    pr = _read_json(os.path.join(pr_root, E2E))
-    base = _read_json(os.path.join(base_root, E2E)) if base_root else None
+def _from_e2e(pr_root: str, base_root: str | None, run: str | None = None) -> list[Entry]:
+    """bench/e2e_delta's deltas between the two roots' `run` e2e JSON; an absent or unreadable file is an empty
+    run"""
+    pr = _read_json(_e2e_path(pr_root, run))
+    base = _read_json(_e2e_path(base_root, run)) if base_root else None
     out: list[Entry] = []
     for d in e2e_deltas(_doc(base), _doc(pr)):
         entry: Entry = {"id": d["id"], "delta": d["delta"], "lo": d["lo"], "hi": d["hi"]}
@@ -128,6 +142,26 @@ def _from_e2e(pr_root: str, base_root: str | None) -> list[Entry]:
         if d["isa"]:
             entry["isa"] = d["isa"]
         out.append(entry)
+    return out
+
+
+def compare(pr_root: str, base_root: str | None) -> list[Entry]:
+    """every benchmark's change, each interleaved pair compared on its own and then folded: the mean of the
+    pairs' deltas, the band from the lowest bound to the highest, so a flag needs every pair to clear it. A
+    bench new in any pair lists as new."""
+    folded: dict[str, list[Entry]] = {}
+    for run in runs(pr_root):
+        for e in _from_criterion(pr_root, base_root, run) + _from_e2e(pr_root, base_root, run):
+            folded.setdefault(e["id"], []).append(e)
+    out: list[Entry] = []
+    for pairs in folded.values():
+        e = pairs[0].copy()
+        if any(p["delta"] is None for p in pairs):
+            e["delta"], e["lo"], e["hi"] = None, 0.0, 0.0
+        else:
+            e["delta"] = sum(p["delta"] or 0.0 for p in pairs) / len(pairs)
+            e["lo"], e["hi"] = min(p["lo"] for p in pairs), max(p["hi"] for p in pairs)
+        out.append(e)
     return out
 
 
@@ -170,7 +204,7 @@ def _fmt(e: Entry) -> str:
     return f"{e['delta'] * 100:+.1f}% [{e['lo'] * 100:+.1f}%, {e['hi'] * 100:+.1f}%]"
 
 
-def render(entries: list[Entry], noise: float) -> tuple[str, bool]:
+def render(entries: list[Entry], noise: float, pairs: int = 1) -> tuple[str, bool]:
     head = [MARKER, "## Benchmark comparison (base → PR)", ""]
     isa = next((e["isa"] for e in entries if e.get("isa")), "")
     if isa:
@@ -183,10 +217,15 @@ def render(entries: list[Entry], noise: float) -> tuple[str, bool]:
         sections.setdefault(e.get("section") or _section(e["id"]), []).append(e)
     any_reg = False
     n_changed = sum(1 for e in entries if e["delta"] is not None)
+    interleaved = (
+        f"Base and PR ran interleaved ({pairs} pairs, each adjacent in time); a change is flagged only when its 95% "
+        f"CI clears ±{noise * 100:.0f}% in every pair"
+        if pairs > 1
+        else f"A change is flagged only when its 95% CI clears ±{noise * 100:.0f}%"
+    )
     lines = head + [
-        f"{n_changed} benchmarks compared vs the base branch; a change is flagged only when its 95% CI clears "
-        f"±{noise * 100:.0f}% (else it reads as runner noise). The perf gate is advisory on the shared runner. Sections "
-        "collapsed below.",
+        f"{n_changed} benchmarks compared vs the base. {interleaved} (else it reads as runner noise). The perf gate "
+        "is advisory on the shared runner. Sections collapsed below.",
         "",
     ]
     # a section is open when it holds a flagged regression, so the interesting ones are visible without a click
@@ -198,7 +237,8 @@ def render(entries: list[Entry], noise: float) -> tuple[str, bool]:
         worst = max((abs(e["delta"]) for e in rows if e["delta"] is not None), default=0.0)
         summary = f"{_safe(name)} · {len(rows)} benches · worst {worst * 100:+.1f}%" + (" · 🔴" if section_reg else "")
         lines.append(f"<details{' open' if section_reg else ''}><summary>{summary}</summary>\n")
-        lines.append("| benchmark | Δ (median), 95% CI | |")
+        band = "mean of the pairs, 95% CI across them" if pairs > 1 else "95% CI"
+        lines.append(f"| benchmark | Δ (median), {band} | |")
         lines.append("|---|---:|:--|")
         for e, (lbl, _reg) in zip(rows, flags):
             lines.append(f"| `{_safe(e['id'])}` | {_fmt(e)} | {lbl} |")
@@ -229,8 +269,8 @@ def main(argv: list[str] | None = None) -> int:
         "native baselines, and above the 0.05 comment noise floor)",
     )
     a = ap.parse_args(argv)
-    entries = _from_criterion(a.pr_root, a.baseline) + _from_e2e(a.pr_root, a.baseline)
-    body, regressed = render(entries, a.noise)
+    entries = compare(a.pr_root, a.baseline)
+    body, regressed = render(entries, a.noise, len(runs(a.pr_root)))
     sys.stdout.write(body)
     if a.out:
         with open(a.out, "w", encoding="utf-8") as f:

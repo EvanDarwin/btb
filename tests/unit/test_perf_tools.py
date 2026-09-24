@@ -103,9 +103,9 @@ def test_the_id_is_the_group_and_the_param_label(
 # --- report: the gate and the comment -------------------------------------------------------------------------
 
 
-def _criterion(root: str, bench: str, median: float, half: float) -> None:
-    """one criterion bench's new/estimates.json under a result root, the way `cargo bench` lays it out"""
-    d = os.path.join(root, "native", "target", "criterion", bench, "new")
+def _criterion(root: str, bench: str, median: float, half: float, run: str = "new") -> None:
+    """one criterion bench's <run>/estimates.json under a result root, the way `cargo bench` lays it out"""
+    d = os.path.join(root, "native", "target", "criterion", bench, run)
     os.makedirs(d, exist_ok=True)
     est = {
         "median": {
@@ -132,6 +132,25 @@ def test_criterion_deltas_come_from_the_two_result_roots(tmp_path: Path) -> None
     assert e["delta"] == pytest.approx(0.10) and (e["lo"], e["hi"]) == pytest.approx((0.10 - half, 0.10 + half))
     assert entries["attn/neon/4"]["delta"] is None
     assert all(e["delta"] is None for e in report._from_criterion(pr, None))
+
+
+def test_interleaved_pairs_fold_so_a_flag_needs_every_pair(tmp_path: Path) -> None:
+    """runs a and b compare pair by pair: the delta is their mean and the band spans both, so a slowdown in one
+    pair only (the runner drifting under it) reads as noise, while one in both is flagged and gated"""
+    base, pr = str(tmp_path / "base"), str(tmp_path / "pr")
+    for run, drifted in (("a", 130.0), ("b", 100.0)):
+        _criterion(base, "delta_step/one_pair", 100.0, 0.1, run)
+        _criterion(pr, "delta_step/one_pair", drifted, 0.1, run)
+        _criterion(base, "delta_step/both", 100.0, 0.1, run)
+        _criterion(pr, "delta_step/both", 130.0, 0.1, run)
+    assert report.runs(pr) == ("a", "b")
+    entries = {e["id"]: e for e in report.compare(pr, base)}
+    one, both = entries["delta_step/one_pair"], entries["delta_step/both"]
+    assert one["delta"] == pytest.approx(0.15) and one["lo"] < 0.05 < one["hi"]
+    assert both["delta"] == pytest.approx(0.30) and both["lo"] > 0.10
+    assert [e["id"] for e in report.regressions(list(entries.values()), 0.10)] == ["delta_step/both"]
+    body, regressed = report.render(list(entries.values()), 0.05, len(report.runs(pr)))
+    assert regressed and "2 pairs" in body and body.count("🔴 slower") == 1
 
 
 def test_main_compares_two_roots_and_gates(tmp_path: Path, capsys: CaptureFixture[str]) -> None:

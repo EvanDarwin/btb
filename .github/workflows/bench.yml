@@ -1,16 +1,16 @@
 # Benchmarks on every PR and every push to main, base against change on one runner: the native criterion benches
 # (`cargo bench`, every [[bench]] target) plus bench/e2e_bench.py (the end-to-end tiny-model loop and the MLX/CUDA
 # per-op kernels, each skipping off its backend). The base - a PR's base branch, a push's previous main commit - is
-# checked out beside it and built and benched first, so both sides run on the same CPU; bench.report compares the
-# two result roots, posts one sticky comment on a PR (a push's goes to the job summary) and computes the perf gate.
-# A base that predates the benches is benched as nothing, and every row lists as new.
+# checked out beside it, and the two are benched interleaved on the same CPU (base, change, change, base);
+# bench.report compares the pairs, posts one sticky comment on a PR (a push's goes to the job summary) and computes
+# the perf gate. A base that predates the benches is benched as nothing, and every row lists as new.
 #
 # The PR's code runs in the `bench` job, which holds a read-only token. Posting the comment needs
 # pull-requests: write, so it is a separate job that checks out nothing and runs no repo code.
 #
-# The gate fails when a benchmark's whole 95% CI clears GATE_THRESHOLD. On the shared runner it is advisory
-# (reported in the job summary); vars.PERF_RUNNER names a dedicated runner and vars.PERF_DEDICATED = "1" makes
-# the gate fail the job. Actions pinned to wheels.yml's SHAs.
+# The gate fails when a benchmark's whole 95% CI clears GATE_THRESHOLD in both pairs. On the shared runner it is
+# advisory (reported in the job summary); vars.PERF_RUNNER names a dedicated runner and vars.PERF_DEDICATED = "1"
+# makes the gate fail the job. Actions pinned to wheels.yml's SHAs.
 name: bench
 
 on:
@@ -31,7 +31,7 @@ permissions:
 env:
   MAXTIME: "8"             # per-benchmark wall cap for the e2e: enough rounds that the slow whole-loop benches'
                            # standard-error band closes to ~2%; rounds are floored at 25 by the mark
-  GATE_THRESHOLD: "0.10"   # a regression trips only when its whole 95% CI sits above +10% vs the base branch
+  GATE_THRESHOLD: "0.10"   # a regression trips only when its whole 95% CI sits above +10% vs the base, in both pairs
 
 jobs:
   bench:
@@ -52,29 +52,43 @@ jobs:
           python-version: "3.11"
       - run: python -m pip install --quiet pytest==9.1.1 pytest-benchmark==5.3.0
 
-      # continue-on-error on the e2e runs: a known-broken cell exits pytest nonzero while pytest-benchmark still
-      # writes e2e.json for everything that did time; the report takes the file as it comes
-      - name: Build and bench the base
+      # both sides built up front, so the benches below run back to back; the change's wheel brings the deps
+      - name: Build the base
         if: env.HAS_BASE == 'true'
         working-directory: base
         run: |
           python build.py build
-          python -m pip install --quiet dist/*.whl
-          if [ -d native/benches ]; then (cd native && cargo bench); else echo "the base has no native benches"; fi
-          if [ -f bench/e2e_bench.py ]; then
-            python -m pytest bench/e2e_bench.py --benchmark-json=e2e.json --benchmark-max-time=$MAXTIME -q \
-              -p no:cacheprovider || true
-          else
-            echo "the base has no e2e bench"
-          fi
-
-      - name: Build and bench the change
+          if [ -d native/benches ]; then (cd native && cargo bench --bench '*' --no-run); fi
+      - name: Build the change
         run: |
           python build.py build
-          python -m pip install --quiet --force-reinstall --no-deps dist/*.whl
-          (cd native && cargo bench)
-          python -m pytest bench/e2e_bench.py --benchmark-json=e2e.json --benchmark-max-time=$MAXTIME -q \
-            -p no:cacheprovider || true
+          python -m pip install --quiet dist/*.whl
+          (cd native && cargo bench --bench '*' --no-run)
+
+      # interleaved base a, change a, change b, base b: each pair runs adjacent in time and their mean cancels a
+      # drift across the job, which one run per side read as a change. `--bench '*'` keeps the lib's own test
+      # harness, which rejects criterion's flags, out. The e2e runs go on when a known-broken cell exits pytest
+      # nonzero: pytest-benchmark still writes the JSON for everything that did time.
+      - name: Bench the base and the change, interleaved
+        run: |
+          bench() {  # $1 the tree, $2 the run
+            (cd "$1" && python -m pip install --quiet --force-reinstall --no-deps dist/*.whl)
+            if [ -d "$1/native/benches" ]; then
+              (cd "$1/native" && cargo bench --bench '*' -- --save-baseline "$2")
+            else
+              echo "$1 has no native benches"
+            fi
+            if [ -f "$1/bench/e2e_bench.py" ]; then
+              (cd "$1" && python -m pytest bench/e2e_bench.py --benchmark-json="e2e-$2.json" \
+                --benchmark-max-time=$MAXTIME -q -p no:cacheprovider) || true
+            else
+              echo "$1 has no e2e bench"
+            fi
+          }
+          if [ "$HAS_BASE" = "true" ]; then bench base a; fi
+          bench . a
+          bench . b
+          if [ "$HAS_BASE" = "true" ]; then bench base b; fi
 
       # one render gives the comment body and the gate's exit code; the body goes to the job summary and, on a PR,
       # to the `comment` job below; the gate fails this job only on a dedicated runner
