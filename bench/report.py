@@ -204,8 +204,24 @@ def _fmt(e: Entry) -> str:
     return f"{e['delta'] * 100:+.1f}% [{e['lo'] * 100:+.1f}%, {e['hi'] * 100:+.1f}%]"
 
 
-def render(entries: list[Entry], noise: float, pairs: int = 1) -> tuple[str, bool]:
+_SHA = re.compile(r"[0-9a-f]{7,40}")
+
+
+def _against(base_ref: str | None, base_sha: str | None) -> str:
+    """the line naming what the change is compared against: the base's branch and the commit it was at, the
+    commit only when it is a plain hex SHA (GitHub links one in a comment); '' without one"""
+    if not base_sha or not _SHA.fullmatch(base_sha):
+        return ""
+    return f"Compared against `{_safe(base_ref)}` at {base_sha}." if base_ref else f"Compared against {base_sha}."
+
+
+def render(
+    entries: list[Entry], noise: float, pairs: int = 1, base_ref: str | None = None, base_sha: str | None = None
+) -> tuple[str, bool]:
     head = [MARKER, "## Benchmark comparison (base → PR)", ""]
+    against = _against(base_ref, base_sha)
+    if against:
+        head += [against, ""]
     isa = next((e["isa"] for e in entries if e.get("isa")), "")
     if isa:
         head += [f"Native and cpu benches at ISA tier `{_safe(isa)}`.", ""]
@@ -255,6 +271,8 @@ def main(argv: list[str] | None = None) -> int:
     # as a regression; 5% sits above the observed drift so between-run noise reads as noise.
     ap.add_argument("--noise", type=float, default=0.05, metavar="FRAC")
     ap.add_argument("--out", default=None, metavar="PATH")
+    ap.add_argument("--base-ref", default=None, help="the base's branch, named in the comment")
+    ap.add_argument("--base-sha", default=None, help="the commit benched as the base, named in the comment")
     ap.add_argument(
         "--gate",
         action="store_true",
@@ -270,7 +288,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     a = ap.parse_args(argv)
     entries = compare(a.pr_root, a.baseline)
-    body, regressed = render(entries, a.noise, len(runs(a.pr_root)))
+    body, regressed = render(entries, a.noise, len(runs(a.pr_root)), a.base_ref, a.base_sha)
     sys.stdout.write(body)
     if a.out:
         with open(a.out, "w", encoding="utf-8") as f:

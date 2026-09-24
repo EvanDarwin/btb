@@ -93,11 +93,16 @@ jobs:
       # one render gives the comment body and the gate's exit code; the body goes to the job summary and, on a PR,
       # to the `comment` job below; the gate fails this job only on a dedicated runner
       - name: Compare and gate
+        env:
+          BASE_REF: ${{ github.base_ref || github.ref_name }}  # a PR's base branch, or main for a push
         run: |
           gate=0
           baseline=()
-          if [ "$HAS_BASE" = "true" ]; then baseline=(--baseline base); fi
-          python -m bench.report . "${baseline[@]}" --gate --gate-threshold "$GATE_THRESHOLD" --out bench-comment.md || gate=$?
+          if [ "$HAS_BASE" = "true" ]; then
+            baseline=(--baseline base --base-ref "$BASE_REF" --base-sha "$(git -C base rev-parse HEAD)")
+          fi
+          python -m bench.report . "${baseline[@]}" --gate --gate-threshold "$GATE_THRESHOLD" \
+            --out bench-comment.md || gate=$?
           { echo "## Perf gate"; echo ""
             if [ "$gate" = "0" ]; then echo "No benchmark's 95% CI cleared +${GATE_THRESHOLD} vs the base."
             else echo "A benchmark regressed past the +${GATE_THRESHOLD} gate (see the step log)."; fi

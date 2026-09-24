@@ -162,9 +162,13 @@ def test_main_compares_two_roots_and_gates(tmp_path: Path, capsys: CaptureFixtur
         with open(os.path.join(root, "e2e.json"), "w", encoding="utf-8") as f:
             json.dump(_doc(_bench("cpu", median, 0.0, 10, {"device": "cpu", "model": "m"}, "cpu"), isa="neon"), f)
     out = str(tmp_path / "c.md")
-    assert report.main([pr, "--baseline", base, "--gate", "--out", out]) == 1
+    base_sha = "b" * 40
+    args = [pr, "--baseline", base, "--base-ref", "main", "--base-sha", base_sha, "--gate", "--out", out]
+    assert report.main(args) == 1
     body = open(out, encoding="utf-8").read()
     assert "`gemv/b16`" in body and "🔴 slower" in body and "`cpu/m`" in body and "at ISA tier `neon`" in body
+    assert f"Compared against `main` at {base_sha}." in body
+    assert report._against("main", "<img src=x>") == "", "only a plain hex SHA is named"
     assert "FAIL: 1 benchmark(s) regressed" in capsys.readouterr().err
     assert report.main([pr, "--gate"]) == 0  # no baseline: every row is new, nothing to gate
 
