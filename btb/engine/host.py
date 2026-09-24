@@ -110,6 +110,30 @@ class _Router(torch.nn.Module):
         return logits, scores.to(hidden_states.dtype), idx
 
 
+def _cast_floats(x: object, dtype: torch.dtype) -> object:
+    """every floating tensor in `x` (a tensor, or a tuple or list of them and anything else) as `dtype`"""
+    if isinstance(x, torch.Tensor):
+        return x.to(dtype) if x.is_floating_point() else x
+    if isinstance(x, (tuple, list)):
+        return type(x)(_cast_floats(v, dtype) for v in x)
+    return x
+
+
+def compute_fp32(module: torch.nn.Module) -> None:
+    """`module` computes in float32 and hands its result back in the dtype of its first floating input, the way
+    transformers runs a router in float32: the host layer widened its matrix, which a bf16 activation cannot
+    meet in a conv or a linear. On a float32 pass both casts are the identity."""
+    inner = module.forward
+
+    def forward(*args: object, **kw: object) -> object:
+        floats = [v for v in (*args, *kw.values()) if isinstance(v, torch.Tensor) and v.is_floating_point()]
+        f32 = torch.float32
+        out = inner(*(_cast_floats(v, f32) for v in args), **{k: _cast_floats(v, f32) for k, v in kw.items()})
+        return _cast_floats(out, floats[0].dtype) if floats else out
+
+    object.__setattr__(module, "forward", forward)
+
+
 class _Experts(torch.nn.Module):
     sm: Any
     _mx_bias: Any

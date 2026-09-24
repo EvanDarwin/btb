@@ -16,7 +16,7 @@ from ..kinds import CAPS, KIND_OF, Cap, FamilyKind, LayerKind, ModelType
 from ..options import UnsupportedModelType
 from .cache import GrowLayer
 from .fused import _fuse_mlp_cls, _fuse_norm_cls
-from .host import _Experts, _HostLinear, _NGramRows, _Router
+from .host import _Experts, _HostLinear, _NGramRows, _Router, compute_fp32
 from .state import _State
 
 
@@ -412,6 +412,7 @@ class _FamiliesMixin(_State):
             layer = self.fam.layer(self.cfg, i).eval()
         layer = self._shape_layer(layer, i)
         base = f"{self.prefix}layers.{i}."
+        fp32_owners: set[str] = set()
         for name, _p, is_buf in self._named_tensors(layer):
             t = self._get(base + name, stored=True)
             # widened once: norms, biases, sinks, the conv, Qwen4's router, gpt-oss's per-expert biases (a few MB,
@@ -420,6 +421,12 @@ class _FamiliesMixin(_State):
                 t.dim() <= 1 or "conv1d" in name or ".experts." in name or name.endswith("mlp.gate.weight")
             )
             self._set_param(layer, name, t.float() if wide else self._held(t), buffer=is_buf)
+            # a widened matrix is its module's conv or linear operand; the per-expert biases are added by
+            # `_Experts`, which casts them itself
+            if wide and t.dim() >= 2 and ".experts." not in name:
+                fp32_owners.add(name.rpartition(".")[0])
+        for owner in sorted(fp32_owners):
+            compute_fp32(layer.get_submodule(owner))
         for mname, m in list(layer.named_modules()):
             for cname, child in list(m.named_children()):
                 if isinstance(child, torch.nn.Linear) and child.weight.dtype == torch.bfloat16:

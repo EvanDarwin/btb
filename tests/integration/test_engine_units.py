@@ -21,6 +21,7 @@ from btb.engine import StreamedTextModel
 from btb.engine.cache import GrowLayer
 from btb.engine.generate import _chains_tree
 from btb.kinds import Json, TokenRows
+from tests.cert import spec
 from tests.helpers import (
     ROOT,
     fixture,
@@ -561,6 +562,26 @@ def test_the_card_and_the_host_answer_the_same_prompt_alike(name: str) -> None:
         finally:
             card.close()
     assert max_abs(got, ref) < 1e-4, f"{name}: the card and the host disagree"
+
+
+@pytest.mark.parametrize("name", sorted(set(spec.FIXTURE_STEM.values())))
+def test_the_host_layers_take_a_bf16_activation_through_their_widened_modules(name: str) -> None:
+    """A host layer widens some matrices to float32 (a conv, Qwen4's router), and the MLX step path hands it
+    bf16 activations; each widened module computes in float32 and answers in bf16. The CPU in bf16 runs the
+    same layers the same way, so every family's fixture decodes here without a GPU."""
+    path = fixture(name)
+    with torch.inference_mode():
+        sm = host_model(path, dtype=torch.bfloat16)
+        try:
+            got = forward_logits(sm, REPEATING, sm.new_cache())[0, -1].float()
+        finally:
+            sm.close()
+        ref_sm = host_model(path)
+        try:
+            ref = forward_logits(ref_sm, REPEATING, ref_sm.new_cache())[0, -1].float()
+        finally:
+            ref_sm.close()
+    assert rel_err(got, ref) < 0.05, f"{name}: the bf16 pass strays from the float32 one"
 
 
 def test_spec_budget_without_a_cost_curve_is_the_wider_of_the_tree_and_the_chain() -> None:
