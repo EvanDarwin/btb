@@ -91,11 +91,23 @@ def bank(path: str) -> int:
     return 0
 
 
+_GAP_CELL = re.compile(r"\[manifest/([^\]]+)\] (.*)")
+
+
+def _gap_cell(line: str) -> str | None:
+    """the cell a manifest GAP line names, None for any other finding: a gap cell is one finding whatever its
+    Missing reason, so a cell whose first reason closed and whose next one now shows is not a new gap"""
+    m = _GAP_CELL.match(line)
+    return m.group(2) if m and m.group(1) in {k.value for k in manifest.Missing} else None
+
+
 def new_since(baseline_path: str) -> list[str]:
-    """the findings present now but not in the baseline snapshot - the gaps this change introduced."""
+    """the findings present now but not in the baseline snapshot - the gaps this change introduced. A manifest
+    gap cell counts as new only if the baseline had no gap on that cell at all."""
     with open(baseline_path, encoding="utf-8") as f:
         base = set(json.load(f))
-    return sorted(findings() - base)
+    base_cells = {c for line in base if (c := _gap_cell(line)) is not None}
+    return sorted(line for line in findings() - base if _gap_cell(line) not in base_cells)
 
 
 def check(baseline_path: str) -> int:

@@ -41,6 +41,16 @@ def test_a_finding_absent_from_the_baseline_is_reported(
     assert "1 new cert gap(s)" in err and dropped in err
 
 
+def test_a_gap_cell_moving_to_its_next_reason_is_not_new(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    """closing a cell's first gap reason shows its next one; that cell was a gap before, so nothing new opened -
+    while a cell that was not a gap at all still reports"""
+    now = {"[manifest/spec-decode] gemma3/gguf-bf16/cpu/greedy", "[manifest/fp8-unimplemented] qwen3/safe-fp8/cpu/g"}
+    monkeypatch.setattr(delta, "findings", lambda: set(now))
+    path = str(tmp_path / "cert.json")
+    Path(path).write_text(json.dumps(["[manifest/gguf-load] gemma3/gguf-bf16/cpu/greedy"]), encoding="utf-8")
+    assert delta.new_since(path) == ["[manifest/fp8-unimplemented] qwen3/safe-fp8/cpu/g"]
+
+
 def test_a_missing_baseline_is_nonzero(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
     """no baseline is not "no new gaps": an agent that never banked one must not read as clean"""
     assert delta.check(str(tmp_path / "absent.json")) != 0
