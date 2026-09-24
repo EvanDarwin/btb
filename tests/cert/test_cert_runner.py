@@ -2,7 +2,8 @@
 on this machine, assert the engine loads it, that the sub-path's OWN `PassTag` engaged, and that greedy decode is
 deterministic (two independent loads of the same fixture produce identical tokens). A greedy cell is also held to
 the banked oracle (`oracle.assert_matches`), so a deterministically-wrong path fails here rather than certifying
-itself; a sampled cell is held to the oracle's banked seeded draw the same way.
+itself; a sampled cell is held to the oracle's banked seeded draw where it computes in fp32, and elsewhere holds a
+greedy decode of the same load to the greedy reference (`oracle.holds_sampled` says why).
 
 The tag assertion is what makes a receipt worth something: it is the sub-path's own `expect`, carried on
 `spec.DeviceSubpath`, so a renamed key cannot quietly turn it off and a fallback (torch on a card without the
@@ -107,17 +108,22 @@ def test_cell_loads_and_is_deterministic(
     if not os.path.isdir(path):
         pytest.skip(f"fixture {stem} not built")
 
-    sampling = SAMPLING if decode is spec.Decode.SAMPLED else None
-    runs = []
+    sampled = decode is spec.Decode.SAMPLED
+    runs: list[list[int]] = []
+    held: list[int] | None = None  # the greedy decode a bf16 sampled cell holds to the oracle instead of its draw
     for i in range(2):  # two independent loads: catches load nondeterminism too, not just decode
         with loaded_model(path, **dev.knobs) as sm:
-            runs.append(list(sm.generate(list(PROMPT), N, speculate=False, sampling=sampling).tokens))
+            runs.append(oracle.decode(sm, PROMPT, SAMPLING if sampled else None))
             if i == 0:
                 _assert_path_engaged(sm, kind, storage, dev, decode, stem)
+                if sampled and not oracle.holds_sampled(sm):
+                    held = oracle.decode(sm, PROMPT)
     assert_same_tokens(runs[0], runs[1], f"{stem} on {dev.key}/{decode.value} decoded differently across two loads")
-    # correctness, not just determinism: the output must match the banked reference (the same tokens every device
-    # produces), so a deterministically-WRONG path fails - greedy and seeded-sampled alike
-    oracle.assert_matches(kind, runs[0], dev.hardware.value, sampled=decode is spec.Decode.SAMPLED)
+    # correctness, not just determinism: a deterministically-WRONG path fails against the banked reference
+    if held is not None:
+        oracle.assert_matches(kind, held, dev.hardware.value)
+    else:
+        oracle.assert_matches(kind, runs[0], dev.hardware.value, sampled=sampled)
     receipt.record(manifest.safetensors_id(kind, dev.key, decode))  # ran+passed here (cross-machine union)
 
 

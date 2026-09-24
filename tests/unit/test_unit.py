@@ -614,3 +614,18 @@ def test_a_packed_tensors_meta_describes_it_and_the_store_is_versioned(tmp_path:
     (d / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
     with pytest.raises(BadPack):
         check_version(str(d))
+
+
+def test_a_sampled_draw_is_held_to_the_oracle_only_where_the_engine_computes_in_fp32() -> None:
+    """the reference computes in fp32; in bf16 a flat-logit near-tie at the sampler's cut falls either way"""
+    from types import SimpleNamespace
+
+    from btb.engine.model import StreamedTextModel
+    from tests.cert import oracle
+
+    def model(dtype: torch.dtype | None) -> StreamedTextModel:
+        return cast(StreamedTextModel, SimpleNamespace(compute_dtype=dtype))
+
+    assert oracle.holds_sampled(model(torch.float32))
+    assert not oracle.holds_sampled(model(None))
+    assert not oracle.holds_sampled(model(torch.bfloat16))

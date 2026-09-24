@@ -1,13 +1,16 @@
 """P5, the derived correctness oracle: a banked greedy and a banked seeded-sampled continuation per served family
-that a cert cell's decode must reproduce. Determinism (test_cert_runner) proves a path runs the same twice; it does NOT prove the answer is
-right - a deterministically-wrong path passes it. The oracle closes that: the reference is the engine's own greedy
+that a cert cell's decode must reproduce. Determinism (test_cert_runner) proves a path runs the same twice; it does
+NOT prove the answer is right - a deterministically-wrong path passes it. The oracle closes that: the reference is the engine's own greedy
 decode of the tiny fixture, banked per `core.served_kinds()` + `spec.FIXTURE_STEM` (derived from core, never a
 hand list like test_receipts' run_* mirror), content-hashed against the fixture so a fixture change invalidates a
 stale bank, and regenerated deterministically so a fresh bank is byte-identical to the committed one.
 
-A sampled cell is held to its seeded continuation the same way: the Gumbel draw is keyed by (seed, row,
-position), so a fixed seed makes it a deterministic function of the logits, and a wrong path that happens to be
-deterministic fails it just as a greedy cell does.
+A sampled draw is held exactly where the engine computes in fp32, as the reference does (`holds_sampled`): the
+Gumbel draw is keyed by (seed, row, position), so a fixed seed makes it a deterministic function of the logits.
+In bf16 it is not held - the tiny fixtures' logits are nearly flat, so bf16 rounding alone moves a token across
+the top-k/top-p cut (MLX in fp32 reproduces the CPU draw exactly; in bf16 it does not). A sampled cell on a bf16
+path instead holds a greedy decode of the same load to the greedy reference, so it still cannot certify a path
+that decodes wrong.
 
 The check is EXACT tokens, not a logit-distance tolerance: test_receipts already holds the banked greedy
 continuation to exact equality on every device (`g == B["greedy"]` on CPU and MLX alike), so exact tokens are the
@@ -19,6 +22,7 @@ finding to report (per `validate`), not a tolerance to widen.
     python -m tests.cert.oracle --rebank     # regenerate and write bank.json (run under the GPU lock)
     python -m tests.cert.oracle --check      # regenerate on the reference device; nonzero if it drifts
     python -m tests.cert.oracle --validate --device mlx   # a second device must reproduce the same tokens
+    python -m tests.cert.oracle --validate --device mlx --fp32   # ... in fp32, where the sampled draws are held too
 """
 
 from __future__ import annotations
@@ -39,6 +43,8 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from torch import Tensor
+
+    from btb.engine.model import StreamedTextModel
 
     CellOutput = Sequence[int] | Tensor  # what a runner cell hands us: the decoded tokens, or a logits row
 
@@ -95,17 +101,30 @@ def fixture_hash(path: str) -> str:
 # --- banking (runs the engine) -----------------------------------------------------------------------------
 
 
+def holds_sampled(sm: StreamedTextModel) -> bool:
+    """whether a sampled draw from `sm` is held to the banked one: only where it computes in fp32, as the reference
+    does - in bf16 a near-tie at the sampler's cut falls on either side by rounding (see the module docstring)"""
+    import torch
+
+    return sm.compute_dtype is torch.float32
+
+
+def decode(sm: StreamedTextModel, prompt_ids: list[int], sampling: Sampling | None = None) -> list[int]:
+    """N new tokens of `prompt_ids` on a loaded model - greedy, or seeded-sampled with `sampling`. Speculation off."""
+    return [int(t) for t in sm.generate(list(prompt_ids), N, speculate=False, sampling=sampling).tokens]
+
+
 def reference_tokens(
     kind: FamilyKind, prompt_ids: list[int], device: str, sampling: Sampling | None = None
 ) -> list[int]:
-    """the engine's own continuation of `prompt_ids` from the family's fixture on `device`, N new tokens - greedy,
-    or seeded-sampled with `sampling` - the reference a cell must reproduce. Speculation off."""
+    """the engine's own continuation of `prompt_ids` from the family's fixture on `device` - the reference a cell
+    must reproduce."""
     import btb
     from tests.helpers import NO_LOG
 
     sm = btb.load(fixture_dir(kind), device=device, log=NO_LOG)
     try:
-        return [int(t) for t in sm.generate(list(prompt_ids), N, speculate=False, sampling=sampling).tokens]
+        return decode(sm, prompt_ids, sampling)
     finally:
         sm.close()
 
@@ -239,24 +258,44 @@ def check() -> list[str]:
     return problems
 
 
-def validate(device: str) -> list[str]:
-    """a second device must reproduce the banked tokens: decode every family and prompt on `device` and compare
-    to the committed reference. Returns the discrepancies - a token mismatch (a real cross-device flip) or an
-    engine error on the path (e.g. a family the device cannot run) - empty when every family reproduces. Each
-    family is caught on its own, so one broken path does not hide whether the rest reproduce."""
+def validate(device: str, fp32: bool = False) -> list[str]:
+    """a second device must reproduce the banked tokens: decode every family and prompt on `device` (in fp32 with
+    `fp32`) and compare to the committed reference - greedy always, sampled where `holds_sampled`.
+    Returns the discrepancies - a token mismatch (a real cross-device flip) or an engine error on the path (e.g. a
+    family the device cannot run) - empty when every family reproduces. Each family is caught on its own, so one
+    broken path does not hide whether the rest reproduce."""
+    import btb
+    from tests.helpers import NO_LOG
+
     committed = load_bank()["families"]
     problems: list[str] = []
     for kind in banked_kinds():
-        for key, sampling in DECODES.items():
-            for name, ids in PROMPTS.items():
-                try:
-                    got = reference_tokens(kind, ids, device, sampling)
-                except Exception as e:  # the engine's failure on a path is itself a finding, not a reason to abort
-                    problems.append(f"{kind.value}/{key}/{name} on {device}: engine error ({type(e).__name__}: {e})")
+        try:
+            path = fixture_dir(kind)
+            # fp32 only when asked: leaving it unset keeps the device's own default (the CPU computes in fp32)
+            sm = (
+                btb.load(path, device=device, log=NO_LOG, fp32=1) if fp32 else btb.load(path, device=device, log=NO_LOG)
+            )
+        except Exception as e:  # the engine's failure on a path is itself a finding, not a reason to abort
+            problems.append(f"{kind.value} on {device}: engine error at load ({type(e).__name__}: {e})")
+            continue
+        try:
+            for key, sampling in DECODES.items():
+                if sampling is not None and not holds_sampled(sm):
                     continue
-                ref = committed[kind.value].get(key, {}).get(name)
-                if got != ref:
-                    problems.append(f"{kind.value}/{key}/{name} on {device}: {got} != banked {ref}")
+                for name, ids in PROMPTS.items():
+                    try:
+                        got = decode(sm, ids, sampling)
+                    except Exception as e:
+                        problems.append(
+                            f"{kind.value}/{key}/{name} on {device}: engine error ({type(e).__name__}: {e})"
+                        )
+                        continue
+                    ref = committed[kind.value].get(key, {}).get(name)
+                    if got != ref:
+                        problems.append(f"{kind.value}/{key}/{name} on {device}: {got} != banked {ref}")
+        finally:
+            sm.close()
     return problems
 
 
@@ -282,6 +321,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--check", action="store_true", help="regenerate on the reference device; nonzero if it drifts")
     ap.add_argument("--validate", action="store_true", help="a second device (--device) must reproduce the tokens")
     ap.add_argument("--device", default=REFERENCE_DEVICE, help="the device to bank/validate on (default cpu)")
+    ap.add_argument("--fp32", action="store_true", help="validate with fp32 compute (the sampled draws are held too)")
     a = ap.parse_args(argv)
     if a.rebank:
         write_bank(bank(device=a.device))
@@ -292,7 +332,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"FAIL: {p}", file=sys.stderr)
         return 1 if problems else 0
     if a.validate:
-        problems = validate(a.device)
+        problems = validate(a.device, a.fp32)
         for p in problems:
             print(f"FAIL cross-device: {p}", file=sys.stderr)
         print(f"{a.device}: {'reproduced the banked tokens' if not problems else f'{len(problems)} mismatch(es)'}")
