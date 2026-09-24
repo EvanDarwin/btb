@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import datetime
 import json
 import os
 import re
@@ -56,36 +55,13 @@ def banner(err: bool = False) -> None:
         print(ART, file=sys.stderr if err else sys.stdout, flush=True)
 
 
-FRIEND_FILE = os.path.expanduser("~/.config/btb.friend")
-
-
-def _build_date() -> datetime.date | None:
-    """The day this wheel was built, baked into btb/_build.py at build time (setup.py). None in a source
-    checkout, where the module is never generated - the FSL window then can't be measured, so the notice shows."""
-    try:
-        from importlib import import_module
-
-        return datetime.date.fromisoformat(import_module("btb._build").BUILD_DATE)
-    except Exception:
-        return None
-
-
 def _license_notice() -> None:
-    """Print the FSL commercial-use notice to stderr while this build is inside its two-year window; silent once
-    the window has passed, and silent for anyone who has `~/.config/btb.friend`. The window is measured from the
-    build date (not a hand-bumped constant), so it stops on its own two years after the wheel was built. Under
-    the FSL the code converts to Apache 2.0 at that point."""
-    if os.path.exists(FRIEND_FILE):
-        return
-    built = _build_date()
-    if built is not None:
-        try:
-            change = built.replace(year=built.year + 2)
-        except ValueError:  # a Feb 29 build
-            change = built.replace(year=built.year + 2, day=28)
-        if datetime.date.today() >= change:
-            return
-    _e("btb is free for personal and academic use. For commercial use, consider a paid license.")
+    """Print the FSL commercial-use notice to stderr while this build is inside its two-year window (btb.fsl);
+    silent once the window has passed, when the code is Apache 2.0, and for anyone with `~/.config/btb.friend`"""
+    from .fsl import restricted
+
+    if restricted():
+        _e("btb is free for personal and academic use. For commercial use, consider a paid license.")
 
 
 PLACEMENT = (
@@ -1072,7 +1048,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     _common(p, path_required=False)
     p.add_argument(
-        "--host", default="127.0.0.1", help="address to bind (default 127.0.0.1; 0.0.0.0 for every interface)"
+        "--host",
+        default="127.0.0.1",
+        help="address to bind (default 127.0.0.1; 0.0.0.0 for every interface, which needs --api-key)",
     )
     p.add_argument("--port", type=_port, default=8000, help="port to listen on (default 8000)")
     p.add_argument(

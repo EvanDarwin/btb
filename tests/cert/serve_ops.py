@@ -10,7 +10,8 @@ reflecting the live handlers would gate this whole matrix behind the runtime. cu
 and mlx_ops parses btb/mlx source for the same reason, all three in the torch-free cert.yml gate; this follows
 that precedent and stays import-light. The handler methods are parsed from the BaseHTTPRequestHandler subclass
 (`def do_<METHOD>`) and the dispatch set from the `r == "/..."` / `r in (...)` / `self._route() in (...)` branches
-in their bodies, the authoritative set a request can reach - a new verb brings its routes with it.
+in their bodies, plus the routes of any `self.do_<METHOD>()` they answer through (do_HEAD is do_GET without the
+body), the authoritative set a request can reach - a new verb brings its routes with it.
 
     python -m tests.cert.serve_ops --report    # the route table plus the plain-language gaps
     python -m tests.cert.serve_ops --missing   # only the gaps in plain language: what is missing and how to close
@@ -79,7 +80,12 @@ class Route:
 # `test` a request that exercises the branch.
 OPS: tuple[Route, ...] = (
     Route("discovery", ("GET",), ("/", "/health"), "tests/unit/test_cli.py::test_server_routes_without_a_model"),
-    Route("liveness_head", ("HEAD",), ("/", "/health"), None),
+    Route(
+        "head",
+        ("HEAD",),
+        ("/", "/health", "/v1/models", "/api/tags", "/api/ps", "/api/version"),
+        "tests/unit/test_cli.py::test_server_head_is_get_without_the_body",
+    ),
     Route("openai_models", ("GET",), ("/v1/models",), "tests/unit/test_cli.py::test_server_routes_without_a_model"),
     Route(
         "openai_chat",
@@ -88,7 +94,7 @@ OPS: tuple[Route, ...] = (
         "tests/unit/test_pi.py::test_openai_stays_plain_text_without_tools",
     ),
     Route("ollama_tags", ("GET",), ("/api/tags",), "tests/unit/test_cli.py::test_server_routes_without_a_model"),
-    Route("ollama_ps", ("GET",), ("/api/ps",), None),
+    Route("ollama_ps", ("GET",), ("/api/ps",), "tests/unit/test_cli.py::test_ollama_ps_lists_the_loaded_models"),
     Route("ollama_version", ("GET",), ("/api/version",), "tests/unit/test_cli.py::test_server_routes_without_a_model"),
     Route(
         "ollama_chat", ("POST",), ("/api/chat",), "tests/unit/test_pi.py::test_a_bad_request_field_is_a_400_naming_it"
@@ -115,6 +121,7 @@ _DO_RE = re.compile(r"\n    def (do_([A-Z]+))\s*\(")  # a do_<METHOD> request ha
 _EQ_RE = re.compile(r'\br\s*==\s*"(/[^"]*)"')  # a `r == "/path"` branch
 _IN_RE = re.compile(r"(?:\br|self\._route\(\))\s+in\s+\(([^)]*)\)", re.S)  # a `r in (...)` / `_route() in (...)` branch
 _LIT_RE = re.compile(r'"(/[^"]*)"')  # a "/path" literal inside an `in (...)` tuple
+_DELEGATE_RE = re.compile(r"\bself\.(do_[A-Z]+)\(")  # a handler answering through another verb's handler
 _TESTREF_RE = re.compile(r"^(.+\.py)::(\w+)$")  # a Route.test, "tests/<file>.py::<func>"
 
 
@@ -142,21 +149,25 @@ def _handler_body(src: str, name: str) -> str:
     return m.group(0) if m else ""
 
 
-def dispatched_routes() -> set[tuple[str, str]]:
-    """(method, path) for every route the server dispatches, parsed from the `r == "/..."` and `r in (...)`
-    branches in every do_<METHOD> handler - the truth the OPS table's claims are checked against. A request
-    reaches exactly these; anything else falls to the handlers' default 404."""
-    full = _serve_source()
-    src = _handler_class(full)
-    out: set[tuple[str, str]] = set()
-    for handler, method in handler_methods(full).items():
-        body = _handler_body(src, handler)
-        for path in _EQ_RE.findall(body):
-            out.add((method, path))
-        for group in _IN_RE.findall(body):
-            for path in _LIT_RE.findall(group):
-                out.add((method, path))
+def _handler_paths(src: str, handler: str, seen: frozenset[str] = frozenset()) -> set[str]:
+    """the paths `handler` dispatches: its own `r == ...` / `r in (...)` branches, plus every path of a
+    do_<METHOD> it delegates to (do_HEAD answering through `self.do_GET()` dispatches all of GET's routes)"""
+    body = _handler_body(src, handler)
+    out = set(_EQ_RE.findall(body))
+    for group in _IN_RE.findall(body):
+        out.update(_LIT_RE.findall(group))
+    for callee in set(_DELEGATE_RE.findall(body)) - seen - {handler}:
+        out |= _handler_paths(src, callee, seen | {handler})
     return out
+
+
+def dispatched_routes(full: str | None = None) -> set[tuple[str, str]]:
+    """(method, path) for every route the server dispatches (btb/serve.py's, or `full` a stand-in source),
+    parsed from each do_<METHOD> handler's branches and delegations - the truth the OPS table's claims are
+    checked against. A request reaches exactly these; anything else falls to the handlers' default 404."""
+    full = _serve_source() if full is None else full
+    src = _handler_class(full)
+    return {(method, p) for handler, method in handler_methods(full).items() for p in _handler_paths(src, handler)}
 
 
 def _test_exists(ref: str | None) -> bool:
