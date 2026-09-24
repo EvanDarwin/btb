@@ -71,24 +71,162 @@ unsafe fn sum_sq(x: *const f32, n: usize) -> f32 {
     (t0 + t1) + (t2 + t3)
 }
 
-#[inline(always)]
-fn recall(row: &[f32], kv: &mut [f32], decay: f32, kd: f32) {
-    for (sv, acc) in row.iter().zip(kv.iter_mut()) {
-        *acc += (*sv * decay) * kd;
-    }
+/// One head's `dk x dv` state stepped in place, row by row: kv = S^T k, delta = (v - kv) beta, then
+/// S = decay S + k delta^T and `$core` = S^T q. A macro so the scalar step keeps its original inline
+/// form: moving these loops into a function measured 6% slower.
+macro_rules! state_rows {
+    ($st:ident, $dk:ident, $dv:ident, $kn:ident, $qn:ident, $decay:ident, $beta:ident, $v_src:ident, $core:ident) => {
+        let mut kvbuf = [0.0f32; MAX_HEAD_DIM];
+        let kv = &mut kvbuf[..$dv];
+        for d in 0..$dk {
+            let kd = $kn[d];
+            let row = std::slice::from_raw_parts($st.add(d * $dv), $dv);
+            for (sv, acc) in row.iter().zip(kv.iter_mut()) {
+                *acc += (*sv * $decay) * kd;
+            }
+        }
+
+        let mut dbuf = [0.0f32; MAX_HEAD_DIM];
+        let delta = &mut dbuf[..$dv];
+        for ((d, vt), m) in delta.iter_mut().zip($v_src.iter()).zip(kv.iter()) {
+            *d = (*vt - *m) * $beta;
+        }
+
+        let mut cbuf = [0.0f32; MAX_HEAD_DIM];
+        let $core = &mut cbuf[..$dv];
+        for d in 0..$dk {
+            let (kd, qd) = ($kn[d], $qn[d]);
+            let row = std::slice::from_raw_parts_mut($st.add(d * $dv), $dv);
+            for ((sv, dl), acc) in row.iter_mut().zip(delta.iter()).zip($core.iter_mut()) {
+                let x = *sv * $decay + kd * *dl;
+                *sv = x;
+                *acc += x * qd;
+            }
+        }
+    };
 }
 
+#[cfg(target_arch = "aarch64")]
+macro_rules! state_neon {
+    ($st:ident, $dk:ident, $dv:ident, $kn:ident, $qn:ident, $decay:ident, $beta:ident, $v_src:ident, $core:ident) => {
+        let mut cbuf = [0.0f32; MAX_HEAD_DIM];
+        let $core = &mut cbuf[..$dv];
+        state_rows_neon($st, $dk, $dv, $kn, $qn, $decay, $beta, $v_src, $core);
+    };
+}
+
+/// Column `j` of [`state_rows`] alone, the same operations in the same order.
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn update(row: &mut [f32], delta: &[f32], core: &mut [f32], decay: f32, kd: f32, qd: f32) {
-    for ((sv, dl), acc) in row.iter_mut().zip(delta.iter()).zip(core.iter_mut()) {
-        let x = *sv * decay + kd * *dl;
+#[allow(clippy::too_many_arguments)]
+unsafe fn state_col(
+    st: *mut f32,
+    dk: usize,
+    dv: usize,
+    j: usize,
+    kn: &[f32],
+    qn: &[f32],
+    decay: f32,
+    beta: f32,
+    v_src: &[f32],
+    core: &mut [f32],
+) {
+    let mut kv = 0.0f32;
+    for (d, &kd) in kn[..dk].iter().enumerate() {
+        kv += (*st.add(d * dv + j) * decay) * kd;
+    }
+    let dl = (v_src[j] - kv) * beta;
+    let mut c = 0.0f32;
+    for (d, (&kd, &qd)) in kn[..dk].iter().zip(qn.iter()).enumerate() {
+        let sv = st.add(d * dv + j);
+        let x = *sv * decay + kd * dl;
         *sv = x;
-        *acc += x * qd;
+        c += x * qd;
+    }
+    core[j] = c;
+}
+
+// NEON: the state in column blocks of 4 * V lanes, each block's kv, delta and core held in registers
+// down all dk rows (the rows' state still in L1 between the two passes). Every element sees the same
+// multiplies and adds in the same order as the scalar rows (no fused multiply-add): bit-identical.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+unsafe fn state_cols_neon<const V: usize>(
+    st: *mut f32,
+    dk: usize,
+    dv: usize,
+    j: usize,
+    kn: &[f32],
+    qn: &[f32],
+    decay: f32,
+    beta: f32,
+    v_src: &[f32],
+    core: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+    let zero = vdupq_n_f32(0.0);
+    let mut kv = [zero; V];
+    for (d, &kd) in kn[..dk].iter().enumerate() {
+        let row = st.add(d * dv + j);
+        for l in 0..V {
+            let s = vmulq_n_f32(vld1q_f32(row.add(4 * l)), decay);
+            kv[l] = vaddq_f32(kv[l], vmulq_n_f32(s, kd));
+        }
+    }
+    let v = &v_src[j..j + 4 * V];
+    let mut dl = [zero; V];
+    for l in 0..V {
+        dl[l] = vmulq_n_f32(vsubq_f32(vld1q_f32(v.as_ptr().add(4 * l)), kv[l]), beta);
+    }
+    let mut c = [zero; V];
+    for (d, (&kd, &qd)) in kn[..dk].iter().zip(qn.iter()).enumerate() {
+        let row = st.add(d * dv + j);
+        for l in 0..V {
+            let x = vaddq_f32(
+                vmulq_n_f32(vld1q_f32(row.add(4 * l)), decay),
+                vmulq_n_f32(dl[l], kd),
+            );
+            vst1q_f32(row.add(4 * l), x);
+            c[l] = vaddq_f32(c[l], vmulq_n_f32(x, qd));
+        }
+    }
+    let out = &mut core[j..j + 4 * V];
+    for l in 0..V {
+        vst1q_f32(out.as_mut_ptr().add(4 * l), c[l]);
     }
 }
 
-// NEON: the scalar loops four lanes wide, the same multiplies and adds in the same order (no fused
-// multiply-add), so every lane rounds as the scalar path does and the step is bit-identical.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn state_rows_neon(
+    st: *mut f32,
+    dk: usize,
+    dv: usize,
+    kn: &[f32],
+    qn: &[f32],
+    decay: f32,
+    beta: f32,
+    v_src: &[f32],
+    core: &mut [f32],
+) {
+    let mut j = 0;
+    while j + 32 <= dv {
+        state_cols_neon::<8>(st, dk, dv, j, kn, qn, decay, beta, v_src, core);
+        j += 32;
+    }
+    while j + 4 <= dv {
+        state_cols_neon::<1>(st, dk, dv, j, kn, qn, decay, beta, v_src, core);
+        j += 4;
+    }
+    while j < dv {
+        state_col(st, dk, dv, j, kn, qn, decay, beta, v_src, core);
+        j += 1;
+    }
+}
+
+// NEON: the squared sum in the scalar's eight lanes and order, so it is bit-identical.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn sum_sq_neon(x: *const f32, n: usize) -> f32 {
@@ -110,53 +248,6 @@ unsafe fn sum_sq_neon(x: *const f32, n: usize) -> f32 {
     let (t0, t1) = (acc[0] + acc[1], acc[2] + acc[3]);
     let (t2, t3) = (acc[4] + acc[5], acc[6] + acc[7]);
     (t0 + t1) + (t2 + t3)
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn recall_neon(row: &[f32], kv: &mut [f32], decay: f32, kd: f32) {
-    use std::arch::aarch64::*;
-    let n = row.len().min(kv.len());
-    let (src, acc) = (row.as_ptr(), kv.as_mut_ptr());
-    let (dec, k) = (vdupq_n_f32(decay), vdupq_n_f32(kd));
-    let mut j = 0;
-    while j + 4 <= n {
-        let s = vld1q_f32(src.add(j));
-        let a = vld1q_f32(acc.add(j));
-        vst1q_f32(acc.add(j), vaddq_f32(a, vmulq_f32(vmulq_f32(s, dec), k)));
-        j += 4;
-    }
-    recall(&row[j..n], &mut kv[j..n], decay, kd);
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn update_neon(
-    row: &mut [f32],
-    delta: &[f32],
-    core: &mut [f32],
-    decay: f32,
-    kd: f32,
-    qd: f32,
-) {
-    use std::arch::aarch64::*;
-    let n = row.len().min(delta.len()).min(core.len());
-    let (st, dl, acc) = (row.as_mut_ptr(), delta.as_ptr(), core.as_mut_ptr());
-    let (dec, k, q) = (vdupq_n_f32(decay), vdupq_n_f32(kd), vdupq_n_f32(qd));
-    let mut j = 0;
-    while j + 4 <= n {
-        let x = vaddq_f32(
-            vmulq_f32(vld1q_f32(st.add(j)), dec),
-            vmulq_f32(k, vld1q_f32(dl.add(j))),
-        );
-        vst1q_f32(st.add(j), x);
-        vst1q_f32(
-            acc.add(j),
-            vaddq_f32(vld1q_f32(acc.add(j)), vmulq_f32(x, q)),
-        );
-        j += 4;
-    }
-    update(&mut row[j..n], &delta[j..n], &mut core[j..n], decay, kd, qd);
 }
 
 #[derive(Clone, Copy)]
@@ -218,8 +309,8 @@ unsafe fn conv_range(p: Tensors, s: Shape, node: usize, c0: usize, c1: usize) {
 }
 
 macro_rules! def_head_step {
-    ($name:ident, $sum_sq:ident, $recall:ident, $update:ident) => {
-        #[inline(always)]
+    ($name:ident, $sum_sq:ident, $state:ident, $inline:meta) => {
+        #[$inline]
         #[allow(clippy::needless_range_loop)]
         unsafe fn $name(p: Tensors, s: Shape, node: usize, h: usize) {
             let (dk, dv) = (s.dk, s.dv);
@@ -248,25 +339,7 @@ macro_rules! def_head_step {
 
             let st = p.state.add((node * s.hv + h) * dk * dv);
 
-            let mut kvbuf = [0.0f32; MAX_HEAD_DIM];
-            let kv = &mut kvbuf[..dv];
-            for d in 0..dk {
-                let row = std::slice::from_raw_parts(st.add(d * dv), dv);
-                $recall(row, kv, decay, kn[d]);
-            }
-
-            let mut dbuf = [0.0f32; MAX_HEAD_DIM];
-            let delta = &mut dbuf[..dv];
-            for ((d, vt), m) in delta.iter_mut().zip(v_src.iter()).zip(kv.iter()) {
-                *d = (*vt - *m) * beta;
-            }
-
-            let mut cbuf = [0.0f32; MAX_HEAD_DIM];
-            let core = &mut cbuf[..dv];
-            for d in 0..dk {
-                let row = std::slice::from_raw_parts_mut(st.add(d * dv), dv);
-                $update(row, delta, core, decay, kn[d], qn[d]);
-            }
+            $state!(st, dk, dv, kn, qn, decay, beta, v_src, core);
 
             let rms = 1.0 / ($sum_sq(core.as_ptr(), dv) / dv as f32 + p.eps).sqrt();
             let zh = std::slice::from_raw_parts(p.z.add((node * s.hv + h) * dv), dv);
@@ -280,9 +353,10 @@ macro_rules! def_head_step {
     };
 }
 
-def_head_step!(head_step, sum_sq, recall, update);
+def_head_step!(head_step, sum_sq, state_rows, inline(always));
+// out of line: inlined beside the scalar step in `key_head_task` it measured the scalar tier 2-6% slower
 #[cfg(target_arch = "aarch64")]
-def_head_step!(head_step_neon, sum_sq_neon, recall_neon, update_neon);
+def_head_step!(head_step_neon, sum_sq_neon, state_neon, inline(never));
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
