@@ -483,8 +483,9 @@ def test_only_a_public_peer_is_public(peer: str, public: bool) -> None:
 
 
 def test_a_public_peer_needs_a_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    """a keyless server answers a public peer 403 and closes before it holds a thread; with a key the peer must
-    present it (401), and a private peer needs a key only when one is set"""
+    """a keyless server answers a public peer 403 before it holds a request thread or a slot, and the peer reads
+    that answer even while it is still sending a body; with a key the peer must present it (401), and a private
+    peer needs a key only when one is set"""
     server = _server("ok")
     srv = server._srv
     try:
@@ -494,6 +495,7 @@ def test_a_public_peer_needs_a_key(monkeypatch: pytest.MonkeyPatch) -> None:
         assert code == 403 and headers.get("connection") == "close", (code, headers)
         assert json.loads(data)["error"] == "An API_KEY must be provided"
         assert request(server.url, "POST", "/v1/chat/completions", {"messages": []})[0] == 403
+        assert request(server.url, "POST", "/v1/chat/completions", {"messages": [], "pad": "x" * (1 << 20)})[0] == 403
         srv.api_key = "k"
         assert request(server.url, "GET", "/health")[0] == 401
         assert request(server.url, "GET", "/health", headers={"Authorization": "Bearer k"})[0] == 200

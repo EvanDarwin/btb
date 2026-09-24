@@ -12,6 +12,7 @@ import os
 import queue
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -390,6 +391,24 @@ _KEYLESS_REFUSAL = (
     b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s"
     % (len(_KEY_BODY), _KEY_BODY)
 )
+DRAIN_S = 0.5  # how long a turned-away connection's remaining request is read and discarded before it closes
+_DRAINS = threading.BoundedSemaphore(16)  # turned-away connections draining at once
+
+
+def _drain(request: socket.socket) -> None:
+    """read and discard what a turned-away peer is still sending, until it closes or DRAIN_S is up, then close"""
+    deadline = time.monotonic() + DRAIN_S
+    try:
+        while (left := deadline - time.monotonic()) > 0:
+            request.settimeout(left)
+            if not request.recv(1 << 16):
+                break
+    except OSError:
+        pass
+    finally:
+        with contextlib.suppress(OSError):
+            request.close()
+        _DRAINS.release()
 
 
 class _Reject(Exception):
@@ -429,22 +448,32 @@ class _Server(ThreadingHTTPServer):
     def process_request(self, request: Any, client_address: Any) -> None:
         # a keyless server refuses a public peer (a port forwarded to a private bind) before it holds a thread
         if not self.api_key and _public(str(client_address[0])):
-            with contextlib.suppress(OSError):
-                request.sendall(_KEYLESS_REFUSAL)
-            self.shutdown_request(request)
+            self._turn_away(request, _KEYLESS_REFUSAL)
             return
         # a connection past the cap is answered at once and dropped, so a flood cannot pile up threads while the
         # one model answers one request at a time
         if not self._slots.acquire(blocking=False):
-            with contextlib.suppress(OSError):
-                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
-            self.shutdown_request(request)
+            self._turn_away(
+                request, b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            )
             return
         try:
             super().process_request(request, client_address)
         except BaseException:
             self._slots.release()
             raise
+
+    def _turn_away(self, request: socket.socket, response: bytes) -> None:
+        """answer a connection before it holds a request thread or a slot, and close it so the peer can read the
+        answer: closing over request bytes still arriving resets the connection, and a client mid-body sees a
+        broken pipe instead of the status, so the rest is drained first on a short-lived thread"""
+        with contextlib.suppress(OSError):
+            request.sendall(response)
+            request.shutdown(socket.SHUT_WR)
+        if not _DRAINS.acquire(blocking=False):
+            self.shutdown_request(request)  # draining as many as it takes already: this one closes as it is
+            return
+        threading.Thread(target=_drain, args=(request,), daemon=True, name="turn-away").start()
 
     def process_request_thread(self, request: Any, client_address: Any) -> None:
         try:
