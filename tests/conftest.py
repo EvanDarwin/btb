@@ -31,13 +31,10 @@ def _keep_the_cards_visibility() -> Iterator[None]:
 
 
 def _release_cuda_cache() -> None:
-    """the engine's own vram_trim idiom (synchronize, then empty_cache); torch is imported here, not at the top,
-    because the torch-free cert gate (cert.yml) runs this conftest without it"""
-    try:
-        import torch
-    except ImportError:
-        return
-    if torch.cuda.is_available():
+    """the engine's own vram_trim idiom (synchronize, then empty_cache), when a test has loaded torch at all - the
+    torch-free cert gate (cert.yml) runs this conftest without it"""
+    torch = sys.modules.get("torch")
+    if torch is not None and torch.cuda.is_available():
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
@@ -51,10 +48,9 @@ def _release_allocator_caches() -> Iterator[None]:
     yield
     gc.collect()
     _release_cuda_cache()
-    if btb.mlx_available():
-        from btb import mlx as mlxdev
-
-        mlxdev.mx().clear_cache()
+    mx = sys.modules.get("mlx.core")  # only a test that loaded MLX has an MLX cache to return
+    if mx is not None:
+        mx.clear_cache()
 
 
 def pytest_configure(config: Config) -> None:
