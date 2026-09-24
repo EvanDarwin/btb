@@ -1,7 +1,7 @@
 """P5, the derived correctness oracle: a banked greedy and a banked seeded-sampled continuation per served family
 that a cert cell's decode must reproduce. Determinism (test_cert_runner) proves a path runs the same twice; it does
-NOT prove the answer is right - a deterministically-wrong path passes it. The oracle closes that: the reference is the engine's own greedy
-decode of the tiny fixture, banked per `core.served_kinds()` + `spec.FIXTURE_STEM` (derived from core, never a
+NOT prove the answer is right - a deterministically-wrong path passes it. The oracle closes that: the reference is
+the engine's own decode of the tiny fixture, banked per `core.served_kinds()` + `spec.FIXTURE_STEM` (derived from core, never a
 hand list like test_receipts' run_* mirror), content-hashed against the fixture so a fixture change invalidates a
 stale bank, and regenerated deterministically so a fresh bank is byte-identical to the committed one.
 
@@ -32,10 +32,9 @@ import hashlib
 import json
 import os
 import sys
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, TypedDict, cast
 
 from btb.kinds import FamilyKind, Json
-from btb.sampling import Sampling
 
 from . import core, spec
 
@@ -45,6 +44,7 @@ if TYPE_CHECKING:
     from torch import Tensor
 
     from btb.engine.model import StreamedTextModel
+    from btb.sampling import Sampling
 
     CellOutput = Sequence[int] | Tensor  # what a runner cell hands us: the decoded tokens, or a logits row
 
@@ -54,8 +54,26 @@ REFERENCE_DEVICE = "cpu"  # the always-present tier and the native gemv path mak
 # this bank holds what that decode must produce, so the two cannot drift into comparing different runs.
 N = 6
 PROMPT: list[int] = [1, 2, 3, 4]
+
+
 # the one sampled decode, likewise shared: the runner's sampled cells use it and the bank holds its continuation
-SAMPLING = Sampling(temperature=0.8, top_p=0.95, top_k=40, seed=20260919)
+# (btb.sampling imports torch, so the Sampling is built on use: this module stays importable by the torch-free gate)
+class SampledParams(TypedDict):
+    temperature: float
+    top_p: float
+    top_k: int
+    seed: int
+
+
+SAMPLED: SampledParams = {"temperature": 0.8, "top_p": 0.95, "top_k": 40, "seed": 20260919}
+
+
+def sampling(key: str) -> Sampling | None:
+    """the decode a banked key stands for: the SAMPLED draw for "sampled", None (greedy) for "tokens\""""
+    from btb.sampling import Sampling
+
+    return Sampling(**SAMPLED) if key == "sampled" else None
+
 
 # the reference inputs: "standard" is the runner's prompt, "single" the boundary case (a one-token prefill, gap
 # #30). A zero-length prompt is out of scope: see NOTES.
@@ -130,7 +148,7 @@ def reference_tokens(
 
 
 # the banked decodes, by their key in a family's entry: greedy under "tokens", the seeded draw under "sampled"
-DECODES: dict[str, Sampling | None] = {"tokens": None, "sampled": SAMPLING}
+DECODES: tuple[str, ...] = ("tokens", "sampled")
 
 
 def bank(kinds: list[FamilyKind] | None = None, device: str = REFERENCE_DEVICE) -> Json:
@@ -140,20 +158,15 @@ def bank(kinds: list[FamilyKind] | None = None, device: str = REFERENCE_DEVICE) 
     families: Json = {}
     for kind in kinds if kinds is not None else banked_kinds():
         fam: Json = {"fixture": spec.FIXTURE_STEM[kind], "fixture_hash": fixture_hash(fixture_dir(kind))}
-        for key, sampling in DECODES.items():
-            fam[key] = {name: reference_tokens(kind, ids, device, sampling) for name, ids in PROMPTS.items()}
+        for key in DECODES:
+            fam[key] = {name: reference_tokens(kind, ids, device, sampling(key)) for name, ids in PROMPTS.items()}
         families[kind.value] = fam
     return {
         "schema": SCHEMA,
         "reference_device": device,
         "decode": {
             "n": N,
-            "sampled": {
-                "temperature": SAMPLING.temperature,
-                "top_p": SAMPLING.top_p,
-                "top_k": SAMPLING.top_k,
-                "seed": SAMPLING.seed,
-            },
+            "sampled": dict(SAMPLED),
         },
         "prompts": PROMPTS,
         "notes": NOTES,
@@ -201,7 +214,7 @@ def assert_matches(
     kind: FamilyKind, output: CellOutput, device: str, *, prompt: str = "standard", sampled: bool = False
 ) -> None:
     """the correctness gate a runner cell calls: the cell's output must equal the banked reference for
-    `(kind, prompt)` - the greedy one, or with `sampled` the SAMPLING draw. Tokens are matched exactly; a logits
+    `(kind, prompt)` - the greedy one, or with `sampled` the SAMPLED draw. Tokens are matched exactly; a logits
     row is matched on its greedy next token. `device` is reported on a mismatch - the reference is
     device-independent, so a cross-device flip is a real discrepancy, surfaced here rather than hidden by a
     tolerance. A family with no banked reference fails (a COVERED cell with no oracle is not covered)."""
@@ -280,12 +293,13 @@ def validate(device: str, fp32: bool = False) -> list[str]:
             problems.append(f"{kind.value} on {device}: engine error at load ({type(e).__name__}: {e})")
             continue
         try:
-            for key, sampling in DECODES.items():
-                if sampling is not None and not holds_sampled(sm):
+            for key in DECODES:
+                draw = sampling(key)
+                if draw is not None and not holds_sampled(sm):
                     continue
                 for name, ids in PROMPTS.items():
                     try:
-                        got = decode(sm, ids, sampling)
+                        got = decode(sm, ids, draw)
                     except Exception as e:
                         problems.append(
                             f"{kind.value}/{key}/{name} on {device}: engine error ({type(e).__name__}: {e})"

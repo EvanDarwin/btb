@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from btb.engine.model import StreamedTextModel
 
 from . import core, manifest, oracle, receipt, spec
-from .oracle import PROMPT, SAMPLING, N  # the decodes the oracle banks; the cells must not drift from them
+from .oracle import PROMPT, N  # the decodes the oracle banks; the cells must not drift from them
 
 
 def _hardware_here(hw: spec.Hardware) -> bool:
@@ -113,7 +113,7 @@ def test_cell_loads_and_is_deterministic(
     held: list[int] | None = None  # the greedy decode a bf16 sampled cell holds to the oracle instead of its draw
     for i in range(2):  # two independent loads: catches load nondeterminism too, not just decode
         with loaded_model(path, **dev.knobs) as sm:
-            runs.append(oracle.decode(sm, PROMPT, SAMPLING if sampled else None))
+            runs.append(oracle.decode(sm, PROMPT, oracle.sampling("sampled" if sampled else "tokens")))
             if i == 0:
                 _assert_path_engaged(sm, kind, storage, dev, decode, stem)
                 if sampled and not oracle.holds_sampled(sm):
