@@ -177,13 +177,7 @@ OPS: tuple[Op, ...] = (
         "kernels/test_gguf.py",
         funcs=("repack_lattice", "matvec_lattice", "dequant_lattice"),
     ),
-    Op(
-        "kv",
-        "kv",
-        ("btb_kv_store",),
-        None,
-        note="no MLX parity test; kv_store/kv_gather run only through the engine cache/drafter",
-    ),
+    Op("kv", "kv", ("btb_kv_store",), "kernels/test_kv.py"),
     Op("mega", "mega", ("btb_mega_*_*_*_*",), "kernels/test_mega.py"),
     Op("sample", "sample", ("btb_sample_pick", "btb_sample_verify"), "kernels/test_sampling.py"),
     Op(
