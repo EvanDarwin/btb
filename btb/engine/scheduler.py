@@ -530,8 +530,8 @@ class BatchScheduler:
         self.batch, self.reserve = batch, target_len
         dv = getattr(self.sm, "device", None)
         if dv is not None and mb is not None:
-            # the epoch's KV is spoken for from here to `release()`: the memory policy must not read it as
-            # free and shed a layer to make room the batch is about to take anyway
+            # the epoch's KV is spoken for from here to `release()`, ahead of the cache allocating it: the
+            # memory policies must not read that room as free and grow a shed layer back into it
             dv.reserve("epoch", self.kv_row_bytes(target_len) * batch)
         return batch, target_len
 

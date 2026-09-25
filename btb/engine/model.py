@@ -337,10 +337,11 @@ class StreamedTextModel(
             self.ram_reserve = int((host_budget if host_budget is not None else BatchScheduler.measure_host()).reserve)
         if self.dev.type == DeviceKind.CUDA:
             total_vram = torch.cuda.get_device_properties(self.dev).total_memory
-            self.vram_margin = (
-                int(float(vram_reserve_gb) * 2**30)
-                if vram_reserve_gb is not None
-                else max(1 << 29, total_vram * 8 // 100)
+            # the margin the load's plan left free (`vram_margin_gb`), so the engine does not read itself as
+            # short of the card the moment it is up
+            self.vram_margin = int(
+                (float(vram_reserve_gb) if vram_reserve_gb is not None else BatchScheduler.vram_margin_gb(total_vram))
+                * 2**30
             )
         else:
             self.vram_margin = 0
