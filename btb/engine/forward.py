@@ -204,6 +204,7 @@ class _ForwardMixin(_State):
         self.vram_policy(cache)
         self.ram_policy()
         self.lend_policy()
+        self.cache_room(cache, B, T)
         own = bool(self.fam.own)
         n_layers = self.L if stop_after is None else min(self.L, int(stop_after))
         # the placement tiers this pass runs layers on, and its stored-weight path, recorded whatever branch

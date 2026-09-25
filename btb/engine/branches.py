@@ -9,7 +9,7 @@ import copy
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Self, overload
 
 import torch
 
@@ -28,7 +28,7 @@ from .cache import (
     linear_layer,
     mark_forked,
 )
-from .hooks import Hooks, LogitsProcessor, OnPass, OnRowToken
+from .hooks import Hooks, LogitsProcessor, OnPass, OnRowToken, Taps
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -145,9 +145,18 @@ class _Rows:
             raise ValueError(f"this {type(self).__name__} is closed")
         return self.cache
 
-    def step(self, tokens: Tokens | None = None) -> torch.Tensor:
+    @overload
+    def step(self, tokens: Tokens | None = None) -> torch.Tensor: ...
+
+    @overload
+    def step(self, tokens: Tokens | None = None, *, taps: Sequence[int]) -> tuple[torch.Tensor, Taps]: ...
+
+    def step(
+        self, tokens: Tokens | None = None, *, taps: Sequence[int] | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, Taps]:
         """Feed a token to each live row, in `live` order (None: the ones `generate` drew last), and return the
-        next token's logits there, [live, V] float32."""
+        next token's logits there, [live, V] float32; with `taps`, also those layers' states at the fed
+        tokens, {layer: [live, H]} float32."""
         self._check()
         live = self.live
         if not live:
@@ -162,33 +171,55 @@ class _Rows:
             toks = [int(t) for t in tokens]
         if len(toks) != len(live):
             raise ValueError(f"{len(toks)} tokens for {len(live)} live rows")
-        out = self.eng._serial(self._advance, toks)
+        want = tuple(int(i) % self.eng.L for i in taps) if taps is not None else ()
+        out, hidden = self.eng._serial(self._advance, toks, want)
         if tokens is not None:
             for r, t in zip(live, toks):
                 self.rows[r].append(t)
         self._pend, self._logits = None, out
-        return out
+        return out if taps is None else (out, hidden)
 
-    def _advance(self, toks: list[int]) -> torch.Tensor:
+    def leave(self, r: int) -> None:
+        """Row r out of the batch before its stop token (a candidate done early): the others step on, every row
+        keeping its number. A fork keeps the row for `keep`; a batch writes it back into its session."""
+        self._check()
+        slot = self._slot[int(r)] if 0 <= int(r) < len(self._slot) else None
+        if slot is None:
+            raise ValueError(f"row {r} is not in the batch")
+        self.eng._serial(self._leave, [slot])
+
+    def _advance(self, toks: list[int], taps: Sequence[int] = ()) -> tuple[torch.Tensor, Taps]:
+        """one token into each live row: their logits [live, V] float32, and the `taps` layers' states there"""
         eng, cache = self.eng, self._check()
         eng._tag(PassTag.ROWS_FLAT if self.mode == "rows" else PassTag.ROWS_JOINED)
+        B = len(toks)
+        seen: Taps = {}
+
+        def keep(i: int, h: torch.Tensor) -> None:
+            if i in taps:
+                seen[i] = h.reshape(B, -1, h.shape[-1])[:, -1].float().cpu()
+
+        on_layer = keep if taps else None
         if self.mode == "rows":
             m = mlxdev.mx()
             hm = eng._mlx_embed_rows(m.array(toks, dtype=m.int32))
             if eng.compute_dtype is not None and eng.compute_dtype != torch.bfloat16:
                 hm = hm.astype(m.float32)
             ns = [int(p) for p in self._rows_layers()[0]._ns]
-            lg = eng._forward_mlx(None, None, cache, None, False, True, eng.L, hm=hm, lazy=True, rows=ns)
+            # a tapped pass is evaluated in place, its layers' outputs read with it; else the logits come lazily
+            lg = eng._forward_mlx(None, None, cache, on_layer, False, True, eng.L, hm=hm, lazy=not taps, rows=ns)
+            if isinstance(lg, torch.Tensor):
+                return lg.reshape(B, -1).float().cpu(), seen
             lg = lg.astype(m.float32)
             m.eval(lg)
-            return mlxdev.from_mx(lg).clone()
+            return mlxdev.from_mx(lg).clone(), seen
         ids = torch.tensor(toks, dtype=torch.long).view(-1, 1)
         am = None
         if self._am is not None:
-            am = self._am = torch.cat([self._am, torch.ones((len(toks), 1), dtype=torch.long)], dim=1)
-        out = eng.forward(ids, cache=cache, attention_mask=am)
+            am = self._am = torch.cat([self._am, torch.ones((B, 1), dtype=torch.long)], dim=1)
+        out = eng.forward(ids, cache=cache, attention_mask=am, on_layer=on_layer)
         assert out is not None
-        return out[:, -1].float().cpu()
+        return out[:, -1].float().cpu(), seen
 
     def _rows_layers(self) -> list[GrowLayer]:
         return [cl for cl in self._check().layers if isinstance(cl, GrowLayer)]
@@ -231,7 +262,7 @@ class _Rows:
                     break
                 ts = time.perf_counter()
                 if self._pend is not None:
-                    self._logits = self._advance(self._pend)
+                    self._logits = self._advance(self._pend)[0]
                     self._pend = None
                     steps += 1
                 assert self._logits is not None
@@ -607,7 +638,7 @@ class Batch(_Rows):
 
         def run() -> None:
             if self._pend is not None:
-                self._logits, self._pend = self._advance(self._pend), None
+                self._logits, self._pend = self._advance(self._pend)[0], None
             live = self.live
             for b, r in enumerate(live):
                 self._write(r, self._take(b))

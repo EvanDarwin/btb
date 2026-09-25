@@ -265,6 +265,33 @@ def test_rows_are_copies_of_the_caches_rows(stem: str, device: str) -> None:
             s.rows(sm.layer_types.index(LayerKind.LINEAR))
 
 
+@cells
+@families
+def test_feed_last_only_is_the_last_row(stem: str, device: str) -> None:
+    """a feed that asks for the last logits alone gets the row a whole feed ends with, [1, V], and leaves the
+    session where the whole feed leaves it"""
+    sm = model(stem, device)
+    whole, last = sm.session(PROMPT), sm.session(PROMPT)
+    every = whole.feed(OTHER)
+    one = last.feed(OTHER, last_only=True)
+    assert one.shape == (1, every.shape[-1])
+    close(one[0], every[-1], device)
+    close(last.feed([4])[-1], whole.feed([4])[-1], device)
+
+
+@cells
+@families
+def test_feed_taps_are_the_layers_at_each_fed_position(stem: str, device: str) -> None:
+    """the tapped layers' states at each fed position, [T, H]: what `hidden` computes over the whole sequence"""
+    sm = model(stem, device)
+    s = sm.session(PROMPT)
+    logits, hid = s.feed(OTHER, last_only=True, taps=(1, -1))
+    assert sorted(hid) == [1, sm.L - 1] and logits.shape[0] == 1
+    ref = sm.hidden(PROMPT + OTHER, layers=(1,))[1][len(PROMPT) :]
+    assert hid[1].shape == ref.shape
+    assert (hid[1] - ref).abs().max().item() <= 3e-2 * ref.abs().max().item()
+
+
 def test_a_mark_past_the_end_is_refused() -> None:
     sm = model(STEMS[0], "cpu")
     m = sm.session(PROMPT).mark()
@@ -324,6 +351,40 @@ def test_a_forks_step_is_each_rows_own_pass(stem: str, device: str) -> None:
         close(lg[2], sm.session(PROMPT + [1]).feed([6])[-1], device)
         assert br.rows == [[2, 4], [2, 5], [1, 6]]
     assert s.forked is None and s.tokens == PROMPT
+
+
+@cells
+@families
+def test_a_step_taps_each_rows_fed_token(stem: str, device: str) -> None:
+    """a tapped step's layer states [live, H] are each row's at the token it was fed, as a session fed it has"""
+    sm = model(stem, device)
+    with sm.session(PROMPT).fork(2) as br:
+        lg, hid = br.step([1, 2], taps=(1,))
+        assert hid[1].shape[0] == 2 and lg.shape[0] == 2
+        for r, t in enumerate((1, 2)):
+            _, want = sm.session(PROMPT).feed([t], taps=(1,))
+            assert (hid[1][r] - want[1][-1]).abs().max().item() <= 3e-2 * want[1].abs().max().item()
+
+
+@cells
+@families
+def test_a_row_left_early_keeps_the_numbering(stem: str, device: str) -> None:
+    """a row taken out mid-decode leaves the others stepping under the numbers they had; kept, it is the
+    session it would have been"""
+    sm = model(stem, device)
+    s = sm.session(PROMPT)
+    with s.fork(3) as br:
+        br.step([1, 2, 3])
+        br.leave(1)
+        assert br.live == [0, 2]
+        lg = br.step([4, 6])
+        close(lg[1], sm.session(PROMPT + [3]).feed([6])[-1], device)
+        assert br.rows == [[1, 4], [2], [3, 6]]
+        with pytest.raises(ValueError, match="not in the batch"):
+            br.leave(1)
+        br.keep(1)
+    assert s.tokens == PROMPT + [2]
+    close(s.feed([7])[-1], sm.session(PROMPT + [2]).feed([7])[-1], device)
 
 
 @cells

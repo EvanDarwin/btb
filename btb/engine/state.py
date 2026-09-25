@@ -602,6 +602,9 @@ class _State:
     def lend_policy(self) -> None:
         raise NotImplementedError
 
+    def cache_room(self, cache: KvCache | None, B: int, T: int) -> None:
+        raise NotImplementedError
+
     def room(self, nbytes: int, device: DeviceSpec | None = None, name: str = "room") -> Room:
         raise NotImplementedError
 

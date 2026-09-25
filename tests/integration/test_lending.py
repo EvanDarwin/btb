@@ -9,14 +9,18 @@ import gc
 import time
 import weakref
 from collections.abc import Callable, Iterator
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
 
 from btb.engine import StreamedTextModel
-from btb.engine.cache import ForkLayer
+from btb.engine.cache import ForkLayer, GrowLayer
 from btb.engine.scheduler import MemoryGrantError
 from tests.helpers import fixture, loaded_model, need_cuda, need_mlx
+
+if TYPE_CHECKING:
+    from btb.engine.cache import KvCache
 
 PROMPT = [5, 17, 99, 3, 42, 8, 61, 7, 12, 30]
 MiB = 2**20
@@ -86,6 +90,59 @@ def test_a_refusal_names_the_request_and_leaves_the_model_answering(sm: Streamed
     with pytest.raises(MemoryGrantError, match="room 'workspace'"):
         sm.room(64 * MiB, name="workspace")
     assert list(sm.generate(PROMPT, 6, eos=(), speculate=False).tokens) == ref
+
+
+def _cache_bytes(cache: KvCache | None) -> int:
+    """what a cache's grown buffers hold, k and v (and an int8 layer's scales)"""
+    assert cache is not None
+    n = 0
+    for cl in cache.layers:
+        if isinstance(cl, GrowLayer) and cl._buf is not None:
+            n += sum(int(t.nbytes) for t in cl._buf)
+        elif isinstance(cl, GrowLayer) and cl._mx is not None and cl.arena is None:
+            n += sum(int(x.nbytes) for x in cl._mx)
+    return n
+
+
+def test_a_cache_growth_is_priced_before_the_pass(sm: StreamedTextModel, monkeypatch: pytest.MonkeyPatch) -> None:
+    """the room a pass's cache growth needs is asked for before the pass, as the bytes its buffers then hold; a
+    pass the buffers already fit asks for nothing"""
+    asked: list[int] = []
+    make = sm._make_room
+
+    def record(dev: torch.device, nbytes: int, what: str, unreserved: bool = True) -> set[str]:
+        asked.append(nbytes)
+        return make(dev, nbytes, what, unreserved)
+
+    monkeypatch.setattr(sm, "_make_room", record)
+    s = sm.session(PROMPT)
+    assert sum(asked) == _cache_bytes(s.cache)
+    before = len(asked)
+    s.feed([1, 2])
+    assert len(asked) == before
+
+
+def test_a_cache_growth_makes_room_instead_of_refusing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """a prefill whose cache growth finds no room: the grant alone refuses it (what the room a policy took left);
+    asked for before the pass, btb gives up what it holds and the prefill runs as it would have"""
+    with loaded_model(fixture("tiny_qwen3"), device="cpu") as sm:
+        ref = sm.session(PROMPT).logits
+        assert ref is not None
+        keep = sm.ram_reserve
+        squeeze(sm, 0)
+        with monkeypatch.context() as mp:
+            mp.setattr(sm, "cache_room", lambda cache, B, T: None)
+            with pytest.raises(MemoryGrantError, match="only"):
+                sm.session(PROMPT)
+
+        def give(dev: torch.device, short: int, tried: set[str]) -> bool:
+            # a shed's freed room, stood in for: the tiny fixture's layers are too small to free a cache's worth
+            sm.ram_reserve = keep
+            return True
+
+        monkeypatch.setattr(sm, "_give_up_one", give)
+        got = sm.session(PROMPT).logits
+        assert got is not None and torch.equal(got, ref)
 
 
 def test_memory_names_each_device_btb_runs_on(sm: StreamedTextModel) -> None:

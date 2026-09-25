@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, TypedDict, Unpack
+from typing import TYPE_CHECKING, TypedDict, Unpack, overload
 
 from .kinds import LayerKind, Tokens
 
@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from .engine.branches import Branches, _Rows
     from .engine.cache import KvCache, LinearStates
     from .engine.drafter import MTPDrafter
+    from .engine.hooks import Taps
     from .engine.model import StreamedTextModel
     from .engine.state import _State
     from .engine.text import GenerateArgs, RowGeneration
@@ -58,6 +59,13 @@ def crop(cache: KvCache, engine: _State, n: int) -> None:
             cl.cumulative_length = int(cl.keys.shape[-2])
         if isinstance(cl, DynamicIndexedLayer) and cl.indexer_keys is not None and cl.indexer_keys.numel():
             cl.indexer_keys = cl.indexer_keys[:, :n]
+
+
+def _cat(hs: list[torch.Tensor]) -> torch.Tensor:
+    """a layer's states over a pass that reached it in pieces, joined along the positions"""
+    import torch
+
+    return torch.cat(hs, dim=0)
 
 
 class Session:
@@ -107,23 +115,49 @@ class Session:
         if self.cache is not None and getattr(eng, "mlx", None) is not None:
             eng._mlx_flush_states(self.cache)
 
-    def feed(self, ids: Tokens) -> torch.Tensor:
+    @overload
+    def feed(self, ids: Tokens, last_only: bool = False) -> torch.Tensor: ...
+
+    @overload
+    def feed(self, ids: Tokens, last_only: bool = False, *, taps: Sequence[int]) -> tuple[torch.Tensor, Taps]: ...
+
+    def feed(
+        self, ids: Tokens, last_only: bool = False, *, taps: Sequence[int] | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, Taps]:
         """Append `ids` to the sequence and return the logits after each of them, [T, V] in float32 - the
-        building block of a loop of your own: feed a draft, read its logits, `rewind` what you reject."""
+        building block of a loop of your own: feed a draft, read its logits, `rewind` what you reject.
+        `last_only`: the last one's alone, [1, V], and the head run on that row alone (a long prelude's [T, V]
+        is gigabytes). `taps`: also those layers' states at each fed position, {layer: [T, H]} float32."""
         eng = self._bound()
         new = [int(t) for t in ids]
         if not new:
             raise ValueError("feed needs at least one token")
         lead = 0 if self.pending is None else 1
-        return eng._serial(lambda: self._append(eng, new)[lead:])
+        want = tuple(int(i) % eng.L for i in taps) if taps is not None else ()
 
-    def _append(self, eng: StreamedTextModel, new: list[int]) -> torch.Tensor:
-        """the pending token and `new` into the cache: the logits after each, [T, V] float32 (on the decode's
-        thread, under its lock)"""
+        def run() -> tuple[torch.Tensor, Taps]:
+            out, hidden = self._append(eng, new, last_only, want)
+            return (out if last_only else out[lead:]), {i: h[lead:] for i, h in hidden.items()}
+
+        logits, hidden = eng._serial(run)
+        return logits if taps is None else (logits, hidden)
+
+    def _append(
+        self, eng: StreamedTextModel, new: list[int], last_only: bool = False, taps: Sequence[int] = ()
+    ) -> tuple[torch.Tensor, Taps]:
+        """the pending token and `new` into the cache: the logits after each, [T, V] float32 (the last one's,
+        [1, V], with `last_only`), and the `taps` layers' states at each, {layer: [T, H]} (on the decode's thread,
+        under its lock)"""
         new = [self.pending, *new] if self.pending is not None else new
         if self.cache is None:
             self.cache = eng.new_cache()
-        logits = eng.forward([new], cache=self.cache, last_only=False)
+        seen: dict[int, list[torch.Tensor]] = {i: [] for i in taps}
+
+        def keep(i: int, h: torch.Tensor) -> None:
+            if i in seen:
+                seen[i].append(h[0].float().cpu())
+
+        logits = eng.forward([new], cache=self.cache, last_only=last_only, on_layer=keep if taps else None)
         assert logits is not None
         out = logits[0].float().cpu()
         self.ids.extend(new)
@@ -131,7 +165,7 @@ class Session:
         self.pending, self.logits = None, out[-1].clone()
         # the drafter's rows no longer follow the cache
         self.dr, self.dr_len, self.pend_h = None, 0, None
-        return out
+        return out, {i: hs[0] if len(hs) == 1 else _cat(hs) for i, hs in seen.items()}
 
     def _settle(self, eng: StreamedTextModel) -> None:
         """every token in the cache and the next token's logits in hand (what a fork starts from)"""
@@ -144,7 +178,7 @@ class Session:
             crop(self.cache, eng, len(self.ids) - 1)
             self.pending = self.ids.pop()
         if self.pending is not None:
-            self._append(eng, [])
+            self._append(eng, [], last_only=True)
 
     def mark(self) -> Mark:
         """this point of the sequence, to `rewind` to later"""
@@ -239,7 +273,7 @@ class Session:
             if cache is not None:
                 del self.ids[reuse:]
                 self.anchor = [a for a in self.anchor if a["n"] <= reuse]
-            return self._append(eng, ids[reuse:])[-1]
+            return self._append(eng, ids[reuse:], last_only=True)[0][-1]
 
         return eng._serial(run)
 

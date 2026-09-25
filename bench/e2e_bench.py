@@ -127,6 +127,41 @@ def test_session_feed_rewind(benchmark: object, model: str, device: str, knobs: 
 @pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
 @pytest.mark.parametrize("model", FAMILIES)
 @pytest.mark.parametrize("device,knobs", DEVICES, ids=[d for d, _ in DEVICES])
+def test_session_feed_tapped(benchmark: object, model: str, device: str, knobs: dict[str, str]) -> None:
+    with _api(benchmark, model, device, knobs, "feed-tapped") as sm:
+        s = sm.session(list(PROMPT))
+        mark = s.mark()
+
+        def once() -> object:
+            out = s.feed(list(range(5, 5 + N)), last_only=True, taps=(-1,))
+            s.rewind(mark)
+            return out
+
+        once()
+        benchmark(once)  # type: ignore[operator]
+
+
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("model", FAMILIES)
+@pytest.mark.parametrize("device,knobs", DEVICES, ids=[d for d, _ in DEVICES])
+def test_fork_step_leave(benchmark: object, model: str, device: str, knobs: dict[str, str]) -> None:
+    with _api(benchmark, model, device, knobs, "fork-step") as sm:
+        s = sm.session(list(PROMPT))
+
+        def once() -> object:
+            with s.fork(4) as br:
+                br.step([1, 2, 3, 4])
+                br.step([5, 6, 7, 8], taps=(-1,))
+                br.leave(1)
+                return br.step([9, 10, 11])
+
+        once()
+        benchmark(once)  # type: ignore[operator]
+
+
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("model", FAMILIES)
+@pytest.mark.parametrize("device,knobs", DEVICES, ids=[d for d, _ in DEVICES])
 def test_fork_generate(benchmark: object, model: str, device: str, knobs: dict[str, str]) -> None:
     with _api(benchmark, model, device, knobs, "fork4") as sm:
         s = sm.session(list(PROMPT))

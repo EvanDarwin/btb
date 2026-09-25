@@ -27,6 +27,7 @@ from ..sysinfo import (
     vram_pressure,
     vram_pressure_line,
 )
+from .cache import GrowLayer
 from .device import DeviceSpec, torch_device
 from .scheduler import MemoryGrantError
 from .state import _State
@@ -498,18 +499,55 @@ class _MemoryMixin(_State):
             f"(model.memory() shows the room)"
         )
 
-    def _make_room(self, dev: torch.device, nbytes: int, what: str) -> set[str]:
-        """room for `nbytes` on `dev` above the margin and what is spoken for, cheapest first; MemoryGrantError
-        when everything btb can give leaves too little. Nothing to make where btb holds nothing (a card it does
-        not run on). Returns the one-off steps taken, for a retry to skip"""
+    def _make_room(self, dev: torch.device, nbytes: int, what: str, unreserved: bool = True) -> set[str]:
+        """room for `nbytes` on `dev` above the margin and (`unreserved`) what is spoken for, cheapest first;
+        MemoryGrantError when everything btb can give leaves too little. Nothing to make where btb holds nothing
+        (a card it does not run on). Returns the one-off steps taken, for a retry to skip"""
         tried: set[str] = set()
         while True:
-            room = self.device.free(dev, unreserved=True)
+            room = self.device.free(dev, unreserved=unreserved)
             if room is None or room >= nbytes:
                 return tried
             if not self._give_up_one(dev, nbytes - room, tried):
                 self.device.returned = True  # refused: what was shed on the way grows back once there is room
                 raise MemoryGrantError(self._short(dev, nbytes, what))
+
+    def cache_room(self, cache: KvCache | None, B: int, T: int) -> None:
+        """Room made, before a pass, for the buffers its cache appends will allocate. The scheduler's grant is
+        asked for them inside the pass, where nothing may move, so a refusal there could only fail; here btb gives
+        up what it holds, cheapest first, as `empty` does. Priced as the grant prices them."""
+        if cache is None:
+            return
+        first = next(((i, cl) for i, cl in enumerate(cache.layers) if isinstance(cl, GrowLayer)), None)
+        if first is None:
+            return
+        c = self.cfg
+        hq = int(c.num_attention_heads)
+        Hk = int(getattr(c, "num_key_value_heads", None) or hq)
+        d = int(getattr(c, "head_dim", None) or c.hidden_size // hq)
+        dev0, dt0 = self._kv_home(*first)
+        if not first[1].growth(B, T, Hk, d, dt0, dev0.type == Device.CPU):
+            return  # the layers grow together: the first one fitting is the pass needing nothing
+        need: dict[torch.device, int] = {}
+        for i, cl in enumerate(cache.layers):
+            if not isinstance(cl, GrowLayer):
+                continue
+            dev, dt = self._kv_home(i, cl)
+            need[dev] = need.get(dev, 0) + cl.growth(B, T, Hk, d, dt, dev.type == Device.CPU)
+        for dev, nbytes in need.items():
+            if nbytes:
+                self._make_room(dev, nbytes, f"the cache's growth for {B}x{T} rows", unreserved=False)
+
+    def _kv_home(self, i: int, cl: GrowLayer) -> tuple[torch.device, torch.dtype]:
+        """where layer i's cache rows live and in what dtype: its buffer's, or where the layer runs"""
+        if cl._buf is not None:
+            return cl._buf[0].device, cl._buf[0].dtype
+        cdt = self.compute_dtype if self.compute_dtype is not None else torch.bfloat16
+        if cl.shared or getattr(self, "mlx", None) is not None:
+            return torch.device("cpu"), cdt
+        if i in self.resident:
+            return (torch.device("cpu") if getattr(self, "kv_host", False) else self.dev), cdt
+        return torch.device("cpu"), torch.float32  # a host layer runs in float32 on the CPU
 
     def _give_up_one(self, dev: torch.device, short: int, tried: set[str]) -> bool:
         """the cheapest thing btb holds on `dev`, given up toward `short` bytes: on a card the drafter, then layers

@@ -549,6 +549,54 @@ class GrowLayer(_DynamicLayer):
         the bare ceiling would refuse the top of every long run. 0 where no ceiling is known (no check)."""
         return self.bound + max(4096, self.bound // 8) if self.bound else 0
 
+    def _mx_cap(self, need: int, have: int) -> int:
+        """the rows a new shared buffer holds for `need` rows, `have` the rows of the one it replaces"""
+        if have >= need:
+            return have
+        if self.cap_hint:
+            # the caller knows how far these rows run (prompt + max_new): reserved once, no regrowth
+            return max(need, self.cap_hint)
+        return max(need, have + max(4096, have // 8), 4096)
+
+    def _torch_cap(self, need: int, have: int, host: bool) -> int:
+        """the rows a new torch buffer holds for `need` rows, `have` the rows of the one it replaces"""
+        if self.cap_hint:
+            # the caller knows how far this sequence runs (prompt + max_new): reserve exactly that once, so a
+            # short decode does not take the 4096-position floor times the batch and OOM
+            return max(need, self.cap_hint)
+        if have >= need:
+            # only the placement changed - the batch, the dtype or the device (a layer shed to the host and
+            # regrown, its rows cast on each move): the rows keep their capacity and the buffer is re-cut at the
+            # same size where they now live. Growing an eighth on every move compounded a 0.6B model's cache to
+            # gigabytes over one answer
+            return have
+        cap = max(need, have + max(4096, have // 8), 4096)
+        return max(cap, self.reserve + 1024) if host and self.reserve else cap
+
+    def growth(self, B: int, T: int, Hk: int, d: int, dtype: torch.dtype, host: bool) -> int:
+        """The bytes the next append of T rows to B sequences allocates: a new buffer where they do not fit the
+        layer's own, 0 where they do. `host`: the rows land in the host's memory. A fork's or a batch's layer
+        grows its step buffer by its own and reads 0."""
+        if self._ns is not None or self._flat:
+            return 0
+        need = self.get_seq_length() + T if self.is_initialized else T
+        if self.shared:
+            same = self._mx is not None and self._shape[1] == Hk and self._shape[-1] == d
+            have = int(self._shape[2]) if same else 0
+            if same and self._shape[0] >= B and have >= need:
+                return 0
+            if self.arena is not None and B == 1 and not self.bits and need <= self.arena[3]:
+                return 0
+            Bc = max(B, int(self._shape[0]) if same else 0)
+            row = d * (1 if self.bits else dtype.itemsize) + (4 if self.bits else 0)
+            return 2 * Bc * Hk * self._mx_cap(need, have) * row
+        buf = self._buf
+        if buf is not None and tuple(buf[0].shape[:2]) == (B, Hk) and buf[0].shape[-1] == d:
+            if buf[0].shape[-2] >= need:
+                return 0
+        have = int(buf[0].shape[-2]) if buf is not None else 0
+        return 2 * B * Hk * self._torch_cap(need, have, host) * d * dtype.itemsize
+
     def _ensure(self, B: int, Hk: int, need: int, d: int, dtype: torch.dtype) -> None:
         m = mlxdev.mx()
         mdt = m.int8 if self.bits else mlxdev._dtypes()[dtype]
@@ -561,13 +609,7 @@ class GrowLayer(_DynamicLayer):
         # rows grow by the usual step; a batch change alone keeps the row capacity (the drafter's tree steps
         # switch batch sizes several times a pass: growing the rows on each switch ran away to gigabytes)
         have = self._shape[2] if same else 0
-        if same and have >= need:
-            cap = have
-        elif self.cap_hint:
-            # the caller knows how far these rows run (prompt + max_new): reserved once, no regrowth
-            cap = max(need, self.cap_hint)
-        else:
-            cap = max(need, have + max(4096, have // 8), 4096)
+        cap = self._mx_cap(need, have)
         Bc = max(B, self._shape[0] if same else 0)
         if self.arena is not None and (Bc != 1 or self.bits or need > self.arena[3]):
             # past the arena: a buffer of the layer's own, the rows copied below; the pass leaves the megakernel
@@ -777,20 +819,7 @@ class GrowLayer(_DynamicLayer):
             self._set_rows(self._buf[0][..., :n, :], self._buf[1][..., :n, :])
         if not fits:
             have = self._buf[0].shape[-2] if self._buf is not None else 0
-            if self.cap_hint:
-                # the caller knows how far this sequence runs (prompt + max_new): reserve exactly that once,
-                # so a short decode does not take the 4096-position floor times the batch and OOM
-                cap = max(n + T, self.cap_hint)
-            elif have >= n + T:
-                # only the placement changed - the batch, the dtype or the device (a layer shed to the host and
-                # regrown, its rows cast on each move): the rows keep their capacity and the buffer is re-cut
-                # at the same size where they now live. Growing an eighth on every move compounded a 0.6B
-                # model's cache to gigabytes over one answer
-                cap = have
-            else:
-                cap = max(n + T, have + max(4096, have // 8), 4096)
-                if key_states.device.type == "cpu" and self.reserve:
-                    cap = max(cap, self.reserve + 1024)
+            cap = self._torch_cap(n + T, have, key_states.device.type == "cpu")
             if self.grant is not None:
                 self.grant(
                     2 * B * Hk * cap * d * key_states.element_size(),
