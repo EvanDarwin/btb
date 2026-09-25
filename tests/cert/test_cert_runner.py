@@ -152,9 +152,9 @@ def test_cell_loads_and_is_deterministic(
     assert_same_tokens(runs[0], runs[1], f"{stem} on {dev.key}/{decode.value} decoded differently across two loads")
     # correctness, not just determinism: a deterministically-WRONG path fails against the banked reference
     if held is not None:
-        oracle.assert_matches(kind, held, dev.hardware.value)
+        oracle.assert_matches(kind, held, dev.hardware.value, storage=storage)
     else:
-        oracle.assert_matches(kind, runs[0], dev.hardware.value, sampled=sampled)
+        oracle.assert_matches(kind, runs[0], dev.hardware.value, sampled=sampled, storage=storage)
     receipt.record(manifest.safetensors_id(kind, dev.key, decode, storage))  # ran+passed here (cross-machine union)
 
 

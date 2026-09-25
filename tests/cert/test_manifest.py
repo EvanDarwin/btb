@@ -36,9 +36,6 @@ EXPECTED_GAPS: dict[manifest.Missing, list[str]] = {
     manifest.Missing.SPEC_MTP_HEAD: ["tiny_gemma3", "tiny_gpt_oss", "tiny_phi3", "tiny_qwen3"],
     manifest.Missing.GGUF_MTP_HEAD: ["tiny_q35"],
     manifest.Missing.SPEC_OWN_LAYER: ["tiny_q4"],
-    manifest.Missing.FP8_FIXTURE: [
-        "tiny_gemma3", "tiny_gpt_oss", "tiny_phi3", "tiny_q35", "tiny_q4", "tiny_qwen3",
-    ],
     manifest.Missing.QUANT_FIXTURE: ["tiny_phi3"],
     manifest.Missing.NO_FIXTURE: ["tiny_phi3"],
 }  # fmt: skip

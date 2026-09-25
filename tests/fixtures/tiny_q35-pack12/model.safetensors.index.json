@@ -1,6 +1,6 @@
 {
   "metadata": {
-    "total_size": 2240348
+    "total_size": 2240284
   },
   "weight_map": {
     "model.layers.0.input_layernorm.weight.pack12": "pack12-00000.safetensors",

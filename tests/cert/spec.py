@@ -260,6 +260,10 @@ def fixture_paths(kind: FamilyKind, storage: Storage) -> tuple[str, ...]:
         path = twin_path(stem, storage)
         if storage is Storage.SAFE_BF16:
             return (path,)
+        if storage is Storage.SAFE_FP8:
+            # an FP8 checkpoint is mixed by design: its matrices e4m3, its norms, embeddings and head bf16, its
+            # scales f32; it binds by carrying e4m3 at all
+            return (path,) if info.fp in header_dtypes(path) else ()
         return (path,) if header_dtypes(path) & FLOAT_HEADERS == {info.fp} else ()
     if info.container is Container.PACK12:
         return (os.path.join(FIXTURES, f"{stem}-pack12"),)

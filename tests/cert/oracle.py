@@ -100,6 +100,21 @@ def fixture_dir(kind: FamilyKind) -> str:
     return os.path.join(FIXTURES, spec.FIXTURE_STEM[kind])
 
 
+# the storages whose twin rounds the weights, so it cannot decode to its family's tokens: each is banked from its
+# own twin, under the family's `storages`, and a cell of that storage is held to that reference
+LOSSY: tuple[spec.Storage, ...] = (spec.Storage.SAFE_FP8,)
+
+
+def lossy_twins(kind: FamilyKind) -> dict[spec.Storage, str]:
+    """the lossy twins of `kind` on disk, by storage"""
+    return {s: p for s in LOSSY for p in spec.fixture_paths(kind, s)}
+
+
+def banked_entry(fam: Json, storage: spec.Storage) -> Json | None:
+    """a family's banked reference for a cell of `storage`: its own for a lossy storage, else the family's"""
+    return fam.get("storages", {}).get(storage.value) if storage in LOSSY else fam
+
+
 def fixture_hash(path: str) -> str:
     """a content hash of every input file in a fixture dir (name + bytes, sorted): the staleness key. A change to
     the config, the weights or the tokenizer changes the hash, so a stale bank is caught against a fresh fixture."""
@@ -133,14 +148,14 @@ def decode(sm: StreamedTextModel, prompt_ids: list[int], sampling: Sampling | No
 
 
 def reference_tokens(
-    kind: FamilyKind, prompt_ids: list[int], device: str, sampling: Sampling | None = None
+    kind: FamilyKind, prompt_ids: list[int], device: str, sampling: Sampling | None = None, path: str | None = None
 ) -> list[int]:
-    """the engine's own continuation of `prompt_ids` from the family's fixture on `device` - the reference a cell
-    must reproduce."""
+    """the engine's own continuation of `prompt_ids` from the family's fixture (or the twin at `path`) on
+    `device` - the reference a cell must reproduce."""
     import btb
     from tests.helpers import NO_LOG
 
-    sm = btb.load(fixture_dir(kind), device=device, log=NO_LOG)
+    sm = btb.load(path or fixture_dir(kind), device=device, log=NO_LOG)
     try:
         return decode(sm, prompt_ids, sampling)
     finally:
@@ -150,16 +165,77 @@ def reference_tokens(
 # the banked decodes, by their key in a family's entry: greedy under "tokens", the seeded draw under "sampled"
 DECODES: tuple[str, ...] = ("tokens", "sampled")
 
+# a greedy step whose top-2 gap is under this share of its largest |logit| is a near-tie: bf16 compute and int8 KV
+# move a fixture's logits up to ~1.5% of that scale (transformers' own bf16 forward drifts as far), so a device path
+# could take the other token and the exact-token oracle would fail on rounding. The bank refuses such a decode.
+MARGIN_FLOOR = 0.02
+
+
+def greedy_margins(sm: StreamedTextModel, prompt_ids: list[int]) -> tuple[list[int], list[float | None]]:
+    """N greedy tokens of `prompt_ids` stepped one forward at a time, and each step's top-2 logit gap as a share of
+    its largest |logit|; None where every logit is exactly equal (a zero hidden state), which argmax's first-index
+    rule decides the same on every path"""
+    import torch
+
+    from tests.helpers import forward_logits
+
+    cache = sm.new_cache()
+    lg = forward_logits(sm, [prompt_ids], cache)[0, -1].float()
+    toks: list[int] = []
+    gaps: list[float | None] = []
+    for _ in range(N):
+        top, scale = torch.topk(lg, 2).values, float(lg.abs().max())
+        gaps.append(None if scale == 0 else round(float(top[0] - top[1]) / scale, 6))
+        toks.append(int(lg.argmax()))
+        lg = forward_logits(sm, [[toks[-1]]], cache)[0, -1].float()
+    return toks, gaps
+
+
+def reference_margins(
+    kind: FamilyKind, prompt_ids: list[int], device: str, path: str | None = None
+) -> tuple[list[int], list[float | None]]:
+    """`greedy_margins` on the family's fixture (or the twin at `path`) on `device`"""
+    import btb
+    from tests.helpers import NO_LOG
+
+    sm = btb.load(path or fixture_dir(kind), device=device, log=NO_LOG)
+    try:
+        return greedy_margins(sm, prompt_ids)
+    finally:
+        sm.close()
+
+
+def _bank_margins(kind: FamilyKind, entry: Json, device: str, path: str | None, label: str) -> None:
+    """`entry`'s greedy margins per prompt, each stepped decode held to the banked `generate` tokens"""
+    entry["margins"] = {}
+    for name, ids in PROMPTS.items():
+        toks, gaps = reference_margins(kind, ids, device, path)
+        if toks != entry["tokens"][name]:
+            raise RuntimeError(f"{label}/{name}: stepped greedy {toks} != generate's {entry['tokens'][name]}")
+        entry["margins"][name] = gaps
+
 
 def bank(kinds: list[FamilyKind] | None = None, device: str = REFERENCE_DEVICE) -> Json:
-    """build the oracle bank: for each banked family, its fixture hash and its greedy and seeded-sampled
-    continuations of every prompt. A pure function of the fixtures, the prompts and the engine (no timestamp), so
-    a rebank is byte-reproducible."""
+    """build the oracle bank: for each banked family (and lossy twin), its fixture hash, its greedy and
+    seeded-sampled continuations of every prompt, and the greedy ones' step margins (`greedy_margins`). A pure
+    function of the fixtures, the prompts and the engine (no timestamp), so a rebank is byte-reproducible."""
     families: Json = {}
     for kind in kinds if kinds is not None else banked_kinds():
         fam: Json = {"fixture": spec.FIXTURE_STEM[kind], "fixture_hash": fixture_hash(fixture_dir(kind))}
         for key in DECODES:
             fam[key] = {name: reference_tokens(kind, ids, device, sampling(key)) for name, ids in PROMPTS.items()}
+        _bank_margins(kind, fam, device, None, kind.value)
+        twins = lossy_twins(kind)
+        if twins:
+            fam["storages"] = {}
+            for storage, path in twins.items():
+                entry: Json = {"fixture": os.path.basename(path), "fixture_hash": fixture_hash(path)}
+                for key in DECODES:
+                    entry[key] = {
+                        n: reference_tokens(kind, ids, device, sampling(key), path) for n, ids in PROMPTS.items()
+                    }
+                _bank_margins(kind, entry, device, path, f"{kind.value}/{storage.value}")
+                fam["storages"][storage.value] = entry
         families[kind.value] = fam
     return {
         "schema": SCHEMA,
@@ -179,7 +255,32 @@ def _canon(doc: Json) -> str:
     return json.dumps(doc, indent=2, sort_keys=True) + "\n"
 
 
+def thin_margins(doc: Json) -> list[str]:
+    """every banked greedy decode (a family's, a lossy twin's) with a step under `MARGIN_FLOOR`, as
+    label/prompt with its smallest gap, or one with no margins banked; reads the bank only"""
+    out: list[str] = []
+    for name, fam in sorted(doc["families"].items()):
+        entries = [(name, fam)] + [(f"{name}/{s}", e) for s, e in sorted(fam.get("storages", {}).items())]
+        for label, entry in entries:
+            banked = entry.get("margins")
+            if banked is None:
+                out.append(f"{label}: no margins banked (rebank)")
+                continue
+            for prompt, gaps in sorted(banked.items()):
+                low = [g for g in gaps if g is not None and g < MARGIN_FLOOR]
+                if low:
+                    out.append(f"{label}/{prompt}: a step's top-2 gap is {min(low):.2%} of its logit scale")
+    return out
+
+
 def write_bank(doc: Json) -> None:
+    """write the bank, refusing one with a near-tie decode (`thin_margins`): its fixture needs another draw"""
+    thin = thin_margins(doc)
+    if thin:
+        raise RuntimeError(
+            f"refusing to bank decodes under the {MARGIN_FLOOR:.0%} margin floor; redraw these fixtures:\n  "
+            + "\n  ".join(thin)
+        )
     os.makedirs(ORACLE_DIR, exist_ok=True)
     with open(BANK, "w", encoding="utf-8") as f:
         f.write(_canon(doc))
@@ -211,17 +312,26 @@ def _to_tokens(output: CellOutput) -> list[int]:
 
 
 def assert_matches(
-    kind: FamilyKind, output: CellOutput, device: str, *, prompt: str = "standard", sampled: bool = False
+    kind: FamilyKind,
+    output: CellOutput,
+    device: str,
+    *,
+    prompt: str = "standard",
+    sampled: bool = False,
+    storage: spec.Storage = spec.Storage.SAFE_BF16,
 ) -> None:
     """the correctness gate a runner cell calls: the cell's output must equal the banked reference for
-    `(kind, prompt)` - the greedy one, or with `sampled` the SAMPLED draw. Tokens are matched exactly; a logits
-    row is matched on its greedy next token. `device` is reported on a mismatch - the reference is
-    device-independent, so a cross-device flip is a real discrepancy, surfaced here rather than hidden by a
-    tolerance. A family with no banked reference fails (a COVERED cell with no oracle is not covered)."""
+    `(kind, prompt)` - the greedy one, or with `sampled` the SAMPLED draw; a lossy storage's cell its own twin's
+    (`banked_entry`). Tokens are matched exactly; a logits row is matched on its greedy next token. `device` is
+    reported on a mismatch - the reference is device-independent, so a cross-device flip is a real discrepancy,
+    surfaced here rather than hidden by a tolerance. A family with no banked reference fails (a COVERED cell with
+    no oracle is not covered)."""
     fam = load_bank()["families"].get(kind.value)
     assert fam is not None, f"no banked oracle for {kind.value} (run python -m tests.cert.oracle --rebank)"
+    entry = banked_entry(fam, storage)
+    assert entry is not None, f"no banked {storage.value} oracle for {kind.value} (rebank)"
     key = "sampled" if sampled else "tokens"
-    ref = fam.get(key, {}).get(prompt)
+    ref = entry.get(key, {}).get(prompt)
     assert ref is not None, f"no banked {key}/{prompt!r} reference for {kind.value} (rebank)"
     got = _to_tokens(output)
     assert got == ref[: len(got)], (
@@ -233,16 +343,26 @@ def assert_matches(
 # --- the guards --------------------------------------------------------------------------------------------
 
 
-def stale_families() -> list[str]:
-    """banked families whose committed fixture hash no longer matches the fixture on disk - a stale bank. Cheap:
-    hashes files, runs no engine, so test_oracle can gate staleness without loading a model."""
-    committed = load_bank()["families"]
-    out: list[str] = []
-    for kind in banked_kinds():
-        fam = committed.get(kind.value)
-        if fam is not None and fam["fixture_hash"] != fixture_hash(fixture_dir(kind)):
-            out.append(kind.value)
+def _subjects(kind: FamilyKind, fam: Json | None) -> list[tuple[str, str, Json | None]]:
+    """what a family banks, as (label, checkpoint, its committed entry): the fixture, then each lossy twin"""
+    out: list[tuple[str, str, Json | None]] = [(kind.value, fixture_dir(kind), fam)]
+    for storage, path in lossy_twins(kind).items():
+        out.append((f"{kind.value}/{storage.value}", path, None if fam is None else banked_entry(fam, storage)))
     return out
+
+
+def stale_families() -> list[str]:
+    """banked families (and lossy twins, as family/storage) whose committed fixture hash no longer matches the
+    checkpoint on disk - a stale bank. Cheap: hashes files, runs no engine, so test_oracle can gate staleness
+    without loading a model."""
+    committed = load_bank()["families"]
+    return [
+        label
+        for kind in banked_kinds()
+        if kind.value in committed
+        for label, path, entry in _subjects(kind, committed[kind.value])
+        if entry is not None and entry["fixture_hash"] != fixture_hash(path)
+    ]
 
 
 def check() -> list[str]:
@@ -254,62 +374,65 @@ def check() -> list[str]:
     fresh = bank(device=device)
     problems: list[str] = []
     for kind in banked_kinds():
-        c = committed["families"].get(kind.value)
-        fr = fresh["families"][kind.value]
-        if c is None:
-            problems.append(f"{kind.value}: no committed reference")
-            continue
-        if c["fixture_hash"] != fr["fixture_hash"]:
-            problems.append(f"{kind.value}: fixture changed ({c['fixture_hash']} != {fr['fixture_hash']}); rebank")
-        for key in DECODES:
-            for name in PROMPTS:
-                was, now = c.get(key, {}).get(name), fr[key][name]
-                if was != now:
-                    problems.append(f"{kind.value}/{key}/{name}: tokens drifted ({was} != {now})")
+        fr_fam = fresh["families"][kind.value]
+        for (label, _path, c), (_l, _p, fr) in zip(
+            _subjects(kind, committed["families"].get(kind.value)), _subjects(kind, fr_fam), strict=True
+        ):
+            assert fr is not None  # a fresh bank holds every subject
+            if c is None:
+                problems.append(f"{label}: no committed reference")
+                continue
+            if c["fixture_hash"] != fr["fixture_hash"]:
+                problems.append(f"{label}: fixture changed ({c['fixture_hash']} != {fr['fixture_hash']}); rebank")
+            for key in DECODES:
+                for name in PROMPTS:
+                    was, now = c.get(key, {}).get(name), fr[key][name]
+                    if was != now:
+                        problems.append(f"{label}/{key}/{name}: tokens drifted ({was} != {now})")
     if _canon(fresh) != _canon(committed) and not problems:
         problems.append("bank bytes differ from a fresh regeneration (metadata/structure changed); rebank")
     return problems
 
 
 def validate(device: str, fp32: bool = False) -> list[str]:
-    """a second device must reproduce the banked tokens: decode every family and prompt on `device` (in fp32 with
-    `fp32`) and compare to the committed reference - greedy always, sampled where `holds_sampled`.
-    Returns the discrepancies - a token mismatch (a real cross-device flip) or an engine error on the path (e.g. a
-    family the device cannot run) - empty when every family reproduces. Each family is caught on its own, so one
-    broken path does not hide whether the rest reproduce."""
+    """a second device must reproduce the banked tokens: decode every family (and lossy twin) and prompt on
+    `device` (in fp32 with `fp32`) and compare to the committed reference - greedy always, sampled where
+    `holds_sampled`. Returns the discrepancies - a token mismatch (a real cross-device flip) or an engine error on
+    the path (e.g. a family the device cannot run) - empty when every one reproduces. Each is caught on its own,
+    so one broken path does not hide whether the rest reproduce."""
     import btb
     from tests.helpers import NO_LOG
 
     committed = load_bank()["families"]
     problems: list[str] = []
     for kind in banked_kinds():
-        try:
-            path = fixture_dir(kind)
-            # fp32 only when asked: leaving it unset keeps the device's own default (the CPU computes in fp32)
-            sm = (
-                btb.load(path, device=device, log=NO_LOG, fp32=1) if fp32 else btb.load(path, device=device, log=NO_LOG)
-            )
-        except Exception as e:  # the engine's failure on a path is itself a finding, not a reason to abort
-            problems.append(f"{kind.value} on {device}: engine error at load ({type(e).__name__}: {e})")
-            continue
-        try:
-            for key in DECODES:
-                draw = sampling(key)
-                if draw is not None and not holds_sampled(sm):
-                    continue
-                for name, ids in PROMPTS.items():
-                    try:
-                        got = decode(sm, ids, draw)
-                    except Exception as e:
-                        problems.append(
-                            f"{kind.value}/{key}/{name} on {device}: engine error ({type(e).__name__}: {e})"
-                        )
+        for label, path, entry in _subjects(kind, committed.get(kind.value)):
+            try:
+                # fp32 only when asked: leaving it unset keeps the device's own default (the CPU computes in fp32)
+                sm = (
+                    btb.load(path, device=device, log=NO_LOG, fp32=1)
+                    if fp32
+                    else btb.load(path, device=device, log=NO_LOG)
+                )
+            except Exception as e:  # the engine's failure on a path is itself a finding, not a reason to abort
+                problems.append(f"{label} on {device}: engine error at load ({type(e).__name__}: {e})")
+                continue
+            try:
+                for key in DECODES:
+                    draw = sampling(key)
+                    if draw is not None and not holds_sampled(sm):
                         continue
-                    ref = committed[kind.value].get(key, {}).get(name)
-                    if got != ref:
-                        problems.append(f"{kind.value}/{key}/{name} on {device}: {got} != banked {ref}")
-        finally:
-            sm.close()
+                    for name, ids in PROMPTS.items():
+                        try:
+                            got = decode(sm, ids, draw)
+                        except Exception as e:
+                            problems.append(f"{label}/{key}/{name} on {device}: engine error ({type(e).__name__}: {e})")
+                            continue
+                        ref = None if entry is None else entry.get(key, {}).get(name)
+                        if got != ref:
+                            problems.append(f"{label}/{key}/{name} on {device}: {got} != banked {ref}")
+            finally:
+                sm.close()
     return problems
 
 

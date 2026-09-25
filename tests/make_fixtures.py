@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 """Regenerate every test fixture from fixed seeds, so nothing under tests/fixtures/ is a copied model artifact
 and all of it can be recreated. For each family it writes a tiny random checkpoint in that family's own shape, a
-byte-level tokenizer, the 12-bit sibling where one is used, its fp16/fp32 precision twins, and the receipts the
+byte-level tokenizer, the 12-bit sibling where one is used, its fp16/fp32/fp8 precision twins, and the receipts the
 suite holds the engine to.
 
 Four families (qwen3, q35, phi3, q4) bank the ENGINE's own float32 output (transformers is a bank-time gate: we
@@ -526,12 +526,17 @@ def build_q4(out_dir: str) -> None:
     _reshard(out_dir, sd)
 
 
-def build_q35(out_dir: str) -> None:
+# a draw whose oracle decodes (base and FP8 twin) keep every greedy top-2 gap above the oracle's margin floor
+Q35_SEED = 94
+
+
+def _q35_model(seed: int = Q35_SEED) -> tuple[PretrainedConfig, GenerativePreTrainedModel]:
+    """tiny_q35's trunk in bf16, transformers' own init under `seed`"""
     import torch
     from transformers import Qwen3_5ForCausalLM
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
-    torch.manual_seed(0)
+    torch.manual_seed(seed)
     lt = ["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 2
     kw: Json = {
         "vocab_size": 512, "hidden_size": 128, "intermediate_size": 256, "num_hidden_layers": 8,
@@ -545,7 +550,11 @@ def build_q35(out_dir: str) -> None:
         "bos_token_id": 0, "dtype": "bfloat16",
     }  # fmt: skip
     cfg = Qwen3_5TextConfig(**kw)
-    m = Qwen3_5ForCausalLM(cfg).eval().to(torch.bfloat16)
+    return cfg, Qwen3_5ForCausalLM(cfg).eval().to(torch.bfloat16)
+
+
+def build_q35(out_dir: str) -> None:
+    cfg, m = _q35_model()
     os.makedirs(out_dir, exist_ok=True)
     m.save_pretrained(out_dir, max_shard_size="100KB", safe_serialization=True)  # config + generation_config
     sd = {k: v.detach().contiguous() for k, v in m.state_dict().items()}
@@ -602,36 +611,45 @@ def _gpt_oss_config() -> Json:
     }  # fmt: skip
 
 
-def _gpt_oss_tensors() -> dict[str, torch.Tensor]:
+# a draw whose oracle decodes (base and FP8 twin) keep every greedy top-2 gap above the oracle's margin floor
+GPT_OSS_SEED = 20260926
+
+
+def _gpt_oss_tensors(seed: int = GPT_OSS_SEED) -> dict[str, torch.Tensor]:
     import numpy as np
     import torch
 
     g = GPT_OSS
-    rng = np.random.default_rng(20260907)
+    rng = np.random.default_rng(seed)
+    # the matrices at transformers' init scale, as the other families' fixtures are drawn: hotter projections
+    # compound a layer's rounding into a token flip by the last layer, so bf16 and fp32 paths could not agree.
+    # The router and the sinks stay hot, so expert choice and the sink column keep clear margins.
+    init = 0.02
 
-    def bf16(*shape: int, scale: float = 0.05) -> torch.Tensor:
+    def bf16(*shape: int, scale: float = init) -> torch.Tensor:
         return torch.from_numpy((rng.standard_normal(shape) * scale).astype(np.float32)).bfloat16()
 
     def experts_mxfp4(n: int, rows: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
-        blocks, scales = mxfp4_random(rng, (n, rows), k, 119, 126)
+        # block scales 2^-9..2^-6 over the e2m1 codes (rms ~2.9): weights of rms ~0.006-0.046, about `init`
+        blocks, scales = mxfp4_random(rng, (n, rows), k, 118, 122)
         return torch.from_numpy(blocks), torch.from_numpy(scales)
 
     H, HEADS, KV, HD, INTER, E = g["H"], g["HEADS"], g["KV_HEADS"], g["HEAD_DIM"], g["INTER"], g["EXPERTS"]
     t = {
-        "model.embed_tokens.weight": bf16(g["VOCAB"], H, scale=0.08),
+        "model.embed_tokens.weight": bf16(g["VOCAB"], H),
         "model.norm.weight": bf16(H, scale=0.2) + 1.0,
-        "lm_head.weight": bf16(g["VOCAB"], H, scale=0.08),
+        "lm_head.weight": bf16(g["VOCAB"], H),
     }
     for i in range(g["LAYERS"]):
         p = f"model.layers.{i}."
-        t[p + "self_attn.q_proj.weight"] = bf16(HEADS * HD, H, scale=0.15)
-        t[p + "self_attn.q_proj.bias"] = bf16(HEADS * HD, scale=0.05)
-        t[p + "self_attn.k_proj.weight"] = bf16(KV * HD, H, scale=0.15)
-        t[p + "self_attn.k_proj.bias"] = bf16(KV * HD, scale=0.05)
-        t[p + "self_attn.v_proj.weight"] = bf16(KV * HD, H, scale=0.15)
-        t[p + "self_attn.v_proj.bias"] = bf16(KV * HD, scale=0.05)
-        t[p + "self_attn.o_proj.weight"] = bf16(H, HEADS * HD, scale=0.15)
-        t[p + "self_attn.o_proj.bias"] = bf16(H, scale=0.05)
+        t[p + "self_attn.q_proj.weight"] = bf16(HEADS * HD, H)
+        t[p + "self_attn.q_proj.bias"] = bf16(HEADS * HD)
+        t[p + "self_attn.k_proj.weight"] = bf16(KV * HD, H)
+        t[p + "self_attn.k_proj.bias"] = bf16(KV * HD)
+        t[p + "self_attn.v_proj.weight"] = bf16(KV * HD, H)
+        t[p + "self_attn.v_proj.bias"] = bf16(KV * HD)
+        t[p + "self_attn.o_proj.weight"] = bf16(H, HEADS * HD)
+        t[p + "self_attn.o_proj.bias"] = bf16(H)
         t[p + "self_attn.sinks"] = bf16(HEADS, scale=0.8)
         t[p + "input_layernorm.weight"] = bf16(H, scale=0.2) + 1.0
         t[p + "post_attention_layernorm.weight"] = bf16(H, scale=0.2) + 1.0
@@ -641,10 +659,10 @@ def _gpt_oss_tensors() -> dict[str, torch.Tensor]:
         db, ds = experts_mxfp4(E, H, INTER)
         t[p + "mlp.experts.gate_up_proj_blocks"] = gb
         t[p + "mlp.experts.gate_up_proj_scales"] = gs
-        t[p + "mlp.experts.gate_up_proj_bias"] = bf16(E, 2 * INTER, scale=0.05)
+        t[p + "mlp.experts.gate_up_proj_bias"] = bf16(E, 2 * INTER)
         t[p + "mlp.experts.down_proj_blocks"] = db
         t[p + "mlp.experts.down_proj_scales"] = ds
-        t[p + "mlp.experts.down_proj_bias"] = bf16(E, H, scale=0.05)
+        t[p + "mlp.experts.down_proj_bias"] = bf16(E, H)
     return t
 
 
@@ -660,11 +678,49 @@ def build_gpt_oss(out_dir: str) -> None:
 
 # --- precision twins: the BF16 fixture's weights stored at the other safetensors precisions -------------------
 
+# the FP8 twin's block: it divides every tiny fixture's projections, where a real checkpoint's is 128x128
+FP8_BLOCK = (16, 16)
+# the routers stay bf16, as Qwen's FP8 releases leave them (`modules_to_not_convert`)
+FP8_KEEP = ("mlp.gate.weight", "mlp.router.weight", "mlp.shared_expert_gate.weight")
+
+
+def fp8_state(state: dict[str, torch.Tensor]) -> tuple[dict[str, torch.Tensor], list[str]]:
+    """`state` as a fine-grained FP8 checkpoint stores it, and the modules left at bf16: every decoder matrix
+    (a projection, a fused expert tensor) whose shape splits into `FP8_BLOCK` in e4m3 with its `_scale_inv` grid,
+    an n-gram table with one per-tensor `weight_scale` (`FP8Embedding`), and the rest (embeddings, norms, the
+    head, the routers, a matrix too small to block) as they are"""
+    from btb import fp8
+
+    out: dict[str, torch.Tensor] = {}
+    kept: list[str] = []
+    for name, t in state.items():
+        experts = name.endswith((".mlp.experts.gate_up_proj", ".mlp.experts.down_proj"))
+        matrix = name.endswith(".weight") and t.dim() == 2 and ".layers." in name and not name.endswith(FP8_KEEP)
+        if not t.is_floating_point() or not (experts or matrix):
+            out[name] = t
+            if t.is_floating_point() and t.dim() >= 2:
+                kept.append(name.rpartition(".")[0])
+            continue
+        if ".ngram_embedding.shard_" in name:
+            q, s = fp8.quantize(t, None)
+            out[name], out[name.removesuffix("weight") + "weight_scale"] = q, s.reshape(1)
+            continue
+        rows, cols = t.shape[-2:]
+        if rows % FP8_BLOCK[0] or cols % FP8_BLOCK[1]:
+            out[name] = t
+            kept.append(name.rpartition(".")[0])
+            continue
+        q, s = fp8.quantize(t, FP8_BLOCK)
+        out[name] = q
+        out[name.removesuffix("weight") + "weight_scale_inv" if matrix else name + "_scale_inv"] = s
+    return out, sorted(set(kept))
+
 
 def write_twins(base: str) -> None:
     """`base`'s precision twins (spec.twin_path): one per safetensors storage beside BF16 whose header dtype the
-    engine reads (StreamedTextModel.ST_DTYPES), every float tensor cast to it and the packed integer ones kept, so
-    each decodes to the same oracle as `base`. The config's `dtype` says what the twin stores."""
+    engine reads (StreamedTextModel.ST_DTYPES). A float twin casts every float tensor and keeps the packed integer
+    ones, so it decodes to the same oracle as `base`; the FP8 twin is `fp8_state`'s, its own oracle's. The config
+    says what the twin stores (`dtype`, and the FP8 twin's `quantization_config`)."""
     from btb.engine import StreamedTextModel
     from tests.cert import spec
 
@@ -674,6 +730,10 @@ def write_twins(base: str) -> None:
         dtype = StreamedTextModel.ST_DTYPES.get(info.fp)
         if info.container is not spec.Container.SAFETENSORS or storage is spec.Storage.SAFE_BF16 or dtype is None:
             continue
+        f8 = storage is spec.Storage.SAFE_FP8
+        tensors, kept = (
+            fp8_state(state) if f8 else ({k: v.to(dtype) if v.is_floating_point() else v for k, v in state.items()}, [])
+        )
         out = spec.twin_path(stem, storage)
         os.makedirs(out, exist_ok=True)
         for name in os.listdir(base):
@@ -682,12 +742,21 @@ def write_twins(base: str) -> None:
             if name == "config.json":
                 with open(os.path.join(base, name), encoding="utf-8") as f:
                     cfg: Json = json.load(f)
-                cfg["dtype"] = str(dtype).removeprefix("torch.")
+                if f8:
+                    cfg["quantization_config"] = {
+                        "quant_method": "fp8",
+                        "fmt": "e4m3",
+                        "activation_scheme": "dynamic",
+                        "weight_block_size": list(FP8_BLOCK),
+                        "modules_to_not_convert": kept,
+                    }
+                else:
+                    cfg["dtype"] = str(dtype).removeprefix("torch.")
                 with open(os.path.join(out, name), "w", encoding="utf-8") as f:
                     json.dump(cfg, f, indent=2)
             else:
                 shutil.copyfile(os.path.join(base, name), os.path.join(out, name))
-        _reshard(out, {k: v.to(dtype) if v.is_floating_point() else v for k, v in state.items()})
+        _reshard(out, tensors)
         print(f"[fixture] {os.path.basename(out)} written ({info.fp})")
 
 
