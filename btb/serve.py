@@ -790,6 +790,21 @@ class _Stops:
         return out
 
 
+def _stop_at(tok: PreTrainedTokenizerBase, eos: Sequence[int], toks: Tokens, stops: Sequence[str]) -> int | None:
+    """how many of an answer's tokens it took to write a stop string into its content, None when none is in it:
+    the tokens a stopped answer counts (a decode stopped at a stop string runs a step or two past it)"""
+    if not stops:
+        return None
+    pieces, st = _Pieces(tok, eos), _Stops(stops)
+    for k, t in enumerate(toks):
+        for kind, delta in pieces.push(int(t)):
+            if kind == "content":
+                st.push(delta)
+        if st.hit:
+            return k + 1
+    return None
+
+
 class _Pieces:
     """One answer's tokens as text pieces as they decode: gpt-oss's channels split (`push(t)` returns
     [(kind, delta)], kind "content" or "thinking"), a stop token and a call's body never text"""
@@ -938,15 +953,30 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self._send_body(s.encode("utf-8"))
             self.wfile.flush()
+            self._writes = getattr(self, "_writes", 0) + 1
             return True
         except OSError:  # the client is gone, or stopped reading (the socket timeout is an OSError too)
+            self._gone = True  # every row of the answer shares the connection
             return False
 
-    def _pump(self, engine: Engine, run: Callable[[OnRowToken], R], rows: int, emit: RowSink) -> tuple[R, float | None]:
+    # tokens a stream may decode writing nothing (a tool call buffered whole) before a keepalive asks after the client
+    QUIET = 32
+
+    def _pump(
+        self,
+        engine: Engine,
+        run: Callable[[OnRowToken], R],
+        rows: int,
+        emit: RowSink,
+        ping: Callable[[], bool] | None = None,
+    ) -> tuple[R, float | None]:
         """`run(on_token)` on a thread of its own, the tokens it reports as `on_token(row, token)` turned into text
         pieces for `emit(row, delta, kind)` as they decode - the answer and the reasoning (gpt-oss's channels) as
         two texts, kind "content" or "thinking". A row whose `emit` returns False is not written to again; once
-        none is left the model stops at its next step. Returns (what `run` returned, the first token's time)."""
+        none is left that has not ended at its stop token the model stops at its next step, and at once when a
+        write finds the client gone. `ping()` (a stream's keepalive) is sent after `QUIET` tokens that wrote
+        nothing, so a client gone while a row is buffered is found too. Returns (what `run` returned, the first
+        token's time)."""
         q: queue.Queue[tuple[int, int] | None] = queue.Queue()
         out: list[R] = []
         err: list[str] = []
@@ -963,6 +993,9 @@ class Handler(BaseHTTPRequestHandler):
         th.start()
         pieces = [_Pieces(engine.tok, engine.eos) for _ in range(rows)]
         alive = [True] * rows
+        ended = [False] * rows  # at its stop token: the decode has nothing more for the row
+        eos = set(engine.eos)
+        quiet, wrote = 0, getattr(self, "_writes", 0)
         t_first = None
         stopped = False
         try:
@@ -970,9 +1003,18 @@ class Handler(BaseHTTPRequestHandler):
                 if t_first is None:
                     t_first = time.perf_counter()
                 r, t = item
+                ended[r] = ended[r] or t in eos
                 for kind, delta in pieces[r].push(t) if alive[r] else ():
                     alive[r] = alive[r] and bool(emit(r, delta, kind))
-                if not any(alive) and not stopped:
+                if getattr(self, "_writes", 0) != wrote:
+                    quiet, wrote = 0, getattr(self, "_writes", 0)
+                elif ping is not None and (quiet := quiet + 1) >= self.QUIET:
+                    quiet = 0
+                    ping()
+                    wrote = getattr(self, "_writes", 0)
+                if getattr(self, "_gone", False):
+                    alive = [False] * rows
+                if not stopped and not all(ended) and not any(a and not e for a, e in zip(alive, ended)):
                     # nothing more is wanted (the client is gone, or a stop string came): the model stops at its
                     # next step instead of finishing while the next request waits on the lock; the session keeps
                     # what was decoded
@@ -1184,13 +1226,18 @@ class Handler(BaseHTTPRequestHandler):
             procs = _processors(req, engine, len(ids))
 
             def message(toks: Tokens) -> tuple[Message, bool, bool]:
-                """an answer's message, whether it calls a tool, and whether a stop string cut it"""
+                """an answer's message, whether it calls a tool, and whether a stop string cut it: the stop string
+                cuts the answer first and the calls are read from what is left, as the stream reads them"""
                 calls: list[ToolCall] = []
-                if tools:
+                if tools and not fmt.in_text:
+                    # the calls are channel tokens (gpt-oss), which no stop string in the prose reaches
                     text, think, calls = fmt.from_tokens(engine.tok, toks, tools)
+                    text, cut = _cut(text, stops)
                 else:
                     text, think = engine.text(toks)
-                text, cut = _cut(text, stops)
+                    text, cut = _cut(text, stops)
+                    if tools:
+                        text, calls = fmt.split(text, tools)
                 msg: Message = {"role": "assistant", "content": (text or None) if calls else text}
                 if think:
                     msg["reasoning_content"] = think
@@ -1208,6 +1255,14 @@ class Handler(BaseHTTPRequestHandler):
             def reason(calls: bool, cut: bool, ended: bool) -> str:
                 return "tool_calls" if calls else ("stop" if cut or ended else "length")
 
+            def spent(toks: Tokens) -> int:
+                """the answer's tokens up to its stop string (all of them without one): what the usage counts"""
+                k = _stop_at(engine.tok, engine.eos, toks, stops)
+                return len(toks) if k is None else k
+
+            def lp_upto(lp: list[TokenLogprob] | None, toks: Tokens) -> list[TokenLogprob] | None:
+                return None if lp is None else lp[: spent(toks)]
+
             def body(choices: list[Json], out: int) -> Json:
                 return {
                     "id": rid,
@@ -1220,15 +1275,29 @@ class Handler(BaseHTTPRequestHandler):
 
             if not stream and n > 1:
                 t0 = time.perf_counter()
-                rows, ended, c, lps = engine.run_rows(ids, n, max_new, sampling=smp, processors=procs, logprobs=top)
+                if stops:
+                    # streamed to nowhere, so the decode ends once every row has come to a stop string or its end
+                    at = [_Stops(stops) for _ in range(n)]
+
+                    def watch(i: int, delta: str, kind: str) -> bool:
+                        return kind != "content" or (at[i].push(delta), not at[i].hit)[1]
+
+                    def all_rows(on_token: OnRowToken) -> RowsResult:
+                        return engine.run_rows(
+                            ids, n, max_new, sampling=smp, processors=procs, logprobs=top, on_token=on_token
+                        )
+
+                    (rows, ended, c, lps), _t = self._pump(engine, all_rows, n, watch)
+                else:
+                    rows, ended, c, lps = engine.run_rows(ids, n, max_new, sampling=smp, processors=procs, logprobs=top)
                 self._flex(engine, [t for r in rows for t in r], c, t0, None, time.perf_counter())
                 choices = []
                 for i, toks in enumerate(rows):
                     msg, called, cut = message(toks)
                     choices.append({"index": i, "message": msg, "finish_reason": reason(called, cut, ended[i])})
                     if top is not None:
-                        choices[-1]["logprobs"] = _lp_json(engine.tok, lps[i] if lps is not None else None)
-                return self._json(200, body(choices, sum(len(r) for r in rows)))
+                        choices[-1]["logprobs"] = _lp_json(engine.tok, lp_upto(lps[i] if lps else None, toks))
+                return self._json(200, body(choices, sum(spent(r) for r in rows)))
             if not stream:
                 t0 = time.perf_counter()
                 if stops:
@@ -1257,8 +1326,8 @@ class Handler(BaseHTTPRequestHandler):
                     "finish_reason": reason(called, cut, len(toks) < int(c.get("cap", 0))),
                 }
                 if top is not None:
-                    choice["logprobs"] = _lp_json(engine.tok, lp)
-                return self._json(200, body([choice], len(toks)))
+                    choice["logprobs"] = _lp_json(engine.tok, lp_upto(lp, toks))
+                return self._json(200, body([choice], spent(toks)))
             self._stream_head("text/event-stream")
 
             def send(delta: Json, finish: str | None = None, index: int = 0, logprobs: Json | None = None) -> bool:
@@ -1325,7 +1394,7 @@ class Handler(BaseHTTPRequestHandler):
                 return [toks], [len(toks) < int(c.get("cap", 0))], c, (None if lp is None else [lp])
 
             t0 = time.perf_counter()
-            (rows, ended, c, lps), t_first = self._pump(engine, run, n, out)
+            (rows, ended, c, lps), t_first = self._pump(engine, run, n, out, ping=lambda: self._write(": \n\n"))
             self._flex(engine, [t for r in rows for t in r], c, t0, t_first, time.perf_counter())
             for i, toks in enumerate(rows):
                 st, g = stoppers[i], gates[i]
@@ -1333,7 +1402,8 @@ class Handler(BaseHTTPRequestHandler):
                     _ = g.push(tail) if g is not None else emit(i, tail)
                 calls: list[ToolCall] = []
                 if g is not None:
-                    _prose, _think, calls = fmt.from_tokens(engine.tok, toks, tools)
+                    # read from the text the gate saw, cut at the stop string as `message` cuts it
+                    calls = fmt.calls(g.buf, tools) if fmt.in_text else fmt.from_tokens(engine.tok, toks, tools)[2]
                     g.finish()
                 if calls:
                     part: Json = {
@@ -1351,11 +1421,14 @@ class Handler(BaseHTTPRequestHandler):
                         part = dict({"role": "assistant"}, **part)
                         first[i] = False
                     send(part, index=i)
+                if first[i]:  # a row a stop string cut to nothing is the assistant's all the same
+                    send({"role": "assistant"}, index=i)
+                    first[i] = False
                 if top is not None:
-                    send({}, index=i, logprobs=_lp_json(engine.tok, lps[i] if lps is not None else None))
+                    send({}, index=i, logprobs=_lp_json(engine.tok, lp_upto(lps[i] if lps else None, toks)))
                 send({}, reason(bool(calls), st is not None and st.hit, ended[i]), index=i)
             if want_usage:
-                send_usage(len(ids), sum(len(r) for r in rows))
+                send_usage(len(ids), sum(spent(r) for r in rows))
             return self._write("data: [DONE]\n\n")
 
     def _ollama_run(
@@ -1368,12 +1441,13 @@ class Handler(BaseHTTPRequestHandler):
         procs: Sequence[LogitsProcessor],
         stops: Sequence[str],
         emit: TextSink | None = None,
-    ) -> tuple[list[int], list[int], GenerateStats, float | None]:
-        """an Ollama route's decode, (prompt ids, tokens, stats, the first token's time): streamed to `emit` when
-        given, the content through the stop strings (one ends the decode where it appears)"""
+    ) -> tuple[list[int], list[int], GenerateStats, float | None, bool]:
+        """an Ollama route's decode, (prompt ids, tokens, stats, the first token's time, whether a stop string cut
+        it): streamed to `emit` when given, the content through the stop strings (one ends the decode where it
+        appears, the tokens counted up to it)"""
         if emit is None and not stops:
             used, toks, c, _lp = engine.run(messages, max_new, ids=ids, sampling=smp, processors=procs)
-            return used, toks, c, None
+            return used, toks, c, None, False
         send = emit if emit is not None else (lambda *_a: True)
         st = _Stops(stops) if stops else None
 
@@ -1387,7 +1461,8 @@ class Handler(BaseHTTPRequestHandler):
         )
         if st is not None and not st.hit and (tail := st.flush()):
             send(tail, "content")
-        return used, toks, c, t_first
+        k = _stop_at(engine.tok, engine.eos, toks, stops)
+        return used, (toks if k is None else toks[:k]), c, t_first, k is not None
 
     def _limit(self, req: Request) -> int | None:
         """Ollama's options.num_predict: a cap above 0; -1 (until the turn ends) and -2 (fill the context) as
@@ -1410,10 +1485,11 @@ class Handler(BaseHTTPRequestHandler):
         t0: float,
         t_first: float | None,
         t_end: float,
+        cut: bool = False,
     ) -> Json:
         ns = lambda s: int(max(0.0, s) * 1e9)
         return {
-            "done_reason": "stop" if len(toks) < int(c.get("cap", 0)) else "length",
+            "done_reason": "stop" if cut or len(toks) < int(c.get("cap", 0)) else "length",
             "total_duration": ns(t_end - t0),
             "load_duration": 0,
             "prompt_eval_count": len(ids),
@@ -1465,7 +1541,7 @@ class Handler(BaseHTTPRequestHandler):
             stops = _stops(opts.get("stop"), "options.stop")
             if not stream:
                 tg = time.perf_counter()
-                ids, toks, c, _t = self._ollama_run(engine, messages, max_new, ids, smp, procs, stops)
+                ids, toks, c, _t, cut = self._ollama_run(engine, messages, max_new, ids, smp, procs, stops)
                 t_end = time.perf_counter()
                 self._flex(engine, toks, c, tg, None, t_end)
                 text, think = engine.text(toks)
@@ -1480,7 +1556,7 @@ class Handler(BaseHTTPRequestHandler):
                         "created_at": _now(),
                         "message": msg,
                         "done": True,
-                        **self._stats(ids, toks, c, t0, None, t_end),
+                        **self._stats(ids, toks, c, t0, None, t_end, cut),
                     },
                 )
             self._stream_head("application/x-ndjson")
@@ -1496,7 +1572,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
             tg = time.perf_counter()
-            ids, toks, c, t_first = self._ollama_run(engine, messages, max_new, ids, smp, procs, stops, emit)
+            ids, toks, c, t_first, cut = self._ollama_run(engine, messages, max_new, ids, smp, procs, stops, emit)
             t_end = time.perf_counter()
             self._flex(engine, toks, c, tg, t_first, t_end)
             return self._write(
@@ -1506,7 +1582,7 @@ class Handler(BaseHTTPRequestHandler):
                         "created_at": _now(),
                         "message": {"role": "assistant", "content": ""},
                         "done": True,
-                        **self._stats(ids, toks, c, t0, t_first, t_end),
+                        **self._stats(ids, toks, c, t0, t_first, t_end, cut),
                     }
                 )
                 + "\n"
@@ -1538,7 +1614,7 @@ class Handler(BaseHTTPRequestHandler):
             stops = _stops(opts.get("stop"), "options.stop")
             if not stream:
                 tg = time.perf_counter()
-                ids_used, toks, c, _t = self._ollama_run(engine, messages or [], max_new, ids, smp, procs, stops)
+                ids_used, toks, c, _t, cut = self._ollama_run(engine, messages or [], max_new, ids, smp, procs, stops)
                 t_end = time.perf_counter()
                 self._flex(engine, toks, c, tg, None, t_end)
                 text, think = engine.text(toks)
@@ -1552,7 +1628,7 @@ class Handler(BaseHTTPRequestHandler):
                         **({"thinking": think} if think else {}),
                         "done": True,
                         "context": [],
-                        **self._stats(ids_used, toks, c, t0, None, t_end),
+                        **self._stats(ids_used, toks, c, t0, None, t_end, cut),
                     },
                 )
             self._stream_head("application/x-ndjson")
@@ -1562,7 +1638,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._write(json.dumps({"model": name, "created_at": _now(), **body, "done": False}) + "\n")
 
             tg = time.perf_counter()
-            ids_used, toks, c, t_first = self._ollama_run(engine, messages or [], max_new, ids, smp, procs, stops, emit)
+            ids_used, toks, c, t_first, cut = self._ollama_run(
+                engine, messages or [], max_new, ids, smp, procs, stops, emit
+            )
             t_end = time.perf_counter()
             self._flex(engine, toks, c, tg, t_first, t_end)
             return self._write(
@@ -1573,7 +1651,7 @@ class Handler(BaseHTTPRequestHandler):
                         "response": "",
                         "done": True,
                         "context": [],
-                        **self._stats(ids_used, toks, c, t0, t_first, t_end),
+                        **self._stats(ids_used, toks, c, t0, t_first, t_end, cut),
                     }
                 )
                 + "\n"
