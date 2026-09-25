@@ -923,10 +923,16 @@ class _TiersMixin(_State):
         """layer `i` back on the store it came from: every linear's weight the checkpoint's mapped bytes again,
         its packed form beside it under the 12-bit store, no slot of the ring behind it"""
         layer = self.host[i]
+        on_mlx = self.mlx is not None and i in self.mlx_layers
         for m in layer.modules():
             if isinstance(m, _HostLinear) and m.key:
                 m.weight = torch.nn.Parameter(self._get(m.key), requires_grad=False)
                 m.packed = None
+                if on_mlx:
+                    m.mx = None  # a view of a ring slot, which the rebuilt ring fills with another layer
+        if on_mlx:
+            self._bind_mlx_resident(layer)
+            self._mlx_fuse(layer)
         if getattr(self, "_packed", None):
             self._bind_host_packed_layer(layer)
 

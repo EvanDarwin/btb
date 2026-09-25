@@ -15,7 +15,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ..kinds import Log
+from ..api import api
+from ..kinds import Log, PassTag
 from ..options import Device
 from ..sysinfo import (
     _darwin_available_bytes,
@@ -85,17 +86,26 @@ class DeviceMemory:
         return self.free + self.sheddable
 
 
+@api("room")
 class Room:
     """Room made for memory btb does not allocate itself - a second model, a library's workspace - and kept from
     btb until `release()`, the end of a `with` block, or the room being dropped. Rooms add up, each its own.
     `empty`/`zeros`/`full` hand out tensors inside it: where btb's free reading sees them (a card, the CPU off MLX)
     their bytes come off what the room holds while they live, so the room and the tensor are not counted twice."""
 
-    def __init__(self, ledger: DeviceLedger, tag: str, nbytes: int, device: torch.device, seen: bool) -> None:
+    def __init__(
+        self, ledger: DeviceLedger, tag: str, nbytes: int, device: torch.device, seen: bool, engine: _State
+    ) -> None:
         self.nbytes, self.device = int(nbytes), device
         self.used = 0  # what the room's own tensors take, while they live
-        self._ledger, self._tag, self._seen = ledger, tag, seen
+        self._ledger, self._loan, self._seen = ledger, tag, seen
+        self._engine = weakref.ref(engine)  # a room outliving its model keeps no model alive
         self._give_back = weakref.finalize(self, _give_back, ledger, tag)
+
+    def _called(self, tag: PassTag) -> None:
+        eng = self._engine()
+        if eng is not None:
+            eng._called(tag)
 
     @property
     def held(self) -> bool:
@@ -140,7 +150,7 @@ class Room:
         """what the room keeps from btb now: all of it where btb's free reading cannot see its tensors, else what
         they have not taken"""
         if self.held:
-            self._ledger.reserve(self._tag, self.nbytes - self.used if self._seen else self.nbytes, self.device)
+            self._ledger.reserve(self._loan, self.nbytes - self.used if self._seen else self.nbytes, self.device)
 
     def __enter__(self) -> Room:
         return self
@@ -435,65 +445,7 @@ class _MemoryMixin(_State):
                 sizes[i] = sizes.get(i, 0) + n * b
         return sizes
 
-    # -- lending: memory for the caller's own tensors ------------------------------------------------------------
-
-    def empty(
-        self, shape: int | Sequence[int], dtype: torch.dtype | None = None, device: DeviceSpec | None = None
-    ) -> torch.Tensor:
-        """
-        A tensor of your own beside the model, as `torch.empty` makes it, with room made for it first: btb gives up
-        what it holds there, cheapest first, instead of your allocation running out of memory. It is a plain tensor
-        and lives as long as you keep it; btb takes the room back once it is gone. `device` defaults to the one the
-        model computes on (the host on Apple silicon). A `MemoryGrantError` when even that is not enough.
-        """
-        return self._lend(shape, dtype, device, None)
-
-    def zeros(
-        self, shape: int | Sequence[int], dtype: torch.dtype | None = None, device: DeviceSpec | None = None
-    ) -> torch.Tensor:
-        """`empty`, filled with zeros"""
-        return self._lend(shape, dtype, device, 0)
-
-    def full(
-        self,
-        shape: int | Sequence[int],
-        value: float,
-        dtype: torch.dtype | None = None,
-        device: DeviceSpec | None = None,
-    ) -> torch.Tensor:
-        """`empty`, filled with `value`"""
-        return self._lend(shape, dtype, device, value)
-
-    def room(self, nbytes: int, device: DeviceSpec | None = None, name: str = "room") -> Room:
-        """
-        Room for memory btb does not allocate itself - a second model, a library's workspace - made now and kept
-        from btb until the `Room` is released (`release()`, or as a `with` block). Keep it while that memory is in
-        use; tensors taken through it (`Room.empty`) count against it, not beside it. A `MemoryGrantError` when
-        btb cannot make that much.
-        """
-        dev = self._lend_device(device)
-        tag = f"{name}#{next(_LOANS)}"
-
-        def run() -> Room:
-            self._lend_check(name)
-            self._make_room(dev, int(nbytes), f"room {name!r}")
-            self.device.reserve(tag, int(nbytes), dev)
-            return Room(self.device, tag, int(nbytes), dev, self._sees(dev))
-
-        return self._serial(run)
-
-    def memory(self) -> dict[str, DeviceMemory]:
-        """what btb sees of each device it runs on, by name ("cuda:0", "cpu") - what `empty` and `room` can get"""
-        out = {}
-        devs = [self.dev] if self.dev.type == Device.CUDA else []
-        for dev in [*devs, torch.device("cpu")]:
-            out[str(dev)] = DeviceMemory(
-                str(dev),
-                int(self.device.free(dev, unreserved=True) or 0),
-                self.device.reserved(dev),
-                self._sheddable(dev),
-            )
-        return out
+    # -- lending: the caller's calls are `_LendMixin`'s, over these helpers `cache_room` shares ------------------
 
     def _lend(
         self, shape: int | Sequence[int], dtype: torch.dtype | None, device: DeviceSpec | None, fill: float | None
@@ -700,3 +652,66 @@ def _bytes_on(cache: KvCache, dev: torch.device, layers: Iterable[int]) -> int:
             if isinstance(t, torch.Tensor) and t.device.type == dev.type:
                 n += t.numel() * t.element_size()
     return n
+
+
+@api("model")
+class _LendMixin(_MemoryMixin):
+    """lending: memory for the caller's own tensors, the model's API over `_MemoryMixin`'s policies"""
+
+    def empty(
+        self, shape: int | Sequence[int], dtype: torch.dtype | None = None, device: DeviceSpec | None = None
+    ) -> torch.Tensor:
+        """
+        A tensor of your own beside the model, as `torch.empty` makes it, with room made for it first: btb gives up
+        what it holds there, cheapest first, instead of your allocation running out of memory. It is a plain tensor
+        and lives as long as you keep it; btb takes the room back once it is gone. `device` defaults to the one the
+        model computes on (the host on Apple silicon). A `MemoryGrantError` when even that is not enough.
+        """
+        return self._lend(shape, dtype, device, None)
+
+    def zeros(
+        self, shape: int | Sequence[int], dtype: torch.dtype | None = None, device: DeviceSpec | None = None
+    ) -> torch.Tensor:
+        """`empty`, filled with zeros"""
+        return self._lend(shape, dtype, device, 0)
+
+    def full(
+        self,
+        shape: int | Sequence[int],
+        value: float,
+        dtype: torch.dtype | None = None,
+        device: DeviceSpec | None = None,
+    ) -> torch.Tensor:
+        """`empty`, filled with `value`"""
+        return self._lend(shape, dtype, device, value)
+
+    def room(self, nbytes: int, device: DeviceSpec | None = None, name: str = "room") -> Room:
+        """
+        Room for memory btb does not allocate itself - a second model, a library's workspace - made now and kept
+        from btb until the `Room` is released (`release()`, or as a `with` block). Keep it while that memory is in
+        use; tensors taken through it (`Room.empty`) count against it, not beside it. A `MemoryGrantError` when
+        btb cannot make that much.
+        """
+        dev = self._lend_device(device)
+        tag = f"{name}#{next(_LOANS)}"
+
+        def run() -> Room:
+            self._lend_check(name)
+            self._make_room(dev, int(nbytes), f"room {name!r}")
+            self.device.reserve(tag, int(nbytes), dev)
+            return Room(self.device, tag, int(nbytes), dev, self._sees(dev), self)
+
+        return self._serial(run)
+
+    def memory(self) -> dict[str, DeviceMemory]:
+        """what btb sees of each device it runs on, by name ("cuda:0", "cpu") - what `empty` and `room` can get"""
+        out = {}
+        devs = [self.dev] if self.dev.type == Device.CUDA else []
+        for dev in [*devs, torch.device("cpu")]:
+            out[str(dev)] = DeviceMemory(
+                str(dev),
+                int(self.device.free(dev, unreserved=True) or 0),
+                self.device.reserved(dev),
+                self._sheddable(dev),
+            )
+        return out

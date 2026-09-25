@@ -42,6 +42,10 @@ if TYPE_CHECKING:
 
     from ..mlx import Shared
 
+# the head sizes the engine routes to its attention kernels (decode, tree, rows, forest, head-256 prefill); any
+# other size runs MLX's own attention (PassTag.MLX_SDPA)
+ATTN_KERNEL_HEADS = (128, 256)
+
 
 @dataclass
 class MlxState:
@@ -589,7 +593,7 @@ class _MlxMixin(_State):
             isinstance(cl, GrowLayer)
             and cl.shared
             and cl._mx is not None
-            and hd in (128, 256)
+            and hd in ATTN_KERNEL_HEADS
             and Hq // Hk <= mlxdev.ATTN_MAXG
             and bool(getattr(self, "mlx_attn_kernel", True))
         )
@@ -818,7 +822,7 @@ class _MlxMixin(_State):
             cl is not None
             and isinstance(cl, GrowLayer)
             and cl.shared
-            and hd in (128, 256)
+            and hd in ATTN_KERNEL_HEADS
             and Hq // Hk <= mlxdev.ATTN_MAXG
             and (cl._mx[0].dtype == m.bfloat16 or cl.bits)
             and getattr(self, "mlx_attn_kernel", True)
@@ -833,6 +837,7 @@ class _MlxMixin(_State):
             place = {"batch": b, "pbase": int(cl._offs[b]), "kbatch": 0}
         if able and nodes is not None:
             past, parents = nodes
+            self._tag(PassTag.MLX_ATTN_KERNEL)
             a = mlxdev.attn_tree(
                 qh[0].transpose(1, 0, 2).astype(m.float32),
                 cl._mx[0],
@@ -855,10 +860,12 @@ class _MlxMixin(_State):
                 if win not in attn_pa.by_window:
                     attn_pa.by_window[win] = mlxdev.attn_params(cl._n, win)
                 pa = attn_pa.by_window[win]
+            self._tag(PassTag.MLX_ATTN_KERNEL)
             a = mlxdev.attn_decode(qh[0, :, 0].astype(m.float32), cl._mx[0], cl._mx[1], cl._n, scale, params=pa, **kq)
             return a.astype(qh.dtype).reshape(1, Hq * hd), attn_pa
         if able and mask == "causal" and win is None and self._mlx_prefill_able(cl, T, hd, Hq, Hk):
             # the chunk's rows are appended already: row t at cache row past + t
+            self._tag(PassTag.MLX_ATTN_KERNEL)
             a = mlxdev.attn_prefill(qh[0].transpose(1, 0, 2), cl._mx[0], cl._mx[1], cl._n - T, scale, odt=qh.dtype)
             return a.reshape(T, Hq * hd), attn_pa
         if win is not None and (mask is None or isinstance(mask, str)):
@@ -970,7 +977,7 @@ class _MlxMixin(_State):
         B, Hq, hd = (int(x) for x in qh.shape)
         Hk = int(cl._mx[0].shape[1])
         able = (
-            hd in (128, 256)
+            hd in ATTN_KERNEL_HEADS
             and Hq // Hk <= mlxdev.ATTN_MAXG
             and (cl._mx[0].dtype == m.bfloat16 or cl.bits)
             and getattr(self, "mlx_attn_kernel", True)
@@ -982,6 +989,7 @@ class _MlxMixin(_State):
                 if cl.bits:
                     kq.update({"ks2": cl._mx2[2], "vs2": cl._mx2[3]})
             # q in its own dtype, the scale applied in the kernel, the output in q's dtype: no casts, no op
+            self._tag(PassTag.MLX_ATTN_KERNEL)
             a = mlxdev.attn_rows(
                 qh,
                 cl._mx[0],
@@ -1011,8 +1019,9 @@ class _MlxMixin(_State):
         m = mlxdev.mx()
         T, Hq, hd = (int(x) for x in qh.shape)
         Hk = int(kh.shape[1])
-        if self.mlx_state.forest_kernel and hd in (128, 256) and Hq // Hk <= mlxdev.ATTN_MAXG:
+        if self.mlx_state.forest_kernel and hd in ATTN_KERNEL_HEADS and Hq // Hk <= mlxdev.ATTN_MAXG:
             kq: dict[str, Any] = {"ks": cl._mx[2], "vs": cl._mx[3]} if cl.bits else {}
+            self._tag(PassTag.MLX_ATTN_KERNEL)
             a = mlxdev.attn_nodes(
                 qh, cl._mx[0], cl._mx[1], forest["meta"], forest["path"], scale, forest["splits"], odt=qh.dtype, **kq
             )
@@ -1617,7 +1626,7 @@ class _MlxMixin(_State):
         m = mlxdev.mx()
         smp = sampling or GREEDY
         prompt = ids[0].tolist()
-        cache, reuse, _anchored = session.open(self, prompt) if session is not None else (None, 0, None)
+        cache, reuse, _anchored = session._open(self, prompt) if session is not None else (None, 0, None)
         if cache is None:
             cache = self.new_cache()
         logits, anchors = self._session_prefill(ids, cache, reuse, session)
@@ -1628,7 +1637,7 @@ class _MlxMixin(_State):
 
         def keep() -> tuple[list[int], dict[str, Any]]:
             if session is not None:
-                session.keep(prompt, out, cache, anchors)
+                session._keep(prompt, out, cache, anchors)
             census["seconds"] = time.time() - t0
             census["forwards"] = len(out)
             return out, census

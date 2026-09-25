@@ -176,6 +176,7 @@ class _State:
     _closed: bool
     _in_epoch: bool
     _pass_rec: _PassRecorder | None = None  # the provenance accumulator, created on first tag or reset
+    _calls: frozenset[PassTag] = frozenset()  # every API call made on the model (btb.api), never reset
 
     # -- the card graph (cuda.py); the mechanism keeps its letters --
     card_pipeline: bool
@@ -678,8 +679,14 @@ class _State:
         if proposed > accepted:
             rec.tags.add(PassTag.SPEC_REJECT)
 
+    def _called(self, tag: PassTag) -> None:
+        """record an API call (btb.api): a call is not one pass's fork, so a generate's reset keeps it"""
+        self._calls = self._calls | {tag}
+
     def last_pass_report(self) -> PassReport:
         """The provenance of the most recent `generate()` (its passes' tags accumulated) or of a bare
-        `forward()`: the `PassTag`s its forks recorded and the speculation counts. Empty before any pass."""
+        `forward()`: the `PassTag`s its forks recorded and the speculation counts, with every API call made on
+        the model so far. Empty before any pass or call."""
         rec = self._pass_rec
-        return rec.report() if rec is not None else PassReport()
+        rep = rec.report() if rec is not None else PassReport()
+        return PassReport(rep.tags | self._calls, rep.spec_proposed, rep.spec_accepted)

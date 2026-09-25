@@ -8,7 +8,7 @@
   "bos_token_id": 0,
   "dtype": "bfloat16",
   "eos_token_id": 1,
-  "head_dim": 64,
+  "head_dim": 256,
   "hidden_act": "silu",
   "hidden_size": 128,
   "initializer_range": 0.02,
@@ -39,9 +39,9 @@
   "rope_parameters": {
     "mrope_interleaved": true,
     "mrope_section": [
-      3,
-      3,
-      2
+      11,
+      11,
+      10
     ],
     "partial_rotary_factor": 0.25,
     "rope_theta": 10000.0,

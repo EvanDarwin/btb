@@ -83,8 +83,10 @@ def test_every_quant_is_classified_and_exercised() -> None:
 # --- COVERED means a receipt, never a file on disk ----------------------------------------------------------
 
 
-def _cell(cells: list[manifest.Cell], storage: spec.Storage, device: str) -> manifest.Cell:
-    got = [c for c in cells if c.kind is FamilyKind.QWEN3 and c.storage is storage and c.device == device]
+def _cell(
+    cells: list[manifest.Cell], storage: spec.Storage, device: str, kind: FamilyKind = FamilyKind.QWEN3
+) -> manifest.Cell:
+    got = [c for c in cells if c.kind is kind and c.storage is storage and c.device == device]
     greedy = [c for c in got if c.decode is spec.DecodePath.GREEDY]
     assert len(greedy) == 1, f"expected one greedy cell for {storage.value}/{device}, got {len(greedy)}"
     return greedy[0]
@@ -112,12 +114,12 @@ def test_a_cell_flips_to_covered_on_its_receipt(tmp_path: Path, monkeypatch: Mon
 
 
 def test_a_receipt_cannot_buy_a_gap(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    """a banked id for a cell the engine cannot engage (qwen3's megakernel on a head_dim-16 fixture) leaves the
-    cell a GAP. Coverage is a verdict about the path, so a stale or fallback-earned id buys nothing."""
-    stale = [manifest.safetensors_id(FamilyKind.QWEN3, "mlx-mega", d) for d in spec.Decode]
+    """a banked id for a cell the engine cannot engage (phi3's megakernel, which the kernel's layout refuses)
+    leaves the cell a GAP. Coverage is a verdict about the path, so a stale or fallback-earned id buys nothing."""
+    stale = [manifest.safetensors_id(FamilyKind.PHI3, "mlx-mega", d) for d in spec.Decode]
     _receipts(tmp_path, monkeypatch, stale)
-    cell = _cell(manifest.compute_cells(), spec.Storage.SAFE_BF16, "mlx-mega")
-    assert cell.verdict is manifest.Verdict.GAP and cell.reason == manifest.Missing.MEGA_SHAPE.value, cell
+    cell = _cell(manifest.compute_cells(), spec.Storage.SAFE_BF16, "mlx-mega", FamilyKind.PHI3)
+    assert cell.verdict is manifest.Verdict.GAP and cell.reason == manifest.Missing.MEGAKERNEL.value, cell
 
 
 def test_ids_are_built_in_one_place() -> None:
@@ -132,7 +134,7 @@ def test_runnable_ids_exclude_gaps() -> None:
     """the union gate asks only for runs a machine could make: a gap cell's would-be id is not demanded, and a
     plain cpu cell's is."""
     ids = manifest.runnable_ids()
-    assert manifest.safetensors_id(FamilyKind.QWEN3, "mlx-mega", spec.Decode.GREEDY) not in ids
+    assert manifest.safetensors_id(FamilyKind.PHI3, "mlx-mega", spec.Decode.GREEDY) not in ids
     assert manifest.safetensors_id(FamilyKind.QWEN3, "cpu", spec.Decode.GREEDY) in ids
 
 
@@ -175,6 +177,26 @@ def test_a_precision_cell_binds_only_its_own_twin(tmp_path: Path, monkeypatch: M
     assert spec.fixture_paths(FamilyKind.QWEN3, spec.Storage.SAFE_FP16) == ()
     why = manifest.gap_reason(FamilyKind.QWEN3, spec.Storage.SAFE_FP16, spec.SUBPATH["cpu"], spec.DecodePath.GREEDY)
     assert why is manifest.Missing.FP16_FIXTURE
+
+
+# the kernels' head gates, which no fixture's cell trips: these kinds are idle until one does
+SHAPE_GAPS: dict[str, manifest.Missing] = {
+    "mlx-mega": manifest.Missing.MEGA_SHAPE,
+    "cuda-graph": manifest.Missing.CARD_GRAPH_SHAPE,
+    "mlx-attn-kernel": manifest.Missing.MLX_ATTN_SHAPE,
+}
+
+
+def test_a_narrow_head_raises_the_shape_gaps(monkeypatch: MonkeyPatch) -> None:
+    """qwen3's fixture head reaches every kernel that gates on the head; a head of 16 reaches none, and each
+    sub-path's cell is then its shape gap rather than a run a fallback would certify."""
+    for key in SHAPE_GAPS:
+        why = manifest.gap_reason(FamilyKind.QWEN3, spec.Storage.SAFE_BF16, spec.SUBPATH[key], spec.DecodePath.GREEDY)
+        assert why is None, (key, why)
+    monkeypatch.setattr(spec, "head_dim", lambda kind: 16)
+    for key, gap in SHAPE_GAPS.items():
+        why = manifest.gap_reason(FamilyKind.QWEN3, spec.Storage.SAFE_BF16, spec.SUBPATH[key], spec.DecodePath.GREEDY)
+        assert why is gap, (key, why)
 
 
 def test_decode_paths_derive_from_proposer() -> None:
@@ -287,7 +309,13 @@ def test_card_family_predicate_matches_cuda_source() -> None:
 def test_mega_head_multiple_matches_its_source() -> None:
     """the megakernel's head gate, quoted from mega.py so MEGA_SHAPE cannot outlive the constraint."""
     assert f"self.hd % {manifest.MEGA_HEAD_MULTIPLE}" in _source("mlx", "mega.py")
-    assert spec.head_dim(FamilyKind.QWEN3) == 16, "the tiny fixture changed; MEGA_SHAPE may no longer hold"
+
+
+def test_mlx_attn_heads_match_their_source() -> None:
+    """the engine's MLX attention-kernel head gate, quoted from mlx_forward.py so MLX_ATTN_SHAPE cannot outlive it."""
+    src = _source("engine", "mlx_forward.py")
+    assert f"ATTN_KERNEL_HEADS = {manifest.MLX_ATTN_HEAD_DIMS}" in src
+    assert src.count("hd in ATTN_KERNEL_HEADS") == 4, "a kernel gate stopped reading ATTN_KERNEL_HEADS"
 
 
 def test_mtp_head_is_read_from_the_fixture() -> None:

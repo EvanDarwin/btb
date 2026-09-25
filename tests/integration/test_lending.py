@@ -16,6 +16,7 @@ import torch
 
 from btb.engine import StreamedTextModel
 from btb.engine.cache import ForkLayer, GrowLayer
+from btb.engine.host import _HostLinear
 from btb.engine.scheduler import MemoryGrantError
 from tests.helpers import fixture, loaded_model, need_cuda, need_mlx
 
@@ -196,6 +197,23 @@ def _until(cond: Callable[[], bool], sm: StreamedTextModel, seconds: float = 20.
         sm.generate(PROMPT, 2, eos=(), speculate=False)
         time.sleep(0.25)
     return bool(cond())
+
+
+def test_a_layer_grown_back_on_mlx_holds_its_own_weights() -> None:
+    """a layer back from the drive holds MLX weights of its own, not views of a ring slot the rebuilt ring fills
+    with another layer's - which decoded right only while the pool happened not to hand that slot out again"""
+    need_mlx()
+    with loaded_model(fixture("tiny_qwen3"), device="mlx") as sm:
+        ref = list(sm.generate(PROMPT, 6, eos=(), speculate=False).tokens)
+        while sm.ram_shed("test") is not None:
+            pass
+        slots = list(sm.cold_ring.shared or [])
+        i = sm.ram_regrow()
+        assert i is not None
+        slots += list(sm.cold_ring.shared or [])
+        views = [getattr(m.mx, "sh", None) for m in sm.host[i].modules() if isinstance(m, _HostLinear)]
+        assert views and not any(v is s for v in views for s in slots), "a regrown layer reads a ring slot"
+        assert list(sm.generate(PROMPT, 6, eos=(), speculate=False).tokens) == ref
 
 
 def test_what_a_refusal_shed_grows_back_once_there_is_room() -> None:

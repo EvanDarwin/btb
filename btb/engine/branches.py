@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import time
+from abc import abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Self, overload
@@ -14,6 +15,7 @@ from typing import TYPE_CHECKING, Self, overload
 import torch
 
 from .. import mlx as mlxdev
+from ..api import api
 from ..kinds import LayerKind, PassTag, Tokens
 from ..sampling import GREEDY, Sampling
 from .cache import (
@@ -56,6 +58,7 @@ class _Row:
     logits: torch.Tensor | None = None
 
 
+@api("rows")
 class _Rows:
     """The rows and their cache: `sess[r]` the session row r writes back into, `base[r]` the tokens its cache
     prefix holds, `rows[r]` its tokens since the batch formed; `_slot[r]` its place in the batch (None once out),
@@ -89,6 +92,9 @@ class _Rows:
                 if eng.layer_types[i] != LayerKind.LINEAR
             )
         )
+
+    def _called(self, tag: PassTag) -> None:
+        self.eng._called(tag)
 
     def _shell(self, parent: KvCache) -> KvCache:
         cache = copy.copy(parent)
@@ -420,10 +426,12 @@ class _Rows:
         if self.cache is not None:
             self.close()
 
+    @abstractmethod
     def close(self) -> None:
         raise NotImplementedError
 
 
+@api("branches")
 class Branches(_Rows):
     """`n` rows forked from a session's end, stepped together over its cache (`session.fork(n)`): `logits` holds
     the live rows' next-token logits, `step(tokens)` feeds one token a live row, `generate` decodes them (row r
@@ -535,6 +543,7 @@ class Branches(_Rows):
         self.cache, self._logits, self._pend, self._out = None, None, None, {}
 
 
+@api("batch")
 class Batch(_Rows):
     """Sessions decoded together, a row each (`model.batch(sessions)`): `logits`, `step` and `generate` as a
     fork's, each row drawing as its session's own decode would. A row leaving at its stop token is written back

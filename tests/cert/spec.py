@@ -18,7 +18,19 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from btb.kinds import PROPOSER_TAG, QUANT_KIND, Cap, FamilyKind, Json, PassTag, Proposer, Quant, QuantClass, quants_of
+from btb.kinds import (
+    PROPOSER_TAG,
+    QUANT_KIND,
+    Cap,
+    FamilyKind,
+    Json,
+    PassTag,
+    Proposer,
+    Quant,
+    QuantClass,
+    api_tags,
+    quants_of,
+)
 
 from . import core
 
@@ -373,6 +385,14 @@ DEVICE_SUBPATHS: tuple[DeviceSubpath, ...] = (
         "the per-token graph, megakernel off",
     ),
     DeviceSubpath(
+        "mlx-attn-kernel",
+        Hardware.MLX,
+        lambda k, s: PassTag.MLX_ATTN_KERNEL,
+        {"device": "mlx", "mlx_mega": 0, "v_max": 4},
+        "the engine's attention kernels over the cache buffers, where the head size routes a decode row to them "
+        "(speculation on at load sends every row, however short the cache)",
+    ),
+    DeviceSubpath(
         "mlx-packed",
         Hardware.MLX,
         lambda k, s: _quant_tag(s),
@@ -453,7 +473,7 @@ def subpaths(*keys: str) -> tuple[DeviceSubpath, ...]:
 class Surface(StrEnum):
     """the id namespace a cert run records under: the container it loaded from, or an axis that is not part of
     the storage/device cartesian (a batch of rows, a long prompt, a hooked decode, a fork and a batch of
-    sessions)."""
+    sessions, the model's own API calls, a session's)."""
 
     SAFETENSORS = "safetensors"
     GGUF = "gguf"
@@ -462,6 +482,8 @@ class Surface(StrEnum):
     CONTEXT = "context"
     HOOKED = "hooked"
     FORK = "fork"
+    MODEL = "model"
+    SESSION = "session"
 
 
 # the surface a cell of each container records under; the shape surfaces have no container of their own.
@@ -485,6 +507,8 @@ SURFACE_SUBPATHS: dict[Surface, tuple[str, ...]] = {
     Surface.CONTEXT: ("cpu", "mlx-step"),
     Surface.HOOKED: ("cpu", "mlx-step", "cuda-torch"),
     Surface.FORK: ("cpu", "mlx-step", "cuda-torch"),
+    Surface.MODEL: ("cpu", "mlx-step", "cuda-torch"),
+    Surface.SESSION: ("cpu", "mlx-step", "cuda-torch"),
 }
 
 
@@ -495,10 +519,15 @@ def rows_tag(kind: FamilyKind, hardware: Hardware) -> PassTag:
 
 
 # the tags a cell of an axis beside the cartesian must show, by family and hardware (the sub-path's own `expects`
-# is about the single stream these axes leave)
+# is about the single stream these axes leave). The API surfaces take every call their owners declare
+# (btb.kinds.api_tags), so a method added to an API class is a tag its cell must show.
 SURFACE_TAGS: dict[Surface, Callable[[FamilyKind, Hardware], frozenset[PassTag]]] = {
     Surface.HOOKED: lambda k, hw: frozenset({PassTag.PICK_HOOKED}),
-    Surface.FORK: lambda k, hw: frozenset({rows_tag(k, hw)}),
+    Surface.FORK: lambda k, hw: (
+        frozenset({rows_tag(k, hw)}) | api_tags("rows") | api_tags("branches") | api_tags("batch")
+    ),
+    Surface.MODEL: lambda k, hw: api_tags("model") | api_tags("room"),
+    Surface.SESSION: lambda k, hw: api_tags("session"),
 }
 
 

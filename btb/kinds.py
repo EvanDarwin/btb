@@ -275,6 +275,9 @@ class PassTag(StrEnum):
     # rotary, a non-bf16 state, or a batched pass
     MLX_HYBRID = "mlx_hybrid"  # the Qwen3.5 DeltaNet fused path (_forward_mlx_hybrid)
     MLX_SDPA = "mlx_sdpa"  # MLX's own fused attention, where the node kernel does not apply
+    # the engine's attention kernels over the cache buffers (btb/mlx/attn.py: decode, tree, rows, forest, head-256
+    # prefill), read from the buffer itself rather than the views an append hands back
+    MLX_ATTN_KERNEL = "mlx_attn_kernel"
     CUDA_GRAPH = "cuda_graph"  # a captured card graph ran the pass (_forward_card_segment/_forward_fast/step graph)
     CUDA_TORCH_FALLBACK = "cuda_torch_fallback"  # a card layer through torch modules, btb's kernels absent
     CPU_NATIVE = "cpu_native"  # a host layer through the native CPU gemv kernels
@@ -316,6 +319,52 @@ class PassTag(StrEnum):
     SPEC_NGRAM = "spec_ngram"  # the n-gram proposer
     SPEC_ACCEPT = "spec_accept"  # a pass accepted at least one drafted token
     SPEC_REJECT = "spec_reject"  # a pass rejected at least one drafted token
+    # the programmatic API, one member per public method of a class `btb.api.api(owner)` declares, valued
+    # "owner.method": the class refuses to build with a public method missing here, and each call records its member
+    API_MODEL_PEAK_MEMORY = "model.peak_memory"
+    API_MODEL_PROMPT_IDS = "model.prompt_ids"
+    API_MODEL_GENERATE = "model.generate"
+    API_MODEL_HIDDEN = "model.hidden"
+    API_MODEL_PROJECT = "model.project"
+    API_MODEL_ENCODE = "model.encode"
+    API_MODEL_ASK = "model.ask"
+    API_MODEL_STREAM = "model.stream"
+    API_MODEL_SESSION = "model.session"
+    API_MODEL_BATCH = "model.batch"
+    API_MODEL_CHAT = "model.chat"
+    API_MODEL_ASK_MANY = "model.ask_many"
+    API_MODEL_RESERVE = "model.reserve"
+    API_MODEL_EMPTY = "model.empty"
+    API_MODEL_ZEROS = "model.zeros"
+    API_MODEL_FULL = "model.full"
+    API_MODEL_ROOM = "model.room"
+    API_MODEL_MEMORY = "model.memory"
+    API_ROOM_RELEASE = "room.release"
+    API_ROOM_EMPTY = "room.empty"
+    API_ROOM_ZEROS = "room.zeros"
+    API_ROOM_FULL = "room.full"
+    API_SESSION_FEED = "session.feed"
+    API_SESSION_MARK = "session.mark"
+    API_SESSION_REWIND = "session.rewind"
+    API_SESSION_CROP = "session.crop"
+    API_SESSION_ROWS = "session.rows"
+    API_SESSION_SYNC = "session.sync"
+    API_SESSION_FORK = "session.fork"
+    API_SESSION_GENERATE = "session.generate"
+    API_ROWS_TOKENS = "rows.tokens"
+    API_ROWS_STEP = "rows.step"
+    API_ROWS_LEAVE = "rows.leave"
+    API_ROWS_GENERATE = "rows.generate"
+    API_BRANCHES_REORDER = "branches.reorder"
+    API_BRANCHES_KEEP = "branches.keep"
+    API_BRANCHES_CLOSE = "branches.close"
+    API_BATCH_JOIN = "batch.join"
+    API_BATCH_CLOSE = "batch.close"
+
+
+def api_tags(owner: str) -> frozenset[PassTag]:
+    """the declared API calls of `owner` (a class's `api(owner)`), from the PassTag values"""
+    return frozenset(t for t in PassTag if t.value.partition(".")[0] == owner and "." in t.value)
 
 
 # the tag a speculative decode records for the proposer it ran (a sibling draft model's decode records SPEC_DRAFT

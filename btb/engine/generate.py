@@ -252,7 +252,7 @@ class _GenerateMixin(_State):
             if i in tap_ids:
                 taps[i] = h
 
-        cache, reuse, anchored = session.open(self, prompt) if session is not None else (None, 0, None)
+        cache, reuse, anchored = session._open(self, prompt) if session is not None else (None, 0, None)
         if cache is None:
             cache = self.new_cache()
         logits: Any
@@ -330,9 +330,9 @@ class _GenerateMixin(_State):
             if session is None:
                 return
             if use_mtp:
-                session.keep(prompt, committed, cache, anchors, dr, last_base if len(committed) > 1 else n - 1, pend_h)
+                session._keep(prompt, committed, cache, anchors, dr, last_base if len(committed) > 1 else n - 1, pend_h)
             else:
-                session.keep(prompt, committed, cache, anchors)
+                session._keep(prompt, committed, cache, anchors)
 
         prop.extend(first)
         if on_token:

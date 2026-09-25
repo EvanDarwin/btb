@@ -533,29 +533,29 @@ def test_session_reuses_the_shared_prefix_and_learns_the_tail() -> None:
         return cast("_State", eng), cache
 
     s = Session()
-    assert s.fresh and s.open(engine_and_cache(1)[0], [1, 2, 3]) == (None, 0, None)
+    assert s.fresh and s._open(engine_and_cache(1)[0], [1, 2, 3]) == (None, 0, None)
     eng, cache = engine_and_cache(6)
-    s.keep([1, 2, 3, 4], [9, 8, 7], cache, None)  # the cache holds the prompt and the answer but its last token
+    s._keep([1, 2, 3, 4], [9, 8, 7], cache, None)  # the cache holds the prompt and the answer but its last token
     assert s.ids == [1, 2, 3, 4, 9, 8] and s.n_prompt == 4 and not s.fresh
     # the next turn extends the previous text: the whole cache is reused
-    c, reuse, anc = s.open(eng, [1, 2, 3, 4, 9, 8, 5, 6])
+    c, reuse, anc = s._open(eng, [1, 2, 3, 4, 9, 8, 5, 6])
     assert c is cache and reuse == 6 and anc is None and cache.layers[0].keys.shape[-2] == 6
     # a prompt that diverges two tokens before the previous prompt's end: a crop to the shared prefix, tail learned
-    c, reuse, _ = s.open(eng, [1, 2, 7, 7, 7])
+    c, reuse, _ = s._open(eng, [1, 2, 7, 7, 7])
     assert reuse == 2 and cache.layers[1].keys.shape[-2] == 2 and s.tail == 2
     # nothing shared: nothing reused, and the old cache is released before the new prefill, not after it, the
     # drafter's cache with it
     drafter = types.SimpleNamespace(resets=0)
     drafter.reset = lambda: setattr(drafter, "resets", drafter.resets + 1)
     s.dr = cast("MTPDrafter", drafter)
-    assert s.open(eng, [5, 5, 5]) == (None, 0, None) and s.cache is None and s.ids == [] and s.fresh
+    assert s._open(eng, [5, 5, 5]) == (None, 0, None) and s.cache is None and s.ids == [] and s.fresh
     assert s.dr is None and drafter.resets == 1
     # a prompt that parts from a long previous prompt far from its end is another conversation: the crop still
     # happens, the tail is not re-learned from it (a learned tail of thousands once resumed a whole prompt as one)
     eng, cache = engine_and_cache(300)
-    s.keep(list(range(1, 201)), [9, 8], cache, None)
+    s._keep(list(range(1, 201)), [9, 8], cache, None)
     s.tail = 2
-    c, reuse, _ = s.open(eng, [1, 2, 3, 7, 7, 7])
+    c, reuse, _ = s._open(eng, [1, 2, 3, 7, 7, 7])
     assert reuse == 3 and s.tail == 2
 
 

@@ -8,7 +8,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypedDict, Unpack, overload
 
-from .kinds import LayerKind, Tokens
+from .api import api
+from .kinds import LayerKind, PassTag, Tokens
 
 if TYPE_CHECKING:
     import torch
@@ -69,6 +70,7 @@ def _cat(hs: list[torch.Tensor]) -> torch.Tensor:
     return torch.cat(hs, dim=0)
 
 
+@api("session")
 class Session:
     """The tokens the cache holds and the cache, a hybrid's DeltaNet snapshots (`anchor`), the drafter's tail
     (`dr`, `dr_len`, `pend_h`) and the template's generation tail (`tail`, learned or given). Made by
@@ -103,6 +105,10 @@ class Session:
 
     def __len__(self) -> int:
         return len(self.ids) + (self.pending is not None)
+
+    def _called(self, tag: PassTag) -> None:
+        if self.engine is not None:
+            self.engine._called(tag)
 
     def _bound(self) -> StreamedTextModel:
         if self.engine is None:
@@ -288,7 +294,7 @@ class Session:
 
         def run() -> torch.Tensor:
             self._flush(eng)
-            cache, reuse, _ = self.open(eng, ids)
+            cache, reuse, _ = self._open(eng, ids)
             if cache is not None:
                 del self.ids[reuse:]
                 self.anchor = [a for a in self.anchor if a["n"] <= reuse]
@@ -309,7 +315,7 @@ class Session:
             raise ValueError("an empty session has nothing to go on from: feed it a prompt first")
         return self._bound().generate(self.tokens, max_new, session=self, **kw)
 
-    def match(self, prompt: Tokens) -> int:
+    def _match(self, prompt: Tokens) -> int:
         """The prefix the new prompt shares with the cache's tokens (at most n - 1); learns `tail`, the distance
         before the previous prompt's end at which its re-rendering diverged."""
         n = len(prompt)
@@ -321,7 +327,7 @@ class Session:
             self.tail = int(self.n_prompt - m)
         return m
 
-    def anchored(self, m: int) -> Anchor | None:
+    def _anchored(self, m: int) -> Anchor | None:
         """the latest DeltaNet snapshot at or before the matched prefix, None when there is none"""
         best = None
         for a in self.anchor:
@@ -329,7 +335,7 @@ class Session:
                 best = a
         return best
 
-    def open(self, engine: _State, prompt: Tokens) -> tuple[KvCache | None, int, Anchor | None]:
+    def _open(self, engine: _State, prompt: Tokens) -> tuple[KvCache | None, int, Anchor | None]:
         """What a new prompt reuses: (cache, rows reused, the snapshot restored), or (None, 0, None). A dense
         cache is cropped to the shared prefix; a hybrid's DeltaNet states cannot be cropped, so they come
         back from the latest snapshot inside it."""
@@ -339,12 +345,12 @@ class Session:
         if self.cache is None:
             return None, 0, None
         n = len(prompt)
-        m = self.match(prompt)
+        m = self._match(prompt)
         cache, reuse, anchored = None, 0, None
         if 0 < len(self.ids) < n and m == len(self.ids):
             cache, reuse = self.cache, len(self.ids)
         elif LayerKind.LINEAR in engine.layer_types:
-            anchored = self.anchored(m)
+            anchored = self._anchored(m)
             if anchored is not None:
                 from .engine.generate import lin_layer
 
@@ -355,7 +361,7 @@ class Session:
             cache, reuse = self.cache, m
         if cache is None:
             # nothing of the last conversation serves this one: its cache goes now, not when the new turn's
-            # `keep` replaces it, or the new prefill runs beside a full cache of the old (7 GB twice at 40k); the
+            # `_keep` replaces it, or the new prefill runs beside a full cache of the old (7 GB twice at 40k); the
             # drafter's own cache, which the engine holds, goes with it (a gigabyte at 120k rows)
             dr = self.dr
             self.cache, self.anchor, self.ids, self.n_prompt = None, [], [], 0
@@ -366,7 +372,7 @@ class Session:
             crop(cache, engine, reuse)
         return cache, reuse, anchored
 
-    def keep(
+    def _keep(
         self,
         prompt: Tokens,
         out: Tokens,

@@ -963,8 +963,8 @@ def check_batch_rows() -> str:
     """batched greedy decoding on the MLX device: B ragged prompts prefilled as a forest (one pass over the
     rows' tokens end to end, the attention one right-padded causal call, the rows' K/V in one flat buffer)
     and decoded through one fused forward a step, each row's tokens the tokens of its own single-sequence
-    decode (the fixture's head_dim 16 takes the per-row attention fallback in the step; the kernel path is
-    `check_attn_rows`), at 3 rows and at 16 (the one-row kernel's tile), through a left-padded batch as
+    decode (the fixture's head of 128 takes the rows kernel in the step), at 3 rows and at 16 (the one-row
+    kernel's tile), through a left-padded batch as
     serve() sends one"""
     from btb.engine import StreamedTextModel
 

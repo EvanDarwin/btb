@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Generic, TypedDict, TypeVar, Unpack, cast
 
 import torch
 
+from ..api import api
 from ..draft import Spans
 from ..kinds import Json, Proposer, TokenRows, Tokens
 from ..sampling import GREEDY, Sampling
@@ -280,6 +281,7 @@ class Chat:
         self.history, self.session, self.last = [], Session(), {}
 
 
+@api("model")
 class _TextMixin(_State):
     _tokenizer: Any = None
 
@@ -354,7 +356,7 @@ class _TextMixin(_State):
         msgs = [*messages_of(prompt), {"role": "assistant", "content": prefill}]
         return self.prompt_ids(msgs, thinking, continue_final=True)
 
-    def on_worker(self, fn: Callable[..., Any], *args: Any, **kw: Any) -> Any:
+    def _on_worker(self, fn: Callable[..., Any], *args: Any, **kw: Any) -> Any:
         """
         `fn(*args, **kw)` on this model's one worker thread, from whichever thread asked. MLX keeps a lazy
         array's stream per thread and refuses it from another, in an eval or in a destructor, so on the MLX tier
@@ -447,7 +449,7 @@ class _TextMixin(_State):
         if getattr(self, "mlx", None) is not None and threading.current_thread() is not getattr(
             self, "_worker_thread", None
         ):
-            gen: RowGeneration | BatchGeneration = self.on_worker(self._locked, self._generate, *args)
+            gen: RowGeneration | BatchGeneration = self._on_worker(self._locked, self._generate, *args)
             return gen
         return self._locked(self._generate, *args)
 
@@ -461,7 +463,7 @@ class _TextMixin(_State):
         if getattr(self, "mlx", None) is not None and threading.current_thread() is not getattr(
             self, "_worker_thread", None
         ):
-            out: R = self.on_worker(self._serial, fn, *args, **kwargs)
+            out: R = self._on_worker(self._serial, fn, *args, **kwargs)
             return out
         with self._decode_lock, torch.inference_mode():
             return fn(*args, **kwargs)

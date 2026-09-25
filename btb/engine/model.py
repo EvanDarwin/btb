@@ -35,7 +35,7 @@ from .forward import _ForwardMixin
 from .fused import fast_causal_conv1d
 from .generate import _GenerateMixin
 from .host import _Experts, _HostLinear, _NGramRows, _Router
-from .memory import RamPolicyState, VramPolicyState, _MemoryMixin
+from .memory import RamPolicyState, VramPolicyState, _LendMixin
 from .mlx_forward import MlxState, _MlxMixin
 from .native import Native
 from .scheduler import BatchScheduler
@@ -44,7 +44,7 @@ from .tiers import ColdRing, _TiersMixin
 
 
 class StreamedTextModel(
-    _FamiliesMixin, _TiersMixin, _MemoryMixin, _MlxMixin, _CudaMixin, _ForwardMixin, _GenerateMixin, _TextMixin
+    _FamiliesMixin, _TiersMixin, _LendMixin, _MlxMixin, _CudaMixin, _ForwardMixin, _GenerateMixin, _TextMixin
 ):
     """The engine over one model. Construction and lifetime live here; the forward, the tiers, memory, the
     MLX and CUDA paths and decoding are the mixins (one module each in this package)."""
@@ -542,7 +542,7 @@ class StreamedTextModel(
             self.draft_engine = None
             draft.close()
         self.abort.set()
-        # the MLX tier's teardown runs on the model's worker thread, where its arrays were built (see `on_worker`),
+        # the MLX tier's teardown runs on the model's worker thread, where its arrays were built (see `_on_worker`),
         # then the worker itself is retired
         w = getattr(self, "_worker", None)
         if w is not None and threading.current_thread() is not getattr(self, "_worker_thread", None):
