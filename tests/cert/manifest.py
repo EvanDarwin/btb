@@ -276,7 +276,7 @@ def expected_tags() -> frozenset[PassTag]:
     for surface, tags in spec.SURFACE_TAGS.items():
         for key in spec.SURFACE_SUBPATHS[surface]:
             for kind in core.served_kinds():
-                out |= tags(kind, spec.SUBPATH[key].hardware)
+                out |= tags(kind, spec.SUBPATH[key])
     return frozenset(out)
 
 

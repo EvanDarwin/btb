@@ -285,6 +285,14 @@ def fixture_paths(kind: FamilyKind, storage: Storage) -> tuple[str, ...]:
 # --- the device sub-paths, each with the tag its run must show ---------------------------------------------
 
 
+def card_rows(kind: FamilyKind) -> bool:
+    """whether the card graph's rows pass takes this family's fixture, by the engine's own gate (cuda.py
+    `_card_family_ok`, under `_card_rows_ok`): the kernel layout or the sandwich layout, at a head width the card's
+    kernels are built for (a lane holds D/32 of a head's dims)."""
+    fl = core.flags(kind)
+    return (Cap.KERNEL_LAYOUT in fl or Cap.SANDWICH in fl) and head_dim(kind) in (64, 128, 256)
+
+
 def fused_step(kind: FamilyKind) -> bool:
     """whether the MLX step elects its fused kernels for this family's fixture, by the engine's own gate
     (mlx_forward.py:1132): the kernel layout or the sandwich layout, and a rotary over the whole head."""
@@ -345,6 +353,9 @@ class DeviceSubpath:
     note: str = ""
     only: Container | None = None
     needs: Cap | None = None
+    # the card graph runs the sub-path's passes: its knobs leave the card's kernels on (the rows of a fork or a
+    # batch then take the card graph's rows pass where the family's layers do)
+    card_graph: bool = False
 
     def expects(self, kind: FamilyKind, storage: Storage) -> frozenset[PassTag]:
         """every tag a run of this cell must carry: the sub-path's own, the residency policy this cell's own knobs
@@ -430,7 +441,14 @@ DEVICE_SUBPATHS: tuple[DeviceSubpath, ...] = (
         "the expert store's plain line instead of the default Bus Pass",
         needs=Cap.MOE,
     ),
-    DeviceSubpath("cuda-graph", Hardware.CUDA, lambda k, s: PassTag.CUDA_GRAPH, {"device": "cuda"}, "card step graph"),
+    DeviceSubpath(
+        "cuda-graph",
+        Hardware.CUDA,
+        lambda k, s: PassTag.CUDA_GRAPH,
+        {"device": "cuda"},
+        "card step graph",
+        card_graph=True,
+    ),
     DeviceSubpath(
         "cuda-torch",
         Hardware.CUDA,
@@ -506,28 +524,33 @@ SURFACE_SUBPATHS: dict[Surface, tuple[str, ...]] = {
     Surface.BATCH: ("cpu", "mlx-step"),
     Surface.CONTEXT: ("cpu", "mlx-step"),
     Surface.HOOKED: ("cpu", "mlx-step", "cuda-torch"),
-    Surface.FORK: ("cpu", "mlx-step", "cuda-torch"),
+    Surface.FORK: ("cpu", "mlx-step", "cuda-graph", "cuda-torch"),
     Surface.MODEL: ("cpu", "mlx-step", "cuda-torch"),
     Surface.SESSION: ("cpu", "mlx-step", "cuda-torch"),
 }
 
 
-def rows_tag(kind: FamilyKind, hardware: Hardware) -> PassTag:
-    """the path a fork's or a batch's rows must show, by the engine's own gate (`_mlx_batch_ok`): the MLX batched
-    step over a flat buffer for a dense family on MLX, the torch pass over joined layers everywhere else"""
-    return PassTag.ROWS_FLAT if hardware is Hardware.MLX and Cap.DENSE in core.flags(kind) else PassTag.ROWS_JOINED
+def rows_tag(kind: FamilyKind, dev: DeviceSubpath) -> PassTag:
+    """the path a fork's or a batch's rows must show, by the engine's own gates: the MLX batched step over a flat
+    buffer for a dense family on MLX (`_mlx_batch_ok`), the card graph's rows pass on a sub-path that runs the card
+    graph for a family the card's kernels take (`_card_rows_ok`), the torch pass over joined layers elsewhere"""
+    if dev.hardware is Hardware.MLX and Cap.DENSE in core.flags(kind):
+        return PassTag.ROWS_FLAT
+    if dev.card_graph and card_rows(kind):
+        return PassTag.ROWS_CARD
+    return PassTag.ROWS_JOINED
 
 
-# the tags a cell of an axis beside the cartesian must show, by family and hardware (the sub-path's own `expects`
-# is about the single stream these axes leave). The API surfaces take every call their owners declare
+# the tags a cell of an axis beside the cartesian must show, by family and device sub-path (the sub-path's own
+# `expects` is about the single stream these axes leave). The API surfaces take every call their owners declare
 # (btb.kinds.api_tags), so a method added to an API class is a tag its cell must show.
-SURFACE_TAGS: dict[Surface, Callable[[FamilyKind, Hardware], frozenset[PassTag]]] = {
-    Surface.HOOKED: lambda k, hw: frozenset({PassTag.PICK_HOOKED}),
-    Surface.FORK: lambda k, hw: (
-        frozenset({rows_tag(k, hw)}) | api_tags("rows") | api_tags("branches") | api_tags("batch")
+SURFACE_TAGS: dict[Surface, Callable[[FamilyKind, DeviceSubpath], frozenset[PassTag]]] = {
+    Surface.HOOKED: lambda k, dev: frozenset({PassTag.PICK_HOOKED}),
+    Surface.FORK: lambda k, dev: (
+        frozenset({rows_tag(k, dev)}) | api_tags("rows") | api_tags("branches") | api_tags("batch")
     ),
-    Surface.MODEL: lambda k, hw: api_tags("model") | api_tags("room"),
-    Surface.SESSION: lambda k, hw: api_tags("session"),
+    Surface.MODEL: lambda k, dev: api_tags("model") | api_tags("room"),
+    Surface.SESSION: lambda k, dev: api_tags("session"),
 }
 
 

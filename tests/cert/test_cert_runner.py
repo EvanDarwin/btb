@@ -349,7 +349,7 @@ def _axis_tags(
     """the surface's tags in the report: the last pass's forks, and (`calls`) every API call made on the model"""
     kind = next(k for k, s in spec.FIXTURE_STEM.items() if s == stem)
     report = sm.last_pass_report()
-    for want in sorted(spec.SURFACE_TAGS[surface](kind, dev.hardware)):
+    for want in sorted(spec.SURFACE_TAGS[surface](kind, dev)):
         if calls or "." not in want.value:
             assert want in report, (
                 f"{stem} on {dev.key}/{surface.value}: {want} never engaged (got {sorted(report.tags)})"
