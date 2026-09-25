@@ -4,8 +4,9 @@ and a fork's layer over another cache's rows."""
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import torch
 
@@ -13,11 +14,65 @@ from .. import mlx as mlxdev
 
 if TYPE_CHECKING:
     import mlx.core as mx_
+    from transformers.cache_utils import CacheLayerMixin, DynamicCache, LinearAttentionCacheLayerMixin
     from transformers.cache_utils import DynamicLayer as _DynamicLayer
+
+    # a sequence's cache: transformers' DynamicCache over the engine's layers (GrowLayer, a fork's, a hybrid's)
+    KvCache = DynamicCache
+    # one layer of it: an attention layer's rows, or a linear-attention layer's recurrent states
+    CacheLayer = CacheLayerMixin | LinearAttentionCacheLayerMixin
 else:
     # transformers is imported by name here and not at the top: the engine package is imported for its
     # discovery and planning too, where transformers' import time is not wanted
     _DynamicLayer = __import__("transformers").cache_utils.DynamicLayer
+
+# a linear-attention layer's states copied out (a mark's, an anchor's): its conv and recurrent states, per state
+# index where the layer keeps several
+LinearStates = tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]] | tuple[torch.Tensor, torch.Tensor]
+
+
+def linear_layer(cl: CacheLayer) -> LinearAttentionCacheLayerMixin:
+    """`cl` as the linear-attention layer a hybrid's linear index holds; a TypeError for any other"""
+    from transformers.cache_utils import LinearAttentionCacheLayerMixin
+
+    if not isinstance(cl, LinearAttentionCacheLayerMixin):
+        raise TypeError(f"a linear-attention layer's states were asked of a {type(cl).__name__}")
+    return cl
+
+
+def attention_rows(cl: CacheLayer) -> tuple[torch.Tensor, torch.Tensor]:
+    """an attention layer's keys and values; a TypeError for a layer that holds none"""
+    from transformers.cache_utils import CacheLayerMixin
+
+    if not isinstance(cl, CacheLayerMixin) or cl.keys is None or cl.values is None:
+        raise TypeError(f"an attention layer's rows were asked of a {type(cl).__name__} holding none")
+    return cl.keys, cl.values
+
+
+def indexer_keys(cl: CacheLayer) -> torch.Tensor | None:
+    """a sparse-attention layer's indexer keys [B, n, d_index]; None for any other layer"""
+    from transformers.cache_utils import DynamicIndexedLayer
+
+    return cl.indexer_keys if isinstance(cl, DynamicIndexedLayer) else None
+
+
+@runtime_checkable
+class GraphStates(Protocol):
+    """a linear layer whose states the pipelined MLX decode carries in its graph between steps (btb's attributes
+    on transformers' layer): this step's (conv, recurrent) pair and the step before's"""
+
+    _mx_pending: tuple[mx_.array, mx_.array] | None
+    _mx_prev: tuple[mx_.array, mx_.array] | None
+
+
+# the caches a fork or a batch built (`forked`), held weakly
+_FORKS: weakref.WeakSet[KvCache] = weakref.WeakSet()
+
+
+def mark_forked(cache: KvCache) -> KvCache:
+    """`cache` as a fork's or a batch's: the single-row paths stand aside for it"""
+    _FORKS.add(cache)
+    return cache
 
 
 class GrowLayer(_DynamicLayer):
@@ -759,7 +814,7 @@ class GrowLayer(_DynamicLayer):
         return self.keys, self.values
 
 
-def set_rows(layer: Any, k: torch.Tensor, v: torch.Tensor) -> None:
+def set_rows(layer: CacheLayerMixin, k: torch.Tensor, v: torch.Tensor) -> None:
     """btb's own write of a layer's rows (see `GrowLayer._set_rows`); any other layer takes them as assigned"""
     if isinstance(layer, GrowLayer):
         layer._set_rows(k, v)
@@ -784,10 +839,10 @@ def _inside(t: torch.Tensor, b: torch.Tensor) -> bool:
     return blo <= lo and hi <= bhi
 
 
-def forked(cache: Any) -> bool:
+def forked(cache: KvCache) -> bool:
     """a fork's or a batch's cache: the single-row paths (the fused MLX step, the card graph) cannot read its
     layers"""
-    return bool(getattr(cache, "btb_fork", False))
+    return cache in _FORKS
 
 
 class ForkLayer(_DynamicLayer):
@@ -841,7 +896,7 @@ class ForkLayer(_DynamicLayer):
         return int(self._pk.shape[-2]) + self._t
 
     def update(
-        self, key_states: torch.Tensor, value_states: torch.Tensor, *args: Any, **kwargs: Any
+        self, key_states: torch.Tensor, value_states: torch.Tensor, *args: object, **kwargs: object
     ) -> tuple[torch.Tensor, torch.Tensor]:
         B, Hk, T, d = key_states.shape
         need = self._t + T

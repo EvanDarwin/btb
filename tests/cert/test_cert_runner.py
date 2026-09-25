@@ -307,6 +307,7 @@ def test_hooked_decode_is_the_plain_one(stem: str, dev: spec.DeviceSubpath) -> N
                 _axis_tags(sm, spec.Surface.HOOKED, stem, dev)
             toks = list(g.tokens)
             assert_same_tokens(plain, toks, f"{stem} on {dev.key}: the hooked decode left the plain one")
+            assert g.logprobs is not None and g.hidden is not None
             assert [t.token for t in g.logprobs] == toks and all(len(t.top) == 2 for t in g.logprobs)
             assert int(next(iter(g.hidden.values())).shape[0]) == len(toks)
             runs.append(toks)

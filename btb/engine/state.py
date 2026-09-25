@@ -8,7 +8,7 @@ from __future__ import annotations
 import weakref
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 import torch
 
@@ -16,6 +16,10 @@ from ..kinds import LayerTier, PassReport, PassTag, Proposer
 
 # rows of the lm_head the drafter proposes from
 DRAFT_VOCAB = 32768
+
+# a call handed to the decode's thread (`_serial`): its parameters and its result
+P = ParamSpec("P")
+R = TypeVar("R")
 
 # LayerTier -> the PassTag a pass records for a layer on that tier (btb/engine/device.py Placement.tier)
 _TIER_TAG: dict[LayerTier, PassTag] = {
@@ -51,13 +55,14 @@ if TYPE_CHECKING:
     from ..mlx.mega import MegaPass
     from ..sampling import Sampling
     from ..session import Session
-    from .device import Device
+    from .cache import CacheLayer, KvCache, LinearStates
+    from .device import Device, DeviceSpec
     from .drafter import MTPDrafter
     from .experts import ExpertProfile, _ExpertStore
     from .families import Family
     from .hooks import Hooks
     from .host import _HostLinear
-    from .memory import RamPolicyState, VramPolicyState
+    from .memory import RamPolicyState, Room, VramPolicyState
     from .mlx_forward import MlxState
     from .model import StreamedTextModel
     from .scheduler import BatchScheduler, Plan
@@ -151,7 +156,7 @@ class _State:
     _card_ms_min: float | None
     _last_card_ms: float | None
     _shed: list[str]
-    _live_caches: weakref.WeakSet[Any]  # every cache a layer's move reaches (`_track`)
+    _live_caches: weakref.WeakSet[KvCache]  # every cache a layer's move reaches (`_track`)
 
     # -- the scheduler, and the run's counters --
     abort: threading.Event
@@ -237,10 +242,10 @@ class _State:
     def _cache_to(cache: Any, i: int, dev: str | torch.device) -> None:
         raise NotImplementedError
 
-    def _track(self, cache: Any) -> Any:
+    def _track(self, cache: KvCache) -> KvCache:
         raise NotImplementedError
 
-    def _caches_to(self, i: int, dev: str | torch.device, cache: Any = None) -> None:
+    def _caches_to(self, i: int, dev: str | torch.device, cache: KvCache | None = None) -> None:
         raise NotImplementedError
 
     def _cold_release(self, i: int) -> None:
@@ -508,6 +513,14 @@ class _State:
     def _lin(cl: Any) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
+    @staticmethod
+    def _lin_snap(cl: CacheLayer) -> LinearStates:
+        raise NotImplementedError
+
+    @staticmethod
+    def _lin_restore(cl: CacheLayer, snap: LinearStates) -> None:
+        raise NotImplementedError
+
     def generate_greedy(
         self,
         ids: torch.Tensor | Tokens | TokenRows,
@@ -589,10 +602,10 @@ class _State:
     def lend_policy(self) -> None:
         raise NotImplementedError
 
-    def room(self, nbytes: int, device: Any = None, name: str = "room") -> Any:
+    def room(self, nbytes: int, device: DeviceSpec | None = None, name: str = "room") -> Room:
         raise NotImplementedError
 
-    def _serial(self, fn: Callable[..., Any], *args: Any) -> Any:
+    def _serial(self, fn: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
         raise NotImplementedError
 
     def ram_policy(self, log: Log | None = None) -> None:

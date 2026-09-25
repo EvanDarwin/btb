@@ -20,7 +20,7 @@ import pytest
 from pytest import CaptureFixture
 
 from btb.draft import SpanBank
-from btb.engine.text import Generation
+from btb.engine.text import Generation, RowGeneration
 from btb.kinds import Json, Tokens
 from btb.sampling import Sampling
 from btb.serve import Engine, Handler, Message, _public
@@ -254,7 +254,7 @@ def test_a_request_never_sizes_a_decode_past_the_window() -> None:
     class _Model:
         window = 64
 
-        def generate(self, ids: Tokens, max_new: int | None, **kw: object) -> Generation:
+        def generate(self, ids: Tokens, max_new: int | None, **kw: object) -> RowGeneration:
             asked.append(max_new)
             return Generation([], {"cap": max_new or 0})
 

@@ -11,7 +11,7 @@ import sys
 import types
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 import pytest
 import torch
@@ -364,13 +364,12 @@ def test_an_mlx_plan_prices_the_gpu_and_says_so(monkeypatch: pytest.MonkeyPatch)
     p.plan_budget = lambda *a, **kw: _TiersMixin.plan_budget(cast("_TiersMixin", p), *a, **kw)
     p.fam = types.SimpleNamespace(moe=False)
     hb = HostBudget(total=64 * GB, available=48 * GB, commit=64 * GB, footprint=0, os_floor=0, growth=0, floor=4 * GB)
-    kw: dict[str, Any] = {"packed": False, "fp32": False, "vram_reserve_gb": 0.0, "budget": hb}
-    pl = BatchScheduler.plan_placement(p, "mlx", 0.0, **kw)
+    pl = BatchScheduler.plan_placement(p, "mlx", 0.0, packed=False, fp32=False, vram_reserve_gb=0.0, budget=hb)
     assert len(pl.warm) == 8 and not pl.cold and pl.gpu_bps == 100e9
     assert pl.predicted_ms_per_token == pytest.approx((pl.bytes.warm + pl.bytes.head) / 100e9 * 1e3)
     s = str(pl)
     assert "8 on the GPU" in s and "head on the GPU" in s and "the GPU reads 100 GB/s" in s and "host" not in s
-    cpu = BatchScheduler.plan_placement(p, "cpu", 0.0, **kw)
+    cpu = BatchScheduler.plan_placement(p, "cpu", 0.0, packed=False, fp32=False, vram_reserve_gb=0.0, budget=hb)
     assert cpu.gpu_bps is None and "8 host" in str(cpu) and "head host" in str(cpu)
 
 
@@ -483,20 +482,27 @@ def test_session_reuses_the_shared_prefix_and_learns_the_tail() -> None:
     the shared prefix otherwise, nothing on a fresh one; the template's tail is learned from the divergence"""
     import types
 
+    from transformers.cache_utils import DynamicCache, DynamicLayer
+
+    from btb.engine.drafter import MTPDrafter
+    from btb.engine.state import _State
     from btb.session import Session
 
-    class Layer:
+    class Layer(DynamicLayer):
         def __init__(self, n: int) -> None:
+            super().__init__()
             self.keys = torch.zeros(1, 2, n, 4)
             self.values = torch.zeros(1, 2, n, 4)
+            self.is_initialized = True
 
-    def engine_and_cache(n: int) -> tuple[types.SimpleNamespace, types.SimpleNamespace]:
-        cache = types.SimpleNamespace(layers=[Layer(n), Layer(n)])
+    def engine_and_cache(n: int) -> tuple[_State, DynamicCache]:
+        cache = DynamicCache()
+        cache.layers = [Layer(n), Layer(n)]
         eng = types.SimpleNamespace(layer_types=["full_attention", "full_attention"], L=2)
-        return eng, cache
+        return cast("_State", eng), cache
 
     s = Session()
-    assert s.fresh and s.open(None, [1, 2, 3]) == (None, 0, None)
+    assert s.fresh and s.open(engine_and_cache(1)[0], [1, 2, 3]) == (None, 0, None)
     eng, cache = engine_and_cache(6)
     s.keep([1, 2, 3, 4], [9, 8, 7], cache, None)  # the cache holds the prompt and the answer but its last token
     assert s.ids == [1, 2, 3, 4, 9, 8] and s.n_prompt == 4 and not s.fresh
@@ -510,7 +516,7 @@ def test_session_reuses_the_shared_prefix_and_learns_the_tail() -> None:
     # drafter's cache with it
     drafter = types.SimpleNamespace(resets=0)
     drafter.reset = lambda: setattr(drafter, "resets", drafter.resets + 1)
-    s.dr = drafter
+    s.dr = cast("MTPDrafter", drafter)
     assert s.open(eng, [5, 5, 5]) == (None, 0, None) and s.cache is None and s.ids == [] and s.fresh
     assert s.dr is None and drafter.resets == 1
     # a prompt that parts from a long previous prompt far from its end is another conversation: the crop still

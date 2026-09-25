@@ -8,10 +8,13 @@ releases text only once its bytes are whole. Nothing here imports torch.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
-from typing import Any
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from .kinds import Json, Tokens
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 Messages = Sequence[Json]
 
@@ -25,8 +28,28 @@ def messages_of(prompt: str | Messages) -> list[dict[str, str]]:
     return [dict(m) for m in prompt]
 
 
+# a tool a chat template renders: its function schema (OpenAI's `tools` entry), or the function itself
+ToolSpec = Json | Callable[..., object]
+# the tools a request offers the model
+ToolSpecs = Sequence[ToolSpec]
+
+
+class TemplateOptions(TypedDict, total=False):
+    """what `template` asks of a chat template; the switches a template's signature lacks are dropped"""
+
+    tokenize: bool
+    add_generation_prompt: bool
+    continue_final_message: bool
+    enable_thinking: bool
+    tools: list[ToolSpec]
+
+
 def template(
-    tok: Any, history: Messages, thinking: bool = False, tools: Any = None, continue_final: bool = False
+    tok: PreTrainedTokenizerBase,
+    history: Messages,
+    thinking: bool = False,
+    tools: ToolSpecs | None = None,
+    continue_final: bool = False,
 ) -> str:
     """
     The conversation rendered through the tokenizer's chat template with the generation prompt appended;
@@ -34,16 +57,17 @@ def template(
     schemas, both dropped for a template whose signature lacks them. `continue_final` leaves the last message
     (the assistant's, begun) open for the model to go on from, where a new turn would start otherwise.
     """
+    kw: TemplateOptions
     if continue_final and history and history[-1].get("role") == "assistant":
-        kw: dict[str, Any] = {"tokenize": False, "add_generation_prompt": False, "continue_final_message": True}
+        kw = {"tokenize": False, "add_generation_prompt": False, "continue_final_message": True}
     else:
         kw = {"tokenize": False, "add_generation_prompt": True}
     kw["enable_thinking"] = thinking
     if tools:
-        kw["tools"] = tools
+        kw["tools"] = list(tools)
     while True:
         try:
-            return str(tok.apply_chat_template(history, **kw))
+            return str(tok.apply_chat_template(list(history), **kw))
         except TypeError:
             if "enable_thinking" in kw:
                 del kw["enable_thinking"]
@@ -58,7 +82,11 @@ def template(
 
 
 def prompt_ids(
-    tok: Any, prompt: str | Messages, thinking: bool = False, tools: Any = None, continue_final: bool = False
+    tok: PreTrainedTokenizerBase,
+    prompt: str | Messages,
+    thinking: bool = False,
+    tools: ToolSpecs | None = None,
+    continue_final: bool = False,
 ) -> list[int]:
     """
     The prompt as the model takes it: the template rendered and tokenized, no special tokens added on top

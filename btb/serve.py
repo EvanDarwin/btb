@@ -23,13 +23,13 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from . import available_models, load, model_stem, resolve, serve_name
 from .draft import SpanBank
 from .engine.constrain import JsonObjectPrefix, LogitBias, Penalties, PrefixConstraint
 from .engine.device import resolve_device
-from .engine.hooks import LogitsProcessor, TokenLogprob
+from .engine.hooks import LogitsProcessor, OnRowToken, OnToken, TokenLogprob
 from .kinds import Json, Log, Tokens
 from .options import BadValue, DeviceName, OptionError
 from .sampling import Sampling
@@ -39,13 +39,28 @@ from .text import Channels, TextStream, answer, probe_tail
 from .tools import ToolFormat, tool_format
 
 if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
+
     from .engine.model import StreamedTextModel
+    from .engine.text import GenerateStats
     from .hf import ModelEntry
     from .kinds import FamilyKind
+    from .tools import ToolCall
 
 # a chat message (role, content, optional tool fields) and a decoded request body (OpenAI or Ollama JSON)
 Message = Json
 Request = Json
+# one decode as the server reads it: the prompt's ids, the answer's tokens, its counts, its logprobs (None: not
+# asked)
+RunResult = tuple[list[int], list[int], "GenerateStats", list[TokenLogprob] | None]
+# `n` answers to one prompt: each one's tokens (stop tokens out), whether it ended at one, the counts, the logprobs
+RowsResult = tuple[list[list[int]], list[bool], "GenerateStats", list[list[TokenLogprob]] | None]
+# a streamed answer's sink: (row, a piece of text, "content" or "thinking"); a falsy return stops that row's text
+RowSink = Callable[[int, str, str], object]
+# one answer's sink: (a piece of text, its kind)
+TextSink = Callable[[str, str], object]
+# what `_pump` runs: a decode reporting each token as `on_token(row, token)`
+R = TypeVar("R")
 
 
 class Engine:
@@ -104,12 +119,12 @@ class Engine:
         self,
         messages: Sequence[Message],
         max_new: int | None,
-        on_token: Callable[[int], Any] | None = None,
+        on_token: OnToken | None = None,
         ids: Tokens | None = None,
         sampling: Sampling | None = None,
         processors: Sequence[LogitsProcessor] = (),
         logprobs: int | None = None,
-    ) -> Any:
+    ) -> RunResult:
         """(prompt ids, answer tokens without the stop tokens, stats, a `TokenLogprob` per answer token or None)"""
         if ids is None:
             ids = self.ids_for(messages)
@@ -129,7 +144,7 @@ class Engine:
         lp = None if gen.logprobs is None else [x for x in gen.logprobs if x.token not in es]
         self.bank.add("prompt", ids)
         self.bank.add("answer", toks)
-        return ids, toks, gen.stats, lp
+        return list(ids), toks, gen.stats, lp
 
     def run_rows(
         self,
@@ -139,8 +154,8 @@ class Engine:
         sampling: Sampling | None = None,
         processors: Sequence[LogitsProcessor] = (),
         logprobs: int | None = None,
-        on_token: Callable[[int, int], Any] | None = None,
-    ) -> Any:
+        on_token: OnRowToken | None = None,
+    ) -> RowsResult:
         """`n` answers to one prompt, the session forked after its prefill: (their tokens without the stop tokens,
         whether each ended at a stop token, stats, their logprobs or None). The session keeps the prompt."""
         max_new = self._cap(ids, max_new)
@@ -674,7 +689,7 @@ def _logprobs(req: Request) -> int | None:
     return int(top or 0) if on else None
 
 
-def _stops(v: Any, name: str = "stop") -> list[str]:
+def _stops(v: object, name: str = "stop") -> list[str]:
     """stop strings: a string or a list of up to 4 non-empty ones; absent or null none"""
     if v is None:
         return []
@@ -685,7 +700,7 @@ def _stops(v: Any, name: str = "stop") -> list[str]:
     return list(v)
 
 
-def _json_mode(v: Any, name: str) -> bool:
+def _json_mode(v: object, name: str) -> bool:
     """whether an OpenAI `response_format` (or Ollama's `format`) asks for JSON: {"type": "text"} or
     {"type": "json_object"} (Ollama: "json"); a schema is refused, as the answer is held to JSON and not to it"""
     if v is None or v == "" or v == {"type": "text"}:
@@ -695,10 +710,10 @@ def _json_mode(v: Any, name: str) -> bool:
     raise BadValue(name, 'text or a JSON object ({"type": "json_object"}, Ollama "json"); a schema is not enforced', v)
 
 
-def _processors(req: Request, engine: Engine, start: int, json_field: str = "response_format") -> list[Any]:
+def _processors(req: Request, engine: Engine, start: int, json_field: str = "response_format") -> list[LogitsProcessor]:
     """the logits processors a request's fields ask for, over an answer from `start`: `logit_bias`, the presence
     and frequency penalties, and JSON mode last (it keeps only tokens that leave the text JSON)"""
-    out: list[Any] = []
+    out: list[LogitsProcessor] = []
     bias = req.get("logit_bias")
     if bias is not None:
         if not isinstance(bias, dict):
@@ -722,7 +737,7 @@ def _processors(req: Request, engine: Engine, start: int, json_field: str = "res
     return out
 
 
-def _lp_json(tok: Any, lp: Sequence[TokenLogprob] | None) -> Json | None:
+def _lp_json(tok: PreTrainedTokenizerBase, lp: Sequence[TokenLogprob] | None) -> Json | None:
     """OpenAI's `logprobs` object for a choice: each token's text, bytes and log-probability, and its alternatives"""
     if lp is None:
         return None
@@ -779,7 +794,7 @@ class _Pieces:
     """One answer's tokens as text pieces as they decode: gpt-oss's channels split (`push(t)` returns
     [(kind, delta)], kind "content" or "thinking"), a stop token and a call's body never text"""
 
-    def __init__(self, tok: Any, eos: Sequence[int]) -> None:
+    def __init__(self, tok: PreTrainedTokenizerBase, eos: Sequence[int]) -> None:
         self.ch = Channels(tok)
         self.streams = {"content": TextStream(tok), "thinking": TextStream(tok)}
         self.eos = set(eos)
@@ -927,21 +942,20 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:  # the client is gone, or stopped reading (the socket timeout is an OSError too)
             return False
 
-    def _pump(
-        self, engine: Engine, run: Callable[[Callable[[int, int], Any]], Any], rows: int, emit: Callable[..., Any]
-    ) -> tuple[Any, float | None]:
+    def _pump(self, engine: Engine, run: Callable[[OnRowToken], R], rows: int, emit: RowSink) -> tuple[R, float | None]:
         """`run(on_token)` on a thread of its own, the tokens it reports as `on_token(row, token)` turned into text
         pieces for `emit(row, delta, kind)` as they decode - the answer and the reasoning (gpt-oss's channels) as
         two texts, kind "content" or "thinking". A row whose `emit` returns False is not written to again; once
         none is left the model stops at its next step. Returns (what `run` returned, the first token's time)."""
-        q: Any = queue.Queue()
-        res = {}
+        q: queue.Queue[tuple[int, int] | None] = queue.Queue()
+        out: list[R] = []
+        err: list[str] = []
 
         def work() -> None:
             try:
-                res["out"] = run(lambda r, t: q.put((int(r), int(t))))
+                out.append(run(lambda r, t: q.put((int(r), int(t)))))
             except Exception as e:
-                res["err"] = repr(e)
+                err.append(repr(e))
             finally:
                 q.put(None)
 
@@ -977,26 +991,26 @@ class Handler(BaseHTTPRequestHandler):
             th.join()
             if stopped:
                 engine.sm.abort.clear()
-        if "err" in res:
-            raise RuntimeError(res["err"])
-        return res["out"], t_first
+        if err:
+            raise RuntimeError(err[0])
+        return out[0], t_first
 
     def _decode(
         self,
         engine: Engine,
         messages: Sequence[Message],
         max_new: int | None,
-        emit: Callable[..., Any],
+        emit: TextSink,
         ids: Tokens | None = None,
-        on_content: Callable[..., Any] | None = None,
+        on_content: Callable[[str], object] | None = None,
         sampling: Sampling | None = None,
         processors: Sequence[LogitsProcessor] = (),
         logprobs: int | None = None,
-    ) -> Any:
+    ) -> tuple[list[int], list[int], GenerateStats, float | None, list[TokenLogprob] | None]:
         """one answer streamed: `emit(delta, kind)` its pieces (the content through `on_content` when given);
         (prompt ids, tokens, stats, the first token's time, logprobs)"""
 
-        def run(on_token: Callable[[int, int], Any]) -> Any:
+        def run(on_token: OnRowToken) -> RunResult:
             return engine.run(
                 messages,
                 max_new,
@@ -1007,7 +1021,7 @@ class Handler(BaseHTTPRequestHandler):
                 logprobs=logprobs,
             )
 
-        def out(_r: int, delta: str, kind: str) -> Any:
+        def out(_r: int, delta: str, kind: str) -> object:
             return on_content(delta) if kind == "content" and on_content is not None else emit(delta, kind)
 
         (ids_used, toks, c, lp), t_first = self._pump(engine, run, 1, out)
@@ -1171,7 +1185,7 @@ class Handler(BaseHTTPRequestHandler):
 
             def message(toks: Tokens) -> tuple[Message, bool, bool]:
                 """an answer's message, whether it calls a tool, and whether a stop string cut it"""
-                calls: list[Any] = []
+                calls: list[ToolCall] = []
                 if tools:
                     text, think, calls = fmt.from_tokens(engine.tok, toks, tools)
                 else:
@@ -1213,7 +1227,7 @@ class Handler(BaseHTTPRequestHandler):
                     msg, called, cut = message(toks)
                     choices.append({"index": i, "message": msg, "finish_reason": reason(called, cut, ended[i])})
                     if top is not None:
-                        choices[-1]["logprobs"] = _lp_json(engine.tok, lps[i])
+                        choices[-1]["logprobs"] = _lp_json(engine.tok, lps[i] if lps is not None else None)
                 return self._json(200, body(choices, sum(len(r) for r in rows)))
             if not stream:
                 t0 = time.perf_counter()
@@ -1247,7 +1261,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, body([choice], len(toks)))
             self._stream_head("text/event-stream")
 
-            def send(delta: Json, finish: Any = None, index: int = 0, logprobs: Json | None = None) -> bool:
+            def send(delta: Json, finish: str | None = None, index: int = 0, logprobs: Json | None = None) -> bool:
                 choice: Json = {"index": index, "delta": delta, "finish_reason": finish}
                 if logprobs is not None:
                     choice["logprobs"] = logprobs
@@ -1275,7 +1289,7 @@ class Handler(BaseHTTPRequestHandler):
             first = [True] * n
             stoppers = [_Stops(stops) if stops else None for _ in range(n)]
 
-            def emit(i: int, delta: Any, kind: str = "content") -> Any:
+            def emit(i: int, delta: str, kind: str = "content") -> bool:
                 part = {"content": delta} if kind == "content" else {"reasoning_content": delta}
                 if first[i]:
                     part = dict({"role": "assistant"}, **part)
@@ -1294,7 +1308,7 @@ class Handler(BaseHTTPRequestHandler):
                 ok = (g.push(piece) if g is not None else emit(i, piece)) if piece else True
                 return bool(ok) and not (st is not None and st.hit)
 
-            def run(on_token: Callable[[int, int], Any]) -> Any:
+            def run(on_token: OnRowToken) -> RowsResult:
                 if n > 1:
                     return engine.run_rows(
                         ids, n, max_new, sampling=smp, processors=procs, logprobs=top, on_token=on_token
@@ -1317,7 +1331,7 @@ class Handler(BaseHTTPRequestHandler):
                 st, g = stoppers[i], gates[i]
                 if st is not None and not st.hit and (tail := st.flush()):
                     _ = g.push(tail) if g is not None else emit(i, tail)
-                calls: list[Any] = []
+                calls: list[ToolCall] = []
                 if g is not None:
                     _prose, _think, calls = fmt.from_tokens(engine.tok, toks, tools)
                     g.finish()
@@ -1338,7 +1352,7 @@ class Handler(BaseHTTPRequestHandler):
                         first[i] = False
                     send(part, index=i)
                 if top is not None:
-                    send({}, index=i, logprobs=_lp_json(engine.tok, lps[i]))
+                    send({}, index=i, logprobs=_lp_json(engine.tok, lps[i] if lps is not None else None))
                 send({}, reason(bool(calls), st is not None and st.hit, ended[i]), index=i)
             if want_usage:
                 send_usage(len(ids), sum(len(r) for r in rows))
@@ -1353,13 +1367,13 @@ class Handler(BaseHTTPRequestHandler):
         smp: Sampling,
         procs: Sequence[LogitsProcessor],
         stops: Sequence[str],
-        emit: Callable[..., Any] | None = None,
-    ) -> tuple[Any, Any, Any, float | None]:
+        emit: TextSink | None = None,
+    ) -> tuple[list[int], list[int], GenerateStats, float | None]:
         """an Ollama route's decode, (prompt ids, tokens, stats, the first token's time): streamed to `emit` when
         given, the content through the stop strings (one ends the decode where it appears)"""
         if emit is None and not stops:
-            ids, toks, c, _lp = engine.run(messages, max_new, ids=ids, sampling=smp, processors=procs)
-            return ids, toks, c, None
+            used, toks, c, _lp = engine.run(messages, max_new, ids=ids, sampling=smp, processors=procs)
+            return used, toks, c, None
         send = emit if emit is not None else (lambda *_a: True)
         st = _Stops(stops) if stops else None
 
@@ -1368,12 +1382,12 @@ class Handler(BaseHTTPRequestHandler):
             ok = send(piece, "content") if piece else True
             return bool(ok) and not (st is not None and st.hit)
 
-        ids, toks, c, t_first, _lp = self._decode(
+        used, toks, c, t_first, _lp = self._decode(
             engine, messages, max_new, send, ids=ids, on_content=content, sampling=smp, processors=procs
         )
         if st is not None and not st.hit and (tail := st.flush()):
             send(tail, "content")
-        return ids, toks, c, t_first
+        return used, toks, c, t_first
 
     def _limit(self, req: Request) -> int | None:
         """Ollama's options.num_predict: a cap above 0; -1 (until the turn ends) and -2 (fill the context) as
@@ -1392,7 +1406,7 @@ class Handler(BaseHTTPRequestHandler):
         self,
         ids: Tokens,
         toks: Tokens,
-        c: Json,
+        c: GenerateStats,
         t0: float,
         t_first: float | None,
         t_end: float,
@@ -1412,7 +1426,7 @@ class Handler(BaseHTTPRequestHandler):
         self,
         engine: Engine,
         toks: Tokens,
-        c: Json,
+        c: GenerateStats,
         t0: float,
         t_first: float | None,
         t_end: float,

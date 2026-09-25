@@ -7,30 +7,50 @@ from __future__ import annotations
 
 import copy
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Self
 
 import torch
 
 from .. import mlx as mlxdev
 from ..kinds import LayerKind, PassTag, Tokens
 from ..sampling import GREEDY, Sampling
-from .cache import ForkIndexedLayer, ForkLayer, GrowLayer, _DynamicLayer
-from .hooks import Hooks, LogitsProcessor, PassStats
+from .cache import (
+    ForkIndexedLayer,
+    ForkLayer,
+    GraphStates,
+    GrowLayer,
+    LinearStates,
+    _DynamicLayer,
+    attention_rows,
+    indexer_keys,
+    linear_layer,
+    mark_forked,
+)
+from .hooks import Hooks, LogitsProcessor, OnPass, OnRowToken
 
 if TYPE_CHECKING:
+    import mlx.core as mx_
+    from transformers.cache_utils import LinearAttentionCacheLayerMixin
+
     from ..session import Session
-    from .text import Generation
+    from .cache import CacheLayer, KvCache
+    from .model import StreamedTextModel
+    from .text import BatchGeneration
+
+    # a row's own attention rows taken out of the batch: a fork's torch (k, v[, indexer keys]), or the MLX step
+    # buffer's slices (k, v[, their int8 scales])
+    RowKV = tuple[torch.Tensor, ...] | list[mx_.array]
 
 
 @dataclass
 class _Row:
-    """a row taken out of the batch: its own rows of each attention layer - torch (k, v) or MLX step-buffer
-    slices - its recurrent states, and its drawn token not fed or its next-token logits"""
+    """a row taken out of the batch: its own rows of each attention layer, its recurrent states, and its drawn
+    token not fed or its next-token logits"""
 
-    kv: dict[int, Any] = field(default_factory=dict)
-    lin: dict[int, tuple[dict[Any, torch.Tensor], dict[Any, torch.Tensor]]] = field(default_factory=dict)
+    kv: dict[int, RowKV] = field(default_factory=dict)
+    lin: dict[int, LinearStates] = field(default_factory=dict)
     pending: int | None = None
     logits: torch.Tensor | None = None
 
@@ -42,7 +62,7 @@ class _Rows:
 
     salted = False  # each row draws under `sampling.row(r)` (a fork's rows, alike but for the draw)
 
-    def __init__(self, eng: Any) -> None:
+    def __init__(self, eng: StreamedTextModel) -> None:
         self.eng = eng
         self.sess: list[Session] = []
         self.base: list[list[int]] = []
@@ -51,7 +71,7 @@ class _Rows:
         self._pend: list[int] | None = None
         self._logits: torch.Tensor | None = None
         self._am: torch.Tensor | None = None
-        self.cache: Any = None
+        self.cache: KvCache | None = None
         self.mode = ""  # "rows": the MLX batched step over a flat buffer; "fork": the torch pass over ForkLayers
 
     # -- the cache --
@@ -64,38 +84,37 @@ class _Rows:
             and all(
                 isinstance(cl, GrowLayer) and cl.shared and cl._mx is not None
                 for s in sessions
-                for i, cl in enumerate(s.cache.layers)
+                for i, cl in enumerate(_cache_of(s).layers)
                 if eng.layer_types[i] != LayerKind.LINEAR
             )
         )
 
-    def _shell(self, parent: Any) -> Any:
+    def _shell(self, parent: KvCache) -> KvCache:
         cache = copy.copy(parent)
         cache.layers = list(parent.layers)
-        cache.btb_fork = True
-        return self.eng._track(cache)
+        return self.eng._track(mark_forked(cache))
 
     @staticmethod
-    def _lin_layer(pls: Sequence[Any], B: int) -> Any:
+    def _lin_layer(pls: Sequence[CacheLayer], B: int) -> LinearAttentionCacheLayerMixin:
         """a recurrent layer whose rows are the given layers' states: one layer's repeated B times, or several
         layers' one a row"""
-        cl = copy.copy(pls[0])
+        lins = [linear_layer(p) for p in pls]
+        cl = copy.copy(lins[0])
 
-        def rows(ts: list[Any]) -> Any:
-            if not isinstance(ts[0], torch.Tensor):
-                return ts[0]  # a state slot not yet filled
-            return ts[0].repeat(B, *([1] * (ts[0].dim() - 1))) if len(ts) == 1 else torch.cat(ts, dim=0)
+        def rows(ts: list[torch.Tensor | None]) -> torch.Tensor | None:
+            t0 = ts[0]
+            if t0 is None:
+                return None  # a state slot not yet filled
+            if len(ts) == 1:
+                return t0.repeat(B, *([1] * (t0.dim() - 1)))
+            return torch.cat([t for t in ts if t is not None], dim=0)
 
-        for name in ("conv_states", "recurrent_states"):
-            st = getattr(pls[0], name)
-            if isinstance(st, dict):
-                setattr(cl, name, {k: rows([getattr(p, name)[k] for p in pls]) for k in st})
-            else:
-                setattr(cl, name, rows([getattr(p, name) for p in pls]))
-        for name, val in vars(pls[0]).items():
-            if isinstance(val, dict) and name not in ("conv_states", "recurrent_states"):
+        for name, val in vars(lins[0]).items():
+            if isinstance(val, dict):
                 setattr(cl, name, dict(val))
-        if hasattr(cl, "_mx_pending"):
+        cl.conv_states = {k: rows([p.conv_states[k] for p in lins]) for k in lins[0].conv_states}
+        cl.recurrent_states = {k: rows([p.recurrent_states[k] for p in lins]) for k in lins[0].recurrent_states}
+        if isinstance(cl, GraphStates):
             cl._mx_pending = cl._mx_prev = None
         return cl
 
@@ -120,9 +139,11 @@ class _Rows:
         """row r's whole sequence"""
         return [*self.base[r], *self.rows[r]]
 
-    def _check(self) -> None:
+    def _check(self) -> KvCache:
+        """the batch's cache; a ValueError once it is closed"""
         if self.cache is None:
             raise ValueError(f"this {type(self).__name__} is closed")
+        return self.cache
 
     def step(self, tokens: Tokens | None = None) -> torch.Tensor:
         """Feed a token to each live row, in `live` order (None: the ones `generate` drew last), and return the
@@ -146,10 +167,10 @@ class _Rows:
             for r, t in zip(live, toks):
                 self.rows[r].append(t)
         self._pend, self._logits = None, out
-        return cast(torch.Tensor, out)
+        return out
 
     def _advance(self, toks: list[int]) -> torch.Tensor:
-        eng = self.eng
+        eng, cache = self.eng, self._check()
         eng._tag(PassTag.ROWS_FLAT if self.mode == "rows" else PassTag.ROWS_JOINED)
         if self.mode == "rows":
             m = mlxdev.mx()
@@ -157,7 +178,7 @@ class _Rows:
             if eng.compute_dtype is not None and eng.compute_dtype != torch.bfloat16:
                 hm = hm.astype(m.float32)
             ns = [int(p) for p in self._rows_layers()[0]._ns]
-            lg = eng._forward_mlx(None, None, self.cache, None, False, True, eng.L, hm=hm, lazy=True, rows=ns)
+            lg = eng._forward_mlx(None, None, cache, None, False, True, eng.L, hm=hm, lazy=True, rows=ns)
             lg = lg.astype(m.float32)
             m.eval(lg)
             return mlxdev.from_mx(lg).clone()
@@ -165,10 +186,12 @@ class _Rows:
         am = None
         if self._am is not None:
             am = self._am = torch.cat([self._am, torch.ones((len(toks), 1), dtype=torch.long)], dim=1)
-        return cast(torch.Tensor, eng.forward(ids, cache=self.cache, attention_mask=am))[:, -1].float().cpu()
+        out = eng.forward(ids, cache=cache, attention_mask=am)
+        assert out is not None
+        return out[:, -1].float().cpu()
 
     def _rows_layers(self) -> list[GrowLayer]:
-        return [cl for cl in self.cache.layers if isinstance(cl, GrowLayer)]
+        return [cl for cl in self._check().layers if isinstance(cl, GrowLayer)]
 
     def generate(
         self,
@@ -177,9 +200,9 @@ class _Rows:
         sampling: Sampling | None = None,
         processors: Sequence[LogitsProcessor] = (),
         logprobs: int | None = None,
-        on_pass: Callable[[PassStats], Any] | None = None,
-        on_token: Callable[[int, int], Any] | None = None,
-    ) -> Generation:
+        on_pass: OnPass | None = None,
+        on_token: OnRowToken | None = None,
+    ) -> BatchGeneration:
         """Decode every live row up to `max_new` tokens, a row leaving the batch at a stop token (`eos`, the
         model's by default). Returns a `Generation` whose tokens (and `logprobs`) are a list a row - empty for a
         row not live. The live rows' last tokens are drawn and not fed (`pending`); hooks as `generate` takes them,
@@ -244,48 +267,40 @@ class _Rows:
                     self._leave(done)
 
         eng._serial(run)
-        stats: dict[str, Any] = {"cap": int(max_new), "proposer": "greedy", "forwards": steps}
-        if not smp.greedy:
+        stats: GenerateStats = {"cap": int(max_new), "proposer": "greedy", "forwards": steps}
+        if not smp.greedy and smp.seed is not None:
             stats["seed"] = smp.seed
         stats["seconds"] = time.perf_counter() - t0
-        return Generation(new, cast(GenerateStats, stats), hk.lp if hk.logprobs is not None else None, None)
+        return Generation(new, stats, hk.lp if hk.logprobs is not None else None, None)
 
     # -- re-forming the batch --
     def _select(self, slots: list[int]) -> None:
         """the batch's rows at `slots` become the batch, in that order"""
+        cache = self._check()
         if self.mode == "rows":
             m = mlxdev.mx()
             idx = m.array(slots, dtype=m.int32)
-            for cl in self._rows_layers():
-                if cl._mx2 is not None:
-                    cl._mx2 = [m.take(x, idx, axis=0) for x in cl._mx2]
-                    m.eval(*cl._mx2)
-                cl._ns = [cl._ns[b] for b in slots]
-                cl._seg = [cl._seg[b] for b in slots] if cl._seg is not None else None
-                cl._offs = [cl._offs[b] for b in slots]
-                cl._rows_total = len(slots)
-                cl._n = max(cl._ns) if cl._ns else 0
+            for gl in self._rows_layers():
+                if gl._mx2 is not None:
+                    gl._mx2 = [m.take(x, idx, axis=0) for x in gl._mx2]
+                    m.eval(*gl._mx2)
+                gl._ns = [gl._ns[b] for b in slots]
+                gl._seg = [gl._seg[b] for b in slots] if gl._seg is not None else None
+                gl._offs = [gl._offs[b] for b in slots]
+                gl._rows_total = len(slots)
+                gl._n = max(gl._ns) if gl._ns else 0
         else:
             ti = torch.tensor(slots, dtype=torch.long)
-            for cl in self.cache.layers:
+            for cl in cache.layers:
                 if isinstance(cl, ForkLayer):
                     cl.select(ti)
         for i in range(self.eng.L):
             if self.eng.layer_types[i] == LayerKind.LINEAR:
-                cl = self.cache.layers[i]
-                for name in ("conv_states", "recurrent_states"):
-                    st = getattr(cl, name)
-                    if isinstance(st, dict):
-                        setattr(
-                            cl,
-                            name,
-                            {
-                                k: v.index_select(0, _index(slots, v)) if isinstance(v, torch.Tensor) else v
-                                for k, v in st.items()
-                            },
-                        )
-                    else:
-                        setattr(cl, name, st.index_select(0, _index(slots, st)))
+                lin = linear_layer(cache.layers[i])
+                for states in (lin.conv_states, lin.recurrent_states):
+                    for k, v in states.items():
+                        if v is not None:
+                            states[k] = v.index_select(0, _index(slots, v))
         pick = torch.tensor(slots, dtype=torch.long)
         if self._logits is not None:
             self._logits = self._logits[pick]
@@ -297,7 +312,7 @@ class _Rows:
     def _take(self, b: int) -> _Row:
         """the batch's row b, copied out: its own rows and its recurrent states"""
         out = _Row()
-        for i, cl in enumerate(self.cache.layers):
+        for i, cl in enumerate(self._check().layers):
             if isinstance(cl, ForkLayer):
                 kv = cl.row(b)
                 if kv is not None:
@@ -309,18 +324,10 @@ class _Rows:
                     m.eval(*parts)
                     out.kv[i] = parts
             elif self.eng.layer_types[i] == LayerKind.LINEAR:
-                c, r = cl.conv_states, cl.recurrent_states
+                lin = linear_layer(cl)
                 out.lin[i] = (
-                    {
-                        k: v[b : b + 1].clone()
-                        for k, v in (c.items() if isinstance(c, dict) else [(0, c)])
-                        if isinstance(v, torch.Tensor)
-                    },
-                    {
-                        k: v[b : b + 1].clone()
-                        for k, v in (r.items() if isinstance(r, dict) else [(0, r)])
-                        if isinstance(v, torch.Tensor)
-                    },
+                    {k: v[b : b + 1].clone() for k, v in lin.conv_states.items() if v is not None},
+                    {k: v[b : b + 1].clone() for k, v in lin.recurrent_states.items() if v is not None},
                 )
         if self._pend is not None:
             out.pending = self._pend[b]
@@ -330,10 +337,15 @@ class _Rows:
 
     def _write(self, r: int, row: _Row) -> None:
         """row r written into its session: its own rows appended to the session's cache, its states restored"""
+        from transformers.cache_utils import CacheLayerMixin, DynamicIndexedLayer
+
         s, eng = self.sess[r], self.eng
+        cache = _cache_of(s)
         for i, kv in row.kv.items():
-            pl = s.cache.layers[i]
-            if self.mode == "rows":
+            pl = cache.layers[i]
+            if isinstance(kv, list):
+                # the MLX step buffer's slices, into the session's MLX buffer
+                assert isinstance(pl, GrowLayer)
                 if pl.bits:
                     k = mlxdev.kv_dequantize(kv[0], kv[2])
                     v = mlxdev.kv_dequantize(kv[1], kv[3])
@@ -342,11 +354,12 @@ class _Rows:
                 pl.mx_update(k, v)
                 mlxdev.mx().eval(*[x for x in pl._mx if x is not None])
             else:
+                assert isinstance(pl, CacheLayerMixin)
                 pl.update(kv[0], kv[1])
-                if len(kv) > 2:
+                if len(kv) > 2 and isinstance(pl, DynamicIndexedLayer):
                     pl.update_indexer(kv[2])
         for i, snap in row.lin.items():
-            eng._lin_restore(s.cache.layers[i], snap)
+            eng._lin_restore(cache.layers[i], snap)
         s.ids.extend(self.rows[r][:-1] if row.pending is not None else self.rows[r])
         s.n_prompt = len(s.ids)
         s.pending, s.logits = row.pending, row.logits
@@ -368,10 +381,10 @@ class _Rows:
     def _left(self, r: int, row: _Row) -> None:
         raise NotImplementedError
 
-    def __enter__(self) -> Any:
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         if self.cache is not None:
             self.close()
 
@@ -408,19 +421,22 @@ class Branches(_Rows):
         s, eng = self.session, self.eng
         s._settle(eng)
         s._flush(eng)
-        assert s.logits is not None and s.cache is not None
+        parent = _cache_of(s)
+        assert s.logits is not None
         rows_ok = self._rows_ok([s], B)
-        cache = self._shell(s.cache)
-        for i, pl in enumerate(s.cache.layers):
+        cache = self._shell(parent)
+        for i, pl in enumerate(parent.layers):
             if eng.layer_types[i] == LayerKind.LINEAR:
                 cache.layers[i] = self._lin_layer([pl], B)
             elif rows_ok:
+                assert isinstance(pl, GrowLayer)
                 cache.layers[i] = self._alias(pl, B)
             else:
                 if isinstance(pl, GrowLayer) and pl._buf is not None:
                     # rows in the card's arena move out, or the next cache to take it would write over them
                     pl.detach()
-                cache.layers[i] = _fork_layer(pl, pl.keys, pl.values, getattr(pl, "indexer_keys", None), B, i)
+                k, v = attention_rows(pl)
+                cache.layers[i] = _fork_layer(pl, k, v, indexer_keys(pl), B, i)
         self.cache, self.mode = cache, ("rows" if rows_ok else "fork")
         self.sess = [s] * B
         self.base = [list(s.ids)] * B
@@ -456,8 +472,9 @@ class Branches(_Rows):
         picks = [int(r) for r in rows]
         if not picks or any(not 0 <= r < self.n for r in picks):
             raise ValueError(f"reorder takes rows of 0..{self.n - 1}")
-        slots = [cast(int, self._slot[r]) for r in picks]
-        self.eng._serial(self._select, slots)
+        slots = [self._slot[r] for r in picks]
+        live = [b for b in slots if b is not None]
+        self.eng._serial(self._select, live)
         self.rows = [list(self.rows[r]) for r in picks]
         self.base = [self.base[0]] * len(picks)
         self.sess = [self.session] * len(picks)
@@ -492,7 +509,7 @@ class Batch(_Rows):
     into its session at once, which is free again; `join(session)` adds a row between steps (the rows' caches
     copied into the batch's); `close()` writes every live row back. Rows are numbered in joining order."""
 
-    def __init__(self, eng: Any, sessions: Sequence[Session]) -> None:
+    def __init__(self, eng: StreamedTextModel, sessions: Sequence[Session]) -> None:
         super().__init__(eng)
         sessions = list(sessions)
         if not sessions:
@@ -521,21 +538,24 @@ class Batch(_Rows):
             s._flush(eng)
         B = len(sessions)
         lens = [len(s.ids) for s in sessions]
+        caches = [_cache_of(s) for s in sessions]
         rows_ok = self._rows_ok(sessions, B)
-        cache = self._shell(sessions[0].cache)
+        cache = self._shell(caches[0])
         for i in range(eng.L):
-            pls = [s.cache.layers[i] for s in sessions]
+            pls = [c.layers[i] for c in caches]
             if eng.layer_types[i] == LayerKind.LINEAR:
                 cache.layers[i] = self._lin_layer(pls, B)
             elif rows_ok:
-                cache.layers[i] = self._flat(pls, lens)
+                grows = [pl for pl in pls if isinstance(pl, GrowLayer)]
+                assert len(grows) == len(pls)
+                cache.layers[i] = self._flat(grows, lens)
             else:
                 # left-padded: every row ends at the longest and steps together, the mask hiding the padding
-                k = _pad([pl.keys[0] for pl in pls], lens, 1)
-                v = _pad([pl.values[0] for pl in pls], lens, 1)
-                ik = getattr(pls[0], "indexer_keys", None)
-                if ik is not None:
-                    ik = _pad([pl.indexer_keys[0] for pl in pls], lens, 0)
+                kvs = [attention_rows(pl) for pl in pls]
+                k = _pad([kv[0][0] for kv in kvs], lens, 1)
+                v = _pad([kv[1][0] for kv in kvs], lens, 1)
+                iks = [indexer_keys(pl) for pl in pls]
+                ik = _pad([x[0] for x in iks if x is not None], lens, 0) if iks[0] is not None else None
                 cache.layers[i] = _fork_layer(pls[0], k, v, ik, B, i)
         self.cache, self.mode = cache, ("rows" if rows_ok else "fork")
         self._am = None
@@ -551,7 +571,8 @@ class Batch(_Rows):
         self._slot += [None] * grow
         for j, (r, s) in enumerate(zip(nums, sessions)):
             self.sess[r], self.base[r], self.rows[r], self._slot[r] = s, list(s.ids), [], j
-        self._logits = torch.stack([cast(torch.Tensor, s.logits) for s in sessions])
+        logits = [s.logits for s in sessions]
+        self._logits = torch.stack([lg for lg in logits if lg is not None])
         self._pend = None
 
     @staticmethod
@@ -614,6 +635,13 @@ class Batch(_Rows):
         self.cache, self._logits, self._pend = None, None, None
 
 
+def _cache_of(s: Session) -> KvCache:
+    """a session's cache, which a fork or a batch reads from; a ValueError for a session without one"""
+    if s.cache is None:
+        raise ValueError("an empty session has nothing to decode: feed it a prompt first")
+    return s.cache
+
+
 def _index(slots: list[int], like: torch.Tensor) -> torch.Tensor:
     return torch.tensor(slots, dtype=torch.long, device=like.device)
 
@@ -629,7 +657,7 @@ def _pad(rows: list[torch.Tensor], lens: list[int], dim: int) -> torch.Tensor:
     return out
 
 
-def _fork_layer(pl: Any, k: torch.Tensor, v: torch.Tensor, ik: Any, B: int, i: int) -> ForkLayer:
+def _fork_layer(pl: CacheLayer, k: torch.Tensor, v: torch.Tensor, ik: torch.Tensor | None, B: int, i: int) -> ForkLayer:
     """the fork's layer over prefix rows `k`, `v` (and a sparse layer's indexer keys `ik`) of parent layer `pl`"""
     if not isinstance(pl, _DynamicLayer) or getattr(pl, "is_sliding", False):
         # a layer that evicts rows (a sliding window's) cannot be joined to rows grown after it

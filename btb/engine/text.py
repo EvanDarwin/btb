@@ -12,8 +12,7 @@ import queue
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Generic, TypedDict, TypeVar, Unpack, cast, overload
 
 import torch
 
@@ -21,12 +20,13 @@ from ..draft import Spans
 from ..kinds import Json, Proposer, TokenRows, Tokens
 from ..sampling import GREEDY, Sampling
 from ..session import Session
-from ..text import Channels, Messages, TextStream, answer, messages_of, prompt_ids
-from .hooks import Hooks, LogitsProcessor, PassStats
-from .state import _State
+from ..text import Channels, Messages, TextStream, ToolSpecs, answer, messages_of, prompt_ids
+from .hooks import HookArgs, Hooks, LogitsProcessor, OnPass, OnToken, Taps, TokenLogprob
+from .state import P, R, _State
 
 if TYPE_CHECKING:
     from .branches import Batch
+    from .model import StreamedTextModel
 
 
 class GenerateStats(TypedDict, total=False):
@@ -56,27 +56,61 @@ class GenerateStats(TypedDict, total=False):
     mtp_step_s: float
 
 
-@dataclass(frozen=True)
-class Generation:
+# a generation's shape: a row's tokens, logprobs and taps, or a list of each per row
+TokensT = TypeVar("TokensT")
+LogprobsT = TypeVar("LogprobsT")
+TapsT = TypeVar("TapsT")
+
+
+class Generation(tuple[TokensT, GenerateStats], Generic[TokensT, LogprobsT, TapsT]):
     """
     What `generate` returns: the new tokens (one row: a flat list; rows: a list per row) and the counts, plus
     what the call's hooks collected - `logprobs` a `TokenLogprob` per token, `hidden` {layer: [new, H]} - each a
     list per row for rows. Unpacks and indexes as `(tokens, stats)`.
     """
 
-    tokens: Any
-    stats: GenerateStats
-    logprobs: Any = None
-    hidden: Any = None
+    logprobs: LogprobsT | None
+    hidden: TapsT | None
 
-    def __iter__(self) -> Iterator[Any]:
-        return iter((self.tokens, self.stats))
+    def __new__(
+        cls,
+        tokens: TokensT,
+        stats: GenerateStats,
+        logprobs: LogprobsT | None = None,
+        hidden: TapsT | None = None,
+    ) -> Generation[TokensT, LogprobsT, TapsT]:
+        self = super().__new__(cls, (tokens, stats))
+        self.logprobs, self.hidden = logprobs, hidden
+        return self
 
-    def __len__(self) -> int:
-        return 2
+    @property
+    def tokens(self) -> TokensT:
+        return self[0]
 
-    def __getitem__(self, i: int) -> Any:
-        return (self.tokens, self.stats)[i]
+    @property
+    def stats(self) -> GenerateStats:
+        return self[1]
+
+
+# one row's generation: its tokens, each token's logprob, the tapped layers' states over them
+RowGeneration = Generation[list[int], list[TokenLogprob], Taps]
+# several rows': a list of each, per row
+BatchGeneration = Generation[list[list[int]], list[list[TokenLogprob]], list[Taps]]
+
+
+class GenerateArgs(HookArgs, total=False):
+    """`generate`'s keywords past the ids and `max_new`, as the calls that pass them on (a session's) take them"""
+
+    eos: Tokens | None
+    on_token: OnToken | None
+    spans: Spans
+    speculate: bool
+    sampling: Sampling | None
+
+
+def _stacked(hooks: Hooks) -> list[Taps]:
+    """each row's tapped states, a layer's per-token states stacked into one [tokens, H]"""
+    return [{i: torch.stack(hs) if hs else torch.empty(0) for i, hs in row.items()} for row in hooks.hidden]
 
 
 class Stream:
@@ -93,10 +127,10 @@ class Stream:
         session: Session | None,
         spans: Spans,
         sampling: Sampling | None = None,
-        **hooks: Any,
+        **hooks: Unpack[HookArgs],
     ):
         self.model = model
-        self.result: Generation | None = None
+        self.result: RowGeneration | None = None
         self._q: queue.Queue[int | None] = queue.Queue()
         self._err: BaseException | None = None
         self._done = False
@@ -183,7 +217,7 @@ class Chat:
             self.session.tail = self._tail(ids)
         return ids
 
-    def _keep(self, ids: Tokens, gen: Generation, prefill: str | None = None) -> str:
+    def _keep(self, ids: Tokens, gen: RowGeneration, prefill: str | None = None) -> str:
         stop = set(self.model.stop_ids)
         ans, think = answer(self.model.tokenizer, [t for t in gen.tokens if t not in stop])
         ans = (prefill or "") + ans
@@ -207,7 +241,9 @@ class Chat:
         )
         return self._keep(ids, gen, prefill)
 
-    def stream(self, text: str, max_new: int | None = None, prefill: str | None = None, **hooks: Any) -> Iterator[str]:
+    def stream(
+        self, text: str, max_new: int | None = None, prefill: str | None = None, **hooks: Unpack[HookArgs]
+    ) -> Iterator[str]:
         """
         The turn as pieces of text (after `prefill`, which opens it unstreamed); the history and `last` are filled
         when it ends; the rest are `generate`'s hooks
@@ -298,7 +334,11 @@ class _TextMixin(_State):
         return peak_memory(self)
 
     def prompt_ids(
-        self, prompt: str | Messages, thinking: bool = False, tools: Any = None, continue_final: bool = False
+        self,
+        prompt: str | Messages,
+        thinking: bool = False,
+        tools: ToolSpecs | None = None,
+        continue_final: bool = False,
     ) -> list[int]:
         """
         A string or a conversation as the ids the model takes, through its chat template; `tools` reaches the
@@ -332,21 +372,55 @@ class _TextMixin(_State):
             return fn(*args, **kw)
         return w.submit(fn, *args, **kw).result()
 
+    @overload
     def generate(
         self,
-        ids: Tokens | TokenRows,
+        ids: Tokens,
         max_new: int | None = None,
         eos: Tokens | None = None,
         session: Session | None = None,
-        on_token: Callable[[int], Any] | None = None,
+        on_token: OnToken | None = None,
         spans: Spans = (),
         speculate: bool = True,
         sampling: Sampling | None = None,
         processors: Sequence[LogitsProcessor] = (),
         logprobs: int | None = None,
         taps: Sequence[int] = (),
-        on_pass: Callable[[PassStats], Any] | None = None,
-    ) -> Generation:
+        on_pass: OnPass | None = None,
+    ) -> RowGeneration: ...
+
+    @overload
+    def generate(
+        self,
+        ids: TokenRows,
+        max_new: int | None = None,
+        eos: Tokens | None = None,
+        session: Session | None = None,
+        on_token: OnToken | None = None,
+        spans: Spans = (),
+        speculate: bool = True,
+        sampling: Sampling | None = None,
+        processors: Sequence[LogitsProcessor] = (),
+        logprobs: int | None = None,
+        taps: Sequence[int] = (),
+        on_pass: OnPass | None = None,
+    ) -> BatchGeneration: ...
+
+    def generate(
+        self,
+        ids: Tokens | TokenRows,
+        max_new: int | None = None,
+        eos: Tokens | None = None,
+        session: Session | None = None,
+        on_token: OnToken | None = None,
+        spans: Spans = (),
+        speculate: bool = True,
+        sampling: Sampling | None = None,
+        processors: Sequence[LogitsProcessor] = (),
+        logprobs: int | None = None,
+        taps: Sequence[int] = (),
+        on_pass: OnPass | None = None,
+    ) -> RowGeneration | BatchGeneration:
         """
         Decode a row of ids with the engine's configured loop: speculative where it pays, the same answer either
         way; several rows go through the batched loop, each row as its own plain decode. One decode runs at a
@@ -368,24 +442,28 @@ class _TextMixin(_State):
             tuple(int(i) % self.L for i in taps),
             on_pass,
         )
+        args = (ids, max_new, eos, session, on_token, spans, speculate, sampling, hooks)
         if getattr(self, "mlx", None) is not None and threading.current_thread() is not getattr(
             self, "_worker_thread", None
         ):
-            return self.on_worker(self._locked, ids, max_new, eos, session, on_token, spans, speculate, sampling, hooks)
-        return self._locked(ids, max_new, eos, session, on_token, spans, speculate, sampling, hooks)
+            gen: RowGeneration | BatchGeneration = self.on_worker(self._locked, self._generate, *args)
+            return gen
+        return self._locked(self._generate, *args)
 
-    def _locked(self, *args: Any) -> Generation:
+    def _locked(self, fn: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+        """`fn` holding the decode lock: one decode at a time on an engine"""
         with self._decode_lock:
-            return self._generate(*args)
+            return fn(*args, **kwargs)
 
-    def _serial(self, fn: Callable[..., Any], *args: Any) -> Any:
+    def _serial(self, fn: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
         """`fn(*args)` as a decode runs: one at a time, on the MLX worker thread where there is one"""
         if getattr(self, "mlx", None) is not None and threading.current_thread() is not getattr(
             self, "_worker_thread", None
         ):
-            return self.on_worker(self._serial, fn, *args)
+            out: R = self.on_worker(self._serial, fn, *args, **kwargs)
+            return out
         with self._decode_lock, torch.inference_mode():
-            return fn(*args)
+            return fn(*args, **kwargs)
 
     def hidden(self, ids: Tokens, layers: Sequence[int] = (-1,)) -> dict[int, torch.Tensor]:
         """
@@ -406,7 +484,7 @@ class _TextMixin(_State):
             )
             return {i: seen[i] for i in want}
 
-        return cast("dict[int, torch.Tensor]", self._serial(run))
+        return self._serial(run)
 
     def project(self, h: torch.Tensor) -> torch.Tensor:
         """
@@ -419,7 +497,7 @@ class _TextMixin(_State):
             out = self._apply_head(self._final_norm(x)).float().cpu()
             return out.reshape(*h.shape[:-1], out.shape[-1])
 
-        return cast(torch.Tensor, self._serial(run))
+        return self._serial(run)
 
     def encode(
         self, texts: str | Sequence[str], layer: int = -1, pool: str = "last", normalize: bool = True
@@ -446,12 +524,12 @@ class _TextMixin(_State):
         max_new: int | None,
         eos: Tokens | None,
         session: Session | None,
-        on_token: Callable[[int], Any] | None,
+        on_token: OnToken | None,
         spans: Spans,
         speculate: bool,
         sampling: Sampling | None,
         hooks: Hooks,
-    ) -> Generation:
+    ) -> RowGeneration | BatchGeneration:
         self._pass_reset()  # one report a generate: its passes' path tags accumulate into it
         if ids and isinstance(ids[0], (list, tuple)):
             rows = [[int(t) for t in r] for r in cast(TokenRows, ids)]
@@ -469,13 +547,15 @@ class _TextMixin(_State):
         if len({len(r) for r in rows}) > 1:
             # rows of their own lengths: left-padded in epochs the scheduler sizes
             out = self.serve(rows, max_new, eos_ids=stop, sampling=smp, hooks=hooks)
-            return self._result(out, dict(cap=max_new, proposer="greedy", tokens_per_pass=1.0, **seed), hooks, True)
+            return self._batch_result(out, dict(cap=max_new, proposer="greedy", tokens_per_pass=1.0, **seed), hooks)
         v = max(0, int(self.v_max)) if speculate else 0
         if len(rows) > 1 or (v == 0 and session is None):
             # several rows, or no drafts and no session to keep: the plain loop (the speculative loop is one row)
             out = self.generate_greedy(rows, max_new, eos_ids=stop, on_token=on_token, sampling=smp, hooks=hooks)
             stats = dict(cap=max_new, proposer="greedy", tokens_per_pass=1.0, **seed)
-            return self._result(out, stats, hooks, len(rows) > 1)
+            if len(rows) > 1:
+                return self._batch_result(out, stats, hooks)
+            return self._row_result(out, stats, hooks)
         if (
             v == 0
             and not hooks.active
@@ -486,7 +566,7 @@ class _TextMixin(_State):
             out, c = self.generate_greedy(
                 rows, max_new, eos_ids=stop, on_token=on_token, session=session, sampling=smp, hooks=hooks
             )
-            return self._result(out, dict(c, cap=max_new, proposer="greedy", tokens_per_pass=1.0, **seed), hooks, False)
+            return self._row_result(out, dict(c, cap=max_new, proposer="greedy", tokens_per_pass=1.0, **seed), hooks)
         prop = self.proposer if v > 0 else Proposer.NGRAM
         one, c = self.generate_speculative(
             rows,
@@ -500,18 +580,21 @@ class _TextMixin(_State):
             sampling=smp,
             hooks=hooks,
         )
-        return self._result(one, dict(c, cap=max_new), hooks, False)
+        return self._row_result(one, dict(c, cap=max_new), hooks)
 
     @staticmethod
-    def _result(out: Any, stats: Json, hooks: Hooks, batched: bool) -> Generation:
-        """the tokens and counts, with what the hooks collected: a row's own, or a list per row"""
-        lp: Any = None
-        hidden: Any = None
-        if hooks.logprobs is not None:
-            lp = hooks.lp if batched else (hooks.lp[0] if hooks.lp else [])
-        if hooks.taps:
-            per = [{i: torch.stack(hs) if hs else torch.empty(0) for i, hs in row.items()} for row in hooks.hidden]
-            hidden = per if batched else (per[0] if per else {})
+    def _row_result(out: list[int], stats: Json, hooks: Hooks) -> RowGeneration:
+        """one row's tokens and counts, with what the hooks collected for it"""
+        lp = (hooks.lp[0] if hooks.lp else []) if hooks.logprobs is not None else None
+        taps = _stacked(hooks)
+        hidden = (taps[0] if taps else {}) if hooks.taps else None
+        return Generation(out, cast(GenerateStats, stats), lp, hidden)
+
+    @staticmethod
+    def _batch_result(out: list[list[int]], stats: Json, hooks: Hooks) -> BatchGeneration:
+        """the rows' tokens and counts, with what the hooks collected, a list per row"""
+        lp = hooks.lp if hooks.logprobs is not None else None
+        hidden = _stacked(hooks) if hooks.taps else None
         return Generation(out, cast(GenerateStats, stats), lp, hidden)
 
     def ask(
@@ -544,7 +627,7 @@ class _TextMixin(_State):
         spans: Spans = (),
         sampling: Sampling | None = None,
         prefill: str | None = None,
-        **hooks: Any,
+        **hooks: Unpack[HookArgs],
     ) -> Stream:
         """The answer as pieces of text as they are decoded, iterated from another thread: `for piece in
         model.stream(...)`. `prompt` as `ask` takes it, or token ids already; the `Stream` carries `.tokens` and
@@ -561,7 +644,8 @@ class _TextMixin(_State):
     def session(self, ids: Tokens = ()) -> Session:
         """A sequence of this engine's to drive by hand - `feed`, `mark`, `rewind`, `fork`, `generate` - fed `ids`
         first when given; also what `generate(session=...)` continues"""
-        s = Session(engine=self)
+        # the mixin is only ever the engine itself
+        s = Session(engine=cast("StreamedTextModel", self))
         if ids:
             s.feed(ids)
         return s
@@ -571,7 +655,7 @@ class _TextMixin(_State):
         steps, each row written back into its session as it ends"""
         from .branches import Batch
 
-        return Batch(self, sessions)
+        return Batch(cast("StreamedTextModel", self), sessions)
 
     def chat(self, max_new: int | None = None, thinking: bool = False, sampling: Sampling | None = None) -> Chat:
         """A conversation whose cache is reused turn to turn: `ask(text)` returns a turn, `stream(text)` yields

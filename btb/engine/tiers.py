@@ -33,6 +33,7 @@ from .state import DRAFT_VOCAB, _State
 
 if TYPE_CHECKING:
     from ..mlx import Shared
+    from .cache import KvCache
 
 _DTYPE_NAME = {torch.bfloat16: "bf16", torch.float32: "fp32", torch.float16: "fp16"}
 RAM_BPS = 50 * 2**30  # the read bandwidth the plan prices a RAM tier at, weights and cache alike
@@ -547,15 +548,15 @@ class _TiersMixin(_State):
             total += cur
         return total
 
-    def _track(self, cache: Any) -> Any:
+    def _track(self, cache: KvCache) -> KvCache:
         """`cache` among those a layer's move reaches while it lives: an idle session's, a fork's, the running pass's"""
-        live = self.__dict__.setdefault("_live_caches", weakref.WeakSet())
+        live: weakref.WeakSet[KvCache] = self.__dict__.setdefault("_live_caches", weakref.WeakSet())
         live.add(cache)
         return cache
 
-    def _caches_to(self, i: int, dev: str | torch.device, cache: Any = None) -> None:
+    def _caches_to(self, i: int, dev: str | torch.device, cache: KvCache | None = None) -> None:
         """layer i's rows in every live cache (and `cache`) moved to `dev`, where the layer now runs"""
-        live = list(self.__dict__.get("_live_caches", ()))
+        live: list[KvCache] = list(self.__dict__.get("_live_caches", ()))
         for c in {id(c): c for c in [*live, *([cache] if cache is not None else [])]}.values():
             self._cache_to(c, i, dev)
 

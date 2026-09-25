@@ -8,7 +8,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol, TypedDict
+from typing import Protocol, TypedDict
 
 import torch
 
@@ -18,7 +18,7 @@ class LogitsProcessor(Protocol):
     [V]. Called on every candidate row, a speculative pass's drafts included, so it must be a function of `ids`:
     a grammar keeps its own memo by prefix."""
 
-    def __call__(self, ids: Sequence[int], logits: torch.Tensor) -> torch.Tensor: ...
+    def __call__(self, ids: Sequence[int], logits: torch.Tensor, /) -> torch.Tensor: ...
 
 
 @dataclass(frozen=True)
@@ -42,6 +42,25 @@ class PassStats(TypedDict):
     seconds: float
 
 
+# a pass callback, handed each pass's stats; what it returns is never read
+OnPass = Callable[[PassStats], object]
+# a token callback, handed each committed token; what it returns is never read
+OnToken = Callable[[int], object]
+# a fork's or a batch's token callback, handed (row, token)
+OnRowToken = Callable[[int, int], object]
+# a row's tapped layers' states over its new tokens: {layer: [tokens, H]}
+Taps = dict[int, torch.Tensor]
+
+
+class HookArgs(TypedDict, total=False):
+    """`generate`'s hook keywords, as the calls that pass them on (`stream`, a `Stream`) take them"""
+
+    processors: Sequence[LogitsProcessor]
+    logprobs: int | None
+    taps: Sequence[int]
+    on_pass: OnPass | None
+
+
 @dataclass
 class Hooks:
     """one call's hooks and, per row, what they collected"""
@@ -49,7 +68,7 @@ class Hooks:
     processors: tuple[LogitsProcessor, ...] = ()
     logprobs: int | None = None  # None: none; 0: the drawn token's alone; k: and the k most likely
     taps: tuple[int, ...] = ()
-    on_pass: Callable[[PassStats], Any] | None = None
+    on_pass: OnPass | None = None
     lp: list[list[TokenLogprob]] = field(default_factory=list)
     hidden: list[dict[int, list[torch.Tensor]]] = field(default_factory=list)
 
@@ -68,13 +87,13 @@ class Hooks:
         """anything to call or collect at all (a pass callback alone leaves the fused paths be)"""
         return self.active or self.on_pass is not None
 
-    def per_token(self, on_token: Callable[[int], Any] | None) -> Callable[[int], Any]:
+    def per_token(self, on_token: OnToken | None) -> OnToken:
         """a one-token loop's token callback that also reports each token as its own pass"""
         on_pass = self.on_pass
         assert on_pass is not None
         k, last = 0, time.perf_counter()
 
-        def cb(t: int) -> Any:
+        def cb(t: int) -> object:
             nonlocal k, last
             now = time.perf_counter()
             on_pass({"index": k, "drafted": 0, "accepted": 0, "tokens": 1, "seconds": now - last})

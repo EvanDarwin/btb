@@ -11,7 +11,7 @@ import time
 import weakref
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -27,10 +27,14 @@ from ..sysinfo import (
     vram_pressure,
     vram_pressure_line,
 )
-from .device import torch_device
+from .device import DeviceSpec, torch_device
 from .scheduler import MemoryGrantError
 from .state import _State
 from .tiers import ColdRing
+
+if TYPE_CHECKING:
+    from .cache import KvCache
+    from .device import Device as DeviceLedger
 
 
 @dataclass
@@ -84,7 +88,7 @@ class Room:
     """Room made for memory btb does not allocate itself - a second model, a library's workspace - and kept from
     btb until `release()`, the end of a `with` block, or the room being dropped. Rooms add up, each its own."""
 
-    def __init__(self, ledger: Any, tag: str, nbytes: int, device: torch.device) -> None:
+    def __init__(self, ledger: DeviceLedger, tag: str, nbytes: int, device: torch.device) -> None:
         self.nbytes, self.device = int(nbytes), device
         self._give_back = weakref.finalize(self, _give_back, ledger, tag)
 
@@ -98,11 +102,11 @@ class Room:
     def __enter__(self) -> Room:
         return self
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.release()
 
 
-def _give_back(ledger: Any, tag: str) -> None:
+def _give_back(ledger: DeviceLedger, tag: str) -> None:
     """lent memory back to btb's ledger (from a finalizer: any thread, any time); the lending policy regrows"""
     ledger.release(tag)
     ledger.returned = True
@@ -382,7 +386,9 @@ class _MemoryMixin(_State):
 
     # -- lending: memory for the caller's own tensors ------------------------------------------------------------
 
-    def empty(self, shape: int | Sequence[int], dtype: torch.dtype | None = None, device: Any = None) -> torch.Tensor:
+    def empty(
+        self, shape: int | Sequence[int], dtype: torch.dtype | None = None, device: DeviceSpec | None = None
+    ) -> torch.Tensor:
         """
         A tensor of your own beside the model, as `torch.empty` makes it, with room made for it first: btb gives up
         what it holds there, cheapest first, instead of your allocation running out of memory. It is a plain tensor
@@ -391,17 +397,23 @@ class _MemoryMixin(_State):
         """
         return self._lend(shape, dtype, device, None)
 
-    def zeros(self, shape: int | Sequence[int], dtype: torch.dtype | None = None, device: Any = None) -> torch.Tensor:
+    def zeros(
+        self, shape: int | Sequence[int], dtype: torch.dtype | None = None, device: DeviceSpec | None = None
+    ) -> torch.Tensor:
         """`empty`, filled with zeros"""
         return self._lend(shape, dtype, device, 0)
 
     def full(
-        self, shape: int | Sequence[int], value: float, dtype: torch.dtype | None = None, device: Any = None
+        self,
+        shape: int | Sequence[int],
+        value: float,
+        dtype: torch.dtype | None = None,
+        device: DeviceSpec | None = None,
     ) -> torch.Tensor:
         """`empty`, filled with `value`"""
         return self._lend(shape, dtype, device, value)
 
-    def room(self, nbytes: int, device: Any = None, name: str = "room") -> Room:
+    def room(self, nbytes: int, device: DeviceSpec | None = None, name: str = "room") -> Room:
         """
         Room for memory btb does not allocate itself - a second model, a library's workspace - made now and kept
         from btb until the `Room` is released (`release()`, or as a `with` block). Keep it while that memory is in
@@ -432,7 +444,7 @@ class _MemoryMixin(_State):
         return out
 
     def _lend(
-        self, shape: int | Sequence[int], dtype: torch.dtype | None, device: Any, fill: float | None
+        self, shape: int | Sequence[int], dtype: torch.dtype | None, device: DeviceSpec | None, fill: float | None
     ) -> torch.Tensor:
         dev = self._lend_device(device)
         dt = dtype if dtype is not None else torch.get_default_dtype()
@@ -462,7 +474,7 @@ class _MemoryMixin(_State):
 
         return self._serial(run)
 
-    def _lend_device(self, device: Any) -> torch.device:
+    def _lend_device(self, device: DeviceSpec | None) -> torch.device:
         dev = torch_device(device) if device is not None else (self.dev if self.dev.type == Device.CUDA else None)
         dev = dev if dev is not None else torch.device("cpu")
         if dev.type not in (Device.CUDA, Device.CPU):
@@ -586,7 +598,7 @@ class _MemoryMixin(_State):
 _LOANS: Iterator[int] = itertools.count(1)
 
 
-def _bytes_on(cache: Any, dev: torch.device, layers: Iterable[int]) -> int:
+def _bytes_on(cache: KvCache, dev: torch.device, layers: Iterable[int]) -> int:
     """the bytes `cache` holds on `dev` for `layers`"""
     n = 0
     for i in layers:

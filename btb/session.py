@@ -4,17 +4,34 @@ caller makes on it: feed tokens, mark a point, rewind to one, fork into rows."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, TypedDict, Unpack
 
 from .kinds import LayerKind, Tokens
 
 if TYPE_CHECKING:
     import torch
 
+    from .engine.branches import Branches, _Rows
+    from .engine.cache import KvCache, LinearStates
+    from .engine.drafter import MTPDrafter
+    from .engine.model import StreamedTextModel
+    from .engine.state import _State
+    from .engine.text import GenerateArgs, RowGeneration
+
 # a chat template's generation tail is a handful of tokens (Qwen3's empty think block is four); a prompt that
 # parts from the previous one further back than this is another conversation, and teaches no tail
 TAIL_MAX = 64
+
+
+class Anchor(TypedDict):
+    """a hybrid's point to resume a later prompt from: the rows before it, its linear layers' states there, and the
+    last layer's state at its last row (the drafter's start)"""
+
+    n: int
+    states: dict[int, LinearStates]
+    h_last: torch.Tensor | None
 
 
 @dataclass(frozen=True)
@@ -23,22 +40,24 @@ class Mark:
     be cropped back, so they are kept), and the token drawn but not yet fed or the next token's logits"""
 
     n: int
-    states: dict[int, Any] = field(default_factory=dict)
+    states: dict[int, LinearStates] = field(default_factory=dict)
     pending: int | None = None
-    logits: Any = None
+    logits: torch.Tensor | None = None
 
 
-def crop(cache: Any, engine: Any, n: int) -> None:
+def crop(cache: KvCache, engine: _State, n: int) -> None:
     """the attention layers of `cache` cut back to their first n rows"""
+    from transformers.cache_utils import CacheLayerMixin, DynamicIndexedLayer, DynamicSlidingWindowLayer
+
     for i in range(engine.L):
         cl = cache.layers[i]
-        if getattr(cl, "keys", None) is not None and cl.keys.shape[-2] > n:
-            cl.keys = cl.keys[..., :n, :]
-            cl.values = cl.values[..., :n, :]
-            if hasattr(cl, "cumulative_length"):
-                cl.cumulative_length = int(cl.keys.shape[-2])
-            if getattr(cl, "indexer_keys", None) is not None and cl.indexer_keys.numel():
-                cl.indexer_keys = cl.indexer_keys[:, :n]
+        if not isinstance(cl, CacheLayerMixin) or cl.keys is None or cl.values is None or cl.keys.shape[-2] <= n:
+            continue
+        cl.keys, cl.values = cl.keys[..., :n, :], cl.values[..., :n, :]
+        if isinstance(cl, DynamicSlidingWindowLayer):
+            cl.cumulative_length = int(cl.keys.shape[-2])
+        if isinstance(cl, DynamicIndexedLayer) and cl.indexer_keys is not None and cl.indexer_keys.numel():
+            cl.indexer_keys = cl.indexer_keys[:, :n]
 
 
 class Session:
@@ -48,21 +67,21 @@ class Session:
     `generate`; any session can be passed as `generate(session=...)`. Cut and read the rows through the session
     (`crop`, `rows`), not `cache.layers`: a layer's tensors may live in memory btb moves or hands to another cache."""
 
-    def __init__(self, tail: int = 0, engine: Any = None) -> None:
+    def __init__(self, tail: int = 0, engine: StreamedTextModel | None = None) -> None:
         self.ids: list[int] = []
         self.n_prompt = 0
-        self.cache: Any = None
-        self.anchor: list[dict[str, Any]] = []
-        self.dr: Any = None
+        self.cache: KvCache | None = None
+        self.anchor: list[Anchor] = []
+        self.dr: MTPDrafter | None = None
         self.dr_len = 0
-        self.pend_h: Any = None
+        self.pend_h: torch.Tensor | None = None
         self.tail = int(tail)
         self.engine = engine
         # the sequence's last token when a decode drew it and the cache does not hold it yet; else, after a
         # `feed`, the next token's logits [V]
         self.pending: int | None = None
         self.logits: torch.Tensor | None = None
-        self.forked: Any = None  # the live `Branches` over this session, which holds it still
+        self.forked: _Rows | None = None  # the live `Branches` or `Batch` over this session, which holds it still
 
     @property
     def fresh(self) -> bool:
@@ -76,14 +95,14 @@ class Session:
     def __len__(self) -> int:
         return len(self.ids) + (self.pending is not None)
 
-    def _bound(self) -> Any:
+    def _bound(self) -> StreamedTextModel:
         if self.engine is None:
             raise ValueError("this session is not bound to an engine: make it with model.session()")
         if self.forked is not None:
             raise ValueError("this session is forked: `keep` a row or `close` the branches first")
         return self.engine
 
-    def _flush(self, eng: Any) -> None:
+    def _flush(self, eng: StreamedTextModel) -> None:
         """the recurrent states an MLX decode kept in its graph, written into the cache's tensors"""
         if self.cache is not None and getattr(eng, "mlx", None) is not None:
             eng._mlx_flush_states(self.cache)
@@ -98,13 +117,15 @@ class Session:
         lead = 0 if self.pending is None else 1
         return eng._serial(lambda: self._append(eng, new)[lead:])
 
-    def _append(self, eng: Any, new: list[int]) -> torch.Tensor:
+    def _append(self, eng: StreamedTextModel, new: list[int]) -> torch.Tensor:
         """the pending token and `new` into the cache: the logits after each, [T, V] float32 (on the decode's
         thread, under its lock)"""
         new = [self.pending, *new] if self.pending is not None else new
         if self.cache is None:
             self.cache = eng.new_cache()
-        out = eng.forward([new], cache=self.cache, last_only=False)[0].float().cpu()
+        logits = eng.forward([new], cache=self.cache, last_only=False)
+        assert logits is not None
+        out = logits[0].float().cpu()
         self.ids.extend(new)
         self.n_prompt = len(self.ids)
         self.pending, self.logits = None, out[-1].clone()
@@ -112,11 +133,13 @@ class Session:
         self.dr, self.dr_len, self.pend_h = None, 0, None
         return out
 
-    def _settle(self, eng: Any) -> None:
+    def _settle(self, eng: StreamedTextModel) -> None:
         """every token in the cache and the next token's logits in hand (what a fork starts from)"""
         if self.pending is None and self.logits is None:
             if LayerKind.LINEAR in eng.layer_types:
                 raise ValueError("the next token's logits are not kept here: feed the next token, then fork")
+            if self.cache is None:
+                raise ValueError("an empty session has nothing to go on from: feed it a prompt first")
             # the last token again: its row cut and re-run
             crop(self.cache, eng, len(self.ids) - 1)
             self.pending = self.ids.pop()
@@ -126,14 +149,13 @@ class Session:
     def mark(self) -> Mark:
         """this point of the sequence, to `rewind` to later"""
         eng = self._bound()
-        if self.cache is None or LayerKind.LINEAR not in eng.layer_types:
+        cache = self.cache
+        if cache is None or LayerKind.LINEAR not in eng.layer_types:
             return Mark(len(self.ids), {}, self.pending, self.logits)
 
         def run() -> Mark:
             self._flush(eng)
-            states = {
-                i: eng._lin_snap(self.cache.layers[i]) for i in range(eng.L) if eng.layer_types[i] == LayerKind.LINEAR
-            }
+            states = {i: eng._lin_snap(cache.layers[i]) for i in range(eng.L) if eng.layer_types[i] == LayerKind.LINEAR}
             return Mark(len(self.ids), states, self.pending, self.logits)
 
         return eng._serial(run)
@@ -186,14 +208,17 @@ class Session:
             raise IndexError(f"layer {layer} of a model of {eng.L}")
         if eng.layer_types[i] == LayerKind.LINEAR:
             raise ValueError(f"layer {i} is a linear-attention layer: its state is recurrent, it has no rows")
-        if self.cache is None:
+        cache = self.cache
+        if cache is None:
             raise ValueError("the session has no cache yet: feed it a prompt first")
 
         def run() -> tuple[torch.Tensor, torch.Tensor]:
             import torch
+            from transformers.cache_utils import CacheLayerMixin
 
             self._flush(eng)
-            cl = self.cache.layers[i]
+            cl = cache.layers[i]
+            assert isinstance(cl, CacheLayerMixin) and cl.keys is not None and cl.values is not None
             # made outside inference mode, so the caller can write to them
             with torch.inference_mode(False):
                 return cl.keys.clone(), cl.values.clone()
@@ -218,14 +243,14 @@ class Session:
 
         return eng._serial(run)
 
-    def fork(self, n: int) -> Any:
+    def fork(self, n: int) -> Branches:
         """`n` rows going on from here together (`btb.Branches`), sharing this session's cache, which holds
         still until one of them is kept"""
         from .engine.branches import Branches
 
         return Branches(self, n)
 
-    def generate(self, max_new: int | None = None, **kw: Any) -> Any:
+    def generate(self, max_new: int | None = None, **kw: Unpack[GenerateArgs]) -> RowGeneration:
         """Decode on from where the sequence stands (`model.generate` with this session; its keyword arguments)"""
         if not len(self):
             raise ValueError("an empty session has nothing to go on from: feed it a prompt first")
@@ -243,7 +268,7 @@ class Session:
             self.tail = int(self.n_prompt - m)
         return m
 
-    def anchored(self, m: int) -> dict[str, Any] | None:
+    def anchored(self, m: int) -> Anchor | None:
         """the latest DeltaNet snapshot at or before the matched prefix, None when there is none"""
         best = None
         for a in self.anchor:
@@ -251,7 +276,7 @@ class Session:
                 best = a
         return best
 
-    def open(self, engine: Any, prompt: Tokens) -> tuple[Any, int, dict[str, Any] | None]:
+    def open(self, engine: _State, prompt: Tokens) -> tuple[KvCache | None, int, Anchor | None]:
         """What a new prompt reuses: (cache, rows reused, the snapshot restored), or (None, 0, None). A dense
         cache is cropped to the shared prefix; a hybrid's DeltaNet states cannot be cropped, so they come
         back from the latest snapshot inside it."""
@@ -290,11 +315,11 @@ class Session:
         self,
         prompt: Tokens,
         out: Tokens,
-        cache: Any,
-        anchors: Any,
-        dr: Any = None,
+        cache: KvCache,
+        anchors: Sequence[Anchor] | None,
+        dr: MTPDrafter | None = None,
         dr_len: int = 0,
-        pend_h: Any = None,
+        pend_h: torch.Tensor | None = None,
     ) -> None:
         """what the next call finds: the cache holds the prompt and the answer but its last token"""
         self.ids = [*prompt, *out[:-1]]

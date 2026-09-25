@@ -9,12 +9,12 @@ import json
 import os
 import re
 from collections.abc import Iterator
-from typing import Any
 
 import pytest
 import torch
 
 from btb.engine.constrain import JsonObjectPrefix, LogitBias, Penalties, PrefixConstraint
+from btb.kinds import Json
 from btb.serve import Server
 from tests.helpers import CharTokenizer, fixture, request, request_json
 
@@ -35,14 +35,14 @@ def served() -> Iterator[tuple[Server, str]]:
         server.close()
 
 
-def chat(served: tuple[Server, str], **fields: Any) -> dict[str, Any]:
+def chat(served: tuple[Server, str], **fields: object) -> Json:
     server, name = served
     code, body = request_json(server.url, "POST", "/v1/chat/completions", {"model": name, "messages": MSGS, **fields})
     assert code == 200, body
     return body
 
 
-def events(served: tuple[Server, str], **fields: Any) -> list[dict[str, Any]]:
+def events(served: tuple[Server, str], **fields: object) -> list[Json]:
     """a streamed chat completion's chunks, in order"""
     server, name = served
     body = {"model": name, "messages": MSGS, "stream": True, **fields}
@@ -175,7 +175,7 @@ def test_ollama_takes_format_and_stop(served: tuple[Server, str]) -> None:
         ({"n": 0}, "n="),
     ],
 )
-def test_a_field_out_of_range_is_a_400(served: tuple[Server, str], fields: dict[str, Any], word: str) -> None:
+def test_a_field_out_of_range_is_a_400(served: tuple[Server, str], fields: Json, word: str) -> None:
     server, name = served
     code, body = request_json(server.url, "POST", "/v1/chat/completions", {"model": name, "messages": MSGS, **fields})
     assert code == 400 and word in body["error"], (fields, body)

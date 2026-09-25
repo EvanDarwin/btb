@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -16,9 +16,13 @@ from ..kinds import Json, LayerKind, PassTag, Proposer, TokenRows, Tokens
 from ..options import Device
 from ..sampling import GREEDY, Sampling, Verify
 from ..session import Session
+from .cache import LinearStates, linear_layer
 from .drafter import MTPDrafter
 from .hooks import Hooks
 from .state import _State
+
+if TYPE_CHECKING:
+    from .cache import CacheLayer
 
 
 def _lin(cl: Any) -> tuple[torch.Tensor, torch.Tensor]:
@@ -78,27 +82,29 @@ class _GenerateMixin(_State):
     _lin = staticmethod(_lin)
 
     @staticmethod
-    def _lin_snap(cl: Any) -> tuple[dict[Any, Any], dict[Any, Any]]:
-        c, r = cl.conv_states, cl.recurrent_states
-        if isinstance(c, dict):
-            return (
-                {k: v.clone() for k, v in c.items() if isinstance(v, torch.Tensor)},
-                {k: v.clone() for k, v in r.items() if isinstance(v, torch.Tensor)},
-            )
-        return c.clone(), r.clone()
+    def _lin_snap(cl: CacheLayer) -> LinearStates:
+        lin = linear_layer(cl)
+        c, r = lin.conv_states, lin.recurrent_states
+        return (
+            {k: v.clone() for k, v in c.items() if isinstance(v, torch.Tensor)},
+            {k: v.clone() for k, v in r.items() if isinstance(v, torch.Tensor)},
+        )
 
     @staticmethod
-    def _lin_restore(cl: Any, snap: tuple[torch.Tensor, torch.Tensor]) -> None:
+    def _lin_restore(cl: CacheLayer, snap: LinearStates) -> None:
+        lin = linear_layer(cl)
         conv, rec = snap
-        if isinstance(conv, dict):
-            for k, v in conv.items():
-                cl.conv_states[k].copy_(v)
-            for k, v in rec.items():
-                cl.recurrent_states[k].copy_(v)
+        if isinstance(conv, torch.Tensor) and isinstance(rec, torch.Tensor):
+            c, r = _lin(lin)
+            c.copy_(conv)
+            r.copy_(rec)
             return
-        c, r = _lin(cl)
-        c.copy_(conv)
-        r.copy_(rec)
+        assert isinstance(conv, dict) and isinstance(rec, dict)
+        for states, saved in ((lin.conv_states, conv), (lin.recurrent_states, rec)):
+            for k, v in saved.items():
+                dst = states[k]
+                assert dst is not None
+                dst.copy_(v)
 
     def _session_prefill(
         self, ids: torch.Tensor, cache: Any, reuse: int, session: Session | None, on_layer: Any = None
@@ -672,7 +678,7 @@ class _GenerateMixin(_State):
 
                 layer_hook = tap_hook
 
-        logits: Any = self._prefill(ids, cache, on_layer=layer_hook, attention_mask=am)
+        logits: torch.Tensor = self._prefill(ids, cache, on_layer=layer_hook, attention_mask=am)
         self.vram_trim("prefill")
         pos0 = int(ids.shape[1]) - 1  # the row the prompt's last token holds: step k picks at pos0 + k
         for step in range(max_new):

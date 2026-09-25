@@ -109,7 +109,11 @@ def _warn_mlx_missing() -> None:
     )
 
 
-def torch_device(device: Any) -> torch.device:
+# a device as a caller names one: 'cpu', 'mlx', 'cuda:1', the enum, a parsed name, or torch's own
+DeviceSpec = str | DeviceKind | DeviceName | torch.device
+
+
+def torch_device(device: DeviceSpec) -> torch.device:
     """A device as torch spells it, to price or allocate on: 'mlx' is the host, whose RAM the GPU spends on
     Apple silicon's unified memory. A name that is not a device (or mlx off Apple silicon) is an OptionError."""
     if isinstance(device, torch.device):

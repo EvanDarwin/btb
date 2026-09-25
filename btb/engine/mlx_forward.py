@@ -30,7 +30,7 @@ from ..mlx import fused as fk
 from ..mlx.q6k import gather_q6k
 from ..sampling import GREEDY
 from ..session import Session
-from .cache import GrowLayer, forked
+from .cache import GraphStates, GrowLayer, forked
 from .families import act_name
 from .host import _HostLinear, copy_bytes
 from .native import Native
@@ -1680,9 +1680,8 @@ class _MlxMixin(_State):
                     for cl in cache.layers:
                         if isinstance(cl, GrowLayer) and cl.shared and cl._mx is not None:
                             cl._n -= 1
-                        if getattr(cl, "_mx_pending", None) is not None:
-                            cl._mx_pending = getattr(cl, "_mx_prev", None)
-                            cl._mx_prev = None
+                        if isinstance(cl, GraphStates) and cl._mx_pending is not None:
+                            cl._mx_pending, cl._mx_prev = cl._mx_prev, None
                 break
             cur = nxt
         self._mlx_flush_states(cache)

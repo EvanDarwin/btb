@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterator, Sequence
-from typing import Any
+from typing import Unpack
 
 import pytest
 import torch
 
+from btb.engine import StreamedTextModel
+from btb.engine.hooks import HookArgs, PassStats
 from btb.kinds import LayerKind
 from btb.sampling import Sampling
 from btb.text import template
@@ -30,7 +32,7 @@ SMP = Sampling(temperature=0.9, seed=11)
 # and a step's gemv sum in fp32 in different orders; on MLX a batched pass and a single-row one do in bf16
 TOL = {"cpu": 1e-4, "mlx": 0.05}
 
-_models: dict[tuple[str, str], Any] = {}
+_models: dict[tuple[str, str], StreamedTextModel] = {}
 _open = contextlib.ExitStack()
 
 
@@ -41,7 +43,7 @@ def _close_models() -> Iterator[None]:
     _models.clear()
 
 
-def model(stem: str, device: str) -> Any:
+def model(stem: str, device: str) -> StreamedTextModel:
     """the fixture loaded once for the module on `device`"""
     if device == "mlx":
         need_mlx()
@@ -51,7 +53,9 @@ def model(stem: str, device: str) -> Any:
     return _models[key]
 
 
-def solo(sm: Any, ids: Sequence[int], n: int, sampling: Sampling | None = None, **kw: Any) -> list[int]:
+def solo(
+    sm: StreamedTextModel, ids: Sequence[int], n: int, sampling: Sampling | None = None, **kw: Unpack[HookArgs]
+) -> list[int]:
     return [int(t) for t in sm.generate(list(ids), n, eos=(), speculate=False, sampling=sampling, **kw).tokens]
 
 
@@ -76,7 +80,7 @@ def test_hooks_leave_the_answer_as_it_was(stem: str, device: str, speculate: boo
     sm = model(stem, device)
     plain = list(sm.generate(PROMPT, N, eos=(), speculate=speculate).tokens)
     g = sm.generate(PROMPT, N, eos=(), speculate=speculate, processors=[lambda ids, lg: lg], logprobs=2, taps=[0, -1])
-    assert list(g.tokens) == plain
+    assert list(g.tokens) == plain and g.logprobs is not None and g.hidden is not None
     assert [t.token for t in g.logprobs] == plain and all(len(t.top) == 2 for t in g.logprobs)
     assert sorted(g.hidden) == [0, sm.L - 1] and all(h.shape[0] == len(plain) for h in g.hidden.values())
 
@@ -110,6 +114,7 @@ def test_logprobs_are_the_distribution_the_token_was_drawn_from(stem: str, devic
     g = sm.generate(PROMPT, N, eos=(), speculate=False, logprobs=3)
     toks = list(g.tokens)
     s = sm.session(PROMPT)
+    assert g.logprobs is not None and s.logits is not None
     ref = torch.log_softmax(torch.cat([s.logits[None], s.feed(toks[:-1])]).float(), -1)
     for k, t in enumerate(g.logprobs):
         close(torch.tensor(t.logprob), ref[k, t.token], device)
@@ -126,6 +131,7 @@ def test_speculative_logprobs_are_each_positions_own(stem: str, device: str) -> 
     g = sm.generate(PROMPT, N, eos=(), speculate=True, sampling=SMP, logprobs=0)
     toks = list(g.tokens)
     s = sm.session(PROMPT)
+    assert g.logprobs is not None and s.logits is not None
     ref = torch.log_softmax(torch.cat([s.logits[None], s.feed(toks[:-1])]).float(), -1)
     got = torch.tensor([t.logprob for t in g.logprobs])
     want = ref[torch.arange(len(toks)), torch.tensor(toks)]
@@ -139,7 +145,7 @@ def test_speculative_logprobs_are_each_positions_own(stem: str, device: str) -> 
 def test_on_pass_counts_every_token(stem: str, device: str, speculate: bool) -> None:
     """the passes' stats add up to the answer: their tokens, in order, accepted drafts never above drafted"""
     sm = model(stem, device)
-    seen: list[Any] = []
+    seen: list[PassStats] = []
     g = sm.generate(PROMPT, N, eos=(), speculate=speculate, on_pass=seen.append)
     assert [p["index"] for p in seen] == list(range(len(seen)))
     assert sum(p["tokens"] for p in seen) == len(g.tokens)
@@ -159,6 +165,7 @@ def test_taps_are_the_hidden_states_at_each_pick(stem: str, device: str) -> None
     g = sm.generate(PROMPT, N, eos=(), speculate=False, taps=[1])
     toks = list(g.tokens)
     h = sm.hidden(PROMPT + toks[:-1], layers=(1,))[1][len(PROMPT) - 1 :]
+    assert g.hidden is not None
     dist = torch.cdist(g.hidden[1].float(), h.float())
     assert dist.argmin(dim=1).tolist() == list(range(len(toks)))
     assert (g.hidden[1] - h).abs().max().item() <= 3e-2 * h.abs().max().item()
@@ -169,7 +176,9 @@ def test_taps_are_the_hidden_states_at_each_pick(stem: str, device: str) -> None
 def test_the_last_layer_through_the_head_is_the_logits(stem: str, device: str) -> None:
     sm = model(stem, device)
     h = sm.hidden(PROMPT, layers=(-1,))[sm.L - 1]
-    close(sm.project(h[-1]), sm.session(PROMPT).logits, device)
+    logits = sm.session(PROMPT).logits
+    assert logits is not None
+    close(sm.project(h[-1]), logits, device)
 
 
 @cells
@@ -305,6 +314,7 @@ def test_a_forks_step_is_each_rows_own_pass(stem: str, device: str) -> None:
     sm = model(stem, device)
     s = sm.session(PROMPT)
     with s.fork(2) as br:
+        assert br.logits is not None and s.logits is not None
         close(br.logits[0], s.logits, device)
         br.step([1, 2])
         br.reorder([1, 1, 0])
@@ -395,7 +405,7 @@ def test_a_batch_row_is_written_back_when_it_stops(stem: str, device: str) -> No
 def test_generate_takes_rows_of_their_own_lengths(stem: str, device: str) -> None:
     sm = model(stem, device)
     g = sm.generate([PROMPT, OTHER], 4, eos=(), speculate=False, logprobs=0)
-    assert len(g.tokens) == 2 and all(len(t) == 4 for t in g.tokens)
+    assert len(g.tokens) == 2 and all(len(t) == 4 for t in g.tokens) and g.logprobs is not None
     assert [len(lp) for lp in g.logprobs] == [4, 4]
     if device == "cpu":
         assert g.tokens == [solo(sm, PROMPT, 4), solo(sm, OTHER, 4)]

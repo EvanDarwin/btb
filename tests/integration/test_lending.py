@@ -8,12 +8,12 @@ from __future__ import annotations
 import gc
 import time
 import weakref
-from collections.abc import Iterator
-from typing import Any
+from collections.abc import Callable, Iterator
 
 import pytest
 import torch
 
+from btb.engine import StreamedTextModel
 from btb.engine.cache import ForkLayer
 from btb.engine.scheduler import MemoryGrantError
 from tests.helpers import fixture, loaded_model, need_cuda, need_mlx
@@ -23,14 +23,14 @@ MiB = 2**20
 
 
 @pytest.fixture(params=["cpu", "mlx"])
-def sm(request: pytest.FixtureRequest) -> Iterator[Any]:
+def sm(request: pytest.FixtureRequest) -> Iterator[StreamedTextModel]:
     if request.param == "mlx":
         need_mlx()
     with loaded_model(fixture("tiny_qwen3"), device=request.param) as m:
         yield m
 
 
-def squeeze(sm: Any, left: int) -> None:
+def squeeze(sm: StreamedTextModel, left: int) -> None:
     """leave `left` bytes free on the host, as btb counts it"""
     if sm.mlx is not None:
         sm.ram_reserve = int(sm.mem_start) - int(sm.mlx.held_bytes()) - left
@@ -38,7 +38,7 @@ def squeeze(sm: Any, left: int) -> None:
         sm.ram_reserve += max(0, sm.memory()["cpu"].free - left)
 
 
-def test_rooms_add_up_and_come_back(sm: Any) -> None:
+def test_rooms_add_up_and_come_back(sm: StreamedTextModel) -> None:
     with sm.room(4 * MiB) as a, sm.room(2 * MiB, name="b"):
         assert sm.memory()["cpu"].reserved == 6 * MiB and a.held
         a.release()
@@ -50,7 +50,7 @@ def test_rooms_add_up_and_come_back(sm: Any) -> None:
     assert sm.memory()["cpu"].reserved == 0
 
 
-def test_a_room_dropped_unreleased_is_given_back(sm: Any) -> None:
+def test_a_room_dropped_unreleased_is_given_back(sm: StreamedTextModel) -> None:
     r = sm.room(MiB)
     assert sm.memory()["cpu"].reserved == MiB
     del r
@@ -58,7 +58,7 @@ def test_a_room_dropped_unreleased_is_given_back(sm: Any) -> None:
     assert sm.memory()["cpu"].reserved == 0
 
 
-def test_a_lent_tensor_is_a_plain_tensor_counted_while_it_lives(sm: Any) -> None:
+def test_a_lent_tensor_is_a_plain_tensor_counted_while_it_lives(sm: StreamedTextModel) -> None:
     """what btb's ledger cannot see (a torch tensor on MLX's unified memory) it counts until the last view is gone;
     where it sees torch's allocations (the CPU, a card) the tensor counts itself"""
     t = sm.full((256, 1024), 2.0, dtype=torch.float32)
@@ -75,7 +75,7 @@ def test_a_lent_tensor_is_a_plain_tensor_counted_while_it_lives(sm: Any) -> None
     assert torch.equal(sm.zeros(3, dtype=torch.int64), torch.zeros(3, dtype=torch.int64))
 
 
-def test_a_refusal_names_the_request_and_leaves_the_model_answering(sm: Any) -> None:
+def test_a_refusal_names_the_request_and_leaves_the_model_answering(sm: StreamedTextModel) -> None:
     """asked for more than btb can give, it gives up what it holds - warm layers to the drive - and refuses,
     naming the request; the model decodes the same tokens from the drive"""
     ref = list(sm.generate(PROMPT, 6, eos=(), speculate=False).tokens)
@@ -88,14 +88,14 @@ def test_a_refusal_names_the_request_and_leaves_the_model_answering(sm: Any) -> 
     assert list(sm.generate(PROMPT, 6, eos=(), speculate=False).tokens) == ref
 
 
-def test_memory_names_each_device_btb_runs_on(sm: Any) -> None:
+def test_memory_names_each_device_btb_runs_on(sm: StreamedTextModel) -> None:
     mem = sm.memory()
     assert list(mem) == ["cpu"]
     m = mem["cpu"]
     assert m.free > 0 and m.reserved == 0 and m.sheddable > 0 and m.lendable == m.free + m.sheddable
 
 
-def _until(cond: Any, sm: Any, seconds: float = 20.0) -> bool:
+def _until(cond: Callable[[], bool], sm: StreamedTextModel, seconds: float = 20.0) -> bool:
     """decode now and then (each pass runs the memory policies) until `cond()` or `seconds` pass"""
     deadline = time.time() + seconds
     while not cond() and time.time() < deadline:
@@ -130,7 +130,7 @@ def test_a_card_gives_layers_up_for_a_tensor_and_every_cache_follows() -> None:
         t = sm.empty(want, dtype=torch.uint8)
         assert t.device.type == "cuda" and set(sm.resident) < before
         for i in before - set(sm.resident):
-            assert idle.cache.layers[i].keys.device.type == "cpu", i
+            assert idle.rows(i)[0].device.type == "cpu", i
         assert len(idle.generate(2, eos=(), speculate=False).tokens) == 2
         del t
         gc.collect()
@@ -150,9 +150,9 @@ def test_a_layer_move_reaches_every_live_cache() -> None:
         gc.collect()
         assert gone() is None and all(c is not None for c in sm._live_caches)
         sm._caches_to(0, "meta")
-        assert idle.cache.layers[0].keys.device.type == "meta"
-        fl = br.cache.layers[0]
+        assert idle.rows(0)[0].device.type == "meta"
+        fl = br._check().layers[0]
         assert isinstance(fl, ForkLayer) and fl.keys.device.type == "meta" and fl._tk is not None
         assert fl._tk.device.type == "meta"
-        assert idle.cache.layers[1].keys.device.type == "cpu"
+        assert idle.rows(1)[0].device.type == "cpu"
         br.close()
