@@ -12,6 +12,7 @@ pub mod attn;
 pub mod delta;
 pub mod direct;
 pub mod gemv;
+pub mod hw;
 pub mod sample;
 
 pub mod codes {

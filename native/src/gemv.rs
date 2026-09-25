@@ -12,7 +12,42 @@ const SPLIT: usize = 4;
 
 const COL_TILE: usize = 512;
 
-const B_TILE: usize = 8;
+/// The most vectors that share one walk of the weights, whatever the machine: the task's stack scratch holds
+/// this many (vector, row) lane sums.
+const MAX_B_TILE: usize = 16;
+
+/// The vectors that share one walk of the weights on a core whose L1 data cache holds `l1d` bytes: as many
+/// `COL_TILE` slices of x as fit beside the widened weight tile in three quarters of it, rounded down to the
+/// 4-vector groups the bf16 kernel runs, within 1..`MAX_B_TILE`. 32 KB (Zen, Skylake, an E-core) gives 8, 48 KB
+/// 12, 64 KB and up 16. A tile moves which bytes stay in cache, never a sum's order: no bit depends on it.
+const fn b_tile_for(l1d: usize) -> usize {
+    let wide = ROW_UNROLL * COL_TILE * 4;
+    let per = COL_TILE * 4;
+    let room = (l1d * 3 / 4).saturating_sub(wide);
+    let t = room / per;
+    let t = if t >= 4 { t / 4 * 4 } else { t };
+    if t < 1 {
+        1
+    } else if t > MAX_B_TILE {
+        MAX_B_TILE
+    } else {
+        t
+    }
+}
+
+/// This machine's vectors a walk: `b_tile_for` its smallest L1 data cache (`hw::l1d_bytes`), decided once.
+/// `BTB_NATIVE_B_TILE=N` in the environment at the first call pins it (1..`MAX_B_TILE`), as `BTB_NATIVE_ISA`
+/// pins the kernel path.
+pub fn b_tile() -> usize {
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("BTB_NATIVE_B_TILE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|t| (1..=MAX_B_TILE).contains(t))
+            .unwrap_or_else(|| b_tile_for(crate::hw::l1d_bytes()))
+    })
+}
 
 #[inline(always)]
 pub fn bf16_to_f32(w: u16) -> f32 {
@@ -467,12 +502,12 @@ unsafe impl Send for Bf16 {}
 unsafe impl Sync for Bf16 {}
 
 // One task body for every weight form and ISA. `R` rows at a time (`ROW_UNROLL`, then single rows); for
-// each group of up to `B_TILE` vectors the row group is walked over the columns in `COL_TILE` tiles, every
-// vector of the group accumulated from the same tile while it is in cache, and the 16 lane sums of each
-// (vector, row) folded by `reduce16`. An accumulator meets the tiles in order with a fixed lane mapping, so
-// the bits do not depend on `b`. `prep` runs once per (vector group, row group); `tile` either fills `wide`
-// with the tile's weights as f32 and yields `false`, or accumulates straight from the rows and
-// yields `true`.
+// each group of up to `tile` vectors (`b_tile()`, this machine's) the row group is walked over the columns in
+// `COL_TILE` tiles, every vector of the group accumulated from the same tile while it is in cache, and the 16
+// lane sums of each (vector, row) folded by `reduce16`. An accumulator meets the tiles in order with a fixed
+// lane mapping, so the bits depend on neither `b` nor `tile`. `prep` runs once per (vector group, row
+// group); `tile` either fills `wide` with the tile's weights as f32 and yields `false`, or accumulates
+// straight from the rows and yields `true`.
 macro_rules! def_task {
     ($group:ident, $task:ident, $w:ty, $accum:ident $(, $feat:literal)?,
      prep |$pp:ident, $pr:ident, $pcols:ident, $pcur:ident| $prep:block,
@@ -490,10 +525,11 @@ macro_rules! def_task {
             y: *mut f32,
             rows_total: usize,
             $r: usize,
+            tile: usize,
         ) {
             let mut $i0 = 0usize;
             while $i0 < b {
-                let $bt = (b - $i0).min(B_TILE);
+                let $bt = (b - $i0).min(tile);
                 std::ptr::write_bytes($scratch, 0, $bt * R * LANES);
                 let mut $cur = [0usize; ROW_UNROLL];
                 {
@@ -526,7 +562,7 @@ macro_rules! def_task {
                             reduce16($scratch.add((i * R + rr) * LANES));
                     }
                 }
-                $i0 += B_TILE;
+                $i0 += tile;
             }
         }
 
@@ -541,18 +577,20 @@ macro_rules! def_task {
             rows_total: usize,
             r0: usize,
             r1: usize,
+            tile: usize,
         ) {
-            let mut scratch = [0.0f32; B_TILE * ROW_UNROLL * LANES];
+            let tile = tile.clamp(1, MAX_B_TILE);
+            let mut scratch = [0.0f32; MAX_B_TILE * ROW_UNROLL * LANES];
             let s = scratch.as_mut_ptr();
             let mut wide = [0.0f32; ROW_UNROLL * COL_TILE];
             let d = wide.as_mut_ptr();
             let mut r = r0;
             while r + ROW_UNROLL <= r1 {
-                $group::<ROW_UNROLL>(s, d, p, cols, x, b, y, rows_total, r);
+                $group::<ROW_UNROLL>(s, d, p, cols, x, b, y, rows_total, r, tile);
                 r += ROW_UNROLL;
             }
             while r < r1 {
-                $group::<1>(s, d, p, cols, x, b, y, rows_total, r);
+                $group::<1>(s, d, p, cols, x, b, y, rows_total, r, tile);
                 r += 1;
             }
         }
@@ -1319,6 +1357,7 @@ trait Weights: Copy + Send + Sync {
         rows_total: usize,
         r0: usize,
         r1: usize,
+        tile: usize,
     );
 }
 
@@ -1334,6 +1373,7 @@ impl Weights for Bf16 {
         rows_total: usize,
         r0: usize,
         r1: usize,
+        tile: usize,
     ) {
         by_isa!(
             isa,
@@ -1341,7 +1381,7 @@ impl Weights for Bf16 {
             task_avx2,
             task_avx512,
             task_neon,
-            (self, cols, x, b, y, rows_total, r0, r1)
+            (self, cols, x, b, y, rows_total, r0, r1, tile)
         )
     }
 }
@@ -1358,6 +1398,7 @@ impl Weights for P12 {
         rows_total: usize,
         r0: usize,
         r1: usize,
+        tile: usize,
     ) {
         by_isa!(
             isa,
@@ -1365,7 +1406,7 @@ impl Weights for P12 {
             task_p12_avx2,
             task_p12_avx512,
             task_p12_neon,
-            (self, cols, x, b, y, rows_total, r0, r1)
+            (self, cols, x, b, y, rows_total, r0, r1, tile)
         )
     }
 }
@@ -1382,6 +1423,7 @@ impl Weights for Mx4 {
         rows_total: usize,
         r0: usize,
         r1: usize,
+        tile: usize,
     ) {
         by_isa!(
             isa,
@@ -1389,7 +1431,7 @@ impl Weights for Mx4 {
             task_mx4_avx2,
             task_mx4_avx512,
             task_mx4_neon,
-            (self, cols, x, b, y, rows_total, r0, r1)
+            (self, cols, x, b, y, rows_total, r0, r1, tile)
         )
     }
 }
@@ -1422,12 +1464,14 @@ unsafe fn run_one<W: Weights>(t: Task<W>, threads: usize) -> i32 {
         None => return ERR_DOMAIN,
     };
     if nt <= 1 || t.rows == 1 {
-        t.w.rows(isa, t.cols, t.x, t.b, t.y, t.rows, 0, t.rows);
+        t.w.rows(isa, t.cols, t.x, t.b, t.y, t.rows, 0, t.rows, b_tile());
         return OK;
     }
     spread(t.rows, nt, global, move |r0, r1| {
         let t = t; // the whole task captured, not its pointer fields one by one
-        unsafe { t.w.rows(isa, t.cols, t.x, t.b, t.y, t.rows, r0, r1) }
+        unsafe {
+            t.w.rows(isa, t.cols, t.x, t.b, t.y, t.rows, r0, r1, b_tile())
+        }
     });
     OK
 }
@@ -1446,7 +1490,7 @@ unsafe fn run_group<W: Weights>(tasks: &[Task<W>], total: usize, threads: usize)
     };
     if nt <= 1 {
         for t in tasks {
-            t.w.rows(isa, t.cols, t.x, t.b, t.y, t.rows, 0, t.rows);
+            t.w.rows(isa, t.cols, t.x, t.b, t.y, t.rows, 0, t.rows, b_tile());
         }
         return OK;
     }
@@ -1463,7 +1507,9 @@ unsafe fn run_group<W: Weights>(tasks: &[Task<W>], total: usize, threads: usize)
         let (i, r0) = work[k];
         let t = tasks[i];
         let r1 = (r0 + chunk).min(t.rows);
-        unsafe { t.w.rows(isa, t.cols, t.x, t.b, t.y, t.rows, r0, r1) }
+        unsafe {
+            t.w.rows(isa, t.cols, t.x, t.b, t.y, t.rows, r0, r1, b_tile())
+        }
     });
     OK
 }
@@ -1772,6 +1818,160 @@ pub(crate) unsafe fn gemv_mxfp4_group_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_tile_follows_the_l1_it_must_fit() {
+        for (l1d, want) in [
+            (4 * 1024, 1),
+            (16 * 1024, 2),
+            (32 * 1024, 8),
+            (48 * 1024, 12),
+            (64 * 1024, 16),
+            (128 * 1024, 16),
+            (2 * 1024 * 1024, 16),
+        ] {
+            assert_eq!(b_tile_for(l1d), want, "{l1d} bytes of L1");
+        }
+        assert!((1..=MAX_B_TILE).contains(&b_tile()));
+    }
+
+    /// Every tile a machine could pick gives the same bits, in every weight form on this machine's path: 19
+    /// vectors (past the largest tile), 13 rows (past the row unroll, with a single-row remainder), columns
+    /// past a whole `COL_TILE` and the packed matrix's escapes crossing tiles and rows.
+    #[test]
+    fn every_tile_size_gives_the_same_bits() {
+        let mut st = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        let (rows, b) = (13usize, 19usize);
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+        let tiles = [1, 2, 3, 4, 5, 7, 8, 9, 12, 16];
+        let isa = isa();
+        // one product of `x` into `y` at a tile
+        type Run<'a> = &'a dyn Fn(&[f32], &mut [f32], usize);
+        let check = |form: &str, cols: usize, run: Run| {
+            let mut s = 0x9e37_79b9_7f4a_7c15u64 ^ cols as u64;
+            let x: Vec<f32> = (0..b * cols)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+                })
+                .collect();
+            let mut want = vec![0.0f32; b * rows];
+            run(&x, &mut want, 1);
+            for tile in tiles {
+                let mut y = vec![f32::NAN; b * rows];
+                run(&x, &mut y, tile);
+                assert_eq!(bits(&y), bits(&want), "{form}: tile {tile}");
+            }
+        };
+
+        let cols = 1057; // not a multiple of 16: the bf16 tail runs
+        let w: Vec<u16> = (0..rows * cols)
+            .map(|_| 0x3C00 | (next() as u16 & 0x81FF))
+            .collect();
+        check("bf16", cols, &|x, y, tile| unsafe {
+            Bf16(w.as_ptr()).rows(
+                isa,
+                cols,
+                x.as_ptr(),
+                b,
+                y.as_mut_ptr(),
+                rows,
+                0,
+                rows,
+                tile,
+            )
+        });
+
+        let cols = 1056; // whole 32-weight blocks
+        let (blocks, scales) = mx4_random(rows, cols, 0x0dd_ba11);
+        for ggml in [false, true] {
+            let blocks = if ggml {
+                // the same codes as 17-byte blocks, the scale first
+                (0..rows * cols / MX_BLOCK)
+                    .flat_map(|g| {
+                        std::iter::once(scales[g]).chain(
+                            blocks[g * MX_BLOCK_BYTES..(g + 1) * MX_BLOCK_BYTES]
+                                .iter()
+                                .copied(),
+                        )
+                    })
+                    .collect::<Vec<u8>>()
+            } else {
+                blocks.clone()
+            };
+            let p = Mx4 {
+                blocks: blocks.as_ptr(),
+                scales: scales.as_ptr(),
+                ggml,
+            };
+            check("mxfp4", cols, &|x, y, tile| unsafe {
+                p.rows(
+                    isa,
+                    cols,
+                    x.as_ptr(),
+                    b,
+                    y.as_mut_ptr(),
+                    rows,
+                    0,
+                    rows,
+                    tile,
+                )
+            });
+        }
+
+        let cols = 1057;
+        let n = rows * cols;
+        let lo: Vec<u8> = (0..n).map(|_| next() as u8).collect();
+        let hi4: Vec<u8> = (0..n.div_ceil(2)).map(|_| next() as u8).collect();
+        let table: Vec<u8> = (0..16)
+            .map(|i| (0x38 + i as u8) | if i & 1 == 1 { 0x80 } else { 0 })
+            .collect();
+        // escapes: sorted, a few in a row, one at a row's start and one across a COL_TILE edge
+        let esc_idx: Vec<i32> = [
+            0usize,
+            5,
+            511,
+            512,
+            513,
+            cols,
+            cols + 700,
+            4 * cols - 1,
+            9 * cols + 1000,
+        ]
+        .iter()
+        .map(|&i| i as i32)
+        .collect();
+        let esc_val: Vec<u8> = esc_idx.iter().map(|&i| 0x3A ^ (i as u8 & 0x81)).collect();
+        let p = P12 {
+            lo: lo.as_ptr(),
+            hi4: hi4.as_ptr(),
+            table: table.as_ptr(),
+            esc_idx: esc_idx.as_ptr(),
+            esc_val: esc_val.as_ptr(),
+            n_esc: esc_idx.len(),
+        };
+        check("p12", cols, &|x, y, tile| unsafe {
+            p.rows(
+                isa,
+                cols,
+                x.as_ptr(),
+                b,
+                y.as_mut_ptr(),
+                rows,
+                0,
+                rows,
+                tile,
+            )
+        });
+    }
 
     fn ref_row(w: &[u16], x: &[f32]) -> f64 {
         let mut acc = 0.0f64;
