@@ -99,6 +99,7 @@ class Stored(StrEnum):
     P12 = "p12"
     MXFP4 = "mxfp4"
     MXFP4_GGML = "mxfp4_ggml"
+    FP8 = "fp8"
     BYTES = "bytes"
 
 
@@ -108,6 +109,7 @@ NON_QUANT: dict[Stored, str] = {
     Stored.F32: "a plain fp32 tensor (an attention/delta state), never a stored quant",
     Stored.P12: "btb's 12-bit packed head store (hf.PACK12_FORMAT)",
     Stored.MXFP4_GGML: "Quant.MXFP4 in GGML's block layout, which needs its own kernel",
+    Stored.FP8: "a fine-grained FP8 safetensors weight: e4m3fn bytes and an f32 block-scale grid",
     Stored.BYTES: "raw file bytes: a direct-IO read has no element type",
 }
 
@@ -144,10 +146,11 @@ OPS: tuple[Op, ...] = (
         "guard_mxfp4.rs",
         "gemv.rs",
     ),
+    Op("gemv_fp8", (Stored.FP8,), ("btb_gemv_fp8_rows",), "guard_scalar.rs", "guard_fp8.rs", "gemv.rs"),
     Op(
         "gemv_group",
-        (Stored.BF16, Stored.MXFP4),
-        ("btb_gemv_bf16_group", "btb_gemv_mxfp4_group", "btb_gemv_mxfp4_ggml_group"),
+        (Stored.BF16, Stored.MXFP4, Stored.FP8),
+        ("btb_gemv_bf16_group", "btb_gemv_mxfp4_group", "btb_gemv_mxfp4_ggml_group", "btb_gemv_fp8_group"),
         "gemv_group.rs",
         "guard_gemv_group.rs",
         "gemv.rs",

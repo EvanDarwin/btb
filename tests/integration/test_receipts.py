@@ -195,7 +195,7 @@ def _avx2() -> bool:
 def main() -> int:
     from btb import mlx_available
 
-    dll = native_library()
+    native_library()
     # the receipts were banked by the AVX2 kernel; the scalar kernel and MLX sum in other orders, so those arms
     # are held to a tolerance. The AVX2 arm is held to four ulps of a logit, not the bit: the head's gemv and
     # torch's AVX-512 reductions on a machine that has them sum in another order than the banking machine's
@@ -215,8 +215,7 @@ def main() -> int:
                 worst[device] = max(worst.get(device, 0.0), w)
                 ok = ok and g_ok and same
                 print(
-                    f"{device} {'p12' if packed else 'bf16'}{' cold' if cold else ''} "
-                    f"{'native' if dll else 'torch'}: {w:.3e} {g_ok} {same}",
+                    f"{device} {'p12' if packed else 'bf16'}{' cold' if cold else ''}: {w:.3e} {g_ok} {same}",
                     flush=True,
                 )
         for tag in ("phi3", "qwen3"):
@@ -226,23 +225,19 @@ def main() -> int:
                     worst[device] = max(worst.get(device, 0.0), w)
                     ok = ok and g_ok and same
                     print(
-                        f"{device} {tag} {'p12' if packed else 'bf16'}{' cold' if cold else ''} "
-                        f"{'native' if dll else 'torch'}: {w:.3e} {g_ok} {same}",
+                        f"{device} {tag} {'p12' if packed else 'bf16'}{' cold' if cold else ''}: {w:.3e} {g_ok} {same}",
                         flush=True,
                     )
         w, g_ok, same = run_q4(device=device)
         worst[device] = max(worst.get(device, 0.0), w)
         ok = ok and g_ok and same
-        print(f"{device} q4 bf16 {'native' if dll else 'torch'}: {w:.3e} {g_ok} {same}", flush=True)
+        print(f"{device} q4 bf16: {w:.3e} {g_ok} {same}", flush=True)
         # the MXFP4 experts through the CPU kernels, and on the MLX tier through the GPU's matvec over the
         # store's shared slots
         w, g_ok, same = run_gpt_oss(device=device)
         worst_ref[device] = max(worst_ref.get(device, 0.0), w)
         ok = ok and g_ok and same
-        print(
-            f"{device} gpt_oss mxfp4 {'native' if dll else 'torch'}: {w:.3e} {g_ok} {same} (vs transformers)",
-            flush=True,
-        )
+        print(f"{device} gpt_oss mxfp4: {w:.3e} {g_ok} {same} (vs transformers)", flush=True)
     within = all(worst[d] <= tol[d] for d in devices) and all(w <= ref_tol[d] for d, w in worst_ref.items())
     print(
         " ".join(f"{d} worst {worst[d]:.3e} (tolerance {tol[d]:.0e})" for d in devices)

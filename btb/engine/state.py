@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from types import ModuleType
 
     from ..draft import Spans
+    from ..fp8 import F8Weight
     from ..gguf import GGUFModel
     from ..kinds import Json, Log, NodePath, Parents, TokenRows, Tokens
     from ..mlx import Backend, Shared
@@ -81,6 +82,9 @@ class _State:
     _gguf_hdr: dict[str, Any]
     head_key: str
     held_cast: bool  # the checkpoint stores its weights at a float precision other than bf16 (tiers._held)
+    fp8_experts: bool  # the checkpoint's fused experts are FP8 (btb/fp8.py), multiplied as stored
+    fp8_layers: set[int]  # the host layers whose FP8 linears are multiplied as stored (`_HostLinear.f8`)
+    fp8_widened: bool  # some FP8 tensor was widened to bf16 for a path that reads it so (MLX slots, a card, cold)
     kv_bits: int | None
     kv_block: int
     kv_host: bool
@@ -262,6 +266,15 @@ class _State:
         raise NotImplementedError
 
     def _cast_on_read(self, info: dict[str, Any]) -> bool:
+        raise NotImplementedError
+
+    def _fp8(self, key: str) -> bool:
+        raise NotImplementedError
+
+    def _f8_weights(self, key: str) -> list[F8Weight]:
+        raise NotImplementedError
+
+    def _shape(self, key: str) -> tuple[int, ...]:
         raise NotImplementedError
 
     def _head_host(self) -> Any:
@@ -592,6 +605,8 @@ class _State:
         """record the placement tiers the pass's layers live on, from the same `Placement.tier` every path reads"""
         place = self.device.snapshot()
         self._tag(*{_TIER_TAG[place.tier(i)] for i in range(n_layers)})
+        if self.fp8_widened:
+            self._tag(PassTag.FP8_WIDENED)
 
     def _tag_quant(self) -> None:
         """record the stored-weight path on MLX: as-stored quant bytes (`mlx_state.affine`) vs a bf16 slot"""

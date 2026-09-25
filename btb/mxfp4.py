@@ -1,10 +1,3 @@
-from __future__ import annotations
-
-from typing import Any
-
-import numpy as np
-import torch
-
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 """MXFP4 as gpt-oss stores it, and the one definition of the expert store's slot.
 
@@ -12,7 +5,7 @@ A block is 32 weights along K: 16 bytes of packed fp4 (e2m1) plus one uint8 e8m0
 is `fp4 * 2**(scale - 127)`. Two weights share a byte, the earlier one in the LOW nibble (weight `2j` is
 `byte & 0x0F`, weight `2j+1` is `byte >> 4`), and the sixteen fp4 codes are :data:`FP4_VALUES`. Both of
 those are read off transformers' own dequantizer (`transformers.integrations.mxfp4`, `FP4_VALUES` and
-`_convert_moe_packed_tensors`) and `tests/test_mxfp4.py` checks this module against it.
+`_convert_moe_packed_tensors`) and `tests/kernels/test_mxfp4.py` checks this module against it.
 
 The checkpoint keeps `<proj>_blocks` as `[experts, rows, K/32, 16]` uint8 and `<proj>_scales` as
 `[experts, rows, K/32]` uint8, so a matrix dequantizes to `[rows, K]` row-major: `y = W @ x` reads it the
@@ -35,6 +28,16 @@ The kernels read that layout as stored (`MxWeight.ggml`), so a GGUF's slot is th
     gate[e] | up[e] | down[e]
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+import torch
+
+if TYPE_CHECKING:
+    from .gguf import GGUFModel
+
 FP4_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 
 #: weights per block, and the bytes that hold them.
@@ -45,6 +48,12 @@ GGML_BLOCK_BYTES = 17
 
 #: the exponent bias of the e8m0 scale: `2**(scale - BIAS)`.
 BIAS = 127
+
+
+def stored_mxfp4(mxfp4_family: bool, gguf: GGUFModel | None) -> bool:
+    """whether a model's experts are MXFP4 blocks the matvec multiplies as stored: an MXFP4 family's checkpoint
+    (gpt-oss's), or a GGUF whose expert tensors llama.cpp stored as MXFP4 (its MXFP4_MOE file type, any MoE)"""
+    return mxfp4_family if gguf is None else gguf.mxfp4_experts()
 
 
 def blocks_per_row(k: int) -> int:
@@ -140,6 +149,10 @@ class MxWeight:
         """a matrix in ggml's layout: `raw` its 17-byte blocks"""
         return cls(raw, None, rows, k, ggml=True)
 
+    @property
+    def nbytes(self) -> int:
+        return self.blocks.numel() + (0 if self.scales is None else self.scales.numel())
+
     def __repr__(self) -> str:
         return f"MxWeight[{self.shape[0]}, {self.shape[1]}{', ggml' if self.ggml else ''}]"
 
@@ -166,6 +179,10 @@ class MxGateUp:
             raise ValueError(f"[mxfp4] gate {gate.shape} and up {up.shape} differ")
         self.gate, self.up = gate, up
         self.shape = (2 * gate.shape[0], gate.shape[1])
+
+    @property
+    def nbytes(self) -> int:
+        return self.gate.nbytes + self.up.nbytes
 
     def __repr__(self) -> str:
         return f"MxGateUp[{self.shape[0]}, {self.shape[1]}]"

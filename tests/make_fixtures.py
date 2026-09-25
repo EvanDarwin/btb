@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 """Regenerate every test fixture from fixed seeds, so nothing under tests/fixtures/ is a copied model artifact
 and all of it can be recreated. For each family it writes a tiny random checkpoint in that family's own shape, a
-byte-level tokenizer, the 12-bit sibling where one is used, its fp16/fp32 precision twins, and the receipts the
+byte-level tokenizer, the 12-bit sibling where one is used, its fp16/fp32/fp8 precision twins, and the receipts the
 suite holds the engine to.
 
 Four families (qwen3, q35, phi3, q4) bank the ENGINE's own float32 output (transformers is a bank-time gate: we
@@ -23,7 +23,7 @@ import shutil
 import sys
 from typing import TYPE_CHECKING
 
-from btb.kinds import Json, TokenRows
+from btb.kinds import Json, QuantClass, TokenRows, quants_of
 from tests.helpers import (
     CHUNK,
     FIXTURES,
@@ -43,6 +43,7 @@ from tests.helpers import (
 
 if TYPE_CHECKING:
     import torch
+    from gguf import GGUFWriter
     from transformers import PretrainedConfig
     from transformers._typing import GenerativePreTrainedModel
 
@@ -94,7 +95,8 @@ def write_tokenizer(model_dir: str) -> None:
 
 # --- GGUF twins: a fixture written in llama.cpp's format through the gguf package's writer ------------------
 
-GGUF_TYPES = ("bf16", "f16", "q8_0", "q4_0")  # the storage types the reader is tested on (the ones gguf-py writes)
+# the storage types the reader is tested on: every float and affine type (the ones gguf-py writes)
+GGUF_TYPES = tuple(q.value.lower() for c in (QuantClass.FLOAT, QuantClass.AFFINE) for q in quants_of(c))
 
 
 def write_gguf(model_dir: str, out: str, outtype: str) -> None:
@@ -105,6 +107,8 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
     from gguf import (
         MODEL_ARCH,
         MODEL_ARCH_NAMES,
+        MODEL_TENSOR,
+        TENSOR_NAMES,
         GGMLQuantizationType,
         GGUFWriter,
         RopeScalingType,
@@ -116,7 +120,12 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
     from btb.mxfp4 import hf_to_ggml
 
     cfg = json.load(open(os.path.join(model_dir, "config.json"), encoding="utf-8"))
-    arch = {"qwen3": MODEL_ARCH.QWEN3, "phi3": MODEL_ARCH.PHI3, "gpt_oss": MODEL_ARCH.GPT_OSS}[cfg["model_type"]]
+    arch = {
+        "qwen3": MODEL_ARCH.QWEN3,
+        "phi3": MODEL_ARCH.PHI3,
+        "gpt_oss": MODEL_ARCH.GPT_OSS,
+        "qwen3_5_text": MODEL_ARCH.QWEN35,
+    }[cfg["model_type"]]
     L = int(cfg["num_hidden_layers"])
     heads = int(cfg["num_attention_heads"])
     head_dim = int(cfg.get("head_dim") or cfg["hidden_size"] // heads)
@@ -145,6 +154,8 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
         w.add_rope_scaling_orig_ctx_len(int(scaling["original_max_position_embeddings"]))
         w.add_rope_scaling_yarn_beta_fast(float(scaling.get("beta_fast", 32.0)))
         w.add_rope_scaling_yarn_beta_slow(float(scaling.get("beta_slow", 1.0)))
+    if arch is MODEL_ARCH.QWEN35:
+        _qwen35_metadata(w, cfg, head_dim)
     tok = json.load(open(os.path.join(model_dir, "tokenizer.json"), encoding="utf-8"))
     vocab = tok["model"]["vocab"]
     tokens = [t for t, _ in sorted(vocab.items(), key=lambda kv: kv[1])]
@@ -164,13 +175,17 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
     if tcfg.get("chat_template"):
         w.add_chat_template(tcfg["chat_template"])
     state = safetensors_state(model_dir)
+    if arch is MODEL_ARCH.QWEN35:
+        state = _qwen35_converted(cfg, state)
     tmap = TensorNameMap(arch, L)
     qtype = {
         "f16": None,
         "bf16": GGMLQuantizationType.BF16,
         "q8_0": GGMLQuantizationType.Q8_0,
         "q4_0": GGMLQuantizationType.Q4_0,
+        "q4_1": GGMLQuantizationType.Q4_1,
     }[outtype]
+    conv = {TENSOR_NAMES[MODEL_TENSOR.SSM_CONV1D].format(bid=i) for i in range(L)}  # llama.cpp keeps these f32
     for name in sorted(state):
         if ".mlp.experts." in name:
             continue  # the MXFP4 experts below, in ggml's layout
@@ -178,11 +193,13 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
         gname = tmap.get_name(base) if suffix in ("weight", "bias") else tmap.get_name(name)
         if gname is None:
             raise RuntimeError(f"no GGUF name for {name}")
-        if suffix not in ("weight", "bias"):  # a bare parameter (gpt-oss's attention sinks)
+        if suffix not in ("weight", "bias"):  # a bare parameter (gpt-oss's attention sinks, Qwen3.5's A_log)
             w.add_tensor(gname, state[name].float().numpy())
             continue
         arr = state[name].float().numpy()
-        if arr.ndim == 2 and qtype is not None and arr.shape[-1] % 32 == 0:
+        if gname in conv:
+            w.add_tensor(f"{gname}.{suffix}", arr.astype(np.float32))
+        elif arr.ndim == 2 and qtype is not None and arr.shape[-1] % 32 == 0:
             w.add_tensor(f"{gname}.{suffix}", quantize(arr, qtype), raw_dtype=qtype)
         elif arr.ndim == 2:
             w.add_tensor(f"{gname}.{suffix}", arr.astype(np.float16))  # f16: bf16's small values lose bits here
@@ -208,9 +225,66 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
     w.close()
 
 
+def _qwen35_metadata(w: GGUFWriter, cfg: Json, head_dim: int) -> None:
+    """the keys llama.cpp's Qwen3.5 converter adds (Qwen3NextModel.set_gguf_parameters): the linear attention's
+    widths, the layer pattern and the rotary's width and MRoPE sections (padded to four)"""
+    w.add_ssm_conv_kernel(int(cfg["linear_conv_kernel_dim"]))
+    w.add_ssm_state_size(int(cfg["linear_key_head_dim"]))
+    w.add_ssm_group_count(int(cfg["linear_num_key_heads"]))
+    w.add_ssm_time_step_rank(int(cfg["linear_num_value_heads"]))
+    w.add_ssm_inner_size(int(cfg["linear_value_head_dim"]) * int(cfg["linear_num_value_heads"]))
+    w.add_full_attention_interval(int(cfg.get("full_attention_interval", 4)))
+    rope = cfg.get("rope_parameters") or {}
+    w.add_rope_dimension_count(int(head_dim * float(rope.get("partial_rotary_factor", 0.25))))
+    sections = [int(x) for x in rope.get("mrope_section", [11, 11, 10])]
+    w.add_rope_dimension_sections((sections + [0] * 4)[:4])
+
+
+def _qwen35_converted(cfg: Json, state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """the checkpoint as llama.cpp's Qwen3.5 converter hands it to the writer (Qwen3_5TextModel.modify_tensors,
+    in float32 as it runs): the MTP head left out (its --no-mtp), the value heads reordered from grouped by key
+    head to tiled, A_log as -exp(A_log), dt_bias renamed dt_proj.bias, conv1d squeezed, the norms as 1 + w"""
+    import torch
+
+    nk, nv = int(cfg["linear_num_key_heads"]), int(cfg["linear_num_value_heads"])
+    hk, hv = int(cfg["linear_key_head_dim"]), int(cfg["linear_value_head_dim"])
+
+    def tiled(t: torch.Tensor, dim: int, width: int) -> torch.Tensor:  # _reorder_v_heads
+        if nk == nv:
+            return t
+        shape = list(t.shape)
+        t = t.reshape(*shape[:dim], nk, nv // nk, width, *shape[dim + 1 :])
+        return t.transpose(dim, dim + 1).contiguous().reshape(shape)
+
+    out: dict[str, torch.Tensor] = {}
+    qk = 2 * nk * hk
+    for name, t in state.items():
+        if name.startswith("mtp."):
+            continue
+        t = t.float()
+        if ".in_proj_qkv." in name or ".conv1d." in name:
+            t = t.squeeze() if ".conv1d." in name else t
+            t = torch.cat([t[:qk], tiled(t[qk:], 0, hv)])
+        elif ".in_proj_z." in name:
+            t = tiled(t, 0, hv)
+        elif ".in_proj_a." in name or ".in_proj_b." in name or name.endswith((".A_log", ".dt_bias")):
+            t = tiled(t, 0, 1)
+        elif ".out_proj." in name:
+            t = tiled(t, 1, hv)
+        if name.endswith(".A_log"):
+            t = -torch.exp(t)
+        elif name.endswith(".dt_bias"):
+            name = name.removesuffix(".dt_bias") + ".dt_proj.bias"
+        elif name.endswith("norm.weight") and not name.endswith("linear_attn.norm.weight"):
+            t = t + 1
+        out[name] = t
+    return out
+
+
 def make_gguf() -> None:
     """the GGUF fixtures: tiny_qwen3 in every storage type the reader is tested on, tiny_phi3 as f16 (its fused
-    projections exercise the table's other layout)"""
+    projections exercise the table's other layout), tiny_q35 in the float and affine types (make_gguf_q35), tiny_q4
+    as llama.cpp's converter writes it (make_q4_gguf)"""
     out = os.path.join(FIXTURES, "gguf")
     os.makedirs(out, exist_ok=True)
     for t in GGUF_TYPES:
@@ -220,7 +294,111 @@ def make_gguf() -> None:
     for t in ("bf16", "q4_0", "q8_0"):
         write_gguf(os.path.join(FIXTURES, "tiny_phi3"), os.path.join(out, f"tiny_phi3-{t}.gguf"), t)
     write_gguf(os.path.join(FIXTURES, "tiny_gpt_oss"), os.path.join(out, "tiny_gpt_oss-mxfp4.gguf"), "bf16")
+    make_gguf_q35()
+    make_q4_gguf()
     print("[fixture] gguf twins regenerated")
+
+
+def make_gguf_q35() -> None:
+    """tiny_q35 in every float and affine type (the storage cells gguf-py can write a twin for), its linear
+    attention through the converter's rewrites the reader must invert"""
+    from btb.kinds import QuantClass, quants_of
+
+    out = os.path.join(FIXTURES, "gguf")
+    os.makedirs(out, exist_ok=True)
+    for q in (*quants_of(QuantClass.FLOAT), *quants_of(QuantClass.AFFINE)):
+        t = q.value.lower()
+        write_gguf(os.path.join(FIXTURES, "tiny_q35"), os.path.join(out, f"tiny_q35-{t}.gguf"), t)
+
+
+# --- the qwen4exp twins, written by llama.cpp's own converter (a checkout named by $LLAMA_CPP) --------------
+
+# the stored types among convert_hf_to_gguf.py's --outtype choices; the other float and affine types are
+# requantized from its f32 output
+Q4_CONVERTER_TYPES = ("bf16", "f16", "q8_0")
+
+# run in a child process against the checkout's gguf-py, never imported into btb's. Two answers are given, the
+# rest is the converter's: the tiny fixtures' synthetic byte-level vocabulary matches no released tokenizer's hash
+# (it pre-tokenizes as qwen2, write_gguf's choice), and config.json is read as written, since transformers renames
+# the checkpoint's "full_attention" layers and the converter then writes a compression ratio of 0 (dense) for all.
+_CONVERT = """
+import json, runpy, sys
+from pathlib import Path
+llama, model, outtype, out = sys.argv[1:5]
+from conversion.base import ModelBase, TextModel
+TextModel.get_vocab_base_pre = lambda self, tokenizer: "qwen2"
+ModelBase.load_hparams = staticmethod(lambda d, mistral: json.loads((Path(d) / "config.json").read_text()))
+sys.argv = ["convert_hf_to_gguf.py", model, "--outtype", outtype, "--outfile", out]
+runpy.run_path(llama + "/convert_hf_to_gguf.py", run_name="__main__")
+"""
+
+
+def llama_convert(model_dir: str, out: str, outtype: str) -> None:
+    """`model_dir` converted to one GGUF by llama.cpp's convert_hf_to_gguf.py, in a subprocess with the checkout's
+    gguf-py first on the path (and no bytecode written into the checkout)."""
+    import subprocess
+
+    llama = os.environ.get("LLAMA_CPP", "")
+    if not os.path.isfile(os.path.join(llama, "convert_hf_to_gguf.py")):
+        raise SystemExit("[fixture] set LLAMA_CPP to a llama.cpp checkout: the qwen4exp twins are its converter's")
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([llama, os.path.join(llama, "gguf-py")])}
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    subprocess.run([sys.executable, "-c", _CONVERT, llama, model_dir, outtype, out], env=env, check=True)
+
+
+def requantize_gguf(src: str, like: str, out: str, outtype: str) -> None:
+    """`like` (a converter q8_0 output) rewritten as `outtype`: every tensor it stores as Q8_0 quantized to
+    `outtype` from `src`'s (the f32 output's) numbers, every other tensor and every metadata key copied as is.
+    MXFP4 is llama.cpp's MXFP4_MOE (src/llama-quant.cpp): only the 3-D expert tensors, the rest kept Q8_0."""
+    import numpy as np
+    from gguf import GGMLQuantizationType, GGUFReader, GGUFValueType, GGUFWriter, Keys, LlamaFileType
+    from gguf.quants import quantize
+
+    qtype = GGMLQuantizationType[outtype.upper()]
+    moe = qtype is GGMLQuantizationType.MXFP4
+    r, f32 = GGUFReader(like), {t.name: t for t in GGUFReader(src).tensors}
+    w = GGUFWriter(out, str(r.fields[Keys.General.ARCHITECTURE].contents()))
+    for f in r.fields.values():
+        if f.name.startswith("GGUF.") or f.name in (Keys.General.ARCHITECTURE, Keys.General.FILE_TYPE):
+            continue
+        sub = f.types[-1] if f.types[0] is GGUFValueType.ARRAY else None
+        w.add_key_value(f.name, f.contents(), f.types[0], sub_type=sub)
+    w.add_file_type(LlamaFileType[f"MOSTLY_{outtype.upper()}{'_MOE' if moe else ''}"])
+    for t in r.tensors:
+        if t.tensor_type is GGMLQuantizationType.Q8_0 and (not moe or len(t.shape) == 3):
+            arr = np.asarray(f32[t.name].data).reshape([int(x) for x in reversed(list(t.shape))])
+            w.add_tensor(t.name, quantize(arr, qtype), raw_dtype=qtype)
+        else:
+            w.add_tensor(t.name, np.array(t.data), raw_dtype=t.tensor_type)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
+def make_q4_gguf() -> None:
+    """tiny_q4's GGUF twins as llama.cpp's converter writes them, from a copy of the fixture whose config spells
+    the attention layers "full_attention" as the released checkpoint does (transformers reads both spellings as
+    the same layer; the converter keys the indexer's compression on that one)."""
+    import shutil
+    import tempfile
+
+    types = [q.value.lower() for c in (QuantClass.FLOAT, QuantClass.AFFINE, QuantClass.MXFP4) for q in quants_of(c)]
+    src = os.path.join(FIXTURES, "tiny_q4")
+    out = os.path.join(FIXTURES, "gguf")
+    with tempfile.TemporaryDirectory() as tmp:
+        stage = os.path.join(tmp, "tiny_q4")
+        shutil.copytree(src, stage)
+        cfg = json.load(open(os.path.join(stage, "config.json"), encoding="utf-8"))
+        cfg["layer_types"] = ["full_attention" if t != "linear_attention" else t for t in cfg["layer_types"]]
+        with open(os.path.join(stage, "config.json"), "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        for t in Q4_CONVERTER_TYPES:
+            llama_convert(stage, os.path.join(out, f"tiny_q4-{t}.gguf"), t)
+        f32 = os.path.join(tmp, "tiny_q4-f32.gguf")
+        llama_convert(stage, f32, "f32")
+        for t in (t for t in types if t not in Q4_CONVERTER_TYPES):
+            requantize_gguf(f32, os.path.join(out, "tiny_q4-q8_0.gguf"), os.path.join(out, f"tiny_q4-{t}.gguf"), t)
 
 
 # --- weight builders: a tiny random checkpoint per family in its own shape ---------------------------------
@@ -348,12 +526,17 @@ def build_q4(out_dir: str) -> None:
     _reshard(out_dir, sd)
 
 
-def build_q35(out_dir: str) -> None:
+# a draw whose oracle decodes (base and FP8 twin) keep every greedy top-2 gap above the oracle's margin floor
+Q35_SEED = 94
+
+
+def _q35_model(seed: int = Q35_SEED) -> tuple[PretrainedConfig, GenerativePreTrainedModel]:
+    """tiny_q35's trunk in bf16, transformers' own init under `seed`"""
     import torch
     from transformers import Qwen3_5ForCausalLM
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
-    torch.manual_seed(0)
+    torch.manual_seed(seed)
     lt = ["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 2
     kw: Json = {
         "vocab_size": 512, "hidden_size": 128, "intermediate_size": 256, "num_hidden_layers": 8,
@@ -367,7 +550,11 @@ def build_q35(out_dir: str) -> None:
         "bos_token_id": 0, "dtype": "bfloat16",
     }  # fmt: skip
     cfg = Qwen3_5TextConfig(**kw)
-    m = Qwen3_5ForCausalLM(cfg).eval().to(torch.bfloat16)
+    return cfg, Qwen3_5ForCausalLM(cfg).eval().to(torch.bfloat16)
+
+
+def build_q35(out_dir: str) -> None:
+    cfg, m = _q35_model()
     os.makedirs(out_dir, exist_ok=True)
     m.save_pretrained(out_dir, max_shard_size="100KB", safe_serialization=True)  # config + generation_config
     sd = {k: v.detach().contiguous() for k, v in m.state_dict().items()}
@@ -424,36 +611,45 @@ def _gpt_oss_config() -> Json:
     }  # fmt: skip
 
 
-def _gpt_oss_tensors() -> dict[str, torch.Tensor]:
+# a draw whose oracle decodes (base and FP8 twin) keep every greedy top-2 gap above the oracle's margin floor
+GPT_OSS_SEED = 20260926
+
+
+def _gpt_oss_tensors(seed: int = GPT_OSS_SEED) -> dict[str, torch.Tensor]:
     import numpy as np
     import torch
 
     g = GPT_OSS
-    rng = np.random.default_rng(20260907)
+    rng = np.random.default_rng(seed)
+    # the matrices at transformers' init scale, as the other families' fixtures are drawn: hotter projections
+    # compound a layer's rounding into a token flip by the last layer, so bf16 and fp32 paths could not agree.
+    # The router and the sinks stay hot, so expert choice and the sink column keep clear margins.
+    init = 0.02
 
-    def bf16(*shape: int, scale: float = 0.05) -> torch.Tensor:
+    def bf16(*shape: int, scale: float = init) -> torch.Tensor:
         return torch.from_numpy((rng.standard_normal(shape) * scale).astype(np.float32)).bfloat16()
 
     def experts_mxfp4(n: int, rows: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
-        blocks, scales = mxfp4_random(rng, (n, rows), k, 119, 126)
+        # block scales 2^-9..2^-6 over the e2m1 codes (rms ~2.9): weights of rms ~0.006-0.046, about `init`
+        blocks, scales = mxfp4_random(rng, (n, rows), k, 118, 122)
         return torch.from_numpy(blocks), torch.from_numpy(scales)
 
     H, HEADS, KV, HD, INTER, E = g["H"], g["HEADS"], g["KV_HEADS"], g["HEAD_DIM"], g["INTER"], g["EXPERTS"]
     t = {
-        "model.embed_tokens.weight": bf16(g["VOCAB"], H, scale=0.08),
+        "model.embed_tokens.weight": bf16(g["VOCAB"], H),
         "model.norm.weight": bf16(H, scale=0.2) + 1.0,
-        "lm_head.weight": bf16(g["VOCAB"], H, scale=0.08),
+        "lm_head.weight": bf16(g["VOCAB"], H),
     }
     for i in range(g["LAYERS"]):
         p = f"model.layers.{i}."
-        t[p + "self_attn.q_proj.weight"] = bf16(HEADS * HD, H, scale=0.15)
-        t[p + "self_attn.q_proj.bias"] = bf16(HEADS * HD, scale=0.05)
-        t[p + "self_attn.k_proj.weight"] = bf16(KV * HD, H, scale=0.15)
-        t[p + "self_attn.k_proj.bias"] = bf16(KV * HD, scale=0.05)
-        t[p + "self_attn.v_proj.weight"] = bf16(KV * HD, H, scale=0.15)
-        t[p + "self_attn.v_proj.bias"] = bf16(KV * HD, scale=0.05)
-        t[p + "self_attn.o_proj.weight"] = bf16(H, HEADS * HD, scale=0.15)
-        t[p + "self_attn.o_proj.bias"] = bf16(H, scale=0.05)
+        t[p + "self_attn.q_proj.weight"] = bf16(HEADS * HD, H)
+        t[p + "self_attn.q_proj.bias"] = bf16(HEADS * HD)
+        t[p + "self_attn.k_proj.weight"] = bf16(KV * HD, H)
+        t[p + "self_attn.k_proj.bias"] = bf16(KV * HD)
+        t[p + "self_attn.v_proj.weight"] = bf16(KV * HD, H)
+        t[p + "self_attn.v_proj.bias"] = bf16(KV * HD)
+        t[p + "self_attn.o_proj.weight"] = bf16(H, HEADS * HD)
+        t[p + "self_attn.o_proj.bias"] = bf16(H)
         t[p + "self_attn.sinks"] = bf16(HEADS, scale=0.8)
         t[p + "input_layernorm.weight"] = bf16(H, scale=0.2) + 1.0
         t[p + "post_attention_layernorm.weight"] = bf16(H, scale=0.2) + 1.0
@@ -463,10 +659,10 @@ def _gpt_oss_tensors() -> dict[str, torch.Tensor]:
         db, ds = experts_mxfp4(E, H, INTER)
         t[p + "mlp.experts.gate_up_proj_blocks"] = gb
         t[p + "mlp.experts.gate_up_proj_scales"] = gs
-        t[p + "mlp.experts.gate_up_proj_bias"] = bf16(E, 2 * INTER, scale=0.05)
+        t[p + "mlp.experts.gate_up_proj_bias"] = bf16(E, 2 * INTER)
         t[p + "mlp.experts.down_proj_blocks"] = db
         t[p + "mlp.experts.down_proj_scales"] = ds
-        t[p + "mlp.experts.down_proj_bias"] = bf16(E, H, scale=0.05)
+        t[p + "mlp.experts.down_proj_bias"] = bf16(E, H)
     return t
 
 
@@ -482,11 +678,49 @@ def build_gpt_oss(out_dir: str) -> None:
 
 # --- precision twins: the BF16 fixture's weights stored at the other safetensors precisions -------------------
 
+# the FP8 twin's block: it divides every tiny fixture's projections, where a real checkpoint's is 128x128
+FP8_BLOCK = (16, 16)
+# the routers stay bf16, as Qwen's FP8 releases leave them (`modules_to_not_convert`)
+FP8_KEEP = ("mlp.gate.weight", "mlp.router.weight", "mlp.shared_expert_gate.weight")
+
+
+def fp8_state(state: dict[str, torch.Tensor]) -> tuple[dict[str, torch.Tensor], list[str]]:
+    """`state` as a fine-grained FP8 checkpoint stores it, and the modules left at bf16: every decoder matrix
+    (a projection, a fused expert tensor) whose shape splits into `FP8_BLOCK` in e4m3 with its `_scale_inv` grid,
+    an n-gram table with one per-tensor `weight_scale` (`FP8Embedding`), and the rest (embeddings, norms, the
+    head, the routers, a matrix too small to block) as they are"""
+    from btb import fp8
+
+    out: dict[str, torch.Tensor] = {}
+    kept: list[str] = []
+    for name, t in state.items():
+        experts = name.endswith((".mlp.experts.gate_up_proj", ".mlp.experts.down_proj"))
+        matrix = name.endswith(".weight") and t.dim() == 2 and ".layers." in name and not name.endswith(FP8_KEEP)
+        if not t.is_floating_point() or not (experts or matrix):
+            out[name] = t
+            if t.is_floating_point() and t.dim() >= 2:
+                kept.append(name.rpartition(".")[0])
+            continue
+        if ".ngram_embedding.shard_" in name:
+            q, s = fp8.quantize(t, None)
+            out[name], out[name.removesuffix("weight") + "weight_scale"] = q, s.reshape(1)
+            continue
+        rows, cols = t.shape[-2:]
+        if rows % FP8_BLOCK[0] or cols % FP8_BLOCK[1]:
+            out[name] = t
+            kept.append(name.rpartition(".")[0])
+            continue
+        q, s = fp8.quantize(t, FP8_BLOCK)
+        out[name] = q
+        out[name.removesuffix("weight") + "weight_scale_inv" if matrix else name + "_scale_inv"] = s
+    return out, sorted(set(kept))
+
 
 def write_twins(base: str) -> None:
     """`base`'s precision twins (spec.twin_path): one per safetensors storage beside BF16 whose header dtype the
-    engine reads (StreamedTextModel.ST_DTYPES), every float tensor cast to it and the packed integer ones kept, so
-    each decodes to the same oracle as `base`. The config's `dtype` says what the twin stores."""
+    engine reads (StreamedTextModel.ST_DTYPES). A float twin casts every float tensor and keeps the packed integer
+    ones, so it decodes to the same oracle as `base`; the FP8 twin is `fp8_state`'s, its own oracle's. The config
+    says what the twin stores (`dtype`, and the FP8 twin's `quantization_config`)."""
     from btb.engine import StreamedTextModel
     from tests.cert import spec
 
@@ -496,6 +730,10 @@ def write_twins(base: str) -> None:
         dtype = StreamedTextModel.ST_DTYPES.get(info.fp)
         if info.container is not spec.Container.SAFETENSORS or storage is spec.Storage.SAFE_BF16 or dtype is None:
             continue
+        f8 = storage is spec.Storage.SAFE_FP8
+        tensors, kept = (
+            fp8_state(state) if f8 else ({k: v.to(dtype) if v.is_floating_point() else v for k, v in state.items()}, [])
+        )
         out = spec.twin_path(stem, storage)
         os.makedirs(out, exist_ok=True)
         for name in os.listdir(base):
@@ -504,12 +742,21 @@ def write_twins(base: str) -> None:
             if name == "config.json":
                 with open(os.path.join(base, name), encoding="utf-8") as f:
                     cfg: Json = json.load(f)
-                cfg["dtype"] = str(dtype).removeprefix("torch.")
+                if f8:
+                    cfg["quantization_config"] = {
+                        "quant_method": "fp8",
+                        "fmt": "e4m3",
+                        "activation_scheme": "dynamic",
+                        "weight_block_size": list(FP8_BLOCK),
+                        "modules_to_not_convert": kept,
+                    }
+                else:
+                    cfg["dtype"] = str(dtype).removeprefix("torch.")
                 with open(os.path.join(out, name), "w", encoding="utf-8") as f:
                     json.dump(cfg, f, indent=2)
             else:
                 shutil.copyfile(os.path.join(base, name), os.path.join(out, name))
-        _reshard(out, {k: v.to(dtype) if v.is_floating_point() else v for k, v in state.items()})
+        _reshard(out, tensors)
         print(f"[fixture] {os.path.basename(out)} written ({info.fp})")
 
 
@@ -678,6 +925,9 @@ def make(name: str) -> None:
         for stem in spec.FIXTURE_STEM.values():
             write_twins(os.path.join(FIXTURES, stem))
         return
+    if name == "gguf_q35":
+        make_gguf_q35()
+        return
     base = os.path.join(FIXTURES, f"tiny_{name}")
     if name == "qwen3":
         build_qwen3(base)
@@ -726,9 +976,7 @@ def _rebank_oracle() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     names = argv or list(FAMILIES)
-    # the receipts are banked by the native gemv kernel, so the suite's 1e-6 tolerance holds
-    if native_library() is None:
-        print("[fixture] warning: no native library found; receipts banked on the torch path", file=sys.stderr)
+    native_library()  # the receipts are banked by the native gemv kernel, so the suite's 1e-6 tolerance holds
     for name in names:
         make(name)
     _rebank_oracle()

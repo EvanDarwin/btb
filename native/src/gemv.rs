@@ -1095,6 +1095,250 @@ def_task_mx4!(
     "avx512f,avx512bw,avx2,fma"
 );
 
+// ---------------------------------------------------------------------------------------------------
+// FP8, the form fine-grained FP8 checkpoints ship their linears in: one e4m3fn byte a weight (1 sign, 4
+// exponent bits biased by 7, 3 mantissa bits, no infinity, 0x7F/0xFF NaN) and an f32 scale per block of a
+// `[sr, sc]` grid over the matrix, the block `rows / sr` by `cols / sc` (a 1x1 grid is one per-tensor
+// scale). weight = bf16(e4m3 * scale): the engine holds every checkpoint's weights as bf16, so the matvec
+// reads the value a bf16 slot of the widened matrix holds, on the CPU as on MLX and the card. Every e4m3
+// value is exact in f32 and is built from its bits by integer arithmetic (never a subnormal f32, so a
+// flush-to-zero mode cannot touch it), multiplied by its scale once - the rounding `q.float() * scale`
+// makes - and rounded to bf16 by integer arithmetic (to nearest, ties to even, as torch's cast), so the
+// scalar, AVX2 and NEON widenings write the same bits and the matvec is bit-identical across ISAs.
+
+/// f32 bits of an e4m3 normal's magnitude once its exponent is rebased (7 -> 127): `(b & 0x7F) << 20`
+/// plus this.
+const F8_REBIAS: u32 = 120 << 23;
+/// The subnormals (exponent field 0) are `m * 2^-9`.
+const F8_SUB: f32 = 1.0 / 512.0;
+
+/// `f` rounded to the nearest bf16, ties to even, as an f32 (a quiet NaN stays one).
+#[inline(always)]
+fn round_bf16(f: f32) -> f32 {
+    let b = f.to_bits();
+    f32::from_bits(b.wrapping_add(0x7FFF + ((b >> 16) & 1)) & 0xFFFF_0000)
+}
+
+#[inline(always)]
+fn f8_value(b: u8) -> f32 {
+    let a = (b & 0x7F) as u32;
+    let mag = if a == 0x7F {
+        f32::NAN
+    } else if a < 8 {
+        a as f32 * F8_SUB
+    } else {
+        f32::from_bits((a << 20) + F8_REBIAS)
+    };
+    f32::from_bits(mag.to_bits() | (((b & 0x80) as u32) << 24))
+}
+
+/// One FP8 matrix: `w` its `rows * cols` e4m3 bytes row-major, `scales` its `[sr, sc]` f32 grid row-major,
+/// a block `bm` rows by `bn` columns.
+#[derive(Clone, Copy)]
+struct F8 {
+    w: *const u8,
+    scales: *const f32,
+    sc: usize,
+    bm: usize,
+    bn: usize,
+}
+
+// SAFETY: read-only input, checked at the boundary; tasks read it over disjoint row ranges
+unsafe impl Send for F8 {}
+unsafe impl Sync for F8 {}
+
+/// Rows `start / row_stride ..` of `p`, columns `start % row_stride` for `n`, into `dst` as f32: each run
+/// of columns under one scale handed to `run(src, scale, out, len)`.
+#[inline(always)]
+unsafe fn f8_runs<const R: usize>(
+    dst: *mut f32,
+    dst_stride: usize,
+    p: F8,
+    start: usize,
+    row_stride: usize,
+    n: usize,
+    mut run: impl FnMut(*const u8, f32, *mut f32, usize),
+) {
+    let (r0, c0) = (start / row_stride, start % row_stride);
+    for r in 0..R {
+        let srow = p.scales.add(((r0 + r) / p.bm) * p.sc);
+        let src = p.w.add((r0 + r) * row_stride);
+        let out = dst.add(r * dst_stride);
+        let mut c = c0;
+        while c < c0 + n {
+            let end = ((c / p.bn + 1) * p.bn).min(c0 + n);
+            run(src.add(c), *srow.add(c / p.bn), out.add(c - c0), end - c);
+            c = end;
+        }
+    }
+}
+
+#[inline]
+unsafe fn widen_f8_scalar<const R: usize>(
+    dst: *mut f32,
+    dst_stride: usize,
+    p: F8,
+    start: usize,
+    row_stride: usize,
+    n: usize,
+) {
+    f8_runs::<R>(
+        dst,
+        dst_stride,
+        p,
+        start,
+        row_stride,
+        n,
+        |src, s, out, len| {
+            for j in 0..len {
+                *out.add(j) = round_bf16(f8_value(*src.add(j)) * s);
+            }
+        },
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn widen_f8_avx2<const R: usize>(
+    dst: *mut f32,
+    dst_stride: usize,
+    p: F8,
+    start: usize,
+    row_stride: usize,
+    n: usize,
+) {
+    use std::arch::x86_64::*;
+    f8_runs::<R>(
+        dst,
+        dst_stride,
+        p,
+        start,
+        row_stride,
+        n,
+        |src, s, out, len| {
+            let sv = _mm256_set1_ps(s);
+            let m7f = _mm256_set1_epi32(0x7F);
+            let rebias = _mm256_set1_epi32(F8_REBIAS as i32);
+            let sub = _mm256_set1_ps(F8_SUB);
+            let nan = _mm256_set1_ps(f32::NAN);
+            let mut j = 0usize;
+            while j + 8 <= len {
+                let u = _mm256_cvtepu8_epi32(_mm_loadl_epi64(src.add(j) as *const __m128i));
+                let a = _mm256_and_si256(u, m7f);
+                let normal =
+                    _mm256_castsi256_ps(_mm256_add_epi32(_mm256_slli_epi32::<20>(a), rebias));
+                let subn = _mm256_mul_ps(_mm256_cvtepi32_ps(a), sub);
+                let is_sub = _mm256_castsi256_ps(_mm256_cmpgt_epi32(_mm256_set1_epi32(8), a));
+                let is_nan = _mm256_castsi256_ps(_mm256_cmpeq_epi32(a, m7f));
+                let mag = _mm256_blendv_ps(_mm256_blendv_ps(normal, subn, is_sub), nan, is_nan);
+                let sign = _mm256_slli_epi32::<24>(_mm256_andnot_si256(m7f, u));
+                let v = _mm256_or_ps(mag, _mm256_castsi256_ps(sign));
+                // to the nearest bf16, ties to even (`round_bf16`)
+                let w = _mm256_castps_si256(_mm256_mul_ps(v, sv));
+                let odd = _mm256_and_si256(_mm256_srli_epi32::<16>(w), _mm256_set1_epi32(1));
+                let up = _mm256_add_epi32(w, _mm256_add_epi32(_mm256_set1_epi32(0x7FFF), odd));
+                let r = _mm256_and_si256(up, _mm256_set1_epi32(0xFFFF_0000u32 as i32));
+                _mm256_storeu_ps(out.add(j), _mm256_castsi256_ps(r));
+                j += 8;
+            }
+            for k in j..len {
+                *out.add(k) = round_bf16(f8_value(*src.add(k)) * s);
+            }
+        },
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn widen_f8_neon<const R: usize>(
+    dst: *mut f32,
+    dst_stride: usize,
+    p: F8,
+    start: usize,
+    row_stride: usize,
+    n: usize,
+) {
+    use std::arch::aarch64::*;
+    f8_runs::<R>(
+        dst,
+        dst_stride,
+        p,
+        start,
+        row_stride,
+        n,
+        |src, s, out, len| {
+            let sv = vdupq_n_f32(s);
+            let m7f = vdupq_n_u32(0x7F);
+            let rebias = vdupq_n_u32(F8_REBIAS);
+            let eight = vdupq_n_u32(8);
+            let nan = vdupq_n_f32(f32::NAN);
+            let mut j = 0usize;
+            while j + 8 <= len {
+                let h = vmovl_u8(vld1_u8(src.add(j)));
+                for (q, u) in [vmovl_u16(vget_low_u16(h)), vmovl_high_u16(h)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let a = vandq_u32(u, m7f);
+                    let normal = vreinterpretq_f32_u32(vaddq_u32(vshlq_n_u32::<20>(a), rebias));
+                    let subn = vmulq_n_f32(vcvtq_f32_u32(a), F8_SUB);
+                    let mag = vbslq_f32(vcltq_u32(a, eight), subn, normal);
+                    let mag = vbslq_f32(vceqq_u32(a, m7f), nan, mag);
+                    let sign = vshlq_n_u32::<24>(vbicq_u32(u, m7f));
+                    let v = vreinterpretq_f32_u32(vorrq_u32(vreinterpretq_u32_f32(mag), sign));
+                    // to the nearest bf16, ties to even (`round_bf16`)
+                    let w = vreinterpretq_u32_f32(vmulq_f32(v, sv));
+                    let odd = vandq_u32(vshrq_n_u32::<16>(w), vdupq_n_u32(1));
+                    let up = vaddq_u32(w, vaddq_u32(vdupq_n_u32(0x7FFF), odd));
+                    let r = vandq_u32(up, vdupq_n_u32(0xFFFF_0000));
+                    vst1q_f32(out.add(j + 4 * q), vreinterpretq_f32_u32(r));
+                }
+                j += 8;
+            }
+            for k in j..len {
+                *out.add(k) = round_bf16(f8_value(*src.add(k)) * s);
+            }
+        },
+    );
+}
+
+macro_rules! def_task_f8 {
+    ($group:ident, $task:ident, $widen:ident, $accum:ident $(, $feat:literal)?) => {
+        def_task!($group, $task, F8, $accum $(, $feat)?,
+            prep |p, r, cols, cur| {},
+            tile |scratch, wide, x, i0, bt, p, r, c0, cols, n, cur| {
+                $widen::<R>(wide, COL_TILE, p, r * cols + c0, cols, n);
+                false
+            });
+    };
+}
+
+def_task_f8!(
+    group_f8_scalar,
+    task_f8_scalar,
+    widen_f8_scalar,
+    accum_scalar
+);
+#[cfg(target_arch = "aarch64")]
+def_task_f8!(group_f8_neon, task_f8_neon, widen_f8_neon, accum_neon);
+#[cfg(target_arch = "x86_64")]
+def_task_f8!(
+    group_f8_avx2,
+    task_f8_avx2,
+    widen_f8_avx2,
+    accum_avx2,
+    "avx2,fma"
+);
+// AVX-512 machines run the AVX2 widening into the AVX-512 accumulation, as MXFP4 does.
+#[cfg(target_arch = "x86_64")]
+def_task_f8!(
+    group_f8_avx512,
+    task_f8_avx512,
+    widen_f8_avx2,
+    accum_avx512,
+    "avx512f,avx512bw,avx2,fma"
+);
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Isa {
     Avx512,
@@ -1278,6 +1522,30 @@ impl Weights for Mx4 {
             task_mx4_avx2,
             task_mx4_avx512,
             task_mx4_neon,
+            (self, cols, x, b, y, rows_total, r0, r1)
+        )
+    }
+}
+
+impl Weights for F8 {
+    #[inline]
+    unsafe fn rows(
+        self,
+        isa: Isa,
+        cols: usize,
+        x: *const f32,
+        b: usize,
+        y: *mut f32,
+        rows_total: usize,
+        r0: usize,
+        r1: usize,
+    ) {
+        by_isa!(
+            isa,
+            task_f8_scalar,
+            task_f8_avx2,
+            task_f8_avx512,
+            task_f8_neon,
             (self, cols, x, b, y, rows_total, r0, r1)
         )
     }
@@ -1649,6 +1917,125 @@ pub(crate) unsafe fn gemv_mxfp4_group_core(
         if !mx4_shape_ok(job.rows, job.cols, job.b) || !aligned(job.x) || !aligned(job.y) {
             return ERR_DOMAIN;
         }
+        total = match total.checked_add(job.rows) {
+            Some(v) => v,
+            None => return ERR_DOMAIN,
+        };
+        tasks.push(job);
+    }
+    run_group(&tasks, total, threads)
+}
+
+/// One FP8 matrix checked and built: the grid `[sr, sc]` divides `[rows, cols]` evenly, the scales are
+/// f32-aligned, and every pointer is set.
+#[allow(clippy::too_many_arguments)]
+unsafe fn f8_task(
+    w: *const u8,
+    scales: *const f32,
+    rows: usize,
+    cols: usize,
+    sr: usize,
+    sc: usize,
+    x: *const f32,
+    b: usize,
+    y: *mut f32,
+) -> Result<Task<F8>, i32> {
+    if w.is_null() || scales.is_null() || x.is_null() || y.is_null() {
+        return Err(ERR_NULL);
+    }
+    if rows == 0 || cols == 0 || b == 0 || sr == 0 || sc == 0 {
+        return Err(ERR_DOMAIN);
+    }
+    if !rows.is_multiple_of(sr)
+        || !cols.is_multiple_of(sc)
+        || !shape_ok(rows, cols, b)
+        || !aligned(scales)
+        || !aligned(x)
+        || !aligned(y)
+    {
+        return Err(ERR_DOMAIN);
+    }
+    Ok(Task {
+        w: F8 {
+            w,
+            scales,
+            sc,
+            bm: rows / sr,
+            bn: cols / sc,
+        },
+        x,
+        y,
+        rows,
+        cols,
+        b,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn gemv_fp8_core(
+    w: *const u8,
+    scales: *const f32,
+    rows: usize,
+    cols: usize,
+    sr: usize,
+    sc: usize,
+    x: *const f32,
+    b: usize,
+    y: *mut f32,
+    threads: usize,
+) -> i32 {
+    match f8_task(w, scales, rows, cols, sr, sc, x, b, y) {
+        Ok(t) => run_one(t, threads),
+        Err(code) => code,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn gemv_fp8_group_core(
+    n: usize,
+    w: *const *const u8,
+    scales: *const *const f32,
+    rows: *const usize,
+    cols: *const usize,
+    sr: *const usize,
+    sc: *const usize,
+    x: *const *const f32,
+    b: *const usize,
+    y: *mut *mut f32,
+    threads: usize,
+) -> i32 {
+    if w.is_null()
+        || scales.is_null()
+        || rows.is_null()
+        || cols.is_null()
+        || sr.is_null()
+        || sc.is_null()
+        || x.is_null()
+        || b.is_null()
+        || y.is_null()
+    {
+        return ERR_NULL;
+    }
+    if n == 0 {
+        return ERR_DOMAIN;
+    }
+    let mut tasks: Vec<Task<F8>> = Vec::with_capacity(n);
+    let mut total = 0usize;
+    for t in 0..n {
+        let job = match f8_task(
+            *w.add(t),
+            *scales.add(t),
+            *rows.add(t),
+            *cols.add(t),
+            *sr.add(t),
+            *sc.add(t),
+            *x.add(t),
+            *b.add(t),
+            *y.add(t),
+        ) {
+            Ok(job) => job,
+            Err(code) => return code,
+        };
         total = match total.checked_add(job.rows) {
             Some(v) => v,
             None => return ERR_DOMAIN,
@@ -2163,5 +2550,323 @@ mod tests {
                 ERR_DOMAIN
             );
         }
+    }
+
+    /// An e4m3fn byte's value from the definition: (-1)^s * 2^(e-7) * (1 + m/8), 2^-6 * m/8 at e == 0.
+    fn f8_reference(b: u8) -> f64 {
+        let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
+        let (e, m) = (((b >> 3) & 0x0F) as i32, (b & 7) as f64);
+        if e == 0 {
+            sign * 2f64.powi(-6) * m / 8.0
+        } else {
+            sign * 2f64.powi(e - 7) * (1.0 + m / 8.0)
+        }
+    }
+
+    /// `p` to the nearest bf16 (8 significant bits, ties to even), by arithmetic rather than bits.
+    fn bf16_nearest(p: f64) -> f64 {
+        if p == 0.0 {
+            return p;
+        }
+        let ulp = 2f64.powi(p.abs().log2().floor().max(-126.0) as i32 - 7);
+        (p / ulp).round_ties_even() * ulp
+    }
+
+    #[test]
+    fn round_bf16_is_torchs_cast() {
+        let mut state = 0x0123_4567_89ab_cdefu64;
+        for _ in 0..100_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let f = f32::from_bits((state >> 32) as u32 & 0xBF7F_FFFF); // finite, both signs
+            assert_eq!(round_bf16(f) as f64, bf16_nearest(f as f64), "{f:e}");
+        }
+        // the ties go to even: 1 + 2^-8 down to 1, 1 + 3 * 2^-8 up to 1 + 2^-6
+        assert_eq!(round_bf16(1.0 + 1.0 / 256.0), 1.0);
+        assert_eq!(round_bf16(1.0 + 3.0 / 256.0), 1.0 + 1.0 / 64.0);
+    }
+
+    #[test]
+    fn f8_value_matches_the_e4m3_definition() {
+        for b in 0..=255u8 {
+            let got = f8_value(b);
+            if b & 0x7F == 0x7F {
+                assert!(got.is_nan(), "{b:#04x} is NaN");
+            } else {
+                assert_eq!(got as f64, f8_reference(b), "{b:#04x}");
+                assert_eq!(got.is_sign_negative(), b & 0x80 != 0, "{b:#04x} sign");
+            }
+        }
+        assert_eq!(f8_value(0x7E), 448.0);
+        assert_eq!(f8_value(0x01), 1.0 / 512.0);
+    }
+
+    /// Random finite e4m3 bytes (a quantizer never writes the NaN codes) and a grid of scales.
+    fn f8_random(rows: usize, cols: usize, sr: usize, sc: usize, seed: u64) -> (Vec<u8>, Vec<f32>) {
+        let mut state = seed;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let w: Vec<u8> = (0..rows * cols)
+            .map(|_| {
+                let v = (next() >> 32) as u8;
+                if v & 0x7F == 0x7F {
+                    v ^ 1
+                } else {
+                    v
+                }
+            })
+            .collect();
+        let s: Vec<f32> = (0..sr * sc)
+            .map(|_| ((next() >> 40) as f32 / 16_777_216.0 + 0.01) / 448.0)
+            .collect();
+        (w, s)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn f8_call(
+        w: &[u8],
+        s: &[f32],
+        rows: usize,
+        cols: usize,
+        sr: usize,
+        sc: usize,
+        x: &[f32],
+        b: usize,
+        threads: usize,
+    ) -> Vec<f32> {
+        let mut y = vec![f32::NAN; b * rows];
+        let code = unsafe {
+            gemv_fp8_core(
+                w.as_ptr(),
+                s.as_ptr(),
+                rows,
+                cols,
+                sr,
+                sc,
+                x.as_ptr(),
+                b,
+                y.as_mut_ptr(),
+                threads,
+            )
+        };
+        assert_eq!(code, OK);
+        y
+    }
+
+    fn f8_x(n: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 40) as f32 / 16_777_216.0) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fp8_matches_the_f64_reference() {
+        // (rows, cols, sr, sc): 128-blocks, blocks narrower than a SIMD run, ragged tails, a per-tensor
+        // scale, and a block wider than the column tile
+        for (rows, cols, sr, sc) in [
+            (1usize, 16usize, 1usize, 1usize),
+            (5, 96, 5, 6),
+            (16, 544, 2, 17),
+            (33, 1024, 3, 8),
+            (64, 1280, 1, 1),
+            (7, 13, 7, 13),
+            (256, 256, 2, 2),
+        ] {
+            let (w, s) = f8_random(
+                rows,
+                cols,
+                sr,
+                sc,
+                0x0f8f_8f8f_1234_5678 ^ (rows * cols) as u64,
+            );
+            let x = f8_x(cols, 0xfeed_beef_0000_0001 ^ cols as u64);
+            let y = f8_call(&w, &s, rows, cols, sr, sc, &x, 1, 1);
+            let (bm, bn) = (rows / sr, cols / sc);
+            for (r, got) in y.iter().enumerate() {
+                let mut want = 0.0f64;
+                let mut scale = 1e-30f64;
+                for (c, xv) in x.iter().enumerate() {
+                    let wv = bf16_nearest(
+                        (f8_reference(w[r * cols + c]) as f32 * s[(r / bm) * sc + c / bn]) as f64,
+                    );
+                    want += wv * *xv as f64;
+                    scale += (wv * *xv as f64).abs();
+                }
+                assert!(
+                    ((*got as f64 - want).abs() / scale) < 1e-6,
+                    "{rows}x{cols} grid {sr}x{sc} row {r}: got {got} want {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fp8_tiling_threads_and_batching_do_not_move_a_single_bit() {
+        let (rows, cols, sr, sc) = (67usize, 1056usize, 67usize, 33usize);
+        let (w, s) = f8_random(rows, cols, sr, sc, 0xabcd_f8f8_5678_9999);
+        let x = f8_x(3 * cols, 0x0bad_c0ff_ee00_0dd1);
+        let base = f8_call(&w, &s, rows, cols, sr, sc, &x, 3, 1);
+        for t in [2usize, 3, 5, 8, 0] {
+            let got = f8_call(&w, &s, rows, cols, sr, sc, &x, 3, t);
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                base.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "threads = {t}"
+            );
+        }
+        for i in 0..3 {
+            let solo = f8_call(
+                &w,
+                &s,
+                rows,
+                cols,
+                sr,
+                sc,
+                &x[i * cols..(i + 1) * cols],
+                1,
+                0,
+            );
+            for r in 0..rows {
+                assert_eq!(solo[r].to_bits(), base[i * rows + r].to_bits());
+            }
+        }
+    }
+
+    /// Every byte through each widening on this machine, over runs that cut the SIMD width, to the bit.
+    #[test]
+    fn fp8_widenings_agree_across_isas() {
+        // 37-column blocks, so every run cuts the SIMD width
+        let (rows, cols, sr, sc) = (4usize, 481usize, 2usize, 13usize);
+        let mut w: Vec<u8> = (0..rows * cols).map(|i| (i % 256) as u8).collect();
+        w.rotate_left(3);
+        let s: Vec<f32> = (0..sr * sc).map(|i| 0.5 + i as f32 / 64.0).collect();
+        let p = F8 {
+            w: w.as_ptr(),
+            scales: s.as_ptr(),
+            sc,
+            bm: rows / sr,
+            bn: cols / sc,
+        };
+        let mut a = vec![0.0f32; ROW_UNROLL * COL_TILE];
+        let mut b = vec![0.0f32; ROW_UNROLL * COL_TILE];
+        for (start, n) in [(0usize, 481usize), (5, 470), (17, 3)] {
+            unsafe {
+                widen_f8_scalar::<4>(a.as_mut_ptr(), COL_TILE, p, start, cols, n);
+                #[cfg(target_arch = "aarch64")]
+                widen_f8_neon::<4>(b.as_mut_ptr(), COL_TILE, p, start, cols, n);
+                #[cfg(target_arch = "x86_64")]
+                if std::is_x86_feature_detected!("avx2") {
+                    widen_f8_avx2::<4>(b.as_mut_ptr(), COL_TILE, p, start, cols, n);
+                } else {
+                    b.copy_from_slice(&a);
+                }
+            }
+            for r in 0..4 {
+                for j in 0..n {
+                    let (u, v) = (a[r * COL_TILE + j], b[r * COL_TILE + j]);
+                    assert!(
+                        u.to_bits() == v.to_bits() || (u.is_nan() && v.is_nan()),
+                        "start {start} row {r} col {j}: {u} vs {v}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fp8_group_matches_the_single_calls() {
+        let shapes = [
+            (12usize, 64usize, 3usize, 4usize),
+            (7, 128, 1, 1),
+            (20, 96, 20, 3),
+        ];
+        let mats: Vec<(Vec<u8>, Vec<f32>)> = shapes
+            .iter()
+            .enumerate()
+            .map(|(i, (r, c, sr, sc))| {
+                f8_random(*r, *c, *sr, *sc, 0x9e37_79b9_f8f8_7c15 ^ i as u64)
+            })
+            .collect();
+        let xs: Vec<Vec<f32>> = shapes
+            .iter()
+            .enumerate()
+            .map(|(i, (_, c, _, _))| f8_x(2 * c, 0x2545_f491_4f6c_dd1d ^ (i as u64) << 8))
+            .collect();
+        let want: Vec<Vec<f32>> = shapes
+            .iter()
+            .enumerate()
+            .map(|(i, (r, c, sr, sc))| {
+                f8_call(&mats[i].0, &mats[i].1, *r, *c, *sr, *sc, &xs[i], 2, 0)
+            })
+            .collect();
+        let mut got: Vec<Vec<f32>> = shapes.iter().map(|s| vec![0.0f32; 2 * s.0]).collect();
+        let wp: Vec<*const u8> = mats.iter().map(|m| m.0.as_ptr()).collect();
+        let sp: Vec<*const f32> = mats.iter().map(|m| m.1.as_ptr()).collect();
+        let rp: Vec<usize> = shapes.iter().map(|s| s.0).collect();
+        let cp: Vec<usize> = shapes.iter().map(|s| s.1).collect();
+        let srp: Vec<usize> = shapes.iter().map(|s| s.2).collect();
+        let scp: Vec<usize> = shapes.iter().map(|s| s.3).collect();
+        let xp: Vec<*const f32> = xs.iter().map(|v| v.as_ptr()).collect();
+        let bs: Vec<usize> = shapes.iter().map(|_| 2usize).collect();
+        let mut yp: Vec<*mut f32> = got.iter_mut().map(|v| v.as_mut_ptr()).collect();
+        let code = unsafe {
+            gemv_fp8_group_core(
+                shapes.len(),
+                wp.as_ptr(),
+                sp.as_ptr(),
+                rp.as_ptr(),
+                cp.as_ptr(),
+                srp.as_ptr(),
+                scp.as_ptr(),
+                xp.as_ptr(),
+                bs.as_ptr(),
+                yp.as_mut_ptr(),
+                0,
+            )
+        };
+        assert_eq!(code, OK);
+        for (i, (w, g)) in want.iter().zip(got.iter()).enumerate() {
+            assert_eq!(
+                w.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                g.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "task {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn fp8_rejects_bad_shapes() {
+        let w = [0u8; 64];
+        let s = [1.0f32; 4];
+        let x = [0.0f32; 32];
+        let mut y = [0.0f32; 4];
+        let call = |w: *const u8, s: *const f32, rows, cols, sr, sc, y: *mut f32| unsafe {
+            gemv_fp8_core(w, s, rows, cols, sr, sc, x.as_ptr(), 1, y, 0)
+        };
+        let yp = y.as_mut_ptr();
+        assert_eq!(
+            call(std::ptr::null(), s.as_ptr(), 2, 32, 1, 1, yp),
+            ERR_NULL
+        );
+        assert_eq!(
+            call(w.as_ptr(), std::ptr::null(), 2, 32, 1, 1, yp),
+            ERR_NULL
+        );
+        // the grid must divide the matrix evenly, and no dimension may be zero
+        assert_eq!(call(w.as_ptr(), s.as_ptr(), 2, 32, 1, 3, yp), ERR_DOMAIN);
+        assert_eq!(call(w.as_ptr(), s.as_ptr(), 2, 32, 4, 1, yp), ERR_DOMAIN);
+        assert_eq!(call(w.as_ptr(), s.as_ptr(), 2, 32, 0, 1, yp), ERR_DOMAIN);
+        assert_eq!(call(w.as_ptr(), s.as_ptr(), 0, 32, 1, 1, yp), ERR_DOMAIN);
     }
 }

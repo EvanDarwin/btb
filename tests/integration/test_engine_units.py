@@ -20,7 +20,8 @@ from btb.draft import NGramProposer, Spans
 from btb.engine import StreamedTextModel
 from btb.engine.cache import GrowLayer
 from btb.engine.generate import _chains_tree
-from btb.kinds import Json, TokenRows
+from btb.kinds import Json, LayerKind, TokenRows
+from tests.cert import spec
 from tests.helpers import (
     ROOT,
     fixture,
@@ -29,6 +30,7 @@ from tests.helpers import (
     layer_count,
     loaded_model,
     max_abs,
+    native_library,
     need_cuda,
     need_mlx,
     rel_err,
@@ -401,6 +403,39 @@ def test_speculative_is_the_greedy_answer_on_the_host() -> None:
             sm.close()
 
 
+@pytest.mark.parametrize("device", ["cpu", "mlx"])
+def test_a_hybrid_draft_model_keeps_its_deltanet_state_at_the_committed_rows(device: str) -> None:
+    """tiny_q35 as a draft model: after a proposal round its DeltaNet state is a prefill's of the committed rows,
+    and a speculative decode with it drafting answers as the plain loop. Its pass over the committed rows used
+    to leave that state where it was (a host tree pass leaves it to the commit, which a drafter never made), and
+    its tree passes crop by a length MLX's linear layers do not have; either way it drafted from a stale state"""
+    from btb.engine.generate import _lin
+    from btb.engine.propose import ModelProposer
+
+    if device == "mlx":
+        need_mlx()
+    path = fixture("tiny_q35")
+    prompt, more = VARIED[0][:8], VARIED[0][8:12]
+    with loaded_model(path, device=device, v_max=0) as sm, torch.inference_mode():
+        mp = ModelProposer(sm, prompt, ks=(2, 2, 1))
+        for t in more:
+            mp.extend(t)
+        assert mp.propose_chains(3), "the drafter proposed nothing"
+        ref = sm.new_cache()
+        sm._prefill(torch.tensor([prompt + more]), ref)
+        for i, kind in enumerate(sm.layer_types):
+            if kind == LayerKind.LINEAR:
+                for got, want in zip(_lin(mp.cache.layers[i]), _lin(ref.layers[i]), strict=True):
+                    err = float((got.float() - want.float()).abs().max())
+                    assert err <= 1e-2 * float(want.float().abs().max()), f"layer {i}: {err:.3e} off the prefill"
+    with loaded_model(path, device=device, draft_model=path, v_max=4, tree_budget=0) as sm:
+        sm._host_cost, sm._mlx_cost = {}, {}  # the load's cost curve sizes a tiny model's passes to one row
+        greedy = list(sm.generate(VARIED, 32, speculate=False).tokens)
+        spec = sm.generate(VARIED, 32, speculate=True)
+    assert spec.stats["proposed"] > 0, "nothing was drafted: the path under test never ran"
+    assert list(spec.tokens) == greedy
+
+
 def test_speculative_is_the_sampled_answer_on_the_host() -> None:
     """Under a temperature the verify pass draws every node's token from the target's own distribution and
     follows the draft that matches: the answer is the sequential sampled loop's, token for token, under one
@@ -563,6 +598,26 @@ def test_the_card_and_the_host_answer_the_same_prompt_alike(name: str) -> None:
     assert max_abs(got, ref) < 1e-4, f"{name}: the card and the host disagree"
 
 
+@pytest.mark.parametrize("name", sorted(set(spec.FIXTURE_STEM.values())))
+def test_the_host_layers_take_a_bf16_activation_through_their_widened_modules(name: str) -> None:
+    """A host layer widens some matrices to float32 (a conv, Qwen4's router), and the MLX step path hands it
+    bf16 activations; each widened module computes in float32 and answers in bf16. The CPU in bf16 runs the
+    same layers the same way, so every family's fixture decodes here without a GPU."""
+    path = fixture(name)
+    with torch.inference_mode():
+        sm = host_model(path, dtype=torch.bfloat16)
+        try:
+            got = forward_logits(sm, REPEATING, sm.new_cache())[0, -1].float()
+        finally:
+            sm.close()
+        ref_sm = host_model(path)
+        try:
+            ref = forward_logits(ref_sm, REPEATING, ref_sm.new_cache())[0, -1].float()
+        finally:
+            ref_sm.close()
+    assert rel_err(got, ref) < 0.05, f"{name}: the bf16 pass strays from the float32 one"
+
+
 def test_spec_budget_without_a_cost_curve_is_the_wider_of_the_tree_and_the_chain() -> None:
     """The speculative loop caps a pass's rows at the budget; without the card's cost curve (the CPU and MLX
     tiers) the budget must be the configured width, the chain's included: a tree budget of 0 with v_max 4 once
@@ -661,11 +716,9 @@ def test_mlx_decodes_run_on_one_worker_thread_whichever_thread_asks() -> None:
 def test_native_isa_is_a_tier_the_cert_matrix_knows() -> None:
     """the tier the library reports (what bench.yml banks a baseline under) is one of the `Isa` variants
     tests/cert/native_ops reads from the crate, so the two never disagree on a name"""
-    from btb.engine.native import isa, native_path
+    from btb.engine.native import isa
     from tests.cert.native_ops import ISA_TIERS
 
-    if native_path() is None:
-        pytest.skip("no native library")
     assert isa() in ISA_TIERS, (isa(), ISA_TIERS)
 
 
@@ -678,14 +731,10 @@ def test_native_open_names_the_os_error_when_the_file_limit_is_hit(tmp_path: Pat
     import errno
     import resource
 
-    from btb.engine.native import Native, NativeError, native_path
+    from btb.engine.native import Native, NativeError
 
-    dll = native_path()
-    if dll is None:
-        pytest.skip("no native library")
-    Native.load_gemv(dll)
-    if Native.open is None:
-        pytest.skip("the native library has no kept-handle reader")
+    native_library()
+    assert Native.open is not None, "the native library has no kept-handle reader: rebuild it"
     f = tmp_path / "shard.bin"
     f.write_bytes(b"\0" * 8192)
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -727,12 +776,11 @@ def test_every_native_kernel_refuses_a_dtype_it_was_not_built_for(monkeypatch: p
     """a kernel reads its tensors through raw pointers: an fp32 weight handed to the bf16 gemv was read as bf16
     pairs and decoded garbage without a word. Loaded `checked`, every fixed-type binding refuses before the call,
     naming the argument, and writes nothing"""
-    from btb.engine.native import Native, NativeDtypeError, native_path
+    from btb.engine.native import Native, NativeDtypeError
+    from btb.fp8 import F8Weight
     from btb.mxfp4 import MxWeight, ggml_bytes, matrix_bytes
 
-    dll = native_path()
-    if dll is None:
-        pytest.skip("no native library")
+    dll = native_library()
     for name in Native.HANDLES:  # the unchecked bindings come back after the test
         monkeypatch.setattr(Native, name, getattr(Native, name))
     Native.load_gemv(dll, checked=True)
@@ -744,6 +792,10 @@ def test_every_native_kernel_refuses_a_dtype_it_was_not_built_for(monkeypatch: p
     mx_bad = MxWeight(torch.zeros(nb, dtype=torch.int8), torch.zeros(ns, dtype=u8), r, c)
     gg = MxWeight.from_ggml(torch.zeros(ggml_bytes(r, c), dtype=u8), r, c)
     gg_bad = MxWeight.from_ggml(torch.zeros(ggml_bytes(r, c), dtype=torch.int8), r, c)
+    f8 = F8Weight(torch.zeros(r * c, dtype=u8), torch.ones(1, 1), r, c)
+    f8_bad = F8Weight(torch.zeros(r * c, dtype=torch.int8), torch.ones(1, 1), r, c)
+    f8_bad_scales = F8Weight(torch.zeros(r * c, dtype=u8), torch.ones(1, 1), r, c)
+    f8_bad_scales.scales = torch.ones(1, 1, dtype=torch.float64)
     p12 = (torch.zeros(r * c, dtype=u8), torch.zeros(r * c // 2, dtype=u8), torch.zeros(16, dtype=u8))
     no_esc = (torch.zeros(0, dtype=torch.int32), torch.zeros(0, dtype=u8), 0)
     q, kv = torch.zeros(2, 16, dtype=f32), torch.zeros(1, 3, 16, dtype=bf)
@@ -799,6 +851,16 @@ def test_every_native_kernel_refuses_a_dtype_it_was_not_built_for(monkeypatch: p
             "btb_gemv_mxfp4_ggml_group",
             "blocks",
             lambda y: Native.gemv_mx4_ggml_group([gg, gg_bad], [x, x], [y, y]),
+            f32,
+        ),
+        ("gemv_fp8", "btb_gemv_fp8_rows", "w", lambda y: Native.gemv_fp8(f8_bad, x, y), f32),
+        ("gemv_fp8", "btb_gemv_fp8_rows", "scales", lambda y: Native.gemv_fp8(f8_bad_scales, x, y), f32),
+        ("gemv_fp8", "btb_gemv_fp8_rows", "x", lambda y: Native.gemv_fp8(f8, x.half(), y), f32),
+        (
+            "gemv_fp8_group",
+            "btb_gemv_fp8_group",
+            "w",
+            lambda y: Native.gemv_fp8_group([f8, f8_bad], [x, x], [y, y]),
             f32,
         ),
         ("attn_decode", "btb_attn_decode", "k", lambda y: Native.attn_decode(q, kv.half(), kv, 1.0, y), f32),

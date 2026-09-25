@@ -1,0 +1,6 @@
+# setuptools-scm puts every tracked file in the sdist; the fixtures are tens of MB of test weights that building
+# btb never reads, and the tests that need them run from a checkout
+prune tests/fixtures
+# repo tooling (agent hooks, CI workflows), not source
+prune .claude
+prune .github

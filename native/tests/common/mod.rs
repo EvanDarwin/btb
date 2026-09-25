@@ -12,6 +12,7 @@
 pub mod attn;
 pub mod deltak;
 pub mod fixture;
+pub mod fp8k;
 pub mod gemvk;
 pub mod refs;
 

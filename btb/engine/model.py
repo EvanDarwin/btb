@@ -53,6 +53,8 @@ class StreamedTextModel(
         "BF16": torch.bfloat16,
         "F16": torch.float16,
         "F32": torch.float32,
+        "F8_E4M3": torch.float8_e4m3fn,  # fine-grained FP8 weights (btb/fp8.py)
+        "F8_E8M0": torch.float8_e8m0fnu,  # their scales stored as exponents
         "F64": torch.float64,
         "I64": torch.int64,
         "I32": torch.int32,
@@ -70,7 +72,8 @@ class StreamedTextModel(
     _NGramRows = _NGramRows
     _ExpertStore = _ExpertStore
     MTPDrafter = MTPDrafter
-    gemv = gemv_p12 = gemv_group = gemv_mx4 = gemv_mx4_group = attn_decode = delta_step = read_direct = None
+    gemv = gemv_p12 = gemv_group = gemv_mx4 = gemv_mx4_group = gemv_fp8 = gemv_fp8_group = None
+    attn_decode = delta_step = read_direct = None
     read_open = read_at = read_close = None
     # `Native.open` and `Native.close` are the reader's file handle; `close` here is the engine's own teardown,
     # so those two are mirrored under the names above
@@ -212,6 +215,9 @@ class StreamedTextModel(
         if self.gguf is None:
             _mm, hdr, _ = self._shard(self.weight_map[emb_keys[0]])
             self.held_cast = self.ST_DTYPES[hdr[emb_keys[0]]["dtype"]] != torch.bfloat16
+        self.fp8_experts = any(self._fp8(k) for k in self.weight_map if k.endswith(".mlp.experts.gate_up_proj"))
+        self.fp8_layers = set()
+        self.fp8_widened = False
         # set by close(): every decode loop ends at its next step, so no thread is mid-pass when the buffers go
         self.abort = threading.Event()
         self._decode_lock = threading.RLock()  # one decode at a time on the engine (MLX's worker serializes too)
@@ -510,13 +516,17 @@ class StreamedTextModel(
         return len(cost)
 
     def _family_tensor_names(self, cfg: Any) -> list[str]:
-        """every tensor the family's layers, embedding, norm and head are loaded from, by its HF name: what a
-        GGUF file's tensors are matched against"""
-        with torch.device("meta"):
-            layer = self.fam.layer(cfg, 0)
-        per = [n for n, _ in layer.named_parameters()] + [n for n, _ in layer.named_buffers()]
+        """every tensor the family's layers, embedding, norm (Qwen4's closing mixer) and head are loaded from, by
+        its HF name: what a GGUF file's tensors are matched against. Each layer is its own: a hybrid family's
+        layers differ in kind."""
         names = ["model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"]
-        return names + [f"model.layers.{i}.{n}" for i in range(self.L) for n in per]
+        with torch.device("meta"):
+            if self.fam.norm is None:
+                mixer = self.fam.mod.Qwen4ExpTextGatedResidual(cfg, use_combine=False)
+                names += [f"model.hyper_connection_mixer.{n}" for n, _, _ in self._named_tensors(mixer)]
+            for i in range(self.L):
+                names += [f"model.layers.{i}.{n}" for n, _, _ in self._named_tensors(self.fam.layer(cfg, i))]
+        return names
 
     def close(self) -> None:
         """Stop any decode in flight and release the model's memory on every tier; safe to call twice. The engine

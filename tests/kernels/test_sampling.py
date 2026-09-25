@@ -18,12 +18,12 @@ from tests.helpers import card_kernels, mlx_core, native_library
 _CpuPick = Callable[[torch.Tensor, Sequence[int], float, int, float], torch.Tensor]
 
 
-def _cpu() -> _CpuPick | None:
-    """the CPU native sampler (Native.sample_pick, the sample.rs port) where the library is here, else None"""
+def _cpu() -> _CpuPick:
+    """the CPU native sampler (Native.sample_pick, the sample.rs port)"""
     from btb.engine.native import Native
 
-    if native_library() is None:
-        return None
+    native_library()
+    assert Native.sample_pick is not None, "the native library has no sampler: rebuild it"
     return Native.sample_pick
 
 
@@ -176,7 +176,7 @@ def test_the_cuda_kernel_picks_as_the_ops_do() -> None:
     cu = card_kernels()
     if cu is None:
         pytest.skip("no CUDA sampler")
-    cpu = _cpu()  # the CPU port, for the token-for-token A/B where its library is here
+    cpu = _cpu()  # the CPU port, for the token-for-token A/B
 
     g = torch.Generator().manual_seed(4)
     x = torch.randn(16, 3000, generator=g) * 3
@@ -190,9 +190,9 @@ def test_the_cuda_kernel_picks_as_the_ops_do() -> None:
     ):
         keysets = [[s.key_for(i * 16 + r) for r in range(16)] for i in range(100)]
         picks = [cu.pick(xc, ks, s.temperature, s.top_k, s.top_p).cpu() for ks in keysets]
-        if cpu is not None:  # the card pick equals the CPU port token-for-token (the exact 3-level threshold)
-            for ks, pk in zip(keysets, picks):
-                assert pk.tolist() == cpu(x, ks, s.temperature, s.top_k, s.top_p).tolist(), (s, ks[0])
+        # the card pick equals the CPU port token-for-token (the exact 3-level threshold)
+        for ks, pk in zip(keysets, picks):
+            assert pk.tolist() == cpu(x, ks, s.temperature, s.top_k, s.top_p).tolist(), (s, ks[0])
         for r in range(16):
             row = x[r] / s.temperature
             keep = set(torch.topk(row, s.top_k).indices.tolist()) if s.top_k > 0 else set(range(3000))
@@ -227,8 +227,8 @@ def test_the_cuda_pick_equals_the_cpu_pick_to_the_token() -> None:
     ordered-uint sum runs to ~2^47"""
     cu = card_kernels()
     cpu = _cpu()
-    if cu is None or cpu is None:
-        pytest.skip("the CUDA and CPU samplers are both needed")
+    if cu is None:
+        pytest.skip("no CUDA sampler")
     configs = ((0.8, 0, 1.0), (0.7, 40, 1.0), (0.9, 0, 0.9), (0.8, 40, 0.9), (1.0, 0, 0.95), (0.6, 100, 0.8))
     for V, R, draws in ((3000, 8, 128), (32768, 4, 64), (151936, 2, 48)):
         g = torch.Generator().manual_seed(V)
@@ -361,8 +361,7 @@ def test_the_uniform_stays_inside_the_unit_interval_and_top_p_zero_keeps_the_top
     x = torch.full((1, V), -60.0)
     x[0, 5] = 40.0
     x[0, tok] = 15.0
-    if cpu is not None:
-        assert int(cpu(x, [key], 1.0, 0, 1.0)[0]) == 5
+    assert int(cpu(x, [key], 1.0, 0, 1.0)[0]) == 5
     if mx is not None:
         assert int(s.pick_mx(mx.array(x.numpy()), [key])[0]) == 5
     if cu is not None:
@@ -372,8 +371,7 @@ def test_the_uniform_stays_inside_the_unit_interval_and_top_p_zero_keeps_the_top
     for tp in (0.0, 1e-12):
         z = Sampling(temperature=0.8, top_p=tp, seed=3)
         keys = [z.key_for(r) for r in range(4)]
-        if cpu is not None:
-            assert cpu(x, keys, 0.8, 0, tp).tolist() == x.argmax(-1).tolist()
+        assert cpu(x, keys, 0.8, 0, tp).tolist() == x.argmax(-1).tolist()
         if mx is not None:
             assert z.pick_mx(mx.array(x.numpy()), keys).tolist() == x.argmax(-1).tolist()
         if cu is not None:
@@ -386,8 +384,8 @@ def test_the_cpu_and_metal_picks_are_one_pick() -> None:
     on either (the card kernel is held to the CPU one the same way)"""
     cpu = _cpu()
     mx = mlx_core()
-    if cpu is None or mx is None:
-        pytest.skip("the CPU and Metal samplers are both needed")
+    if mx is None:
+        pytest.skip("no Metal sampler")
     g = torch.Generator().manual_seed(11)
     x = torch.randn(8, 151936, generator=g) * 4
     xm = mx.array(x.numpy())

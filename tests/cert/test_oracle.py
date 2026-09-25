@@ -1,7 +1,7 @@
 """The P5 oracle's own gates: every served family with a fixture has a banked correctness reference (the
 derive-from-core hoop - a new family with none fails here), the bank is not stale against its fixtures (the
-content-hash guard), and a fresh regeneration on the reference device is byte-identical to the committed bank
-(the reproducibility guard). The cross-device reproduction (`oracle.validate`) runs on hardware the suite may
+content-hash guard), no banked decode sits on a near-tie (the margin guard), and a fresh regeneration on the
+reference device is byte-identical to the committed bank (the reproducibility guard). The cross-device reproduction (`oracle.validate`) runs on hardware the suite may
 not have, so it is a manual `--validate` under the GPU lock, not a committed CPU test."""
 
 from __future__ import annotations
@@ -54,6 +54,16 @@ def test_every_banked_family_carries_every_decode() -> None:
     for kind in oracle.banked_kinds():
         for key in oracle.DECODES:
             assert set(fams[kind.value].get(key, {})) == set(oracle.PROMPTS), f"{kind.value}: {key} incomplete"
+
+
+def test_every_banked_decode_clears_the_margin_floor() -> None:
+    """the near-tie guard: every banked greedy decode, a family's and each lossy twin's, keeps each step's top-2
+    gap above `oracle.MARGIN_FLOOR` - past what bf16 compute and int8 KV move a fixture's logits - so a device path
+    decodes the banked tokens unless it computes wrong. Reads the bank only, like the staleness guard."""
+    thin = oracle.thin_margins(oracle.load_bank())
+    assert not thin, (
+        f"banked decodes under the {oracle.MARGIN_FLOOR:.0%} margin floor (redraw the fixture):\n  " + "\n  ".join(thin)
+    )
 
 
 def test_reference_reproducible_on_cpu() -> None:
