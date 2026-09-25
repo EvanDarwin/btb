@@ -127,7 +127,8 @@ class Session:
         """Append `ids` to the sequence and return the logits after each of them, [T, V] in float32 - the
         building block of a loop of your own: feed a draft, read its logits, `rewind` what you reject.
         `last_only`: the last one's alone, [1, V], and the head run on that row alone (a long prelude's [T, V]
-        is gigabytes). `taps`: also those layers' states at each fed position, {layer: [T, H]} float32."""
+        is gigabytes). `taps`: also those layers' states at each fed position, {layer: [T, H]} float32 - layer i's
+        the residual stream leaving block i, before the final norm (transformers' `hidden_states[i + 1]`)."""
         eng = self._bound()
         new = [int(t) for t in ids]
         if not new:

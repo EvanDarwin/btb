@@ -432,7 +432,8 @@ class _TextMixin(_State):
 
         Hooks: `processors` (`btb.LogitsProcessor`s) rewrite every pick's logits, speculative drafts included;
         `logprobs` returns each token's log-probability (and the `logprobs` most likely, when above 0);
-        `taps` returns the chosen layers' hidden state at each new token; `on_pass` is called with each pass's
+        `taps` returns the chosen layers' hidden state at each new token (layer i's is the residual stream leaving
+        block i, before the final norm: transformers' `hidden_states[i + 1]`); `on_pass` is called with each pass's
         `btb.PassStats`. The processors, logprobs and taps need the logits or the layers in hand, so a hooked
         decode skips the paths that pick inside their graph (recorded as `PassTag.PICK_HOOKED`).
         """

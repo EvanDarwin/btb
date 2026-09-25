@@ -156,7 +156,7 @@ class _Rows:
     ) -> torch.Tensor | tuple[torch.Tensor, Taps]:
         """Feed a token to each live row, in `live` order (None: the ones `generate` drew last), and return the
         next token's logits there, [live, V] float32; with `taps`, also those layers' states at the fed
-        tokens, {layer: [live, H]} float32."""
+        tokens, {layer: [live, H]} float32 (as `Session.feed` taps them)."""
         self._check()
         live = self.live
         if not live:
