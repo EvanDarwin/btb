@@ -1967,11 +1967,24 @@ def test_the_plan_sets_prefill_templates_aside_only_when_asked() -> None:
         total=64 * GB, available=40 * GB, commit=30 * GB, footprint=2 * GB, os_floor=GB, growth=0, floor=3 * GB
     )
 
-    def asked(device: str, **kw: bool) -> list[object]:
+    def asked(device: str, prefill_card: bool | None = None) -> list[object]:
         p = _PlanProbe()
-        BatchScheduler.plan_placement(
-            p, device, 11.0, packed=False, fp32=False, vram_reserve_gb=0.5, budget=hb, settle_s=0.0, **kw
-        )
+        if prefill_card is None:  # left unset: the default is what is under test
+            BatchScheduler.plan_placement(
+                p, device, 11.0, packed=False, fp32=False, vram_reserve_gb=0.5, budget=hb, settle_s=0.0
+            )
+        else:
+            BatchScheduler.plan_placement(
+                p,
+                device,
+                11.0,
+                packed=False,
+                fp32=False,
+                vram_reserve_gb=0.5,
+                budget=hb,
+                settle_s=0.0,
+                prefill_card=prefill_card,
+            )
         return [a["prefill_card"] for _, a in p.asked]
 
     assert set(asked("cuda")) == {False}, "off unless asked"
