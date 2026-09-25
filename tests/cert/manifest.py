@@ -244,6 +244,8 @@ FORK_NOTES: dict[PassTag, str] = {
     ),
     PassTag.SPEC_OFF: "every runner cell decodes with speculate=False; the tag is carried but nothing asserts it",
     PassTag.SPEC_MTP: "no runner cell speculates (Missing.SPEC_DECODE); the decode axis reports it per family",
+    PassTag.SPEC_MTP_TREE: "no runner cell speculates (Missing.SPEC_DECODE); the decode axis reports it per family",
+    PassTag.SPEC_MTP_DYN: "no runner cell speculates (Missing.SPEC_DECODE); the decode axis reports it per family",
     PassTag.SPEC_DRAFT: "no runner cell speculates; a sibling draft model also needs a second cached model",
     PassTag.SPEC_NGRAM: "no runner cell speculates (Missing.SPEC_DECODE)",
     PassTag.SPEC_ACCEPT: "an accepted draft; unreachable while no cell speculates",

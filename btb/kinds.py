@@ -303,11 +303,23 @@ class PassTag(StrEnum):
     TIER_STREAMED = "tier_streamed"
     # speculation: the proposer, and whether a pass's drafts were accepted (btb/engine/generate.py)
     SPEC_OFF = "spec_off"  # the plain one-token loop, no drafts
-    SPEC_MTP = "spec_mtp"  # a drafting head proposes
+    SPEC_MTP = "spec_mtp"  # a drafting head proposes a chain
+    SPEC_MTP_TREE = "spec_mtp_tree"  # a drafting head proposes a fixed tree
+    SPEC_MTP_DYN = "spec_mtp_dyn"  # a drafting head draws its own tree
     SPEC_DRAFT = "spec_draft"  # a sibling draft model proposes
     SPEC_NGRAM = "spec_ngram"  # the n-gram proposer
     SPEC_ACCEPT = "spec_accept"  # a pass accepted at least one drafted token
     SPEC_REJECT = "spec_reject"  # a pass rejected at least one drafted token
+
+
+# the tag a speculative decode records for the proposer it ran (a sibling draft model's decode records SPEC_DRAFT
+# in the n-gram proposer's place)
+PROPOSER_TAG: dict[Proposer, PassTag] = {
+    Proposer.NGRAM: PassTag.SPEC_NGRAM,
+    Proposer.MTP: PassTag.SPEC_MTP,
+    Proposer.MTP_TREE: PassTag.SPEC_MTP_TREE,
+    Proposer.MTP_DYN: PassTag.SPEC_MTP_DYN,
+}
 
 
 @dataclass(frozen=True)

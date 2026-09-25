@@ -12,7 +12,7 @@ import torch
 
 from .. import mlx as mlxdev
 from ..draft import NGramProposer, SpanBank, Spans
-from ..kinds import Json, LayerKind, PassTag, Proposer, TokenRows, Tokens
+from ..kinds import PROPOSER_TAG, Json, LayerKind, PassTag, Proposer, TokenRows, Tokens
 from ..options import Device
 from ..sampling import GREEDY, Sampling, Verify
 from ..session import Session
@@ -246,7 +246,7 @@ class _GenerateMixin(_State):
 
             ks = getattr(self, "draft_ks", None) or (3, 2, 1)
             prop = UnionProposer(ModelProposer(draft, prompt, ks=ks), prop)
-        self._tag(PassTag.SPEC_MTP if use_mtp else (PassTag.SPEC_DRAFT if draft is not None else PassTag.SPEC_NGRAM))
+        self._tag(PassTag.SPEC_DRAFT if draft is not None and not use_mtp else PROPOSER_TAG[prop_kind])
         by_src: dict[str, dict[str, int]] = {"drafted": {}, "accepted": {}}
         last_base = n
         if use_mtp:
