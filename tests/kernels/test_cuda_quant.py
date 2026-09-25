@@ -114,7 +114,7 @@ def _decode_q3k(blk: bytes) -> np.ndarray:
 Decoder = Callable[[bytes], np.ndarray]
 # the byte offsets of a block's f16 scale fields, made finite in a random block (random bytes as f16 may be inf/nan)
 ScaleFields = tuple[int, ...]
-# by type; the block sizes are the registry's (pinned to gguf's table by test_quant.py)
+# by type; the block sizes are the registry's (pinned to gguf's table by tests/unit/test_quant.py)
 DECODERS: dict[Quant, tuple[Decoder, ScaleFields]] = {
     Quant.Q2_K: (_decode_q2k, (80, 82)),
     Quant.Q3_K: (_decode_q3k, (108,)),

@@ -31,7 +31,8 @@ def test_the_derived_lists_are_the_hand_written_ones() -> None:
     assert "btb_gemv_q4k_bf16_m32" in CARD_KERNELS and QUANTS[Quant.Q4_K].card_kernel(1) == "btb_gemv_q4k_bf16_m1"
     with pytest.raises(ValueError):
         QUANTS[Quant.Q8_0].card_kernel(1)
-    assert quant_of("BF16") is None and quant_of("MXFP4") is None and quant_of("Q6_K") is QUANTS[Quant.Q6_K]
+    assert quant_of("BF16") is None and quant_of("MXFP4") is None and quant_of("F32") is None
+    assert quant_of("Q6_K") is QUANTS[Quant.Q6_K]
     # every as-stored type kinds.QUANT_KIND names has a native CPU gemv; the ksigns subset of the lattice types
     # also takes the sign table
     stored = {q for q in Quant if QUANT_KIND[q] not in (QuantClass.FLOAT, QuantClass.MXFP4)}
