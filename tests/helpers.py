@@ -377,9 +377,17 @@ class SchedulerModel:
 def stub_engine(**attrs: object) -> types.SimpleNamespace:
     """the least an engine the scheduler or the expert store is built over: a quiet log, the CPU, and the store's
     residency policy at the model's own defaults (it reads `bus_pass`/`store_pin` directly - a stub without them
-    is an AttributeError, not a quietly-wrong policy), plus whatever the test adds"""
+    is an AttributeError, not a quietly-wrong policy), plus whatever the test adds. `_tag`, the engine's record of
+    which path a pass took, records nothing here: it steers nothing, and the expert path calls it on a card"""
     return types.SimpleNamespace(
-        **{"log": NO_LOG, "dev": torch.device("cpu"), "bus_pass": True, "store_pin": 0, **attrs}
+        **{
+            "log": NO_LOG,
+            "dev": torch.device("cpu"),
+            "bus_pass": True,
+            "store_pin": 0,
+            "_tag": lambda *a, **k: None,
+            **attrs,
+        }
     )
 
 
