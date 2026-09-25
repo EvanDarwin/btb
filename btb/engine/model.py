@@ -390,16 +390,25 @@ class StreamedTextModel(
         self._batched_cont = False
         self.resident_fp32 = bool(resident_fp32)
         if self.compute_dtype is not None and self.compute_dtype != torch.bfloat16:
-            srcs = {lt: self.templates[lt][0] for lt in self.templates}
+            # one float32 shadow per layer kind and structure, built from a layer of that structure: layers of one
+            # kind can differ (tiny_q4's layer 1 carries a `ple` block its kind's other layers lack), and a shadow
+            # of the wrong one had the upcast copy a (256, 64) weight into a 64-wide slot. The kind stays in the
+            # key: two kinds can share a structure (gemma3's sliding and full layers) and still run apart
+            srcs: dict[tuple[Any, tuple[Any, ...]], tuple[int, Any]] = {}
+            for lt in self.templates:
+                tmpl = self.templates[lt][0]
+                srcs.setdefault((lt, self._structure(tmpl)), (self.layer_types.index(lt), tmpl))
             if not self.resident_fp32:
                 for i, tmpl in self.resident.items():
-                    srcs.setdefault(self.layer_types[i], tmpl)
-            for lt, src_mod in srcs.items():
-                idx = self.layer_types.index(lt)
+                    srcs.setdefault((self.layer_types[i], self._structure(tmpl)), (i, tmpl))
+            for (lt, key), (idx, src_mod) in srcs.items():
                 sh = self._new_layer(idx)
-                for name, src in list(src_mod.named_parameters()):
-                    self._set_param(sh, name, src.data.to(self.compute_dtype))
-                self.shadow[lt] = sh
+                # the buffers too, at their own dtype: a layer's buffer (tiny_q4's `ple.layer_multipliers`) left as
+                # `_new_layer` made it stayed on the meta device
+                for name, src, is_buf in list(self._named_tensors(src_mod)):
+                    t = src.data if is_buf else src.data.to(self.compute_dtype)
+                    self._set_param(sh, name, t.clone() if is_buf else t, buffer=is_buf)
+                self.shadow.setdefault(lt, {})[key] = sh
             for m in (self.norm, self.mixer):
                 if m is not None:
                     for p in m.parameters():
