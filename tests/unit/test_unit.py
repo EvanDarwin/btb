@@ -350,6 +350,34 @@ def test_plan_prices_the_cache_for_the_context() -> None:
     assert out["kv_read_ms"] == 8 * 64 * MB / RAM_BPS * 1e3 and budget()["kv_read_ms"] == 0.0
 
 
+def test_plan_takes_no_prefill_templates_when_the_card_holds_every_layer() -> None:
+    """the prefill templates serve only a layer left on the host, so they are priced after the layers: a model the
+    card holds whole without them takes none (reserving them first pushed two of these eight layers off a card
+    they fit), and one that does not fit whole still has them reserved before its layers are placed"""
+    from btb.engine.tiers import _TiersMixin
+
+    MB = 2**20
+    plan = lambda layers_gb: _TiersMixin.plan_budget(
+        cast("_TiersMixin", _probe()),
+        ram_gb=64.0,
+        vram_gb=1.5 + 0.5 + layers_gb,
+        packed=False,
+        fp32=False,
+        drafter=False,
+        prefill_card=True,
+        os_reserve_gb=1.0,
+        vram_reserve_gb=0.5,
+    )
+    # 0.55 GB holds the eight 66 MB layers (weights and cache) but not those and the 128 MB of templates too
+    whole = plan(0.55)
+    assert len(whole["resident"]) == 8 and not whole["host"]
+    assert not whole["prefill_card"] and whole["bytes"]["templates"] == 0
+    # 0.40 GB holds six layers bare: the templates are reserved first and four layers fit beside them
+    split = plan(0.40)
+    assert split["prefill_card"] and split["bytes"]["templates"] == 128 * MB
+    assert len(split["resident"]) == 4 and len(split["host"]) == 4
+
+
 def test_plan_prices_the_staging_a_streamed_layer_crosses() -> None:
     """once a layer streams to the card, its pinned staging (one layer a type in bf16, and the stored form beside
     it under the 12-bit store) is charged to the RAM: a plan that ends with cold layers is priced again with it"""

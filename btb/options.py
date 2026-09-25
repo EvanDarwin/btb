@@ -174,6 +174,7 @@ FLAGS = (
     "fp32",
     "resident_head",
     "kv_host",
+    "prefill_card",
     "vram_watch",
     "mlx_mega",
     "gguf_packed",

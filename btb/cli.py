@@ -72,6 +72,7 @@ PLACEMENT = (
     "fp32",
     "resident_head",
     "kv_host",
+    "prefill_card",
     "context",
     "kv_bits",
     "tree_min_prob",
@@ -348,6 +349,16 @@ def _common(ap: argparse.ArgumentParser, path_required: bool = True) -> None:
         default=None,
         help="the attention cache in RAM with the weights on the GPU (1) or on the card (0); unset, the plan "
         "prices both and keeps it on the card unless the layers it would evict cost more to stream",
+    )
+    g.add_argument(
+        "--prefill-card",
+        dest="prefill_card",
+        type=int,
+        choices=(0, 1),
+        default=None,
+        help="where layers run on the CPU, set aside card memory for one layer of each kind so a long prompt's "
+        "prefill runs those layers on the GPU (1); off by default (0), that memory holds more layers "
+        "instead, which every generated token is faster for",
     )
     g.add_argument(
         "--kv-bits",

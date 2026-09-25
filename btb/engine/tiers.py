@@ -149,24 +149,30 @@ class _TiersMixin(_State):
             vram -= shadow_b
         else:
             shadow_b = 0
-        prefill_card = bool(prefill_card) and vram >= tmpl_b + (
-            0 if shadow_b else sum(2 * big[lt] for lt in types) * (1 if fp32 else 0)
-        )
-        if prefill_card:
-            vram -= tmpl_b
-        else:
-            tmpl_b = 0
-        resident = []
-        for i in reversed(range(L)):
-            b = bf16[i] * (2 if (fp32 and resident_fp32) else 1) + (0 if kv_host else kv_layer[i])
-            if vram >= b:
-                resident.append(i)
-                vram -= b
-            else:
-                break
-        resident = sorted(resident)
-        if len(resident) == L:
+
+        def fit(room: int) -> list[int]:
+            """the layers the card holds from the last one down, in `room` bytes"""
+            out = []
+            for i in reversed(range(L)):
+                b = bf16[i] * (2 if (fp32 and resident_fp32) else 1) + (0 if kv_host else kv_layer[i])
+                if room < b:
+                    break
+                out.append(i)
+                room -= b
+            return sorted(out)
+
+        # the prefill templates serve only a layer left on the host: a model the card holds whole without them
+        # takes no templates, where reserving them first pushed layers off a card they fit (4B on a 12 GB card)
+        resident = fit(vram)
+        if len(resident) < L:
+            prefill_card = bool(prefill_card) and vram >= tmpl_b + (
+                0 if shadow_b else sum(2 * big[lt] for lt in types) * (1 if fp32 else 0)
+            )
+            if prefill_card:
+                resident = fit(vram - tmpl_b)
+        if len(resident) == L or not prefill_card:
             prefill_card = False
+            tmpl_b = 0
         rest = [i for i in range(L) if i not in resident]
         # what the cold reader lands: a float32 layer as stored, before it is rewritten as bf16
         read = {i: stored[i] + self._cast_growth(i) for i in rest}

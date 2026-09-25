@@ -556,6 +556,7 @@ class BatchScheduler:
         kv_host: bool | None = None,
         settle_s: float = 30.0,
         drive: DriveBenchmark | None = None,
+        prefill_card: bool = False,
     ) -> Plan:
         """The placement for `probe` (an engine opened on the CPU to price its layers) against the host budget
         (`budget`, else `measure_host` now, with `os_reserve_gb` as the floor where one is named) and
@@ -567,7 +568,9 @@ class BatchScheduler:
         and keeps RAM only where the layers the cache would evict stream at more a token than the host's
         attention reads at the full context; True or False is the placement asked for. `drive` is the drive's
         measurement to price the cold tier from; None measures it on the model's largest file when the
-        placement streams layers, once per volume for the process (the engine's Route reuses it)."""
+        placement streams layers, once per volume for the process (the engine's Route reuses it). `prefill_card`
+        (off by default) sets card memory aside for a layer of each kind, where layers are left on the host, so a
+        prompt's prefill runs them on the card: memory that otherwise holds layers every token is faster for."""
         name = DeviceName.parse(device)
         card = name is not None and name.kind.card
         has_mtp = any(k.startswith("mtp.") for k in probe.weight_map)
@@ -582,7 +585,7 @@ class BatchScheduler:
             fp32=fp32,
             working_ram_gb=0.0,
             drafter=has_mtp,
-            prefill_card=card,
+            prefill_card=card and prefill_card,
             os_reserve_gb=hb.floor / 2**30,
             vram_reserve_gb=vram_reserve_gb,
             context=int(context or 0),

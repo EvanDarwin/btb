@@ -1958,6 +1958,27 @@ def test_the_plan_puts_the_cache_in_ram_only_where_it_beats_streaming() -> None:
     assert plan(_KvProbe(20.0, 100.0), kv_host=True).kv_host
 
 
+def test_the_plan_sets_prefill_templates_aside_only_when_asked() -> None:
+    """the prefill templates' card memory holds layers instead unless `prefill_card` asks for it: a host layer
+    costs every token, the templates speed one prompt's prefill. Asked on the CPU, there is no card to prefill on"""
+    from btb.engine.scheduler import HostBudget
+
+    hb = HostBudget(
+        total=64 * GB, available=40 * GB, commit=30 * GB, footprint=2 * GB, os_floor=GB, growth=0, floor=3 * GB
+    )
+
+    def asked(device: str, **kw: bool) -> list[object]:
+        p = _PlanProbe()
+        BatchScheduler.plan_placement(
+            p, device, 11.0, packed=False, fp32=False, vram_reserve_gb=0.5, budget=hb, settle_s=0.0, **kw
+        )
+        return [a["prefill_card"] for _, a in p.asked]
+
+    assert set(asked("cuda")) == {False}, "off unless asked"
+    assert set(asked("cuda", prefill_card=True)) == {True}
+    assert set(asked("cpu", prefill_card=True)) == {False}, "no card, nothing to prefill on"
+
+
 class _ColdProbe(_PlanProbe):
     """a model with a layer on the drive, its one weight file this test module (the drive probe reads it)"""
 

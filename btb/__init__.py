@@ -114,12 +114,13 @@ def plan(
     vram_reserve_gb: float | None = None,
     context: int = 0,
     kv_host: bool | None = None,
+    prefill_card: bool = False,
 ) -> Plan:
     """The placement the engine would take for the model at `path` on `device`, priced against the memory free
     right now. Opens the model on the CPU to size its layers, measures the card, and hands the budgeting to the
     scheduler (`BatchScheduler.plan_placement`), which owns the arithmetic - the host budget it measures, the
     floor it keeps (`os_reserve_gb` names another) - and the wait for a machine that is still giving memory
-    back."""
+    back. `prefill_card` lets it set card memory aside to prefill the host's layers on the card."""
     import torch
 
     from .engine import StreamedTextModel
@@ -152,6 +153,7 @@ def plan(
             vram_reserve_gb=vram_reserve_gb,
             context=context,
             kv_host=kv_host,
+            prefill_card=prefill_card,
         )
     finally:
         p.close()
@@ -236,6 +238,8 @@ def load(
         "fp32": fp32,
         "context": int(c.get("context", 0) or 0),
         "kv_host": (None if c.get("kv_host") is None else bool(int(c["kv_host"]))) if dev.kind.card else False,
+        # off unless asked: the templates' memory holds layers instead, which every token is faster for
+        "prefill_card": bool(int(c.get("prefill_card") or 0)) and dev.kind.card,
         **reserves,
     }
     mlx_layers = None

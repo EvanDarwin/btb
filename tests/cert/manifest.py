@@ -222,9 +222,9 @@ FORK_NOTES: dict[PassTag, str] = {
         "planner's `head_on_card` decides where `resident_head` is unset); none asserts it"
     ),
     PassTag.PREFILL_CARD: (
-        "a prefill's host layers on the card (forward.py:324): the planner decides `prefill_card` and the "
-        "`prefill_card_min` option only sets the rows it takes, so a cell would need a card, a cpu/card split "
-        "and a prompt that long - none of which the tiny fixtures reach here"
+        "a prefill's host layers on the card (forward.py:324): off unless `prefill_card=1` asks for it, and then "
+        "only where the plan leaves layers on the host, with `prefill_card_min` the rows it takes - so a cell "
+        "would need a card, a cpu/card split and a prompt that long, none of which the tiny fixtures reach here"
     ),
     PassTag.EXPERT_TABLES: (
         "the MoE experts with no store (host.py:434), which needs expert_cache_gb=0 - and that option takes a "
