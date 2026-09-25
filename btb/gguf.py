@@ -514,7 +514,7 @@ class GGUFModel:
                 continue
             block = gguf_lib().GGML_QUANT_SIZES[self.tensors[file].tensor_type][0]
             # a pure reordering of whole blocks keeps the file's name, so the packed kernels bind it as stored
-            # (`raw`/`affine` reorder the bytes); anything else is read through `get` under the HF name
+            # (`raw` reorders the bytes); anything else is read through `get` under the HF name
             as_stored = block > 1 and undo.value is None and undo.shape is None
             name = file
             if not as_stored or (undo.cols is not None and _block_perm(undo.cols, block) is None):
@@ -684,14 +684,6 @@ class GGUFModel:
         data = self._stored(t, self.undo[name][1]) if name in self.undo else np.asarray(t.data)
         return torch.from_numpy(np.array(data, dtype=np.uint8).reshape(-1))
 
-    def affine(self, name: str) -> Affine | None:
-        """the file's tensor `name` for the packed kernels, or None where its storage type has no affine form
-        or `name` is not a file tensor (it is then read through `get`, dequantized)"""
-        t = self.tensors.get(name)
-        if t is None:
-            return None
-        return affine_of(t, self._stored(t, self.undo[name][1]) if name in self.undo else None)
-
     def packable(self) -> int:
         """how many of the file's tensors the packed kernels take as stored"""
         return sum(1 for t in self.tensors.values() if t.tensor_type.name in AFFINE_TYPES)
@@ -732,11 +724,6 @@ class GGUFModel:
         return torch.from_numpy(np.ascontiguousarray(arr)).to(torch.bfloat16)
 
 
-# The affine storage types (hf.AFFINE_TYPES) are read from the block layouts the GGUF format documents into
-# the form MLX's quantized_matmul multiplies as stored; held to the package's own dequantization by the tests.
-GROUP = 32
-
-
 O200K_PRE_TYPES = ("gpt-4o",)  # llama.cpp's tokenizer.ggml.pre names for OpenAI's o200k pre-tokenization
 # OpenAI's o200k pre-tokenization pattern (tiktoken's o200k_base; the HF gpt-oss tokenizer.json carries the same)
 O200K_PATTERN = "|".join(
@@ -768,68 +755,6 @@ def o200k_pre_tokenizer() -> Any:
 EXPERTS_SUFFIX = "-experts.safetensors"
 
 
-def _f16(b: np.ndarray) -> np.ndarray:
-    """two bytes per block as float16, widened, the last axis dropped"""
-    return b.copy().view(np.float16).astype(np.float32)[..., 0]
-
-
-def _affine_blocks(raw: np.ndarray, rows: int, kind: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """(q, scale, bias) of a tensor's blocks: q the integers as stored [rows, groups, 32] (unsigned), scale and
-    bias [rows, groups] float32 with value = q * scale + bias, the number the format defines for the block"""
-    if kind == "Q4_0":  # 18 bytes: d, then 16 bytes of nibbles (the low nibbles the first 16 values); v = d (q - 8)
-        b = raw.reshape(rows, -1, 18)
-        d = _f16(b[:, :, :2])
-        qs = b[:, :, 2:]
-        return np.concatenate([qs & 0xF, qs >> 4], axis=-1), d, -8.0 * d
-    if kind == "Q4_1":  # 20 bytes: d, m, 16 bytes of nibbles; v = d q + m
-        b = raw.reshape(rows, -1, 20)
-        d, m = _f16(b[:, :, :2]), _f16(b[:, :, 2:4])
-        qs = b[:, :, 4:]
-        return np.concatenate([qs & 0xF, qs >> 4], axis=-1), d, m
-    if kind == "Q8_0":  # 34 bytes: d, 32 signed bytes; v = d q
-        b = raw.reshape(rows, -1, 34)
-        d = _f16(b[:, :, :2])
-        return b[:, :, 2:].view(np.int8).astype(np.int16) + 128, d, -128.0 * d
-    if kind == "Q4_K":
-        # 144 bytes for 256 values: d, dmin, 12 bytes holding a 6-bit scale and a 6-bit min for each of 8
-        # sub-blocks of 32, then 128 bytes of nibbles (32 bytes a pair of sub-blocks: low nibbles the first,
-        # high the second); v = d sc q - dmin mn
-        b = raw.reshape(rows, -1, 144)
-        d, dm = _f16(b[:, :, :2]), _f16(b[:, :, 2:4])
-        s = b[:, :, 4:16].astype(np.int32)
-        sc = np.zeros(b.shape[:2] + (8,), np.int32)
-        mn = np.zeros_like(sc)
-        for j in range(8):
-            if j < 4:
-                sc[..., j] = s[..., j] & 63
-                mn[..., j] = s[..., j + 4] & 63
-            else:
-                sc[..., j] = (s[..., j + 4] & 0xF) | ((s[..., j - 4] >> 6) << 4)
-                mn[..., j] = (s[..., j + 4] >> 4) | ((s[..., j] >> 6) << 4)
-        qs = b[:, :, 16:]
-        q = np.concatenate(
-            [
-                np.stack([qs[..., 32 * k : 32 * k + 32] & 0xF, qs[..., 32 * k : 32 * k + 32] >> 4], axis=-2)
-                for k in range(4)
-            ],
-            axis=-2,
-        )  # [rows, super-blocks, 8, 32]
-        return q.reshape(rows, -1, 32), (d[..., None] * sc).reshape(rows, -1), (-dm[..., None] * mn).reshape(rows, -1)
-    raise KeyError(kind)
-
-
-class Affine:
-    """A tensor as stored, in the affine form MLX multiplies: `wq` uint32 [rows, cols * bits / 32] with the
-    integers packed low bits first, `scales` and `biases` float32 [rows, cols / 32], `bits`; `group` 32."""
-
-    group = GROUP
-
-    def __init__(
-        self, wq: np.ndarray, scales: np.ndarray, biases: np.ndarray, bits: int, shape: tuple[int, int]
-    ) -> None:
-        self.wq, self.scales, self.biases, self.bits, self.shape = wq, scales, biases, bits, shape
-
-
 def _block_perm(perm: np.ndarray, block: int) -> np.ndarray | None:
     """a column gather `perm` as a gather of whole blocks of `block` values, or None where it splits a block"""
     if perm.size % block:
@@ -838,25 +763,6 @@ def _block_perm(perm: np.ndarray, block: int) -> np.ndarray | None:
     if np.any(runs[:, 0] % block) or np.any(runs - runs[:, :1] != np.arange(block)):
         return None
     return runs[:, 0] // block
-
-
-def affine_of(t: Any, data: np.ndarray | None = None) -> Affine | None:
-    """the tensor repacked for the packed kernels, or None for a storage type without that form; `data` its
-    bytes where they are not the file's order (GGUFModel._stored)"""
-    kind = t.tensor_type.name
-    bits = AFFINE_TYPES.get(kind)
-    if bits is None:
-        return None
-    shape = tuple(int(x) for x in reversed(list(t.shape)))
-    if len(shape) != 2 or shape[1] % GROUP:
-        return None
-    rows, cols = shape
-    q, scale, bias = _affine_blocks((np.asarray(t.data) if data is None else data).reshape(rows, -1), rows, kind)
-    q = q.reshape(rows, cols).astype(np.uint32)
-    per = 32 // bits
-    words = q.reshape(rows, cols // per, per) << (np.arange(per, dtype=np.uint32) * bits)
-    wq = words.sum(axis=-1, dtype=np.uint32)
-    return Affine(wq, scale.astype(np.float32), bias.astype(np.float32), bits, (rows, cols))
 
 
 def config_of(path: str) -> Any:

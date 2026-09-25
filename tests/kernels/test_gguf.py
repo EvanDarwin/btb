@@ -784,29 +784,38 @@ def test_a_q4k_self_draft_speculates_to_the_greedy_tokens_on_mlx() -> None:
 
 
 def test_the_packed_mlx_path_multiplies_as_stored() -> None:
-    """on MLX a Q4_0 / Q8_0 fixture binds its matrices in the affine form and the packed kernel multiplies them
-    as stored: the affine repack equals the package's dequantization to the number, and Q4_K (which leaves the
-    affine path for its own native matvec) is within bf16 rounding of the dequantization and batch-invariant.
-    The report counts the packed tensors, and the first-step logits sit within bf16 rounding of the dequantized
-    path's"""
+    """on MLX a Q4_0 / Q4_1 / Q8_0 fixture binds its matrices as their own blocks and `matvec_legacy` multiplies
+    them as stored: the dequant is the package's numbers in bf16, the fp32 matvec sits within f32 rounding of the
+    package's dequantized product, and a row is bit-identical alone and inside a 16-row tile (so a verify pass
+    computes each row as the one-row step does). Q4_K's own native matvec is held to the same. The report counts
+    the packed tensors, and the first-step logits sit within bf16 rounding of the dequantized path's"""
     _need()
     need_mlx()
+    import mlx.core as mx
     from gguf import dequantize
 
     from btb.gguf import GGUFModel
+    from btb.mlx.legacyq import KINDS, dequant_legacy, matvec_legacy
 
-    g = GGUFModel(os.path.join(GGUF, "tiny_qwen3-q4_0.gguf"))
-    for name, t in g.tensors.items():
-        aff = g.affine(name)
-        if aff is None:
-            continue
-        import mlx.core as mx
-
-        deq = mx.dequantize(
-            mx.array(aff.wq), mx.array(aff.scales), mx.array(aff.biases), group_size=aff.group, bits=aff.bits
-        )
-        ref = dequantize(np.asarray(t.data), t.tensor_type).astype(np.float32)
-        assert np.array_equal(np.array(deq.astype(mx.float32)), ref), name
+    rng = np.random.default_rng(1)
+    for kind in KINDS:
+        g = GGUFModel(os.path.join(GGUF, f"tiny_qwen3-{kind}.gguf"))
+        mats = [(n, t) for n, t in g.tensors.items() if t.tensor_type.name.lower() == kind and len(t.shape) == 2]
+        assert mats, f"tiny_qwen3-{kind}.gguf holds no {kind} matrix"
+        for name, t in mats:
+            rows, cols = (int(x) for x in reversed(list(t.shape)))
+            ref = dequantize(np.asarray(t.data), t.tensor_type).astype(np.float32).reshape(rows, cols)
+            wb = mx.array(np.asarray(t.data).reshape(-1).view(np.uint8))
+            deq = np.array(dequant_legacy(kind, wb, rows, cols).astype(mx.float32))
+            assert np.array_equal(deq, np.array(mx.array(ref).astype(mx.bfloat16).astype(mx.float32))), name
+            x = mx.array(rng.standard_normal((16, cols)).astype(np.float32))
+            y = np.array(matvec_legacy(kind, wb, x, rows, cols))
+            want, mag = np.array(x) @ ref.T.astype(np.float64), np.abs(np.array(x)) @ np.abs(ref.T).astype(np.float64)
+            # against each output's conditioning; a zero weight row (the pad token's embedding) must give exact 0
+            assert float(np.max(np.abs(y - want) / np.maximum(mag, 1e-30))) < 1e-6, name
+            for i in (0, 7, 15):
+                one = np.array(matvec_legacy(kind, wb, x[i : i + 1], rows, cols))
+                assert np.array_equal(one[0], y[i]), f"{name}: row {i} alone differs from the 16-row tile"
 
     # Q4_K leaves the affine repack for its own native matvec (batch-invariant, so affine speculation is exact):
     # over a synthetic superblock weight the matvec sits within bf16 rounding of the package's dequantization,

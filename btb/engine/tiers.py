@@ -21,9 +21,8 @@ import torch
 from .. import fp8
 from .. import mlx as mlxdev
 from ..fp8 import F8Weight
-from ..gguf import GROUP
-from ..hf import AFFINE_TYPES
 from ..kinds import Json, LayerKind, Proposer, Tier
+from ..mlx.legacyq import KINDS as LEGACY_KINDS
 from ..options import Device
 from ..pack12 import entries, unpack_bf16
 from ..sysinfo import process_working_set_bytes
@@ -1105,11 +1104,9 @@ class _TiersMixin(_State):
         return blob, torch.tensor(e["table"], dtype=torch.uint8), e
 
     def _gguf_binds_packed(self, name: str) -> bool:
-        """Whether the GGUF tensor `name` binds to a packed MLX kernel (mlx_forward.py's `_bind_gguf_q4k`/
-        `_affine`/`_q6k`) instead of a plain bf16 slot, so `_get` can skip the bf16 dequant they would
-        immediately discard for their own raw-byte read. The type/shape gate `affine_of` (`gguf.py`) and
-        `_bind_gguf_q6k` apply, without `affine_of`'s block decode: that decode is wasted work here since
-        `_bind_gguf_affine`/`_bind_gguf_q4k` run it again from the raw bytes right after this returns."""
+        """Whether the GGUF tensor `name` binds to one of its own MLX kernels (mlx_forward.py's `_bind_gguf_*`)
+        instead of a plain bf16 slot, so `_get` can skip the bf16 dequant the binder would discard for its own
+        raw-byte read: the binders' type and shape gates, nothing read."""
         if self.mlx is None or not bool(int(getattr(self, "gguf_packed", 1))):
             return False
         assert self.gguf is not None
@@ -1124,6 +1121,7 @@ class _TiersMixin(_State):
         if kind in (
             "Q6_K",
             "Q5_K",
+            "Q4_K",
             "Q3_K",
             "Q2_K",
             "IQ4_XS",
@@ -1136,9 +1134,7 @@ class _TiersMixin(_State):
             "IQ1_M",
         ):
             return shape[1] % 256 == 0
-        if kind == "IQ4_NL":
-            return shape[1] % 32 == 0
-        return kind in AFFINE_TYPES and shape[1] % GROUP == 0
+        return (kind == "IQ4_NL" or kind.lower() in LEGACY_KINDS) and shape[1] % 32 == 0
 
     def _gguf_layer_index(self, key: str) -> int | None:
         """The layer index a weight key names, or None for a non-layer tensor (head, embed, norm, ...)."""
