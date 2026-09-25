@@ -17,6 +17,7 @@ from btb.engine import StreamedTextModel
 from btb.engine.hooks import HookArgs, PassStats
 from btb.kinds import LayerKind
 from btb.sampling import Sampling
+from btb.session import Session
 from btb.text import template
 from tests.cert import spec
 from tests.helpers import fixture, loaded_model, need_mlx
@@ -490,3 +491,142 @@ def test_generate_takes_rows_of_their_own_lengths(stem: str, device: str) -> Non
     assert [len(lp) for lp in g.logprobs] == [4, 4]
     if device == "cpu":
         assert g.tokens == [solo(sm, PROMPT, 4), solo(sm, OTHER, 4)]
+
+
+# -- a failure part way ----------------------------------------------------------------------------------------------
+
+
+class Boom(RuntimeError):
+    """a caller's callback raising"""
+
+
+def boom(*_: object) -> None:
+    raise Boom("the caller's")
+
+
+def in_step(sm: StreamedTextModel, s: Session) -> None:
+    """the session's tokens are what its cache holds: its next logits are a fresh session's of the same tokens"""
+    if not len(s):
+        return
+    toks = s.tokens
+    close(s.feed([7])[-1], sm.session(toks).feed([7])[-1], "cpu")
+
+
+@families
+@pytest.mark.parametrize("speculate", [False, True])
+def test_a_decoded_session_feeds_on_as_a_fresh_one_of_its_tokens(stem: str, speculate: bool) -> None:
+    """what a decode leaves in the session - its rows, its drawn token pending - is what a prefill of the same
+    tokens holds: the next feed's logits are a fresh session's"""
+    sm = model(stem, "cpu")
+    s = sm.session(PROMPT)
+    s.generate(N, eos=(), speculate=speculate)
+    in_step(sm, s)
+
+
+@families
+@pytest.mark.parametrize("speculate", [False, True])
+def test_a_decode_that_fails_leaves_the_session_in_step_with_its_cache(stem: str, speculate: bool) -> None:
+    """a decode over a session that raises after the session gave it its cache (a hook, a refusal) leaves the session
+    at the rows it reused - or fresh, for a hybrid it cannot cut back - never tokens its cache does not hold"""
+    sm = model(stem, "cpu")
+    s = sm.session(PROMPT)
+    with pytest.raises(Boom):
+        sm.generate(PROMPT[:3] + [9, 9, 9], 4, eos=(), speculate=speculate, session=s, on_token=boom)
+    assert s.tokens in (PROMPT[:3], [])
+    in_step(sm, s)
+    t = sm.session(PROMPT)
+    with pytest.raises(Boom):
+        sm.generate(PROMPT[:3] + [9, 9, 9], 4, eos=(), speculate=speculate, session=t, on_token=boom)
+    assert list(sm.generate(PROMPT + [1, 2], N, eos=(), speculate=speculate, session=t).tokens) == solo(
+        sm, PROMPT + [1, 2], N
+    )
+
+
+@families
+def test_a_feed_that_fails_part_way_feeds_nothing(stem: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """a feed whose pass fails after some layers took their rows leaves the session as it was (a hybrid, whose
+    recurrent states moved on, fresh)"""
+    sm = model(stem, "cpu")
+    s = sm.session(PROMPT)
+    run = sm.device.run_layer
+
+    def failing(i: int, h: torch.Tensor, pas: object) -> torch.Tensor:
+        if i == sm.L - 1:
+            raise Boom("mid-pass")
+        return run(i, h, pas)
+
+    monkeypatch.setattr(sm.device, "run_layer", failing)
+    with pytest.raises(Boom):
+        s.feed(OTHER)
+    monkeypatch.undo()
+    assert s.tokens == ([] if LayerKind.LINEAR in sm.layer_types else PROMPT)
+    in_step(sm, s)
+
+
+@families
+def test_a_callback_raising_mid_decode_leaves_every_row_its_draw(stem: str) -> None:
+    """`on_token` raising in a fork's decode: every row holds the token drawn for it, pending, as a decode stopped
+    there would - not one row a token its cache will never be fed"""
+    sm = model(stem, "cpu")
+    br = sm.session(PROMPT).fork(2)
+    with pytest.raises(Boom):
+        br.generate(3, eos=(), on_token=boom)
+    assert br.pending is not None and [len(r) for r in br.rows] == [1, 1]
+    br.step()
+    kept = br.keep(0)
+    assert br.live == []
+    in_step(sm, kept)
+
+
+@families
+def test_a_batch_write_failing_part_way_writes_no_row_twice(stem: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    sm = model(stem, "cpu")
+    a, b = sm.session(PROMPT), sm.session(OTHER)
+    bt = sm.batch([a, b])
+    g = bt.generate(3, eos=())
+    write, calls = bt._write, []
+
+    def flaky(r: int, row: object) -> None:
+        calls.append(r)
+        if len(calls) == 2:
+            raise Boom("write")
+        write(r, row)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(bt, "_write", flaky)
+    with pytest.raises(Boom):
+        bt.close()
+    bt.close()
+    assert bt.live == [] and a.forked is None and b.forked is None
+    assert a.tokens == PROMPT + g.tokens[0] and b.tokens == OTHER + g.tokens[1]
+    in_step(sm, a)
+    in_step(sm, b)
+
+
+@families
+def test_a_join_refused_leaves_the_batch_as_it_was(stem: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    sm = model(stem, "cpu")
+    a, c = sm.session(PROMPT), sm.session(LONG)
+    bt = sm.batch([a])
+    bt.step([1])
+    monkeypatch.setattr(c, "_settle", boom)
+    with pytest.raises(Boom):
+        bt.join(c)
+    assert bt.live == [0] and a.forked is bt and c.forked is None
+    bt.step([2])
+    bt.close()
+    assert a.tokens == PROMPT + [1, 2]
+    in_step(sm, a)
+
+
+@families
+def test_a_session_that_left_a_batch_joins_it_again(stem: str) -> None:
+    sm = model(stem, "cpu")
+    a, b = sm.session(PROMPT), sm.session(OTHER)
+    with sm.batch([a, b]) as bt:
+        bt.step([1, 2])
+        bt.leave(1)
+        b.feed([3])
+        assert bt.join(b) == 2 and bt.live == [0, 2]
+        bt.step([4, 5])
+    assert a.tokens == PROMPT + [1, 4] and b.tokens == OTHER + [2, 3, 5]
+    in_step(sm, b)

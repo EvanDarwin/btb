@@ -4,7 +4,8 @@ caller makes on it: feed tokens, mark a point, rewind to one, fork into rows."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import contextlib
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypedDict, Unpack, overload
 
@@ -93,6 +94,8 @@ class Session:
         self.pending: int | None = None
         self.logits: torch.Tensor | None = None
         self.forked: _Rows | None = None  # the live `Branches` or `Batch` over this session, which holds it still
+        # where a decode under way goes back to should it fail: the rows `_open` kept, and a hybrid's states there
+        self._undo: tuple[int, dict[int, LinSnap] | None] | None = None
 
     @property
     def fresh(self) -> bool:
@@ -113,9 +116,14 @@ class Session:
     def _bound(self) -> StreamedTextModel:
         if self.engine is None:
             raise ValueError("this session is not bound to an engine: make it with model.session()")
+        self._unforked()
+        return self.engine
+
+    def _unforked(self) -> None:
+        """a ValueError for a session a fork or a batch holds. Checked again under the decode lock, where a fork
+        takes the session: a check before it could pass as another thread forks it"""
         if self.forked is not None:
             raise ValueError("this session is forked: `keep` a row or `close` the branches first")
-        return self.engine
 
     def _flush(self, eng: StreamedTextModel) -> None:
         """the recurrent states an MLX decode kept in its graph, written into the cache's tensors"""
@@ -144,7 +152,9 @@ class Session:
         want = tuple(int(i) % eng.L for i in taps) if taps is not None else ()
 
         def run() -> tuple[torch.Tensor, Taps]:
-            out, hidden = self._append(eng, new, last_only, want)
+            self._unforked()
+            with self._whole(eng):
+                out, hidden = self._append(eng, new, last_only, want)
             return (out if last_only else out[lead:]), {i: h[lead:] for i, h in hidden.items()}
 
         logits, hidden = eng._serial(run)
@@ -184,6 +194,52 @@ class Session:
         self.dr, self.dr_len, self.pend_h = None, 0, None
         return out, {i: hs[0] if len(hs) == 1 else _cat(hs) for i, hs in seen.items()}
 
+    @contextlib.contextmanager
+    def _whole(self, eng: _State) -> Iterator[None]:
+        """the block's change to the session whole or not at all: a pass failing part way (a hook raising, memory
+        refused) leaves layers holding rows the tokens do not, so the session goes back to where it stood"""
+        n, pending, logits = len(self.ids), self.pending, self.logits
+        try:
+            yield
+        except BaseException:
+            self._back_to(eng, n, None, pending, logits)
+            raise
+
+    def _abandon(self, eng: _State) -> None:
+        """a decode that failed after `_open`: the session back to the rows it reused (else fresh), in step with
+        its cache again. Nothing to do for a decode refused before `_open` took the session"""
+        back, self._undo = self._undo, None
+        if back is not None:
+            self._back_to(eng, back[0], back[1], None, None)
+
+    def _back_to(
+        self,
+        eng: _State,
+        n: int,
+        states: dict[int, LinSnap] | None,
+        pending: int | None,
+        logits: torch.Tensor | None,
+    ) -> None:
+        """the session as it stood at its first `n` rows, a hybrid's recurrent states `states` there (a cache cannot
+        be cut back past a recurrent layer without them: the session starts over), with `pending`/`logits`"""
+        dr = self.dr
+        self.dr, self.dr_len, self.pend_h = None, 0, None
+        if dr is not None and hasattr(dr, "reset"):
+            dr.reset()
+        if self.cache is None or n == 0 or (states is None and LayerKind.LINEAR in eng.layer_types):
+            self.cache, self.anchor, self.ids, self.n_prompt = None, [], [], 0
+            self.pending, self.logits = None, None
+            return
+        from .engine.generate import lin_layer
+
+        crop(self.cache, eng, n)
+        for i, snap in (states or {}).items():
+            eng._lin_restore(lin_layer(self.cache.layers[i]), snap)
+        del self.ids[n:]
+        self.n_prompt = min(self.n_prompt, n)
+        self.anchor = [a for a in self.anchor if a["n"] <= n]
+        self.pending, self.logits = pending, logits
+
     def _settle(self, eng: StreamedTextModel) -> None:
         """every token in the cache and the next token's logits in hand (what a fork starts from)"""
         if self.pending is None and self.logits is None:
@@ -195,7 +251,8 @@ class Session:
             crop(self.cache, eng, len(self.ids) - 1)
             self.pending = self.ids.pop()
         if self.pending is not None:
-            self._append(eng, [], last_only=True)
+            with self._whole(eng):
+                self._append(eng, [], last_only=True)
 
     def mark(self) -> Mark:
         """this point of the sequence, to `rewind` to later"""
@@ -207,6 +264,7 @@ class Session:
         def run() -> Mark:
             from .engine.generate import lin_layer
 
+            self._unforked()
             self._flush(eng)
             states = {
                 i: eng._lin_snap(lin_layer(cache.layers[i]))
@@ -228,6 +286,7 @@ class Session:
             raise ValueError("this mark was taken before the session had a cache: rewind to it from a fresh session")
 
         def run() -> None:
+            self._unforked()
             if mark.n == 0 or self.cache is None:
                 self.cache, self.anchor = None, []
             else:
@@ -275,6 +334,7 @@ class Session:
             import torch
             from transformers.cache_utils import CacheLayerMixin
 
+            self._unforked()
             self._flush(eng)
             cl = cache.layers[i]
             assert isinstance(cl, CacheLayerMixin) and cl.keys is not None and cl.values is not None
@@ -293,12 +353,19 @@ class Session:
             raise ValueError("sync needs at least one token")
 
         def run() -> torch.Tensor:
+            self._unforked()
             self._flush(eng)
             cache, reuse, _ = self._open(eng, ids)
-            if cache is not None:
-                del self.ids[reuse:]
-                self.anchor = [a for a in self.anchor if a["n"] <= reuse]
-            return self._append(eng, ids[reuse:], last_only=True)[0][-1]
+            try:
+                if cache is not None:
+                    del self.ids[reuse:]
+                    self.anchor = [a for a in self.anchor if a["n"] <= reuse]
+                return self._append(eng, ids[reuse:], last_only=True)[0][-1]
+            except BaseException:
+                self._abandon(eng)
+                raise
+            finally:
+                self._undo = None
 
         return eng._serial(run)
 
@@ -343,6 +410,7 @@ class Session:
             raise ValueError("this session is forked: `keep` a row or `close` the branches first")
         self.pending, self.logits = None, None
         if self.cache is None:
+            self._undo = (0, None)
             return None, 0, None
         n = len(prompt)
         m = self._match(prompt)
@@ -370,6 +438,7 @@ class Session:
                 dr.reset()
         if cache is not None:
             crop(cache, engine, reuse)
+        self._undo = (reuse, anchored["states"] if anchored is not None else None)
         return cache, reuse, anchored
 
     def _keep(
@@ -383,6 +452,7 @@ class Session:
         pend_h: torch.Tensor | None = None,
     ) -> None:
         """what the next call finds: the cache holds the prompt and the answer but its last token"""
+        self._undo = None
         self.ids = [*prompt, *out[:-1]]
         self.pending, self.logits = (int(out[-1]) if len(out) else None), None
         self.n_prompt = len(prompt)

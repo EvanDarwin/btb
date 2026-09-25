@@ -552,6 +552,29 @@ class _TextMixin(_State):
         seed: dict[str, Any] = {} if smp.greedy else {"seed": smp.seed}
         if len(rows) > 1 and session is not None:
             raise ValueError("a session holds one sequence: batch sessions with model.batch(sessions)")
+        if session is None:
+            return self._decode(rows, max_new, stop, None, on_token, spans, speculate, smp, seed, hooks)
+        try:
+            return self._decode(rows, max_new, stop, session, on_token, spans, speculate, smp, seed, hooks)
+        except BaseException:
+            # a hook raising, memory refused, a stop mid-prefill: the session back in step with its cache
+            session._abandon(self)
+            raise
+
+    def _decode(
+        self,
+        rows: list[list[int]],
+        max_new: int,
+        stop: tuple[int, ...],
+        session: Session | None,
+        on_token: OnToken | None,
+        spans: Spans,
+        speculate: bool,
+        smp: Sampling,
+        seed: dict[str, Any],
+        hooks: Hooks,
+    ) -> RowGeneration | BatchGeneration:
+        """`_generate`'s rows decoded by the loop that fits them"""
         if len({len(r) for r in rows}) > 1:
             # rows of their own lengths: left-padded in epochs the scheduler sizes
             out = self.serve(rows, max_new, eos_ids=stop, sampling=smp, hooks=hooks)

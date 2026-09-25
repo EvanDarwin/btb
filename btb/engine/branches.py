@@ -18,6 +18,7 @@ from .. import mlx as mlxdev
 from ..api import api
 from ..kinds import LayerKind, PassTag, Tokens
 from ..sampling import GREEDY, Sampling
+from ..session import crop
 from .cache import (
     CardRowsLayer,
     ForkIndexedLayer,
@@ -314,15 +315,19 @@ class _Rows:
                     for r in live
                 ]
                 picks = [int(t) for t in smp.pick_torch(lg, keys).tolist()]
-                done = []
-                for j, (r, t) in enumerate(zip(live, picks)):
-                    hk.record(r, lg[j], t)
+                # the step's picks are the rows' before a callback sees one: a callback raising leaves every row
+                # holding its drawn token, pending
+                for r, t in zip(live, picks):
                     self.rows[r].append(t)
                     new[r].append(t)
+                self._pend, self._logits = picks, None
+                done = [j for j, t in enumerate(picks) if t in stop]
+                if done:
+                    self._leave(done)
+                for j, (r, t) in enumerate(zip(live, picks)):
+                    hk.record(r, lg[j], t)
                     if on_token is not None:
                         on_token(r, t)
-                    if t in stop:
-                        done.append(j)
                 if hk.on_pass is not None:
                     hk.on_pass(
                         {
@@ -333,9 +338,6 @@ class _Rows:
                             "seconds": time.perf_counter() - ts,
                         }
                     )
-                self._pend, self._logits = picks, None
-                if done:
-                    self._leave(done)
 
         eng._serial(run)
         stats: GenerateStats = {"cap": int(max_new), "proposer": "greedy", "forwards": steps}
@@ -417,23 +419,30 @@ class _Rows:
 
         s, eng = self.sess[r], self.eng
         cache = _cache_of(s)
-        for i, kv in row.kv.items():
-            pl = cache.layers[i]
-            if isinstance(kv, list):
-                # the MLX step buffer's slices, into the session's MLX buffer
-                assert isinstance(pl, GrowLayer)
-                if pl.bits:
-                    k = mlxdev.kv_dequantize(kv[0], kv[2])
-                    v = mlxdev.kv_dequantize(kv[1], kv[3])
+        n0 = len(s.ids)
+        try:
+            for i, kv in row.kv.items():
+                pl = cache.layers[i]
+                if isinstance(kv, list):
+                    # the MLX step buffer's slices, into the session's MLX buffer
+                    assert isinstance(pl, GrowLayer)
+                    if pl.bits:
+                        k = mlxdev.kv_dequantize(kv[0], kv[2])
+                        v = mlxdev.kv_dequantize(kv[1], kv[3])
+                    else:
+                        k, v = kv[0], kv[1]
+                    pl.mx_update(k, v)
+                    mlxdev.mx().eval(*[x for x in pl._mx if x is not None])
                 else:
-                    k, v = kv[0], kv[1]
-                pl.mx_update(k, v)
-                mlxdev.mx().eval(*[x for x in pl._mx if x is not None])
-            else:
-                assert isinstance(pl, CacheLayerMixin)
-                pl.update(kv[0], kv[1])
-                if len(kv) > 2 and isinstance(pl, DynamicIndexedLayer):
-                    pl.update_indexer(kv[2])
+                    assert isinstance(pl, CacheLayerMixin)
+                    pl.update(kv[0], kv[1])
+                    if len(kv) > 2 and isinstance(pl, DynamicIndexedLayer):
+                        pl.update_indexer(kv[2])
+        except BaseException:
+            # the layers written so far cut back: the session stays where it was forked (its recurrent states are
+            # only restored below, once every row is in)
+            crop(cache, eng, n0)
+            raise
         for i, snap in row.lin.items():
             eng._lin_restore(lin_layer(cache.layers[i]), snap)
         s.ids.extend(self.rows[r][:-1] if row.pending is not None else self.rows[r])
@@ -442,17 +451,22 @@ class _Rows:
         s.dr, s.dr_len, s.pend_h = None, 0, None
 
     def _leave(self, slots: list[int]) -> None:
-        """the batch's rows at `slots` leave it (their stop token drawn), the rest re-formed"""
+        """the batch's rows at `slots` leave it (their stop token drawn), the rest re-formed. A row's write-back
+        failing leaves it in the batch, the rows written before it gone: none is written twice"""
         live = self.live
-        for b in slots:
-            self._left(live[b], self._take(b))
-        gone = set(slots)
-        stay = [b for b in range(len(live)) if b not in gone]
-        self._select(stay)
-        for r in live:
-            self._slot[r] = None
-        for j, b in enumerate(stay):
-            self._slot[live[b]] = j
+        gone: list[int] = []
+        try:
+            for b in slots:
+                self._left(live[b], self._take(b))
+                gone.append(b)
+        finally:
+            if gone:
+                stay = [b for b in range(len(live)) if b not in gone]
+                self._select(stay)
+                for r in live:
+                    self._slot[r] = None
+                for j, b in enumerate(stay):
+                    self._slot[live[b]] = j
 
     def _left(self, r: int, row: _Row) -> None:
         raise NotImplementedError
@@ -488,8 +502,14 @@ class Branches(_Rows):
         super().__init__(eng)
         self.session = session
         self._out: dict[int, _Row] = {}
-        eng._serial(self._open, int(n))
-        session.forked = self
+
+        def run() -> None:
+            # taken under the decode lock, where a feed or another fork checks it: two threads cannot both have it
+            session._unforked()
+            self._open(int(n))
+            session.forked = self
+
+        eng._serial(run)
 
     @property
     def n(self) -> int:
@@ -586,6 +606,7 @@ class Branches(_Rows):
         if self.cache is not None and self.mode == "card":
             self.eng._card_rows_release(self.cache)
         self.cache, self._logits, self._pend, self._out = None, None, None, {}
+        self._slot = [None] * len(self._slot)
 
 
 @api("batch")
@@ -600,19 +621,24 @@ class Batch(_Rows):
         sessions = list(sessions)
         if not sessions:
             raise ValueError("a batch needs at least one session")
-        self._admit(sessions)
-        self.eng._serial(self._form, sessions, list(range(len(sessions))))
-        for s in sessions:
-            s.forked = self
+
+        def run() -> None:
+            self._admit(sessions)
+            self._form(sessions, list(range(len(sessions))))
+            for s in sessions:
+                s.forked = self
+
+        self.eng._serial(run)
 
     def _admit(self, sessions: Sequence[Session]) -> None:
+        """the sessions free to join, under the decode lock (where a feed or a fork checks them too); one that
+        left the batch joins again as any other"""
         for s in sessions:
-            if s._bound() is not self.eng:
+            if s.engine is not self.eng:
                 raise ValueError("a batch's sessions are the model's own: make them with this model's session()")
+            s._unforked()
             if not len(s):
                 raise ValueError("an empty session has nothing to decode: feed it a prompt first")
-            if s in self.sess:
-                raise ValueError("a session is in the batch already")
         if len({id(s) for s in sessions}) != len(sessions):
             raise ValueError("a session is given twice")
 
@@ -696,38 +722,49 @@ class Batch(_Rows):
         """Add `session` as a row (its tokens fed and logits in hand first); the live rows' drawn tokens are fed
         and every live row's cache copied into the batch formed anew. Returns the new row's number."""
         self._check()
-        self._admit([session])
 
         def run() -> None:
+            self._admit([session])
+            # the joiner ready before the live rows are torn down for the batch formed anew: a join it would refuse
+            # leaves the batch as it was
+            session._settle(self.eng)
+            _cache_of(session)
             if self._pend is not None:
                 self._logits, self._pend = self._advance(self._pend)[0], None
             live = self.live
-            for b, r in enumerate(live):
-                self._write(r, self._take(b))
-            for r in live:
-                self._slot[r] = None
-            self._form([self.sess[r] for r in live] + [session], [*live, len(self.sess)])
+            self._write_back()
+            try:
+                self._form([self.sess[r] for r in live] + [session], [*live, len(self.sess)])
+            except BaseException:
+                # the rows are in their sessions already: they go free, and the batch holds none
+                for r in live:
+                    if self.sess[r].forked is self:
+                        self.sess[r].forked = None
+                raise
+            session.forked = self
 
         self.eng._serial(run)
-        session.forked = self
         return len(self.sess) - 1
+
+    def _write_back(self) -> None:
+        """every live row written into its session, each out of the batch as soon as it is in: a write failing
+        part way leaves the rows before it written once, the rest still live"""
+        for r, b in sorted(((r, b) for r, b in enumerate(self._slot) if b is not None), key=lambda rb: rb[1]):
+            self._write(r, self._take(b))
+            self._slot[r] = None
 
     def close(self) -> None:
         """every live row written back into its session, and the batch dropped"""
         if self.cache is None:
             return
-
-        def run() -> None:
-            for b, r in enumerate(self.live):
-                self._write(r, self._take(b))
-
-        self.eng._serial(run)
+        self.eng._serial(self._write_back)
         for s in self.sess:
             if s.forked is self:
                 s.forked = None
         if self.mode == "card":
             self.eng._card_rows_release(self.cache)
         self.cache, self._logits, self._pend = None, None, None
+        self._slot = [None] * len(self._slot)
 
 
 def _cache_of(s: Session) -> KvCache:
