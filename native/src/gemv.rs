@@ -1042,6 +1042,17 @@ unsafe fn widen_mxfp4_avx2<const R: usize>(
     n: usize,
 ) {
     use std::arch::x86_64::*;
+    // An fp4 code is a sign (bit 3) over eight magnitudes, so a block's weights are its scale times the eight
+    // magnitudes - one multiply a block, the very products the scalar path forms a weight at a time - looked up
+    // by `vpermps` (which reads an index's low three bits alone), the sign OR'd in after: the product's sign is
+    // the operands' XOR, so the bits are the scalar's, -0 of code 8 included. Eight codes reach eight lanes
+    // without a shuffle: in the checkpoint's layout 8 weights are 4 bytes whose nibbles run in weight order, a
+    // broadcast shifted right 4 bits more a lane. The pshufb route it replaced spent ~3.5 shuffle-port uops on
+    // each 8 weights and was bound there; this spends one (15% faster a row on a 13700K). ggml's layout keeps
+    // that route: its codes need no interleave there, and here a zero-extension a lane (measured 9-17% slower).
+    let mags = _mm256_setr_ps(0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+    let nibble = _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28);
+    let sign = _mm256_set1_epi32(i32::MIN);
     let thi = _mm_loadu_si128(FP4_HI.as_ptr() as *const __m128i);
     let tlo = _mm_loadu_si128(FP4_LO.as_ptr() as *const __m128i);
     let mask = _mm_set1_epi8(0x0F);
@@ -1051,27 +1062,39 @@ unsafe fn widen_mxfp4_avx2<const R: usize>(
         for blk in 0..(n / MX_BLOCK) {
             let g = s / MX_BLOCK + blk;
             let (bytes, sc) = mx4_block(p, g);
-            let v = _mm_loadu_si128(bytes as *const __m128i);
-            let sv = _mm256_set1_ps(sc);
             let o = out.add(blk * MX_BLOCK);
-            let even = _mm_and_si128(v, mask);
-            let odd = _mm_and_si128(_mm_srli_epi16::<4>(v), mask);
-            // the codes in weight order: ggml's low nibbles are weights 0..15 as they are, the checkpoint's
-            // alternate low and high
-            let halves = if p.ggml {
-                [even, odd]
-            } else {
-                [_mm_unpacklo_epi8(even, odd), _mm_unpackhi_epi8(even, odd)]
-            };
-            for (h, codes) in halves.iter().enumerate() {
-                let hi = _mm_shuffle_epi8(thi, *codes);
-                let lo = _mm_shuffle_epi8(tlo, *codes);
-                let w0 = _mm_unpacklo_epi8(lo, hi);
-                let w1 = _mm_unpackhi_epi8(lo, hi);
-                let f0 = _mm256_castsi256_ps(_mm256_slli_epi32::<16>(_mm256_cvtepu16_epi32(w0)));
-                let f1 = _mm256_castsi256_ps(_mm256_slli_epi32::<16>(_mm256_cvtepu16_epi32(w1)));
-                _mm256_storeu_ps(o.add(h * 16), _mm256_mul_ps(f0, sv));
-                _mm256_storeu_ps(o.add(h * 16 + 8), _mm256_mul_ps(f1, sv));
+            if p.ggml {
+                // ggml: byte j's low nibble is weight j, its high nibble weight 16 + j - each half's codes in
+                // weight order already; their bf16 patterns built by table, widened, then scaled
+                let v = _mm_loadu_si128(bytes as *const __m128i);
+                let sv = _mm256_set1_ps(sc);
+                let halves = [
+                    _mm_and_si128(v, mask),
+                    _mm_and_si128(_mm_srli_epi16::<4>(v), mask),
+                ];
+                for (h, codes) in halves.iter().enumerate() {
+                    let hi = _mm_shuffle_epi8(thi, *codes);
+                    let lo = _mm_shuffle_epi8(tlo, *codes);
+                    let w0 = _mm_unpacklo_epi8(lo, hi);
+                    let w1 = _mm_unpackhi_epi8(lo, hi);
+                    let f0 =
+                        _mm256_castsi256_ps(_mm256_slli_epi32::<16>(_mm256_cvtepu16_epi32(w0)));
+                    let f1 =
+                        _mm256_castsi256_ps(_mm256_slli_epi32::<16>(_mm256_cvtepu16_epi32(w1)));
+                    _mm256_storeu_ps(o.add(h * 16), _mm256_mul_ps(f0, sv));
+                    _mm256_storeu_ps(o.add(h * 16 + 8), _mm256_mul_ps(f1, sv));
+                }
+                continue;
+            }
+            let tbl = _mm256_mul_ps(mags, _mm256_set1_ps(sc));
+            for q in 0..4 {
+                // weights 8q .. 8q+7, each lane's code in its low four bits (the bits above are left to the
+                // lookup and the sign mask, which read none of them)
+                let w = (bytes.add(4 * q) as *const i32).read_unaligned();
+                let idx = _mm256_srlv_epi32(_mm256_set1_epi32(w), nibble);
+                let v = _mm256_permutevar8x32_ps(tbl, idx);
+                let neg = _mm256_and_si256(_mm256_slli_epi32::<28>(idx), sign);
+                _mm256_storeu_ps(o.add(8 * q), _mm256_or_ps(v, _mm256_castsi256_ps(neg)));
             }
         }
     }
@@ -2144,6 +2167,52 @@ mod tests {
         }
         for (i, (u, v)) in a.iter().zip(b.iter()).enumerate() {
             assert_eq!(u.to_bits(), v.to_bits(), "lane {i}: {u} vs {v}");
+        }
+    }
+
+    /// The AVX2 widening against the scalar one over every code at every one of the 256 scales (0's half-step
+    /// subnormal and 255's infinity, whose zero codes give NaN, among them), in both layouts and two orders of
+    /// the codes inside a block: the table lookup with the sign OR'd in forms the scalar's products bit for bit.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_mxfp4_widening_is_the_scalar_one_at_every_code_and_scale() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for ggml in [false, true] {
+            for order in [|i: usize| i % 16, |i: usize| (i * 7 + 3) % 16] {
+                let (mut blocks, mut scales) = (Vec::new(), Vec::new());
+                for s in 0..=255u8 {
+                    let code = |i: usize| order(i) as u8;
+                    if ggml {
+                        blocks.push(s);
+                        blocks.extend((0..16).map(|j| code(j) | (code(j + 16) << 4)));
+                    } else {
+                        scales.push(s);
+                        blocks.extend((0..16).map(|j| code(2 * j) | (code(2 * j + 1) << 4)));
+                    }
+                }
+                let p = Mx4 {
+                    blocks: blocks.as_ptr(),
+                    scales: scales.as_ptr(),
+                    ggml,
+                };
+                let n = 256 * MX_BLOCK;
+                let (mut a, mut b) = (vec![0.0f32; n], vec![1.0f32; n]);
+                unsafe {
+                    widen_mxfp4_scalar::<1>(a.as_mut_ptr(), 0, p, 0, 0, n);
+                    widen_mxfp4_avx2::<1>(b.as_mut_ptr(), 0, p, 0, 0, n);
+                }
+                for (i, (u, v)) in a.iter().zip(b.iter()).enumerate() {
+                    let s = i / MX_BLOCK;
+                    assert_eq!(
+                        u.to_bits(),
+                        v.to_bits(),
+                        "ggml={ggml} scale {s} weight {}: {u} vs {v}",
+                        i % MX_BLOCK
+                    );
+                }
+            }
         }
     }
 
