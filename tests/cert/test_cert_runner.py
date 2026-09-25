@@ -44,9 +44,12 @@ def _hardware_here(hw: spec.Hardware) -> bool:
         return True
     if hw is spec.Hardware.MLX:
         return btb.mlx_available()
+    if hw in spec.NO_BACKEND:
+        return False
     import torch
 
-    return torch.cuda.is_available()
+    # torch's ROCm build answers to torch.cuda too; only an NVIDIA card is this hardware
+    return torch.cuda.is_available() and torch.version.hip is None
 
 
 def _subpaths(surface: spec.Surface) -> tuple[spec.DeviceSubpath, ...]:

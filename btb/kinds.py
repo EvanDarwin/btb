@@ -73,6 +73,17 @@ class FamilyKind(StrEnum):
     GEMMA3 = "gemma3"
 
 
+# the name a user would recognize for each family; an unsupported load lists these values
+FAMILY_NAMES: dict[FamilyKind, str] = {
+    FamilyKind.QWEN3: "Qwen3",
+    FamilyKind.QWEN3_5: "Qwen3.5",
+    FamilyKind.PHI3: "Phi-3",
+    FamilyKind.QWEN4: "Qwen4",
+    FamilyKind.GPT_OSS: "GPT-OSS",
+    FamilyKind.GEMMA3: "Gemma 3",
+}
+
+
 class ModelType(StrEnum):
     """a config's `model_type`, as transformers and GGUF name it - the string the loader reads and `family()`
     switches on. `KIND_OF` maps each to its FamilyKind (the "_text" GGUF variants share a base family). Spelled

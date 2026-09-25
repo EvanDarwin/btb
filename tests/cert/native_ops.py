@@ -206,6 +206,28 @@ def isa_tiers() -> tuple[str, ...]:
 
 ISA_TIERS: tuple[str, ...] = isa_tiers()
 
+_DETECT_RE = re.compile(r"fn detect_isa\(\) -> Isa \{(.*?)\n\}", re.S)
+_ARCH_RE = re.compile(r'#\[cfg\(target_arch = "(\w+)"\)\]')
+
+
+def tier_arch() -> dict[str, str | None]:
+    """each ISA tier's CPU architecture, from the `#[cfg(target_arch = ...)]` block of `detect_isa` in
+    native/src/gemv.rs that returns it (Rust's spelling: x86_64, aarch64); None for a tier no such block names,
+    the portable scalar one"""
+    with open(GEMV_RS, encoding="utf-8") as f:
+        body = _DETECT_RE.search(f.read())
+    out: dict[str, str | None] = dict.fromkeys(ISA_TIERS)
+    if body is None:
+        return out
+    marks = list(_ARCH_RE.finditer(body.group(1)))
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(body.group(1))
+        segment = body.group(1)[m.end() : end].split("#[cfg(not(")[0]
+        for tier in re.findall(r"Isa::(\w+)", segment):
+            if tier.lower() != SCALAR and out.get(tier.lower()) is None:
+                out[tier.lower()] = m.group(1)
+    return out
+
 
 def family_tiers(family: str) -> frozenset[str]:
     """the ISA tiers native/src/<family>.rs implements: scalar (the oracle every family has) plus every tier the
