@@ -169,6 +169,26 @@ def test_gather_moves_the_kept_rows_in_place(Hk: int, d: int) -> None:
 
 
 @pytest.mark.parametrize("Hk,d", SHAPES)
+def test_an_arena_append_is_in_the_buffer_when_it_returns(Hk: int, d: int) -> None:
+    """the rows an arena layer appends are in the arena's bytes when `mx_update` returns, before anything it handed
+    back is evaluated: the one-row decode, tree and head-256 prefill kernels read the buffer itself, not those views
+    (stores left lazy in the graph once had a decode step read the row before it was written)"""
+    from btb import mlx as mlxdev
+
+    _sh, layers, arena = _arena(Hk, d, 256)
+    layer = layers[1]
+    g = torch.Generator().manual_seed(Hk * 7 + d)
+    n = 0
+    for T in (37, 1, 1):
+        k = (torch.randn(1, Hk, T, d, generator=g) * 4).bfloat16()
+        v = (torch.randn(1, Hk, T, d, generator=g) * 4).bfloat16()
+        layer.mx_update(mlxdev.to_mx(k), mlxdev.to_mx(v))
+        assert np.array_equal(arena[2, :, n : n + T], _bits(k[0])), f"K rows {n}+{T} not in the arena"
+        assert np.array_equal(arena[3, :, n : n + T], _bits(v[0])), f"V rows {n}+{T} not in the arena"
+        n += T
+
+
+@pytest.mark.parametrize("Hk,d", SHAPES)
 def test_arena_layer_appends_gathers_and_grows_out(Hk: int, d: int) -> None:
     """a GrowLayer in the arena driven as the engine drives it - a prefill, decode steps, a verify pass, the
     accepted path gathered (eagerly and with the flags handed back), then an append past the stretch that moves
