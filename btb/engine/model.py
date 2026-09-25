@@ -653,7 +653,7 @@ class StreamedTextModel(
                 )
         if self.dev.type == DeviceKind.CUDA:
             self._card_adopt_cache(cache)
-        return cache
+        return self._track(cache)
 
     def reset_stats(self) -> None:
         self.bytes_streamed = 0

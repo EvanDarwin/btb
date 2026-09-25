@@ -82,6 +82,79 @@ def test_generate(benchmark: object, model: str, device: str, knobs: dict[str, s
         benchmark(once)  # type: ignore[operator]  # pytest-benchmark times this over many rounds
 
 
+def _api(benchmark: object, model: str, device: str, knobs: dict[str, str], what: str) -> btb.StreamedTextModel:
+    path = os.path.join(FIXTURES, model)
+    if not os.path.isdir(path):
+        pytest.skip(f"{model} fixture not built")
+    benchmark.group = f"{device}/{what}"  # type: ignore[attr-defined]
+    benchmark.name = f"{device}/{model}/{what}"  # type: ignore[attr-defined]
+    return btb.load(path, log=None, v_max=0, **knobs)
+
+
+# The programmatic API beside the plain loop, per family and device: what each costs over `test_generate`'s
+# decode of the same tokens - the hooked pick (logits in Python, the in-graph picks aside), a session driven by
+# hand, a fork's rows over one prefill, sessions of their own lengths batched, and memory lent to the caller.
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("model", FAMILIES)
+@pytest.mark.parametrize("device,knobs", DEVICES, ids=[d for d, _ in DEVICES])
+def test_generate_hooked(benchmark: object, model: str, device: str, knobs: dict[str, str]) -> None:
+    with _api(benchmark, model, device, knobs, "hooked") as sm:
+
+        def once() -> object:
+            return sm.generate(list(PROMPT), N, speculate=False, processors=[lambda ids, lg: lg], logprobs=2)
+
+        once()
+        benchmark(once)  # type: ignore[operator]
+
+
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("model", FAMILIES)
+@pytest.mark.parametrize("device,knobs", DEVICES, ids=[d for d, _ in DEVICES])
+def test_session_feed_rewind(benchmark: object, model: str, device: str, knobs: dict[str, str]) -> None:
+    with _api(benchmark, model, device, knobs, "feed-rewind") as sm:
+        s = sm.session(list(PROMPT))
+        mark = s.mark()
+
+        def once() -> object:
+            out = s.feed(list(range(5, 5 + N)))
+            s.rewind(mark)
+            return out
+
+        once()
+        benchmark(once)  # type: ignore[operator]
+
+
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("model", FAMILIES)
+@pytest.mark.parametrize("device,knobs", DEVICES, ids=[d for d, _ in DEVICES])
+def test_fork_generate(benchmark: object, model: str, device: str, knobs: dict[str, str]) -> None:
+    with _api(benchmark, model, device, knobs, "fork4") as sm:
+        s = sm.session(list(PROMPT))
+        smp = btb.Sampling(temperature=0.8, seed=1)
+
+        def once() -> object:
+            with s.fork(4) as br:
+                return br.generate(N, eos=(), sampling=smp)
+
+        once()
+        benchmark(once)  # type: ignore[operator]
+
+
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("model", FAMILIES)
+@pytest.mark.parametrize("device,knobs", DEVICES, ids=[d for d, _ in DEVICES])
+def test_batch_generate(benchmark: object, model: str, device: str, knobs: dict[str, str]) -> None:
+    rows = [list(PROMPT), [9, 8], list(range(1, 11))]  # three sessions of their own lengths
+    with _api(benchmark, model, device, knobs, "batch3") as sm:
+
+        def once() -> object:
+            with sm.batch([sm.session(r) for r in rows]) as bt:
+                return bt.generate(N, eos=())
+
+        once()
+        benchmark(once)  # type: ignore[operator]
+
+
 # the one piece of hand data: bytes per 256-weight superblock, as the GGUF layout stores it. IQ4_NL has no entry
 # because it is not a superblock type - 32-weight blocks with the scales in a separate array, so its launcher
 # takes (d, q, x, ...) rather than one as-stored buffer and does not fit this bench's call shape.

@@ -259,6 +259,10 @@ def expected_tags() -> frozenset[PassTag]:
         for kind in core.served_kinds():
             for st in spec.Storage:
                 out |= dev.expects(kind, st)
+    for surface, tags in spec.SURFACE_TAGS.items():
+        for key in spec.SURFACE_SUBPATHS[surface]:
+            for kind in core.served_kinds():
+                out |= tags(kind, spec.SUBPATH[key].hardware)
     return frozenset(out)
 
 
@@ -341,14 +345,14 @@ def cell_ids(
 
 
 def shape_ids() -> frozenset[str]:
-    """the input-shape axes' ids (a ragged batch, a long prompt), which sit outside the storage/device grid:
-    one per served family with a fixture, per sub-path the shape runs take."""
+    """the ids of the axes that sit outside the storage/device grid (a ragged batch, a long prompt, a hooked
+    decode, a fork and a batch of sessions): one per served family with a fixture, per sub-path the axis takes."""
     out: set[str] = set()
     for kind in core.served_kinds():
         stem = spec.FIXTURE_STEM.get(kind)
         if stem is None or not os.path.isdir(os.path.join(FIXTURES, stem)):
             continue
-        for surface in (spec.Surface.BATCH, spec.Surface.CONTEXT):
+        for surface in (spec.Surface.BATCH, spec.Surface.CONTEXT, spec.Surface.HOOKED, spec.Surface.FORK):
             out |= {stem_id(surface, stem, key) for key in spec.SURFACE_SUBPATHS[surface]}
     return frozenset(out)
 

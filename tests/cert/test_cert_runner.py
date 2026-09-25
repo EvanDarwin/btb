@@ -282,6 +282,67 @@ def test_context_growth_is_deterministic(stem: str, dev: spec.DeviceSubpath) -> 
     receipt.record(manifest.stem_id(spec.Surface.CONTEXT, stem, dev.key))
 
 
+def _axis_tags(sm: StreamedTextModel, surface: spec.Surface, stem: str, dev: spec.DeviceSubpath) -> None:
+    kind = next(k for k, s in spec.FIXTURE_STEM.items() if s == stem)
+    report = sm.last_pass_report()
+    for want in sorted(spec.SURFACE_TAGS[surface](kind, dev.hardware)):
+        assert want in report, f"{stem} on {dev.key}/{surface.value}: {want} never engaged (got {sorted(report.tags)})"
+
+
+@pytest.mark.parametrize("stem,dev", _shape_cells(spec.Surface.HOOKED))
+def test_hooked_decode_is_the_plain_one(stem: str, dev: spec.DeviceSubpath) -> None:
+    """a decode with every hook on (a processor, logprobs, a tapped layer) picks over the logits in hand, the
+    in-graph picks standing aside, and draws the plain decode's tokens - reproducibly across two loads"""
+    if not _hardware_here(dev.hardware):
+        pytest.skip(f"{dev.hardware.value} not available on this machine")
+    path = os.path.join(FIXTURES, stem)
+    if not os.path.isdir(path):
+        pytest.skip(f"fixture {stem} not built")
+    runs = []
+    for i in range(2):
+        with loaded_model(path, **dev.knobs) as sm:
+            plain = oracle.decode(sm, PROMPT)
+            g = sm.generate(list(PROMPT), N, speculate=False, processors=[lambda ids, lg: lg], logprobs=2, taps=[-1])
+            if i == 0:
+                _axis_tags(sm, spec.Surface.HOOKED, stem, dev)
+            toks = list(g.tokens)
+            assert_same_tokens(plain, toks, f"{stem} on {dev.key}: the hooked decode left the plain one")
+            assert [t.token for t in g.logprobs] == toks and all(len(t.top) == 2 for t in g.logprobs)
+            assert int(next(iter(g.hidden.values())).shape[0]) == len(toks)
+            runs.append(toks)
+    assert_same_tokens(runs[0], runs[1], f"{stem} on {dev.key}: hooked decode differed across two loads")
+    receipt.record(manifest.stem_id(spec.Surface.HOOKED, stem, dev.key))
+
+
+RAGGED = [list(PROMPT), [9, 8, 7, 6, 5], list(range(20, 33))]  # sessions of three lengths batched together
+
+
+@pytest.mark.parametrize("stem,dev", _shape_cells(spec.Surface.FORK))
+def test_fork_and_batch_are_deterministic(stem: str, dev: spec.DeviceSubpath) -> None:
+    """a session forked into sampled rows and sessions of ragged lengths batched decode reproducibly across two
+    loads, and the fork's rows keep going as a session"""
+    if not _hardware_here(dev.hardware):
+        pytest.skip(f"{dev.hardware.value} not available on this machine")
+    path = os.path.join(FIXTURES, stem)
+    if not os.path.isdir(path):
+        pytest.skip(f"fixture {stem} not built")
+    runs = []
+    for i in range(2):
+        with loaded_model(path, **dev.knobs) as sm:
+            br = sm.session(list(PROMPT)).fork(3)
+            rows = br.generate(N, eos=(), sampling=oracle.sampling("sampled")).tokens
+            if i == 0:
+                _axis_tags(sm, spec.Surface.FORK, stem, dev)
+            more = list(br.keep(1).generate(4, eos=(), speculate=False).tokens)
+            with sm.batch([sm.session(r) for r in RAGGED]) as bt:
+                batched = bt.generate(N, eos=()).tokens
+                if i == 0:
+                    _axis_tags(sm, spec.Surface.FORK, stem, dev)
+            runs.append((rows, more, batched))
+    assert runs[0] == runs[1], f"{stem} on {dev.key}: a fork or a batch differed across two loads"
+    receipt.record(manifest.stem_id(spec.Surface.FORK, stem, dev.key))
+
+
 def test_cross_process_determinism() -> None:
     """determinism across PROCESSES, not just two in-process loads: a fresh interpreter that loads and greedily
     decodes the same fixture on cpu yields the same tokens. Catches process-global nondeterminism (RNG, thread

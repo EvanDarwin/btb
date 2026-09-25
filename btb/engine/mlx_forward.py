@@ -30,7 +30,7 @@ from ..mlx import fused as fk
 from ..mlx.q6k import gather_q6k
 from ..sampling import GREEDY
 from ..session import Session
-from .cache import GrowLayer
+from .cache import GrowLayer, forked
 from .families import act_name
 from .host import _HostLinear, copy_bytes
 from .native import Native
@@ -428,7 +428,7 @@ class _MlxMixin(_State):
     def _mlx_ok(
         self, cache: Any, B: int, T: int, am: torch.Tensor | None, positions: torch.Tensor | None, n_layers: int
     ) -> bool:
-        if self.mlx is None or B != 1 or am is not None:
+        if self.mlx is None or B != 1 or am is not None or forked(cache):
             return False
         if not getattr(self, "mlx_fused", True) or getattr(self, "_probe", None) is not None:
             return False

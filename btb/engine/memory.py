@@ -97,7 +97,7 @@ class _MemoryMixin(_State):
             tmpl = self.resident.pop(i)
             del tmpl
             self.host[i] = self._make_host_layer(i)
-            self._cache_to(cache, i, "cpu")
+            self._caches_to(i, "cpu", cache)
             moved = f"layer {i}"
         elif self.resident_head and self.dev.type == Device.CUDA:
             self._head_host()
@@ -134,7 +134,7 @@ class _MemoryMixin(_State):
                     p.data = p.data.to(self.compute_dtype)
             self.resident[i] = tmpl
             self.host.pop(i, None)
-            self._cache_to(cache, i, self.dev)
+            self._caches_to(i, self.dev, cache)
         log(f"[vram] REGROW {what} -> card (still shed: {self._shed}); " + vram_pressure_line())
         return what
 

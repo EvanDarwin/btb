@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
-"""The attention cache layer grown in place, in torch's memory or in MLX's (the shared buffer the GPU appends to)."""
+"""The attention cache layer grown in place, in torch's memory or in MLX's (the shared buffer the GPU appends to),
+and a fork's layer over another cache's rows."""
 
 from __future__ import annotations
 
@@ -327,6 +328,16 @@ class GrowLayer(_DynamicLayer):
                 if self.bits:
                     self._mx2 += [m.ones((B, Hk, cap2), dtype=m.float32), m.ones((B, Hk, cap2), dtype=m.float32)]
             t = self._t
+            if t + T > int(self._mx2[0].shape[2]):
+                # a fork's rows stepped past the room they were given: twice the room, the steps so far kept
+                cap2 = max(t + T, 2 * int(self._mx2[0].shape[2]))
+                grown = []
+                for x in self._mx2:
+                    y = (m.ones if x.ndim == 3 else m.zeros)((*x.shape[:2], cap2, *x.shape[3:]), dtype=x.dtype)
+                    y[:, :, :t] = x[:, :, :t]
+                    grown.append(y)
+                m.eval(*grown)
+                self._mx2 = grown
             if self.bits:
                 qk, sk = mlxdev.kv_quantize(k)
                 qv, sv = mlxdev.kv_quantize(v)
@@ -771,3 +782,144 @@ def _inside(t: torch.Tensor, b: torch.Tensor) -> bool:
 
     (lo, hi), (blo, bhi) = span(t), span(b)
     return blo <= lo and hi <= bhi
+
+
+def forked(cache: Any) -> bool:
+    """a fork's or a batch's cache: the single-row paths (the fused MLX step, the card graph) cannot read its
+    layers"""
+    return bool(getattr(cache, "btb_fork", False))
+
+
+class ForkLayer(_DynamicLayer):
+    """One attention layer of B rows going on from given rows: a prefix `[1, Hk, P, d]` every row shares (a fork's,
+    another cache's rows, never written) or `[B, Hk, P, d]` one a row (a batch's, left-padded), then each row's
+    own rows in a buffer of their own. A pass reads the two joined, built once a step."""
+
+    def __init__(self, k: torch.Tensor, v: torch.Tensor, B: int) -> None:
+        super().__init__()
+        self._pk, self._pv = k, v
+        self._B = int(B)
+        self._tk: torch.Tensor | None = None
+        self._tv: torch.Tensor | None = None
+        self._t = 0
+        self._cat: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.dtype, self.device = k.dtype, k.device
+        self.is_initialized = True
+
+    def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+        self.is_initialized = True
+
+    def _joined(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._cat is None:
+            pk = self._pk.expand(self._B, -1, -1, -1)
+            pv = self._pv.expand(self._B, -1, -1, -1)
+            if self._t and self._tk is not None and self._tv is not None:
+                pk = torch.cat([pk, self._tk[..., : self._t, :]], dim=-2)
+                pv = torch.cat([pv, self._tv[..., : self._t, :]], dim=-2)
+            self._cat = (pk, pv)
+        return self._cat
+
+    @property
+    def keys(self) -> torch.Tensor:
+        return self._joined()[0]
+
+    @keys.setter
+    def keys(self, t: torch.Tensor | None) -> None:
+        if t is not None:
+            raise TypeError("a fork's rows are cut by its Branches, not through the cache")
+
+    @property
+    def values(self) -> torch.Tensor:
+        return self._joined()[1]
+
+    @values.setter
+    def values(self, t: torch.Tensor | None) -> None:
+        if t is not None:
+            raise TypeError("a fork's rows are cut by its Branches, not through the cache")
+
+    def get_seq_length(self) -> int:
+        return int(self._pk.shape[-2]) + self._t
+
+    def update(
+        self, key_states: torch.Tensor, value_states: torch.Tensor, *args: Any, **kwargs: Any
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, Hk, T, d = key_states.shape
+        need = self._t + T
+        if self._tk is None or self._tv is None or self._tk.shape[-2] < need:
+            cap = max(need, 2 * (self._tk.shape[-2] if self._tk is not None else 0), 64)
+            tk = key_states.new_empty(B, Hk, cap, d)
+            tv = value_states.new_empty(B, Hk, cap, d)
+            if self._t and self._tk is not None and self._tv is not None:
+                tk[..., : self._t, :].copy_(self._tk[..., : self._t, :])
+                tv[..., : self._t, :].copy_(self._tv[..., : self._t, :])
+            self._tk, self._tv = tk, tv
+        self._tk[..., self._t : need, :].copy_(key_states)
+        self._tv[..., self._t : need, :].copy_(value_states)
+        self._t = need
+        self._cat = None
+        return self._joined()
+
+    def select(self, idx: torch.Tensor) -> None:
+        """the rows `idx` become the batch, in that order"""
+        if self._pk.shape[0] > 1:
+            self._pk = self._pk.index_select(0, idx.to(self._pk.device))
+            self._pv = self._pv.index_select(0, idx.to(self._pv.device))
+        if self._tk is not None and self._tv is not None:
+            self._tk = self._tk.index_select(0, idx.to(self._tk.device))
+            self._tv = self._tv.index_select(0, idx.to(self._tv.device))
+        self._B = int(idx.numel())
+        self._cat = None
+
+    def row(self, b: int) -> tuple[torch.Tensor, ...] | None:
+        """row b's own rows [1, Hk, t, d], copied out"""
+        if not self._t or self._tk is None or self._tv is None:
+            return None
+        return self._tk[b : b + 1, :, : self._t].clone(), self._tv[b : b + 1, :, : self._t].clone()
+
+    def to(self, dev: str | torch.device) -> None:
+        """every row to `dev`, where the layer now runs: the prefix becomes a copy of its own there"""
+        self._pk, self._pv = self._pk.to(dev), self._pv.to(dev)
+        if self._tk is not None and self._tv is not None:
+            self._tk, self._tv = self._tk.to(dev), self._tv.to(dev)
+        self.device = torch.device(dev)
+        self._cat = None
+
+
+class ForkIndexedLayer(ForkLayer):
+    """a `ForkLayer` of a sparse-attention layer, which caches its indexer's keys `[B, n, d_index]` beside K and V:
+    the prefix's shared (or one a row) and each row's own after them, as the attention's rows are"""
+
+    def __init__(self, k: torch.Tensor, v: torch.Tensor, ik: torch.Tensor, B: int) -> None:
+        super().__init__(k, v, B)
+        self._pi = ik
+        self._ti: torch.Tensor | None = None
+        self.is_indexer_initialized = True
+
+    @property
+    def indexer_keys(self) -> torch.Tensor:
+        pi = self._pi.expand(self._B, -1, -1)
+        return pi if self._ti is None else torch.cat([pi, self._ti], dim=1)
+
+    def update_indexer(self, indexer_key_states: torch.Tensor) -> torch.Tensor:
+        t = indexer_key_states
+        self._ti = t.clone() if self._ti is None else torch.cat([self._ti, t], dim=1)
+        return self.indexer_keys
+
+    def select(self, idx: torch.Tensor) -> None:
+        if self._pi.shape[0] > 1:
+            self._pi = self._pi.index_select(0, idx.to(self._pi.device))
+        if self._ti is not None:
+            self._ti = self._ti.index_select(0, idx.to(self._ti.device))
+        super().select(idx)
+
+    def row(self, b: int) -> tuple[torch.Tensor, ...] | None:
+        kv = super().row(b)
+        if kv is None or self._ti is None:
+            return kv
+        return (*kv, self._ti[b : b + 1].clone())
+
+    def to(self, dev: str | torch.device) -> None:
+        super().to(dev)
+        self._pi = self._pi.to(dev)
+        if self._ti is not None:
+            self._ti = self._ti.to(dev)

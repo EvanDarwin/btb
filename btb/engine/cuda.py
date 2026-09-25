@@ -18,7 +18,7 @@ from .. import mlx as mlxdev
 from ..kinds import LayerKind, NodePath, Parents, PassTag, Tokens
 from ..options import Device
 from ..sampling import GREEDY
-from .cache import GrowLayer, set_rows
+from .cache import GrowLayer, forked, set_rows
 from .families import act_name
 from .forward import layer_window, node_mask, pe_for
 from .fused import _fused_rope
@@ -319,6 +319,7 @@ class _CudaMixin(_State):
             and on_layer is None
             and stop_after is None
             and cache is not None
+            and not forked(cache)
             and self._card_ready()
         )
 

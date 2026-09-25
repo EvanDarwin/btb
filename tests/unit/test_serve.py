@@ -20,6 +20,7 @@ import pytest
 from pytest import CaptureFixture
 
 from btb.draft import SpanBank
+from btb.engine.text import Generation
 from btb.kinds import Json, Tokens
 from btb.sampling import Sampling
 from btb.serve import Engine, Handler, Message, _public
@@ -253,9 +254,9 @@ def test_a_request_never_sizes_a_decode_past_the_window() -> None:
     class _Model:
         window = 64
 
-        def generate(self, ids: Tokens, max_new: int | None, **kw: object) -> tuple[list[int], Json]:
+        def generate(self, ids: Tokens, max_new: int | None, **kw: object) -> Generation:
             asked.append(max_new)
-            return [], {"cap": max_new or 0}
+            return Generation([], {"cap": max_new or 0})
 
     eng = Engine.__new__(Engine)
     eng.sm, eng.max_new, eng.eos, eng.session = _Model(), None, (), None  # type: ignore[assignment]
@@ -536,6 +537,7 @@ def test_openai_stream_client_disconnect_stops_the_model_and_frees_the_next_turn
             on_token: Callable[[int], object] | None = None,
             ids: Tokens | None = None,
             sampling: Sampling | None = None,
+            **_hooks: object,
         ) -> FakeRun:
             toks = []
             try:
@@ -547,7 +549,7 @@ def test_openai_stream_client_disconnect_stops_the_model_and_frees_the_next_turn
                     if on_token is not None:
                         on_token(ord("a"))
                     time.sleep(0.01)
-                return (ids or [1, 2, 3]), toks, {"cap": 9999, "forwards": 0}
+                return (ids or [1, 2, 3]), toks, {"cap": 9999, "forwards": 0}, None
             finally:
                 self.done.set()
 
@@ -602,6 +604,7 @@ def test_a_write_that_raises_mid_stream_stops_the_model_before_the_lock_goes() -
             on_token: Callable[[int], object] | None = None,
             ids: Tokens | None = None,
             sampling: Sampling | None = None,
+            **_hooks: object,
         ) -> FakeRun:
             toks = []
             for _ in range(1000):
@@ -612,7 +615,7 @@ def test_a_write_that_raises_mid_stream_stops_the_model_before_the_lock_goes() -
                 if on_token is not None:
                     on_token(ord("a"))
                 time.sleep(0.005)
-            return (ids or [1, 2, 3]), toks, {"cap": 9999, "forwards": 0}
+            return (ids or [1, 2, 3]), toks, {"cap": 9999, "forwards": 0}, None
 
     eng = _Slow()
     h = Handler.__new__(Handler)

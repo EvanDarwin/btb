@@ -5,6 +5,7 @@ engine reads as `getattr(self, name, default)` is declared without a value: unse
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
     from .drafter import MTPDrafter
     from .experts import ExpertProfile, _ExpertStore
     from .families import Family
+    from .hooks import Hooks
     from .host import _HostLinear
     from .memory import RamPolicyState, VramPolicyState
     from .mlx_forward import MlxState
@@ -149,6 +151,7 @@ class _State:
     _card_ms_min: float | None
     _last_card_ms: float | None
     _shed: list[str]
+    _live_caches: weakref.WeakSet[Any]  # every cache a layer's move reaches (`_track`)
 
     # -- the scheduler, and the run's counters --
     abort: threading.Event
@@ -232,6 +235,12 @@ class _State:
 
     @staticmethod
     def _cache_to(cache: Any, i: int, dev: str | torch.device) -> None:
+        raise NotImplementedError
+
+    def _track(self, cache: Any) -> Any:
+        raise NotImplementedError
+
+    def _caches_to(self, i: int, dev: str | torch.device, cache: Any = None) -> None:
         raise NotImplementedError
 
     def _cold_release(self, i: int) -> None:
@@ -461,6 +470,12 @@ class _State:
     def _finish(self, h: torch.Tensor, last_only: bool, head: bool) -> torch.Tensor:
         raise NotImplementedError
 
+    def _final_norm(self, h: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def _apply_head(self, hf: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
     def _prefill(
         self, ids: torch.Tensor, cache: Any, on_layer: Any = None, attention_mask: torch.Tensor | None = None
     ) -> Any:
@@ -501,6 +516,7 @@ class _State:
         prefill_only: bool = False,
         session: Any = None,
         sampling: Any = None,
+        hooks: Hooks | None = None,
     ) -> Any:
         raise NotImplementedError
 
@@ -517,6 +533,7 @@ class _State:
         spans: Spans = (),
         session: Session | None = None,
         sampling: Any = None,
+        hooks: Hooks | None = None,
     ) -> tuple[list[int], Json]:
         raise NotImplementedError
 
@@ -527,6 +544,7 @@ class _State:
         eos_ids: Tokens = (),
         pad_id: int | None = None,
         sampling: Any = None,
+        hooks: Hooks | None = None,
     ) -> list[list[int]]:
         raise NotImplementedError
 
@@ -565,6 +583,9 @@ class _State:
         raise NotImplementedError
 
     # -- memory.py --
+    def _serial(self, fn: Callable[..., Any], *args: Any) -> Any:
+        raise NotImplementedError
+
     def ram_policy(self, log: Log | None = None) -> None:
         raise NotImplementedError
 

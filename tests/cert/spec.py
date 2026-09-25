@@ -438,14 +438,17 @@ def subpaths(*keys: str) -> tuple[DeviceSubpath, ...]:
 
 
 class Surface(StrEnum):
-    """the id namespace a cert run records under: the container it loaded from, or an input-shape axis that is
-    not part of the storage/device cartesian (a batch of rows, a long prompt)."""
+    """the id namespace a cert run records under: the container it loaded from, or an axis that is not part of
+    the storage/device cartesian (a batch of rows, a long prompt, a hooked decode, a fork and a batch of
+    sessions)."""
 
     SAFETENSORS = "safetensors"
     GGUF = "gguf"
     PACK12 = "pack12"
     BATCH = "batch"
     CONTEXT = "context"
+    HOOKED = "hooked"
+    FORK = "fork"
 
 
 # the surface a cell of each container records under; the shape surfaces have no container of their own.
@@ -464,6 +467,22 @@ SURFACE_SUBPATHS: dict[Surface, tuple[str, ...]] = {
     Surface.PACK12: ("cpu", "mlx-step"),
     Surface.BATCH: ("cpu", "mlx-step"),
     Surface.CONTEXT: ("cpu", "mlx-step"),
+    Surface.HOOKED: ("cpu", "mlx-step", "cuda-torch"),
+    Surface.FORK: ("cpu", "mlx-step", "cuda-torch"),
+}
+
+
+def rows_tag(kind: FamilyKind, hardware: Hardware) -> PassTag:
+    """the path a fork's or a batch's rows must show, by the engine's own gate (`_mlx_batch_ok`): the MLX batched
+    step over a flat buffer for a dense family on MLX, the torch pass over joined layers everywhere else"""
+    return PassTag.ROWS_FLAT if hardware is Hardware.MLX and Cap.DENSE in core.flags(kind) else PassTag.ROWS_JOINED
+
+
+# the tags a cell of an axis beside the cartesian must show, by family and hardware (the sub-path's own `expects`
+# is about the single stream these axes leave)
+SURFACE_TAGS: dict[Surface, Callable[[FamilyKind, Hardware], frozenset[PassTag]]] = {
+    Surface.HOOKED: lambda k, hw: frozenset({PassTag.PICK_HOOKED}),
+    Surface.FORK: lambda k, hw: frozenset({rows_tag(k, hw)}),
 }
 
 

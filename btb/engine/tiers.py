@@ -11,6 +11,7 @@ import os
 import struct
 import threading
 import time
+import weakref
 from collections.abc import Sequence
 from concurrent.futures import CancelledError
 from dataclasses import dataclass, field
@@ -25,7 +26,7 @@ from ..kinds import Json, LayerKind, Tier
 from ..options import Device
 from ..pack12 import entries, unpack_bf16
 from ..sysinfo import process_working_set_bytes
-from .cache import GrowLayer
+from .cache import ForkLayer, GrowLayer
 from .host import _Experts, _HostLinear, bf16_in_place, copy_bytes
 from .native import Native
 from .state import DRAFT_VOCAB, _State
@@ -546,11 +547,26 @@ class _TiersMixin(_State):
             total += cur
         return total
 
+    def _track(self, cache: Any) -> Any:
+        """`cache` among those a layer's move reaches while it lives: an idle session's, a fork's, the running pass's"""
+        live = self.__dict__.setdefault("_live_caches", weakref.WeakSet())
+        live.add(cache)
+        return cache
+
+    def _caches_to(self, i: int, dev: str | torch.device, cache: Any = None) -> None:
+        """layer i's rows in every live cache (and `cache`) moved to `dev`, where the layer now runs"""
+        live = list(self.__dict__.get("_live_caches", ()))
+        for c in {id(c): c for c in [*live, *([cache] if cache is not None else [])]}.values():
+            self._cache_to(c, i, dev)
+
     @staticmethod
     def _cache_to(cache: Any, i: int, dev: str | torch.device) -> None:
         if cache is None or i >= len(cache.layers):
             return
         cl = cache.layers[i]
+        if isinstance(cl, ForkLayer):
+            cl.to(dev)
+            return
         if isinstance(cl, GrowLayer) and cl.is_initialized and isinstance(cl.keys, torch.Tensor):
             if cl.keys.device != torch.device(dev):
                 cl._set_rows(cl.keys.to(dev), cl.values.to(dev))

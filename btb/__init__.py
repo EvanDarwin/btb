@@ -42,12 +42,14 @@ os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 from .draft import SpanBank
-from .session import Session
+from .session import Mark, Session
 from .text import Channels, TextStream, answer, prompt_ids, template
 
 if TYPE_CHECKING:
     from .engine import StreamedTextModel
+    from .engine.branches import Batch, Branches
     from .engine.device import mlx_available, resolve_device
+    from .engine.hooks import LogitsProcessor, PassStats, TokenLogprob
     from .engine.native import kernels_path, native_path, native_tag, quiet_omp  # noqa: F401
     from .engine.scheduler import BatchScheduler, HostBudget, MemoryGrantError, Plan, PlanError
     from .engine.text import Chat, GenerateStats, Generation, Stream
@@ -90,6 +92,11 @@ _LAZY = {
     "Generation": ".engine.text",
     "GenerateStats": ".engine.text",
     "Stream": ".engine.text",
+    "Batch": ".engine.branches",
+    "Branches": ".engine.branches",
+    "LogitsProcessor": ".engine.hooks",
+    "PassStats": ".engine.hooks",
+    "TokenLogprob": ".engine.hooks",
     "Sampling": ".sampling",  # torch-backed: the root stays torch-free until a load
 }
 
@@ -599,13 +606,18 @@ def available_devices() -> list[Json]:
 
 
 __all__ = [
+    "Batch",
     "BatchScheduler",
+    "Branches",
     "Channels",
     "Chat",
     "GenerateStats",
     "Generation",
     "HostBudget",
+    "LogitsProcessor",
+    "Mark",
     "MemoryGrantError",
+    "PassStats",
     "Plan",
     "PlanError",
     "Sampling",
@@ -614,6 +626,7 @@ __all__ = [
     "Stream",
     "StreamedTextModel",
     "TextStream",
+    "TokenLogprob",
     "answer",
     "available_devices",
     "available_models",

@@ -25,13 +25,20 @@ def messages_of(prompt: str | Messages) -> list[dict[str, str]]:
     return [dict(m) for m in prompt]
 
 
-def template(tok: Any, history: Messages, thinking: bool = False, tools: Any = None) -> str:
+def template(
+    tok: Any, history: Messages, thinking: bool = False, tools: Any = None, continue_final: bool = False
+) -> str:
     """
     The conversation rendered through the tokenizer's chat template with the generation prompt appended;
     `thinking` reaches the templates that have the switch (Qwen3's) and `tools` the ones that render function
-    schemas, both dropped for a template whose signature lacks them
+    schemas, both dropped for a template whose signature lacks them. `continue_final` leaves the last message
+    (the assistant's, begun) open for the model to go on from, where a new turn would start otherwise.
     """
-    kw: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True, "enable_thinking": thinking}
+    if continue_final and history and history[-1].get("role") == "assistant":
+        kw: dict[str, Any] = {"tokenize": False, "add_generation_prompt": False, "continue_final_message": True}
+    else:
+        kw = {"tokenize": False, "add_generation_prompt": True}
+    kw["enable_thinking"] = thinking
     if tools:
         kw["tools"] = tools
     while True:
@@ -42,15 +49,21 @@ def template(tok: Any, history: Messages, thinking: bool = False, tools: Any = N
                 del kw["enable_thinking"]
             elif "tools" in kw:
                 del kw["tools"]
+            elif kw.get("continue_final_message"):
+                # a tokenizer without the switch: the turn opened as a new one, the begun text after it
+                head = template(tok, history[:-1], thinking, tools)
+                return head + str(history[-1].get("content") or "")
             else:
                 raise
 
 
-def prompt_ids(tok: Any, prompt: str | Messages, thinking: bool = False, tools: Any = None) -> list[int]:
+def prompt_ids(
+    tok: Any, prompt: str | Messages, thinking: bool = False, tools: Any = None, continue_final: bool = False
+) -> list[int]:
     """
     The prompt as the model takes it: the template rendered and tokenized, no special tokens added on top
     """
-    text = template(tok, messages_of(prompt), thinking, tools)
+    text = template(tok, messages_of(prompt), thinking, tools, continue_final)
     return [int(i) for i in tok(text, add_special_tokens=False)["input_ids"]]
 
 

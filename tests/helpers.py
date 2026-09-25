@@ -571,8 +571,8 @@ class CharTokenizer:
         return "".join(chr(int(i)) for i in ids)
 
 
-# what a fake engine's `run` answers: the prompt ids, the tokens, the census
-FakeRun = tuple[Tokens, list[int], Json]
+# what a fake engine's `run` answers: the prompt ids, the tokens, the census, the logprobs (None: not asked)
+FakeRun = tuple[Tokens, list[int], Json, None]
 
 
 class FakeEngine:
@@ -596,12 +596,13 @@ class FakeEngine:
         on_token: Callable[[int], object] | None = None,
         ids: Tokens | None = None,
         sampling: Sampling | None = None,
+        **_hooks: object,
     ) -> FakeRun:
         toks = [ord(ch) for ch in self._out]
         if on_token is not None:
             for t in toks:
                 on_token(t)
-        return (ids or [1, 2, 3]), toks, {"cap": 9999, "forwards": 0}
+        return (ids or [1, 2, 3]), toks, {"cap": 9999, "forwards": 0}, None
 
     def text(self, toks: Tokens) -> tuple[str, str]:
         return self._out, ""
