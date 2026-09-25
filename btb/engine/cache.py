@@ -1003,3 +1003,168 @@ class ForkIndexedLayer(ForkLayer):
         self._pi = self._pi.to(dev)
         if self._ti is not None:
             self._ti = self._ti.to(dev)
+
+
+class CardRowsLayer(_DynamicLayer):
+    """One attention layer of B rows in the card's arena, stepped by the card graph's rows pass: row b's prefix is
+    `lens[b]` rows from slot `offs[b]` (a fork's rows share their session's, a batch's lie end to end), then its
+    own steps - step i of every row in the stretch of `W` slots from `base + i * W`, row b at column `cols[b]`.
+    The kernels read each row's keys where they lie, so a step joins and copies nothing; torch reads a row out
+    (`row`), or the lot as a fork's layer (`to_fork`) when the rows leave the card."""
+
+    def __init__(
+        self, kb: torch.Tensor, vb: torch.Tensor, offs: Sequence[int], lens: Sequence[int], base: int, W: int
+    ) -> None:
+        super().__init__()
+        # this layer's [Hk, cap, d] slices of the arena; None while another cache holds it, the rows then in `_own`
+        self._buf: tuple[torch.Tensor, torch.Tensor] | None = (kb, vb)
+        self._own: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.offs, self.lens = [int(x) for x in offs], [int(x) for x in lens]
+        self.cols = list(range(len(self.offs)))
+        self.base, self.W = int(base), int(W)
+        self._t = 0
+        self.dtype, self.device = kb.dtype, kb.device
+        self.is_initialized = True
+
+    def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+        self.is_initialized = True
+
+    @property
+    def used(self) -> int:
+        """the arena's slots the rows hold, [0, used)"""
+        return self.base + self._t * self.W
+
+    def _rows(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """[Hk, >= used, d]: the arena's slices, or the copy made when another cache took the arena"""
+        src = self._buf if self._buf is not None else self._own
+        assert src is not None  # a layer holds its rows in one place or the other
+        return src
+
+    def _steps(self, cols: Sequence[int], W: int | None = None) -> torch.Tensor:
+        """the slots of the rows at `cols`, [len(cols), t]: step i of the row at column c is base + i * W + c"""
+        W = self.W if W is None else W
+        steps = torch.arange(self._t, device=self.device) * W + self.base
+        return steps[None, :] + torch.tensor(list(cols), device=self.device)[:, None]
+
+    def get_seq_length(self) -> int:
+        return max(self.lens) + self._t
+
+    # the rows as a fork's layer holds them, a copy (the kernels read the arena; this is torch's view)
+    @property
+    def keys(self) -> torch.Tensor:
+        return self._joined(0)
+
+    @keys.setter
+    def keys(self, t: torch.Tensor | None) -> None:
+        if t is not None:
+            raise TypeError("a fork's rows are cut by its Branches, not through the cache")
+
+    @property
+    def values(self) -> torch.Tensor:
+        return self._joined(1)
+
+    @values.setter
+    def values(self, t: torch.Tensor | None) -> None:
+        if t is not None:
+            raise TypeError("a fork's rows are cut by its Branches, not through the cache")
+
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, *args: object, **kwargs: object) -> Any:
+        raise TypeError("a card rows layer is written by the card graph's rows pass alone")
+
+    def _prefix(self, which: int) -> torch.Tensor:
+        """every row's prefix, [1, Hk, P, d] when the rows share one, else left-padded [B, Hk, max len, d]"""
+        x = self._rows()[which]
+        if len(set(zip(self.offs, self.lens))) == 1:
+            return x[:, self.offs[0] : self.offs[0] + self.lens[0]][None].clone()
+        P = max(self.lens)
+        out = x.new_zeros(len(self.offs), x.shape[0], P, x.shape[-1])
+        for b, (off, n) in enumerate(zip(self.offs, self.lens)):
+            out[b, :, P - n :] = x[:, off : off + n]
+        return out
+
+    def _tails(self, which: int, cols: Sequence[int]) -> torch.Tensor:
+        """the steps of the rows at `cols`, [len(cols), Hk, t, d]"""
+        x = self._rows()[which]
+        return x[:, self._steps(cols)].permute(1, 0, 2, 3).contiguous()
+
+    def _joined(self, which: int) -> torch.Tensor:
+        p = self._prefix(which).expand(len(self.cols), -1, -1, -1)
+        return torch.cat([p, self._tails(which, self.cols)], dim=-2) if self._t else p.clone()
+
+    def row(self, b: int) -> tuple[torch.Tensor, ...] | None:
+        """row b's own rows [1, Hk, t, d], copied out"""
+        if not self._t:
+            return None
+        return self._tails(0, [self.cols[b]]), self._tails(1, [self.cols[b]])
+
+    def to_fork(self, dev: str | torch.device | None = None) -> ForkLayer:
+        """the rows as a fork's layer holds them (a shared prefix, or a batch's left-padded one, then each row's
+        own), for the torch pass once the card cannot take them; a batch's pass masks the padding"""
+        fl = ForkLayer(self._prefix(0), self._prefix(1), len(self.cols))
+        if self._t:
+            fl._tk, fl._tv, fl._t = self._tails(0, self.cols), self._tails(1, self.cols), self._t
+        if dev is not None:
+            fl.to(dev)
+        return fl
+
+    def select(self, slots: Sequence[int]) -> None:
+        """the rows at `slots` become the rows, in that order (a row may repeat: a beam's survivor kept twice). A
+        row keeps its column; a repeat takes a free one, its steps copied there - or, with too few columns free,
+        every row's steps move to a wider stretch, which the arena must have room for (`used_after`)."""
+        slots = [int(s) for s in slots]
+        cols, taken = self._plan(slots)
+        if cols is None:
+            # a stretch as wide as the rows: row j at column j, every step moved (the gather reads before it writes)
+            W = len(slots)
+            src = self._steps([self.cols[s] for s in slots])
+            dst = self._steps(range(W), W)
+            for x in self._rows():
+                x[:, dst] = x[:, src]
+            self.W, self.cols = W, list(range(W))
+        else:
+            src = self._steps([self.cols[s] for s, c in zip(slots, cols) if c not in taken])
+            dst = self._steps([c for c in cols if c not in taken])
+            if src.numel():
+                for x in self._rows():
+                    x[:, dst] = x[:, src]
+            self.cols = cols
+        self.offs = [self.offs[s] for s in slots]
+        self.lens = [self.lens[s] for s in slots]
+
+    def _plan(self, slots: Sequence[int]) -> tuple[list[int] | None, set[int]]:
+        """each new row's column: a row's first appearance keeps its own (`taken`), a repeat takes a free one;
+        None when the columns run out"""
+        taken: set[int] = set()
+        cols: list[int | None] = []
+        for s in slots:
+            c = self.cols[s]
+            cols.append(None if c in taken else c)
+            taken.add(c)
+        free = [c for c in range(self.W) if c not in taken]
+        if cols.count(None) > len(free):
+            return None, taken
+        it = iter(free)
+        return [c if c is not None else next(it) for c in cols], taken
+
+    def used_after(self, slots: Sequence[int]) -> int:
+        """the slots `select(slots)` leaves the rows holding"""
+        cols, _ = self._plan(slots)
+        return self.base + self._t * (len(slots) if cols is None else self.W)
+
+    def detach(self) -> None:
+        """another cache takes the arena: the rows held so far become a copy of their own"""
+        if self._buf is None:
+            return
+        n = self.used
+        self._own = (self._buf[0][:, :n].clone(), self._buf[1][:, :n].clone())
+        self._buf = None
+
+    def attach(self, kb: torch.Tensor, vb: torch.Tensor) -> None:
+        """the rows back in the arena's slices `(kb, vb)` (copied in when they were held apart)"""
+        if self._own is not None:
+            n = self.used
+            kb[:, :n].copy_(self._own[0])
+            vb[:, :n].copy_(self._own[1])
+            self._own = None
+        self._buf = (kb, vb)
+        self.device = kb.device

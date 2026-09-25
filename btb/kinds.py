@@ -305,6 +305,7 @@ class PassTag(StrEnum):
     PICK_HOOKED = "pick_hooked"  # the pick over logits a caller's hooks saw: the in-graph picks stood aside
     ROWS_FLAT = "rows_flat"  # a fork's or a batch's rows on the MLX batched step, over one flat buffer
     ROWS_JOINED = "rows_joined"  # a fork's or a batch's rows on the torch pass, prefix and own rows joined
+    ROWS_CARD = "rows_card"  # a fork's or a batch's rows on the card graph's rows pass, read in place in its arena
     # the placement tiers a pass ran layers on (btb/engine/device.py Placement.tier)
     TIER_RESIDENT = "tier_resident"
     TIER_HOST = "tier_host"

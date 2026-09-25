@@ -310,3 +310,104 @@ def test_the_speculative_answer_is_the_greedy_answer(engine: EngineTok, prompt_i
         o, census = sm.generate(ids, 128, eos=())
         assert o == g, f"diverged at token {next(i for i, (a, b) in enumerate(zip(g, o)) if a != b)} of {len(g)}"
         assert census["forwards"] < len(o)
+
+
+# -- the rows pass: a fork's or a batch's rows, a token each at its own position, read in place in the arena ---------
+
+
+def _stepped(sm: StreamedTextModel, prompt: Sequence[int], toks: Sequence[int]) -> torch.Tensor:
+    """the logits after `toks` fed one at a time to a session of `prompt`: the one-row steps a row's own rows were
+    written by (a prefill of them would write the same rows through other kernels)"""
+    s = sm.session(list(prompt))
+    lg = None
+    for t in toks:
+        lg = s.feed([t])
+    assert lg is not None
+    return lg[-1].float().cpu()
+
+
+def test_a_forks_rows_are_its_sessions_one_row_steps_bit_for_bit(
+    engine: EngineTok, prompt_ids: list[list[int]]
+) -> None:
+    """each row walks its own keys as a one-row step walks them, whatever rows step beside it: a row's logits are its
+    session's own step's, every bit, through reorders (a repeat's steps copied to a free column; more rows than
+    columns re-laid wider) and rows leaving; a kept row's session goes on as one fed its tokens would"""
+    sm, _ = engine
+    P = prompt_ids[0]
+    s = sm.session(P)
+    with s.fork(3) as br:
+        assert br.mode == "card"
+        br.step([1, 2, 3])
+        br.reorder([2, 0, 2])
+        lg = br.step([4, 5, 6])
+        for r, toks in enumerate([[3, 4], [1, 5], [3, 6]]):
+            assert torch.equal(lg[r], _stepped(sm, P, toks)), r
+        br.reorder([0, 1, 2, 1, 0])  # five rows over three columns: every row's steps move to a wider stretch
+        lg = br.step([7, 8, 9, 10, 11])
+        for r, toks in enumerate([[3, 4, 7], [1, 5, 8], [3, 6, 9], [1, 5, 10], [3, 4, 11]]):
+            assert torch.equal(lg[r], _stepped(sm, P, toks)), r
+        br.leave(1)
+        lg = br.step([12, 13, 14, 15])
+        for r, toks in enumerate([[3, 4, 7, 12], [3, 6, 9, 13], [1, 5, 10, 14], [3, 4, 11, 15]]):
+            assert torch.equal(lg[r], _stepped(sm, P, toks)), r
+        kept = br.keep(3)
+    assert kept.tokens == P + [1, 5, 10, 14]
+    assert torch.equal(kept.feed([16])[-1].float().cpu(), _stepped(sm, P, [1, 5, 10, 14, 16]))
+
+
+def test_a_forks_greedy_rows_are_the_sessions_greedy_decode(engine: EngineTok, prompt_ids: list[list[int]]) -> None:
+    """every row of a greedy fork decodes the tokens the session's own greedy decode does (the step graph's)"""
+    sm, _ = engine
+    P = prompt_ids[1]
+    want = list(sm.generate(P, 24, eos=(), speculate=False)[0])
+    with sm.session(P).fork(4) as br:
+        assert br.mode == "card"
+        g = br.generate(24, eos=())
+    assert all(list(t) == want for t in g.tokens)
+
+
+def test_a_batchs_rows_are_each_sessions_own_steps(engine: EngineTok, prompt_ids: list[list[int]]) -> None:
+    """sessions of their own lengths end to end in the arena: each row is its session's step, every bit, a padding
+    row beside them (three rows ride the four-row graph), and a tapped step's states are each row's own"""
+    sm, _ = engine
+    ps = prompt_ids[:3]
+    assert len({len(p) for p in ps}) > 1
+    sessions = [sm.session(p) for p in ps]
+    with sm.batch(sessions) as bt:
+        assert bt.mode == "card"
+        lg = bt.step([1, 2, 3])
+        for r in range(3):
+            assert torch.equal(lg[r], _stepped(sm, ps[r], [r + 1])), r
+        lg, hid = bt.step([4, 5, 6], taps=(0, sm.L // 2, sm.L - 1))
+        for r in range(3):
+            assert torch.equal(lg[r], _stepped(sm, ps[r], [r + 1, r + 4])), r
+            _, want = sm.session(ps[r] + [r + 1]).feed([r + 4], taps=(0, sm.L // 2, sm.L - 1))
+            for i in (0, sm.L // 2, sm.L - 1):
+                ref = want[i][-1].float()
+                # the session's tapped feed runs the torch modules (a tap stands the graph aside): a tolerance,
+                # the one test_nerd_api holds a fork's taps to
+                assert (hid[i][r] - ref).abs().max().item() <= 3e-2 * max(1.0, ref.abs().max().item()), (r, i)
+    for r in range(3):
+        assert sessions[r].tokens == ps[r] + [r + 1, r + 4]
+
+
+def test_the_rows_go_on_through_torch_when_a_layer_leaves_the_card(
+    engine: EngineTok, prompt_ids: list[list[int]]
+) -> None:
+    """a layer's rows moved off the card turn the batch over to the torch pass (a fork's layers, its prefixes left-
+    padded under a mask), and the rows go on from where they were"""
+    sm, _ = engine
+    a, b = prompt_ids[0], prompt_ids[2]
+    sa, sb = sm.session(a), sm.session(b)
+    with sm.batch([sa, sb]) as bt:
+        bt.step([1, 2])
+        assert bt.cache is not None
+        for i in range(sm.L):
+            sm._cache_to(bt.cache, i, "cpu")
+            sm._cache_to(bt.cache, i, sm.dev)
+        lg = bt.step([4, 5])
+        assert bt.mode == "fork"
+        for r, (p, toks) in enumerate([(a, [1, 4]), (b, [2, 5])]):
+            ref = _stepped(sm, p, toks)
+            assert (lg[r] - ref).abs().max().item() <= 5e-2 * ref.abs().max().item(), r
+    assert sa.tokens == a + [1, 4] and sb.tokens == b + [2, 5]

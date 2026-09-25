@@ -27,7 +27,7 @@ from ..mlx.legacyq import KINDS as LEGACY_KINDS
 from ..options import Device
 from ..pack12 import entries, unpack_bf16
 from ..sysinfo import process_working_set_bytes
-from .cache import ForkLayer, GrowLayer
+from .cache import CardRowsLayer, ForkLayer, GrowLayer
 from .host import _Experts, _HostLinear, bf16_in_place, copy_bytes
 from .native import Native
 from .state import DRAFT_VOCAB, _State
@@ -610,6 +610,12 @@ class _TiersMixin(_State):
         cl = cache.layers[i]
         if isinstance(cl, ForkLayer):
             cl.to(dev)
+            return
+        if isinstance(cl, CardRowsLayer):
+            # a fork's or a batch's rows leaving the card's arena: a fork's layer where the layer now runs (the
+            # batch takes the torch pass from its next step)
+            if torch.device(dev).type != cl.device.type:
+                cache.layers[i] = cl.to_fork(dev)
             return
         if (
             isinstance(cl, GrowLayer)

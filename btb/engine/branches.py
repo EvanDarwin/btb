@@ -19,6 +19,7 @@ from ..api import api
 from ..kinds import LayerKind, PassTag, Tokens
 from ..sampling import GREEDY, Sampling
 from .cache import (
+    CardRowsLayer,
     ForkIndexedLayer,
     ForkLayer,
     GraphStates,
@@ -76,9 +77,33 @@ class _Rows:
         self._logits: torch.Tensor | None = None
         self._am: torch.Tensor | None = None
         self.cache: KvCache | None = None
-        self.mode = ""  # "rows": the MLX batched step over a flat buffer; "fork": the torch pass over ForkLayers
+        # "rows": the MLX batched step over a flat buffer; "card": the card graph's rows pass over its arena;
+        # "fork": the torch pass over ForkLayers
+        self.mode = ""
+        self._lens: list[int] = []  # on the card, the live rows' prefix lengths (a batch's mask, should they leave it)
 
     # -- the cache --
+    def _card_ok(self, B: int) -> bool:
+        """the card graph's rows pass takes B rows: the whole model resident on the card as one run"""
+        return bool(self.eng._card_rows_ok(B))
+
+    def _off_card(self) -> None:
+        """the rows leave the card's arena for the torch pass (a layer left the card, or the rows outgrew the
+        graphs): a fork's layers, a batch's prefixes left-padded under a mask"""
+        cache = self._check()
+        for i, cl in enumerate(cache.layers):
+            if isinstance(cl, CardRowsLayer):
+                cache.layers[i] = cl.to_fork()
+        self.eng._card_rows_release(cache)
+        lens = self._lens
+        if len(set(lens)) > 1:
+            P = max(lens)
+            t = cache.get_seq_length() - P
+            self._am = torch.zeros((len(lens), P + t), dtype=torch.long)
+            for b, n in enumerate(lens):
+                self._am[b, P - n :] = 1
+        self.mode = "fork"
+
     def _rows_ok(self, sessions: Sequence[Session], B: int) -> bool:
         """the MLX batched decode takes these rows: a dense family, every attention layer an MLX buffer"""
         eng = self.eng
@@ -198,8 +223,13 @@ class _Rows:
     def _advance(self, toks: list[int], taps: Sequence[int] = ()) -> tuple[torch.Tensor, Taps]:
         """one token into each live row: their logits [live, V] float32, and the `taps` layers' states there"""
         eng, cache = self.eng, self._check()
-        eng._tag(PassTag.ROWS_FLAT if self.mode == "rows" else PassTag.ROWS_JOINED)
         B = len(toks)
+        if self.mode == "card" and not eng._card_rows_ok(B, cache):
+            self._off_card()
+        eng._tag({"rows": PassTag.ROWS_FLAT, "card": PassTag.ROWS_CARD}.get(self.mode, PassTag.ROWS_JOINED))
+        if self.mode == "card":
+            lg, tapped = eng._card_rows_step(cache, toks, tuple(taps))
+            return lg.cpu(), tapped
         seen: Taps = {}
 
         def keep(i: int, h: torch.Tensor) -> None:
@@ -315,7 +345,12 @@ class _Rows:
     def _select(self, slots: list[int]) -> None:
         """the batch's rows at `slots` become the batch, in that order"""
         cache = self._check()
-        if self.mode == "rows":
+        if self.mode == "card" and slots and not self.eng._card_rows_ok(len(slots), cache):
+            self._off_card()
+        if self.mode == "card":
+            self.eng._card_rows_select(cache, slots)
+            self._lens = [self._lens[b] for b in slots]
+        elif self.mode == "rows":
             m = mlxdev.mx()
             idx = m.array(slots, dtype=m.int32)
             for gl in self._rows_layers():
@@ -351,7 +386,7 @@ class _Rows:
         """the batch's row b, copied out: its own rows and its recurrent states"""
         out = _Row()
         for i, cl in enumerate(self._check().layers):
-            if isinstance(cl, ForkLayer):
+            if isinstance(cl, (ForkLayer, CardRowsLayer)):
                 kv = cl.row(b)
                 if kv is not None:
                     out.kv[i] = kv
@@ -464,6 +499,7 @@ class Branches(_Rows):
         parent = _cache_of(s)
         assert s.logits is not None
         rows_ok = self._rows_ok([s], B)
+        card_ok = not rows_ok and self._card_ok(B)
         cache = self._shell(parent)
         for i, pl in enumerate(parent.layers):
             if eng.layer_types[i] == LayerKind.LINEAR:
@@ -471,13 +507,17 @@ class Branches(_Rows):
             elif rows_ok:
                 assert isinstance(pl, GrowLayer)
                 cache.layers[i] = self._alias(pl, B)
+            elif card_ok:
+                continue  # every layer formed below, together, over the session's rows in the card's arena
             else:
                 if isinstance(pl, GrowLayer) and pl._buf is not None:
                     # rows in the card's arena move out, or the next cache to take it would write over them
                     pl.detach()
                 k, v = attention_rows(pl)
                 cache.layers[i] = _fork_layer(pl, k, v, indexer_keys(pl), B, i)
-        self.cache, self.mode = cache, ("rows" if rows_ok else "fork")
+        if card_ok:
+            self._lens = eng._card_rows_form(cache, [parent], [0] * B)
+        self.cache, self.mode = cache, ("rows" if rows_ok else "card" if card_ok else "fork")
         self.sess = [s] * B
         self.base = [list(s.ids)] * B
         self.rows = [[] for _ in range(B)]
@@ -540,6 +580,8 @@ class Branches(_Rows):
         """the fork dropped: the session goes on from where it was forked"""
         if self.session.forked is self:
             self.session.forked = None
+        if self.cache is not None and self.mode == "card":
+            self.eng._card_rows_release(self.cache)
         self.cache, self._logits, self._pend, self._out = None, None, None, {}
 
 
@@ -581,6 +623,9 @@ class Batch(_Rows):
         lens = [len(s.ids) for s in sessions]
         caches = [_cache_of(s) for s in sessions]
         rows_ok = self._rows_ok(sessions, B)
+        card_ok = not rows_ok and self._card_ok(B)
+        if self.cache is not None and self.mode == "card":
+            eng._card_rows_release(self.cache)  # the batch formed anew: its rows are written back already
         cache = self._shell(caches[0])
         for i in range(eng.L):
             pls = [c.layers[i] for c in caches]
@@ -590,6 +635,8 @@ class Batch(_Rows):
                 grows = [pl for pl in pls if isinstance(pl, GrowLayer)]
                 assert len(grows) == len(pls)
                 cache.layers[i] = self._flat(grows, lens)
+            elif card_ok:
+                continue  # every layer formed below, together: the sessions' rows end to end in the card's arena
             else:
                 # left-padded: every row ends at the longest and steps together, the mask hiding the padding
                 kvs = [attention_rows(pl) for pl in pls]
@@ -598,9 +645,11 @@ class Batch(_Rows):
                 iks = [indexer_keys(pl) for pl in pls]
                 ik = _pad([x[0] for x in iks if x is not None], lens, 0) if iks[0] is not None else None
                 cache.layers[i] = _fork_layer(pls[0], k, v, ik, B, i)
-        self.cache, self.mode = cache, ("rows" if rows_ok else "fork")
+        if card_ok:
+            self._lens = eng._card_rows_form(cache, caches, list(range(B)))
+        self.cache, self.mode = cache, ("rows" if rows_ok else "card" if card_ok else "fork")
         self._am = None
-        if not rows_ok and len(set(lens)) > 1:
+        if self.mode == "fork" and len(set(lens)) > 1:
             P = max(lens)
             self._am = torch.zeros((B, P), dtype=torch.long)
             for b, n in enumerate(lens):
@@ -673,6 +722,8 @@ class Batch(_Rows):
         for s in self.sess:
             if s.forked is self:
                 s.forked = None
+        if self.mode == "card":
+            self.eng._card_rows_release(self.cache)
         self.cache, self._logits, self._pend = None, None, None
 
 
