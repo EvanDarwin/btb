@@ -252,6 +252,9 @@ class _State:
     def _cold_stop(self) -> None:
         raise NotImplementedError
 
+    def _layer_bytes(self, i: int) -> int:
+        raise NotImplementedError
+
     def _layer_bytes_stored(self, i: int, packed: bool = False) -> int:
         raise NotImplementedError
 
@@ -583,6 +586,12 @@ class _State:
         raise NotImplementedError
 
     # -- memory.py --
+    def lend_policy(self) -> None:
+        raise NotImplementedError
+
+    def room(self, nbytes: int, device: Any = None, name: str = "room") -> Any:
+        raise NotImplementedError
+
     def _serial(self, fn: Callable[..., Any], *args: Any) -> Any:
         raise NotImplementedError
 

@@ -202,6 +202,7 @@ class Device:
         self._holds = 0
         self._pending: list[tuple[str, Callable[[], Any]]] = []
         self._reserved: dict[str, tuple[str, int]] = {}
+        self.returned = False  # lent memory came back since the lending policy last looked
 
     # -- placement -----------------------------------------------------------------------------------------
 

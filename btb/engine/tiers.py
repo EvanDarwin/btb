@@ -567,6 +567,16 @@ class _TiersMixin(_State):
         if isinstance(cl, ForkLayer):
             cl.to(dev)
             return
+        if (
+            isinstance(cl, GrowLayer)
+            and not cl.shared
+            and cl._buf is not None
+            and cl._buf[0].device != torch.device(dev)
+        ):
+            # the rows copied out and the buffer they grew in let go now, not at the cache's next append
+            k, v = cl.keys, cl.values
+            cl._buf, cl._an = None, None
+            cl._set_rows(k, v)
         if isinstance(cl, GrowLayer) and cl.is_initialized and isinstance(cl.keys, torch.Tensor):
             if cl.keys.device != torch.device(dev):
                 cl._set_rows(cl.keys.to(dev), cl.values.to(dev))

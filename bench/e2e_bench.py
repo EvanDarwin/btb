@@ -155,6 +155,21 @@ def test_batch_generate(benchmark: object, model: str, device: str, knobs: dict[
         benchmark(once)  # type: ignore[operator]
 
 
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("device,knobs", DEVICES, ids=[d for d, _ in DEVICES])
+def test_lend(benchmark: object, device: str, knobs: dict[str, str]) -> None:
+    """a tensor and a room lent beside a loaded model with room to spare: the ledger's own cost"""
+    with _api(benchmark, FAMILIES[0], device, knobs, "lend") as sm:
+
+        def once() -> object:
+            t = sm.empty((1024, 1024), dtype=torch.bfloat16)
+            with sm.room(1 << 20):
+                return t
+
+        once()
+        benchmark(once)  # type: ignore[operator]
+
+
 # the one piece of hand data: bytes per 256-weight superblock, as the GGUF layout stores it. IQ4_NL has no entry
 # because it is not a superblock type - 32-weight blocks with the scales in a separate array, so its launcher
 # takes (d, q, x, ...) rather than one as-stored buffer and does not fit this bench's call shape.

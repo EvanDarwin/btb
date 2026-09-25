@@ -607,15 +607,11 @@ class _TextMixin(_State):
     @contextlib.contextmanager
     def reserve(self, tag: str, nbytes: int, device: Any = None) -> Iterator[None]:
         """
-        Memory of your own spoken for while the block runs: the memory policies count it as taken, so a shed
-        layer is not grown back into it, and the host tier sheds to the drive sooner to leave it free. It
-        frees nothing by itself and `grant` does not see it; the room it names must already be free.
+        `room` for the block: room made for memory of your own and kept from btb while the block runs, `tag`
+        naming it in a refusal. A `MemoryGrantError` when btb cannot make that much.
         """
-        self.device.reserve(tag, int(nbytes), device)
-        try:
+        with self.room(nbytes, device, name=tag):
             yield
-        finally:
-            self.device.release(tag)
 
     def __enter__(self) -> Any:
         return self

@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from .engine.branches import Batch, Branches
     from .engine.device import mlx_available, resolve_device
     from .engine.hooks import LogitsProcessor, PassStats, TokenLogprob
+    from .engine.memory import DeviceMemory, Room
     from .engine.native import kernels_path, native_path, native_tag, quiet_omp  # noqa: F401
     from .engine.scheduler import BatchScheduler, HostBudget, MemoryGrantError, Plan, PlanError
     from .engine.text import Chat, GenerateStats, Generation, Stream
@@ -86,6 +87,8 @@ _LAZY = {
     "BatchScheduler": ".engine.scheduler",
     "HostBudget": ".engine.scheduler",
     "MemoryGrantError": ".engine.scheduler",
+    "DeviceMemory": ".engine.memory",
+    "Room": ".engine.memory",
     "Plan": ".engine.scheduler",
     "PlanError": ".engine.scheduler",
     "Chat": ".engine.text",
@@ -611,6 +614,7 @@ __all__ = [
     "Branches",
     "Channels",
     "Chat",
+    "DeviceMemory",
     "GenerateStats",
     "Generation",
     "HostBudget",
@@ -620,6 +624,7 @@ __all__ = [
     "PassStats",
     "Plan",
     "PlanError",
+    "Room",
     "Sampling",
     "Session",
     "SpanBank",
