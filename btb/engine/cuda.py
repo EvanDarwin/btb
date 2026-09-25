@@ -603,7 +603,8 @@ class _CudaMixin(_State):
         g = {
             "key": key,
             "mma": mma,
-            "m": torch.zeros(M, I, dtype=bf, device=dev) if mma else None,
+            # act(gate) * up, for the passes that run it as its own kernel (see `_card_body`'s down projection)
+            "m": torch.zeros(M, I, dtype=bf, device=dev) if mma or M > 1 else None,
             "h": torch.zeros(M, H, dtype=bf, device=dev),
             "x": torch.zeros(M, H, dtype=bf, device=dev),
             "y": torch.zeros(M, H, dtype=bf, device=dev),
@@ -749,8 +750,10 @@ class _CudaMixin(_State):
                     [P(g["h"]), P(g["y"]), P(L["ln2"]), cf(L["eps"]), P(g["x"]), ci(H), cen],
                 )
             matvec(L["gu"], g["x"], g["gu"], 2 * I, H)
-            if mma:
-                # the tensor-core kernel has no activation fold: the two kernels, the same bits
+            if mma or M > 1:
+                # the two kernels, the same bits as the fold: the tensor-core kernel has no fold, and past one row
+                # the fold loses - each output row recomputes act(g) * u for all M rows of x, so at qwen3-4b's
+                # down shape (4070 Ti) it ran 1.3x slower at M 2, 3.7x at 8 and 6.6x at 16 than this pair
                 k.launch(
                     f"btb_{act}_mul",
                     (min(4096, (M * I + 255) // 256), 1, 1),
@@ -759,7 +762,8 @@ class _CudaMixin(_State):
                 )
                 matvec(L["down"], g["m"], g["y"], H, I)
             else:
-                # act(gate) * up folded into the down projection's x load: the same bits as the two kernels
+                # one row: act(gate) * up folded into the down projection's x load, the same bits as the two
+                # kernels and one launch and buffer fewer (its recompute hides under the weight stream)
                 k.launch(
                     gemv_act, ((H + 3) // 4, 1, 1), (128, 1, 1), [P(L["down"]), P(g["gu"]), P(g["y"]), ci(H), ci(I)]
                 )
