@@ -177,31 +177,99 @@ unsafe fn accum_avx2<E: Elem, const R: usize>(
     accum_tail::<E, R>(acc, w, row_stride, x, n, nb * LANES);
 }
 
+/// Sixteen bf16 as two f32 vectors (columns 0-7, 8-15) on the shuffle port alone: the qword swap puts each
+/// half's words in one 128-bit lane's reach, and interleaving them under zero words is the 16-bit shift.
+/// The same values as `load16_avx2`, without its two shifts on the FMA ports.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn widen_avx2<const R: usize>(
-    dst: *mut f32,
+#[inline]
+unsafe fn load16_bf16_p5_avx2(
+    p: *const u16,
+) -> (std::arch::x86_64::__m256, std::arch::x86_64::__m256) {
+    use std::arch::x86_64::*;
+    let v = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_loadu_si256(p as *const __m256i));
+    let z = _mm256_setzero_si256();
+    (
+        _mm256_castsi256_ps(_mm256_unpacklo_epi16(z, v)),
+        _mm256_castsi256_ps(_mm256_unpackhi_epi16(z, v)),
+    )
+}
+
+/// One bf16 row of a tile against `V` vectors: each 16 columns converted once and multiplied into every
+/// vector's 16 lane sums, vector v's sums at `acc + v * acc_stride` and its x at `x + v * x_stride`. Lane j of
+/// each sum meets column c + j in column order, as `accum_avx2` has it, so the bits are its bits.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn accum_bf16_vecs_avx2<const V: usize>(
+    acc: *mut f32,
+    acc_stride: usize,
     w: *const u16,
-    row_stride: usize,
-    dst_stride: usize,
+    x: *const f32,
+    x_stride: usize,
     n: usize,
 ) {
     use std::arch::x86_64::*;
+    let mut lo = [_mm256_setzero_ps(); V];
+    let mut hi = [_mm256_setzero_ps(); V];
+    for v in 0..V {
+        lo[v] = _mm256_loadu_ps(acc.add(v * acc_stride));
+        hi[v] = _mm256_loadu_ps(acc.add(v * acc_stride + 8));
+    }
     let nb = n / LANES;
-    for r in 0..R {
-        let src = w.add(r * row_stride);
-        let out = dst.add(r * dst_stride);
-        for k in 0..nb {
-            let c = k * LANES;
-            let v = _mm256_loadu_si256(src.add(c) as *const __m256i);
-            let lo = _mm256_slli_epi32::<16>(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(v)));
-            let hi =
-                _mm256_slli_epi32::<16>(_mm256_cvtepu16_epi32(_mm256_extracti128_si256::<1>(v)));
-            _mm256_storeu_ps(out.add(c), _mm256_castsi256_ps(lo));
-            _mm256_storeu_ps(out.add(c + 8), _mm256_castsi256_ps(hi));
+    for k in 0..nb {
+        let c = k * LANES;
+        let (wl, wh) = load16_bf16_p5_avx2(w.add(c));
+        for v in 0..V {
+            let xp = x.add(v * x_stride + c);
+            lo[v] = _mm256_fmadd_ps(wl, _mm256_loadu_ps(xp), lo[v]);
+            hi[v] = _mm256_fmadd_ps(wh, _mm256_loadu_ps(xp.add(8)), hi[v]);
         }
-        for j in (nb * LANES)..n {
-            *out.add(j) = bf16_to_f32(*src.add(j));
+    }
+    for v in 0..V {
+        _mm256_storeu_ps(acc.add(v * acc_stride), lo[v]);
+        _mm256_storeu_ps(acc.add(v * acc_stride + 8), hi[v]);
+        accum_tail::<u16, 1>(
+            acc.add(v * acc_stride),
+            w,
+            0,
+            x.add(v * x_stride),
+            n,
+            nb * LANES,
+        );
+    }
+}
+
+/// A tile of `R` bf16 rows against `bt` vectors straight from the rows, four vectors a pass: the rows are
+/// converted in registers where the f32 tile this replaced was stored and read back once per vector, its
+/// conversion's shifts sharing the FMA ports. Vector i's sums for row rr at `scratch + (i * R + rr) * LANES`,
+/// its x at `x + i * row_stride` (x rows and weight rows are both `cols` long).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn accum_bf16_multi_avx2<const R: usize>(
+    scratch: *mut f32,
+    w: *const u16,
+    row_stride: usize,
+    x: *const f32,
+    bt: usize,
+    n: usize,
+) {
+    let st = R * LANES;
+    for rr in 0..R {
+        let wr = w.add(rr * row_stride);
+        let mut i = 0;
+        while i + 4 <= bt {
+            let a = scratch.add(i * st + rr * LANES);
+            accum_bf16_vecs_avx2::<4>(a, st, wr, x.add(i * row_stride), row_stride, n);
+            i += 4;
+        }
+        let a = scratch.add(i * st + rr * LANES);
+        let xi = x.add(i * row_stride);
+        match bt - i {
+            3 => accum_bf16_vecs_avx2::<3>(a, st, wr, xi, row_stride, n),
+            2 => accum_bf16_vecs_avx2::<2>(a, st, wr, xi, row_stride, n),
+            1 => accum_bf16_vecs_avx2::<1>(a, st, wr, xi, row_stride, n),
+            _ => {}
         }
     }
 }
@@ -403,8 +471,8 @@ unsafe impl Sync for Bf16 {}
 // vector of the group accumulated from the same tile while it is in cache, and the 16 lane sums of each
 // (vector, row) folded by `reduce16`. An accumulator meets the tiles in order with a fixed lane mapping, so
 // the bits do not depend on `b`. `prep` runs once per (vector group, row group); `tile` either fills `wide`
-// with the tile's weights as f32 and yields `false`, or (one bf16 vector) accumulates straight from the rows
-// and yields `true`.
+// with the tile's weights as f32 and yields `false`, or accumulates straight from the rows and
+// yields `true`.
 macro_rules! def_task {
     ($group:ident, $task:ident, $w:ty, $accum:ident $(, $feat:literal)?,
      prep |$pp:ident, $pr:ident, $pcols:ident, $pcur:ident| $prep:block,
@@ -506,11 +574,31 @@ macro_rules! def_task_bf16 {
                 }
             });
     };
+    // the vectors of a group accumulated straight from the bf16 rows by `$multi`, no f32 tile
+    ($group:ident, $task:ident, $accum:ident, multi $multi:ident $(, $feat:literal)?) => {
+        def_task!($group, $task, Bf16, $accum $(, $feat)?,
+            prep |p, r, cols, cur| {},
+            tile |scratch, wide, x, i0, bt, p, r, c0, cols, n, cur| {
+                let wt = p.0.add(r * cols + c0);
+                if bt == 1 {
+                    $accum::<u16, R>(scratch, wt, cols, x.add(i0 * cols + c0), n);
+                } else {
+                    $multi::<R>(scratch, wt, cols, x.add(i0 * cols + c0), bt, n);
+                }
+                true
+            });
+    };
 }
 
 def_task_bf16!(group_scalar, task_scalar, accum_scalar, widen_scalar);
 #[cfg(target_arch = "x86_64")]
-def_task_bf16!(group_avx2, task_avx2, accum_avx2, widen_avx2, "avx2,fma");
+def_task_bf16!(
+    group_avx2,
+    task_avx2,
+    accum_avx2,
+    multi accum_bf16_multi_avx2,
+    "avx2,fma"
+);
 #[cfg(target_arch = "aarch64")]
 def_task_bf16!(group_neon, task_neon, accum_neon, widen_neon);
 #[cfg(target_arch = "x86_64")]
