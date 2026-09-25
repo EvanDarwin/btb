@@ -220,8 +220,10 @@ class _Rows:
             raise ValueError(f"row {r} is not in the batch")
         self.eng._serial(self._leave, [slot])
 
-    def _advance(self, toks: list[int], taps: Sequence[int] = ()) -> tuple[torch.Tensor, Taps]:
-        """one token into each live row: their logits [live, V] float32, and the `taps` layers' states there"""
+    def _advance(self, toks: list[int], taps: Sequence[int] = (), host: bool = True) -> tuple[torch.Tensor, Taps]:
+        """one token into each live row: their logits [live, V] float32 - on the host, or with `host=False` where
+        the pass left them (`generate` picks there, and brings back a token a row instead of the vocabulary) - and
+        the `taps` layers' states there"""
         eng, cache = self.eng, self._check()
         B = len(toks)
         if self.mode == "card" and not eng._card_rows_ok(B, cache):
@@ -229,7 +231,7 @@ class _Rows:
         eng._tag({"rows": PassTag.ROWS_FLAT, "card": PassTag.ROWS_CARD}.get(self.mode, PassTag.ROWS_JOINED))
         if self.mode == "card":
             lg, tapped = eng._card_rows_step(cache, toks, tuple(taps))
-            return lg.cpu(), tapped
+            return (lg.cpu() if host else lg), tapped
         seen: Taps = {}
 
         def keep(i: int, h: torch.Tensor) -> None:
@@ -256,7 +258,8 @@ class _Rows:
             am = self._am = torch.cat([self._am, torch.ones((B, 1), dtype=torch.long)], dim=1)
         out = eng.forward(ids, cache=cache, attention_mask=am, on_layer=on_layer)
         assert out is not None
-        return out[:, -1].float().cpu(), seen
+        lg = out[:, -1].float()
+        return (lg.cpu() if host else lg), seen
 
     def _rows_layers(self) -> list[GrowLayer]:
         return [cl for cl in self._check().layers if isinstance(cl, GrowLayer)]
@@ -299,7 +302,7 @@ class _Rows:
                     break
                 ts = time.perf_counter()
                 if self._pend is not None:
-                    self._logits = self._advance(self._pend)[0]
+                    self._logits = self._advance(self._pend, host=False)[0]
                     self._pend = None
                     steps += 1
                 assert self._logits is not None
