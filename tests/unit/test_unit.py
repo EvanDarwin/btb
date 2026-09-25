@@ -11,7 +11,7 @@ import sys
 import types
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 import torch
@@ -348,6 +348,39 @@ def test_plan_prices_the_cache_for_the_context() -> None:
     from btb.engine.tiers import RAM_BPS
 
     assert out["kv_read_ms"] == 8 * 64 * MB / RAM_BPS * 1e3 and budget()["kv_read_ms"] == 0.0
+
+
+def test_an_mlx_plan_prices_the_gpu_and_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
+    """on Apple silicon a pass reads its layers and the head on the GPU from the one memory: the prediction is those
+    bytes at the GPU's measured read rate (not the host tier's CPU price and its host head), and the summary puts
+    the layers and the head on the GPU; a card's plan reads as it did"""
+    import btb.mlx
+    from btb.engine.scheduler import BatchScheduler, HostBudget
+    from btb.engine.tiers import _TiersMixin
+
+    GB = 2**30
+    monkeypatch.setattr(btb.mlx, "read_bps", lambda: 100e9)
+    p = _probe()
+    p.plan_budget = lambda *a, **kw: _TiersMixin.plan_budget(cast("_TiersMixin", p), *a, **kw)
+    p.fam = types.SimpleNamespace(moe=False)
+    hb = HostBudget(total=64 * GB, available=48 * GB, commit=64 * GB, footprint=0, os_floor=0, growth=0, floor=4 * GB)
+    kw: dict[str, Any] = {"packed": False, "fp32": False, "vram_reserve_gb": 0.0, "budget": hb}
+    pl = BatchScheduler.plan_placement(p, "mlx", 0.0, **kw)
+    assert len(pl.warm) == 8 and not pl.cold and pl.gpu_bps == 100e9
+    assert pl.predicted_ms_per_token == pytest.approx((pl.bytes.warm + pl.bytes.head) / 100e9 * 1e3)
+    s = str(pl)
+    assert "8 on the GPU" in s and "head on the GPU" in s and "the GPU reads 100 GB/s" in s and "host" not in s
+    cpu = BatchScheduler.plan_placement(p, "cpu", 0.0, **kw)
+    assert cpu.gpu_bps is None and "8 host" in str(cpu) and "head host" in str(cpu)
+
+
+def test_the_report_line_puts_mlx_layers_the_head_and_the_cache_on_the_gpu() -> None:
+    from btb.engine.tiers import report_line
+    from btb.kinds import Tier
+
+    placement = {"resident": [], "host": [0, 1, 2], "cold": [2], "mlx": [0, 1], "head": Tier.GPU, "kv": Tier.GPU}
+    line = report_line({"device": "mlx", "placement": {**placement, "drafter": Tier.NONE}})
+    assert "resident 0, gpu 2, host 1, cold 1; head gpu; drafter none; kv gpu" in line
 
 
 def test_plan_prices_the_staging_a_streamed_layer_crosses() -> None:

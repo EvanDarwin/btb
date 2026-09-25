@@ -4,7 +4,9 @@ rows (8x8 matrix multiplies, each row its own chain), and the MXFP4 kernels for 
 
 from __future__ import annotations
 
+import functools
 import threading
+import time
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -229,6 +231,26 @@ def gemv(w_bf16: mx_.array, x: mx_.array) -> mx_.array:
         output_dtypes=[m.uint16 if xb else m.float32],
     )[0]
     return y.view(m.bfloat16) if xb else y
+
+
+@functools.cache
+def read_bps() -> float:
+    """The rate the GPU reads weights at, bytes a second: this matvec (what an MLX pass is made of, and bound by
+    its reads) for one row over a 256 MiB bf16 weight, eight launches a reading, the best of five. Measured once
+    for the process; a plan prices an MLX pass from it."""
+    m = mx()
+    rows, cols = 16384, 8192
+    w = m.random.normal((rows, cols)).astype(m.bfloat16)
+    x = m.ones((1, cols), dtype=m.bfloat16)
+    m.eval(w, x, gemv(w, x))
+    best = float("inf")
+    for _ in range(5):
+        t0 = time.perf_counter()
+        m.eval([gemv(w, x) for _ in range(8)])
+        best = min(best, (time.perf_counter() - t0) / 8)
+    del w, x
+    m.clear_cache()
+    return rows * cols * 2 / best
 
 
 def gemv_f32(w_bf16: mx_.array, x_f32: mx_.array) -> mx_.array:

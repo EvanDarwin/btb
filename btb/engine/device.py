@@ -212,11 +212,14 @@ class Device:
         host = tuple(i for i in sorted(getattr(sm, "host", {}) or {}) if i not in cold)
         mlx = tuple(sorted(getattr(sm, "mlx_layers", ()) or ()))
         cuda = sm.dev.type == DeviceKind.CUDA
+        unified = getattr(sm, "mlx", None) is not None
         hh = getattr(sm, "head_host", None)
         if hh is not None and getattr(hh, "packed", None) is not None:
             head = Tier.PACKED
         elif getattr(sm, "head", None) is not None and cuda:
             head = Tier.CARD
+        elif unified and hh is not None and getattr(hh, "mx", None) is not None:
+            head = Tier.GPU
         else:
             head = Tier.HOST
         aj = getattr(sm, "aj", None)
@@ -230,7 +233,10 @@ class Device:
             drafter = (
                 Tier.HOST if (dd is not None and dd.type == DeviceKind.CPU) else (Tier.CARD if cuda else Tier.HOST)
             )
-        kv = Tier.CARD if (cuda and not getattr(sm, "kv_host", False)) else Tier.HOST
+        if cuda:
+            kv = Tier.HOST if getattr(sm, "kv_host", False) else Tier.CARD
+        else:
+            kv = Tier.GPU if unified else Tier.HOST
         return Placement(self.version, resident, host, tuple(sorted(cold)), mlx, head, drafter, kv)
 
     @contextlib.contextmanager

@@ -222,6 +222,7 @@ class Tier(StrEnum):
     """where a part of the model lives: the head, the drafter and the attention cache in a Placement and a report"""
 
     CARD = "card"
+    GPU = "gpu"  # Apple silicon's GPU (MLX), over the memory the host shares
     HOST = "host"
     PACKED = "packed"  # the head read from the 12-bit store
     NONE = "none"  # no such part (a model without a drafting head)

@@ -181,18 +181,28 @@ class Plan:
     free: PlanFree
     budget: HostBudget | None = None
     drive: DriveBenchmark | None = None  # the drive's measurement where layers stream from it
+    gpu_bps: float | None = None  # Apple silicon's GPU read rate (`btb.mlx.read_bps`) an MLX plan is priced at
 
     def __str__(self) -> str:
         b = self.bytes
-        head = Tier.CARD if self.head_on_card else Tier.HOST
-        drafter = Tier.CARD if self.drafter_on_card else (Tier.HOST if self.has_mtp else Tier.NONE)
-        s = (
-            f"{self.device}: {len(self.resident)} resident ({b.vram_layers / 2**30:.2f} GB), {len(self.host)} host "
-            f"({len(self.cold)} streamed from the drive, {b.warm / 2**30:.2f} GB in RAM, {b.cold / 2**30:.2f} GB a pass), "
-            f"head {head}, drafter {drafter}{', cache in RAM' if self.kv_host else ''}; "
-            f"{self.predicted_ms_per_token:.1f} ms a token predicted; "
-            f"free RAM {self.free.ram_gb:.1f} GB, VRAM {self.free.vram_gb:.1f} GB"
-        )
+        if self.gpu_bps:
+            # one memory: the GPU runs every layer the RAM holds, the head with them
+            s = (
+                f"{self.device}: {len(self.warm)} on the GPU ({b.warm / 2**30:.2f} GB, unified memory), "
+                f"{len(self.cold)} streamed from the drive ({b.cold / 2**30:.2f} GB a pass), head on the GPU, "
+                f"drafter {'yes' if self.has_mtp else 'none'}; {self.predicted_ms_per_token:.1f} ms a token "
+                f"predicted (the GPU reads {self.gpu_bps / 1e9:.0f} GB/s); free RAM {self.free.ram_gb:.1f} GB"
+            )
+        else:
+            head = Tier.CARD if self.head_on_card else Tier.HOST
+            drafter = Tier.CARD if self.drafter_on_card else (Tier.HOST if self.has_mtp else Tier.NONE)
+            s = (
+                f"{self.device}: {len(self.resident)} resident ({b.vram_layers / 2**30:.2f} GB), {len(self.host)} "
+                f"host ({len(self.cold)} streamed from the drive, {b.warm / 2**30:.2f} GB in RAM, "
+                f"{b.cold / 2**30:.2f} GB a pass), head {head}, drafter {drafter}"
+                f"{', cache in RAM' if self.kv_host else ''}; {self.predicted_ms_per_token:.1f} ms a token "
+                f"predicted; free RAM {self.free.ram_gb:.1f} GB, VRAM {self.free.vram_gb:.1f} GB"
+            )
         if self.budget is not None:
             s += f"; {self.budget.floor / 2**30:.2f} GB kept free"
         if self.drive is not None:
@@ -636,6 +646,18 @@ class BatchScheduler:
             + int(b.get("kv_host", 0))
             + int(b.get("staging", 0))
         )
+        predicted, gpu_bps = float(out["predicted_ms_per_token"]), None
+        if name is not None and name.kind is Device.MLX:
+            from ..mlx import read_bps
+            from .tiers import DRIVE_BPS
+
+            # an MLX pass reads every weight it runs from the one memory: the GPU's layers and the head at the
+            # GPU's own read rate, the drive's layers streamed alongside at the drive's (the host tier's price is
+            # the CPU's, and the head there a host matvec)
+            gpu_bps = read_bps()
+            gpu_ms = (int(b["warm"]) + int(b["head"])) / gpu_bps * 1e3
+            cold_ms = int(b["cold"]) / (drive.bps if drive is not None else DRIVE_BPS) * 1e3
+            predicted = max(gpu_ms, cold_ms)
         room = min(hb.available, hb.commit) - hb.floor
         if room < least:
             raise PlanError(
@@ -656,7 +678,7 @@ class BatchScheduler:
             kv_host=kv_chosen,
             has_mtp=has_mtp,
             moe=bool(probe.fam.moe),
-            predicted_ms_per_token=float(out["predicted_ms_per_token"]),
+            predicted_ms_per_token=predicted,
             bytes=PlanBytes(
                 vram_layers=int(b["vram_layers"]),
                 head=int(b["head"]),
@@ -679,6 +701,7 @@ class BatchScheduler:
             free=PlanFree(vram_gb=vram_gb, ram_gb=ram_gb, ram_gb_first=ram0, settle_s=waited),
             budget=hb,
             drive=drive,
+            gpu_bps=gpu_bps,
         )
 
     @staticmethod

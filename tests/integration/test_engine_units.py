@@ -199,6 +199,21 @@ def test_grow_layer_appends_rows_in_order() -> None:
     assert keys.untyped_storage().data_ptr() == layer._buf[0].untyped_storage().data_ptr()
 
 
+def test_an_mlx_engine_reports_its_layers_head_and_cache_on_the_gpu() -> None:
+    """Apple silicon runs the layers, the head and the cache on the GPU over the one memory: the report and its line
+    say so (gpu, not host), and the plan it loaded from was priced on the GPU"""
+    from btb.kinds import Tier
+
+    need_mlx()
+    with loaded_model(fixture("tiny_qwen3"), device="mlx") as sm:
+        rep = sm.report()
+        pl = rep["placement"]
+        assert pl["head"] == Tier.GPU and pl["kv"] == Tier.GPU and len(pl["mlx"]) == sm.L
+        line = sm.report_line(rep)
+        assert f"gpu {sm.L}, host 0" in line and "head gpu" in line and "kv gpu" in line
+        assert sm.plan is not None and sm.plan.gpu_bps and "on the GPU" in str(sm.plan)
+
+
 def test_grow_layer_crop_cuts_the_rows_on_the_torch_path() -> None:
     """`crop` was a new length for the shared MLX buffer alone: a torch layer kept every row, so a prefill chunk
     rolled back after a GPU recovery was appended twice, and a draft model drafted over rows it had rejected.

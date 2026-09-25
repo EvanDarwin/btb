@@ -21,7 +21,7 @@ import torch
 from .. import mlx as mlxdev
 from ..gguf import GROUP
 from ..hf import AFFINE_TYPES
-from ..kinds import Json, LayerKind, Proposer, Tier
+from ..kinds import Json, LayerKind, Tier
 from ..options import Device
 from ..pack12 import entries, unpack_bf16
 from ..sysinfo import process_working_set_bytes
@@ -62,9 +62,10 @@ class ColdRing:
 def report_line(report: Json) -> str:
     """`report()` as one line for the verbose log: the device, the tiers, the head, the drafter, the cache."""
     pl = report.get("placement") or {}
-    parts = [f"{k} {len(pl.get(k) or ())}" for k in ("resident", "host", "cold")]
-    if pl.get("mlx"):
-        parts.append(f"mlx {len(pl['mlx'])}")
+    gpu = set(pl.get("mlx") or ())  # the host layers Apple silicon's GPU runs
+    host = [i for i in pl.get("host") or () if i not in gpu]
+    parts = [f"resident {len(pl.get('resident') or ())}", *([f"gpu {len(gpu)}"] if gpu else [])]
+    parts += [f"host {len(host)}", f"cold {len(pl.get('cold') or ())}"]
     return (
         f"[report] {report.get('device')}: {', '.join(parts)}; head {pl.get('head')}; "
         f"drafter {pl.get('drafter')}; kv {pl.get('kv')}; {pl.get('compute_dtype')}"
@@ -279,17 +280,10 @@ class _TiersMixin(_State):
         tmpl_b = 0
         for lt, mods in (getattr(self, "templates", {}) or {}).items():
             tmpl_b += len(mods) * max((bf16.get(i, 0) for i in range(L) if types[i] == lt), default=0)
-        if getattr(self, "head", None) is not None:
-            head = Tier.CARD if cuda else Tier.HOST
-        else:
-            hh = getattr(self, "head_host", None)
-            head = Tier.PACKED if (hh is not None and hh.packed is not None) else Tier.HOST
-        # a checkpoint's `mtp.*` weights are a drafter only when the proposer draws from them
-        aj = getattr(self, "aj", None)
-        dd = aj.dev if aj is not None else getattr(self, "drafter_dev", None)
-        drafter = Tier.NONE
-        if aj is not None or (mtp and Proposer.of(getattr(self, "proposer", Proposer.NGRAM)).mtp):
-            drafter = Tier.CARD if (dd if dd is not None else dev).type == Device.CUDA else Tier.HOST
+        # where the head, the drafter and the cache sit: the live placement's reading, the one the passes hold
+        dv = getattr(self, "device", None)
+        snap = dv.snapshot() if dv is not None else None
+        head, drafter, kv = (snap.head, snap.drafter, snap.kv) if snap is not None else (Tier.NONE,) * 3
         rss = peak_memory()[0]
         pl = getattr(self, "plan", None)
         # the run's growth past its plan: the working set now, less the footprint the plan was drawn at and the
@@ -339,7 +333,7 @@ class _TiersMixin(_State):
                 "mlx": sorted(getattr(self, "mlx_layers", ()) or ()),
                 "head": head,
                 "drafter": drafter,
-                "kv": Tier.CARD if (cuda and not getattr(self, "kv_host", False)) else Tier.HOST,
+                "kv": kv,
                 "kv_bits": getattr(self, "kv_bits", None),
                 "packed": packed,
                 "templates": sum(len(v) for v in (getattr(self, "templates", {}) or {}).values()),
