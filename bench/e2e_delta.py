@@ -78,13 +78,40 @@ def _entries(doc: Doc) -> dict[str, _Entry]:
     return out
 
 
+def _id(e: _Entry) -> str:
+    """the output id: the label, under its section unless the label already names one (`<device>/<model>`)"""
+    sec, label = e["section"], e["label"]
+    return f"{sec}/{label}" if sec and "/" not in label else label
+
+
+class Timing(TypedDict):
+    id: str
+    section: str
+    median_s: float
+    lo_s: float  # the median's 95% band, from the same standard error `deltas` uses
+    hi_s: float
+
+
+def timings(doc: Doc) -> list[Timing]:
+    """each benchmark's own median in seconds with its 95% band, under the ids `deltas` gives it"""
+    out: list[Timing] = []
+    for e in _entries(doc).values():
+        st = e["stats"]
+        median = float(st.get("median", 0.0))
+        half = 1.96 * _MEDIAN_SE * float(st.get("stddev", 0.0)) / math.sqrt(max(1, int(st.get("rounds", 1))))
+        out.append(
+            {"id": _id(e), "section": e["section"], "median_s": median, "lo_s": median - half, "hi_s": median + half}
+        )
+    return out
+
+
 def deltas(base: Doc, pr: Doc) -> list[_Delta]:
     b, p = _entries(base), _entries(pr)
     pr_isa = isa_of(pr)
     out: list[_Delta] = []
     for key in sorted(p.keys()):
-        sec, label = p[key]["section"], p[key]["label"]
-        entry_id = f"{sec}/{label}" if sec and "/" not in label else label
+        sec = p[key]["section"]
+        entry_id = _id(p[key])
         bs: Stats = b[key]["stats"] if key in b else {}
         ps = p[key]["stats"]
         bm, pm = float(bs.get("median", 0.0)), float(ps.get("median", 0.0))

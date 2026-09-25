@@ -173,6 +173,41 @@ def test_main_compares_two_roots_and_gates(tmp_path: Path, capsys: CaptureFixtur
     assert report.main([pr, "--gate"]) == 0  # no baseline: every row is new, nothing to gate
 
 
+def test_json_carries_each_benchs_time_and_its_change(tmp_path: Path) -> None:
+    """--json writes the change side's own times in seconds (criterion's nanoseconds converted, the e2e's median
+    and its standard-error band), the interleaved runs folded, each beside its change against the base; a bench the
+    base lacks has no change, and only a plain hex SHA is recorded"""
+    base, pr = str(tmp_path / "base"), str(tmp_path / "pr")
+    for run, median in (("a", 100.0), ("b", 120.0)):
+        _criterion(base, "gemv/b16", 100.0, 1.0, run)
+        _criterion(pr, "gemv/b16", median, 2.0, run)
+        _criterion(pr, "attn/new", 50.0, 1.0, run)
+        with open(os.path.join(pr, f"e2e-{run}.json"), "w", encoding="utf-8") as f:
+            doc = _doc(_bench("cpu", 0.5, 0.1, 100, {"device": "cpu", "model": "m"}, "cpu"), isa="neon")
+            doc["machine_info"]["cpu"] = {"brand_raw": "Test CPU"}
+            json.dump(doc, f)
+    out = str(tmp_path / "bench.json")
+    sha = "a" * 40
+    assert report.main([pr, "--baseline", base, "--json", out, "--sha", sha, "--run-url", "https://x/1"]) == 0
+    got = json.load(open(out, encoding="utf-8"))
+    benches = {b["id"]: b for b in got["benches"]}
+    assert (got["sha"], got["run_url"], got["isa"], got["cpu"], got["pairs"]) == (
+        sha,
+        "https://x/1",
+        "neon",
+        "Test CPU",
+        2,
+    )
+    g = benches["gemv/b16"]
+    assert g["median_s"] == pytest.approx(110e-9) and (g["lo_s"], g["hi_s"]) == pytest.approx((98e-9, 122e-9))
+    assert g["change"]["delta"] == pytest.approx(0.10) and g["section"] == "gemv"
+    assert benches["attn/new"]["change"] is None
+    c = benches["cpu/m"]
+    half = 1.96 * math.sqrt(math.pi / 2) * 0.1 / 10
+    assert c["median_s"] == pytest.approx(0.5) and (c["lo_s"], c["hi_s"]) == pytest.approx((0.5 - half, 0.5 + half))
+    assert report.results(pr, [], "<img>", None, None)["sha"] is None
+
+
 def test_the_gate_trips_only_when_the_whole_ci_clears_the_threshold() -> None:
     """strictly above: a CI lower bound sitting exactly on the line is not a regression, and one straddling zero
     is runner noise, not a slowdown"""
