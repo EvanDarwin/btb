@@ -116,11 +116,7 @@ class GrowLayer(_DynamicLayer):
 
     @keys.setter
     def keys(self, t: torch.Tensor | None) -> None:
-        if not self.shared or self._mx is None:
-            self._keys_t = t
-            self._an = self._front_len(0, t)
-        else:
-            self._assign(0, t)
+        self._put(0, self._owned(0, t))
 
     @property
     def values(self) -> torch.Tensor:
@@ -134,11 +130,45 @@ class GrowLayer(_DynamicLayer):
 
     @values.setter
     def values(self, t: torch.Tensor | None) -> None:
+        self._put(1, self._owned(1, t))
+
+    def _set_rows(self, k: torch.Tensor | None, v: torch.Tensor | None) -> None:
+        """btb's own write of the rows, taken as they are: tensors it just made, or cut from this layer's buffer"""
+        self._put(0, k)
+        self._put(1, v)
+
+    def _put(self, which: int, t: torch.Tensor | None) -> None:
         if not self.shared or self._mx is None:
-            self._values_t = t
-            self._an = self._front_len(1, t)
+            if which == 0:
+                self._keys_t = t
+            else:
+                self._values_t = t
+            self._an = self._front_len(which, t)
         else:
-            self._assign(1, t)
+            self._assign(which, t)
+
+    def _owned(self, which: int, t: torch.Tensor | None) -> torch.Tensor | None:
+        """`t` as rows the layer may keep: a cut from the front of its own buffer, or of rows it holds apart from
+        one, stays a view; anything else (another cache's rows, the card's arena, MLX memory) is copied, so no
+        later write elsewhere, reallocation or change of the arena's owner can reach the layer's rows"""
+        if t is None or not t.numel():
+            return t
+        if t.ndim != 4:
+            raise ValueError(f"a cache layer's rows are [batch, kv heads, positions, head dim], got {tuple(t.shape)}")
+        if self.shared and self._mx is not None:
+            keep = self._mx_prefix(which, t)
+        elif self._front_len(which, t) is not None:
+            keep = True
+        else:
+            cur = self._keys_t if which == 0 else self._values_t
+            keep = (
+                self._an is None
+                and isinstance(cur, torch.Tensor)
+                and bool(cur.numel())
+                and not (self._buf is not None and _same_storage(t, self._buf[which]))
+                and _inside(t, cur)
+            )
+        return t if keep else t.clone(memory_format=torch.contiguous_format)
 
     def _front_len(self, which: int, t: torch.Tensor | None) -> int | None:
         """the rows' count when `t` is the front of the buffer (a view from its first row), else None"""
@@ -152,6 +182,7 @@ class GrowLayer(_DynamicLayer):
             and t.dtype == kb.dtype
             and t.shape[:2] == kb.shape[:2]
             and t.shape[-1] == kb.shape[-1]
+            and t.stride() == kb.stride()
         ):
             return int(t.shape[-2])
         return None
@@ -369,7 +400,7 @@ class GrowLayer(_DynamicLayer):
             return
         if n < have:
             k, v = self.keys, self.values
-            self.keys, self.values = k[..., :n, :], v[..., :n, :]
+            self._set_rows(k[..., :n, :], v[..., :n, :])
 
     def gather(self, keep: Sequence[int], base: int = 0, lazy: bool = False) -> list[Any]:
         """The rows `keep` become the cache: gathered on the GPU and written back, an int8 layer's scales with
@@ -412,28 +443,37 @@ class GrowLayer(_DynamicLayer):
             else:
                 self._tv = None
             return
-        base = self._ptr[which]
-        if self.bits:
-            base = self._tmp[which].untyped_storage().data_ptr() if self._tmp[which] is not None else -1
-        prefix = (
-            t.untyped_storage().data_ptr() == base
-            and t.storage_offset() == 0
-            and tuple(t.shape[:2]) == (self._b, self._shape[1])
-            and int(t.shape[-1]) == self._shape[-1]
-        )
-        if prefix:
+        if self._mx_prefix(which, t):
             self._n = int(t.shape[-2])
             if which == 0:
                 self._tk = None
             else:
                 self._tv = None
             return
-        if t.untyped_storage().data_ptr() == base:
+        if t.untyped_storage().data_ptr() == self._mx_base(which):
             t = t.clone()
         if which == 0:
             self._tk = t
         else:
             self._tv = t
+
+    def _mx_base(self, which: int) -> int:
+        """the storage torch's view of a shared buffer lives in (an int8 layer's: its last dequantized copy)"""
+        if self.bits:
+            return self._tmp[which].untyped_storage().data_ptr() if self._tmp[which] is not None else -1
+        return int(self._ptr[which])
+
+    def _mx_prefix(self, which: int, t: torch.Tensor) -> bool:
+        """`t` is the first rows of torch's view of a shared buffer, strides and all"""
+        rows = self._tmp[which].shape[-2] if self.bits and self._tmp[which] is not None else self._shape[2]
+        d = self._shape[-1]
+        return bool(
+            t.untyped_storage().data_ptr() == self._mx_base(which)
+            and t.storage_offset() == 0
+            and tuple(t.shape[:2]) == (self._b, self._shape[1])
+            and int(t.shape[-1]) == d
+            and tuple(t.stride()[1:]) == (int(rows) * d, d, 1)
+        )
 
     # -- storage --
     def _grant_bound(self) -> int:
@@ -598,8 +638,7 @@ class GrowLayer(_DynamicLayer):
         self._buf = (kb, vb)
         self._an = None
         if n:
-            self.keys = kb[..., :n, :]
-            self.values = vb[..., :n, :]
+            self._set_rows(kb[..., :n, :], vb[..., :n, :])
 
     def detach(self) -> None:
         """The layer gives its buffer up (another cache takes the arena): its rows become its own copy."""
@@ -669,8 +708,7 @@ class GrowLayer(_DynamicLayer):
             # from the card): copy them into the buffer that already holds room for them instead of growing it
             self._buf[0][..., :n, :].copy_(self.keys)
             self._buf[1][..., :n, :].copy_(self.values)
-            self.keys = self._buf[0][..., :n, :]
-            self.values = self._buf[1][..., :n, :]
+            self._set_rows(self._buf[0][..., :n, :], self._buf[1][..., :n, :])
         if not fits:
             have = self._buf[0].shape[-2] if self._buf is not None else 0
             if self.cap_hint:
@@ -706,6 +744,30 @@ class GrowLayer(_DynamicLayer):
         kb, vb = self._buf
         kb[..., n : n + T, :].copy_(key_states)
         vb[..., n : n + T, :].copy_(value_states)
-        self.keys = kb[..., : n + T, :]
-        self.values = vb[..., : n + T, :]
+        self._set_rows(kb[..., : n + T, :], vb[..., : n + T, :])
         return self.keys, self.values
+
+
+def set_rows(layer: Any, k: torch.Tensor, v: torch.Tensor) -> None:
+    """btb's own write of a layer's rows (see `GrowLayer._set_rows`); any other layer takes them as assigned"""
+    if isinstance(layer, GrowLayer):
+        layer._set_rows(k, v)
+    else:
+        layer.keys, layer.values = k, v
+
+
+def _same_storage(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return a.device == b.device and a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr()
+
+
+def _inside(t: torch.Tensor, b: torch.Tensor) -> bool:
+    """every element of `t` lies within the span of memory `b` covers"""
+    if t.dtype != b.dtype or not _same_storage(t, b):
+        return False
+
+    def span(x: torch.Tensor) -> tuple[int, int]:
+        last = sum((n - 1) * s for n, s in zip(x.shape, x.stride()))
+        return x.data_ptr(), x.data_ptr() + (last + 1) * x.element_size()
+
+    (lo, hi), (blo, bhi) = span(t), span(b)
+    return blo <= lo and hi <= bhi

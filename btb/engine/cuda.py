@@ -18,7 +18,7 @@ from .. import mlx as mlxdev
 from ..kinds import LayerKind, NodePath, Parents, PassTag, Tokens
 from ..options import Device
 from ..sampling import GREEDY
-from .cache import GrowLayer
+from .cache import GrowLayer, set_rows
 from .families import act_name
 from .forward import layer_window, node_mask, pe_for
 from .fused import _fused_rope
@@ -469,8 +469,7 @@ class _CudaMixin(_State):
                         n = int(layer.keys.shape[-2]) if (layer.is_initialized and layer.keys is not None) else 0
                         layer._buf = (A[slot[i], 0][None], A[slot[i], 1][None])
                         if n:
-                            layer.keys = layer._buf[0][..., :n, :]
-                            layer.values = layer._buf[1][..., :n, :]
+                            layer._set_rows(layer._buf[0][..., :n, :], layer._buf[1][..., :n, :])
         st["arena"] = new
         st["graphs"].clear()
         # how much of the arena's front sits in persisting L2 is the scheduler's call (it holds the
@@ -1341,12 +1340,10 @@ class _CudaMixin(_State):
                     continue
                 if getattr(layer, "keys", None) is not None:
                     if path == list(range(len(path))):
-                        layer.keys = layer.keys[..., : len(keep), :]
-                        layer.values = layer.values[..., : len(keep), :]
+                        set_rows(layer, layer.keys[..., : len(keep), :], layer.values[..., : len(keep), :])
                     else:
                         idx = torch.tensor(keep, device=layer.keys.device)
-                        layer.keys = layer.keys.index_select(-2, idx)
-                        layer.values = layer.values.index_select(-2, idx)
+                        set_rows(layer, layer.keys.index_select(-2, idx), layer.values.index_select(-2, idx))
                     if hasattr(layer, "cumulative_length"):
                         layer.cumulative_length = int(layer.keys.shape[-2])
             else:

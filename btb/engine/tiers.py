@@ -25,6 +25,7 @@ from ..kinds import Json, LayerKind, Proposer, Tier
 from ..options import Device
 from ..pack12 import entries, unpack_bf16
 from ..sysinfo import process_working_set_bytes
+from .cache import GrowLayer
 from .host import _Experts, _HostLinear, bf16_in_place, copy_bytes
 from .native import Native
 from .state import DRAFT_VOCAB, _State
@@ -556,6 +557,9 @@ class _TiersMixin(_State):
         if cache is None or i >= len(cache.layers):
             return
         cl = cache.layers[i]
+        if isinstance(cl, GrowLayer) and cl.is_initialized and isinstance(cl.keys, torch.Tensor):
+            if cl.keys.device != torch.device(dev):
+                cl._set_rows(cl.keys.to(dev), cl.values.to(dev))
         for attr in ("keys", "values", "conv_states", "recurrent_states", "indexer_keys"):
             t = getattr(cl, attr, None)
             if isinstance(t, dict):

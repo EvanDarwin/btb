@@ -16,7 +16,7 @@ from .. import mlx as mlxdev
 from ..kinds import LayerKind, Tokens
 from ..mlx import fused as fk
 from ..options import Device
-from .cache import GrowLayer
+from .cache import GrowLayer, set_rows
 from .host import _HostLinear
 from .native import Native
 
@@ -548,8 +548,7 @@ class MTPDrafter:
     def crop(self, keep: int) -> None:
         for layer in self.cache.layers:
             if getattr(layer, "keys", None) is not None and layer.keys.shape[-2] > keep:
-                layer.keys = layer.keys[..., :keep, :]
-                layer.values = layer.values[..., :keep, :]
+                set_rows(layer, layer.keys[..., :keep, :], layer.values[..., :keep, :])
                 if hasattr(layer, "cumulative_length"):
                     layer.cumulative_length = int(layer.keys.shape[-2])
 
@@ -856,7 +855,7 @@ class MTPDrafter:
                 vs = torch.cat(
                     [kv_root[1] if parent < 0 else kv_after[parent][1] for _, _, parent, _, _ in group], dim=0
                 )
-                layer.keys, layer.values = ks, vs
+                set_rows(layer, ks, vs)
                 hs = torch.cat([hin for _, _, _, _, hin in group], dim=0)
                 lg, ho = self._step(ts, hs, root_len + depth - 1)
                 if smp is not None:
@@ -873,7 +872,7 @@ class MTPDrafter:
                     kv_after[idx] = (layer.keys[b : b + 1].clone(), layer.values[b : b + 1].clone())
                     az(idx, neg, depth, vals_l[b], inds_l[b], ho[b : b + 1, -1:], paths[idx])
         if not mlx_tree:
-            layer.keys, layer.values = kv_root
+            set_rows(layer, *kv_root)
         out = ([n[0] for n in nodes], [n[1] for n in nodes], [n[2] for n in nodes])
         if with_tags and smp is not None:
             return (*out, [tags[i] for i in range(len(nodes))], qrows, draws)

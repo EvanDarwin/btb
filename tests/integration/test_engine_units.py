@@ -227,6 +227,88 @@ def test_grow_layer_crop_cuts_the_arena_front() -> None:
     assert keys[0, 0, :, 0].tolist() == [1.0, 1.0, 3.0] and kb[0, 0, 2, 0].item() == 3.0
 
 
+def test_grow_layer_keeps_a_cut_of_its_own_rows_as_a_view() -> None:
+    """a caller's crop through the setters is no copy: the arena's front stays the front, detached rows stay theirs"""
+    layer = GrowLayer()
+    layer.update(*_kv(1, 2, 4, 8, fill=1.0))
+    kb, vb = torch.zeros(1, 2, 16, 8, dtype=torch.bfloat16), torch.zeros(1, 2, 16, 8, dtype=torch.bfloat16)
+    layer.attach(kb, vb)
+    layer.keys, layer.values = layer.keys[..., :3, :], layer.values[..., :3, :]
+    assert layer._an == 3 and layer.keys.data_ptr() == kb.data_ptr()
+    layer.detach()
+    rows = layer.keys
+    layer.keys, layer.values = layer.keys[..., :2, :], layer.values[..., :2, :]
+    assert layer.keys.data_ptr() == rows.data_ptr() and layer.get_seq_length() == 2
+
+
+def test_grow_layer_copies_rows_it_does_not_own() -> None:
+    """rows assigned from elsewhere are copied in: a later write to where they came from never reaches the layer"""
+    layer = GrowLayer()
+    layer.update(*_kv(1, 2, 4, 8, fill=1.0))
+    src_k, src_v = _kv(1, 2, 3, 8, fill=5.0)
+    layer.keys, layer.values = src_k, src_v
+    src_k.fill_(9.0)
+    assert layer.keys.data_ptr() != src_k.data_ptr() and layer.keys[0, 0, :, 0].tolist() == [5.0] * 3
+    keys, _values = layer.update(*_kv(1, 2, 1, 8, fill=2.0))
+    assert keys[0, 0, :, 0].tolist() == [5.0, 5.0, 5.0, 2.0]
+
+
+def test_grow_layer_copies_another_layers_arena_rows() -> None:
+    """two caches' layers in one arena storage (the card's): rows lifted from one into the other are copied, so the
+    first one's appends, and the arena passing to another owner, leave the second's rows as they were"""
+    arena = torch.zeros(2, 2, 1, 2, 16, 8, dtype=torch.bfloat16)
+    a, b = GrowLayer(), GrowLayer()
+    a.update(*_kv(1, 2, 4, 8, fill=1.0))
+    b.update(*_kv(1, 2, 2, 8, fill=7.0))
+    a.attach(arena[0, 0], arena[0, 1])
+    b.attach(arena[1, 0], arena[1, 1])
+    b.keys, b.values = a.keys[..., :3, :], a.values[..., :3, :]
+    assert (
+        b._an is None
+        and not b._attached()
+        and b.keys.untyped_storage().data_ptr() != arena.untyped_storage().data_ptr()
+    )
+    a.crop(1)
+    a.update(*_kv(1, 2, 3, 8, fill=4.0))
+    arena.fill_(-1.0)
+    assert b.keys[0, 0, :, 0].tolist() == [1.0, 1.0, 1.0]
+    # a cut from the middle of its own buffer is copied as well: a view that is not the front would be written
+    # over by the rows' own move back into the buffer
+    b.attach(arena[1, 0], arena[1, 1])
+    b.keys, b.values = b.keys[..., 1:3, :], b.values[..., 1:3, :]
+    assert b._an is None and b.keys.untyped_storage().data_ptr() != arena.untyped_storage().data_ptr()
+
+
+def test_grow_layer_does_not_take_a_strided_view_for_its_front() -> None:
+    layer = GrowLayer()
+    layer.update(*_kv(1, 2, 4, 8, fill=1.0))
+    kb, vb = layer._buf
+    layer.keys, layer.values = kb[:, :, ::2], vb[:, :, ::2]
+    assert layer._an is None and layer.keys.is_contiguous()
+
+
+def test_grow_layer_refuses_rows_of_the_wrong_rank() -> None:
+    layer = GrowLayer()
+    layer.update(*_kv(1, 2, 4, 8, fill=1.0))
+    with pytest.raises(ValueError, match="batch, kv heads"):
+        layer.keys = torch.zeros(2, 4, 8)
+
+
+def test_a_shared_layer_copies_rows_it_does_not_own() -> None:
+    """a shared (MLX) layer holds rows assigned from torch as an override until its next append: a copy, so the
+    caller's tensor changing in between does not change what is written in"""
+    need_mlx()
+    layer = GrowLayer(shared=True)
+    layer.update(*_kv(1, 2, 4, 8, fill=1.0, dtype=torch.bfloat16))
+    src_k, src_v = _kv(1, 2, 2, 8, fill=5.0, dtype=torch.bfloat16)
+    layer.keys, layer.values = src_k, src_v
+    src_k.fill_(9.0)
+    keys, _values = layer.update(*_kv(1, 2, 1, 8, fill=2.0, dtype=torch.bfloat16))
+    assert keys[0, 0, :, 0].tolist() == [5.0, 5.0, 2.0]
+    layer.keys, layer.values = layer.keys[..., :2, :], layer.values[..., :2, :]
+    assert layer._tk is None and layer.get_seq_length() == 2, "a cut of its own view is a new length"
+
+
 def test_grow_layer_reserves_the_cap_hint_and_not_the_floor() -> None:
     """`cap_hint` is prompt + max_new: the caller knows how far the sequence runs, so the buffer is that long
     and no longer. Without it every layer takes the 4096-position floor, which a batch of short decodes
