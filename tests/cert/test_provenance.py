@@ -112,8 +112,7 @@ def test_cpu_native_and_sampling_tags() -> None:
     if not os.path.isdir(QWEN3):
         pytest.skip("tiny_qwen3 not built")
     with loaded_model(QWEN3, device="cpu") as sm:
-        if Native.gemv is None:
-            pytest.skip("the native CPU gemv kernel is not built here")  # the load binds it if it exists
+        assert Native.gemv is not None, "the load bound no native CPU gemv kernel"
         sm.generate([1, 2, 3, 4], 6, speculate=False)
         greedy = sm.last_pass_report()
         assert {PassTag.CPU_NATIVE, PassTag.TIER_HOST, PassTag.SPEC_OFF, PassTag.SAMPLE_GREEDY} <= greedy.tags
@@ -172,8 +171,7 @@ def test_expert_store_and_mxfp4_tags() -> None:
         pytest.skip("tiny_gpt_oss-mxfp4.gguf not built")
     for flag, policy in ((0, PassTag.EXPERT_LINE), (1, PassTag.EXPERT_BUS_PASS)):
         with loaded_model(path, device="cpu", bus_pass=flag) as sm:
-            if sm.expert_store is None:
-                pytest.skip("this build has no direct reader, so the experts run off the checkpoint's tables")
+            assert sm.expert_store is not None, "the expert store did not open"
             sm.generate([1, 2, 3, 4], 4, speculate=False)
             tags = sm.last_pass_report().tags
         want = {PassTag.EXPERT_STORE, PassTag.EXPERT_MXFP4_ASSTORED, policy}
@@ -189,6 +187,7 @@ def test_mlx_mxfp4_experts_are_as_stored() -> None:
     if not os.path.isfile(path):
         pytest.skip("tiny_gpt_oss-mxfp4.gguf not built")
     with loaded_model(path, device="mlx", gguf_packed=1) as sm:
+        assert sm.expert_store is not None, "the expert store did not open"
         sm.generate([1, 2, 3, 4], 4, speculate=False)
         tags = sm.last_pass_report().tags
     assert PassTag.EXPERT_MXFP4_ASSTORED in tags, sorted(t.value for t in tags)

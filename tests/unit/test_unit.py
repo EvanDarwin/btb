@@ -19,7 +19,7 @@ from pytest import CaptureFixture, MonkeyPatch
 
 from btb import resolve_device
 from btb.engine import BatchScheduler, pack_bf16, unpack_bf16
-from tests.helpers import ROOT, SchedulerModel, checkout, need_native
+from tests.helpers import ROOT, SchedulerModel, checkout, native_library
 
 if TYPE_CHECKING:
     from btb.engine.tiers import _TiersMixin
@@ -144,7 +144,7 @@ def test_scheduler_off_the_card_takes_every_pending_row() -> None:
 
 
 def _native() -> Callable[..., int]:
-    lib = ctypes.CDLL(need_native())
+    lib = ctypes.CDLL(native_library())
     f = lib.btb_gemv_bf16_rows
     f.restype = ctypes.c_int32
     f.argtypes = [

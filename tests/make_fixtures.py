@@ -907,9 +907,7 @@ def _rebank_oracle() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     names = argv or list(FAMILIES)
-    # the receipts are banked by the native gemv kernel, so the suite's 1e-6 tolerance holds
-    if native_library() is None:
-        print("[fixture] warning: no native library found; receipts banked on the torch path", file=sys.stderr)
+    native_library()  # the receipts are banked by the native gemv kernel, so the suite's 1e-6 tolerance holds
     for name in names:
         make(name)
     _rebank_oracle()

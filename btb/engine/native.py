@@ -7,7 +7,6 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import os
-import platform
 import sys
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -15,44 +14,8 @@ from typing import Any
 import torch
 
 from .. import mlx as mlxdev
+from ..native_files import kernels_path, native_path
 from ..sysinfo import raise_file_limit
-
-# -- where the built library and the CUDA kernels ship: btb/native/<platform-tag>/ ---------------------------
-_LIB_NAMES = {"windows": "btb_native.dll", "linux": "libbtb_native.so", "macos": "libbtb_native.dylib"}
-# the package directory (btb/); this module sits one level down, in btb/engine/
-_PKG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def native_tag() -> str:
-    """Calculate the native platform tag"""
-    system = {"win32": "windows", "linux": "linux", "darwin": "macos"}.get(sys.platform, sys.platform)
-    m = platform.machine().lower()
-    arch = {"amd64": "x86_64", "x86_64": "x86_64", "arm64": "aarch64", "aarch64": "aarch64"}.get(m, m)
-    return f"{system}-{arch}"
-
-
-def native_path() -> str | None:
-    tag = native_tag()
-    own = _LIB_NAMES.get(tag.split("-")[0])
-    names = [own] if own else list(_LIB_NAMES.values())
-    cands = [os.path.join(_PKG, "native", tag, n) for n in names]
-    cands += [os.path.join(_PKG, "native", n) for n in _LIB_NAMES.values()]
-    for p in cands:
-        if os.path.exists(p):
-            return os.path.abspath(p)
-    return None
-
-
-def kernels_path() -> str | None:
-    """the CUDA decode kernels (btb_kernels.fatbin)"""
-    tag = native_tag()
-    for p in (
-        os.path.join(_PKG, "native", tag, "btb_kernels.fatbin"),
-        os.path.join(_PKG, "native", "btb_kernels.fatbin"),
-    ):
-        if os.path.exists(p):
-            return os.path.abspath(p)
-    return None
 
 
 def isa() -> str:
@@ -737,7 +700,6 @@ class _Cuda:
     _PROP_NORMAL, _PROP_STREAMING, _PROP_PERSISTING = 0, 1, 2
 
     def __init__(self, fatbin_path: str | os.PathLike[str]) -> None:
-        import sys
 
         name = self._NAMES.get({"win32": "windows", "linux": "linux"}.get(sys.platform, sys.platform))
         if name is None:

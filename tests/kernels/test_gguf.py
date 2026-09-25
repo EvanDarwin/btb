@@ -31,9 +31,9 @@ from tests.helpers import (
     loaded_model,
     max_abs,
     mxfp4_random,
+    native_library,
     need_cached,
     need_mlx,
-    need_native,
     safetensors_state,
 )
 
@@ -127,14 +127,13 @@ def _mxfp4_pair(rows: int, k: int, seed: int) -> tuple[np.ndarray, np.ndarray, n
 
 def test_the_cpu_mxfp4_kernel_reads_ggml_blocks_as_the_checkpoints() -> None:
     """the native matvec over ggml's layout gives the checkpoint layout's bits for the same weights, alone
-    and grouped, at every batch width the host path uses; skipped without the native library"""
+    and grouped, at every batch width the host path uses"""
     _need()
     from btb.engine.native import Native
     from btb.mxfp4 import MxWeight
 
-    need_native()
-    if Native.gemv_mx4_ggml is None:
-        pytest.skip("the native library predates ggml's layout")
+    native_library()
+    assert Native.gemv_mx4_ggml is not None, "the native library predates ggml's layout: rebuild it"
     rows, k = 96, 256
     for b in (1, 5, 16):
         blocks, scales, raw = _mxfp4_pair(rows, k, 7 + b)

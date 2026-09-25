@@ -7,12 +7,11 @@ rather than an error.
 """
 
 import numpy as np
-import pytest
 import torch
 
 from btb import mxfp4
 from btb.engine import StreamedTextModel
-from tests.helpers import mxfp4_random, mxfp4_slot, need_native
+from tests.helpers import mxfp4_random, mxfp4_slot, native_library
 
 
 def test_table_is_the_transformers_table() -> None:
@@ -47,9 +46,8 @@ def test_mxweight_wraps_slot_bytes_without_copying() -> None:
 
 
 def test_native_matvec_matches_the_numpy_reference() -> None:
-    need_native()
-    if StreamedTextModel.gemv_mx4 is None:
-        pytest.skip("the native library has no MXFP4 gemv")
+    native_library()
+    assert StreamedTextModel.gemv_mx4 is not None, "the native library has no MXFP4 gemv: rebuild it"
     rng = np.random.default_rng(13)
     for rows, k, b in ((1, 32, 1), (5, 64, 1), (128, 64, 3), (17, 2880, 8), (64, 96, 9)):
         blocks, scales = mxfp4_random(rng, rows, k, 118, 130)
@@ -69,9 +67,8 @@ def test_native_matvec_matches_the_numpy_reference() -> None:
 
 
 def test_native_group_matches_the_single_calls() -> None:
-    need_native()
-    if StreamedTextModel.gemv_mx4_group is None:
-        pytest.skip("the native library has no MXFP4 group gemv")
+    native_library()
+    assert StreamedTextModel.gemv_mx4_group is not None, "the native library has no MXFP4 group gemv: rebuild it"
     rng = np.random.default_rng(17)
     shapes = [(12, 64), (7, 128), (20, 96)]
     ws, xs, want = [], [], []

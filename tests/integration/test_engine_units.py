@@ -30,6 +30,7 @@ from tests.helpers import (
     layer_count,
     loaded_model,
     max_abs,
+    native_library,
     need_cuda,
     need_mlx,
     rel_err,
@@ -715,11 +716,9 @@ def test_mlx_decodes_run_on_one_worker_thread_whichever_thread_asks() -> None:
 def test_native_isa_is_a_tier_the_cert_matrix_knows() -> None:
     """the tier the library reports (what bench.yml banks a baseline under) is one of the `Isa` variants
     tests/cert/native_ops reads from the crate, so the two never disagree on a name"""
-    from btb.engine.native import isa, native_path
+    from btb.engine.native import isa
     from tests.cert.native_ops import ISA_TIERS
 
-    if native_path() is None:
-        pytest.skip("no native library")
     assert isa() in ISA_TIERS, (isa(), ISA_TIERS)
 
 
@@ -732,14 +731,10 @@ def test_native_open_names_the_os_error_when_the_file_limit_is_hit(tmp_path: Pat
     import errno
     import resource
 
-    from btb.engine.native import Native, NativeError, native_path
+    from btb.engine.native import Native, NativeError
 
-    dll = native_path()
-    if dll is None:
-        pytest.skip("no native library")
-    Native.load_gemv(dll)
-    if Native.open is None:
-        pytest.skip("the native library has no kept-handle reader")
+    native_library()
+    assert Native.open is not None, "the native library has no kept-handle reader: rebuild it"
     f = tmp_path / "shard.bin"
     f.write_bytes(b"\0" * 8192)
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -781,12 +776,10 @@ def test_every_native_kernel_refuses_a_dtype_it_was_not_built_for(monkeypatch: p
     """a kernel reads its tensors through raw pointers: an fp32 weight handed to the bf16 gemv was read as bf16
     pairs and decoded garbage without a word. Loaded `checked`, every fixed-type binding refuses before the call,
     naming the argument, and writes nothing"""
-    from btb.engine.native import Native, NativeDtypeError, native_path
+    from btb.engine.native import Native, NativeDtypeError
     from btb.mxfp4 import MxWeight, ggml_bytes, matrix_bytes
 
-    dll = native_path()
-    if dll is None:
-        pytest.skip("no native library")
+    dll = native_library()
     for name in Native.HANDLES:  # the unchecked bindings come back after the test
         monkeypatch.setattr(Native, name, getattr(Native, name))
     Native.load_gemv(dll, checked=True)
