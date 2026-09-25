@@ -3,9 +3,11 @@
 //! with top-k and top-p, the thresholds found by radix select over histograms (three levels of a float's
 //! ordered bits, no sort), the masses in 64-bit fixed point, the draw the argmax of the kept tokens' logits
 //! plus Gumbel noise hashed from the row's key and the token (the Metal kernel's formula: a draw only moves
-//! when two candidates tie to the ulp). Deterministic for a (key, row); rows across the thread pool.
+//! when two candidates tie to the ulp). Deterministic for a (key, row); rows across the thread pool. The NEON
+//! passes pick bit-for-bit what the scalar ones pick.
 
 use crate::codes::*;
+use crate::gemv::Isa;
 use rayon::prelude::*;
 
 const BINS: usize = 2048;
@@ -49,15 +51,265 @@ struct Cfg {
 }
 
 fn argmax(row: &[f32]) -> u32 {
-    let mut best = f32::NEG_INFINITY;
-    let mut bi = 0usize;
-    for (i, &v) in row.iter().enumerate() {
+    argmax_from(row, 0, f32::NEG_INFINITY, 0)
+}
+
+/// the lowest-index maximum over `row[from..]`, carried on from `best` at `bi`
+#[inline(always)]
+fn argmax_from(row: &[f32], from: usize, mut best: f32, mut bi: usize) -> u32 {
+    for (i, &v) in row.iter().enumerate().skip(from) {
         if v > best {
             best = v;
             bi = i;
         }
     }
     bi as u32
+}
+
+/// the scaled logits and their maximum (a NaN never wins it)
+fn scale_max(x: &[f32], inv_t: f32, s: &mut Vec<f32>) -> f32 {
+    s.clear();
+    s.extend(x.iter().map(|&a| a * inv_t));
+    s.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+}
+
+/// a token's mass in fixed point: none under `floor` or 21 nats below the top (a 2^-30 chance)
+#[inline(always)]
+fn mass(a: f32, m: f32, floor: u32) -> u64 {
+    if ordered(a) >= floor && a - m >= -21.0 {
+        (fast_exp(a - m) * MASS_SCALE) as u64
+    } else {
+        0
+    }
+}
+
+fn masses(s: &[f32], m: f32, floor: u32, w: &mut Vec<u64>) {
+    w.clear();
+    w.extend(s.iter().map(|&a| mass(a, m, floor)));
+}
+
+/// token `i`'s logit plus its Gumbel noise under `key`
+#[inline(always)]
+fn gumbel(key: u64, i: usize, a: f32) -> f32 {
+    let mut h = key ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 32;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 29;
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 32;
+    // 23 bits: the top of a 24-bit range rounds to 1.0 in f32, an infinite Gumbel that wins the row
+    let uf = ((h >> 41) as f32 + 0.5) * (1.0 / 8_388_608.0);
+    a - (-uf.ln()).ln()
+}
+
+/// the race over `s[from..]`, carried on from `best` at `bi`: a token under `floor` or 21 nats under
+/// the top (a 2^-30 chance) is left out
+#[inline(always)]
+fn draw_from(
+    s: &[f32],
+    m: f32,
+    floor: u32,
+    key: u64,
+    from: usize,
+    mut best: f32,
+    mut bi: usize,
+) -> (f32, usize) {
+    for (i, &a) in s.iter().enumerate().skip(from) {
+        if ordered(a) < floor || a - m < -21.0 {
+            continue;
+        }
+        let v = gumbel(key, i, a);
+        if v > best {
+            best = v;
+            bi = i;
+        }
+    }
+    (best, bi)
+}
+
+fn draw(s: &[f32], m: f32, floor: u32, key: u64) -> u32 {
+    draw_from(s, m, floor, key, 0, f32::NEG_INFINITY, 0).1 as u32
+}
+
+// NEON: the passes over a whole row four lanes at a time, each lane the scalar operation (no fused
+// multiply-add; max as fmaxnm, which is order-free), so a pick is bit-for-bit the scalar one. The
+// radix selects scatter into histograms and stay shared.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn ordered_neon(a: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::uint32x4_t {
+    use std::arch::aarch64::*;
+    let u = vreinterpretq_u32_f32(a);
+    let neg = vreinterpretq_u32_s32(vshrq_n_s32::<31>(vreinterpretq_s32_u32(u)));
+    veorq_u32(u, vorrq_u32(neg, vdupq_n_u32(0x8000_0000)))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fast_exp_neon(t: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    let n = vrndaq_f32(vmulq_f32(t, vdupq_n_f32(std::f32::consts::LOG2_E)));
+    let r = vsubq_f32(
+        vsubq_f32(t, vmulq_f32(n, vdupq_n_f32(0.693_145_75))),
+        vmulq_f32(n, vdupq_n_f32(1.428_606_8e-6)),
+    );
+    let mut p = vmulq_f32(r, vdupq_n_f32(0.000_198_412_7));
+    for c in [
+        0.001_388_889f32,
+        0.008_333_334,
+        0.041_666_668,
+        0.166_666_67,
+        0.5,
+        1.0,
+    ] {
+        p = vmulq_f32(r, vaddq_f32(vdupq_n_f32(c), p));
+    }
+    p = vaddq_f32(vdupq_n_f32(1.0), p);
+    let e = vaddq_s32(vcvtq_s32_f32(n), vdupq_n_s32(127));
+    let e = vminq_s32(vmaxq_s32(e, vdupq_n_s32(1)), vdupq_n_s32(254));
+    let y = vmulq_f32(vreinterpretq_f32_s32(vshlq_n_s32::<23>(e)), p);
+    vbslq_f32(vcltq_f32(t, vdupq_n_f32(-87.0)), vdupq_n_f32(0.0), y)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::needless_range_loop)]
+unsafe fn argmax_neon(row: &[f32]) -> u32 {
+    use std::arch::aarch64::*;
+    let n = row.len();
+    if n > u32::MAX as usize {
+        return argmax(row);
+    }
+    let p = row.as_ptr();
+    // sixteen lanes, each the lowest-index maximum of its own column of the row
+    let mut best = [vdupq_n_f32(f32::NEG_INFINITY); 4];
+    let mut idx = [vdupq_n_u32(0); 4];
+    let base: [u32; 4] = [0, 1, 2, 3];
+    let lane = vld1q_u32(base.as_ptr());
+    let mut cur = [0u32, 4, 8, 12].map(|o| vaddq_u32(lane, vdupq_n_u32(o)));
+    let mut i = 0;
+    while i + 16 <= n {
+        for k in 0..4 {
+            let v = vld1q_f32(p.add(i + 4 * k));
+            let gt = vcgtq_f32(v, best[k]);
+            best[k] = vbslq_f32(gt, v, best[k]);
+            idx[k] = vbslq_u32(gt, cur[k], idx[k]);
+            cur[k] = vaddq_u32(cur[k], vdupq_n_u32(16));
+        }
+        i += 16;
+    }
+    let (mut bv, mut bx) = ([0.0f32; 16], [0u32; 16]);
+    for k in 0..4 {
+        vst1q_f32(bv.as_mut_ptr().add(4 * k), best[k]);
+        vst1q_u32(bx.as_mut_ptr().add(4 * k), idx[k]);
+    }
+    // no lane holds a NaN; -0 == +0 here as in the scalar compare, so the first zero wins
+    let m = bv
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, |a, b| if b > a { b } else { a });
+    let bi = (0..16)
+        .filter(|&l| bv[l] == m)
+        .map(|l| bx[l])
+        .min()
+        .unwrap_or(0);
+    argmax_from(row, i, m, bi as usize)
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn scale_max_neon(x: &[f32], inv_t: f32, s: &mut Vec<f32>) -> f32 {
+    use std::arch::aarch64::*;
+    let n = x.len();
+    s.clear();
+    s.reserve(n);
+    let (src, dst) = (x.as_ptr(), s.as_mut_ptr());
+    let it = vdupq_n_f32(inv_t);
+    let mut mx = [vdupq_n_f32(f32::NEG_INFINITY); 4];
+    let mut i = 0;
+    while i + 16 <= n {
+        for (k, acc) in mx.iter_mut().enumerate() {
+            let v = vmulq_f32(vld1q_f32(src.add(i + 4 * k)), it);
+            vst1q_f32(dst.add(i + 4 * k), v);
+            *acc = vmaxnmq_f32(*acc, v);
+        }
+        i += 16;
+    }
+    while i + 4 <= n {
+        let v = vmulq_f32(vld1q_f32(src.add(i)), it);
+        vst1q_f32(dst.add(i), v);
+        mx[0] = vmaxnmq_f32(mx[0], v);
+        i += 4;
+    }
+    let mut m = vmaxnmvq_f32(vmaxnmq_f32(
+        vmaxnmq_f32(mx[0], mx[1]),
+        vmaxnmq_f32(mx[2], mx[3]),
+    ));
+    while i < n {
+        let v = *src.add(i) * inv_t;
+        *dst.add(i) = v;
+        m = m.max(v);
+        i += 1;
+    }
+    s.set_len(n);
+    m
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn masses_neon(s: &[f32], m: f32, floor: u32, w: &mut Vec<u64>) {
+    use std::arch::aarch64::*;
+    let n = s.len();
+    w.clear();
+    w.reserve(n);
+    let (src, dst) = (s.as_ptr(), w.as_mut_ptr());
+    let (mv, fl) = (vdupq_n_f32(m), vdupq_n_u32(floor));
+    let mut i = 0;
+    while i + 4 <= n {
+        let a = vld1q_f32(src.add(i));
+        let t = vsubq_f32(a, mv);
+        let keep = vandq_u32(
+            vcgeq_u32(ordered_neon(a), fl),
+            vcgeq_f32(t, vdupq_n_f32(-21.0)),
+        );
+        let e = vbslq_f32(keep, fast_exp_neon(t), vdupq_n_f32(0.0));
+        // f32 to f64 is exact and the fixed-point convert scales by 2^30 before truncating, as
+        // `(e * MASS_SCALE) as u64` does, saturating alike
+        vst1q_u64(
+            dst.add(i),
+            vcvtq_n_u64_f64::<30>(vcvt_f64_f32(vget_low_f32(e))),
+        );
+        vst1q_u64(dst.add(i + 2), vcvtq_n_u64_f64::<30>(vcvt_high_f64_f32(e)));
+        i += 4;
+    }
+    while i < n {
+        *dst.add(i) = mass(*src.add(i), m, floor);
+        i += 1;
+    }
+    w.set_len(n);
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn draw_neon(s: &[f32], m: f32, floor: u32, key: u64) -> u32 {
+    use std::arch::aarch64::*;
+    let n = s.len();
+    let p = s.as_ptr();
+    let (mv, fl, lim) = (vdupq_n_f32(m), vdupq_n_u32(floor), vdupq_n_f32(-21.0));
+    let (mut best, mut bi) = (f32::NEG_INFINITY, 0usize);
+    let mut i = 0;
+    while i + 16 <= n {
+        let mut skip = vdupq_n_u32(u32::MAX);
+        for k in 0..4 {
+            let a = vld1q_f32(p.add(i + 4 * k));
+            let out = vorrq_u32(
+                vcltq_u32(ordered_neon(a), fl),
+                vcltq_f32(vsubq_f32(a, mv), lim),
+            );
+            skip = vandq_u32(skip, out);
+        }
+        // a lane some token of the sixteen stays in: race them in order, as the scalar loop does
+        if vminvq_u32(skip) == 0 {
+            (best, bi) = draw_from(&s[..i + 16], m, floor, key, i, best, bi);
+        }
+        i += 16;
+    }
+    draw_from(s, m, floor, key, i, best, bi).1 as u32
 }
 
 /// the radix select over `s` (scaled logits): the threshold u (ordered bits) at which the count of tokens with
@@ -130,53 +382,53 @@ fn select_mass(s: &[f32], w: &[u64], top_p: f32, floor: u32) -> u32 {
     prefix
 }
 
-fn pick_row(x: &[f32], key: u64, c: Cfg, s: &mut Vec<f32>, w: &mut Vec<u64>) -> u32 {
-    if c.inv_t <= 0.0 {
-        return argmax(x);
-    }
-    let v = x.len();
-    s.clear();
-    s.extend(x.iter().map(|&a| a * c.inv_t));
-    let m = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut floor = 0u32;
-    if c.top_k > 0 && (c.top_k as usize) < v {
-        floor = select_count(s, c.top_k, 0);
-    }
-    if c.top_p < 1.0 {
-        // the masses in fixed point (a token below 2^-30 of the top one carries none), the top-p threshold
-        w.clear();
-        w.extend(s.iter().map(|&a| {
-            if ordered(a) >= floor && a - m >= -21.0 {
-                (fast_exp(a - m) * MASS_SCALE) as u64
-            } else {
-                0
+macro_rules! def_pick_row {
+    ($name:ident, $argmax:ident, $scale_max:ident, $masses:ident, $draw:ident) => {
+        unsafe fn $name(x: &[f32], key: u64, c: Cfg, s: &mut Vec<f32>, w: &mut Vec<u64>) -> u32 {
+            if c.inv_t <= 0.0 {
+                return $argmax(x);
             }
-        }));
-        floor = floor.max(select_mass(s, w, c.top_p, floor));
-    }
-    // the draw: argmax of s + gumbel over the kept tokens; a token 21 nats under the top (a 2^-30 chance)
-    // is left out of the race
-    let mut best = f32::NEG_INFINITY;
-    let mut bi = 0usize;
-    for (i, &a) in s.iter().enumerate() {
-        if ordered(a) < floor || a - m < -21.0 {
-            continue;
+            let v = x.len();
+            let m = $scale_max(x, c.inv_t, s);
+            let mut floor = 0u32;
+            if c.top_k > 0 && (c.top_k as usize) < v {
+                floor = select_count(s, c.top_k, 0);
+            }
+            if c.top_p < 1.0 {
+                $masses(s, m, floor, w);
+                floor = floor.max(select_mass(s, w, c.top_p, floor));
+            }
+            // the draw: argmax of s + gumbel over the kept tokens
+            $draw(s, m, floor, key)
         }
-        let mut h = key ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        h ^= h >> 32;
-        h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        h ^= h >> 29;
-        h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
-        h ^= h >> 32;
-        // 23 bits: the top of a 24-bit range rounds to 1.0 in f32, an infinite Gumbel that wins the row
-        let uf = ((h >> 41) as f32 + 0.5) * (1.0 / 8_388_608.0);
-        let v = a - (-uf.ln()).ln();
-        if v > best {
-            best = v;
-            bi = i;
-        }
+    };
+}
+
+def_pick_row!(pick_row, argmax, scale_max, masses, draw);
+#[cfg(target_arch = "aarch64")]
+def_pick_row!(
+    pick_row_neon,
+    argmax_neon,
+    scale_max_neon,
+    masses_neon,
+    draw_neon
+);
+
+#[inline]
+unsafe fn pick_on(
+    isa: Isa,
+    x: &[f32],
+    key: u64,
+    c: Cfg,
+    s: &mut Vec<f32>,
+    w: &mut Vec<u64>,
+) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    if isa == Isa::Neon {
+        return pick_row_neon(x, key, c, s, w);
     }
-    bi as u32
+    let _ = isa;
+    pick_row(x, key, c, s, w)
 }
 
 /// # Safety
@@ -220,10 +472,11 @@ pub unsafe fn sample_pick(
     let xs = unsafe { std::slice::from_raw_parts(x, rows * v) };
     let ks = unsafe { std::slice::from_raw_parts(keys, rows) };
     let os = unsafe { std::slice::from_raw_parts_mut(out, rows) };
+    let isa = crate::gemv::isa();
     let one = |r: usize, o: &mut u32| {
         let mut s = Vec::with_capacity(v);
         let mut w = Vec::with_capacity(v);
-        *o = pick_row(&xs[r * v..(r + 1) * v], ks[r], c, &mut s, &mut w);
+        *o = unsafe { pick_on(isa, &xs[r * v..(r + 1) * v], ks[r], c, &mut s, &mut w) };
     };
     if nt <= 1 || rows == 1 {
         for (r, o) in os.iter_mut().enumerate() {
@@ -308,6 +561,96 @@ mod tests {
         for (i, q) in p.iter().enumerate() {
             let f = counts[i] as f32 / n as f32;
             assert!((f - q).abs() < 0.02, "token {i}: {f} vs {q}");
+        }
+    }
+
+    /// Each NEON pass and the whole pick agree with the scalar ones to the bit, over ragged widths,
+    /// ties, signed zeros, infinities and NaNs; the C ABI runs one tier per process, so the two are
+    /// compared here.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_passes_are_bit_identical_to_scalar() {
+        let mut st = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            st = st
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            st
+        };
+        let uni = |r: u64| ((r >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 24.0;
+        let special = [
+            f32::NAN,
+            -f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            -0.0,
+            f32::MIN_POSITIVE / 4.0,
+            f32::MAX,
+        ];
+        let cfgs = [
+            (0.0f32, 0u32, 1.0f32),
+            (1.0, 0, 1.0),
+            (0.8, 40, 0.9),
+            (0.7, 0, 0.8),
+            (1.5, 3, 0.5),
+            (0.3, 0, 0.99),
+        ];
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+        for v in (1..=70).chain([255, 256, 257, 3001, 50257]) {
+            for kind in 0..4 {
+                let row: Vec<f32> = (0..v)
+                    .map(|_| {
+                        let r = next();
+                        match kind {
+                            0 => uni(r),
+                            1 => (r >> 61) as f32 - 3.0,
+                            2 if r % 5 == 0 => special[(r >> 32) as usize % special.len()],
+                            2 => uni(r),
+                            _ => [0.0, -0.0, f32::NEG_INFINITY][(r >> 32) as usize % 3],
+                        }
+                    })
+                    .collect();
+                let ctx = format!("v={v} kind={kind}");
+                unsafe {
+                    assert_eq!(argmax(&row), argmax_neon(&row), "{ctx}: argmax");
+                    for &(t, _, _) in &cfgs[1..] {
+                        let (mut s, mut sn) = (Vec::new(), Vec::new());
+                        let m = scale_max(&row, 1.0 / t, &mut s);
+                        let mn = scale_max_neon(&row, 1.0 / t, &mut sn);
+                        assert_eq!(m.to_bits(), mn.to_bits(), "{ctx} t={t}: max");
+                        assert_eq!(bits(&s), bits(&sn), "{ctx} t={t}: scaled");
+                        let floors = [0, if v > 7 { select_count(&s, 7, 0) } else { 0 }];
+                        for floor in floors {
+                            let (mut w, mut wn) = (Vec::new(), Vec::new());
+                            masses(&s, m, floor, &mut w);
+                            masses_neon(&s, m, floor, &mut wn);
+                            assert_eq!(w, wn, "{ctx} t={t} floor={floor}: masses");
+                            for key in 0..3u64 {
+                                assert_eq!(
+                                    draw(&s, m, floor, key),
+                                    draw_neon(&s, m, floor, key),
+                                    "{ctx} t={t} floor={floor} key={key}: draw"
+                                );
+                            }
+                        }
+                    }
+                    for &(t, k, p) in &cfgs {
+                        let inv_t = if t > 0.0 { 1.0 / t } else { 0.0 };
+                        let c = Cfg {
+                            inv_t,
+                            top_k: k,
+                            top_p: p,
+                        };
+                        for key in [0u64, 0xDEAD_BEEF, u64::MAX] {
+                            let (mut s, mut w) = (Vec::new(), Vec::new());
+                            let a = pick_row(&row, key, c, &mut s, &mut w);
+                            let b = pick_row_neon(&row, key, c, &mut s, &mut w);
+                            assert_eq!(a, b, "{ctx} t={t} k={k} p={p} key={key}: pick");
+                        }
+                    }
+                }
+            }
         }
     }
 

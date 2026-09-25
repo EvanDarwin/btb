@@ -6,9 +6,13 @@
 //! The step advances one position for every head, so there is no token-batch axis; the plan's
 //! rows {1, 4, 16} sweep does not apply, and the bench measures the single real shape with and
 //! without a conv bias (the two branches the parity test covers). `mixed_qkv`, `conv_state` and
-//! `state` are updated in place; a bench reuses the same buffers across iterations, so the state
-//! drifts, which does not change the per-call cost. Threads is pinned to 1; the tier is read from
-//! `isa()` and tagged into every id. See `benches/gemv.rs` for the ISA/OnceLock note.
+//! `state` are updated in place, so every call gets them fresh from the generated inputs, copied
+//! outside the timing: fed its own output, the conv overflows to inf within ~200 calls and the
+//! state fills with subnormals, whose cost grows with the iteration count and swung the bench by
+//! 25-40% between identical kernels. Threads is pinned to 1; the tier is read from `isa()` and
+//! tagged into every id. See `benches/gemv.rs` for the ISA/OnceLock note.
+
+use std::time::{Duration, Instant};
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
@@ -16,7 +20,7 @@ use btb_native::btb_delta_step;
 
 #[path = "../tests/common/refs.rs"]
 mod refs;
-use refs::{gen_delta, DeltaShape};
+use refs::{gen_delta, DeltaIn, DeltaShape};
 
 const S: DeltaShape = DeltaShape {
     hk: 16,
@@ -33,11 +37,10 @@ fn tier() -> String {
 
 fn bench_delta(c: &mut Criterion) {
     let isa = tier();
-    let c_dim = S.c();
     let mut g = c.benchmark_group("delta_step");
     for (bias, seed) in [(false, 11u64), (true, 22u64)] {
         let n = gen_delta(&S, seed, bias);
-        // In-place buffers, copied from the generated inputs once.
+        // In-place buffers, refilled from the generated inputs before every call.
         let mut mixed = n.mixed.clone();
         let mut conv_state = n.conv_state.clone();
         let mut state = n.state.clone();
@@ -45,33 +48,62 @@ fn bench_delta(c: &mut Criterion) {
         let conv_b_ptr = n.conv_b.as_ref().map_or(std::ptr::null(), |b| b.as_ptr());
         let label = if bias { "bias" } else { "nobias" };
         g.bench_with_input(BenchmarkId::new(&isa, label), &bias, |bch, _| {
-            bch.iter(|| unsafe {
-                btb_delta_step(
-                    mixed.as_mut_ptr(),
-                    conv_state.as_mut_ptr(),
-                    black_box(n.conv_w.as_ptr()),
-                    conv_b_ptr,
-                    c_dim,
-                    S.k,
-                    black_box(n.z.as_ptr()),
-                    n.a.as_ptr(),
-                    n.b.as_ptr(),
-                    n.a_log.as_ptr(),
-                    n.dt_bias.as_ptr(),
-                    state.as_mut_ptr(),
-                    S.hk,
-                    S.hv,
-                    S.dk,
-                    S.dv,
-                    n.norm_w.as_ptr(),
-                    EPS,
-                    out.as_mut_ptr(),
-                    1,
-                )
+            bch.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    mixed.copy_from_slice(&n.mixed);
+                    conv_state.copy_from_slice(&n.conv_state);
+                    state.copy_from_slice(&n.state);
+                    let t = Instant::now();
+                    black_box(step(
+                        &n,
+                        conv_b_ptr,
+                        &mut mixed,
+                        &mut conv_state,
+                        &mut state,
+                        &mut out,
+                    ));
+                    total += t.elapsed();
+                }
+                total
             });
         });
     }
     g.finish();
+}
+
+fn step(
+    n: &DeltaIn,
+    conv_b_ptr: *const f32,
+    mixed: &mut [f32],
+    conv_state: &mut [f32],
+    state: &mut [f32],
+    out: &mut [f32],
+) -> i32 {
+    unsafe {
+        btb_delta_step(
+            mixed.as_mut_ptr(),
+            conv_state.as_mut_ptr(),
+            black_box(n.conv_w.as_ptr()),
+            conv_b_ptr,
+            S.c(),
+            S.k,
+            black_box(n.z.as_ptr()),
+            n.a.as_ptr(),
+            n.b.as_ptr(),
+            n.a_log.as_ptr(),
+            n.dt_bias.as_ptr(),
+            state.as_mut_ptr(),
+            S.hk,
+            S.hv,
+            S.dk,
+            S.dv,
+            n.norm_w.as_ptr(),
+            EPS,
+            out.as_mut_ptr(),
+            1,
+        )
+    }
 }
 
 criterion_group!(delta, bench_delta);
