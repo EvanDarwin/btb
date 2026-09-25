@@ -135,22 +135,15 @@ def mlx_core() -> ModuleType | None:
     return mx
 
 
-def native_library() -> str | None:
-    """the native library's path with its kernels bound to the engine, None where it is not built (the torch
-    path answers then)"""
+def native_library() -> str:
+    """the native library's path with its kernels bound to the engine; conftest refuses a run without it"""
     from btb import native_path
     from btb.engine import StreamedTextModel
 
     p = native_path()
-    if p:
-        StreamedTextModel.load_gemv(p)
-    return p
-
-
-def need_native() -> str:
-    p = native_library()
     if p is None:
-        pytest.skip("no native library built")
+        raise RuntimeError("no native library built for this machine: `python build.py build --no-wheel`")
+    StreamedTextModel.load_gemv(p)
     return p
 
 

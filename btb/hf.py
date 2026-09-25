@@ -79,7 +79,12 @@ GGUF_EXT = ".gguf"
 # btb's families by their llama.cpp architecture name (general.architecture) -> the ModelType the loader assigns.
 # The keys are llama.cpp's arch strings (its vocabulary, e.g. "gpt-oss" hyphenated); the values are ModelType so
 # a GGUF target is tied to the enum, not a loose string (consistency_problems checks each is served).
-ARCH_MODEL_TYPES = {"qwen3": ModelType.QWEN3, "phi3": ModelType.PHI3, "gpt-oss": ModelType.GPT_OSS}
+ARCH_MODEL_TYPES = {
+    "qwen3": ModelType.QWEN3,
+    "phi3": ModelType.PHI3,
+    "gpt-oss": ModelType.GPT_OSS,
+    "qwen35": ModelType.QWEN3_5_TEXT,
+}
 # the bits an integer takes in each type the affine decoder reads; the only part of the table below that no
 # declaration derives
 _AFFINE_BITS = {Quant.Q4_0: 4, Quant.Q4_1: 4, Quant.Q8_0: 8, Quant.Q4_K: 4}
@@ -88,6 +93,11 @@ _AFFINE_BITS = {Quant.Q4_0: 4, Quant.Q4_1: 4, Quant.Q8_0: 8, Quant.Q4_K: 4}
 # AFFINE class from kinds.QUANT_KIND, plus Q4_K, which the affine decoder also produces though it is classified
 # by the k-quant kernel it binds through first.
 AFFINE_TYPES: dict[Quant, int] = {q: _AFFINE_BITS[q] for q in [*quants_of(QuantClass.AFFINE), Quant.Q4_K]}
+
+# llama.cpp's architecture for transformers' qwen4_exp, which the gguf package's releases (0.19) do not know yet:
+# btb carries its tensor names until they do (gguf.OWN_NAMES)
+QWEN4EXP = "qwen4exp"
+ARCH_MODEL_TYPES[QWEN4EXP] = ModelType.QWEN4_EXP_TEXT
 
 
 def is_gguf(path: Any) -> bool:

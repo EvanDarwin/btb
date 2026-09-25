@@ -14,8 +14,9 @@ if TYPE_CHECKING:
     import torch
 
     from .engine.branches import Branches, _Rows
-    from .engine.cache import KvCache, LinearStates
+    from .engine.cache import KvCache
     from .engine.drafter import MTPDrafter
+    from .engine.generate import LinSnap
     from .engine.hooks import Taps
     from .engine.model import StreamedTextModel
     from .engine.state import _State
@@ -31,7 +32,7 @@ class Anchor(TypedDict):
     last layer's state at its last row (the drafter's start)"""
 
     n: int
-    states: dict[int, LinearStates]
+    states: dict[int, LinSnap]
     h_last: torch.Tensor | None
 
 
@@ -41,7 +42,7 @@ class Mark:
     be cropped back, so they are kept), and the token drawn but not yet fed or the next token's logits"""
 
     n: int
-    states: dict[int, LinearStates] = field(default_factory=dict)
+    states: dict[int, LinSnap] = field(default_factory=dict)
     pending: int | None = None
     logits: torch.Tensor | None = None
 
@@ -198,8 +199,14 @@ class Session:
             return Mark(len(self.ids), {}, self.pending, self.logits)
 
         def run() -> Mark:
+            from .engine.generate import lin_layer
+
             self._flush(eng)
-            states = {i: eng._lin_snap(cache.layers[i]) for i in range(eng.L) if eng.layer_types[i] == LayerKind.LINEAR}
+            states = {
+                i: eng._lin_snap(lin_layer(cache.layers[i]))
+                for i in range(eng.L)
+                if eng.layer_types[i] == LayerKind.LINEAR
+            }
             return Mark(len(self.ids), states, self.pending, self.logits)
 
         return eng._serial(run)
@@ -218,10 +225,12 @@ class Session:
             if mark.n == 0 or self.cache is None:
                 self.cache, self.anchor = None, []
             else:
+                from .engine.generate import lin_layer
+
                 self._flush(eng)
                 crop(self.cache, eng, mark.n)
                 for i, snap in mark.states.items():
-                    eng._lin_restore(self.cache.layers[i], snap)
+                    eng._lin_restore(lin_layer(self.cache.layers[i]), snap)
                 self.anchor = [a for a in self.anchor if a["n"] <= mark.n]
             del self.ids[mark.n :]
             self.n_prompt = min(self.n_prompt, mark.n)
@@ -337,9 +346,11 @@ class Session:
         elif LayerKind.LINEAR in engine.layer_types:
             anchored = self.anchored(m)
             if anchored is not None:
+                from .engine.generate import lin_layer
+
                 cache, reuse = self.cache, int(anchored["n"])
                 for i, snap in anchored["states"].items():
-                    engine._lin_restore(cache.layers[i], snap)
+                    engine._lin_restore(lin_layer(cache.layers[i]), snap)
         elif m > 0:
             cache, reuse = self.cache, m
         if cache is None:

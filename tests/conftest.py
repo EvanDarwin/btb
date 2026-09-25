@@ -54,7 +54,15 @@ def _release_allocator_caches() -> Iterator[None]:
 
 
 def pytest_configure(config: Config) -> None:
+    _require_native()
     _warn_missing_prereqs(config)
+
+
+def _require_native() -> None:
+    """no run without the native library: its kernel, store and receipt tests would take the torch path or skip, and
+    the run would pass having certified none of them. A file check, so the torch-free cert gate can run it."""
+    if btb.native_path() is None:
+        raise pytest.UsageError("no native library built for this machine: `python build.py build --no-wheel`")
 
 
 def pytest_report_header() -> str | None:

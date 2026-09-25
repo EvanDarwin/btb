@@ -23,8 +23,7 @@ MOE = "tiny_gpt_oss"  # the served MoE family whose tiny fixture builds a store
 def _policy(path: str, **load_kw: object) -> tuple[str, frozenset[PassTag]]:
     """(the residency class the store chose, the tags one greedy pass recorded)"""
     with loaded_model(path, device="cpu", **load_kw) as sm:
-        if sm.expert_store is None:
-            pytest.skip("this build has no direct reader, so the experts run off the checkpoint's tables")
+        assert sm.expert_store is not None, "the expert store did not open"
         sm.generate([1, 2, 3, 4], 4, speculate=False)
         return type(sm.expert_store.res).__name__, sm.last_pass_report().tags
 

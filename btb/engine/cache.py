@@ -26,10 +26,6 @@ else:
     # discovery and planning too, where transformers' import time is not wanted
     _DynamicLayer = __import__("transformers").cache_utils.DynamicLayer
 
-# a linear-attention layer's states copied out (a mark's, an anchor's): its conv and recurrent states, per state
-# index where the layer keeps several
-LinearStates = tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]] | tuple[torch.Tensor, torch.Tensor]
-
 
 def linear_layer(cl: CacheLayer) -> LinearAttentionCacheLayerMixin:
     """`cl` as the linear-attention layer a hybrid's linear index holds; a TypeError for any other"""

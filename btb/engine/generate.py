@@ -6,17 +6,17 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import torch
 
 from .. import mlx as mlxdev
 from ..draft import NGramProposer, SpanBank, Spans
-from ..kinds import Json, LayerKind, PassTag, Proposer, TokenRows, Tokens
+from ..kinds import PROPOSER_TAG, Json, LayerKind, PassTag, Proposer, TokenRows, Tokens
 from ..options import Device
 from ..sampling import GREEDY, Sampling, Verify
 from ..session import Session
-from .cache import LinearStates, linear_layer
+from .cache import linear_layer
 from .drafter import MTPDrafter
 from .hooks import Hooks
 from .state import _State
@@ -24,8 +24,26 @@ from .state import _State
 if TYPE_CHECKING:
     from .cache import CacheLayer
 
+# one of a DeltaNet layer's two states, as the layer holds it: a tensor, or a dict of them by index
+LinState = torch.Tensor | dict[int, torch.Tensor]
+# a DeltaNet layer's (conv, recurrent) states copied, for a later `_lin_restore`
+LinSnap = tuple[LinState, LinState]
 
-def _lin(cl: Any) -> tuple[torch.Tensor, torch.Tensor]:
+
+class LinLayer(Protocol):
+    """a cache layer of a DeltaNet (linear attention) layer, as the helpers below read and write it"""
+
+    conv_states: LinState
+    recurrent_states: LinState
+
+
+def lin_layer(cl: CacheLayer) -> LinLayer:
+    """`cl` as the helpers below take it; a TypeError for a layer that is not a DeltaNet's. transformers types its
+    states dict[int, Tensor | None], and `_lin_snap` copies only the ones set."""
+    return cast(LinLayer, linear_layer(cl))
+
+
+def _lin(cl: LinLayer) -> tuple[torch.Tensor, torch.Tensor]:
     c, r = cl.conv_states, cl.recurrent_states
     if isinstance(c, dict):
         c = c[0]
@@ -82,29 +100,27 @@ class _GenerateMixin(_State):
     _lin = staticmethod(_lin)
 
     @staticmethod
-    def _lin_snap(cl: CacheLayer) -> LinearStates:
-        lin = linear_layer(cl)
-        c, r = lin.conv_states, lin.recurrent_states
-        return (
-            {k: v.clone() for k, v in c.items() if isinstance(v, torch.Tensor)},
-            {k: v.clone() for k, v in r.items() if isinstance(v, torch.Tensor)},
-        )
+    def _lin_snap(cl: LinLayer) -> LinSnap:
+        def copy(s: LinState) -> LinState:
+            if isinstance(s, dict):
+                return {k: v.clone() for k, v in s.items() if isinstance(v, torch.Tensor)}
+            return s.clone()
+
+        return copy(cl.conv_states), copy(cl.recurrent_states)
 
     @staticmethod
-    def _lin_restore(cl: CacheLayer, snap: LinearStates) -> None:
-        lin = linear_layer(cl)
+    def _lin_restore(cl: LinLayer, snap: LinSnap) -> None:
         conv, rec = snap
-        if isinstance(conv, torch.Tensor) and isinstance(rec, torch.Tensor):
-            c, r = _lin(lin)
-            c.copy_(conv)
-            r.copy_(rec)
+        if isinstance(conv, dict) and isinstance(rec, dict):
+            for k, v in conv.items():
+                cl.conv_states[k].copy_(v)
+            for k, v in rec.items():
+                cl.recurrent_states[k].copy_(v)
             return
-        assert isinstance(conv, dict) and isinstance(rec, dict)
-        for states, saved in ((lin.conv_states, conv), (lin.recurrent_states, rec)):
-            for k, v in saved.items():
-                dst = states[k]
-                assert dst is not None
-                dst.copy_(v)
+        assert isinstance(conv, torch.Tensor) and isinstance(rec, torch.Tensor)  # _lin_snap copies both alike
+        c, r = _lin(cl)
+        c.copy_(conv)
+        r.copy_(rec)
 
     def _session_prefill(
         self, ids: torch.Tensor, cache: Any, reuse: int, session: Session | None, on_layer: Any = None
@@ -169,7 +185,7 @@ class _GenerateMixin(_State):
             hk.tap(0, i, h[0, node])
 
     @staticmethod
-    def _lin_set(cl: Any, conv: torch.Tensor, rec: torch.Tensor) -> None:
+    def _lin_set(cl: LinLayer, conv: torch.Tensor, rec: torch.Tensor) -> None:
         if isinstance(cl.conv_states, dict):
             cl.conv_states[0] = conv
         else:
@@ -286,7 +302,7 @@ class _GenerateMixin(_State):
 
             ks = getattr(self, "draft_ks", None) or (3, 2, 1)
             prop = UnionProposer(ModelProposer(draft, prompt, ks=ks), prop)
-        self._tag(PassTag.SPEC_MTP if use_mtp else (PassTag.SPEC_DRAFT if draft is not None else PassTag.SPEC_NGRAM))
+        self._tag(PassTag.SPEC_DRAFT if draft is not None and not use_mtp else PROPOSER_TAG[prop_kind])
         by_src: dict[str, dict[str, int]] = {"drafted": {}, "accepted": {}}
         last_base = n
         if use_mtp:

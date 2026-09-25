@@ -61,7 +61,6 @@ class Missing(StrEnum):
     A new gap kind is one member here and one row in MISSING - the natural-language taxonomy lives in one place."""
 
     GGUF_LOAD = "gguf-load"
-    MXFP4_NON_GPTOSS = "mxfp4-non-gptoss"
     GPTOSS_GGUF_TWIN = "gptoss-gguf-twin"
     KIQUANT_FIXTURE = "kiquant-fixture"
     MEGAKERNEL = "megakernel"
@@ -70,12 +69,12 @@ class Missing(StrEnum):
     CARD_GRAPH_FAMILY = "card-graph-family"
     CARD_GRAPH_SHAPE = "card-graph-shape"
     SPEC_MTP_HEAD = "spec-mtp-head"
-    SPEC_DECODE = "spec-decode"
+    GGUF_MTP_HEAD = "gguf-mtp-head"
+    SPEC_OWN_LAYER = "spec-own-layer"
     FP16_FIXTURE = "fp16-fixture"
     FP32_FIXTURE = "fp32-fixture"
-    FP8_UNIMPLEMENTED = "fp8-unimplemented"
+    FP8_FIXTURE = "fp8-fixture"
     QUANT_FIXTURE = "quant-fixture"
-    NO_RUNNER_CELL = "no-runner-cell"
     NO_FIXTURE = "no-fixture"
 
 
@@ -87,11 +86,6 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "hf.ARCH_MODEL_TYPES, so no GGUF path exists for it",
         "add the family's architecture to hf.ARCH_MODEL_TYPES with its GGUF tensor-name mapping, then commit a "
         "tiny GGUF fixture (tests/make_fixtures.py) so the storage cells can bind",
-    ),
-    Missing.MXFP4_NON_GPTOSS: (
-        "an mxfp4 GGUF is expected for a family that does not use mxfp4 (mxfp4 is gpt-oss's expert format)",
-        "either wire mxfp4 loading for this family and add a fixture, or, if mxfp4 is genuinely gpt-oss-only, "
-        "record that as a DNR in dnr() with the proof - do not leave it an implied gap",
     ),
     Missing.GPTOSS_GGUF_TWIN: (
         "gpt-oss ships only an mxfp4 GGUF; no GGUF twin of it in any other stored type is produced",
@@ -140,13 +134,22 @@ MISSING: dict[Missing, tuple[str, str]] = {
     Missing.SPEC_MTP_HEAD: (
         "speculation via an MTP head cannot run: this family's tiny fixture has no MTP drafter head (no `mtp.*` "
         "entry in its weight map, the engine's own probe at scheduler.py:573)",
-        "add an MTP head to the fixture in tests/make_fixtures.py (see _mtp_head), then add a spec-mtp runner "
-        "cell - spec.has_mtp_head reads the fixture, so no list needs editing",
+        "where the architecture ships a drafting head, add one to the fixture in tests/make_fixtures.py (see "
+        "_mtp_head); where it ships none, the MTP proposers need a drafter made from the model's own layers - "
+        "spec.has_mtp_head reads the fixture, so the cells follow with no list to edit",
     ),
-    Missing.SPEC_DECODE: (
-        "speculation decode is not exercised at all - the cert runner decodes greedily (speculate=False)",
-        "add spec-decode runner cells (MTP, n-gram, and a draft-model pair) that assert the accepted tokens match "
-        "a banked greedy oracle; speculation is otherwise entirely uncertified",
+    Missing.GGUF_MTP_HEAD: (
+        "the GGUF reader maps no MTP drafting head: llama.cpp keeps a checkpoint's head as NextN layers "
+        "(blk.N.nextn.*, counted into block_count), which btb/gguf.py does not map to the engine's `mtp.*`, and "
+        "the tiny twins are written without them (write_gguf drops mtp.*, as the converter's --no-mtp does)",
+        "map the NextN layers to `mtp.*` in GGUFModel.weight_map (inverting what the converter wrote), keep them "
+        "in the twins write_gguf writes, and the MTP cells run on the GGUF storages",
+    ),
+    Missing.SPEC_OWN_LAYER: (
+        "the engine turns speculation off for a family that brings its own layer (`sm.fam.own` sets v_max and "
+        "tree_budget to 0 at load, btb/__init__.py), so no proposer ever drafts for it",
+        "teach the family's own layer the verify pass (several rows, and the tree mask where the tier verifies "
+        "trees), drop the load's refusal, and its speculation cells run like any other family's",
     ),
     Missing.FP16_FIXTURE: (
         "this family has no fp16 safetensors twin (`<stem>-f16`, every float tensor stored F16), so its fp16 "
@@ -160,22 +163,17 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "regenerate the precision twins (`python tests/make_fixtures.py twins`); spec.fixture_paths binds a twin "
         "whose headers carry F32 and no other float dtype",
     ),
-    Missing.FP8_UNIMPLEMENTED: (
-        "fp8 checkpoint loading is unimplemented (no float8/e4m3/e5m2 path in the engine), so the fp8 storage "
-        "axis cannot be covered",
-        "implement fp8 dequant/load in the engine, then add an fp8 fixture; or record fp8 as out of scope",
+    Missing.FP8_FIXTURE: (
+        "this family has no fine-grained FP8 safetensors twin (`<stem>-f8_e4m3`, its matrices e4m3 with their "
+        "scale grids), so its FP8 load and matvec paths are exercised by nothing",
+        "regenerate the precision twins (`python tests/make_fixtures.py twins`); spec.fixture_paths binds a twin "
+        "whose headers carry F8_E4M3",
     ),
     Missing.QUANT_FIXTURE: (
         "this storage stands for several stored types (one kernel each) and only some have a tiny GGUF twin, so "
         "certifying the cell off the ones that exist would claim kernels nothing reads",
         "write the missing twins in tests/make_fixtures.py - the cell binds one file per kinds.Quant member of "
         "its class, so the report names exactly which are absent",
-    ),
-    Missing.NO_RUNNER_CELL: (
-        "the fixture is on disk and the path is implemented, but no cert run loads this storage on this device "
-        "sub-path - there is no receipt id it could ever produce",
-        "add the combination to spec.SURFACE_SUBPATHS and give test_cert_runner a cell for it, or record why the "
-        "combination is not a distinct run in dnr()",
     ),
     Missing.NO_FIXTURE: (
         "this family is served but has no tiny fixture for this storage at all",
@@ -188,7 +186,7 @@ MISSING: dict[Missing, tuple[str, str]] = {
 SAFE_PRECISION_GAP: dict[spec.Storage, Missing] = {
     spec.Storage.SAFE_FP16: Missing.FP16_FIXTURE,
     spec.Storage.SAFE_FP32: Missing.FP32_FIXTURE,
-    spec.Storage.SAFE_FP8: Missing.FP8_UNIMPLEMENTED,
+    spec.Storage.SAFE_FP8: Missing.FP8_FIXTURE,
 }
 
 
@@ -242,12 +240,11 @@ FORK_NOTES: dict[PassTag, str] = {
         "MXFP4 experts widened instead of multiplied as stored (host.py:376) happens only where the native "
         "library was built without the mx4 matvec, which the cert's own machines are not"
     ),
-    PassTag.SPEC_OFF: "every runner cell decodes with speculate=False; the tag is carried but nothing asserts it",
-    PassTag.SPEC_MTP: "no runner cell speculates (Missing.SPEC_DECODE); the decode axis reports it per family",
-    PassTag.SPEC_DRAFT: "no runner cell speculates; a sibling draft model also needs a second cached model",
-    PassTag.SPEC_NGRAM: "no runner cell speculates (Missing.SPEC_DECODE)",
-    PassTag.SPEC_ACCEPT: "an accepted draft; unreachable while no cell speculates",
-    PassTag.SPEC_REJECT: "a rejected draft; unreachable while no cell speculates",
+    PassTag.SPEC_ACCEPT: (
+        "a draft's outcome, not a path a cell selects: a speculative cell requires drafts and holds its tokens to "
+        "the plain decode's, and how many of a tiny random fixture's drafts are accepted is the fixture's doing"
+    ),
+    PassTag.SPEC_REJECT: "a draft's outcome, as SPEC_ACCEPT",
 }
 
 
@@ -255,6 +252,7 @@ def expected_tags() -> frozenset[PassTag]:
     """every PassTag some device sub-path's cell would assert, over the served families and storages - the tags
     the grid is able to certify. Derived from the sub-path table, so adding a sub-path closes a fork note."""
     out = {PassTag.SAMPLE_GREEDY, PassTag.SAMPLE_STOCHASTIC}  # asserted by every runner cell, per decode
+    out |= {spec.decode_tag(d) for d in spec.DecodePath}  # the decode path's own, greedy's SPEC_OFF included
     for dev in spec.DEVICE_SUBPATHS:
         for kind in core.served_kinds():
             for st in spec.Storage:
@@ -328,20 +326,34 @@ def cell_ids(
     kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath, decode: spec.DecodePath
 ) -> tuple[str, ...]:
     """every receipt id a cell needs before it is COVERED, empty when no cert run exercises the combination at
-    all (which is Missing.NO_RUNNER_CELL, not silence). The runner decodes without speculation, so only the
-    GREEDY decode path has runs; its two samplers are two ids of the same cell."""
+    all (which `compute_cells` raises on). The GREEDY decode path's two samplers are two ids of the same cell; a
+    speculative path is one id per fixture, its decode path's name last."""
     stem = spec.FIXTURE_STEM.get(kind)
-    if stem is None or decode is not spec.DecodePath.GREEDY:
+    if stem is None:
         return ()
     container = spec.STORAGE[storage].container
     surface = spec.CONTAINER_SURFACE[container]
     if dev.key not in spec.SURFACE_SUBPATHS[surface]:
         return ()
+    if decode is not spec.DecodePath.GREEDY:
+        return tuple(spec_id(kind, storage, p, dev.key, decode) for p in spec.fixture_paths(kind, storage))
     if container is spec.Container.SAFETENSORS:
         return tuple(safetensors_id(kind, dev.key, d, storage) for d in spec.Decode)
     if container is spec.Container.PACK12:
         return (stem_id(surface, stem, dev.key),)
     return tuple(gguf_id(p, dev.key) for p in spec.fixture_paths(kind, storage))
+
+
+def spec_id(kind: FamilyKind, storage: spec.Storage, path: str, key: str, decode: spec.DecodePath) -> str:
+    """the id for a speculative decode of one fixture on one sub-path: the greedy cell's own subject (the
+    family and precision, the GGUF file, the 12-bit store's stem), the sub-path, then the decode path"""
+    container = spec.STORAGE[storage].container
+    surface = spec.CONTAINER_SURFACE[container]
+    if container is spec.Container.SAFETENSORS:
+        subject = safetensors_subject(kind, storage)
+    else:
+        subject = os.path.basename(path).removesuffix(".gguf")
+    return cell_id(surface, subject, key, decode.value)
 
 
 def shape_ids() -> frozenset[str]:
@@ -382,6 +394,11 @@ def dnr(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath, decode
         return (
             f"not a distinct cell: {dev.key}'s knob is a no-op on a family without {dev.needs.value} "
             f"(identical to the plain {dev.hardware.value} run)"
+        )
+    if spec.quant_class(storage) is QuantClass.MXFP4 and Cap.MOE not in core.flags(kind):
+        return (
+            "not a distinct cell: llama.cpp's MXFP4_MOE stores only 3-D expert tensors as MXFP4 and every other "
+            "as Q8_0 (src/llama-quant.cpp), so a dense family's MXFP4 file is its Q8_0 file (the gguf-affine run)"
         )
     return None
 
@@ -436,8 +453,6 @@ def gap_reason(
     if info.container is spec.Container.GGUF:
         if kind not in core.gguf_kinds():
             return Missing.GGUF_LOAD
-        if qc is QuantClass.MXFP4 and Cap.MXFP4 not in fl:
-            return Missing.MXFP4_NON_GPTOSS
         if Cap.MXFP4 in fl and qc is not QuantClass.MXFP4:
             return Missing.GPTOSS_GGUF_TWIN
     # 2. the device sub-path the engine does not engage for this family or this fixture
@@ -455,12 +470,15 @@ def gap_reason(
         return Missing.NO_FIXTURE
     if absent:
         return Missing.QUANT_FIXTURE
-    # 4. a decode path the cert runner does not drive
+    # 4. a decode path the engine does not take for this family
+    if spec.DECODE_KIND[decode] is not spec.DecodeKind.PLAIN and Cap.OWN in fl:
+        return Missing.SPEC_OWN_LAYER
     proposer = spec.DECODE_PROPOSER[decode]
-    if proposer is not None and proposer.mtp and not spec.has_mtp_head(kind):
-        return Missing.SPEC_MTP_HEAD
-    if spec.DECODE_KIND[decode] is not spec.DecodeKind.PLAIN:
-        return Missing.SPEC_DECODE
+    if proposer is not None and proposer.mtp:
+        if not spec.has_mtp_head(kind):
+            return Missing.SPEC_MTP_HEAD
+        if info.container is spec.Container.GGUF:
+            return Missing.GGUF_MTP_HEAD
     return None
 
 
@@ -508,9 +526,8 @@ def compute_cells(receipts: frozenset[str] | set[str] | None = None) -> list[Cel
                         cells.append(Cell(kind, storage, dev.key, decode, Verdict.GAP, why.value))
                         continue
                     ids = cell_ids(kind, storage, dev, decode)
-                    if not ids:
-                        cells.append(Cell(kind, storage, dev.key, decode, Verdict.GAP, Missing.NO_RUNNER_CELL.value))
-                        continue
+                    if not ids:  # every container's surface runs its every sub-path, so this is the manifest's bug
+                        raise RuntimeError(f"{kind.value}/{storage.value}/{dev.key}/{decode.value}: no receipt id")
                     proven = set(ids) <= banked
                     cells.append(
                         Cell(

@@ -25,6 +25,7 @@ from .iquant import (
     repack_lattice,
 )
 from .kquant import dequant_q2k, dequant_q3k, dequant_q4k, dequant_q5k, matvec_q2k, matvec_q3k, matvec_q4k, matvec_q5k
+from .legacyq import dequant_legacy, matvec_legacy
 from .q6k import dequant_q6k, matvec_q6k
 
 if TYPE_CHECKING:
@@ -47,7 +48,7 @@ class Weight:
     nb: int
     a: Any
 
-    quant: tuple[Any, Any, Any, int, int] | None  # (wq, scales, biases, bits, group): affine, multiplied as stored
+    legacy: tuple[str, Any, int, int] | None  # (kind, raw bytes, rows, cols): a GGUF Q4_0/Q4_1/Q8_0 weight, as stored
     q6k: tuple[Any, int, int] | None  # (raw bytes, rows, cols): a GGUF Q6_K weight, multiplied by its own kernel
     q4k: tuple[Any, int, int] | None  # (raw bytes, rows, cols): a GGUF Q4_K weight, multiplied by its own kernel
     q5k: tuple[Any, int, int] | None  # (raw bytes, rows, cols): a GGUF Q5_K weight, multiplied by its own kernel
@@ -62,7 +63,7 @@ class Weight:
         a: Any = None,
         packed: tuple[Any, ...] | None = None,
         shape: Sequence[int] | None = None,
-        quant: tuple[Any, Any, Any, int, int] | None = None,
+        legacy: tuple[str, Any, int, int] | None = None,
         q6k: tuple[Any, int, int] | None = None,
         q4k: tuple[Any, int, int] | None = None,
         q5k: tuple[Any, int, int] | None = None,
@@ -79,8 +80,8 @@ class Weight:
             m.eval(a)
         if packed is not None:
             m.eval(*[x for x in packed[:5] if x is not None])
-        if quant is not None:
-            m.eval(*quant[:3])
+        if legacy is not None:
+            m.eval(legacy[1])
         if q6k is not None:
             m.eval(q6k[0])
         if q4k is not None:
@@ -99,7 +100,7 @@ class Weight:
             m.eval(latt[1], *latt[4])
         self.a = a
         self.packed = packed
-        self.quant = quant
+        self.legacy = legacy
         self.q6k = q6k
         self.q4k = q4k
         self.q5k = q5k
@@ -152,9 +153,9 @@ class Weight:
                 self.a = dequant_lattice(kind, raw, rows, cols)
                 mx().eval(self.a)
                 return self.a
-            if self.quant is not None:
-                wq, sc, bi, bits, group = self.quant
-                self.a = mx().dequantize(wq, sc, bi, group_size=group, bits=bits).astype(mx().bfloat16)
+            if self.legacy is not None:
+                kind, raw, rows, cols = self.legacy
+                self.a = dequant_legacy(kind, raw, rows, cols)
             else:
                 lo, hi4, tbl, esc_idx, esc_val, n = self.packed
                 self.a = unpack_bf16(lo, hi4, tbl, n, self.shape, esc_idx, esc_val)
@@ -163,7 +164,7 @@ class Weight:
 
     def invalidate(self) -> None:
         """The slot under a streamed weight was rewritten: drop the unpacked copy of a packed one."""
-        if self.packed is not None or self.quant is not None:
+        if self.packed is not None or self.legacy is not None:
             self.a = None
 
     def drop(self) -> None:
@@ -200,7 +201,8 @@ class Backend:
                 m.set_wired_limit(int(self.info.get("max_recommended_working_set_size", 0)))
         if log:
             log(
-                f"[mlx] {self.info.get('device_name')}: unified memory {self.info.get('memory_size', 0) / 2**30:.0f} GB, "
+                f"[mlx] {self.info.get('device_name')}: "
+                f"unified memory {self.info.get('memory_size', 0) / 2**30:.0f} GB, "
                 f"recommended working set {self.info.get('max_recommended_working_set_size', 0) / 2**30:.1f} GB"
             )
 
@@ -263,17 +265,11 @@ class Backend:
         return Weight(packed=(lo, hi4, table, esc_idx, esc_val, int(e["n"])), shape=shape)
 
     # -- the linear --
-    def weight_affine(
-        self, wq: Any, scales: Any, biases: Any, bits: int, group: int, shape: Sequence[int], dtype: Any = None
-    ) -> Weight:
-        """a weight the kernels multiply as stored: the affine form (`mx.quantized_matmul`), never a bf16 copy.
-        The scales and biases are held at `dtype` (the compute dtype, bf16): matching the activations is the path
-        MLX's kernel runs fastest, and on an already-quantized weight their rounding is inside the file's own loss.
-        `dtype` None keeps them float32 (an `--fp32` run, where the repack stays exact)."""
-        m = mx()
-        sd = dtype or m.float32
-        q = (m.array(wq), m.array(scales).astype(sd), m.array(biases).astype(sd), int(bits), int(group))
-        return Weight(quant=q, shape=shape)
+    def weight_legacy(self, kind: str, raw: Any, shape: Sequence[int]) -> Weight:
+        """a GGUF Q4_0/Q4_1/Q8_0 weight (`kind` a legacyq.KINDS key) kept as its own bytes (`matvec_legacy` reads
+        the blocks as stored, batch-invariant), never a bf16 copy. `raw` the file's uint8 bytes for `shape`."""
+        rows, cols = int(shape[0]), int(shape[1])
+        return Weight(legacy=(kind, mx().array(raw), rows, cols), shape=shape)
 
     def weight_q6k(self, raw: Any, shape: Sequence[int]) -> Weight:
         """a GGUF Q6_K weight kept as its own bytes (`matvec_q6k` reads the superblocks as stored), never a bf16
@@ -348,10 +344,9 @@ class Backend:
         if w.latt is not None:
             kind, raw, rows, cols, side = w.latt
             return matvec_lattice(kind, raw, x, rows, cols, side)
-        if w.quant is not None:
-            wq, sc, bi, bits, group = w.quant
-            y = m.quantized_matmul(x, wq, sc, bi, transpose=True, group_size=group, bits=bits)
-            return y if y.dtype == x.dtype else y.astype(x.dtype)
+        if w.legacy is not None:
+            kind, raw, rows, cols = w.legacy
+            return matvec_legacy(kind, raw, x, rows, cols)
         W = w.get()
         # up to 16 rows: the engine's kernel, one weight read for the tile and batch-invariant rows (a verify
         # pass computes each row as the one-row step does); past that (prefill) MLX's gemm
@@ -426,10 +421,12 @@ class Backend:
         alpha: float,
         limit: float,
         ggml: bool = False,
+        act: Callable[[mx_.array], mx_.array] | None = None,
     ) -> Any:
         """One MXFP4 expert over its rows as its own graph (`async_eval`): `xm` [T, H], `token_idx`/`wts` its rows and
         router weights, `pair` = (gu, dn) uint8 slot views with `gu_shape`/`dn_shape` (`ggml`: a GGUF's, gu the
-        (gate, up) views in ggml's layout), the bias tables, `alpha`/`limit` the gate's. Up to 16 rows through
+        (gate, up) views in ggml's layout), the bias tables (None for a family without them), and the gate:
+        gpt-oss's clamped GLU with `alpha`/`limit`, or `act(gate) * up` where `act` is given. Up to 16 rows through
         the batch-invariant matvec, more through a gemm. Returns (idx, y): the rows' indices (None for the whole
         input) and the weighted output in x's dtype."""
         m = mx()
@@ -439,13 +436,20 @@ class Backend:
         idx = None if whole else m.array(np.asarray(token_idx, dtype=np.int32))
         cur = xm if whole else m.take(xm, idx, axis=0)
         if ggml:
-            y = matmul_mxfp4_pair(gu[0], gu[1], gu_shape[0] // 2, gu_shape[1], cur) + gu_bias[e].astype(xm.dtype)
+            y = matmul_mxfp4_pair(gu[0], gu[1], gu_shape[0] // 2, gu_shape[1], cur)
         else:
-            y = matmul_mxfp4(gu, gu_shape[0], gu_shape[1], cur) + gu_bias[e].astype(xm.dtype)
-        gate = m.minimum(y[..., 0::2], limit)
-        up = m.clip(y[..., 1::2], -limit, limit)
-        h = ((up + 1) * (gate * m.sigmoid(alpha * gate))).astype(xm.dtype)
-        o = matmul_mxfp4(dn, dn_shape[0], dn_shape[1], h, ggml=ggml) + dn_bias[e].astype(xm.dtype)
+            y = matmul_mxfp4(gu, gu_shape[0], gu_shape[1], cur)
+        if gu_bias is not None:
+            y = y + gu_bias[e].astype(xm.dtype)
+        if act is not None:  # the pair's rows interleave gate and up
+            h = (act(y[..., 0::2]) * y[..., 1::2]).astype(xm.dtype)
+        else:
+            gate = m.minimum(y[..., 0::2], limit)
+            up = m.clip(y[..., 1::2], -limit, limit)
+            h = ((up + 1) * (gate * m.sigmoid(alpha * gate))).astype(xm.dtype)
+        o = matmul_mxfp4(dn, dn_shape[0], dn_shape[1], h, ggml=ggml)
+        if dn_bias is not None:
+            o = o + dn_bias[e].astype(xm.dtype)
         y = o * m.array(np.asarray(wts, dtype=np.float32)).astype(xm.dtype)[:, None]
         m.async_eval(y)
         return idx, y

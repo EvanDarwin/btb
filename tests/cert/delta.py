@@ -34,6 +34,10 @@ Findings = Callable[[], list[tuple[StrEnum, str]]]
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9_./:@ +-]")
 
+# the manifest findings that are not a GAP cell's Missing reason
+_DNR_NO_REASON = "dnr-no-reason"
+_ORPHAN = "orphan-fixture"
+
 
 def _safe(s: str, limit: int = 100) -> str:
     """neutralize a checkout-derived token (a symbol, a route, a fixture directory name) before it enters an
@@ -76,9 +80,9 @@ def findings() -> set[str]:
         if c.verdict is manifest.Verdict.GAP:
             out.add(f"[manifest/{c.reason}] {cell}")
         elif c.verdict is manifest.Verdict.DNR and not c.reason.strip():
-            out.add(f"[manifest/dnr-no-reason] {cell}")  # "did not run" with no reason is a hidden gap
+            out.add(f"[manifest/{_DNR_NO_REASON}] {cell}")  # "did not run" with no reason is a hidden gap
     for name in manifest.fixture_gaps():
-        out.add(f"[manifest/orphan-fixture] {_safe(name)}")
+        out.add(f"[manifest/{_ORPHAN}] {_safe(name)}")
     return out
 
 
@@ -96,9 +100,10 @@ _GAP_CELL = re.compile(r"\[manifest/([^\]]+)\] (.*)")
 
 def _gap_cell(line: str) -> str | None:
     """the cell a manifest GAP line names, None for any other finding: a gap cell is one finding whatever its
-    Missing reason, so a cell whose first reason closed and whose next one now shows is not a new gap"""
+    Missing reason, so a cell whose first reason closed and whose next one now shows is not a new gap. A baseline
+    from an older tree can carry a reason this one has retired, so any reason counts, not only today's Missing."""
     m = _GAP_CELL.match(line)
-    return m.group(2) if m and m.group(1) in {k.value for k in manifest.Missing} else None
+    return m.group(2) if m and m.group(1) not in (_DNR_NO_REASON, _ORPHAN) else None
 
 
 def new_since(baseline_path: str) -> list[str]:

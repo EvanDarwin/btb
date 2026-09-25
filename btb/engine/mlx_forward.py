@@ -27,6 +27,7 @@ from ..kinds import (
     quants_of,
 )
 from ..mlx import fused as fk
+from ..mlx.legacyq import KINDS as LEGACY_KINDS
 from ..mlx.q6k import gather_q6k
 from ..sampling import GREEDY
 from ..session import Session
@@ -60,7 +61,7 @@ class MlxState:
     pool_blocks: set[Any] = field(default_factory=set)
     weights: dict[Any, Any] | None = None
     family_ok: bool | None = None
-    affine: bool = False  # linears bound as affine-quantized weights (quantized_matmul): no megakernel, no fused step
+    affine: bool = False  # linears bound as a GGUF's own quant blocks (their kernels): no megakernel, no fused step
     rope_cache: tuple[Any, ...] | None = None
     embed_w: Any = None
     embed_lin: _HostLinear | None = None
@@ -173,7 +174,7 @@ class _MlxMixin(_State):
         lins = [m for m in lins if not self._bind_gguf_lattice(m)]
         if not lins:
             return 0
-        lins = [m for m in lins if not self._bind_gguf_affine(m)]
+        lins = [m for m in lins if not self._bind_gguf_legacy(m)]
         if not lins:
             return 0
         lins = [m for m in lins if not self._bind_gguf_q6k(m)]
@@ -228,28 +229,26 @@ class _MlxMixin(_State):
         self.mlx_state.bytes += cur
         return cur
 
-    def _bind_gguf_affine(self, m: Any) -> bool:
-        """a GGUF tensor of an affine storage type bound as stored for the packed kernels (`gguf_packed`): the
-        torch weight becomes a shape-only placeholder, so the bf16 copy `_get` made is released; False when the
-        linear is not such a tensor"""
+    def _bind_gguf_legacy(self, m: Any) -> bool:
+        """a GGUF Q4_0/Q4_1/Q8_0 tensor bound as its own blocks for `matvec_legacy` (`gguf_packed`): batch-invariant,
+        so a verify pass computes each row as the one-row step does. The torch weight becomes a shape-only
+        placeholder, so the bf16 copy `_get` made is released; False when the linear is not such a tensor."""
         gg = getattr(self, "gguf", None)
         if gg is None or not getattr(self, "gguf_packed", True) or m.key not in getattr(self, "_gguf_names", {}):
             return False
-        aff = gg.affine(self._gguf_names[m.key])
-        if aff is None:
+        name = self._gguf_names[m.key]
+        t = gg.tensors.get(name)
+        kind = t.tensor_type.name.lower() if t is not None else ""
+        shape = tuple(m.weight.shape)
+        if kind not in LEGACY_KINDS or len(shape) != 2 or shape[1] % 32:
             return False
         be = self.mlx
         assert be is not None
-        # bf16 scales on the bf16 path (the fast MLX kernel, half the metadata bytes); float32 kept for an --fp32 run
-        fp32 = self.compute_dtype is not None and self.compute_dtype != torch.bfloat16
-        m.mx = be.weight_affine(
-            aff.wq, aff.scales, aff.biases, aff.bits, aff.group, aff.shape, None if fp32 else mlxdev.mx().bfloat16
-        )
-        shape = tuple(m.weight.shape)
+        raw = gg.raw(name).numpy()
+        m.mx = be.weight_legacy(kind, raw, shape)
         m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*shape), requires_grad=False)
-        self.mlx_state.affine = True
-        meta = aff.scales.nbytes + aff.biases.nbytes
-        self.mlx_state.bytes += int(aff.wq.nbytes + (meta if fp32 else meta // 2))
+        self.mlx_state.affine = True  # not a plain bf16 slot: stays on the per-op path, off the megakernel
+        self.mlx_state.bytes += int(raw.nbytes)
         return True
 
     def _bind_gguf_q4k(self, m: Any) -> bool:
@@ -420,7 +419,7 @@ class _MlxMixin(_State):
         self.mlx_state.bytes += int(raw.nbytes)
         return True
 
-    def _mlx_act(self) -> Any:
+    def _mlx_act(self) -> Callable[[mx_.array], mx_.array] | None:
         if self.mlx is None:
             return None
         return self.mlx.act(act_name(self.cfg))
@@ -1106,6 +1105,7 @@ class _MlxMixin(_State):
             T = int(hm.shape[0])
             dt = mlxdev.torch_dtype(hm.dtype)
         act = self._mlx_act()
+        assert act is not None  # _mlx_ok admits the family only with an MLX activation
         silu = act_name(c) in ("silu", "swish")  # the fused gate/up kernel is silu's; gelu keeps `act`
         Hq = int(c.num_attention_heads)
         Hk = int(getattr(c, "num_key_value_heads", None) or Hq)
@@ -1720,6 +1720,7 @@ class _MlxMixin(_State):
             T = int(hm.shape[0])
             dt = mlxdev.torch_dtype(hm.dtype)
         act = self._mlx_act()
+        assert act is not None  # _mlx_ok admits the family only with an MLX activation
         silu = act_name(c) in ("silu", "swish")
         past = cache.get_seq_length() if cache is not None else 0
         Hq = int(c.num_attention_heads)

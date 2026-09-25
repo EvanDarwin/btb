@@ -51,9 +51,10 @@ if TYPE_CHECKING:
     from .engine.device import mlx_available, resolve_device
     from .engine.hooks import LogitsProcessor, PassStats, TokenLogprob
     from .engine.memory import DeviceMemory, Room
-    from .engine.native import kernels_path, native_path, native_tag, quiet_omp  # noqa: F401
+    from .engine.native import quiet_omp  # noqa: F401
     from .engine.scheduler import BatchScheduler, HostBudget, MemoryGrantError, Plan, PlanError
     from .engine.text import Chat, GenerateStats, Generation, Stream
+    from .native_files import kernels_path, native_path, native_tag  # noqa: F401
 
 CUDA = True
 
@@ -80,9 +81,9 @@ _LAZY = {
     "pack_model": ".engine",
     "mlx_available": ".engine.device",
     "resolve_device": ".engine.device",
-    "native_path": ".engine.native",
-    "native_tag": ".engine.native",
-    "kernels_path": ".engine.native",
+    "native_path": ".native_files",
+    "native_tag": ".native_files",
+    "kernels_path": ".native_files",
     "quiet_omp": ".engine.native",
     "BatchScheduler": ".engine.scheduler",
     "HostBudget": ".engine.scheduler",
@@ -196,8 +197,9 @@ def load(
 
     from .engine import StreamedTextModel
     from .engine.device import mlx_available, resolve_device
-    from .engine.native import native_path, quiet_omp
+    from .engine.native import quiet_omp
     from .engine.state import DRAFT_VOCAB
+    from .native_files import native_path
 
     if asked is not None and asked.kind is Device.CPU:
         cpu_only()

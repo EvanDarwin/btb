@@ -19,7 +19,7 @@ from pytest import CaptureFixture, MonkeyPatch
 
 from btb import resolve_device
 from btb.engine import BatchScheduler, pack_bf16, unpack_bf16
-from tests.helpers import ROOT, SchedulerModel, checkout, need_native
+from tests.helpers import ROOT, SchedulerModel, checkout, native_library
 
 if TYPE_CHECKING:
     from btb.engine.tiers import _TiersMixin
@@ -87,6 +87,37 @@ def test_pack_escapes_the_rare_high_bytes() -> None:
     assert torch.equal(out, vals)
 
 
+# --- a widened host module (btb/engine/host.py) -------------------------------------------------------------
+
+
+def test_a_widened_module_computes_in_float32_and_answers_in_the_callers_dtype() -> None:
+    """`compute_fp32` on a float32 router: a bf16 activation is multiplied in float32 and its floating results
+    come back bf16 (the indices untouched); a float32 activation passes through bit for bit."""
+    from btb.engine.host import compute_fp32
+
+    class Router(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(4, 16), requires_grad=False)
+
+        def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            logits = torch.nn.functional.linear(x, self.weight)
+            return logits, logits.argmax(-1)
+
+    torch.manual_seed(0)
+    router, x = Router(), torch.randn(3, 16)
+    want_fp32 = router(x)
+    want_bf16 = router(x.bfloat16().float())
+    with pytest.raises(RuntimeError, match="same dtype"):
+        router(x.bfloat16())
+    compute_fp32(router)
+    got = router(x)
+    assert got[0].dtype == torch.float32 and torch.equal(got[0], want_fp32[0]) and torch.equal(got[1], want_fp32[1])
+    logits, idx = router(x.bfloat16())
+    assert logits.dtype == torch.bfloat16 and torch.equal(logits, want_bf16[0].bfloat16())
+    assert idx.dtype == torch.int64 and torch.equal(idx, want_bf16[1])
+
+
 # --- the scheduler (btb/engine/scheduler.py) ---------------------------------------------------------------
 
 
@@ -113,7 +144,7 @@ def test_scheduler_off_the_card_takes_every_pending_row() -> None:
 
 
 def _native() -> Callable[..., int]:
-    lib = ctypes.CDLL(need_native())
+    lib = ctypes.CDLL(native_library())
     f = lib.btb_gemv_bf16_rows
     f.restype = ctypes.c_int32
     f.argtypes = [

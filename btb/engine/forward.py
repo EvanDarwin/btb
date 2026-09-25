@@ -431,6 +431,8 @@ class _ForwardMixin(_State):
             self._tag(PassTag.CPU_NATIVE)
         elif self.mlx is not None:
             self._tag(PassTag.MLX_PEROP)  # the non-fused MLX path: a MoE family, or a layer offloaded to the host
+        if i in self.fp8_layers:
+            self._tag(PassTag.FP8_ASSTORED)
         tmpl = self.host[i]
         hc = pas.host_side()
         if i in self.cold:

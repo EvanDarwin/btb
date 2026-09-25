@@ -21,13 +21,13 @@ from .cache import (
     ForkLayer,
     GraphStates,
     GrowLayer,
-    LinearStates,
     _DynamicLayer,
     attention_rows,
     indexer_keys,
     linear_layer,
     mark_forked,
 )
+from .generate import lin_layer
 from .hooks import Hooks, LogitsProcessor, OnPass, OnRowToken, Taps
 
 if TYPE_CHECKING:
@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 
     from ..session import Session
     from .cache import CacheLayer, KvCache
+    from .generate import LinSnap
     from .model import StreamedTextModel
     from .text import BatchGeneration
 
@@ -50,7 +51,7 @@ class _Row:
     token not fed or its next-token logits"""
 
     kv: dict[int, RowKV] = field(default_factory=dict)
-    lin: dict[int, LinearStates] = field(default_factory=dict)
+    lin: dict[int, LinSnap] = field(default_factory=dict)
     pending: int | None = None
     logits: torch.Tensor | None = None
 
@@ -390,7 +391,7 @@ class _Rows:
                 if len(kv) > 2 and isinstance(pl, DynamicIndexedLayer):
                     pl.update_indexer(kv[2])
         for i, snap in row.lin.items():
-            eng._lin_restore(cache.layers[i], snap)
+            eng._lin_restore(lin_layer(cache.layers[i]), snap)
         s.ids.extend(self.rows[r][:-1] if row.pending is not None else self.rows[r])
         s.n_prompt = len(s.ids)
         s.pending, s.logits = row.pending, row.logits

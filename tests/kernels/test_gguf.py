@@ -2,19 +2,25 @@
 """GGUF models (btb/gguf.py): the fixtures' GGUF twins (tests/make_fixtures.py gguf) read through the gguf
 package - the config off the metadata, every tensor of the family mapped through llama.cpp's table, a bf16
 file decoding token for token as its safetensors twin, an f16 file within f16's rounding of it, a quantized
-file as the numbers llama.cpp dequantizes, a gpt-oss file's MXFP4 experts streamed and multiplied as stored
-(ggml's layout, in the CPU and Metal kernels), discovery and resolution of .gguf paths. The tokenizer conversion (transformers') is not exercised
-here: the fixtures' byte-level vocabulary has no merges, which that converter refuses; it is checked on a real
-release."""
+file as the numbers llama.cpp dequantizes, a gpt-oss or qwen4exp file's MXFP4 experts streamed and multiplied
+as stored (ggml's layout, in the CPU and Metal kernels), discovery and resolution of .gguf paths. The tokenizer
+conversion (transformers') is not exercised here: the fixtures' byte-level vocabulary has no merges, which that
+converter refuses; it is checked on a real release."""
 
 import json
 import os
 import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 import torch
+
+from btb.kinds import PassTag
+
+if TYPE_CHECKING:
+    from btb.gguf import GGUFModel
 
 from tests.helpers import (
     FIXTURES,
@@ -25,9 +31,9 @@ from tests.helpers import (
     loaded_model,
     max_abs,
     mxfp4_random,
+    native_library,
     need_cached,
     need_mlx,
-    need_native,
     safetensors_state,
 )
 
@@ -121,14 +127,13 @@ def _mxfp4_pair(rows: int, k: int, seed: int) -> tuple[np.ndarray, np.ndarray, n
 
 def test_the_cpu_mxfp4_kernel_reads_ggml_blocks_as_the_checkpoints() -> None:
     """the native matvec over ggml's layout gives the checkpoint layout's bits for the same weights, alone
-    and grouped, at every batch width the host path uses; skipped without the native library"""
+    and grouped, at every batch width the host path uses"""
     _need()
     from btb.engine.native import Native
     from btb.mxfp4 import MxWeight
 
-    need_native()
-    if Native.gemv_mx4_ggml is None:
-        pytest.skip("the native library predates ggml's layout")
+    native_library()
+    assert Native.gemv_mx4_ggml is not None, "the native library predates ggml's layout: rebuild it"
     rows, k = 96, 256
     for b in (1, 5, 16):
         blocks, scales, raw = _mxfp4_pair(rows, k, 7 + b)
@@ -301,6 +306,263 @@ def test_a_quantized_gguf_decodes_as_its_dequantized_weights(tmp_path: Path) -> 
             shutil.copy(os.path.join(src, fn), twin / fn)
         save_file(deq, str(twin / "model.safetensors"), metadata={"format": "pt"})
         assert _tokens(path) == _tokens(str(twin)), qt
+
+
+def _need_q35() -> None:
+    if not os.path.isfile(os.path.join(GGUF, "tiny_q35-bf16.gguf")):
+        pytest.skip("the Qwen3.5 GGUF fixtures are not here (tests/make_fixtures.py gguf_q35)")
+
+
+def _q35_trunk() -> dict[str, torch.Tensor]:
+    """the tiny_q35 checkpoint without its MTP head, which llama.cpp's converter leaves out under --no-mtp"""
+    state = safetensors_state(os.path.join(FIXTURES, "tiny_q35"))
+    return {k: v for k, v in state.items() if not k.startswith("mtp.")}
+
+
+def test_a_qwen35_gguf_reads_back_its_checkpoint() -> None:
+    """Qwen3.5 through llama.cpp's converter and back: the config off the typed keys (the hybrid's layer pattern,
+    linear attention widths, partial MRoPE), every trunk tensor found and equal as bf16 once the converter's
+    rewrites are inverted (the tiled value heads, -exp(A_log), 1 + norm, the squeezed conv), and a quantized
+    file's reordered blocks (what the packed kernels bind) the same numbers as its reordered dequantization"""
+    _need_q35()
+    from gguf import dequantize
+
+    from btb.gguf import GGUFModel
+
+    g = GGUFModel(os.path.join(GGUF, "tiny_q35-bf16.gguf"))
+    cfg = g.config()
+    want = json.load(open(os.path.join(FIXTURES, "tiny_q35", "config.json")))
+    assert cfg.model_type == want["model_type"] == g.model_type
+    for k in (
+        "num_hidden_layers",
+        "hidden_size",
+        "intermediate_size",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "layer_types",
+        "linear_conv_kernel_dim",
+        "linear_key_head_dim",
+        "linear_value_head_dim",
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+        "partial_rotary_factor",
+        "tie_word_embeddings",
+    ):
+        assert getattr(cfg, k) == want[k], (k, getattr(cfg, k), want[k])
+    for k in ("rope_theta", "mrope_section", "mrope_interleaved"):
+        assert cfg.rope_parameters[k] == want["rope_parameters"][k], k
+    state = _q35_trunk()
+    names, hdr = g.weight_map(list(state), cfg.num_hidden_layers)
+    assert set(names) == set(state), set(state) ^ set(names)
+    for hf, gn in names.items():
+        t = g.get(gn)
+        assert t.dtype == torch.bfloat16 and tuple(t.shape) == tuple(state[hf].shape) == tuple(hdr[hf]["shape"]), hf
+        assert torch.equal(t, state[hf].to(torch.bfloat16)), hf
+    for qt in ("q8_0", "q4_0", "q4_1"):
+        q = GGUFModel(os.path.join(GGUF, f"tiny_q35-{qt}.gguf"))
+        qnames, _ = q.weight_map(list(state), cfg.num_hidden_layers)
+        reordered = [gn for gn in qnames.values() if gn in q.undo and gn in q.tensors]
+        assert any(q.undo[gn][1].cols is not None for gn in reordered), qt  # out_proj binds as stored too
+        for gn in reordered:
+            t = q.tensors[gn]
+            got = dequantize(q.raw(gn).numpy(), t.tensor_type).reshape(q.get(gn).shape)
+            assert torch.equal(torch.from_numpy(np.array(got, dtype=np.float32)).bfloat16(), q.get(gn)), (qt, gn)
+
+
+def test_a_qwen35_bf16_gguf_decodes_as_its_safetensors_twin() -> None:
+    _need_q35()
+    twin = os.path.join(FIXTURES, "tiny_q35")
+    assert _tokens(os.path.join(GGUF, "tiny_q35-bf16.gguf")) == _tokens(twin)
+
+
+def test_a_qwen35_bf16_gguf_decodes_as_its_safetensors_twin_on_mlx() -> None:
+    _need_q35()
+    need_mlx()
+    twin = os.path.join(FIXTURES, "tiny_q35")
+    assert _tokens(os.path.join(GGUF, "tiny_q35-bf16.gguf"), "mlx") == _tokens(twin, "mlx")
+
+
+def test_a_quantized_qwen35_gguf_decodes_as_its_dequantized_weights(tmp_path: Path) -> None:
+    """each affine type: the file decodes exactly as a safetensors model built from the numbers the reader
+    dequantizes and un-rewrites, and those numbers differ from the bf16 twin's as a quantization does"""
+    _need_q35()
+    from safetensors.torch import save_file
+
+    from btb.gguf import GGUFModel
+
+    src = os.path.join(FIXTURES, "tiny_q35")
+    state = _q35_trunk()
+    for qt in ("q8_0", "q4_0", "q4_1"):
+        path = os.path.join(GGUF, f"tiny_q35-{qt}.gguf")
+        g = GGUFModel(path)
+        names, _ = g.weight_map(list(state), g.config().num_hidden_layers)
+        deq = {hf: g.get(gn).contiguous() for hf, gn in names.items()}
+        assert any(not torch.equal(deq[k], state[k].to(torch.bfloat16)) for k in deq), qt
+        twin = tmp_path / f"twin-{qt}"
+        twin.mkdir()
+        for fn in ("config.json", "tokenizer.json", "tokenizer_config.json"):
+            shutil.copy(os.path.join(src, fn), twin / fn)
+        save_file(deq, str(twin / "model.safetensors"), metadata={"format": "pt"})
+        assert _tokens(path) == _tokens(str(twin)), qt
+
+
+def test_a_qwen35_gguf_multiplies_its_reordered_blocks_as_stored_on_mlx() -> None:
+    """the value-head reordering applied to the stored blocks (rows of in_proj_*, whole blocks of out_proj's
+    columns): the packed path's first-step logits sit within bf16 rounding of the dequantized path's"""
+    _need_q35()
+    need_mlx()
+    logits = {}
+    for packed in (1, 0):
+        with loaded_model(os.path.join(GGUF, "tiny_q35-q8_0.gguf"), device="mlx", gguf_packed=packed) as sm:
+            rep = sm.report()["model"]["gguf"]
+            assert (rep["packed"] > 0) == bool(packed), rep
+            lg = sm.forward([PROMPT], cache=sm.new_cache())
+            assert lg is not None
+            logits[packed] = lg.float()[0, -1]
+    assert_close(logits[1], logits[0])
+
+
+# --- qwen4exp: tiny_q4's twins as llama.cpp's own converter writes them (tests/make_fixtures.py make_q4_gguf) ---
+
+Q4 = os.path.join(FIXTURES, "tiny_q4")
+NGRAM = ".ple.ple_embedding.ngram_embedding.shard_"
+
+
+def _q4_state() -> dict[str, torch.Tensor]:
+    """tiny_q4's tensors with its n-gram shards as the one table the GGUF stores (`shard_0`)"""
+    state = safetensors_state(Q4)
+    for pre in sorted({k.partition(NGRAM)[0] for k in state if NGRAM in k}):
+        parts = sorted((k for k in state if k.startswith(pre + NGRAM)), key=lambda k: (len(k), k))
+        state[pre + NGRAM + "0.weight"] = torch.cat([state.pop(k) for k in parts])
+    return state
+
+
+def _q4_names(g: "GGUFModel") -> dict[str, str]:
+    names, _ = g.weight_map(list(safetensors_state(Q4)), g.config().num_hidden_layers)
+    return names
+
+
+def test_the_qwen4exp_table_is_llama_cpps() -> None:
+    """btb's own qwen4exp names and keys are the gguf package's once a release knows the architecture; until
+    then they name exactly the tensors llama.cpp's converter wrote, every one of them read"""
+    _need()
+    from gguf import MODEL_ARCH_NAMES, MODEL_TENSOR, TENSOR_NAMES, TensorNameMap
+
+    from btb.gguf import OWN_KEYS, OWN_NAMES, OWN_TENSOR_NAMES, GGUFModel, knows_arch, meta_key
+    from btb.hf import QWEN4EXP
+
+    g = GGUFModel(os.path.join(GGUF, "tiny_q4-bf16.gguf"))
+    if knows_arch(QWEN4EXP):
+        L = int(g.config().num_hidden_layers)
+        tmap = TensorNameMap(next(a for a, n in MODEL_ARCH_NAMES.items() if n == QWEN4EXP), L)
+        for hf, name in OWN_NAMES[QWEN4EXP].items():
+            assert tmap.get_name(hf.format(bid=1)) == name.format(bid=1), hf
+        for member, name in OWN_TENSOR_NAMES[QWEN4EXP].items():
+            assert TENSOR_NAMES[MODEL_TENSOR[member]] == name, member
+        for path, key in OWN_KEYS.items():
+            assert meta_key(QWEN4EXP, path) == key.format(arch=QWEN4EXP), path
+    names = _q4_names(g)
+    read = {g.undo[n][0] if n in g.undo else n for n in names.values() if n not in g.derived}
+    read |= {f for fs, _ in g.derived.values() for f in fs}
+    assert read == set(g.tensors), set(g.tensors) ^ read
+
+
+def test_the_qwen4exp_reader_inverts_llama_cpps_converter() -> None:
+    """the bf16 twin: the config transformers reads off the checkpoint, rebuilt from llama.cpp's keys; every
+    tensor of the checkpoint equal as bf16 once the converter's rewrites are undone (V heads regrouped, A_log,
+    the +1 gammas, the squeezed convolutions, the split indexer and experts, the n-gram table and its hash
+    constants); the f16 twin within f16's rounding of it"""
+    _need()
+    from transformers import AutoConfig
+
+    from btb.gguf import GGUFModel
+
+    g = GGUFModel(os.path.join(GGUF, "tiny_q4-bf16.gguf"))
+    cfg, want = g.config(), AutoConfig.from_pretrained(Q4)
+    assert g.model_type == cfg.model_type == want.model_type
+    # the n-gram hash's seed and the shard count are not in the file (its constants and its one table stand in),
+    # nor the checkpoint's provenance; the file holds the epsilon as a float32
+    unread = {"seed", "split_ngram_parts", "ngram_vocab_size_base", "dtype", "architectures", "transformers_version"}
+    same = set(want.to_diff_dict()) - unread - {"rms_norm_eps"}
+    assert {k: getattr(cfg, k) for k in same} == {k: getattr(want, k) for k in same}
+    assert np.float32(cfg.rms_norm_eps) == np.float32(want.rms_norm_eps)
+    state = _q4_state()
+    names = _q4_names(g)
+    assert set(names) == set(state), set(state) ^ set(names)
+    for hf, gn in names.items():
+        t = g.get(gn)
+        assert t.dtype == state[hf].dtype and tuple(t.shape) == tuple(state[hf].shape), hf
+        assert torch.equal(t, state[hf]), hf
+    h = GGUFModel(os.path.join(GGUF, "tiny_q4-f16.gguf"))
+    diffs = [max_abs(h.get(gn).float(), state[hf].float()) for hf, gn in _q4_names(h).items()]
+    assert max(diffs) < 1e-3 and any(d > 0 for d in diffs), max(diffs)
+
+
+def test_a_bf16_qwen4exp_gguf_decodes_as_its_safetensors_twin() -> None:
+    _need()
+    assert _tokens(os.path.join(GGUF, "tiny_q4-bf16.gguf")) == _tokens(Q4)
+
+
+def _q4_dequantized_twin(path: str, dest: Path) -> str:
+    """a tiny_q4 checkpoint of the numbers the GGUF at `path` dequantizes to, written at `dest`: the n-gram table
+    split back into the checkpoint's shards, and experts the file keeps as MXFP4 blocks (read by the store, not
+    mapped to an HF name) rebuilt as the checkpoint's gate/up and down tables"""
+    from safetensors.torch import save_file
+
+    from btb.gguf import GGUFModel
+
+    g = GGUFModel(path)
+    deq = {hf: g.get(gn).contiguous() for hf, gn in _q4_names(g).items() if not hf.endswith("_exps.weight")}
+    assert any(not torch.equal(deq[k], v) for k, v in _q4_state().items() if k in deq), path
+    for i in range(int(g.config().num_hidden_layers)):
+        pre, exps = f"model.layers.{i}.mlp.experts.", f"blk.{i}.ffn_{{}}_exps.weight"
+        if exps.format("gate") in g.tensors and pre + "gate_up_proj" not in deq:
+            deq[pre + "gate_up_proj"] = torch.cat([g.get(exps.format("gate")), g.get(exps.format("up"))], dim=1)
+            deq[pre + "down_proj"] = g.get(exps.format("down")).contiguous()
+    shards: dict[str, list[int]] = {}  # the checkpoint's shard rows, in order, by PLE layer
+    for k, v in sorted(safetensors_state(Q4).items(), key=lambda kv: (len(kv[0]), kv[0])):
+        if NGRAM in k:
+            shards.setdefault(k.partition(NGRAM)[0], []).append(int(v.shape[0]))
+    for pre, rows in shards.items():
+        for j, part in enumerate(torch.split(deq.pop(pre + NGRAM + "0.weight"), rows)):
+            deq[pre + NGRAM + f"{j}.weight"] = part.contiguous()
+    dest.mkdir()
+    for fn in ("config.json", "tokenizer.json", "tokenizer_config.json"):
+        shutil.copy(os.path.join(Q4, fn), dest / fn)
+    save_file(deq, str(dest / "model.safetensors"), metadata={"format": "pt"})
+    return str(dest)
+
+
+def test_a_quantized_qwen4exp_gguf_decodes_as_its_dequantized_weights(tmp_path: Path) -> None:
+    """Q8_0, Q4_0 and Q4_1: the file decodes exactly as a checkpoint of the numbers it dequantizes to, the
+    experts dequantized into the expert store's slots as a checkpoint's are read into them"""
+    _need()
+    for qt in ("q8_0", "q4_0", "q4_1"):
+        path = os.path.join(GGUF, f"tiny_q4-{qt}.gguf")
+        assert _tokens(path) == _tokens(_q4_dequantized_twin(path, tmp_path / f"twin-{qt}")), qt
+
+
+def test_a_qwen4exp_mxfp4_gguf_multiplies_its_experts_as_stored(tmp_path: Path) -> None:
+    """llama.cpp's MXFP4_MOE of tiny_q4 (its experts MXFP4, every other matrix Q8_0): the expert store reads the
+    experts straight out of the file in ggml's layout and multiplies them as stored through the family's own
+    SiLU gate, and the file decodes as a checkpoint of its dequantized numbers on the CPU and on MLX"""
+    _need()
+    from btb.engine.device import mlx_available
+    from btb.mxfp4 import MxGateUp
+
+    path = os.path.join(GGUF, "tiny_q4-mxfp4.gguf")
+    with loaded_model(path, device="cpu") as sm:
+        assert "blk.0.ffn_gate_exps.weight" in sm.weight_map
+        out, _ = sm.generate(PROMPT, 8, eos=(), speculate=False)
+        store = sm.expert_store
+        assert store is not None and store.ggml
+        assert isinstance(store._views(store.last_slots[next(iter(store.last_slots))])[0], MxGateUp)
+        assert PassTag.EXPERT_MXFP4_ASSTORED in sm.last_pass_report()
+    twin = _q4_dequantized_twin(path, tmp_path / "twin")
+    assert [int(t) for t in out] == _tokens(twin)
+    if mlx_available():
+        assert _tokens(path, "mlx") == _tokens(twin, "mlx")
 
 
 def test_gguf_paths_are_discovered_resolved_and_not_packed() -> None:
@@ -522,29 +784,38 @@ def test_a_q4k_self_draft_speculates_to_the_greedy_tokens_on_mlx() -> None:
 
 
 def test_the_packed_mlx_path_multiplies_as_stored() -> None:
-    """on MLX a Q4_0 / Q8_0 fixture binds its matrices in the affine form and the packed kernel multiplies them
-    as stored: the affine repack equals the package's dequantization to the number, and Q4_K (which leaves the
-    affine path for its own native matvec) is within bf16 rounding of the dequantization and batch-invariant.
-    The report counts the packed tensors, and the first-step logits sit within bf16 rounding of the dequantized
-    path's"""
+    """on MLX a Q4_0 / Q4_1 / Q8_0 fixture binds its matrices as their own blocks and `matvec_legacy` multiplies
+    them as stored: the dequant is the package's numbers in bf16, the fp32 matvec sits within f32 rounding of the
+    package's dequantized product, and a row is bit-identical alone and inside a 16-row tile (so a verify pass
+    computes each row as the one-row step does). Q4_K's own native matvec is held to the same. The report counts
+    the packed tensors, and the first-step logits sit within bf16 rounding of the dequantized path's"""
     _need()
     need_mlx()
+    import mlx.core as mx
     from gguf import dequantize
 
     from btb.gguf import GGUFModel
+    from btb.mlx.legacyq import KINDS, dequant_legacy, matvec_legacy
 
-    g = GGUFModel(os.path.join(GGUF, "tiny_qwen3-q4_0.gguf"))
-    for name, t in g.tensors.items():
-        aff = g.affine(name)
-        if aff is None:
-            continue
-        import mlx.core as mx
-
-        deq = mx.dequantize(
-            mx.array(aff.wq), mx.array(aff.scales), mx.array(aff.biases), group_size=aff.group, bits=aff.bits
-        )
-        ref = dequantize(np.asarray(t.data), t.tensor_type).astype(np.float32)
-        assert np.array_equal(np.array(deq.astype(mx.float32)), ref), name
+    rng = np.random.default_rng(1)
+    for kind in KINDS:
+        g = GGUFModel(os.path.join(GGUF, f"tiny_qwen3-{kind}.gguf"))
+        mats = [(n, t) for n, t in g.tensors.items() if t.tensor_type.name.lower() == kind and len(t.shape) == 2]
+        assert mats, f"tiny_qwen3-{kind}.gguf holds no {kind} matrix"
+        for name, t in mats:
+            rows, cols = (int(x) for x in reversed(list(t.shape)))
+            ref = dequantize(np.asarray(t.data), t.tensor_type).astype(np.float32).reshape(rows, cols)
+            wb = mx.array(np.asarray(t.data).reshape(-1).view(np.uint8))
+            deq = np.array(dequant_legacy(kind, wb, rows, cols).astype(mx.float32))
+            assert np.array_equal(deq, np.array(mx.array(ref).astype(mx.bfloat16).astype(mx.float32))), name
+            x = mx.array(rng.standard_normal((16, cols)).astype(np.float32))
+            y = np.array(matvec_legacy(kind, wb, x, rows, cols))
+            want, mag = np.array(x) @ ref.T.astype(np.float64), np.abs(np.array(x)) @ np.abs(ref.T).astype(np.float64)
+            # against each output's conditioning; a zero weight row (the pad token's embedding) must give exact 0
+            assert float(np.max(np.abs(y - want) / np.maximum(mag, 1e-30))) < 1e-6, name
+            for i in (0, 7, 15):
+                one = np.array(matvec_legacy(kind, wb, x[i : i + 1], rows, cols))
+                assert np.array_equal(one[0], y[i]), f"{name}: row {i} alone differs from the 16-row tile"
 
     # Q4_K leaves the affine repack for its own native matvec (batch-invariant, so affine speculation is exact):
     # over a synthetic superblock weight the matvec sits within bf16 rounding of the package's dequantization,

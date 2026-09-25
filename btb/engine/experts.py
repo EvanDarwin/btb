@@ -18,8 +18,9 @@ import numpy as np
 import torch
 
 from .. import mlx as mlxdev
+from ..fp8 import F8Weight
 from ..kinds import PassTag
-from ..mxfp4 import BLOCK, MxGateUp, MxWeight
+from ..mxfp4 import BLOCK, MxGateUp, MxWeight, stored_mxfp4
 from ..options import Device
 from ..sysinfo import host_free_bytes
 from .host import bf16_in_place
@@ -404,6 +405,8 @@ class _ExpertStore:
     lru: Any
     max_call: int
     mx: bool
+    f8: bool
+    f8_sdt: torch.dtype
     n_slots: int
     next_slot: int
     parked: list[int]
@@ -429,9 +432,16 @@ class _ExpertStore:
         self.sizes = None
         self.dt = torch.bfloat16
         self.as_bf16 = set()
-        self.mx = bool(sm.fam.mxfp4)
+        self.mx = stored_mxfp4(sm.fam.mxfp4, getattr(sm, "gguf", None))
+        # an FP8 checkpoint's experts: each projection's e4m3 bytes and its scale grid, multiplied as stored
+        self.f8 = bool(getattr(sm, "fp8_experts", False))
+        self.f8_sdt = torch.float32  # the scale grids' stored dtype, from the first recipe
         # a GGUF's experts: gate, up and down in ggml's block layout, multiplied as stored (btb/mxfp4.py)
         self.ggml = self.mx and getattr(sm, "gguf", None) is not None
+        # a GGUF's other experts, which no kernel multiplies as stored: a read dequantizes the expert (its layout
+        # inverted, `GGUFModel.get`) into the slot as the bf16 a checkpoint's read would land there
+        self.dequant = not self.mx and getattr(sm, "gguf", None) is not None
+        self.keys: dict[int, tuple[str, ...]] = {}  # the dequantized experts' tensor names by layer
         self.n_slots = 0
         self.budget = int(budget_bytes)
         self.reserve = int(reserve_bytes)
@@ -563,7 +573,8 @@ class _ExpertStore:
                 except RuntimeError as e:
                     self.pin = False
                     self.sm.log(
-                        f"[experts] store: the machine would not pin a {k * stride / 2**30:.2f} GB block ({e}); pageable from here"
+                        f"[experts] store: the machine would not pin a {k * stride / 2**30:.2f} GB block ({e}); "
+                        "pageable from here"
                     )
             if raw is None:
                 raw = torch.empty(k * stride + 4096, dtype=torch.uint8)
@@ -646,6 +657,8 @@ class _ExpertStore:
                 names = tuple(f"blk.{layer}.ffn_{k}_exps.weight" for k in ("gate", "up", "down"))
             elif self.mx:
                 names = ("gate_up_proj_blocks", "gate_up_proj_scales", "down_proj_blocks", "down_proj_scales")
+            elif self.f8:
+                names = ("gate_up_proj", "gate_up_proj_scale_inv", "down_proj", "down_proj_scale_inv")
             else:
                 names = ("gate_up_proj", "down_proj")
             parts = []
@@ -659,8 +672,12 @@ class _ExpertStore:
                 if (b - a) % shape[0]:
                     raise RuntimeError(f"[experts] {key}: {b - a} bytes do not divide by {shape[0]} experts")
                 parts.append((self._os.path.join(self.sm.dir, shard), hoff + a, (b - a) // shape[0], shape[1:]))
-                if not (self.ggml or self.mx):
+                if self.f8 and name.endswith("_scale_inv"):
+                    self.f8_sdt = self.sm.ST_DTYPES[info["dtype"]]
+                elif not (self.ggml or self.mx or self.f8):
                     self.dt = self.sm.ST_DTYPES[info["dtype"]]
+            if self.dequant:
+                self.keys[layer] = tuple(base + name for name in names)
             r = self.recipes[layer] = parts
             sched = getattr(self.sm, "scheduler", None)
             if sched is not None and hasattr(sched, "disk"):
@@ -675,11 +692,12 @@ class _ExpertStore:
                 self.per = per
                 # bf16: (gate_up bytes, gate_up shape, down shape), what `_views` splits the slot on;
                 # MXFP4: the four tensors' per-expert shapes, and `sizes` their byte counts
-                self.shapes = shapes if self.mx else (parts[0][2], *shapes)
+                self.shapes = shapes if self.mx or self.f8 else (parts[0][2], *shapes)
                 self.sizes = tuple(p[2] for p in parts)
                 # reads straight into the slot (padded regions) unless BTB_STORE_PADDED=0 asks for the bounce
                 self.padded = (
                     self.sm.mlx is None
+                    and not self.dequant
                     and Native.read_at is not None
                     and os.environ.get("BTB_STORE_PADDED", "1") != "0"
                 )
@@ -708,7 +726,7 @@ class _ExpertStore:
         assert self.per is not None  # the store is sized before this runs
         want = getattr(self.sm, "vram_experts_gb", 0)
         dev = getattr(self.sm, "dev", None)
-        if self.mx or dev is None or dev.type != Device.CUDA or not want or self.stride is None:
+        if self.mx or self.f8 or dev is None or dev.type != Device.CUDA or not want or self.stride is None:
             return
         if want == "auto":
             sched = getattr(self.sm, "scheduler", None)
@@ -848,6 +866,17 @@ class _ExpertStore:
                 rows, g = int(self.shapes[i][0]), int(self.shapes[i][1])
                 out.append(MxWeight(self._part(slot, region, i), self._part(slot, region, i + 1), rows, g * BLOCK))
             return out[0], out[1]
+        if self.f8:
+            pair = []
+            for i in (0, 2):
+                (rows, cols), grid = self.shapes[i], self.shapes[i + 1]
+                raw = self._part(slot, region, i + 1)
+                # a scale part a direct read left off its element alignment is copied to one
+                if raw.data_ptr() % self.f8_sdt.itemsize:
+                    raw = raw.clone()
+                s = raw.view(self.f8_sdt).reshape(*grid)
+                pair.append(F8Weight(self._part(slot, region, i), s, int(rows), int(cols)))
+            return pair[0], pair[1]
         _gu_n, gu_shape, dn_shape = self.shapes
         if self.dt == torch.bfloat16:
             return (
@@ -921,14 +950,21 @@ class _ExpertStore:
         for j, (path, off, n_e, _) in enumerate(parts):
             at = self.part_at[j] if self.part_at else sum(self.sizes[:j])
             tp = time.perf_counter_ns()
-            Native.read_direct(path, off + e * n_e, n_e, region[at : at + n_e], self.sm.cold_chunk)
+            if self.dequant:
+                w = self.sm.gguf.get(self.sm._gguf_names[self.keys[layer][j]], expert=int(e))
+                region[at : at + n_e].view(torch.bfloat16).copy_(w.reshape(-1))
+            else:
+                Native.read_direct(path, off + e * n_e, n_e, region[at : at + n_e], self.sm.cold_chunk)
             self._note_read(prof, layer, e, j, path, off + e * n_e, n_e, slot, time.perf_counter_ns() - tp)
 
     def _submit(self, sched: Any, parts: Any, e: Any, slot: Any, layer: int, priority: int) -> Any:
         """the expert's parts queued on the Route, one read each, with the profile's row and the counters
         taken as each lands; returns what `wait` and the layer's forward call `.result()` on. In a padded slot
-        the read is the sector-aligned span around the part, straight into its region."""
+        the read is the sector-aligned span around the part, straight into its region. A dequantized expert is
+        no drive read: the store's own readers fill it."""
         self.as_bf16.discard(slot)
+        if self.dequant:
+            return Parts([self.pool.submit(self._read, parts, e, slot, layer)])
         region = self._region(slot)
         prof = getattr(self.sm, "expert_profile", None)
         futs = []

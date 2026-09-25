@@ -144,6 +144,8 @@ def cmd_build(a: argparse.Namespace) -> None:
             say(f"cuda: btb/native/{tag}/btb_kernels.fatbin" + ("" if have_nvcc else " (packaged as built)"))
         else:
             say("cuda: no nvcc and no built fatbin; the wheel ships without the card's kernels")
+    if a.no_wheel:
+        return
     # the wheel carries the library, so it is tagged py3-none-<platform>, never the pure py3-none-any; on macOS
     # the floor is the library's own build version, on Linux the manylinux container's policy tag when it sets one
     if tag.startswith("macos-"):
@@ -218,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     b.add_argument("--no-cuda", action="store_true", help="neither build nor package the card's kernels")
     b.add_argument("--cuda-only", action="store_true", help="build the fatbin with nvcc and stop: no library, no wheel")
+    b.add_argument("--no-wheel", action="store_true", help="stop once btb/native/<tag> holds the library")
     b.add_argument("--python", default="", help="the interpreter that builds the wheel (default: this one)")
     b.set_defaults(fn=cmd_build)
     for name, fn, text in (

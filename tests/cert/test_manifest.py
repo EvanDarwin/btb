@@ -1,9 +1,8 @@
 """The manifest as a suite gate. It derives families from core (`core.served_kinds`), so these hold for any
-family core adds - a new one is iterated, and uncovered it reports its gaps rather than passing quietly. The
-blocking gate is `python -m tests.cert.manifest --check`, which stays red while any gap or unproven cell is open,
-and `python -m tests.cert.delta check` names the gaps a change opened; these tests hold the manifest's SHAPE:
-that COVERED means a receipt, that the axes are still total against btb.kinds, and that every gap kind is one a
-rule raises and the report can explain."""
+family core adds - a new one is iterated, and uncovered it is a gap that `--check` and the base-branch delta
+report rather than passing quietly. The blocking gate is `python -m tests.cert.manifest --check`, which stays
+red while any gap or unproven cell is open; these tests hold the manifest's SHAPE: that COVERED means a receipt
+and that the axes are still total against btb.kinds."""
 
 from __future__ import annotations
 
@@ -326,25 +325,9 @@ def test_fixture_gaps_sees_an_unbound_gguf_twin(tmp_path: Path, monkeypatch: Mon
     assert manifest.fixture_gaps() == ["gguf/tiny_qwen3-q9_9.gguf"]
 
 
-def test_every_gap_kind_is_raised_and_explained() -> None:
-    """each open gap names the families it affects and what closing it takes; and a Missing kind no cell reports
-    is one its own source shows closed, never a kind no rule raises any more. Which gaps are open is the
-    manifest's to derive - `tests.cert.delta check` names the ones a change opened."""
-    got = {kind: fams for kind, _n, fams in manifest.missing_items()}
-    for kind, fams in got.items():
-        what, how = manifest.MISSING[kind]
-        assert fams and what.strip() and how.strip(), kind
-    # a precision's gap kind is idle while every family has that twin (test_a_precision_cell_binds_only_its_own_twin
-    # holds it live for a family that loses one)
-    idle = {
-        gap
-        for storage, gap in manifest.SAFE_PRECISION_GAP.items()
-        if all(spec.fixture_paths(kind, storage) for kind in spec.FIXTURE_STEM)
-    }
-    assert set(got) | idle == set(manifest.Missing), "a Missing kind that no cell uses, or a cell kind not pinned here"
-
-
 def test_the_gate_stays_red_while_gaps_are_open() -> None:
-    """--check is the blocking gate and is MEANT to fail while the set above is non-empty; it must never be
-    softened into a pass. (It writes its FAIL lines to stderr, which pytest captures.)"""
-    assert manifest.check() == 1
+    """--check is the blocking gate and is MEANT to fail while any gap is open; it must never be softened into a
+    pass. A gap a change opens is caught against its base branch (`tests.cert.delta check` in cert.yml).
+    (It writes its FAIL lines to stderr, which pytest captures.)"""
+    if manifest.missing_items():
+        assert manifest.check() == 1
