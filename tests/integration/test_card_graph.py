@@ -258,8 +258,7 @@ def test_the_default_engine_takes_one_gemv_for_every_width_and_is_exact(default_
     sm = default_engine
     choice = sm._cg["mma_for"]
     assert choice and len(set(choice.values())) == 1, f"a kernel per width: {choice}"
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    with open(os.path.join(here, "bench", "questions.jsonl"), encoding="utf-8") as fh:
+    with open(checkout("bench", "questions.jsonl"), encoding="utf-8") as fh:
         prompts = [sm.prompt_ids(json.loads(line)["prompt"]) for line in fh if line.strip()][:3]
     for ids in prompts:
         g = sm.generate(ids, 128, eos=(), speculate=False).tokens
