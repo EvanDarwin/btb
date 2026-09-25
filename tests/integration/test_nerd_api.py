@@ -292,6 +292,26 @@ def test_feed_taps_are_the_layers_at_each_fed_position(stem: str, device: str) -
     assert (hid[1] - ref).abs().max().item() <= 3e-2 * ref.abs().max().item()
 
 
+@cells
+@families
+def test_a_long_feed_goes_in_the_prefills_chunks(stem: str, device: str) -> None:
+    """a feed longer than a chunk goes in the chunks a prompt's prefill takes (a long prelude is never one pass):
+    the same logits and taps as the one pass gives"""
+    sm = model(stem, device)
+    whole, whole_taps = sm.session(PROMPT).feed(LONG, taps=(1,))
+    keep = sm.prefill_chunk
+    sm.prefill_chunk = 4
+    try:
+        chunked, chunked_taps = sm.session(PROMPT).feed(LONG, taps=(1,))
+        last = sm.session(PROMPT).feed(LONG, last_only=True)
+    finally:
+        sm.prefill_chunk = keep
+    assert chunked.shape == whole.shape and chunked_taps[1].shape == whole_taps[1].shape
+    close(chunked, whole, device)
+    close(chunked_taps[1], whole_taps[1], device)
+    close(last[0], whole[-1], device)
+
+
 def test_a_mark_past_the_end_is_refused() -> None:
     sm = model(STEMS[0], "cpu")
     m = sm.session(PROMPT).mark()

@@ -32,6 +32,8 @@ Rope = tuple[torch.Tensor, torch.Tensor]
 PassRope = Rope | dict[str, Rope]
 
 _GPU_PREFILL_RETRIES = 3
+# the fewest rows a prefill chunk takes, however short of room: a pass of no more rows is never chunked
+PREFILL_MIN_ROWS = 64
 
 
 def pe_for(pe: PassRope | None, lt: str) -> Rope | None:
@@ -690,15 +692,22 @@ class _ForwardMixin(_State):
         # shrink until the whole working set fits the room, and until the attention's own buffer at these rows
         # fits buf_cap - so a free reading that runs high never passes a single buffer the GPU cannot allocate,
         # the oversized ask that faults it
-        while rows > 64 and (
+        while rows > PREFILL_MIN_ROWS and (
             rows * (per_token + scores * (int(past) + rows)) > free or scores * rows * (int(past) + rows) > buf_cap
         ):
             rows //= 2
         return int(rows)
 
     def _prefill(
-        self, ids: torch.Tensor, cache: Any, on_layer: Any = None, attention_mask: torch.Tensor | None = None
+        self,
+        ids: torch.Tensor,
+        cache: Any,
+        on_layer: Any = None,
+        attention_mask: torch.Tensor | None = None,
+        last_only: bool = True,
     ) -> Any:
+        """`ids` into `cache` in chunks the free memory prices: the last row's logits, or every row's (the chunks'
+        joined) without `last_only`"""
         ids = torch.as_tensor(ids, dtype=torch.long, device=self.dev)
         if ids.dim() == 1:
             ids = ids.view(1, -1)
@@ -706,14 +715,14 @@ class _ForwardMixin(_State):
         # the host path's DeltaNet takes a prompt whole; the MLX path continues a chunk from the stored states
         whole_hybrid = LayerKind.LINEAR in self.layer_types and not self.fam.own and self.mlx is None
         if cache is None or attention_mask is not None or getattr(self, "aq", False) or whole_hybrid:
-            return self.forward(ids, cache=cache, on_layer=on_layer, attention_mask=attention_mask)
+            return self.forward(ids, cache=cache, on_layer=on_layer, attention_mask=attention_mask, last_only=last_only)
         past = int(cache.get_seq_length())
         C = int(self.prefill_chunk or self._auto_chunk(past))
         if T <= C:
-            return self.forward(ids, cache=cache, on_layer=on_layer)
+            return self.forward(ids, cache=cache, on_layer=on_layer, last_only=last_only)
         # a mixture of experts with the whole trunk resident prefills layer by layer, so a layer's experts
         # are read once for the whole prompt instead of once per chunk
-        if self.fam.moe and not self.host and len(self.resident) == self.L and on_layer is None:
+        if self.fam.moe and not self.host and len(self.resident) == self.L and on_layer is None and last_only:
             return self._prefill_by_layer(ids, cache, C)
         self.log(f"[prefill] {T} tokens in chunks of {C} from position {past}")
         # a layer hook sees the last layer's rows for the whole prompt once, joined at the end, as it would from
@@ -730,6 +739,7 @@ class _ForwardMixin(_State):
                 on_layer(i, h)
 
         hook = collect if on_layer is not None else None
+        rows: list[torch.Tensor] = []  # every chunk's logits, without `last_only`
         self._batched_cont = True
         try:
             a = 0
@@ -752,7 +762,7 @@ class _ForwardMixin(_State):
                 attempt = 0
                 while True:
                     try:
-                        out = self.forward(ids[:, a:b], cache=cache, on_layer=hook)
+                        out = self.forward(ids[:, a:b], cache=cache, on_layer=hook, last_only=last_only)
                         break
                     except Exception as e:
                         sched = getattr(self, "scheduler", None)
@@ -774,6 +784,8 @@ class _ForwardMixin(_State):
                             f"replay {attempt}/{_GPU_PREFILL_RETRIES} in {wait:.2f}s"
                         )
                         time.sleep(wait)
+                if not last_only and out is not None:
+                    rows.append(out)
                 if b >= T:
                     break
                 self.log(f"[prefill] {b}/{T} (chunks of {C})")
@@ -782,7 +794,7 @@ class _ForwardMixin(_State):
             self._batched_cont = False
         if on_layer is not None and taps:
             on_layer(last, taps[0] if len(taps) == 1 else torch.cat(taps, dim=1))
-        return out
+        return out if last_only else torch.cat(rows, dim=1)
 
     @torch.inference_mode()
     def _prefill_by_layer(self, ids: torch.Tensor, cache: Any, C: int) -> Any:

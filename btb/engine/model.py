@@ -112,7 +112,7 @@ class StreamedTextModel(
         expert_cache_gb: float | None = None,
         ram_reserve_gb: float | None = None,
         vram_reserve_gb: float | None = None,
-        vram_watch: bool = True,
+        adapt: bool = True,
         mlx_layers: Iterable[int] | None = None,
         kv_bits: int | None = None,
         gguf_packed: bool = True,
@@ -365,10 +365,13 @@ class StreamedTextModel(
             else:
                 budget = int(float(expert_cache_gb) * 2**30)
             self.expert_store = _ExpertStore(self, budget, self.ram_reserve)
-        self.vram_watch = bool(vram_watch) and self.dev.type == DeviceKind.CUDA
+        # the memory policies give layers up when another program needs the memory and take them back after;
+        # `adapt` off pins the placement taken at load
+        self.adapt = bool(adapt)
+        self.vram_watch = self.adapt and self.dev.type == DeviceKind.CUDA
         self.vram_state = VramPolicyState()
         # the host tier's policy: on where layers run from RAM off unified memory (which keeps its own ledger)
-        self.ram_watch = bool(self.host) and self.mlx is None
+        self.ram_watch = self.adapt and bool(self.host) and self.mlx is None
         self.ram_state = RamPolicyState()
         self._shed = []
         self.drafter_dev = None

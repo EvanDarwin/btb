@@ -86,7 +86,7 @@ PLACEMENT = (
     "expert_cache_gb",
     "ram_reserve_gb",
     "vram_reserve_gb",
-    "vram_watch",
+    "adapt",
     "cold_slots",
     "temperature",
     "top_p",
@@ -393,13 +393,13 @@ def _common(ap: argparse.ArgumentParser, path_required: bool = True) -> None:
         "(default: 0.5 GB, or 8%% of a smaller card)",
     )
     m.add_argument(
-        "--vram-watch",
-        dest="vram_watch",
+        "--adapt",
+        dest="adapt",
         type=int,
         choices=(0, 1),
         default=1,
-        help="move layers off the card when another program takes it, and back when it frees (default 1); "
-        "--vram-watch 0 pins the placement taken at load",
+        help="give layers up (off the card, from RAM to the drive) when another program needs the memory, and take "
+        "them back when it frees (default 1); --adapt 0 pins the placement taken at load",
     )
     s = ap.add_argument_group("speculation (models with a drafting head, or the n-gram drafter)")
     s.add_argument(

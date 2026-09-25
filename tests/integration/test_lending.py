@@ -145,6 +145,43 @@ def test_a_cache_growth_makes_room_instead_of_refusing(monkeypatch: pytest.Monke
         assert got is not None and torch.equal(got, ref)
 
 
+def test_a_pinned_placement_makes_no_room_for_growth(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`adapt` off pins the placement: neither memory policy runs, a cache's growth gives nothing up, and the grant
+    refuses what does not fit"""
+    with loaded_model(fixture("tiny_qwen3"), device="cpu", adapt=False) as sm:
+        assert not sm.adapt and not sm.ram_watch and not sm.vram_watch
+        squeeze(sm, 0)
+        gave: list[int] = []
+
+        def give(dev: torch.device, short: int, tried: set[str]) -> bool:
+            gave.append(short)
+            return True
+
+        monkeypatch.setattr(sm, "_give_up_one", give)
+        with pytest.raises(MemoryGrantError, match="only"):
+            sm.session(PROMPT)
+        assert not gave
+
+
+def test_a_rooms_own_tensors_count_against_it(sm: StreamedTextModel) -> None:
+    """tensors taken through a room fill it: where btb's free reading sees them (the CPU) the room holds only what
+    they leave, so neither is counted twice; on MLX, which cannot, the whole room. A tensor past what is left is
+    refused, and one gone gives its bytes back to the room"""
+    seen = sm.mlx is None
+    with sm.room(4 * MiB) as r:
+        t = r.zeros(MiB, dtype=torch.uint8)
+        assert t.device.type == "cpu" and int(t.sum()) == 0 and r.used == MiB
+        assert sm.memory()["cpu"].reserved == (3 * MiB if seen else 4 * MiB)
+        with pytest.raises(MemoryGrantError, match="MiB left"):
+            r.empty(4 * MiB, dtype=torch.uint8)
+        del t
+        gc.collect()
+        assert r.used == 0 and sm.memory()["cpu"].reserved == 4 * MiB
+    assert sm.memory()["cpu"].reserved == 0
+    with pytest.raises(ValueError, match="released"):
+        r.empty(1)
+
+
 def test_memory_names_each_device_btb_runs_on(sm: StreamedTextModel) -> None:
     mem = sm.memory()
     assert list(mem) == ["cpu"]
@@ -178,7 +215,7 @@ def test_a_card_gives_layers_up_for_a_tensor_and_every_cache_follows() -> None:
     """a squeezed card sheds layers for a tensor; an idle session's rows follow each layer to the host (its next
     turn runs, no device mismatch); once the tensor is gone the layers grow back with no memory policy running"""
     dev = need_cuda()
-    with loaded_model(fixture("tiny_qwen3"), device=dev, vram_watch=False) as sm:
+    with loaded_model(fixture("tiny_qwen3"), device=dev, adapt=False) as sm:
         idle = sm.session(PROMPT)
         card = str(sm.dev)
         before, margin = set(sm.resident), sm.vram_margin

@@ -363,7 +363,7 @@ def load(
         expert_cache_gb=c.get("expert_cache_gb"),
         ram_reserve_gb=c.get("ram_reserve_gb"),
         vram_reserve_gb=c.get("vram_reserve_gb"),
-        vram_watch=bool(int(c.get("vram_watch", 1))),
+        adapt=bool(int(c.get("adapt", 1))),
         mlx_layers=mlx_layers,
         host_budget=pl.budget if pl is not None else None,
         # the expert store is built inside __init__, so its policy travels as an argument, not an assignment after

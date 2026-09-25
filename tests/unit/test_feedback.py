@@ -46,7 +46,7 @@ class _Engine:
     cfg = None
     context = 4096
     ram_reserve = 2**30
-    vram_watch = False
+    adapt = False
 
     def report(self) -> Json:
         return {
@@ -82,6 +82,7 @@ def test_the_crash_report_carries_the_engines_ledger_when_one_is_up() -> None:
         "btb run m",
         "--device cpu",
         "--kv-host 1",
+        "--adapt 0",
         "### Placement",
         "2 host",
         "### Memory",

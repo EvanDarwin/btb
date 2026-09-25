@@ -149,6 +149,7 @@ class _State:
     mem_start: int
     ram_reserve: int
     ram_state: RamPolicyState
+    adapt: bool  # the memory policies give way to other programs (`--adapt`); off, the placement is pinned
     ram_watch: bool
     vram_margin: int
     vram_state: VramPolicyState
@@ -485,7 +486,12 @@ class _State:
         raise NotImplementedError
 
     def _prefill(
-        self, ids: torch.Tensor, cache: Any, on_layer: Any = None, attention_mask: torch.Tensor | None = None
+        self,
+        ids: torch.Tensor,
+        cache: Any,
+        on_layer: Any = None,
+        attention_mask: torch.Tensor | None = None,
+        last_only: bool = True,
     ) -> Any:
         raise NotImplementedError
 

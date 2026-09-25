@@ -157,7 +157,16 @@ class Session:
             if i in seen:
                 seen[i].append(h[0].float().cpu())
 
-        logits = eng.forward([new], cache=self.cache, last_only=last_only, on_layer=keep if taps else None)
+        import torch
+
+        from .engine.forward import PREFILL_MIN_ROWS
+
+        hook = keep if taps else None
+        if len(new) > min(PREFILL_MIN_ROWS, int(eng.prefill_chunk or PREFILL_MIN_ROWS)):
+            # a long feed goes in the chunks the free memory prices, as a prompt's prefill does
+            logits = eng._prefill(torch.tensor([new]), self.cache, on_layer=hook, last_only=last_only)
+        else:
+            logits = eng.forward([new], cache=self.cache, last_only=last_only, on_layer=hook)
         assert logits is not None
         out = logits[0].float().cpu()
         self.ids.extend(new)

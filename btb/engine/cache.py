@@ -279,9 +279,10 @@ class GrowLayer(_DynamicLayer):
             )
         return self._mx[0][r, :, start:n], self._mx[1][r, :, start:n]
 
-    def _store(self, which: int, n0: int, a: mx_.array, row: int | None = None) -> None:
+    def _store(self, which: int, n0: int, a: mx_.array, row: int | None = None, lazy: bool = False) -> mx_.array | None:
         """rows n0.. of buffer `which` from an MLX [B, Hk, T, d] array (into batch row `row` when given, at
-        the row's offset of a flat buffer), quantized for an int8 layer"""
+        the row's offset of a flat buffer), quantized for an int8 layer. An arena layer's write is evaluated now,
+        or with `lazy` handed back as its flag, for the caller to make the rows' readers depend on."""
         B, T = int(a.shape[0]), int(a.shape[2])
         if self._flat:
             if row is not None:
@@ -293,14 +294,18 @@ class GrowLayer(_DynamicLayer):
             q, s = mlxdev.kv_quantize(a)
             self._mx[which][r, :, n0 : n0 + T, :] = q
             self._mx[2 + which][r, :, n0 : n0 + T] = s
-            return
+            return None
         if self._mx[which].dtype != a.dtype:
             a = a.astype(self._mx[which].dtype)
         if self.arena is not None:
-            # in place, evaluated now: the rows have no graph dependency to order them before their readers
-            mlxdev.mx().eval(mlxdev.kv_store(self._mx[which], a[0], int(n0)))
-            return
+            # in place: the rows have no graph dependency to order them before their readers
+            flag = mlxdev.kv_store(self._mx[which], a[0], int(n0))
+            if lazy:
+                return flag
+            mlxdev.mx().eval(flag)
+            return None
         self._mx[which][r, :, n0 : n0 + T, :] = a
+        return None
 
     # -- a batched cache: B rows, each at its own length --
     def batch_rows(self, B: int, dec_cap: int = 0, lens: Any = None) -> None:
@@ -722,11 +727,15 @@ class GrowLayer(_DynamicLayer):
         if self._mx[0].dtype != k.dtype:
             k, v = k.astype(self._mx[0].dtype), v.astype(self._mx[0].dtype)
         if self.arena is not None:
-            # in place through the arena's kernel: a slice assignment would rebind the layer to a copy
-            self._store(0, n, k)
-            self._store(1, n, v)
+            # in place through the arena's kernel (a slice assignment would rebind the layer to a copy), left in
+            # the pass's graph: the rows handed back depend on the writes, so no sync a layer orders them
+            flags = [f for f in (self._store(0, n, k, lazy=True), self._store(1, n, v, lazy=True)) if f is not None]
             self._n = n + T
-            return self.mx_kv(0, self._n)
+            K, V = self.mx_kv(0, self._n)
+            if not flags:
+                return K, V
+            K, V = mlxdev.mx().depends([K, V], flags)
+            return K, V
         if self._shape[0] == B:
             self._mx[0][..., n : n + T, :] = k
             self._mx[1][..., n : n + T, :] = v

@@ -87,10 +87,14 @@ class DeviceMemory:
 
 class Room:
     """Room made for memory btb does not allocate itself - a second model, a library's workspace - and kept from
-    btb until `release()`, the end of a `with` block, or the room being dropped. Rooms add up, each its own."""
+    btb until `release()`, the end of a `with` block, or the room being dropped. Rooms add up, each its own.
+    `empty`/`zeros`/`full` hand out tensors inside it: where btb's free reading sees them (a card, the CPU off MLX)
+    their bytes come off what the room holds while they live, so the room and the tensor are not counted twice."""
 
-    def __init__(self, ledger: DeviceLedger, tag: str, nbytes: int, device: torch.device) -> None:
+    def __init__(self, ledger: DeviceLedger, tag: str, nbytes: int, device: torch.device, seen: bool) -> None:
         self.nbytes, self.device = int(nbytes), device
+        self.used = 0  # what the room's own tensors take, while they live
+        self._ledger, self._tag, self._seen = ledger, tag, seen
         self._give_back = weakref.finalize(self, _give_back, ledger, tag)
 
     @property
@@ -99,6 +103,44 @@ class Room:
 
     def release(self) -> None:
         self._give_back()
+
+    def empty(self, shape: int | Sequence[int], dtype: torch.dtype | None = None) -> torch.Tensor:
+        """a tensor of the room's, as `torch.empty` makes it on the room's device; a MemoryGrantError past what is
+        left of the room"""
+        return self._alloc(shape, dtype, None)
+
+    def zeros(self, shape: int | Sequence[int], dtype: torch.dtype | None = None) -> torch.Tensor:
+        """`empty`, filled with zeros"""
+        return self._alloc(shape, dtype, 0)
+
+    def full(self, shape: int | Sequence[int], value: float, dtype: torch.dtype | None = None) -> torch.Tensor:
+        """`empty`, filled with `value`"""
+        return self._alloc(shape, dtype, value)
+
+    def _alloc(self, shape: int | Sequence[int], dtype: torch.dtype | None, fill: float | None) -> torch.Tensor:
+        if not self.held:
+            raise ValueError("this room was released: make another")
+        dt = dtype if dtype is not None else torch.get_default_dtype()
+        size = (int(shape),) if isinstance(shape, int) else tuple(int(s) for s in shape)
+        nbytes = math.prod(size) * torch.empty(0, dtype=dt).element_size()
+        if self.used + nbytes > self.nbytes:
+            raise MemoryGrantError(
+                f"a {dt} tensor of shape {list(size)} ({nbytes / 2**20:.1f} MiB) in a room of {self.nbytes / 2**20:.1f} "
+                f"MiB with {(self.nbytes - self.used) / 2**20:.1f} MiB left"
+            )
+        t = torch.empty(size, dtype=dt, device=self.device)
+        if fill is not None:
+            t.fill_(fill)
+        self.used += nbytes
+        self._hold()
+        weakref.finalize(t.untyped_storage(), _emptied, weakref.ref(self), nbytes)
+        return t
+
+    def _hold(self) -> None:
+        """what the room keeps from btb now: all of it where btb's free reading cannot see its tensors, else what
+        they have not taken"""
+        if self.held:
+            self._ledger.reserve(self._tag, self.nbytes - self.used if self._seen else self.nbytes, self.device)
 
     def __enter__(self) -> Room:
         return self
@@ -111,6 +153,14 @@ def _give_back(ledger: DeviceLedger, tag: str) -> None:
     """lent memory back to btb's ledger (from a finalizer: any thread, any time); the lending policy regrows"""
     ledger.release(tag)
     ledger.returned = True
+
+
+def _emptied(room: weakref.ref[Room], nbytes: int) -> None:
+    """a room's tensor gone (from a finalizer): its bytes are the room's to hold again"""
+    r = room()
+    if r is not None:
+        r.used -= nbytes
+        r._hold()
 
 
 class _MemoryMixin(_State):
@@ -418,7 +468,8 @@ class _MemoryMixin(_State):
         """
         Room for memory btb does not allocate itself - a second model, a library's workspace - made now and kept
         from btb until the `Room` is released (`release()`, or as a `with` block). Keep it while that memory is in
-        use. A `MemoryGrantError` when btb cannot make that much.
+        use; tensors taken through it (`Room.empty`) count against it, not beside it. A `MemoryGrantError` when
+        btb cannot make that much.
         """
         dev = self._lend_device(device)
         tag = f"{name}#{next(_LOANS)}"
@@ -427,7 +478,7 @@ class _MemoryMixin(_State):
             self._lend_check(name)
             self._make_room(dev, int(nbytes), f"room {name!r}")
             self.device.reserve(tag, int(nbytes), dev)
-            return Room(self.device, tag, int(nbytes), dev)
+            return Room(self.device, tag, int(nbytes), dev, self._sees(dev))
 
         return self._serial(run)
 
@@ -515,8 +566,9 @@ class _MemoryMixin(_State):
     def cache_room(self, cache: KvCache | None, B: int, T: int) -> None:
         """Room made, before a pass, for the buffers its cache appends will allocate. The scheduler's grant is
         asked for them inside the pass, where nothing may move, so a refusal there could only fail; here btb gives
-        up what it holds, cheapest first, as `empty` does. Priced as the grant prices them."""
-        if cache is None:
+        up what it holds, cheapest first, as `empty` does. Priced as the grant prices them. With `adapt` off the
+        placement is pinned: nothing is given up, and the grant refuses what does not fit."""
+        if cache is None or not getattr(self, "adapt", True):
             return
         first = next(((i, cl) for i, cl in enumerate(cache.layers) if isinstance(cl, GrowLayer)), None)
         if first is None:
