@@ -255,6 +255,21 @@ def _canon(doc: Json) -> str:
     return json.dumps(doc, indent=2, sort_keys=True) + "\n"
 
 
+def _sans_margins(doc: Json) -> str:
+    """`_canon` without the step margins: their last digit follows the ISA's fp32 rounding, so a rebank on
+    another machine reproduces the tokens and the structure but not those bytes"""
+
+    def drop(entry: Json) -> Json:
+        return {k: v for k, v in entry.items() if k != "margins"}
+
+    families: Json = {}
+    for name, fam in doc["families"].items():
+        families[name] = drop(fam)
+        if "storages" in fam:
+            families[name]["storages"] = {s: drop(e) for s, e in fam["storages"].items()}
+    return _canon({**doc, "families": families})
+
+
 def thin_margins(doc: Json) -> list[str]:
     """every banked greedy decode (a family's, a lossy twin's) with a step under `MARGIN_FLOOR`, as
     label/prompt with its smallest gap, or one with no margins banked; reads the bank only"""
@@ -389,8 +404,9 @@ def check() -> list[str]:
                     was, now = c.get(key, {}).get(name), fr[key][name]
                     if was != now:
                         problems.append(f"{label}/{key}/{name}: tokens drifted ({was} != {now})")
-    if _canon(fresh) != _canon(committed) and not problems:
+    if _sans_margins(fresh) != _sans_margins(committed) and not problems:
         problems.append("bank bytes differ from a fresh regeneration (metadata/structure changed); rebank")
+    problems += [f"fresh regeneration: {t}" for t in thin_margins(fresh)]
     return problems
 
 

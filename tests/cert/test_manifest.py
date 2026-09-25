@@ -1,8 +1,8 @@
 """The manifest as a suite gate. It derives families from core (`core.served_kinds`), so these hold for any
-family core adds - a new one is iterated, and uncovered it appears in the pinned gap set below rather than
-passing quietly. The blocking gate is `python -m tests.cert.manifest --check`, which stays red while any gap or
-unproven cell is open; these tests hold the manifest's SHAPE: that COVERED means a receipt, that the axes are
-still total against btb.kinds, and that the gap set is exactly the one the repo knows about."""
+family core adds - a new one is iterated, and uncovered it is a gap that `--check` and the base-branch delta
+report rather than passing quietly. The blocking gate is `python -m tests.cert.manifest --check`, which stays
+red while any gap or unproven cell is open; these tests hold the manifest's SHAPE: that COVERED means a receipt
+and that the axes are still total against btb.kinds."""
 
 from __future__ import annotations
 
@@ -20,25 +20,6 @@ if TYPE_CHECKING:
     from pytest import MonkeyPatch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# The gaps the repo knows it has, as `Missing` kind -> the families it affects. This is the intentionally-red
-# half made explicit: `--check` fails on every one of them, and this test fails when the set MOVES - a new gap
-# nobody wrote down, or a closed gap still claimed here. Update it in the same change that opens or closes one.
-EXPECTED_GAPS: dict[manifest.Missing, list[str]] = {
-    manifest.Missing.GGUF_LOAD: ["tiny_gemma3"],
-    manifest.Missing.GPTOSS_GGUF_TWIN: ["tiny_gpt_oss"],
-    manifest.Missing.KIQUANT_FIXTURE: ["tiny_phi3", "tiny_q35", "tiny_q4", "tiny_qwen3"],
-    manifest.Missing.MEGAKERNEL: ["tiny_gemma3", "tiny_gpt_oss", "tiny_phi3", "tiny_q35", "tiny_q4"],
-    manifest.Missing.MEGA_STORAGE: ["tiny_qwen3"],
-    manifest.Missing.MEGA_SHAPE: ["tiny_qwen3"],
-    manifest.Missing.CARD_GRAPH_FAMILY: ["tiny_gpt_oss", "tiny_phi3", "tiny_q35", "tiny_q4"],
-    manifest.Missing.CARD_GRAPH_SHAPE: ["tiny_gemma3", "tiny_qwen3"],
-    manifest.Missing.SPEC_MTP_HEAD: ["tiny_gemma3", "tiny_gpt_oss", "tiny_phi3", "tiny_qwen3"],
-    manifest.Missing.GGUF_MTP_HEAD: ["tiny_q35"],
-    manifest.Missing.SPEC_OWN_LAYER: ["tiny_q4"],
-    manifest.Missing.QUANT_FIXTURE: ["tiny_phi3"],
-    manifest.Missing.NO_FIXTURE: ["tiny_phi3"],
-}  # fmt: skip
 
 
 def _source(*rel: str) -> str:
@@ -344,22 +325,9 @@ def test_fixture_gaps_sees_an_unbound_gguf_twin(tmp_path: Path, monkeypatch: Mon
     assert manifest.fixture_gaps() == ["gguf/tiny_qwen3-q9_9.gguf"]
 
 
-def test_the_known_gaps_are_exactly_these() -> None:
-    """the intentionally-red set, pinned: `--check` fails on every kind below, and this fails if the set moves -
-    a gap nobody recorded, or one closed without being struck from the list."""
-    got = {kind: fams for kind, _n, fams in manifest.missing_items()}
-    assert got == EXPECTED_GAPS
-    # a precision's gap kind is idle while every family has that twin (test_a_precision_cell_binds_only_its_own_twin
-    # holds it live for a family that loses one)
-    idle = {
-        gap
-        for storage, gap in manifest.SAFE_PRECISION_GAP.items()
-        if all(spec.fixture_paths(kind, storage) for kind in spec.FIXTURE_STEM)
-    }
-    assert set(got) | idle == set(manifest.Missing), "a Missing kind that no cell uses, or a cell kind not pinned here"
-
-
 def test_the_gate_stays_red_while_gaps_are_open() -> None:
-    """--check is the blocking gate and is MEANT to fail while the set above is non-empty; it must never be
-    softened into a pass. (It writes its FAIL lines to stderr, which pytest captures.)"""
-    assert manifest.check() == 1
+    """--check is the blocking gate and is MEANT to fail while any gap is open; it must never be softened into a
+    pass. A gap a change opens is caught against its base branch (`tests.cert.delta check` in cert.yml).
+    (It writes its FAIL lines to stderr, which pytest captures.)"""
+    if manifest.missing_items():
+        assert manifest.check() == 1
