@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import available_models, load, model_stem, resolve, serve_name
 from .draft import SpanBank
-from .engine.constrain import JsonObject, LogitBias, Penalties
+from .engine.constrain import JsonObjectPrefix, LogitBias, Penalties, PrefixConstraint
 from .engine.device import resolve_device
 from .engine.hooks import LogitsProcessor, TokenLogprob
 from .kinds import Json, Log, Tokens
@@ -718,7 +718,7 @@ def _processors(req: Request, engine: Engine, start: int, json_field: str = "res
     if pres or freq:
         out.append(Penalties(start, pres, freq))
     if _json_mode(req.get(json_field), json_field):
-        out.append(JsonObject(engine.tok, start, engine.eos))
+        out.append(PrefixConstraint(engine.tok, start, engine.eos, JsonObjectPrefix()))
     return out
 
 

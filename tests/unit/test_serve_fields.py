@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 import torch
 
-from btb.engine.constrain import JsonObject, LogitBias, Penalties, _Json
+from btb.engine.constrain import JsonObjectPrefix, LogitBias, Penalties, PrefixConstraint
 from btb.serve import Server
 from tests.helpers import CharTokenizer, fixture, request, request_json
 
@@ -130,7 +130,7 @@ def test_logit_bias_decides_the_pick(served: tuple[Server, str]) -> None:
 def test_json_mode_holds_the_answer_to_a_json_object(served: tuple[Server, str]) -> None:
     choice = chat(served, max_tokens=40, response_format={"type": "json_object"})["choices"][0]
     text = choice["message"]["content"]
-    assert _Json().fed(text) is not None, text
+    assert JsonObjectPrefix().feed(text) is not None, text
     if choice["finish_reason"] == "stop":
         assert isinstance(json.loads(text), dict)
 
@@ -143,7 +143,7 @@ def test_ollama_takes_format_and_stop(served: tuple[Server, str]) -> None:
         "/api/generate",
         {"model": name, "prompt": "hi", "stream": False, "format": "json", "options": {"num_predict": 20}},
     )
-    assert code == 200 and _Json().fed(body["response"]) is not None, body
+    assert code == 200 and JsonObjectPrefix().feed(body["response"]) is not None, body
     code, plain = request_json(
         server.url,
         "POST",
@@ -209,7 +209,7 @@ def test_json_mode_keeps_every_prefix_valid_and_ends_at_a_stop() -> None:
     """random logits over printable characters, steered only by the processor: every text it lets through is a
     JSON object's prefix, and once the object closes only the stop token is left"""
     stop = 3
-    proc = JsonObject(_Chars(), start=2, stop_ids=[stop], width=8, scan=128)
+    proc = PrefixConstraint(_Chars(), 2, [stop], JsonObjectPrefix(), width=8, scan=128)
     gen = torch.Generator().manual_seed(0)
     ids = [1, 2]
     for _ in range(400):
@@ -219,8 +219,33 @@ def test_json_mode_keeps_every_prefix_valid_and_ends_at_a_stop() -> None:
         if t == stop:
             break
         ids.append(t)
-        assert _Json().fed("".join(map(chr, ids[2:]))) is not None
+        assert JsonObjectPrefix().feed("".join(map(chr, ids[2:]))) is not None
     text = "".join(map(chr, ids[2:]))
     assert isinstance(json.loads(text), dict), text
     after = proc(ids, torch.zeros(128))
     assert torch.isfinite(after).nonzero().flatten().tolist() == [stop]
+
+
+class _Digits:
+    """a language of its own: two or more digits, complete from the second"""
+
+    def __init__(self, n: int = 0) -> None:
+        self.n = n
+
+    @property
+    def complete(self) -> bool:
+        return self.n >= 2
+
+    def feed(self, text: str) -> _Digits | None:
+        return _Digits(self.n + len(text)) if text.isdigit() else None
+
+
+def test_a_prefix_constraint_takes_any_recognizer() -> None:
+    """the constraint knows no JSON: any `TextPrefix` holds the answer to its language, a stop token allowed once
+    the text is complete and not before"""
+    stop = 3
+    proc = PrefixConstraint(_Chars(), 0, [stop], _Digits(), width=128, scan=128)
+    allowed = torch.isfinite(proc([ord("7")], torch.zeros(128))).nonzero().flatten().tolist()
+    assert allowed == [ord(c) for c in "0123456789"]
+    allowed = torch.isfinite(proc([ord("7"), ord("1")], torch.zeros(128))).nonzero().flatten().tolist()
+    assert allowed == [stop, *(ord(c) for c in "0123456789")]
