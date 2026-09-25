@@ -1,8 +1,9 @@
 """The manifest as a suite gate. It derives families from core (`core.served_kinds`), so these hold for any
-family core adds - a new one is iterated, and uncovered it appears in the pinned gap set below rather than
-passing quietly. The blocking gate is `python -m tests.cert.manifest --check`, which stays red while any gap or
-unproven cell is open; these tests hold the manifest's SHAPE: that COVERED means a receipt, that the axes are
-still total against btb.kinds, and that the gap set is exactly the one the repo knows about."""
+family core adds - a new one is iterated, and uncovered it reports its gaps rather than passing quietly. The
+blocking gate is `python -m tests.cert.manifest --check`, which stays red while any gap or unproven cell is open,
+and `python -m tests.cert.delta check` names the gaps a change opened; these tests hold the manifest's SHAPE:
+that COVERED means a receipt, that the axes are still total against btb.kinds, and that every gap kind is one a
+rule raises and the report can explain."""
 
 from __future__ import annotations
 
@@ -20,31 +21,6 @@ if TYPE_CHECKING:
     from pytest import MonkeyPatch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# The gaps the repo knows it has, as `Missing` kind -> the families it affects. This is the intentionally-red
-# half made explicit: `--check` fails on every one of them, and this test fails when the set MOVES - a new gap
-# nobody wrote down, or a closed gap still claimed here. Update it in the same change that opens or closes one.
-EXPECTED_GAPS: dict[manifest.Missing, list[str]] = {
-    manifest.Missing.GGUF_LOAD: ["tiny_gemma3", "tiny_q35", "tiny_q4"],
-    manifest.Missing.MXFP4_NON_GPTOSS: ["tiny_phi3", "tiny_qwen3"],
-    manifest.Missing.GPTOSS_GGUF_TWIN: ["tiny_gpt_oss"],
-    manifest.Missing.KIQUANT_FIXTURE: ["tiny_phi3", "tiny_qwen3"],
-    manifest.Missing.MEGAKERNEL: ["tiny_gemma3", "tiny_gpt_oss", "tiny_phi3", "tiny_q35", "tiny_q4"],
-    manifest.Missing.MEGA_STORAGE: ["tiny_qwen3"],
-    manifest.Missing.MEGA_SHAPE: ["tiny_qwen3"],
-    manifest.Missing.CARD_GRAPH_FAMILY: ["tiny_gpt_oss", "tiny_phi3", "tiny_q35", "tiny_q4"],
-    manifest.Missing.CARD_GRAPH_SHAPE: ["tiny_gemma3", "tiny_qwen3"],
-    manifest.Missing.SPEC_MTP_HEAD: ["tiny_gemma3", "tiny_gpt_oss", "tiny_phi3", "tiny_q4", "tiny_qwen3"],
-    manifest.Missing.SPEC_DECODE: ["tiny_gemma3", "tiny_gpt_oss", "tiny_phi3", "tiny_q35", "tiny_q4", "tiny_qwen3"],
-    manifest.Missing.FP8_UNIMPLEMENTED: [
-        "tiny_gemma3", "tiny_gpt_oss", "tiny_phi3", "tiny_q35", "tiny_q4", "tiny_qwen3",
-    ],
-    manifest.Missing.QUANT_FIXTURE: ["tiny_phi3", "tiny_qwen3"],
-    manifest.Missing.NO_RUNNER_CELL: [
-        "tiny_gemma3", "tiny_gpt_oss", "tiny_phi3", "tiny_q35", "tiny_q4", "tiny_qwen3",
-    ],
-    manifest.Missing.NO_FIXTURE: ["tiny_phi3"],
-}  # fmt: skip
 
 
 def _source(*rel: str) -> str:
@@ -350,11 +326,14 @@ def test_fixture_gaps_sees_an_unbound_gguf_twin(tmp_path: Path, monkeypatch: Mon
     assert manifest.fixture_gaps() == ["gguf/tiny_qwen3-q9_9.gguf"]
 
 
-def test_the_known_gaps_are_exactly_these() -> None:
-    """the intentionally-red set, pinned: `--check` fails on every kind below, and this fails if the set moves -
-    a gap nobody recorded, or one closed without being struck from the list."""
+def test_every_gap_kind_is_raised_and_explained() -> None:
+    """each open gap names the families it affects and what closing it takes; and a Missing kind no cell reports
+    is one its own source shows closed, never a kind no rule raises any more. Which gaps are open is the
+    manifest's to derive - `tests.cert.delta check` names the ones a change opened."""
     got = {kind: fams for kind, _n, fams in manifest.missing_items()}
-    assert got == EXPECTED_GAPS
+    for kind, fams in got.items():
+        what, how = manifest.MISSING[kind]
+        assert fams and what.strip() and how.strip(), kind
     # a precision's gap kind is idle while every family has that twin (test_a_precision_cell_binds_only_its_own_twin
     # holds it live for a family that loses one)
     idle = {
