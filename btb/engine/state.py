@@ -80,6 +80,7 @@ class _State:
     _gguf_names: dict[str, str]
     _gguf_hdr: dict[str, Any]
     head_key: str
+    held_cast: bool  # the checkpoint stores its weights at a float precision other than bf16 (tiers._held)
     kv_bits: int | None
     kv_block: int
     kv_host: bool
@@ -254,7 +255,13 @@ class _State:
     def _flush_events(self) -> None:
         raise NotImplementedError
 
-    def _get(self, key: str) -> torch.Tensor:
+    def _get(self, key: str, gguf_shortcut: bool = False, stored: bool = False) -> torch.Tensor:
+        raise NotImplementedError
+
+    def _held(self, t: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def _cast_on_read(self, info: dict[str, Any]) -> bool:
         raise NotImplementedError
 
     def _head_host(self) -> Any:

@@ -66,14 +66,14 @@ class StorageInfo:
 
     container: Container
     quants: tuple[Quant, ...] = ()  # GGUF only; every supported Quant appears under exactly one member
-    fp: str = ""  # safetensors only: the header dtype the cell's fixture must carry
+    fp: str = ""  # safetensors only: the header dtype (safetensors' spelling) the cell's fixture must carry
 
 
 STORAGE: dict[Storage, StorageInfo] = {
-    Storage.SAFE_BF16: StorageInfo(Container.SAFETENSORS, fp="bf16"),
-    Storage.SAFE_FP16: StorageInfo(Container.SAFETENSORS, fp="fp16"),
-    Storage.SAFE_FP32: StorageInfo(Container.SAFETENSORS, fp="fp32"),
-    Storage.SAFE_FP8: StorageInfo(Container.SAFETENSORS, fp="fp8"),
+    Storage.SAFE_BF16: StorageInfo(Container.SAFETENSORS, fp="BF16"),
+    Storage.SAFE_FP16: StorageInfo(Container.SAFETENSORS, fp="F16"),
+    Storage.SAFE_FP32: StorageInfo(Container.SAFETENSORS, fp="F32"),
+    Storage.SAFE_FP8: StorageInfo(Container.SAFETENSORS, fp="F8_E4M3"),
     Storage.PACK12: StorageInfo(Container.PACK12),
     Storage.GGUF_BF16: StorageInfo(Container.GGUF, (Quant.BF16,)),
     Storage.GGUF_F16: StorageInfo(Container.GGUF, (Quant.F16,)),
@@ -221,16 +221,46 @@ def storage_of_gguf(fname: str) -> Storage | None:
     return None if q is None else next((s for s, i in STORAGE.items() if q in i.quants), None)
 
 
+def twin_path(stem: str, storage: Storage) -> str:
+    """where a safetensors precision twin of a BF16 fixture lives: `<stem>-<header dtype>` (tiny_qwen3-f16),
+    named by its stored type as the GGUF twins are. SAFE_BF16 is the fixture itself."""
+    if storage is Storage.SAFE_BF16:
+        return os.path.join(FIXTURES, stem)
+    return os.path.join(FIXTURES, f"{stem}-{STORAGE[storage].fp.lower()}")
+
+
+# the float header dtypes the storage axis knows; a twin must carry exactly its own among these
+FLOAT_HEADERS: frozenset[str] = frozenset(i.fp for i in STORAGE.values() if i.fp)
+
+
+def header_dtypes(path: str) -> frozenset[str]:
+    """every tensor dtype a checkpoint directory's safetensors headers declare (each shard's leading JSON, so
+    no tensor is read); empty when the directory is absent or holds no shard."""
+    if not os.path.isdir(path):
+        return frozenset()
+    out: set[str] = set()
+    for name in os.listdir(path):
+        if not name.endswith(".safetensors"):
+            continue
+        with open(os.path.join(path, name), "rb") as f:
+            header: Json = json.loads(f.read(int.from_bytes(f.read(8), "little")))
+        out |= {str(v["dtype"]) for k, v in header.items() if k != "__metadata__"}
+    return frozenset(out)
+
+
 def fixture_paths(kind: FamilyKind, storage: Storage) -> tuple[str, ...]:
     """every artifact a (family, storage) cell binds: the checkpoint directory, or one GGUF file per stored type
-    the storage member stands for. Empty when the family has no fixture stem, or when no committed fixture
-    carries that precision - the safetensors fixtures are BF16 headers, so no other precision binds one."""
+    the storage member stands for. Empty when the family has no fixture stem, or when no precision twin on disk
+    carries exactly that storage's float header dtype - a twin binds by what its headers say, never its name."""
     stem = FIXTURE_STEM.get(kind)
     if stem is None:
         return ()
     info = STORAGE[storage]
     if info.container is Container.SAFETENSORS:
-        return (os.path.join(FIXTURES, stem),) if storage is Storage.SAFE_BF16 else ()
+        path = twin_path(stem, storage)
+        if storage is Storage.SAFE_BF16:
+            return (path,)
+        return (path,) if header_dtypes(path) & FLOAT_HEADERS == {info.fp} else ()
     if info.container is Container.PACK12:
         return (os.path.join(FIXTURES, f"{stem}-pack12"),)
     return tuple(os.path.join(GGUF_DIR, gguf_name(stem, q)) for q in info.quants)

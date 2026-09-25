@@ -25,7 +25,7 @@ from ..kinds import Json, LayerKind, Proposer, Tier
 from ..options import Device
 from ..pack12 import entries, unpack_bf16
 from ..sysinfo import process_working_set_bytes
-from .host import _Experts, _HostLinear
+from .host import _Experts, _HostLinear, bf16_in_place, copy_bytes
 from .native import Native
 from .state import DRAFT_VOCAB, _State
 
@@ -168,7 +168,9 @@ class _TiersMixin(_State):
         if len(resident) == L:
             prefill_card = False
         rest = [i for i in range(L) if i not in resident]
-        slot_b = max(stored[i] for i in rest) if rest else 0
+        # what the cold reader lands: a float32 layer as stored, before it is rewritten as bf16
+        read = {i: stored[i] + self._cast_growth(i) for i in rest}
+        slot_b = max(read[i] for i in rest) if rest else 0
         ram = int(ram_gb * 2**30) - int(working_ram_gb * 2**30) - int(os_reserve_gb * 2**30) - slots * slot_b
         if not head_on_card:
             ram -= head_host_b
@@ -201,7 +203,7 @@ class _TiersMixin(_State):
             k += 1
         cold = sorted(cold)
         warm = [i for i in rest if i not in cold]
-        cold_b = sum(stored[i] for i in cold)
+        cold_b = sum(read[i] for i in cold)
         warm_b = sum(stored[i] for i in warm)
         warm_ms = warm_b / RAM_BPS * 1e3
         cold_ms = cold_b / (drive_bps or DRIVE_BPS) * 1e3
@@ -419,7 +421,8 @@ class _TiersMixin(_State):
 
     def _span(self, key: str) -> tuple[str | None, int, int]:
         """where a tensor's bf16 bytes are read from: (file path, offset, bytes), or (None, 0, bytes) when they
-        are not on the drive as bf16 (a GGUF tensor of another storage type: `_get` has them in memory)"""
+        are not on the drive as bf16 (a GGUF tensor of another storage type, or a safetensors float of another
+        precision: `_get` has them in memory, cast)"""
         shard = self.weight_map[key]
         _mm, hdr, base = self._shard(shard)
         info = hdr[key]
@@ -429,7 +432,58 @@ class _TiersMixin(_State):
             if gg["type"] == "BF16":
                 return os.path.join(self.dir, shard), int(gg["offset"]), int(gg["nbytes"])
             return None, 0, b - a
+        if self._cast_on_read(info):
+            return None, 0, self._held_nbytes(info)
         return os.path.join(self.dir, shard), base + a, b - a
+
+    def _cast_on_read(self, info: dict[str, Any]) -> bool:
+        """whether `_held` casts this safetensors tensor: any fp16 one, and every float at another precision in a
+        checkpoint that stores its weights so; a bf16 checkpoint's own float32 tensors (norms, routers) are read
+        as stored"""
+        if info.get("gguf") is not None:
+            return False
+        dt = self.ST_DTYPES[info["dtype"]]
+        return dt == torch.float16 or (self.held_cast and dt.is_floating_point and dt != torch.bfloat16)
+
+    def _stored_span(self, key: str) -> tuple[str, int, tuple[int, torch.dtype]] | None:
+        """where a tensor `_held` casts sits on the drive as stored: (file path, offset, (bytes, dtype)); None
+        for any other"""
+        shard = self.weight_map[key]
+        _mm, hdr, base = self._shard(shard)
+        info = hdr[key]
+        if not self._cast_on_read(info):
+            return None
+        a, b = info["data_offsets"]
+        return os.path.join(self.dir, shard), base + a, (int(b - a), self.ST_DTYPES[info["dtype"]])
+
+    def _cast_growth(self, i: int) -> int:
+        """the bytes layer `i`'s float32 tensors read as stored take beyond their bf16 (the cold slot holds them
+        as they land)"""
+        if not self.held_cast:
+            return 0
+        base = f"{self.prefix}layers.{i}."
+        n = 0
+        for k in self.weight_map:
+            if k.startswith(base) and self._dense_key(k):
+                _mm, hdr, _ = self._shard(self.weight_map[k])
+                a, b = hdr[k]["data_offsets"]
+                n += int(b - a) - self._held_nbytes(hdr[k])
+        return n
+
+    def _held_nbytes(self, info: dict[str, Any]) -> int:
+        """a safetensors tensor's bytes as the engine holds it (`_held`)"""
+        a, b = info["data_offsets"]
+        if not self._cast_on_read(info):
+            return int(b - a)
+        return int(b - a) // self.ST_DTYPES[info["dtype"]].itemsize * 2
+
+    def _held(self, t: torch.Tensor) -> torch.Tensor:
+        """a checkpoint tensor as the engine holds it: an fp16 one, and in a checkpoint stored at another float
+        precision every float one, as bf16 - the one weight precision the host gemv, the CPU GEMM, the MLX slots,
+        the cold ring and the 12-bit store read - and anything else as stored"""
+        if t.dtype == torch.float16 or (self.held_cast and t.is_floating_point() and t.dtype != torch.bfloat16):
+            return t.to(torch.bfloat16)
+        return t
 
     def _layer_items(self, lins: Sequence[Any]) -> tuple[list[tuple[Any, str | None, int, int, int]], int]:
         """(module, file path or None, offset, bytes, slot offset) per linear, 64-byte aligned, and the bytes in
@@ -481,7 +535,7 @@ class _TiersMixin(_State):
                 if rd is not None and path is not None:
                     rd(path, off, nb, sh.torch[base + so : base + so + nb], chunk)  # noqa: B023
                 else:
-                    sh.torch[base + so : base + so + nb].copy_(m.weight.data.reshape(-1).view(torch.uint8))  # noqa: B023
+                    copy_bytes(sh.torch[base + so : base + so + nb], m.weight.data)  # noqa: B023
                 return nb
 
             for nb in pool.map(read, items):
@@ -517,8 +571,7 @@ class _TiersMixin(_State):
         for k in self.weight_map:
             if k.startswith(base) and self._dense_key(k):
                 _mm, hdr, _ = self._shard(self.weight_map[k])
-                a, b = hdr[k]["data_offsets"]
-                n += b - a
+                n += self._held_nbytes(hdr[k])
         return n
 
     def _regrow_bytes(self) -> int:
@@ -560,9 +613,15 @@ class _TiersMixin(_State):
                     # "mem": the bytes are not on the drive as bf16 (a GGUF tensor of another type): each pass
                     # takes them from `_get`, which reads and dequantizes them
                     kind, e = ("bf16", None) if path is not None else ("mem", m.key)
+                    stored = self._stored_span(m.key)
+                    if stored is not None:
+                        # "cast": a float at another precision, read as stored into its region and rewritten as
+                        # bf16 there as it lands (`_cold_cast`); e is (stored bytes, dtype)
+                        path, off, e = stored
+                        kind = "cast"
                 cur = (cur + 63) // 64 * 64
                 items.append((m, path, off, nb, cur, kind, e))
-                cur += nb
+                cur += e[0] if kind == "cast" else nb
             recipes[i], sizes[i] = items, cur
         slot_bytes = max(sizes.values())
         R = max(1, min(self.cold_slots, len(self.cold)))
@@ -583,12 +642,13 @@ class _TiersMixin(_State):
                 if self.cold_ring.shared is not None and i in self.mlx_layers:
                     sh = self.cold_ring.shared[self.cold_ring.slot_of[i]]
                     assert self.mlx is not None  # the ring is shared only on the MLX device
+                    # "mem" lands in the slot as bf16 too; only a 12-bit record is read packed
                     m.mx = (
-                        self.mlx.weight_slot(sh, so, nb, (rows, cols))
-                        if kind == "bf16"
-                        else self.mlx.weight_slot_packed(sh, so, e, (rows, cols))
+                        self.mlx.weight_slot_packed(sh, so, e, (rows, cols))
+                        if kind == "p12"
+                        else self.mlx.weight_slot(sh, so, nb, (rows, cols))
                     )
-                if kind == "bf16":
+                if kind != "p12":
                     m.weight = torch.nn.Parameter(region.view(torch.bfloat16).view(rows, cols), requires_grad=False)
                     m.packed = None
                 else:
@@ -638,6 +698,17 @@ class _TiersMixin(_State):
                 raise RuntimeError(f"[cold] short read: {path} @ {off}+{got} of {nb}")
             got += n
 
+    @staticmethod
+    def _cold_nb(it: Any) -> int:
+        """the bytes a cold recipe item reads: a cast float's as stored"""
+        return int(it[6][0]) if it[5] == "cast" else int(it[3])
+
+    def _cold_cast(self, i: int, slot: torch.Tensor) -> None:
+        """layer `i`'s floats read as stored rewritten as bf16 where they landed, once all its reads are in"""
+        for _m, _path, _off, _nb, so, kind, e in self.cold_ring.recipe[i]:
+            if kind == "cast":
+                bf16_in_place(slot[so : so + e[0]], e[1])
+
     def _cold_start(self, n_layers: int) -> None:
         """The cold reader as a ring across passes: one thread reads the cold layers into their slots as they free
         and goes on into the next pass (the layer order never depends on the tokens). A pass over the same
@@ -670,10 +741,12 @@ class _TiersMixin(_State):
         def submit(i: int, slot: torch.Tensor) -> list[Any]:
             assert route is not None  # submit runs only where the Route reads the cold tier
             futs = []
-            for _m, path, off, nb, so, kind, e in self.cold_ring.recipe[i]:
+            for it in self.cold_ring.recipe[i]:
+                _m, path, off, nb, so, kind, e = it
                 if kind == "mem":
-                    slot[so : so + nb].copy_(self._get(e).reshape(-1).view(torch.uint8))
+                    copy_bytes(slot[so : so + nb], self._get(e))
                     continue
+                nb = self._cold_nb(it)
                 futs.append(
                     route.disk_read(
                         path,
@@ -692,6 +765,7 @@ class _TiersMixin(_State):
         def land(i: int, s: int, t_sub: float, futs: list[Any], nbytes: int) -> None:
             for f in futs:
                 f.result()
+            self._cold_cast(i, self.cold_ring.slots[s])
             stat[i] = {"t0": t_sub, "t1": time.time(), "bytes": nbytes}
             holds[s] = i
             ready[i].set()
@@ -718,18 +792,21 @@ class _TiersMixin(_State):
                         a = time.time()
                         if route is None:
                             nbytes = 0
-                            for _m, path, off, nb, so, kind, e in self.cold_ring.recipe[i]:
+                            for it in self.cold_ring.recipe[i]:
+                                _m, path, off, _nb, so, kind, e = it
+                                nb = self._cold_nb(it)
                                 if kind == "mem":
-                                    slot[so : so + nb].copy_(self._get(e).reshape(-1).view(torch.uint8))
+                                    copy_bytes(slot[so : so + nb], self._get(e))
                                 else:
                                     self._cold_read(path, off, nb, slot[so : so + nb])
                                 self.cold_ring.bytes += nb
                                 nbytes += nb
+                            self._cold_cast(i, slot)
                             stat[i] = {"t0": a, "t1": time.time(), "bytes": nbytes}
                             holds[s] = i
                             ready[i].set()
                             continue
-                        queued.append((i, s, a, submit(i, slot), sum(it[3] for it in self.cold_ring.recipe[i])))
+                        queued.append((i, s, a, submit(i, slot), sum(map(self._cold_nb, self.cold_ring.recipe[i]))))
                         while len(queued) > 1:
                             land(*queued.pop(0))
                     while queued:
@@ -1030,7 +1107,9 @@ class _TiersMixin(_State):
         head, _, _ = key[len(pre) :].partition(".")
         return int(head) if head.isdigit() else None
 
-    def _get(self, key: str, gguf_shortcut: bool = False) -> torch.Tensor:
+    def _get(self, key: str, gguf_shortcut: bool = False, stored: bool = False) -> torch.Tensor:
+        """a checkpoint tensor as the engine holds it (`_held`), or with `stored` at the checkpoint's own
+        precision - for a caller that widens it to float32 itself, so an fp32 checkpoint's values reach it whole"""
         import warnings
 
         shard = self.weight_map.get(key)
@@ -1065,7 +1144,7 @@ class _TiersMixin(_State):
                 warnings.simplefilter("ignore")
                 t = torch.frombuffer(mm, dtype=dt, count=n, offset=base + a).view(shape)
         self.bytes_streamed += n * t.element_size()
-        return t
+        return t if stored else self._held(t)
 
     @staticmethod
     def _set_param(module: Any, dotted: str, t: torch.Tensor, buffer: bool = False) -> None:

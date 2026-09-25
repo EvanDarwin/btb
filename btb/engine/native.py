@@ -76,6 +76,113 @@ class NativeError(RuntimeError):
         super().__init__(f"{call} returned {rc}{detail}{f': {os.strerror(self.errno)}' if self.errno else ''}")
 
 
+class NativeDtypeError(TypeError):
+    """A tensor handed to a native kernel is not the element type the kernel reads through its pointer: `call`
+    the kernel, `arg` the argument, `got` its dtype and `want` what the kernel was built for. Raised before the
+    call by a binding loaded with `checked`, so a wrong tensor is refused rather than read as another type's."""
+
+    def __init__(self, call: str, arg: str, got: torch.dtype, want: tuple[torch.dtype, ...]) -> None:
+        self.call, self.arg, self.got, self.want = call, arg, got, want
+        super().__init__(f"{call}: {arg} is {got}, the kernel reads {' or '.join(str(w) for w in want)}")
+
+
+_BF16, _F32, _U8, _I32 = torch.bfloat16, torch.float32, torch.uint8, torch.int32
+# what one argument must be: a tensor (or each of a group's tensors) and the dtypes the kernel reads it as
+Want = tuple[torch.Tensor | Sequence[torch.Tensor], tuple[torch.dtype, ...]]
+
+# each fixed-type binding: its kernel, and its arguments' wants from the call's own arguments, in the order a
+# refusal names the first wrong one
+_WANTS: dict[str, tuple[str, Callable[..., dict[str, Want]]]] = {
+    "gemv": ("btb_gemv_bf16_rows", lambda w, x, y: {"w": (w, (_BF16,)), "x": (x, (_F32,)), "y": (y, (_F32,))}),
+    "gemv_p12": (
+        "btb_gemv_p12_rows",
+        lambda lo, hi4, tbl, esc_idx, esc_val, n_esc, rows, cols, x, y: {
+            "lo": (lo, (_U8,)),
+            "hi4": (hi4, (_U8,)),
+            "table": (tbl, (_U8,)),
+            **({"esc_idx": (esc_idx, (_I32,)), "esc_val": (esc_val, (_U8,))} if n_esc else {}),
+            "x": (x, (_F32,)),
+            "y": (y, (_F32,)),
+        },
+    ),
+    "gemv_group": (
+        "btb_gemv_bf16_group",
+        lambda ws, xs, ys: {"w": (ws, (_BF16,)), "x": (xs, (_F32,)), "y": (ys, (_F32,))},
+    ),
+    "gemv_mx4": (
+        "btb_gemv_mxfp4_rows",
+        lambda w, x, y: {
+            "blocks": (w.blocks, (_U8,)),
+            "scales": (w.scales, (_U8,)),
+            "x": (x, (_F32,)),
+            "y": (y, (_F32,)),
+        },
+    ),
+    "gemv_mx4_group": (
+        "btb_gemv_mxfp4_group",
+        lambda ws, xs, ys: {
+            "blocks": ([w.blocks for w in ws], (_U8,)),
+            "scales": ([w.scales for w in ws], (_U8,)),
+            "x": (xs, (_F32,)),
+            "y": (ys, (_F32,)),
+        },
+    ),
+    "gemv_mx4_ggml": (
+        "btb_gemv_mxfp4_ggml_rows",
+        lambda w, x, y: {"blocks": (w.blocks, (_U8,)), "x": (x, (_F32,)), "y": (y, (_F32,))},
+    ),
+    "gemv_mx4_ggml_group": (
+        "btb_gemv_mxfp4_ggml_group",
+        lambda ws, xs, ys: {"blocks": ([w.blocks for w in ws], (_U8,)), "x": (xs, (_F32,)), "y": (ys, (_F32,))},
+    ),
+    "delta_step": (
+        "btb_delta_step",
+        lambda mixed, conv_state, conv_w, conv_b, z, a, b, a_log, dt_bias, state, hk, hv, dk, dv, norm_w, eps, out: {
+            "conv_b": ([] if conv_b is None else conv_b, (_F32,)),
+            **{
+                k: (t, (_F32,))
+                for k, t in (
+                    ("mixed", mixed),
+                    ("conv_state", conv_state),
+                    ("conv_w", conv_w),
+                    ("z", z),
+                    ("a", a),
+                    ("b", b),
+                    ("a_log", a_log),
+                    ("dt_bias", dt_bias),
+                    ("state", state),
+                    ("norm_w", norm_w),
+                    ("out", out),
+                )
+            },
+        },
+    ),
+    "attn_decode": (
+        "btb_attn_decode",
+        lambda q, k, v, scale, out: {
+            "q": (q, (_F32,)),
+            "k": (k, (_BF16, _F32)),
+            "v": (v, (k.dtype,)),
+            "out": (out, (_F32,)),
+        },
+    ),
+}
+
+
+def _checked(name: str, fn: Callable[..., Any]) -> Callable[..., Any]:
+    """the binding `name`, refusing the first argument whose dtype its kernel does not read before calling it"""
+    call, wants = _WANTS[name]
+
+    def run(*args: Any, **kw: Any) -> Any:
+        for arg, (ts, want) in wants(*args, **kw).items():
+            for t in [ts] if isinstance(ts, torch.Tensor) else ts:
+                if t.dtype not in want:
+                    raise NativeDtypeError(call, arg, t.dtype, want)
+        return fn(*args, **kw)
+
+    return run
+
+
 def quiet_omp() -> None:
     """Load libiomp, silently fail if not found"""
     p = os.path.join(os.path.dirname(torch.__file__), "lib", "libiomp5md.dll")
@@ -130,8 +237,11 @@ class Native:
 
     @classmethod
     def load_gemv(
-        cls, dll_path: str | os.PathLike[str], threads: int = 0
+        cls, dll_path: str | os.PathLike[str], threads: int = 0, checked: bool = False
     ) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None]:
+        """Bind the library's kernels onto the class; `checked` wraps each fixed-type one to refuse a tensor of
+        another dtype (`NativeDtypeError`) - a debugging aid, off by default, so a decode step pays nothing for
+        what the engine fixes at load. Returns the bf16 gemv."""
         lib = ctypes.CDLL(dll_path, use_errno=True)
         raise_file_limit()
         f = lib.btb_gemv_bf16_rows
@@ -512,7 +622,12 @@ class Native:
                     raise RuntimeError(f"btb_attn_decode returned {rc}")
 
             cls.attn_decode = attn_decode
-        return gemv
+        if checked:
+            for name in _WANTS:
+                bound = getattr(cls, name)
+                if bound is not None:
+                    setattr(cls, name, _checked(name, bound))
+        return cls.gemv
 
     # the card's own kernels (a `_Cuda`), bound by `load_cuda` once per process; None until then
     cuda: Any = None

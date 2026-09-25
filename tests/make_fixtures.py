@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 """Regenerate every test fixture from fixed seeds, so nothing under tests/fixtures/ is a copied model artifact
 and all of it can be recreated. For each family it writes a tiny random checkpoint in that family's own shape, a
-byte-level tokenizer, the 12-bit sibling where one is used, and the receipts the suite holds the engine to.
+byte-level tokenizer, the 12-bit sibling where one is used, its fp16/fp32 precision twins, and the receipts the
+suite holds the engine to.
 
 Four families (qwen3, q35, phi3, q4) bank the ENGINE's own float32 output (transformers is a bank-time gate: we
 bank only where the engine reproduces it); gpt_oss banks transformers' float32 forward directly. The engine's
@@ -9,6 +10,7 @@ native gemv kernel is loaded first so the receipts match the tolerance the suite
 
     python tests/make_fixtures.py            # all families
     python tests/make_fixtures.py qwen3 q4   # a subset
+    python tests/make_fixtures.py twins      # only the precision twins of every cert fixture
 
 Families: qwen3, q35, phi3, q4, gpt_oss.
 """
@@ -17,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from typing import TYPE_CHECKING
 
@@ -477,6 +480,39 @@ def build_gpt_oss(out_dir: str) -> None:
         json.dump(gen, f, indent=2)
 
 
+# --- precision twins: the BF16 fixture's weights stored at the other safetensors precisions -------------------
+
+
+def write_twins(base: str) -> None:
+    """`base`'s precision twins (spec.twin_path): one per safetensors storage beside BF16 whose header dtype the
+    engine reads (StreamedTextModel.ST_DTYPES), every float tensor cast to it and the packed integer ones kept, so
+    each decodes to the same oracle as `base`. The config's `dtype` says what the twin stores."""
+    from btb.engine import StreamedTextModel
+    from tests.cert import spec
+
+    state = safetensors_state(base)
+    stem = os.path.basename(base)
+    for storage, info in spec.STORAGE.items():
+        dtype = StreamedTextModel.ST_DTYPES.get(info.fp)
+        if info.container is not spec.Container.SAFETENSORS or storage is spec.Storage.SAFE_BF16 or dtype is None:
+            continue
+        out = spec.twin_path(stem, storage)
+        os.makedirs(out, exist_ok=True)
+        for name in os.listdir(base):
+            if name.endswith(".safetensors") or name == "model.safetensors.index.json":
+                continue  # _reshard writes the twin's own
+            if name == "config.json":
+                with open(os.path.join(base, name), encoding="utf-8") as f:
+                    cfg: Json = json.load(f)
+                cfg["dtype"] = str(dtype).removeprefix("torch.")
+                with open(os.path.join(out, name), "w", encoding="utf-8") as f:
+                    json.dump(cfg, f, indent=2)
+            else:
+                shutil.copyfile(os.path.join(base, name), os.path.join(out, name))
+        _reshard(out, {k: v.to(dtype) if v.is_floating_point() else v for k, v in state.items()})
+        print(f"[fixture] {os.path.basename(out)} written ({info.fp})")
+
+
 # --- receipt bankers: run the engine the way the suite does, and save what it compares against --------------
 
 
@@ -636,6 +672,12 @@ def make(name: str) -> None:
     if name == "gguf":
         make_gguf()
         return
+    if name == "twins":
+        from tests.cert import spec
+
+        for stem in spec.FIXTURE_STEM.values():
+            write_twins(os.path.join(FIXTURES, stem))
+        return
     base = os.path.join(FIXTURES, f"tiny_{name}")
     if name == "qwen3":
         build_qwen3(base)
@@ -657,6 +699,7 @@ def make(name: str) -> None:
     from btb.engine import pack_model
 
     pack_model(base, log=NO_LOG)
+    write_twins(base)
     pack = os.path.join(FIXTURES, f"tiny_{name}-pack12")
     if name in ("qwen3", "phi3"):
         bank_dense(name, base, pack, os.path.join(FIXTURES, f"receipts_{name}.pt"))

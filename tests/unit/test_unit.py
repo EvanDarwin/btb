@@ -312,6 +312,7 @@ def _probe(L: int = 8, layer_bytes: int = 64 * 2**20, hk: int = 2, hd: int = 64)
         weight_map={},
         _layer_bytes=lambda i: layer_bytes,
         _layer_bytes_stored=lambda i, packed: layer_bytes,
+        _cast_growth=lambda i: 0,  # a bf16 checkpoint: a cold layer lands no wider than it is held
     )
 
 

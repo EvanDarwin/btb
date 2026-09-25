@@ -32,7 +32,7 @@ from ..sampling import GREEDY
 from ..session import Session
 from .cache import GrowLayer
 from .families import act_name
-from .host import _HostLinear
+from .host import _HostLinear, copy_bytes
 from .native import Native
 from .state import _State
 
@@ -212,8 +212,8 @@ class _MlxMixin(_State):
 
         def read(it: Any) -> Any:
             m, path, off, nb, so = it
-            if path is None:  # not on the drive as bf16 (a GGUF tensor of another type): from memory
-                sh.torch[base + so : base + so + nb].copy_(m.weight.data.reshape(-1).view(torch.uint8))
+            if path is None:  # not on the drive as bf16 (a GGUF tensor of another type, a cast float): from memory
+                copy_bytes(sh.torch[base + so : base + so + nb], m.weight.data)
             else:
                 rd(path, off, nb, sh.torch[base + so : base + so + nb], chunk)
             return nb
