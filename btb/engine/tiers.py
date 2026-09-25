@@ -143,7 +143,10 @@ class _TiersMixin(_State):
         types = sorted(set(self.layer_types))
         big = {lt: max(bf16[i] for i in range(L) if self.layer_types[i] == lt) for lt in types}
         big_stored = {lt: max(stored[i] for i in range(L) if self.layer_types[i] == lt) for lt in types}
-        shadow_b = sum(2 * big[lt] for lt in types) if (fp32 and not resident_fp32) else 0
+        # a float32 shadow per layer structure (model.py): a layer kind's layers can differ, and those that do differ
+        # in size, so each distinct (kind, size) is one shadow at twice its bf16 bytes
+        shapes = {(self.layer_types[i], bf16[i]) for i in range(L)}
+        shadow_b = sum(2 * b for _, b in shapes) if (fp32 and not resident_fp32) else 0
         tmpl_b = sum(big[lt] * (1 if fp32 else 2) for lt in types)
         if fp32 and not resident_fp32 and vram >= shadow_b:
             vram -= shadow_b
@@ -890,10 +893,17 @@ class _TiersMixin(_State):
                 m.gate_up = m.down = None
         return module
 
+    def _structure(self, module: Any) -> tuple[Any, ...]:
+        """a layer module's parameters and buffers as (name, shape): what a float32 shadow must match to run it"""
+        return tuple((name, tuple(t.shape), is_buf) for name, t, is_buf in self._named_tensors(module))
+
     def _upcast(self, lt: str, tmpl: Any, i: int) -> Any:
-        sh = self.shadow[lt]
-        for (_, p32), (_, p16) in zip(sh.named_parameters(), tmpl.named_parameters()):
-            p32.data.copy_(p16.data)
+        """layer `i`'s bf16 weights, and its buffers (a layer's own values), into the float32 shadow of its
+        structure, copied by name"""
+        sh = self.shadow[lt][self._structure(tmpl)]
+        src = {name: t for name, t, _ in self._named_tensors(tmpl)}
+        for name, t, _ in self._named_tensors(sh):
+            t.data.copy_(src[name].data)
         return self._retarget(sh, i)
 
     def _host_copy(self, dst: torch.Tensor, src: torch.Tensor) -> None:
