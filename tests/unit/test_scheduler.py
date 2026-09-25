@@ -1775,7 +1775,9 @@ def test_the_cold_ring_survives_a_pass_of_the_same_order() -> None:
     """the reader goes on into the next pass: a second `_cold_start` over the same layers finds the ring running
     and keeps it (no second thread, no re-read of a slot still holding its layer); a different order restarts
     it, and `_cold_stop` joins the thread it started"""
-    from btb.engine.tiers import ColdRing, _TiersMixin
+    from btb.engine.host import _HostLinear
+    from btb.engine.tiers import ColdItem, ColdRing, _TiersMixin
+    from btb.kinds import SlotKind
 
     class Ring(_TiersMixin):
         def __init__(self, cold: Iterable[int], slots: int) -> None:
@@ -1788,7 +1790,19 @@ def test_the_cold_ring_survives_a_pass_of_the_same_order() -> None:
             self.cold_ring = ColdRing(
                 slots=[torch.empty(4096, dtype=torch.uint8) for _ in range(slots)],
                 slot_of={i: k % slots for k, i in enumerate(sorted(cold))},
-                recipe={i: [(None, f"layer{i}.bin", 0, 4096, 0, "bf16", None)] for i in cold},
+                recipe={
+                    i: [
+                        ColdItem(
+                            _HostLinear(torch.zeros(1, 1, dtype=torch.bfloat16), key=f"layer{i}"),
+                            SlotKind.BF16,
+                            f"layer{i}",
+                            at=0,
+                            nb=4096,
+                            path=f"layer{i}.bin",
+                        )
+                    ]
+                    for i in cold
+                },
             )
 
         def _cold_read(self, path: str, off: int, nb: int, dst: torch.Tensor) -> None:

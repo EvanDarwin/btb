@@ -125,6 +125,146 @@ def _mxfp4_pair(rows: int, k: int, seed: int) -> tuple[np.ndarray, np.ndarray, n
     return blocks, scales, hf_to_ggml(blocks, scales)
 
 
+def _kquant_raw(nb: int, bw: int, scale_offs: tuple[int, ...], rows: int, cols: int, seed: int) -> np.ndarray:
+    """random bytes for `rows * cols / bw` blocks of `nb` bytes, the f16 fields at `scale_offs` held to a
+    small finite positive range so the dequantized weights stay finite (as a real quantizer's deltas are)"""
+    n = rows * cols // bw
+    rng = np.random.default_rng(seed)
+    buf = bytearray(rng.integers(0, 256, size=n * nb, dtype=np.uint8).tobytes())
+    for blk in range(n):
+        for off in scale_offs:
+            buf[blk * nb + off : blk * nb + off + 2] = np.float16(rng.uniform(0.001, 0.05)).tobytes()
+    return np.frombuffer(bytes(buf), np.uint8).copy()
+
+
+def test_the_cpu_kquant_kernels_match_the_gguf_dequantization() -> None:
+    """the native Q4_K / Q6_K matvecs over a GGUF tensor's own bytes equal `x @ gguf.dequantize(bytes)` to f32
+    rounding, at every batch width the host path uses, and row `r` is bit-for-bit the same at any batch (the
+    verify pass's contract)."""
+    from gguf import dequantize
+    from gguf.constants import GGMLQuantizationType as GT
+
+    from btb.engine.native import Native
+
+    native_library()
+    assert Native.gemv_q4k is not None, "the native library predates the CPU packed kernels: rebuild it"
+    rows, cols = 40, 512
+    cases = [
+        ("Q4_K", 144, 256, (0, 2), GT.Q4_K, Native.gemv_q4k),
+        ("Q6_K", 210, 256, (208,), GT.Q6_K, Native.gemv_q6k),
+        ("Q5_K", 176, 256, (0, 2), GT.Q5_K, Native.gemv_q5k),
+        ("Q2_K", 84, 256, (80, 82), GT.Q2_K, Native.gemv_q2k),
+        ("Q3_K", 110, 256, (108,), GT.Q3_K, Native.gemv_q3k),
+        ("IQ4_NL", 18, 32, (0,), GT.IQ4_NL, Native.gemv_iq4nl),
+        ("IQ4_XS", 136, 256, (0,), GT.IQ4_XS, Native.gemv_iq4xs),
+        ("Q4_0", 18, 32, (0,), GT.Q4_0, Native.gemv_q40),
+        ("Q4_1", 20, 32, (0, 2), GT.Q4_1, Native.gemv_q41),
+        ("Q8_0", 34, 32, (0,), GT.Q8_0, Native.gemv_q80),
+    ]
+    for name, nb, bw, offs, gt, gemv in cases:
+        raw = _kquant_raw(nb, bw, offs, rows, cols, hash(name) & 0xFFFF)
+        ref = torch.from_numpy(dequantize(raw.copy(), gt).astype(np.float32).reshape(rows, cols))
+        raw_t = torch.from_numpy(raw)
+        for b in (1, 8):
+            x = torch.randn(b, cols, generator=torch.Generator().manual_seed(b)).float().contiguous()
+            y = torch.empty(b, rows, dtype=torch.float32)
+            gemv(raw_t, rows, cols, x, y)
+            gold = x @ ref.T
+            rel = (y - gold).abs().max().item() / (gold.abs().max().item() + 1e-9)
+            assert rel < 1e-4, f"{name} b={b}: rel {rel}"
+        # row 0 of the 8-row pass is bit-for-bit its own one-row call
+        x8 = torch.randn(8, cols, generator=torch.Generator().manual_seed(99)).float().contiguous()
+        y8 = torch.empty(8, rows, dtype=torch.float32)
+        gemv(raw_t, rows, cols, x8, y8)
+        y1 = torch.empty(1, rows, dtype=torch.float32)
+        gemv(raw_t, rows, cols, x8[:1].contiguous(), y1)
+        assert torch.equal(y8[0], y1[0]), name
+
+
+def test_the_cpu_lattice_kernels_match_the_gguf_dequantization() -> None:
+    """the native IQ lattice matvecs (grid-codebook quants) equal `x @ gguf.dequantize(bytes)` to f32 rounding
+    at every batch width, and row `r` is bit-for-bit the same at any batch. The grid (and the shared sign table
+    for the ksigns types) come from the gguf package, as the MLX path reads them."""
+    from gguf import dequantize, quants
+    from gguf.constants import GGMLQuantizationType as GT
+
+    from btb.engine.native import Native
+
+    native_library()
+    assert Native.gemv_iq3xxs is not None, "the native library predates the CPU lattice kernels: rebuild it"
+
+    def grid_of(name: str) -> torch.Tensor:
+        cls = getattr(quants, name)
+        cls.init_grid()
+        return torch.from_numpy(np.ascontiguousarray(cls.grid).reshape(-1).astype(np.int8))
+
+    ksigns = torch.from_numpy(np.frombuffer(quants.IQ2_XXS.ksigns, np.uint8).copy())
+    rows, cols = 24, 512
+    cases = [
+        ("IQ3_XXS", 98, True, Native.gemv_iq3xxs),
+        ("IQ2_XXS", 66, True, Native.gemv_iq2xxs),
+        ("IQ2_XS", 74, True, Native.gemv_iq2xs),
+        ("IQ2_S", 82, False, Native.gemv_iq2s),
+        ("IQ1_S", 50, False, Native.gemv_iq1s),
+        ("IQ3_S", 110, False, Native.gemv_iq3s),
+        ("IQ1_M", 56, False, Native.gemv_iq1m),
+    ]
+    for name, nb, uses_ks, gemv in cases:
+        if name == "IQ1_M":
+            raw = _kquant_raw(nb, 256, (), rows, cols, hash(name) & 0xFFFF)
+            for o in range(0, raw.size, nb):  # d is four top nibbles of the scale words; pin it to a finite half
+                raw[o + 49] &= 0x0F
+                raw[o + 51] &= 0x0F
+                raw[o + 53] = (raw[o + 53] & 0x0F) | 0xC0
+                raw[o + 55] = (raw[o + 55] & 0x0F) | 0x20
+        else:
+            raw = _kquant_raw(nb, 256, (0,), rows, cols, hash(name) & 0xFFFF)
+        grid = grid_of(name)
+        ks = ksigns if uses_ks else None
+        ref = torch.from_numpy(dequantize(raw.copy(), GT[name]).astype(np.float32).reshape(rows, cols))
+        raw_t = torch.from_numpy(raw)
+        for b in (1, 8):
+            x = torch.randn(b, cols, generator=torch.Generator().manual_seed(b)).float().contiguous()
+            y = torch.empty(b, rows, dtype=torch.float32)
+            gemv(raw_t, grid, ks, rows, cols, x, y)
+            gold = x @ ref.T
+            rel = (y - gold).abs().max().item() / (gold.abs().max().item() + 1e-9)
+            assert rel < 2e-4, f"{name} b={b}: rel {rel}"
+        x8 = torch.randn(8, cols, generator=torch.Generator().manual_seed(7)).float().contiguous()
+        y8 = torch.empty(8, rows, dtype=torch.float32)
+        gemv(raw_t, grid, ks, rows, cols, x8, y8)
+        y1 = torch.empty(1, rows, dtype=torch.float32)
+        gemv(raw_t, grid, ks, rows, cols, x8[:1].contiguous(), y1)
+        assert torch.equal(y8[0], y1[0]), name
+
+
+def test_a_gguf_multiplies_its_blocks_as_stored_on_the_cpu() -> None:
+    """on the CPU tier a GGUF's quantized tensors bind to their native as-stored gemv (gguf_packed=1, no bf16
+    copy); the first-step logits sit within f32 rounding of the dequantized path (gguf_packed=0) and the greedy
+    tokens match. Skipped without the cached file."""
+    from btb.engine.native import Native
+
+    native_library()
+    assert Native.gemv_q4k is not None, "the native library predates the CPU packed kernels: rebuild it"
+    path = need_cached(f"{REAL_REPO}:Qwen3-0.6B-Q4_K_M.gguf", "Qwen3-0.6B-Q4_K_M.gguf is not cached")
+    logits, toks = {}, {}
+    for packed in (1, 0):
+        with loaded_model(path, device="cpu", gguf_packed=packed) as sm:
+            if packed:
+                bound = any(
+                    getattr(m, "quant", None) is not None for layer in sm.host.values() for m in layer.modules()
+                )
+                assert bound, "no host linear bound to a native as-stored kernel"
+            lg = sm.forward(PROMPT, cache=sm.new_cache())
+            assert lg is not None
+            logits[packed] = lg.float()[0, -1]
+            out, _ = sm.generate(PROMPT, 8, speculate=False)
+            toks[packed] = [int(t) for t in out]
+    a, b = logits[1], logits[0]
+    assert torch.allclose(a, b, atol=0.05 * b.abs().max().item()), (a - b).abs().max().item()
+    assert toks[1] == toks[0]
+
+
 def test_the_cpu_mxfp4_kernel_reads_ggml_blocks_as_the_checkpoints() -> None:
     """the native matvec over ggml's layout gives the checkpoint layout's bits for the same weights, alone
     and grouped, at every batch width the host path uses"""

@@ -249,9 +249,7 @@ class StreamedTextModel(
             self.head_host = _HostLinear(self._get(self.head_key, gguf_shortcut=True), key=self.head_key)
             self._bind_mlx_linears([self.head_host])
         elif resident_head:
-            with self._meta:
-                self.head = torch.nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
-            self._adopt(self.head, "weight", self._get(self.head_key))
+            self.head = self._make_head()
         # the embedding table, unless the tied head is Q6_K: then its packed bytes are the table, gathered on demand
         # (embed / _mlx_embed_rows) instead of a bf16 copy of the whole vocabulary
         tied_q6k = self.head_host is not None and getattr(self.head_host.mx, "q6k", None) is not None
@@ -429,6 +427,7 @@ class StreamedTextModel(
         if (
             head is not None
             and self.head_key == self.prefix + "embed_tokens.weight"
+            and isinstance(head, torch.nn.Linear)  # a packed head has no table to gather from: the embed_table below
             and head.weight.device.type != "cpu"
         ):
             # tied embeddings: the head on the card is the table - one gather there, no host round trip

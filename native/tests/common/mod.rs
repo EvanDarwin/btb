@@ -14,6 +14,7 @@ pub mod deltak;
 pub mod fixture;
 pub mod fp8k;
 pub mod gemvk;
+pub mod quant;
 pub mod refs;
 
 // A test binary that never opens a file does not name anything from `fixture`.

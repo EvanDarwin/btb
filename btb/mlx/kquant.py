@@ -8,10 +8,9 @@ copy. Native 144 B/256 as stored, vs MLX's 160 B repack."""
 
 from __future__ import annotations
 
-import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from .core import mx
+from .launch import BlockKernel, RowKernel
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -132,10 +131,6 @@ _DEQUANT = r"""
 
 # Q4_K: 144 B/superblock, nibbles at offset 16, no qh. Q5_K: 176 B, nibbles at 48, the 5th bit in qh at 16.
 _KQ = {"q4k": (144, 16, 0), "q5k": (176, 48, 1)}
-_matvec_kernels: dict[Any, Any] = {}
-_deq_kernels: dict[str, Any] = {}
-_lock = threading.Lock()
-ROWS_MAX = 16  # a call takes up to 16 rows (acc[TR] in registers); a wider pass is chunked
 
 
 def _defs(kind: str) -> str:
@@ -143,86 +138,30 @@ def _defs(kind: str) -> str:
     return f"#define BLKB {blkb}\n#define QSOFF {qsoff}\n#define Q5 {q5}\n"
 
 
-def _matvec_kernel(kind: str, rows: int, nsb: int, tr: int) -> Any:
-    m = mx()
-    key = (kind, rows, nsb, tr)
-    with _lock:
-        k = _matvec_kernels.get(key)
-        if k is None:
-            k = _matvec_kernels[key] = m.fast.metal_kernel(
-                name=f"btb_{kind}_mv_{rows}_{nsb}_{tr}",
-                input_names=["W", "x"],
-                output_names=["out"],
-                header=f"{_SM}{_defs(kind)}#define ROWS {rows}\n#define NSB {nsb}\n#define TR {tr}\n",
-                source=_MATVEC,
-            )
-    return k
-
-
-def _matvec(kind: str, w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:
-    m = mx()
-    nsb = cols // 256
-    grid = ((rows * 32 + 255) // 256) * 256  # a simdgroup an output row; pad to whole 256-thread groups
-    outs = []
-    for s in range(0, int(x.shape[0]), ROWS_MAX):
-        xr = x[s : s + ROWS_MAX]
-        tr = int(xr.shape[0])
-        outs.append(
-            _matvec_kernel(kind, rows, nsb, tr)(
-                inputs=[w_bytes, xr],
-                grid=(grid, 1, 1),
-                threadgroup=(256, 1, 1),
-                output_shapes=[(tr, rows)],
-                output_dtypes=[x.dtype],
-                template=[("T", x.dtype)],
-            )[0]
-        )
-    return outs[0] if len(outs) == 1 else m.concatenate(outs, axis=0)
-
-
-def _dequant(kind: str, w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
-    m = mx()
-    nblk = rows * cols // 256
-    with _lock:
-        k = _deq_kernels.get(kind)
-        if k is None:
-            k = _deq_kernels[kind] = m.fast.metal_kernel(
-                name=f"btb_{kind}_dequant",
-                input_names=["W"],
-                output_names=["out"],
-                header=f"{_SM}{_defs(kind)}",
-                source=_DEQUANT,
-            )
-    grid = ((nblk + 255) // 256) * 256
-    return k(
-        inputs=[w_bytes],
-        grid=(grid, 1, 1),
-        threadgroup=(256, 1, 1),
-        output_shapes=[(rows, cols)],
-        output_dtypes=[m.bfloat16],
-        template=[("T", m.bfloat16), ("NBLK", nblk)],
-    )[0]
+# one source for both kinds, specialised by the block defines; a thread a superblock for the dequant
+_KQ_MV = {kind: RowKernel(f"{kind}_mv", ["W", "x"], f"{_SM}{_defs(kind)}", _MATVEC) for kind in _KQ}
+_KQ_DEQ = {kind: BlockKernel(f"{kind}_dequant", ["W"], f"{_SM}{_defs(kind)}", _DEQUANT) for kind in _KQ}
 
 
 def matvec_q4k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:
     """y[T, rows] = x[T, cols] . W[rows, cols]^T, W the raw Q4_K bytes (rows * cols / 256 row-major superblocks).
     float32 accumulation over the blocks as stored, y in x's dtype; 1..16 rows a launch, a wider pass chunked."""
-    return _matvec("q4k", w_bytes, x, rows, cols)
+    return _KQ_MV["q4k"].matvec([w_bytes], x, [], rows, cols // 256)
 
 
 def dequant_q4k(w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
     """the full [rows, cols] bf16 weight, the numbers llama.cpp dequantizes (for a path that wants a bf16 copy)."""
-    return _dequant("q4k", w_bytes, rows, cols)
+    return _KQ_DEQ["q4k"].run([w_bytes], rows * cols // 256, (rows, cols))
 
 
 def matvec_q5k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:
     """`matvec_q4k` for Q5_K (176 B superblocks, the 5th bit in the qh plane)."""
-    return _matvec("q5k", w_bytes, x, rows, cols)
+    return _KQ_MV["q5k"].matvec([w_bytes], x, [], rows, cols // 256)
 
 
 def dequant_q5k(w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
     """the full [rows, cols] bf16 weight for a Q5_K tensor."""
-    return _dequant("q5k", w_bytes, rows, cols)
+    return _KQ_DEQ["q5k"].run([w_bytes], rows * cols // 256, (rows, cols))
 
 
 # Q2_K: 84 B/superblock. scales[16] (a 4-bit scale and 4-bit min a 16-weight sub-block), qs[64] (2-bit), d f16,
@@ -282,62 +221,18 @@ _DEQUANT_Q2K = r"""
         }
     }
 """
-_q2k_mv: dict[Any, Any] = {}
-_q2k_deq = None
+_Q2K_MV = RowKernel("q2k_mv", ["W", "x"], "", _MATVEC_Q2K)
+_Q2K_DEQ = BlockKernel("q2k_dequant", ["W"], "", _DEQUANT_Q2K, per=32)
 
 
 def matvec_q2k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:
     """`matvec_q4k` for Q2_K (84 B superblocks, 2-bit, 16-weight sub-blocks with 4-bit scale/min)."""
-    m = mx()
-    nsb = cols // 256
-    grid = ((rows * 32 + 255) // 256) * 256
-    outs = []
-    for s in range(0, int(x.shape[0]), ROWS_MAX):
-        xr = x[s : s + ROWS_MAX]
-        tr = int(xr.shape[0])
-        key = (rows, nsb, tr)
-        with _lock:
-            k = _q2k_mv.get(key)
-            if k is None:
-                k = _q2k_mv[key] = m.fast.metal_kernel(
-                    name=f"btb_q2k_mv_{rows}_{nsb}_{tr}",
-                    input_names=["W", "x"],
-                    output_names=["out"],
-                    header=f"#define ROWS {rows}\n#define NSB {nsb}\n#define TR {tr}\n",
-                    source=_MATVEC_Q2K,
-                )
-        outs.append(
-            k(
-                inputs=[w_bytes, xr],
-                grid=(grid, 1, 1),
-                threadgroup=(256, 1, 1),
-                output_shapes=[(tr, rows)],
-                output_dtypes=[x.dtype],
-                template=[("T", x.dtype)],
-            )[0]
-        )
-    return outs[0] if len(outs) == 1 else m.concatenate(outs, axis=0)
+    return _Q2K_MV.matvec([w_bytes], x, [], rows, cols // 256)
 
 
 def dequant_q2k(w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
     """the full [rows, cols] bf16 weight for a Q2_K tensor."""
-    global _q2k_deq
-    m = mx()
-    nblk = rows * cols // 256
-    with _lock:
-        if _q2k_deq is None:
-            _q2k_deq = m.fast.metal_kernel(
-                name="btb_q2k_dequant", input_names=["W"], output_names=["out"], header="", source=_DEQUANT_Q2K
-            )
-    grid = ((nblk * 32 + 255) // 256) * 256
-    return _q2k_deq(
-        inputs=[w_bytes],
-        grid=(grid, 1, 1),
-        threadgroup=(256, 1, 1),
-        output_shapes=[(rows, cols)],
-        output_dtypes=[m.bfloat16],
-        template=[("T", m.bfloat16), ("NBLK", nblk)],
-    )[0]
+    return _Q2K_DEQ.run([w_bytes], rows * cols // 256, (rows, cols))
 
 
 # Q3_K: 110 B/superblock. hmask[32] (the 3rd bit of each weight), qs[64] (2 low bits), scales[12] (16 signed
@@ -415,59 +310,15 @@ _DEQUANT_Q3K = r"""
         }
     }
 """
-_q3k_mv: dict[Any, Any] = {}
-_q3k_deq = None
+_Q3K_MV = RowKernel("q3k_mv", ["W", "x"], _Q3K_AUX, _MATVEC_Q3K)
+_Q3K_DEQ = BlockKernel("q3k_dequant", ["W"], _Q3K_AUX, _DEQUANT_Q3K, per=32)
 
 
 def matvec_q3k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:
     """`matvec_q4k` for Q3_K (110 B superblocks, 3-bit split qs+hmask, 16 signed 6-bit scales)."""
-    m = mx()
-    nsb = cols // 256
-    grid = ((rows * 32 + 255) // 256) * 256
-    outs = []
-    for s in range(0, int(x.shape[0]), ROWS_MAX):
-        xr = x[s : s + ROWS_MAX]
-        tr = int(xr.shape[0])
-        key = (rows, nsb, tr)
-        with _lock:
-            k = _q3k_mv.get(key)
-            if k is None:
-                k = _q3k_mv[key] = m.fast.metal_kernel(
-                    name=f"btb_q3k_mv_{rows}_{nsb}_{tr}",
-                    input_names=["W", "x"],
-                    output_names=["out"],
-                    header=f"{_Q3K_AUX}#define ROWS {rows}\n#define NSB {nsb}\n#define TR {tr}\n",
-                    source=_MATVEC_Q3K,
-                )
-        outs.append(
-            k(
-                inputs=[w_bytes, xr],
-                grid=(grid, 1, 1),
-                threadgroup=(256, 1, 1),
-                output_shapes=[(tr, rows)],
-                output_dtypes=[x.dtype],
-                template=[("T", x.dtype)],
-            )[0]
-        )
-    return outs[0] if len(outs) == 1 else m.concatenate(outs, axis=0)
+    return _Q3K_MV.matvec([w_bytes], x, [], rows, cols // 256)
 
 
 def dequant_q3k(w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
     """the full [rows, cols] bf16 weight for a Q3_K tensor."""
-    global _q3k_deq
-    m = mx()
-    nblk = int(rows * cols // 256)
-    with _lock:
-        if _q3k_deq is None:
-            _q3k_deq = m.fast.metal_kernel(
-                name="btb_q3k_dequant", input_names=["W"], output_names=["out"], header=_Q3K_AUX, source=_DEQUANT_Q3K
-            )
-    grid = ((nblk * 32 + 255) // 256) * 256
-    return _q3k_deq(
-        inputs=[w_bytes],
-        grid=(grid, 1, 1),
-        threadgroup=(256, 1, 1),
-        output_shapes=[(rows, cols)],
-        output_dtypes=[m.bfloat16],
-        template=[("T", m.bfloat16), ("NBLK", nblk)],
-    )[0]
+    return _Q3K_DEQ.run([w_bytes], rows * cols // 256, (rows, cols))

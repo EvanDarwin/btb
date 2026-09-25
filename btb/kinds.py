@@ -236,6 +236,18 @@ class LayerTier(StrEnum):
     STREAMED = "streamed"
 
 
+class SlotKind(StrEnum):
+    """what a cold ring slot holds for one linear: the checkpoint's bf16 bytes read off the drive, a 12-bit store
+    entry read off the drive, bf16 the engine dequantizes into the slot each pass (a GGUF tensor of another
+    storage type, which is not on the drive as bf16), or a float of another precision read off the drive as
+    stored and rewritten as bf16 in place as it lands"""
+
+    BF16 = "bf16"
+    P12 = "p12"
+    MEM = "mem"
+    CAST = "cast"
+
+
 class Proposer(StrEnum):
     """what proposes a speculative pass's drafts (btb/engine/generate.py): the n-gram continuations, or a
     drafting head as a chain, a fixed tree or the dynamic tree it draws itself. A sibling draft model is not a

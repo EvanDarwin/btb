@@ -4,6 +4,8 @@
 // computes each row bit-for-bit as the one-row step does, and one captured graph serves every length.
 //
 //   btb_gemv_bf16_m{1,..,32}      y[m][r] = sum_c w[r][c] * x[m][c]      (bf16 in, f32 accumulate, bf16 out)
+//   btb_gemv_q{2,3,4,5,6}k_bf16_m{1,..,32}  the same over raw k-quant weights (ggml's superblocks as stored),
+//                                 dequantised in registers; the same warp-a-row shape and fixed order
 //   btb_gemv_{silu,gelu}_bf16_m{1,..,32}  the down projection with act(g) * u folded into its x load
 //   btb_attn_split_d{64,128,256}  one pass of T queries over the cache (a sliding layer's window of it), a tree of
 //                                 T rows at its end, split over the sequence
@@ -17,6 +19,7 @@
 
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <stdint.h>
 
 namespace cg = cooperative_groups;
@@ -202,6 +205,386 @@ GEMV_ACT(4)
 GEMV_ACT(8)
 GEMV_ACT(16)
 GEMV_ACT(32)
+
+// ---------------------------------------------------------------------------------------------------------
+// gemv over Q4_K weights: w the raw ggml Q4_K bytes [R, C/256] row-major superblocks of 144 B, x [M, C] bf16,
+// y [M, R] bf16. One warp a row; lane l is the inner index 0..31, so the 32 lanes cooperate on a superblock
+// (the byte read qs[32k + l] and the two x reads at ...+ l are each 32 contiguous values, coalesced) and each
+// lane owns eight of the 256 weights. The decode is llama.cpp's (144 B: d f16, dmin f16, 12 B of 6-bit
+// scale/min pairs read by get_scale_min_k4, then 128 B of nibbles), dequantised in registers - the 4-bit
+// weights never expand to bf16. value = d*sc[j]*q - dmin*mn[j], j = weight >> 5. acc[m] runs the blocks and
+// the (k, lo/hi) pairs in a fixed order, independent of M, so row r of a T-row pass equals row r of the
+// one-row step, as the bf16 gemv above.
+// ---------------------------------------------------------------------------------------------------------
+// the 6-bit scale and min of sub-block j (0..7) from the 12 packed bytes, llama.cpp's get_scale_min_k4
+__device__ __forceinline__ void q4k_scale_min(const uint8_t* s, int j, float& sc, float& mn) {
+    if (j < 4) {
+        sc = (float)(s[j] & 63);
+        mn = (float)(s[j + 4] & 63);
+    } else {
+        sc = (float)((s[j + 4] & 0xF) | ((s[j - 4] >> 6) << 4));
+        mn = (float)((s[j + 4] >> 4) | ((s[j] >> 6) << 4));
+    }
+}
+
+template <int M>
+__device__ __forceinline__ void gemv_q4k_rows(const uint8_t* __restrict__ w, const bf16* __restrict__ x,
+                                              bf16* __restrict__ y, int R, int C) {
+    const int lane = threadIdx.x & 31;
+    const int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (r >= R) return;
+    const int nsb = C >> 8;  // superblocks of 256 weights
+    const uint8_t* base = w + (size_t)r * nsb * 144;
+    // NVIDIA layout: lane l owns one uint (4 nibble bytes, 8 weights) of every superblock - bytes [4l, 4l+3],
+    // all in sub-block pair k = l >> 3 at inner offset (l & 7) * 4 - so a superblock's 128 nibble bytes are one
+    // coalesced 128 B __ldcs a warp (evict-first, the weight stream never evicts the cache's persisting-L2
+    // window) and each lane's scale pair unpacks once. The eight weights are decoded once and reused across the
+    // M rows; x rides the default policy as a uint2 (4 bf16). acc runs the blocks and the (lo/hi, i) in a fixed
+    // order independent of M, so row r of a T-row pass equals row r of the one-row step.
+    const int k = lane >> 3;
+    const int inner = (lane & 7) << 2;
+    const int colL = (2 * k) * 32 + inner;
+    const int colH = (2 * k + 1) * 32 + inner;
+    float acc[M];
+#pragma unroll
+    for (int m = 0; m < M; ++m) acc[m] = 0.f;
+#pragma unroll 4
+    for (int c = 0; c < nsb; ++c) {
+        const uint8_t* blk = base + (size_t)c * 144;
+        const unsigned hdr = __ldcs(reinterpret_cast<const unsigned*>(blk));  // d in the low half, dmin in the high
+        const float d = __half2float(__ushort_as_half((unsigned short)(hdr & 0xFFFF)));
+        const float dm = __half2float(__ushort_as_half((unsigned short)(hdr >> 16)));
+        const uint8_t* s = blk + 4;
+        float sclo, mnlo, schi, mnhi;
+        q4k_scale_min(s, 2 * k, sclo, mnlo);
+        q4k_scale_min(s, 2 * k + 1, schi, mnhi);
+        const unsigned packed = __ldcs(reinterpret_cast<const unsigned*>(blk + 16 + (lane << 2)));
+        float wl[4], wh[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const unsigned byte = (packed >> (8 * i)) & 0xFF;
+            wl[i] = d * sclo * (float)(byte & 0xF) - dm * mnlo;
+            wh[i] = d * schi * (float)(byte >> 4) - dm * mnhi;
+        }
+        const bf16* xc = x + (size_t)c * 256;
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+            const bf16* xr = xc + (size_t)m * C;
+            Vec<4> xl, xh;
+            xl.load(xr + colL);
+            xh.load(xr + colH);
+            float a = acc[m];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                a = fmaf(wl[i], xl.at(i), a);
+                a = fmaf(wh[i], xh.at(i), a);
+            }
+            acc[m] = a;
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < M; ++m) acc[m] = warp_sum(acc[m]);
+    if (lane == 0) {
+#pragma unroll
+        for (int m = 0; m < M; ++m) y[(size_t)m * R + r] = f2bf(acc[m]);
+    }
+}
+
+#define GEMV_Q4K(M)                                                                                          \
+    extern "C" __global__ void __launch_bounds__(128) btb_gemv_q4k_bf16_m##M(                                \
+        const uint8_t* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ y, int R, int C) {      \
+        gemv_q4k_rows<M>(w, x, y, R, C);                                                                     \
+    }
+GEMV_Q4K(1)
+GEMV_Q4K(2)
+GEMV_Q4K(4)
+GEMV_Q4K(8)
+GEMV_Q4K(16)
+GEMV_Q4K(32)
+
+// ---------------------------------------------------------------------------------------------------------
+// gemv over Q5_K weights: 176 B/superblock - d f16, dmin f16, 12 scale bytes (get_scale_min_k4, as Q4_K), a 32
+// B qh plane (the 5th bit of each weight), then 128 B of low nibbles. q = nibble | (qh_bit << 4); value =
+// d*sc[j]*q - dmin*mn[j]. lane = inner index 0..31 (the qh plane and the nibble sub-blocks index by it), so the
+// qs/qh and x reads are coalesced across the warp; qh[lane] is read once and each (k) weight pair is decoded
+// once and reused across the M rows, __ldcs evict-first. Fixed accumulation order, batch-invariant.
+// ---------------------------------------------------------------------------------------------------------
+template <int M>
+__device__ __forceinline__ void gemv_q5k_rows(const uint8_t* __restrict__ w, const bf16* __restrict__ x,
+                                              bf16* __restrict__ y, int R, int C) {
+    const int lane = threadIdx.x & 31;
+    const int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (r >= R) return;
+    const int nsb = C >> 8;
+    const uint8_t* baseW = w + (size_t)r * nsb * 176;
+    float acc[M];
+#pragma unroll
+    for (int m = 0; m < M; ++m) acc[m] = 0.f;
+#pragma unroll 4
+    for (int c = 0; c < nsb; ++c) {
+        const uint8_t* blk = baseW + (size_t)c * 176;
+        const unsigned hdr = __ldcs(reinterpret_cast<const unsigned*>(blk));
+        const float d = __half2float(__ushort_as_half((unsigned short)(hdr & 0xFFFF)));
+        const float dm = __half2float(__ushort_as_half((unsigned short)(hdr >> 16)));
+        const uint8_t* s = blk + 4;
+        const uint8_t hbit = __ldcs(blk + 16 + lane);
+        const uint8_t* qs = blk + 48;
+        const bf16* xc = x + (size_t)c * 256;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            float sclo, mnlo, schi, mnhi;
+            q4k_scale_min(s, 2 * k, sclo, mnlo);
+            q4k_scale_min(s, 2 * k + 1, schi, mnhi);
+            const uint8_t byte = __ldcs(qs + 32 * k + lane);
+            const int qlo = (byte & 0xF) | (((hbit >> (2 * k)) & 1) << 4);
+            const int qhi = (byte >> 4) | (((hbit >> (2 * k + 1)) & 1) << 4);
+            const float wlo = d * sclo * (float)qlo - dm * mnlo;
+            const float whi = d * schi * (float)qhi - dm * mnhi;
+            const int clo = (2 * k) * 32 + lane;
+            const int chi = (2 * k + 1) * 32 + lane;
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+                const bf16* xr = xc + (size_t)m * C;
+                acc[m] = fmaf(whi, bf2f(xr[chi]), fmaf(wlo, bf2f(xr[clo]), acc[m]));
+            }
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < M; ++m) acc[m] = warp_sum(acc[m]);
+    if (lane == 0) {
+#pragma unroll
+        for (int m = 0; m < M; ++m) y[(size_t)m * R + r] = f2bf(acc[m]);
+    }
+}
+
+#define GEMV_Q5K(M)                                                                                          \
+    extern "C" __global__ void __launch_bounds__(128) btb_gemv_q5k_bf16_m##M(                                \
+        const uint8_t* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ y, int R, int C) {      \
+        gemv_q5k_rows<M>(w, x, y, R, C);                                                                     \
+    }
+GEMV_Q5K(1)
+GEMV_Q5K(2)
+GEMV_Q5K(4)
+GEMV_Q5K(8)
+GEMV_Q5K(16)
+GEMV_Q5K(32)
+
+// ---------------------------------------------------------------------------------------------------------
+// gemv over Q6_K weights: 210 B/superblock - ql[128] low nibbles, qh[64] the high 2 bits, scales[16] int8,
+// d f16. value = d * sc[is] * (q - 32), q the 6-bit weight. lane = inner index 0..31; each lane owns eight
+// weights (four per half h), ql/qh read __ldcs evict-first and coalesced across the warp, the eight weights
+// decoded once and reused across the M rows. Fixed accumulation order, batch-invariant.
+// ---------------------------------------------------------------------------------------------------------
+template <int M>
+__device__ __forceinline__ void gemv_q6k_rows(const uint8_t* __restrict__ w, const bf16* __restrict__ x,
+                                              bf16* __restrict__ y, int R, int C) {
+    const int lane = threadIdx.x & 31;
+    const int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (r >= R) return;
+    const int nsb = C >> 8;
+    const uint8_t* baseW = w + (size_t)r * nsb * 210;
+    float acc[M];
+#pragma unroll
+    for (int m = 0; m < M; ++m) acc[m] = 0.f;
+#pragma unroll 4
+    for (int c = 0; c < nsb; ++c) {
+        const uint8_t* blk = baseW + (size_t)c * 210;
+        const uint8_t* ql = blk;
+        const uint8_t* qh = blk + 128;
+        const int8_t* sc = reinterpret_cast<const int8_t*>(blk + 192);
+        const float df = __half2float(__ushort_as_half((unsigned short)__ldcs(reinterpret_cast<const unsigned short*>(blk + 208))));
+        const bf16* xc = x + (size_t)c * 256;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int o = h * 128, qlo = h * 64, qho = h * 32, sco = h * 8;
+            const int isc = sco + (lane >> 4);
+            const uint8_t l0 = __ldcs(ql + qlo + lane);
+            const uint8_t l1 = __ldcs(ql + qlo + lane + 32);
+            const uint8_t hb = __ldcs(qh + qho + lane);
+            const float w1 = df * (float)sc[isc + 0] * (float)((int)((l0 & 0xF) | (((hb >> 0) & 3) << 4)) - 32);
+            const float w2 = df * (float)sc[isc + 2] * (float)((int)((l1 & 0xF) | (((hb >> 2) & 3) << 4)) - 32);
+            const float w3 = df * (float)sc[isc + 4] * (float)((int)((l0 >> 4) | (((hb >> 4) & 3) << 4)) - 32);
+            const float w4 = df * (float)sc[isc + 6] * (float)((int)((l1 >> 4) | (((hb >> 6) & 3) << 4)) - 32);
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+                const bf16* xr = xc + (size_t)m * C + o;
+                float a = acc[m];
+                a = fmaf(w1, bf2f(xr[lane]), a);
+                a = fmaf(w2, bf2f(xr[lane + 32]), a);
+                a = fmaf(w3, bf2f(xr[lane + 64]), a);
+                a = fmaf(w4, bf2f(xr[lane + 96]), a);
+                acc[m] = a;
+            }
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < M; ++m) acc[m] = warp_sum(acc[m]);
+    if (lane == 0) {
+#pragma unroll
+        for (int m = 0; m < M; ++m) y[(size_t)m * R + r] = f2bf(acc[m]);
+    }
+}
+
+#define GEMV_Q6K(M)                                                                                          \
+    extern "C" __global__ void __launch_bounds__(128) btb_gemv_q6k_bf16_m##M(                                \
+        const uint8_t* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ y, int R, int C) {      \
+        gemv_q6k_rows<M>(w, x, y, R, C);                                                                     \
+    }
+GEMV_Q6K(1)
+GEMV_Q6K(2)
+GEMV_Q6K(4)
+GEMV_Q6K(8)
+GEMV_Q6K(16)
+GEMV_Q6K(32)
+
+// ---------------------------------------------------------------------------------------------------------
+// gemv over Q2_K weights: 84 B/superblock - scales[16] (a 4-bit scale and 4-bit min a 16-weight sub-block) @0,
+// qs[64] (2-bit) @16, d f16 @80, dmin f16 @82. value = d*(s&0xF)*q - dmin*(s>>4). lane = inner index; sub =
+// lane>>4 picks the 16-weight sub-block. qs coalesced across the warp, __ldcs; the four weights of a half are
+// decoded once and reused across the M rows. Fixed accumulation order, batch-invariant.
+// ---------------------------------------------------------------------------------------------------------
+template <int M>
+__device__ __forceinline__ void gemv_q2k_rows(const uint8_t* __restrict__ w, const bf16* __restrict__ x,
+                                              bf16* __restrict__ y, int R, int C) {
+    const int lane = threadIdx.x & 31;
+    const int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (r >= R) return;
+    const int nsb = C >> 8;
+    const uint8_t* baseW = w + (size_t)r * nsb * 84;
+    const int sub = lane >> 4;
+    float acc[M];
+#pragma unroll
+    for (int m = 0; m < M; ++m) acc[m] = 0.f;
+#pragma unroll 4
+    for (int c = 0; c < nsb; ++c) {
+        const uint8_t* blk = baseW + (size_t)c * 84;
+        const uint8_t* scales = blk;
+        const uint8_t* qs = blk + 16;
+        const unsigned dd = __ldcs(reinterpret_cast<const unsigned*>(blk + 80));  // d low half, dmin high half
+        const float d = __half2float(__ushort_as_half((unsigned short)(dd & 0xFFFF)));
+        const float dm = __half2float(__ushort_as_half((unsigned short)(dd >> 16)));
+        const bf16* xc = x + (size_t)c * 256;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const uint8_t byte = __ldcs(qs + h * 32 + lane);
+            float wj[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint8_t s = scales[h * 8 + 2 * j + sub];
+                wj[j] = d * (float)(s & 0xF) * (float)((byte >> (2 * j)) & 3) - dm * (float)(s >> 4);
+            }
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+                const bf16* xr = xc + (size_t)m * C + h * 128 + lane;
+                float a = acc[m];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) a = fmaf(wj[j], bf2f(xr[j * 32]), a);
+                acc[m] = a;
+            }
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < M; ++m) acc[m] = warp_sum(acc[m]);
+    if (lane == 0) {
+#pragma unroll
+        for (int m = 0; m < M; ++m) y[(size_t)m * R + r] = f2bf(acc[m]);
+    }
+}
+
+#define GEMV_Q2K(M)                                                                                          \
+    extern "C" __global__ void __launch_bounds__(128) btb_gemv_q2k_bf16_m##M(                                \
+        const uint8_t* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ y, int R, int C) {      \
+        gemv_q2k_rows<M>(w, x, y, R, C);                                                                     \
+    }
+GEMV_Q2K(1)
+GEMV_Q2K(2)
+GEMV_Q2K(4)
+GEMV_Q2K(8)
+GEMV_Q2K(16)
+GEMV_Q2K(32)
+
+// the 16 signed 6-bit scales of a Q3_K superblock from its 12 packed bytes (llama.cpp's kmask dance), as four
+// uints whose bytes are the scales 0..63 (read (scl >> 32) then - 32 for the value). The 12 bytes are read one
+// at a time - blk + 96 is not 4-aligned for every superblock (110 B blocks) - so no unaligned word load.
+__device__ __forceinline__ void q3k_scales(const uint8_t* sc, unsigned aux[4]) {
+    const unsigned a0 = (unsigned)sc[0] | ((unsigned)sc[1] << 8) | ((unsigned)sc[2] << 16) | ((unsigned)sc[3] << 24);
+    const unsigned a1 = (unsigned)sc[4] | ((unsigned)sc[5] << 8) | ((unsigned)sc[6] << 16) | ((unsigned)sc[7] << 24);
+    const unsigned a2 = (unsigned)sc[8] | ((unsigned)sc[9] << 8) | ((unsigned)sc[10] << 16) | ((unsigned)sc[11] << 24);
+    const unsigned k1 = 0x03030303u, k2 = 0x0f0f0f0fu;
+    aux[2] = ((a0 >> 4) & k2) | (((a2 >> 4) & k1) << 4);
+    aux[3] = ((a1 >> 4) & k2) | (((a2 >> 6) & k1) << 4);
+    aux[0] = (a0 & k2) | (((a2 >> 0) & k1) << 4);
+    aux[1] = (a1 & k2) | (((a2 >> 2) & k1) << 4);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// gemv over Q3_K weights: 110 B/superblock - hmask[32] (the 3rd bit) @0, qs[64] (the low 2 bits) @32, 12 scale
+// bytes @96, d f16 @108. q = ((qs[h*32+l] >> 2j) & 3) - (hmask bit set ? 0 : 4); value = d*(scale-32)*q, the 16
+// signed 6-bit scales unpacked once per superblock. lane = inner; sub = lane>>4. hmask/qs coalesced, __ldcs;
+// decode reused across the M rows. Fixed accumulation order, batch-invariant.
+// ---------------------------------------------------------------------------------------------------------
+template <int M>
+__device__ __forceinline__ void gemv_q3k_rows(const uint8_t* __restrict__ w, const bf16* __restrict__ x,
+                                              bf16* __restrict__ y, int R, int C) {
+    const int lane = threadIdx.x & 31;
+    const int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (r >= R) return;
+    const int nsb = C >> 8;
+    const uint8_t* baseW = w + (size_t)r * nsb * 110;
+    const int sub = lane >> 4;
+    float acc[M];
+#pragma unroll
+    for (int m = 0; m < M; ++m) acc[m] = 0.f;
+#pragma unroll 4
+    for (int c = 0; c < nsb; ++c) {
+        const uint8_t* blk = baseW + (size_t)c * 110;
+        unsigned aux[4];
+        q3k_scales(blk + 96, aux);
+        const float d = __half2float(__ushort_as_half((unsigned short)__ldcs(reinterpret_cast<const unsigned short*>(blk + 108))));
+        const uint8_t hm = __ldcs(blk + lane);
+        const uint8_t* qs = blk + 32;
+        const bf16* xc = x + (size_t)c * 256;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const uint8_t byte = __ldcs(qs + h * 32 + lane);
+            float wj[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                int q = (int)((byte >> (2 * j)) & 3);
+                if (!(hm & (1 << (h * 4 + j)))) q -= 4;
+                const int idx = h * 8 + 2 * j + sub;
+                const int sval = (int)((aux[idx >> 2] >> (8 * (idx & 3))) & 0xFF);
+                wj[j] = d * (float)(sval - 32) * (float)q;
+            }
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+                const bf16* xr = xc + (size_t)m * C + h * 128 + lane;
+                float a = acc[m];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) a = fmaf(wj[j], bf2f(xr[j * 32]), a);
+                acc[m] = a;
+            }
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < M; ++m) acc[m] = warp_sum(acc[m]);
+    if (lane == 0) {
+#pragma unroll
+        for (int m = 0; m < M; ++m) y[(size_t)m * R + r] = f2bf(acc[m]);
+    }
+}
+
+#define GEMV_Q3K(M)                                                                                          \
+    extern "C" __global__ void __launch_bounds__(128) btb_gemv_q3k_bf16_m##M(                                \
+        const uint8_t* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ y, int R, int C) {      \
+        gemv_q3k_rows<M>(w, x, y, R, C);                                                                     \
+    }
+GEMV_Q3K(1)
+GEMV_Q3K(2)
+GEMV_Q3K(4)
+GEMV_Q3K(8)
+GEMV_Q3K(16)
+GEMV_Q3K(32)
 
 // ---------------------------------------------------------------------------------------------------------
 // attention: q [T, Hq, D] bf16 (normed, roped), K/V [Hk, cap, D] bf16 (the cache layer's own buffer: row j

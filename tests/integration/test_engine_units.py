@@ -20,7 +20,7 @@ from btb.draft import NGramProposer, Spans
 from btb.engine import StreamedTextModel
 from btb.engine.cache import GrowLayer
 from btb.engine.generate import _chains_tree
-from btb.kinds import Json, LayerKind, TokenRows
+from btb.kinds import Json, LayerKind, SlotKind, TokenRows
 from tests.cert import spec
 from tests.helpers import (
     ROOT,
@@ -897,10 +897,12 @@ def test_a_layer_shed_to_the_drive_off_a_weight_not_stored_as_bf16_answers_as_fr
         with torch.inference_mode():
             i = sm.ram_shed("the test")
         assert i is not None and sm.cold == {i}
-        kind = "mem" if name.startswith("gguf/") else "cast"
-        assert {it[5] for it in sm.cold_ring.recipe[i]} == {kind}, "every linear of the shed layer is read cast"
+        kind = SlotKind.MEM if name.startswith("gguf/") else SlotKind.CAST
+        assert {it.kind for it in sm.cold_ring.recipe[i]} == {kind}, "every linear of the shed layer is read cast"
         during, _ = sm.generate(REPEATING, 12, speculate=False)
         assert during == before, "a layer read through the ring each pass answers as it did from RAM"
         assert sm.ram_regrow() == i and not sm.cold
+        if name.startswith("gguf/") and device == "cpu":  # regrown, its Q8_0 blocks multiply as stored again
+            assert any(getattr(m, "quant", None) is not None for m in sm.host[i].modules()), "not rebound as stored"
         after, _ = sm.generate(REPEATING, 12, speculate=False)
         assert after == before

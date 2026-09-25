@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from .core import mx
+from .launch import BlockKernel, RowKernel
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -163,72 +164,12 @@ _DEQUANT_IQ4XS = r"""
         o[32 * ib + lane] = (T)(dl * (float)KV[q]);
     }
 """
-_lock = threading.Lock()
-ROWS_MAX = 16
-_mv: dict[Any, Any] = {}
-_deq: dict[str, Any] = {}
-# (block bytes, block weights, matvec source, dequant source) a kind
-_IQ = {
-    "iq4xs": (136, 256, _MATVEC_IQ4XS, _DEQUANT_IQ4XS),
-}
-
-
-def _matvec(kind: str, w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:
-    m = mx()
-    _, blkw, src, _ = _IQ[kind]
-    nb = cols // blkw
-    grid = ((rows * 32 + 255) // 256) * 256
-    outs = []
-    for s in range(0, int(x.shape[0]), ROWS_MAX):
-        xr = x[s : s + ROWS_MAX]
-        tr = int(xr.shape[0])
-        key = (kind, rows, nb, tr)
-        with _lock:
-            k = _mv.get(key)
-            if k is None:
-                k = _mv[key] = m.fast.metal_kernel(
-                    name=f"btb_{kind}_mv_{rows}_{nb}_{tr}",
-                    input_names=["W", "x"],
-                    output_names=["out"],
-                    header=f"{_KV}#define ROWS {rows}\n#define NSB {nb}\n#define TR {tr}\n",
-                    source=src,
-                )
-        outs.append(
-            k(
-                inputs=[w_bytes, xr],
-                grid=(grid, 1, 1),
-                threadgroup=(256, 1, 1),
-                output_shapes=[(tr, rows)],
-                output_dtypes=[x.dtype],
-                template=[("T", x.dtype)],
-            )[0]
-        )
-    return outs[0] if len(outs) == 1 else m.concatenate(outs, axis=0)
-
-
-def _dequant(kind: str, w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
-    m = mx()
-    _, blkw, _, src = _IQ[kind]
-    nblk = int(rows * cols // blkw)
-    with _lock:
-        k = _deq.get(kind)
-        if k is None:
-            k = _deq[kind] = m.fast.metal_kernel(
-                name=f"btb_{kind}_dequant", input_names=["W"], output_names=["out"], header=_KV, source=src
-            )
-    grid = ((nblk * 32 + 255) // 256) * 256
-    return k(
-        inputs=[w_bytes],
-        grid=(grid, 1, 1),
-        threadgroup=(256, 1, 1),
-        output_shapes=[(rows, cols)],
-        output_dtypes=[m.bfloat16],
-        template=[("T", m.bfloat16), ("NBLK", nblk)],
-    )[0]
-
-
-_iq4nl_mv: dict[Any, Any] = {}
-_iq4nl_deq = None
+# IQ4_XS: 136 B a superblock of 256, the KV table in the header; one simdgroup a superblock for the dequant
+_IQ4XS_MV = RowKernel("iq4xs_mv", ["W", "x"], _KV, _MATVEC_IQ4XS)
+_IQ4XS_DEQ = BlockKernel("iq4xs_dequant", ["W"], _KV, _DEQUANT_IQ4XS, per=32)
+# IQ4_NL over its two repacked streams (the f16 scales, the nibble bytes), 32-weight blocks (NB a row)
+_IQ4NL_MV = RowKernel("iq4nl_mv", ["Dd", "Qq", "x"], _KV, _MATVEC_IQ4NL, nb_define="NB")
+_IQ4NL_DEQ = BlockKernel("iq4nl_dequant", ["Dd", "Qq"], _KV, _DEQUANT_IQ4NL)
 
 
 def repack_iq4nl(raw: Any) -> tuple[mx_.array, mx_.array]:
@@ -245,70 +186,22 @@ def repack_iq4nl(raw: Any) -> tuple[mx_.array, mx_.array]:
 def matvec_iq4nl(d: mx_.array, q: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:
     """y[T, rows] = x[T, cols] . W^T for an IQ4_NL weight as `repack_iq4nl` splits it; fp32 accumulation, y in
     x's dtype, 1..16 rows a launch."""
-    m = mx()
-    nb = cols // 32
-    grid = ((rows * 32 + 255) // 256) * 256
-    outs = []
-    for s in range(0, int(x.shape[0]), ROWS_MAX):
-        xr = x[s : s + ROWS_MAX]
-        tr = int(xr.shape[0])
-        key = (rows, nb, tr)
-        with _lock:
-            k = _iq4nl_mv.get(key)
-            if k is None:
-                k = _iq4nl_mv[key] = m.fast.metal_kernel(
-                    name=f"btb_iq4nl_mv_{rows}_{nb}_{tr}",
-                    input_names=["Dd", "Qq", "x"],
-                    output_names=["out"],
-                    header=f"{_KV}#define ROWS {rows}\n#define NB {nb}\n#define TR {tr}\n",
-                    source=_MATVEC_IQ4NL,
-                )
-        outs.append(
-            k(
-                inputs=[d, q, xr],
-                grid=(grid, 1, 1),
-                threadgroup=(256, 1, 1),
-                output_shapes=[(tr, rows)],
-                output_dtypes=[x.dtype],
-                template=[("T", x.dtype)],
-            )[0]
-        )
-    return outs[0] if len(outs) == 1 else m.concatenate(outs, axis=0)
+    return _IQ4NL_MV.matvec([d, q], x, [], rows, cols // 32)
 
 
 def dequant_iq4nl(d: mx_.array, q: mx_.array, rows: int, cols: int) -> mx_.array:
     """the full [rows, cols] bf16 weight for an IQ4_NL tensor from its repacked streams."""
-    global _iq4nl_deq
-    m = mx()
-    nblk = int(rows * cols // 32)
-    with _lock:
-        if _iq4nl_deq is None:
-            _iq4nl_deq = m.fast.metal_kernel(
-                name="btb_iq4nl_dequant",
-                input_names=["Dd", "Qq"],
-                output_names=["out"],
-                header=_KV,
-                source=_DEQUANT_IQ4NL,
-            )
-    grid = ((nblk + 255) // 256) * 256
-    return _iq4nl_deq(
-        inputs=[d, q],
-        grid=(grid, 1, 1),
-        threadgroup=(256, 1, 1),
-        output_shapes=[(rows, cols)],
-        output_dtypes=[m.bfloat16],
-        template=[("T", m.bfloat16), ("NBLK", nblk)],
-    )[0]
+    return _IQ4NL_DEQ.run([d, q], rows * cols // 32, (rows, cols))
 
 
 def matvec_iq4xs(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:
     """`matvec_iq4nl` for IQ4_XS (136 B/256 superblocks, a 6-bit scale a 32-block)."""
-    return _matvec("iq4xs", w_bytes, x, rows, cols)
+    return _IQ4XS_MV.matvec([w_bytes], x, [], rows, cols // 256)
 
 
 def dequant_iq4xs(w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
     """the full [rows, cols] bf16 weight for an IQ4_XS tensor."""
-    return _dequant("iq4xs", w_bytes, rows, cols)
+    return _IQ4XS_DEQ.run([w_bytes], rows * cols // 256, (rows, cols))
 
 
 # IQ3_XXS: 98 B a superblock of 256. d f16, 64 grid-index bytes, then 8 uint32 (one a 32-block: the top 4 bits a
@@ -765,8 +658,15 @@ def repack_lattice(kind: str, raw: Any) -> tuple[Any, ...]:
     return tuple(side(raw)) if side is not None else ()
 
 
-_latt_mv: dict[Any, Any] = {}
-_latt_deq: dict[str, Any] = {}
+# a kind's kernels, made on first use: its inputs are the sources' (the sign table and side streams vary a kind)
+_latt_mv: dict[str, RowKernel] = {}
+_latt_deq: dict[str, BlockKernel] = {}
+
+
+def _lattice_tables(kind: str) -> list[mx_.array]:
+    """the grid (and the sign table, where the kind reads it) a lattice kernel takes beside the bytes"""
+    spec = _LATT[kind]
+    return [_grid(spec["grid"])] + ([_ksigns()] if spec["ksigns"] else [])
 
 
 def matvec_lattice(
@@ -775,59 +675,19 @@ def matvec_lattice(
     """y[T, rows] = x[T, cols] . W^T for a raw IQ lattice weight; fp32 accumulation, y in x's dtype, 1..16 rows a
     launch. `kind` selects the layout from `_LATT`; the grid (and sign table, when used) ride along as buffers,
     and `side` is this kind's `repack_lattice` streams when it has any."""
-    m = mx()
     spec = _LATT[kind]
-    inames = ["W", "x", "GRID"] + (["KS"] if spec["ksigns"] else []) + list(spec.get("side_names", []))
-    tbls = [_grid(spec["grid"])] + ([_ksigns()] if spec["ksigns"] else []) + list(side)
-    nsb = cols // 256
-    g = ((rows * 32 + 255) // 256) * 256
-    outs = []
-    for s in range(0, int(x.shape[0]), ROWS_MAX):
-        xr = x[s : s + ROWS_MAX]
-        tr = int(xr.shape[0])
-        key = (kind, rows, nsb, tr)
-        with _lock:
-            k = _latt_mv.get(key)
-            if k is None:
-                k = _latt_mv[key] = m.fast.metal_kernel(
-                    name=f"btb_{kind}_mv_{rows}_{nsb}_{tr}",
-                    input_names=inames,
-                    output_names=["out"],
-                    header=f"#define ROWS {rows}\n#define NSB {nsb}\n#define TR {tr}\n",
-                    source=spec["mv"],
-                )
-        outs.append(
-            k(
-                inputs=[w_bytes, xr, *tbls],
-                grid=(g, 1, 1),
-                threadgroup=(256, 1, 1),
-                output_shapes=[(tr, rows)],
-                output_dtypes=[x.dtype],
-                template=[("T", x.dtype)],
-            )[0]
-        )
-    return outs[0] if len(outs) == 1 else m.concatenate(outs, axis=0)
+    k = _latt_mv.get(kind)
+    if k is None:
+        inames = ["W", "x", "GRID"] + (["KS"] if spec["ksigns"] else []) + list(spec.get("side_names", []))
+        k = _latt_mv[kind] = RowKernel(f"{kind}_mv", inames, "", spec["mv"])
+    return k.matvec([w_bytes], x, [*_lattice_tables(kind), *side], rows, cols // 256)
 
 
 def dequant_lattice(kind: str, w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
     """the full [rows, cols] bf16 weight for an IQ lattice tensor of the given `kind`."""
-    m = mx()
     spec = _LATT[kind]
-    inames = ["W", "GRID"] + (["KS"] if spec["ksigns"] else [])
-    tbls = [_grid(spec["grid"])] + ([_ksigns()] if spec["ksigns"] else [])
-    nblk = int(rows * cols // 256)
-    with _lock:
-        k = _latt_deq.get(kind)
-        if k is None:
-            k = _latt_deq[kind] = m.fast.metal_kernel(
-                name=f"btb_{kind}_dequant", input_names=inames, output_names=["out"], header="", source=spec["deq"]
-            )
-    g = ((nblk * 32 + 255) // 256) * 256
-    return k(
-        inputs=[w_bytes, *tbls],
-        grid=(g, 1, 1),
-        threadgroup=(256, 1, 1),
-        output_shapes=[(rows, cols)],
-        output_dtypes=[m.bfloat16],
-        template=[("T", m.bfloat16), ("NBLK", nblk)],
-    )[0]
+    k = _latt_deq.get(kind)
+    if k is None:
+        inames = ["W", "GRID"] + (["KS"] if spec["ksigns"] else [])
+        k = _latt_deq[kind] = BlockKernel(f"{kind}_dequant", inames, "", spec["deq"], per=32)
+    return k.run([w_bytes, *_lattice_tables(kind)], rows * cols // 256, (rows, cols))

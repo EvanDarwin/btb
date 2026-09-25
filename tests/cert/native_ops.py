@@ -101,6 +101,23 @@ class Stored(StrEnum):
     MXFP4_GGML = "mxfp4_ggml"
     FP8 = "fp8"
     BYTES = "bytes"
+    Q2_K = "q2_k"
+    Q3_K = "q3_k"
+    Q4_K = "q4_k"
+    Q5_K = "q5_k"
+    Q6_K = "q6_k"
+    Q4_0 = "q4_0"
+    Q4_1 = "q4_1"
+    Q8_0 = "q8_0"
+    IQ4_NL = "iq4_nl"
+    IQ4_XS = "iq4_xs"
+    IQ3_XXS = "iq3_xxs"
+    IQ3_S = "iq3_s"
+    IQ2_XXS = "iq2_xxs"
+    IQ2_XS = "iq2_xs"
+    IQ2_S = "iq2_s"
+    IQ1_S = "iq1_s"
+    IQ1_M = "iq1_m"
 
 
 # the Stored forms that are not GGUF quant types, each with what btb stores under it. A member absent here and
@@ -148,6 +165,54 @@ OPS: tuple[Op, ...] = (
     ),
     Op("gemv_fp8", (Stored.FP8,), ("btb_gemv_fp8_rows",), "guard_scalar.rs", "guard_fp8.rs", "gemv.rs"),
     Op(
+        "gemv_kquant",
+        (Stored.Q2_K, Stored.Q3_K, Stored.Q4_K, Stored.Q5_K, Stored.Q6_K),
+        ("btb_gemv_q2k_rows", "btb_gemv_q3k_rows", "btb_gemv_q4k_rows", "btb_gemv_q5k_rows", "btb_gemv_q6k_rows"),
+        "gemv_quant.rs",
+        "guard_gemv_quant.rs",
+        "gemv.rs",
+    ),
+    Op(
+        "gemv_affine",
+        (Stored.Q4_0, Stored.Q4_1, Stored.Q8_0),
+        ("btb_gemv_q40_rows", "btb_gemv_q41_rows", "btb_gemv_q80_rows"),
+        "gemv_quant.rs",
+        "guard_gemv_quant.rs",
+        "gemv.rs",
+    ),
+    Op(
+        "gemv_iq4",
+        (Stored.IQ4_NL, Stored.IQ4_XS),
+        ("btb_gemv_iq4nl_rows", "btb_gemv_iq4xs_rows"),
+        "gemv_quant.rs",
+        "guard_gemv_quant.rs",
+        "gemv.rs",
+    ),
+    Op(
+        "gemv_lattice",
+        (
+            Stored.IQ3_XXS,
+            Stored.IQ3_S,
+            Stored.IQ2_XXS,
+            Stored.IQ2_XS,
+            Stored.IQ2_S,
+            Stored.IQ1_S,
+            Stored.IQ1_M,
+        ),
+        (
+            "btb_gemv_iq3xxs_rows",
+            "btb_gemv_iq3s_rows",
+            "btb_gemv_iq2xxs_rows",
+            "btb_gemv_iq2xs_rows",
+            "btb_gemv_iq2s_rows",
+            "btb_gemv_iq1s_rows",
+            "btb_gemv_iq1m_rows",
+        ),
+        "gemv_quant.rs",
+        "guard_gemv_quant.rs",
+        "gemv.rs",
+    ),
+    Op(
         "gemv_group",
         (Stored.BF16, Stored.MXFP4, Stored.FP8),
         ("btb_gemv_bf16_group", "btb_gemv_mxfp4_group", "btb_gemv_mxfp4_ggml_group", "btb_gemv_fp8_group"),
@@ -190,6 +255,7 @@ def op_families() -> list[str]:
 LIB_RS = os.path.join(ROOT, "native", "src", "lib.rs")
 GEMV_RS = os.path.join(ROOT, "native", "src", "gemv.rs")
 _EXPORT_RE = re.compile(r'pub\s+(?:unsafe\s+)?extern\s+"C"\s+fn\s+(btb_\w+)')
+_EXPORT_MACRO_RE = re.compile(r'macro_rules!\s+(\w+)\s*\{(?:(?!macro_rules!).)*?extern\s+"C"\s+fn\s+\$\w+', re.S)
 _ISA_RE = re.compile(r"pub enum Isa \{(.*?)\n\}", re.S)
 _VARIANT_RE = re.compile(r"^\s{4}(\w+),?\s*$", re.M)
 SCALAR = "scalar"
@@ -218,9 +284,14 @@ def family_tiers(family: str) -> frozenset[str]:
 
 def crate_exports() -> set[str]:
     """the btb_* C-ABI functions the crate actually exports, read from native/src/lib.rs - the truth the OPS
-    table's `exports` claims are checked against."""
+    table's `exports` claims are checked against. A `macro_rules!` whose body defines `extern "C" fn $name`
+    exports each btb_* name it is invoked with (the lattice gemvs)."""
     with open(LIB_RS, encoding="utf-8") as f:
-        return set(_EXPORT_RE.findall(f.read()))
+        src = f.read()
+    out = set(_EXPORT_RE.findall(src))
+    for macro in _EXPORT_MACRO_RE.findall(src):
+        out |= set(re.findall(rf"\b{macro}!\(\s*(btb_\w+)", src))
+    return out
 
 
 def _exists(base: str, name: str | None) -> bool:

@@ -1,11 +1,10 @@
 // Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
-//! Per-op benches for the fused mat-vec family: the bf16 matrix, the 12-bit packed matrix, the two
-//! MXFP4 layouts (checkpoint blocks/scales and the ggml 17-byte block), the FP8 matrix, and the grouped
-//! dispatches (one thread-pool barrier for a whole layer's active experts).
+//! Per-op benches for the fused mat-vec family: the bf16 matrix, the 12-bit packed matrix, the GGUF
+//! quants, the two MXFP4 layouts (checkpoint blocks/scales and the ggml 17-byte block), the FP8 matrix,
+//! and the grouped dispatches (one thread-pool barrier for a whole layer's active experts).
 //!
-//! Inputs are built with the same generators the parity tests use (`tests/common/refs.rs`,
-//! included by path so core is untouched), in plain `Vec`s rather than the guard tests' fenced
-//! `Fence` buffers.
+//! Inputs are built with the same generators the parity tests use (`tests/common`, included by
+//! path so core is untouched), in plain `Vec`s rather than the guard tests' fenced `Fence` buffers.
 //!
 //! Each group sweeps the batch width (token rows) b in {1, 4, 16} at one realistic hidden width
 //! (rows = cols = 5120), the decode / small-draft regime. Threads is pinned to 1 so a run measures
@@ -24,9 +23,10 @@ use btb_native::{
     btb_gemv_mxfp4_ggml_rows, btb_gemv_mxfp4_group, btb_gemv_mxfp4_rows, btb_gemv_p12_rows,
 };
 
-#[path = "../tests/common/refs.rs"]
-mod refs;
-use refs::{
+#[path = "../tests/common/mod.rs"]
+mod common;
+use common::quant;
+use common::refs::{
     gen_f32, gen_fp8, gen_mxfp4, gen_w, gen_w_palette, pack_bf16, Fp8, Mxfp4, MX_BLOCK,
     MX_BLOCK_BYTES,
 };
@@ -314,6 +314,39 @@ fn bench_fp8_group(c: &mut Criterion) {
     g.finish();
 }
 
+/// Every GGUF quant matvec as stored, a group per format (`gemv_q4_k`, ...), at a decode step and a verify
+/// pass only: 17 formats at every width of [`BATCHES`] would triple the job's bench time.
+fn bench_quant(c: &mut Criterion) {
+    let isa = tier();
+    for f in quant::FORMATS {
+        let raw = quant::blocks(f, ROWS, COLS, 0x9ACED);
+        let t = quant::tables(f, 0x9ACED);
+        let mut g = c.benchmark_group(format!("gemv_{}", f.name.to_lowercase()));
+        for &b in &[1usize, 16] {
+            let x = gen_f32(b * COLS, 0x515);
+            let mut y = vec![0f32; b * ROWS];
+            g.throughput(Throughput::Elements((b * ROWS * COLS) as u64));
+            g.bench_with_input(BenchmarkId::new(&isa, b), &b, |bch, &b| {
+                bch.iter(|| unsafe {
+                    quant::call_raw(
+                        f,
+                        black_box(raw.as_ptr()),
+                        t.grid.as_ptr(),
+                        quant::ksigns_ptr(&t),
+                        ROWS,
+                        COLS,
+                        black_box(x.as_ptr()),
+                        b,
+                        y.as_mut_ptr(),
+                        1,
+                    )
+                });
+            });
+        }
+        g.finish();
+    }
+}
+
 criterion_group!(
     gemv,
     bench_bf16,
@@ -323,6 +356,7 @@ criterion_group!(
     bench_bf16_group,
     bench_mxfp4_group,
     bench_fp8,
-    bench_fp8_group
+    bench_fp8_group,
+    bench_quant
 );
 criterion_main!(gemv);

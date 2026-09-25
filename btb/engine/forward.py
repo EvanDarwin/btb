@@ -586,7 +586,8 @@ class _ForwardMixin(_State):
         if self.head is None and self.head_host is not None:
             return self.head_host(hf.float().cpu()).float()
         assert self.head is not None  # no head_host means the head is resident
-        if self.head.weight.dtype != cd:
+        # a packed head is bf16-only (never a widened compute), so it takes the generic call below
+        if isinstance(self.head, torch.nn.Linear) and self.head.weight.dtype != cd:
             # the resident head is bf16, the compute float32: the native gemv reads the head once and widens on the
             # fly (no float32 copy of a ~1 Gelem head per token) for the few rows a decode or verify pass carries. Its
             # accumulation order moves the logits ~20 ulp from the widen's; the tokens are identical. BTB_HEAD_GEMV=0

@@ -223,6 +223,8 @@ _KERNEL_RE = re.compile(r'(?:f)?"(btb_[^"]*)"')  # every btb_* string literal in
 _BRACE_RE = re.compile(r"\{[^{}]*\}")  # an f-string interpolation; folded to `*` to make a template
 _LEAD_RE = re.compile(r"^btb_\{(\w+)\}")  # the kind segment of a name, the one interpolation that is expanded
 _WILDCARD_RE = re.compile(r"^btb_\*")  # a template that names no kind: it would claim every kernel of its module
+_STEM_RE = re.compile(r'\b(\w+Kernel)\(\s*f?"([^"]*)"')  # a launcher built from a stem: RowKernel(f"{kind}_mv", ...)
+_STEM_TMPL_RE = re.compile(r'f"(btb_\{self\.stem\}[^"]*)"')  # the name a launcher class builds from its stem
 
 
 def _mlx_modules() -> list[tuple[str, str]]:
@@ -272,13 +274,32 @@ def expand(name: str, kinds: dict[str, set[str]]) -> list[str]:
     return [_BRACE_RE.sub("*", n) for n in names]
 
 
+def launch_templates(src: str) -> dict[str, str]:
+    """{launcher class -> the kernel-name f-string it builds from its stem}, read from launch.py: RowKernel's
+    `btb_{self.stem}_{rows}_{nb}_{tr}`, BlockKernel's `btb_{self.stem}`"""
+    out: dict[str, str] = {}
+    for chunk in re.split(r"^class ", src, flags=re.M)[1:]:
+        name = re.match(r"(\w+)", chunk)
+        tmpl = _STEM_TMPL_RE.search(chunk)
+        if name is not None and tmpl is not None:
+            out[name.group(1)] = tmpl.group(1)
+    return out
+
+
 def source_kernels() -> set[tuple[str, str]]:
-    """(module, template) for every btb_* Metal-kernel name a module compiles, each f-string expanded over its
-    kind table and folded elsewhere; the entry-point axis a family's `kernels` is checked against."""
+    """(module, template) for every btb_* Metal-kernel name a module compiles - a literal name, or a stem handed
+    to one of launch.py's launcher classes, filled into that class's template - each expanded over its kind
+    table and folded elsewhere; the entry-point axis a family's `kernels` is checked against."""
+    modules = _mlx_modules()
+    templates = launch_templates(dict(modules)["launch"])
     out: set[tuple[str, str]] = set()
-    for mod, src in _mlx_modules():
+    for mod, src in modules:
         kinds = dispatch_kinds(src)
-        for raw in _KERNEL_RE.findall(src):
+        raws = [r for r in _KERNEL_RE.findall(src) if "{self.stem}" not in r]  # launch.py's templates, filled below
+        for cls, stem in _STEM_RE.findall(src):
+            if cls in templates:
+                raws.append(templates[cls].replace("{self.stem}", stem))
+        for raw in raws:
             out |= {(mod, t) for t in expand(raw, kinds)}
     return out
 

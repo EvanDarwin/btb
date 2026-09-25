@@ -15,6 +15,7 @@ import torch
 
 from .. import mlx as mlxdev
 from ..native_files import kernels_path, native_path
+from ..quant import CARD_KERNELS
 from ..sysinfo import raise_file_limit
 
 
@@ -182,6 +183,23 @@ class Native:
         "gemv_mx4_ggml_group",
         "gemv_fp8",
         "gemv_fp8_group",
+        "gemv_q4k",
+        "gemv_q6k",
+        "gemv_q5k",
+        "gemv_q2k",
+        "gemv_q3k",
+        "gemv_iq4nl",
+        "gemv_iq4xs",
+        "gemv_q40",
+        "gemv_q41",
+        "gemv_q80",
+        "gemv_iq3xxs",
+        "gemv_iq2xxs",
+        "gemv_iq2xs",
+        "gemv_iq2s",
+        "gemv_iq1s",
+        "gemv_iq3s",
+        "gemv_iq1m",
         "attn_decode",
         "delta_step",
         "read_direct",
@@ -199,6 +217,23 @@ class Native:
     gemv_mx4_ggml_group: Any = None
     gemv_fp8: Any = None
     gemv_fp8_group: Any = None
+    gemv_q4k: Any = None
+    gemv_q6k: Any = None
+    gemv_q5k: Any = None
+    gemv_q2k: Any = None
+    gemv_q3k: Any = None
+    gemv_iq4nl: Any = None
+    gemv_iq4xs: Any = None
+    gemv_q40: Any = None
+    gemv_q41: Any = None
+    gemv_q80: Any = None
+    gemv_iq3xxs: Any = None
+    gemv_iq2xxs: Any = None
+    gemv_iq2xs: Any = None
+    gemv_iq2s: Any = None
+    gemv_iq1s: Any = None
+    gemv_iq3s: Any = None
+    gemv_iq1m: Any = None
     attn_decode: Any = None
     delta_step: Any = None
     sample_pick: Any = None
@@ -425,6 +460,73 @@ class Native:
                     raise NativeError("btb_gemv_mxfp4_ggml_group", rc)
 
             cls.gemv_mx4_ggml, cls.gemv_mx4_ggml_group = gemv_mx4_ggml, gemv_mx4_ggml_group
+        # the k-quant matvecs over a GGUF tensor's own bytes (`raw`, [rows, cols] as 256-weight superblocks):
+        # each binds when the library carries it, so an older library keeps the dequantize-to-bf16 path
+        P = ctypes.c_void_p
+        S = ctypes.c_size_t
+        for kind, sym in (
+            ("gemv_q4k", "btb_gemv_q4k_rows"),
+            ("gemv_q6k", "btb_gemv_q6k_rows"),
+            ("gemv_q5k", "btb_gemv_q5k_rows"),
+            ("gemv_q2k", "btb_gemv_q2k_rows"),
+            ("gemv_q3k", "btb_gemv_q3k_rows"),
+            ("gemv_iq4nl", "btb_gemv_iq4nl_rows"),
+            ("gemv_iq4xs", "btb_gemv_iq4xs_rows"),
+            ("gemv_q40", "btb_gemv_q40_rows"),
+            ("gemv_q41", "btb_gemv_q41_rows"),
+            ("gemv_q80", "btb_gemv_q80_rows"),
+        ):
+            setattr(cls, kind, None)
+            if not hasattr(lib, sym):
+                continue
+            fn = getattr(lib, sym)
+            fn.restype = ctypes.c_int32
+            fn.argtypes = [P, S, S, P, S, P, S]
+
+            def gemv_kq(
+                raw: torch.Tensor, rows: int, cols: int, x: torch.Tensor, y: torch.Tensor, fn: Any = fn, sym: str = sym
+            ) -> None:
+                rc = fn(raw.data_ptr(), rows, cols, x.data_ptr(), x.shape[0], y.data_ptr(), threads)
+                if rc != 0:
+                    raise NativeError(sym, rc)
+
+            setattr(cls, kind, gemv_kq)
+        # the IQ lattice matvecs take the type's int8 grid and (where used) the shared sign table as buffers
+        for kind, sym in (
+            ("gemv_iq3xxs", "btb_gemv_iq3xxs_rows"),
+            ("gemv_iq2xxs", "btb_gemv_iq2xxs_rows"),
+            ("gemv_iq2xs", "btb_gemv_iq2xs_rows"),
+            ("gemv_iq2s", "btb_gemv_iq2s_rows"),
+            ("gemv_iq1s", "btb_gemv_iq1s_rows"),
+            ("gemv_iq3s", "btb_gemv_iq3s_rows"),
+            ("gemv_iq1m", "btb_gemv_iq1m_rows"),
+        ):
+            setattr(cls, kind, None)
+            if not hasattr(lib, sym):
+                continue
+            fn = getattr(lib, sym)
+            fn.restype = ctypes.c_int32
+            fn.argtypes = [P, P, P, S, S, P, S, P, S]
+
+            def gemv_latt(
+                raw: torch.Tensor,
+                grid: torch.Tensor,
+                ksigns: torch.Tensor | None,
+                rows: int,
+                cols: int,
+                x: torch.Tensor,
+                y: torch.Tensor,
+                fn: Any = fn,
+                sym: str = sym,
+            ) -> None:
+                ks = ksigns.data_ptr() if ksigns is not None else 0
+                rc = fn(
+                    raw.data_ptr(), grid.data_ptr(), ks, rows, cols, x.data_ptr(), x.shape[0], y.data_ptr(), threads
+                )
+                if rc != 0:
+                    raise NativeError(sym, rc)
+
+            setattr(cls, kind, gemv_latt)
         cls.gemv_fp8 = cls.gemv_fp8_group = None
         if hasattr(lib, "btb_gemv_fp8_rows") and hasattr(lib, "btb_gemv_fp8_group"):
             # an FP8 matrix as stored (btb/fp8.py's F8Weight): its e4m3 bytes and its f32 scale grid
@@ -716,7 +818,8 @@ class _Cuda:
     of the cache the weights' streaming loads never evict) and `persist_limit()` the card's ceiling for it."""
 
     _NAMES = {"windows": "nvcuda.dll", "linux": "libcuda.so.1"}
-    KERNELS = (
+    # every fatbin carries these; the packed gemvs (quant.CARD_KERNELS) are bound when the fatbin has them
+    _REQUIRED = (
         "btb_gemv_bf16_m1",
         "btb_gemv_bf16_m2",
         "btb_gemv_bf16_m4",
@@ -755,6 +858,10 @@ class _Cuda:
         "btb_sample_keys",
         "btb_sample_verify",
     )
+    # a fatbin built before a packed type was added lacks its entries: bound when present, skipped when not, and
+    # the feature that needs one reads `name in fn` (`card_quant_avail`) - so an older fatbin keeps the card graph
+    OPTIONAL = CARD_KERNELS
+    KERNELS = _REQUIRED + tuple(sorted(CARD_KERNELS))
     # cuda.h
     _LIMIT_PERSISTING_L2 = 0x06
     _ATTR_L2_SIZE = 38
@@ -791,7 +898,12 @@ class _Cuda:
         self.fn: dict[str, ctypes.c_void_p] = {}
         for k in self.KERNELS:
             f = ctypes.c_void_p()
-            self._call("cuModuleGetFunction", ctypes.byref(f), self.module, ctypes.c_char_p(k.encode()))
+            try:
+                self._call("cuModuleGetFunction", ctypes.byref(f), self.module, ctypes.c_char_p(k.encode()))
+            except RuntimeError:
+                if k not in self.OPTIONAL:
+                    raise
+                continue
             self.fn[k] = f
         dev = ctypes.c_int()
         self._call("cuCtxGetDevice", ctypes.byref(dev))

@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from ..mlx.mega import MegaPass
     from ..sampling import Sampling
     from ..session import Session
+    from .cuda import _CardQuantLinear
     from .device import Device
     from .drafter import MTPDrafter
     from .experts import ExpertProfile, _ExpertStore
@@ -59,6 +60,7 @@ if TYPE_CHECKING:
     from .memory import RamPolicyState, VramPolicyState
     from .mlx_forward import MlxState
     from .model import StreamedTextModel
+    from .native import _Cuda
     from .scheduler import BatchScheduler, Plan
     from .tiers import ColdRing
 
@@ -101,7 +103,7 @@ class _State:
     drafter_dev: torch.device | None
     embed_table: torch.Tensor | None
     embed_scale: float | None
-    head: torch.nn.Linear | None
+    head: torch.nn.Linear | _CardQuantLinear | None  # packed on the card: a GGUF tensor's bytes, no bf16 weight
     head_host: _HostLinear | None
     host: dict[int, Any]
     mixer: torch.nn.Module | None
@@ -234,6 +236,9 @@ class _State:
     def _bind_host_packed_layer(self, layer: Any) -> Any:
         raise NotImplementedError
 
+    def _bind_host_quant_layer(self, i: int, layer: Any) -> None:
+        raise NotImplementedError
+
     @staticmethod
     def _cache_to(cache: Any, i: int, dev: str | torch.device) -> None:
         raise NotImplementedError
@@ -286,6 +291,9 @@ class _State:
     def _load_layer(self, i: int, tmpl: Any, first: bool = False) -> None:
         raise NotImplementedError
 
+    def _make_head(self) -> torch.nn.Linear | _CardQuantLinear:
+        raise NotImplementedError
+
     def _new_layer(self, idx: int) -> Any:
         raise NotImplementedError
 
@@ -318,6 +326,15 @@ class _State:
         raise NotImplementedError
 
     # -- cuda.py --
+    def _card_kernels(self) -> _Cuda | None:
+        raise NotImplementedError
+
+    def _bind_card_resident(self, tmpl: torch.nn.Module, i: int, base: str, keys: Sequence[str]) -> None:
+        raise NotImplementedError
+
+    def _card_stored(self, key: str, bias: torch.Tensor | None = None) -> _CardQuantLinear:
+        raise NotImplementedError
+
     def _card_generate_greedy(
         self,
         ids: torch.Tensor,

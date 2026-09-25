@@ -8,8 +8,9 @@ import ctypes
 import os
 import sys
 import time
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
 
 import torch
 import torch.nn.functional as F
@@ -17,12 +18,13 @@ import torch.nn.functional as F
 from .. import mlx as mlxdev
 from ..kinds import LayerKind, NodePath, Parents, PassTag, Tokens
 from ..options import Device
+from ..quant import CARD_WIDTHS, QuantType, card_width, quant_of
 from ..sampling import GREEDY
 from .cache import GrowLayer
 from .families import act_name
 from .forward import layer_window, node_mask, pe_for
 from .fused import _fused_rope
-from .native import Native, kernels_path
+from .native import Native, _Cuda, kernels_path
 from .state import _State
 
 if TYPE_CHECKING:
@@ -53,6 +55,101 @@ def _card_warning(reason: str) -> None:
         f"{amd}{rule}\n\n"
     )
     sys.stderr.flush()
+
+
+def card_quant_avail(k: _Cuda, q: QuantType) -> bool:
+    """whether the loaded fatbin carries `q`'s gemv (its widths ship together, so one entry answers); an older
+    fatbin lacks them and the tensor reads dequantized instead"""
+    return q.card is not None and q.card_kernel(CARD_WIDTHS[0]) in k.fn
+
+
+def card_quant_matvec(
+    k: _Cuda, raw: torch.Tensor, q: QuantType, x: torch.Tensor, y: torch.Tensor, R: int, C: int
+) -> None:
+    """y[M, R] = x[M, C] . W^T over the packed bytes `raw` of an [R, C] weight of type `q`: M rows in chunks of
+    the fatbin's widest kernel, each chunk padded to the kernel's row count and one launch. The same kernel
+    family at every width, so a row's bits are those of the one-row step."""
+    M = int(x.shape[0])
+    P, ci = k.ptr, ctypes.c_int
+    widest = CARD_WIDTHS[-1]
+    for s in range(0, M, widest):
+        T = min(widest, M - s)
+        Mp = card_width(T)
+        xs, ys = x[s : s + T], y[s : s + T]
+        if Mp != T:
+            xp = torch.zeros(Mp, C, dtype=torch.bfloat16, device=x.device)
+            xp[:T].copy_(xs)
+            yp = torch.empty(Mp, R, dtype=torch.bfloat16, device=x.device)
+        else:
+            xp, yp = xs, ys
+        k.launch(q.card_kernel(Mp), ((R + 3) // 4, 1, 1), (128, 1, 1), [P(raw), P(xp), P(yp), ci(R), ci(C)])
+        if Mp != T:
+            ys.copy_(yp[:T])
+
+
+class _CardQuantLinear(torch.nn.Module):
+    """A GGUF-quantized linear resident on the card as its stored bytes - `raw` uint8 on the device, `q` its
+    storage type, `rows` x `cols` its shape - in place of a torch Linear whose bf16 weight would hold and read
+    2-4x the bytes. `forward` runs the type's gemv kernel, so the prefill and the generic path multiply the
+    packed weight with no bf16 copy; the card graph reads `raw` straight (`_card_weights`)."""
+
+    raw: torch.Tensor
+
+    def __init__(
+        self, raw: torch.Tensor, q: QuantType, rows: int, cols: int, key: str, bias: torch.Tensor | None = None
+    ) -> None:
+        super().__init__()
+        self.register_buffer("raw", raw)
+        self.q, self.rows, self.cols, self.key = q, int(rows), int(cols), key
+        self.bias = None if bias is None else torch.nn.Parameter(bias, requires_grad=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        k = Native.cuda if Native.cuda is not None else Native.card_kernels()
+        if k is None:
+            raise RuntimeError(
+                f"[card] {self.key}: a packed {self.q.name} weight needs the card's kernels ({Native.cuda_reason})"
+            )
+        shp = x.shape
+        x2 = x.reshape(-1, self.cols).to(torch.bfloat16).contiguous()
+        y = torch.empty(x2.shape[0], self.rows, dtype=torch.bfloat16, device=x2.device)
+        card_quant_matvec(k, self.raw, self.q, x2, y, self.rows, self.cols)
+        out = y.view(*shp[:-1], self.rows)
+        return out if self.bias is None else out + self.bias.to(out.dtype)
+
+
+# a resident linear on the card: a bf16 Linear, or a GGUF tensor as stored
+CardLinear = torch.nn.Linear | _CardQuantLinear
+
+
+@dataclass(frozen=True)
+class RowBlock:
+    """one row block of a merged card weight: `w` bf16 [rows, C] where `q` is None, else `q`'s bytes as stored"""
+
+    w: torch.Tensor
+    rows: int
+    q: QuantType | None = None
+
+
+# a card weight as the graph's matvec takes it: its row blocks in order (one for a bf16 or same-type merge)
+RowBlocks = tuple[RowBlock, ...]
+
+
+class CardLayerWeights(TypedDict):
+    """a resident layer's weights as the graph's kernels take them: the merged projections, the norms, the scale"""
+
+    qkv: RowBlocks
+    gu: RowBlocks
+    o: RowBlocks
+    down: RowBlocks
+    ln1: torch.Tensor
+    ln2: torch.Tensor
+    wq: torch.Tensor
+    wk: torch.Tensor
+    scale: float
+    eps: float
+    win: int
+    pre_ff: NotRequired[torch.Tensor]  # the sandwich block's feed-forward norms (Gemma), set only when sandwich
+    post_ff: NotRequired[torch.Tensor]
 
 
 class _CudaMixin(_State):
@@ -261,7 +358,7 @@ class _CudaMixin(_State):
     CARD_T_MAX = 32
     ATTN_SPLIT = 1024  # keys per attention block along the sequence (ATTN_SPLIT in btb_kernels.cu)
 
-    def _card_kernels(self) -> Any:
+    def _card_kernels(self) -> _Cuda | None:
         """the card's kernels, else None once `_card_warning` has said why the card runs through torch alone"""
         k = Native.cuda
         if k is None:
@@ -373,33 +470,105 @@ class _CudaMixin(_State):
         I = int(getattr(c, "intermediate_size", None) or getattr(c, "moe_intermediate_size", None) or 4 * H)
         return H, Hq, Hk, D, I
 
-    def _card_weights(self, st: dict[str, Any], i: int) -> dict[str, Any]:
-        """layer i's weights as the kernels take them: q/k/v and gate/up merged into one row block each (the
-        modules keep views of the same memory, so the generic path is unchanged), the norms, the scale"""
-        L = st["layers"].get(i)
-        if L is not None:
-            return L
+    @staticmethod
+    def _card_rows(m: CardLinear) -> int:
+        """a resident linear's output rows, packed or bf16"""
+        return int(m.rows) if isinstance(m, _CardQuantLinear) else int(m.weight.shape[0])
+
+    @staticmethod
+    def _card_on(m: CardLinear) -> bool:
+        """whether a resident linear's weight lives on the card"""
+        t = m.raw if isinstance(m, _CardQuantLinear) else m.weight
+        return bool(t.device.type == "cuda")
+
+    def _card_has_packed(self) -> bool:
+        """whether any resident weight (or the head) is on the card as stored"""
+        if isinstance(self.head, _CardQuantLinear):
+            return True
+        return any(isinstance(m, _CardQuantLinear) for layer in self.resident.values() for m in layer.modules())
+
+    def _card_stored(self, key: str, bias: torch.Tensor | None = None) -> _CardQuantLinear:
+        """the GGUF tensor the weight `key` names as a linear over its stored bytes on the card (a tensor
+        `_gguf_binds_packed` passed)"""
+        assert self.gguf is not None
+        name = self._gguf_names[key]
+        t = self.gguf.tensors[name]
+        q = quant_of(t.tensor_type.name)
+        assert q is not None  # _gguf_binds_packed passed it
+        rows, cols = (int(v) for v in reversed(list(t.shape)))
+        return _CardQuantLinear(self.gguf.raw(name).to(self.dev), q, rows, cols, key, bias)
+
+    def _bind_card_resident(self, tmpl: torch.nn.Module, i: int, base: str, keys: Sequence[str]) -> None:
+        """the packable tensors of resident layer `i` bound as stored: each named linear replaced by a
+        `_CardQuantLinear` over the file's bytes on the card (the one-element stand-in `_load_layer` adopted goes
+        with the module it replaces)"""
+        for key in keys:
+            *path, cname = key[len(base) : -len(".weight")].split(".")
+            parent = tmpl
+            for p in path:
+                parent = getattr(parent, p)
+            bias = getattr(getattr(parent, cname), "bias", None)
+            setattr(parent, cname, self._card_stored(key, None if bias is None else bias.data))
+        self.log(f"[card] layer {i}: {len(keys)} linears bound as stored")
+
+    def _card_merge(self, what: str, mods: Sequence[CardLinear]) -> RowBlocks:
+        """the weight of `mods` (one or more projections, merged along the rows) as the graph's matvec takes it.
+        bf16 modules become one contiguous block re-pointed under them as views (the generic path unchanged):
+        one row block. Packed modules (`_CardQuantLinear`) of one type become one row block of their bytes end
+        to end, each module re-pointed at its slice, so one launch covers the merged projection; a mix of types,
+        or of packed and bf16, stays one row block a module."""
+        stored = [m for m in mods if isinstance(m, _CardQuantLinear)]
+        plain = [m for m in mods if isinstance(m, torch.nn.Linear)]
+        if len(stored) + len(plain) != len(mods):
+            raise TypeError(f"[card] {what}: a projection is neither a Linear nor packed: {[type(m) for m in mods]}")
+        if not stored:
+            W = torch.cat([m.weight for m in plain], 0).contiguous() if len(plain) > 1 else plain[0].weight
+            if W.dtype != torch.bfloat16 or W.device.type != "cuda":
+                raise RuntimeError(
+                    f"[card] {what}: the card graph takes bf16 weights on the card, got {W.dtype} {W.device}"
+                )
+            if len(plain) > 1:
+                off = 0
+                for lin in plain:
+                    n = int(lin.weight.shape[0])
+                    self._set_param(lin, "weight", W[off : off + n])
+                    off += n
+            return (RowBlock(W, int(W.shape[0])),)
+        if not plain and len({m.q for m in stored}) == 1:
+            W = torch.cat([m.raw for m in stored]) if len(stored) > 1 else stored[0].raw
+            if len(stored) > 1:
+                off = 0
+                for sq in stored:
+                    n = int(sq.raw.numel())
+                    sq.raw = W[off : off + n]
+                    off += n
+            return (RowBlock(W, sum(m.rows for m in stored), stored[0].q),)
+        out: list[RowBlock] = []
+        for m in mods:
+            if isinstance(m, _CardQuantLinear):
+                out.append(RowBlock(m.raw, m.rows, m.q))
+                continue
+            if m.weight.dtype != torch.bfloat16 or m.weight.device.type != "cuda":
+                raise RuntimeError(
+                    f"[card] {what}: the card graph takes bf16 weights on the card, got {m.weight.dtype} {m.weight.device}"
+                )
+            out.append(RowBlock(m.weight, int(m.weight.shape[0])))
+        return tuple(out)
+
+    def _card_weights(self, st: dict[str, Any], i: int) -> CardLayerWeights:
+        """layer i's weights as the kernels take them: q/k/v and gate/up merged into one row block each
+        (`_card_merge`: bf16 views under the modules, or packed bytes end to end), the norms, the scale"""
+        layers: dict[int, CardLayerWeights] = st["layers"]
+        cached = layers.get(i)
+        if cached is not None:
+            return cached
         tmpl = self.resident[i]
         at, mlp = tmpl.self_attn, tmpl.mlp
-        H, Hq, Hk, D, I = self._card_dims()
-        nq, nk = Hq * D, Hk * D
-        W = torch.cat([at.q_proj.weight, at.k_proj.weight, at.v_proj.weight], 0).contiguous()
-        self._set_param(at.q_proj, "weight", W[:nq])
-        self._set_param(at.k_proj, "weight", W[nq : nq + nk])
-        self._set_param(at.v_proj, "weight", W[nq + nk :])
-        G = torch.cat([mlp.gate_proj.weight, mlp.up_proj.weight], 0).contiguous()
-        self._set_param(mlp.gate_proj, "weight", G[:I])
-        self._set_param(mlp.up_proj, "weight", G[I:])
-        for t in (W, G, at.o_proj.weight, mlp.down_proj.weight):
-            if t.dtype != torch.bfloat16 or t.device.type != "cuda":
-                raise RuntimeError(
-                    f"[card] layer {i}: the card graph takes bf16 weights on the card, got {t.dtype} {t.device}"
-                )
-        L = {
-            "qkv": W,
-            "gu": G,
-            "o": at.o_proj.weight,
-            "down": mlp.down_proj.weight,
+        L: CardLayerWeights = {
+            "qkv": self._card_merge(f"layer {i}", (at.q_proj, at.k_proj, at.v_proj)),
+            "gu": self._card_merge(f"layer {i}", (mlp.gate_proj, mlp.up_proj)),
+            "o": self._card_merge(f"layer {i}", (at.o_proj,)),
+            "down": self._card_merge(f"layer {i}", (mlp.down_proj,)),
             "ln1": tmpl.input_layernorm.weight,
             "ln2": tmpl.post_attention_layernorm.weight,
             "wq": at.q_norm.weight,
@@ -538,10 +707,7 @@ class _CudaMixin(_State):
 
     @staticmethod
     def _card_m(T: int) -> int:
-        for m in (1, 2, 4, 8, 16, 32):
-            if T <= m:
-                return m
-        raise ValueError(T)
+        return card_width(T)
 
     def _card_mma_avail(self) -> bool:
         k = Native.cuda
@@ -598,12 +764,16 @@ class _CudaMixin(_State):
         V = 0
         if tail:
             assert self.head is not None  # the tail runs the head, so it is on the card
-            V = int(self.head.weight.shape[0])
+            V = self._card_rows(self.head)
+        packed = self._card_has_packed()
         S = (int(st["arena"]["cap"]) + self.ATTN_SPLIT - 1) // self.ATTN_SPLIT
         g = {
             "key": key,
             "mma": mma,
-            "m": torch.zeros(M, I, dtype=bf, device=dev) if mma else None,
+            "m": torch.zeros(M, I, dtype=bf, device=dev) if (mma or packed) else None,
+            # a merged projection of pieces of different types lands piece by piece through here (a kernel
+            # writes rows of its own width), then into its slice of the merged buffer
+            "tmp": torch.zeros(M * max((Hq + 2 * Hk) * D, 2 * I), dtype=bf, device=dev) if packed else None,
             "h": torch.zeros(M, H, dtype=bf, device=dev),
             "x": torch.zeros(M, H, dtype=bf, device=dev),
             "y": torch.zeros(M, H, dtype=bf, device=dev),
@@ -655,16 +825,32 @@ class _CudaMixin(_State):
             raise RuntimeError(f"[card] no kernel for head_dim {D}")
         S = int(g["S"])
 
-        def matvec(W: torch.Tensor, xin: torch.Tensor, yout: torch.Tensor, R: int, C: int) -> None:
-            if mma:
-                k.launch(
-                    "btb_gemv_mma_bf16",
-                    (self._card_mma_grid(R, C), 1, 1),
-                    (self.MMA_BLOCK, 1, 1),
-                    [P(W), P(xin), P(yout), ci(R), ci(C), ci(T)],
-                )
-            else:
-                k.launch(gemv, ((R + 3) // 4, 1, 1), (128, 1, 1), [P(W), P(xin), P(yout), ci(R), ci(C)])
+        Mq = self._card_m(T)  # the packed kernels' row count: the fp32 chain's, whatever GEMV the bf16 weights run
+
+        def matvec(spec: RowBlocks, xin: torch.Tensor, yout: torch.Tensor, C: int) -> None:
+            R = sum(p.rows for p in spec)
+            if len(spec) == 1 and spec[0].q is None:
+                W = spec[0].w
+                if mma:
+                    k.launch(
+                        "btb_gemv_mma_bf16",
+                        (self._card_mma_grid(R, C), 1, 1),
+                        (self.MMA_BLOCK, 1, 1),
+                        [P(W), P(xin), P(yout), ci(R), ci(C), ci(T)],
+                    )
+                else:
+                    k.launch(gemv, ((R + 3) // 4, 1, 1), (128, 1, 1), [P(W), P(xin), P(yout), ci(R), ci(C)])
+                return
+            # packed pieces (a bf16 piece beside them on the fp32 chain) at Mq rows: one piece writes the buffer
+            # straight; several each write their own width into `tmp`, then their slice of the merged buffer
+            off = 0
+            for p in spec:
+                dst = yout if len(spec) == 1 else g["tmp"].view(-1)[: Mq * p.rows].view(Mq, p.rows)
+                name = f"btb_gemv_bf16_m{Mq}" if p.q is None else p.q.card_kernel(Mq)
+                k.launch(name, ((p.rows + 3) // 4, 1, 1), (128, 1, 1), [P(p.w), P(xin), P(dst), ci(p.rows), ci(C)])
+                if len(spec) > 1:
+                    yout[:Mq, off : off + p.rows].copy_(dst)
+                off += p.rows
 
         y_prev = None
         for n, L in enumerate(Ls):
@@ -678,7 +864,7 @@ class _CudaMixin(_State):
                 (256, 1, 1),
                 [P(g["h"]), P(y_prev), P(L["ln1"]), cf(L["eps"]), P(g["x"]), ci(H), cen],
             )
-            matvec(L["qkv"], g["x"], g["qkv"], (Hq + 2 * Hk) * D, H)
+            matvec(L["qkv"], g["x"], g["qkv"], H)
             k.launch(
                 nrk,
                 (Hq + 2 * Hk, T, 1),
@@ -726,7 +912,7 @@ class _CudaMixin(_State):
                     ci(L["win"]),
                 ],
             )
-            matvec(L["o"], g["att"], g["y"], H, Hq * D)
+            matvec(L["o"], g["att"], g["y"], Hq * D)
             if sandwich:
                 # the attention output normed, then added; the MLP reads its own input norm of the sum
                 k.launch(
@@ -748,20 +934,23 @@ class _CudaMixin(_State):
                     (256, 1, 1),
                     [P(g["h"]), P(g["y"]), P(L["ln2"]), cf(L["eps"]), P(g["x"]), ci(H), cen],
                 )
-            matvec(L["gu"], g["x"], g["gu"], 2 * I, H)
-            if mma:
-                # the tensor-core kernel has no activation fold: the two kernels, the same bits
+            matvec(L["gu"], g["x"], g["gu"], H)
+            if mma or L["down"][0].q is not None:
+                # neither the tensor-core kernel nor the packed ones has a silu fold: the two kernels, the same bits
                 k.launch(
                     f"btb_{act}_mul",
                     (min(4096, (M * I + 255) // 256), 1, 1),
                     (256, 1, 1),
                     [P(g["gu"]), P(g["m"]), ci(M), ci(I)],
                 )
-                matvec(L["down"], g["m"], g["y"], H, I)
+                matvec(L["down"], g["m"], g["y"], I)
             else:
                 # act(gate) * up folded into the down projection's x load: the same bits as the two kernels
                 k.launch(
-                    gemv_act, ((H + 3) // 4, 1, 1), (128, 1, 1), [P(L["down"]), P(g["gu"]), P(g["y"]), ci(H), ci(I)]
+                    gemv_act,
+                    ((H + 3) // 4, 1, 1),
+                    (128, 1, 1),
+                    [P(L["down"][0].w), P(g["gu"]), P(g["y"]), ci(H), ci(I)],
                 )
             if sandwich:
                 # the MLP output normed, then added: the residual is whole, nothing carries into the next norm
@@ -776,17 +965,17 @@ class _CudaMixin(_State):
         assert sandwich or y_prev is not None  # the segment holds at least one layer, so the loop set the residual
         if tail:
             assert self.head is not None  # the tail runs the final head
-            norm_w, head_w = self.norm.weight, self.head.weight
-            if norm_w.device.type != "cuda" or head_w.device.type != "cuda" or head_w.dtype != torch.bfloat16:
-                raise RuntimeError("[card] the tail needs the final norm and the head on the card in bf16")
-            V = int(head_w.shape[0])
+            norm_w = self.norm.weight
+            if norm_w.device.type != "cuda" or not self._card_on(self.head):
+                raise RuntimeError("[card] the tail needs the final norm and the head on the card")
+            head_spec = self._card_merge("head", (self.head,))
             k.launch(
                 "btb_add_rmsnorm",
                 (T, 1, 1),
                 (256, 1, 1),
                 [P(g["h"]), P(y_prev), P(norm_w), cf(float(self.cfg.rms_norm_eps)), P(g["x"]), ci(H), cen],
             )
-            matvec(head_w, g["x"], g["logits"], V, H)
+            matvec(head_spec, g["x"], g["logits"], H)
         elif y_prev is not None:
             g["h"][:T].add_(y_prev[:T])
 
@@ -830,6 +1019,7 @@ class _CudaMixin(_State):
         if (
             head is not None
             and self.head_key == self.prefix + "embed_tokens.weight"
+            and not isinstance(head, _CardQuantLinear)  # packed: no bf16 table there, the embed_table copy below
             and head.weight.device.type == "cuda"
         ):
             st["table"] = head.weight
@@ -865,7 +1055,7 @@ class _CudaMixin(_State):
             st["segments"] == [(0, self.L)]
             and self.head is not None
             and self.norm is not None
-            and self.head.weight.device.type == "cuda"
+            and self._card_on(self.head)
             and self._card_table(st) is not None
         )
 
