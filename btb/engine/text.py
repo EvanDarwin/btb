@@ -431,8 +431,9 @@ class _TextMixin(_State):
     @contextlib.contextmanager
     def reserve(self, tag: str, nbytes: int, device: Any = None) -> Iterator[None]:
         """
-        Memory of your own spoken for while the block runs, so the policy does not shed layers to make room
-        the caller is about to take
+        Memory of your own spoken for while the block runs: the memory policies count it as taken, so a shed
+        layer is not grown back into it, and the host tier sheds to the drive sooner to leave it free. It
+        frees nothing by itself and `grant` does not see it; the room it names must already be free.
         """
         self.device.reserve(tag, int(nbytes), device)
         try:
