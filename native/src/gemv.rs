@@ -2758,6 +2758,161 @@ def_task_f8!(
     "avx512f,avx512bw,avx2,fma"
 );
 
+// x86 has no quant widen of its own yet: each tier decodes a tile with the scalar widen (whose one fused
+// multiply-add a weight rounds as the NEON widen does) into its own accumulation, the lattice types' NEON
+// arrangement, so the bits are every other tier's.
+macro_rules! def_task_kq_x86 {
+    ($w:ty, $widen:ident, $g2:ident, $t2:ident, $g5:ident, $t5:ident) => {
+        #[cfg(target_arch = "x86_64")]
+        def_task_kq!($g2, $t2, $w, $widen, accum_avx2, "avx2,fma");
+        #[cfg(target_arch = "x86_64")]
+        def_task_kq!(
+            $g5,
+            $t5,
+            $w,
+            $widen,
+            accum_avx512,
+            "avx512f,avx512bw,avx2,fma"
+        );
+    };
+}
+def_task_kq_x86!(
+    Q4k,
+    widen_q4k_scalar,
+    group_q4k_avx2,
+    task_q4k_avx2,
+    group_q4k_avx512,
+    task_q4k_avx512
+);
+def_task_kq_x86!(
+    Q6k,
+    widen_q6k_scalar,
+    group_q6k_avx2,
+    task_q6k_avx2,
+    group_q6k_avx512,
+    task_q6k_avx512
+);
+def_task_kq_x86!(
+    Q5k,
+    widen_q5k_scalar,
+    group_q5k_avx2,
+    task_q5k_avx2,
+    group_q5k_avx512,
+    task_q5k_avx512
+);
+def_task_kq_x86!(
+    Q2k,
+    widen_q2k_scalar,
+    group_q2k_avx2,
+    task_q2k_avx2,
+    group_q2k_avx512,
+    task_q2k_avx512
+);
+def_task_kq_x86!(
+    Q3k,
+    widen_q3k_scalar,
+    group_q3k_avx2,
+    task_q3k_avx2,
+    group_q3k_avx512,
+    task_q3k_avx512
+);
+def_task_kq_x86!(
+    Iq4nl,
+    widen_iq4nl_scalar,
+    group_iq4nl_avx2,
+    task_iq4nl_avx2,
+    group_iq4nl_avx512,
+    task_iq4nl_avx512
+);
+def_task_kq_x86!(
+    Iq4xs,
+    widen_iq4xs_scalar,
+    group_iq4xs_avx2,
+    task_iq4xs_avx2,
+    group_iq4xs_avx512,
+    task_iq4xs_avx512
+);
+def_task_kq_x86!(
+    Q40,
+    widen_q40_scalar,
+    group_q40_avx2,
+    task_q40_avx2,
+    group_q40_avx512,
+    task_q40_avx512
+);
+def_task_kq_x86!(
+    Q41,
+    widen_q41_scalar,
+    group_q41_avx2,
+    task_q41_avx2,
+    group_q41_avx512,
+    task_q41_avx512
+);
+def_task_kq_x86!(
+    Q80,
+    widen_q80_scalar,
+    group_q80_avx2,
+    task_q80_avx2,
+    group_q80_avx512,
+    task_q80_avx512
+);
+def_task_kq_x86!(
+    Iq3xxs,
+    widen_iq3xxs,
+    group_iq3xxs_avx2,
+    task_iq3xxs_avx2,
+    group_iq3xxs_avx512,
+    task_iq3xxs_avx512
+);
+def_task_kq_x86!(
+    Iq2xxs,
+    widen_iq2xxs,
+    group_iq2xxs_avx2,
+    task_iq2xxs_avx2,
+    group_iq2xxs_avx512,
+    task_iq2xxs_avx512
+);
+def_task_kq_x86!(
+    Iq2xs,
+    widen_iq2xs,
+    group_iq2xs_avx2,
+    task_iq2xs_avx2,
+    group_iq2xs_avx512,
+    task_iq2xs_avx512
+);
+def_task_kq_x86!(
+    Iq2s,
+    widen_iq2s,
+    group_iq2s_avx2,
+    task_iq2s_avx2,
+    group_iq2s_avx512,
+    task_iq2s_avx512
+);
+def_task_kq_x86!(
+    Iq1s,
+    widen_iq1s,
+    group_iq1s_avx2,
+    task_iq1s_avx2,
+    group_iq1s_avx512,
+    task_iq1s_avx512
+);
+def_task_kq_x86!(
+    Iq3s,
+    widen_iq3s,
+    group_iq3s_avx2,
+    task_iq3s_avx2,
+    group_iq3s_avx512,
+    task_iq3s_avx512
+);
+def_task_kq_x86!(
+    Iq1m,
+    widen_iq1m,
+    group_iq1m_avx2,
+    task_iq1m_avx2,
+    group_iq1m_avx512,
+    task_iq1m_avx512
+);
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Isa {
     Avx512,
@@ -2959,12 +3114,11 @@ impl Weights for Q4k {
         r0: usize,
         r1: usize,
     ) {
-        // no AVX k-quant widen yet: x86 runs the scalar decode into the shared accumulation
         by_isa!(
             isa,
             task_q4k_scalar,
-            task_q4k_scalar,
-            task_q4k_scalar,
+            task_q4k_avx2,
+            task_q4k_avx512,
             task_q4k_neon,
             (self, cols, x, b, y, rows_total, r0, r1)
         )
@@ -2987,8 +3141,8 @@ impl Weights for Q6k {
         by_isa!(
             isa,
             task_q6k_scalar,
-            task_q6k_scalar,
-            task_q6k_scalar,
+            task_q6k_avx2,
+            task_q6k_avx512,
             task_q6k_neon,
             (self, cols, x, b, y, rows_total, r0, r1)
         )
@@ -2996,7 +3150,7 @@ impl Weights for Q6k {
 }
 
 macro_rules! impl_weights_kq {
-    ($w:ty, $scalar:ident, $neon:ident) => {
+    ($w:ty, $scalar:ident, $avx2:ident, $avx512:ident, $neon:ident) => {
         impl Weights for $w {
             #[inline]
             unsafe fn rows(
@@ -3010,12 +3164,11 @@ macro_rules! impl_weights_kq {
                 r0: usize,
                 r1: usize,
             ) {
-                // no AVX k-quant widen yet: x86 runs the scalar decode into the shared accumulation
                 by_isa!(
                     isa,
                     $scalar,
-                    $scalar,
-                    $scalar,
+                    $avx2,
+                    $avx512,
                     $neon,
                     (self, cols, x, b, y, rows_total, r0, r1)
                 )
@@ -3024,21 +3177,111 @@ macro_rules! impl_weights_kq {
     };
 }
 
-impl_weights_kq!(Q5k, task_q5k_scalar, task_q5k_neon);
-impl_weights_kq!(Q2k, task_q2k_scalar, task_q2k_neon);
-impl_weights_kq!(Q3k, task_q3k_scalar, task_q3k_neon);
-impl_weights_kq!(Iq4nl, task_iq4nl_scalar, task_iq4nl_neon);
-impl_weights_kq!(Iq4xs, task_iq4xs_scalar, task_iq4xs_neon);
-impl_weights_kq!(Q40, task_q40_scalar, task_q40_neon);
-impl_weights_kq!(Q41, task_q41_scalar, task_q41_neon);
-impl_weights_kq!(Q80, task_q80_scalar, task_q80_neon);
-impl_weights_kq!(Iq3xxs, task_iq3xxs_s, task_iq3xxs_n);
-impl_weights_kq!(Iq2xxs, task_iq2xxs_s, task_iq2xxs_n);
-impl_weights_kq!(Iq2xs, task_iq2xs_s, task_iq2xs_n);
-impl_weights_kq!(Iq2s, task_iq2s_s, task_iq2s_n);
-impl_weights_kq!(Iq1s, task_iq1s_s, task_iq1s_n);
-impl_weights_kq!(Iq3s, task_iq3s_s, task_iq3s_n);
-impl_weights_kq!(Iq1m, task_iq1m_s, task_iq1m_n);
+impl_weights_kq!(
+    Q5k,
+    task_q5k_scalar,
+    task_q5k_avx2,
+    task_q5k_avx512,
+    task_q5k_neon
+);
+impl_weights_kq!(
+    Q2k,
+    task_q2k_scalar,
+    task_q2k_avx2,
+    task_q2k_avx512,
+    task_q2k_neon
+);
+impl_weights_kq!(
+    Q3k,
+    task_q3k_scalar,
+    task_q3k_avx2,
+    task_q3k_avx512,
+    task_q3k_neon
+);
+impl_weights_kq!(
+    Iq4nl,
+    task_iq4nl_scalar,
+    task_iq4nl_avx2,
+    task_iq4nl_avx512,
+    task_iq4nl_neon
+);
+impl_weights_kq!(
+    Iq4xs,
+    task_iq4xs_scalar,
+    task_iq4xs_avx2,
+    task_iq4xs_avx512,
+    task_iq4xs_neon
+);
+impl_weights_kq!(
+    Q40,
+    task_q40_scalar,
+    task_q40_avx2,
+    task_q40_avx512,
+    task_q40_neon
+);
+impl_weights_kq!(
+    Q41,
+    task_q41_scalar,
+    task_q41_avx2,
+    task_q41_avx512,
+    task_q41_neon
+);
+impl_weights_kq!(
+    Q80,
+    task_q80_scalar,
+    task_q80_avx2,
+    task_q80_avx512,
+    task_q80_neon
+);
+impl_weights_kq!(
+    Iq3xxs,
+    task_iq3xxs_s,
+    task_iq3xxs_avx2,
+    task_iq3xxs_avx512,
+    task_iq3xxs_n
+);
+impl_weights_kq!(
+    Iq2xxs,
+    task_iq2xxs_s,
+    task_iq2xxs_avx2,
+    task_iq2xxs_avx512,
+    task_iq2xxs_n
+);
+impl_weights_kq!(
+    Iq2xs,
+    task_iq2xs_s,
+    task_iq2xs_avx2,
+    task_iq2xs_avx512,
+    task_iq2xs_n
+);
+impl_weights_kq!(
+    Iq2s,
+    task_iq2s_s,
+    task_iq2s_avx2,
+    task_iq2s_avx512,
+    task_iq2s_n
+);
+impl_weights_kq!(
+    Iq1s,
+    task_iq1s_s,
+    task_iq1s_avx2,
+    task_iq1s_avx512,
+    task_iq1s_n
+);
+impl_weights_kq!(
+    Iq3s,
+    task_iq3s_s,
+    task_iq3s_avx2,
+    task_iq3s_avx512,
+    task_iq3s_n
+);
+impl_weights_kq!(
+    Iq1m,
+    task_iq1m_s,
+    task_iq1m_avx2,
+    task_iq1m_avx512,
+    task_iq1m_n
+);
 
 impl Weights for F8 {
     #[inline]
