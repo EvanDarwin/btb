@@ -9,21 +9,19 @@ payload=$(cat 2>/dev/null || true)
 case "$payload" in *"git commit"*) ;; *) exit 0 ;; esac
 cd "${CLAUDE_PROJECT_DIR:-.}" || exit 0
 
-# a worktree keeps its .venv in the shared main checkout, so look there too, then fall back to PATH
-venv=""
-for base in "." "$(dirname "$(git rev-parse --git-common-dir 2>/dev/null || echo .)")"; do
-  [ -x "$base/.venv/bin/ruff" ] && {
-    venv="$base/.venv"
-    break
-  }
-done
-if [ -n "$venv" ]; then
-  ruff="$venv/bin/ruff"
-  mypy="$venv/bin/mypy"
-else
-  ruff=ruff
-  mypy=mypy
-fi
+# the venv's tools, POSIX layout then Windows (as build.py's venv_python), here or in the shared main checkout a
+# worktree keeps its .venv in, else whatever is on PATH
+common=$(dirname "$(git rev-parse --git-common-dir 2>/dev/null || echo .)")
+tool() {
+  local base p
+  for base in "." "$common"; do
+    for p in "$base/.venv/bin/$1" "$base/.venv/Scripts/$1.exe"; do
+      [ -x "$p" ] && { echo "$p"; return; }
+    done
+  done
+  echo "$1"
+}
+ruff=$(tool ruff); mypy=$(tool mypy)
 if command -v rustfmt >/dev/null 2>&1; then
   rustfmt=rustfmt
 elif [ -x "${CARGO_HOME:-$HOME/.cargo}/bin/rustfmt" ]; then

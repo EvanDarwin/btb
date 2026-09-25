@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import datetime
 import json
 import os
 import re
@@ -56,22 +55,13 @@ def banner(err: bool = False) -> None:
         print(ART, file=sys.stderr if err else sys.stdout, flush=True)
 
 
-# the day this version was released; bump it each release. Under the FSL the code converts to Apache 2.0
-# two years after this date, at which point the notice below stops.
-RELEASE_DATE = datetime.date(2026, 9, 10)
-FRIEND_FILE = os.path.expanduser("~/.config/btb.friend")
-
-
 def _license_notice() -> None:
-    """Print the FSL commercial-use notice to stderr while this release is inside its two-year window; silent
-    once the window has passed, and silent for anyone who has `~/.config/btb.friend`."""
-    try:
-        change = RELEASE_DATE.replace(year=RELEASE_DATE.year + 2)
-    except ValueError:  # a Feb 29 release
-        change = RELEASE_DATE.replace(year=RELEASE_DATE.year + 2, day=28)
-    if datetime.date.today() >= change or os.path.exists(FRIEND_FILE):
-        return
-    _e("btb is free for personal and academic use. For commercial use, consider a paid license.")
+    """Print the FSL commercial-use notice to stderr while this build is inside its two-year window (btb.fsl);
+    silent once the window has passed, when the code is Apache 2.0, and for anyone with `~/.config/btb.friend`"""
+    from .fsl import restricted
+
+    if restricted():
+        _e("btb is free for personal and academic use. For commercial use, consider a paid license.")
 
 
 PLACEMENT = (
@@ -1058,7 +1048,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     _common(p, path_required=False)
     p.add_argument(
-        "--host", default="127.0.0.1", help="address to bind (default 127.0.0.1; 0.0.0.0 for every interface)"
+        "--host",
+        default="127.0.0.1",
+        help="address to bind (default 127.0.0.1; 0.0.0.0 for every interface, which needs --api-key)",
     )
     p.add_argument("--port", type=_port, default=8000, help="port to listen on (default 8000)")
     p.add_argument(

@@ -83,12 +83,23 @@ def _value(node: ast.expr) -> Any:
         return ast.unparse(node)
 
 
+# every ToolFormat subclass in definition order, filled by ToolFormat.__init_subclass__; FORMATS and AnyText.forms
+# are built from it at the end of the module, so a new parser is one class and nothing else.
+_SUBCLASSES: list[type[ToolFormat]] = []
+
+
 class ToolFormat:
     """One family's convention. `kinds` names the engine families it serves; `openers` the text at which the
-    streamed answer stops and buffers, since a call is not content."""
+    streamed answer stops and buffers, since a call is not content. Defining a subclass registers it, so a parser
+    that names `kinds` is dispatched by `tool_format()` and (when `in_text`) tried by `AnyText` on its own."""
 
-    kinds: tuple[str, ...] = ()
+    kinds: tuple[FamilyKind, ...] = ()
     openers: tuple[str, ...] = ()
+    in_text: bool = True  # whether a call of this form can sit in the answer text, so AnyText should try it
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        _SUBCLASSES.append(cls)
 
     def prepare(self, messages: Sequence[Json], tools: Any) -> tuple[list[Json], Any]:
         """(messages, tools) as the family's chat template takes them; the default hands `tools` to the template"""
@@ -272,6 +283,7 @@ class Harmony(ToolFormat):
     is parsed out of the prose."""
 
     kinds = (FamilyKind.GPT_OSS,)
+    in_text = False  # the call is channel tokens, so there is nothing for AnyText to find in an answer's text
 
     def from_tokens(self, tok: Any, toks: Tokens, tools: Any = None) -> tuple[str, str, list[ToolCall]]:
         content, thinking, calls = Channels(tok).split_calls(toks)
@@ -436,9 +448,10 @@ class GemmaJson(ToolFormat):
 
 
 class AnyText(ToolFormat):
-    """A family this module does not know: every text form tried in turn, the first that finds a call wins."""
+    """A family this module does not know: every text form tried in turn, the first that finds a call wins.
+    `forms` is filled below from the registered parsers whose calls sit in the answer text (`in_text`)."""
 
-    forms: tuple[ToolFormat, ...] = (HermesJson(), QwenXml(), PhiJson(), GemmaJson())
+    forms: tuple[ToolFormat, ...] = ()
 
     def opener_at(self, text: str, start: int = 0) -> int | None:
         hits = [p for p in (f.opener_at(text, start) for f in self.forms) if p is not None]
@@ -461,7 +474,10 @@ class AnyText(ToolFormat):
         return text
 
 
-FORMATS: tuple[ToolFormat, ...] = (HermesJson(), QwenXml(), PhiJson(), GemmaJson(), Harmony())
+# the dispatch set: every registered parser that names families, in definition order. A parser is in FORMATS
+# because it declares `kinds`, so declaring them is what makes tool_format() reach it - there is no second list.
+FORMATS: tuple[ToolFormat, ...] = tuple(cls() for cls in _SUBCLASSES if cls.kinds)
+AnyText.forms = tuple(f for f in FORMATS if f.in_text)
 
 
 def tool_format(kind: FamilyKind | str | None) -> ToolFormat:

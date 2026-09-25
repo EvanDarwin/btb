@@ -24,11 +24,6 @@ COMPARE_PY = os.path.join(
     "python.exe" if sys.platform == "win32" else "python",
 )
 
-# WARN: btb is not installed in .venv-compare; the checkout goes last on the path so the venv's own
-#   packages win, and nothing in this package imports btb at load - the tools do, after the rival has run
-if ROOT not in sys.path:
-    sys.path.append(ROOT)
-
 
 def say(msg: str = "", tag: str = "matrix") -> None:
     """

@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 //! Page-fenced attention decode at a grouped-query shape (hq 24, hk 4, d 256) for every KV length
 //! 1..=1200. See `common/attn.rs` for the fences.
-#![cfg(windows)]
 
 mod common;
 

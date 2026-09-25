@@ -18,9 +18,12 @@ import numpy as np
 import torch
 
 from .. import mlx as mlxdev
-from ..mxfp4 import BLOCK, MxGateUp, MxWeight
+from ..fp8 import F8Weight
+from ..kinds import PassTag
+from ..mxfp4 import BLOCK, MxGateUp, MxWeight, stored_mxfp4
 from ..options import Device
 from ..sysinfo import host_free_bytes
+from .host import bf16_in_place
 from .native import Native
 
 if TYPE_CHECKING:
@@ -331,8 +334,8 @@ class VramSeats:
     """The first-class seats: the regulars with the most rides copied onto the card, where an expert costs no
     host memory traffic and no read. A rider earns a seat with `min_rides` rides; the seats are given up by
     last ride; at most `per_pass` promotions a pass keep the copies off the token's time. The RAM copy stays
-    (a seat given up falls back to it), so a seat costs the store nothing but the copy. bf16 experts only: the
-    card multiplies the stored tensors as they are."""
+    (a seat given up falls back to it), so a seat costs the store nothing but the copy. bf16 experts only (an
+    fp16/fp32 one is seated as the bf16 its slot holds): the card multiplies the stored tensors as they are."""
 
     def __init__(self, n_seats: int, per: int, shapes: Any, device: Any, min_rides: int = 8, per_pass: int = 4) -> None:
         self.n = int(n_seats)
@@ -395,11 +398,15 @@ class _ExpertStore:
     _os: ModuleType
     blocks: dict[int, tuple[torch.Tensor, list[int]]]
     budget: int
+    dt: torch.dtype  # a bf16-layout checkpoint's expert element type as stored (an fp16/fp32 one is cast once read)
+    as_bf16: set[Any]  # the slots whose fp16/fp32 expert has been rewritten as bf16 since it was read
     free: Any
     last_slots: Any
     lru: Any
     max_call: int
     mx: bool
+    f8: bool
+    f8_sdt: torch.dtype
     n_slots: int
     next_slot: int
     parked: list[int]
@@ -423,9 +430,18 @@ class _ExpertStore:
         self.per = None
         self.shapes = None
         self.sizes = None
-        self.mx = bool(sm.fam.mxfp4)
+        self.dt = torch.bfloat16
+        self.as_bf16 = set()
+        self.mx = stored_mxfp4(sm.fam.mxfp4, getattr(sm, "gguf", None))
+        # an FP8 checkpoint's experts: each projection's e4m3 bytes and its scale grid, multiplied as stored
+        self.f8 = bool(getattr(sm, "fp8_experts", False))
+        self.f8_sdt = torch.float32  # the scale grids' stored dtype, from the first recipe
         # a GGUF's experts: gate, up and down in ggml's block layout, multiplied as stored (btb/mxfp4.py)
         self.ggml = self.mx and getattr(sm, "gguf", None) is not None
+        # a GGUF's other experts, which no kernel multiplies as stored: a read dequantizes the expert (its layout
+        # inverted, `GGUFModel.get`) into the slot as the bf16 a checkpoint's read would land there
+        self.dequant = not self.mx and getattr(sm, "gguf", None) is not None
+        self.keys: dict[int, tuple[str, ...]] = {}  # the dequantized experts' tensor names by layer
         self.n_slots = 0
         self.budget = int(budget_bytes)
         self.reserve = int(reserve_bytes)
@@ -433,15 +449,17 @@ class _ExpertStore:
         self.margin = max(self.block_max, self.reserve // 4)
         self.scratch_n = int(scratch)
         # the residency policy: the store's line, or the Bus Pass (the configuration's `bus_pass`, BTB_BUS_PASS
-        # over it); `lru` is the day riders' line, which in the store's own shape is the whole line
+        # over it); `lru` is the day riders' line, which in the store's own shape is the whole line. Read off
+        # the model with no default of its own: a model built without a policy must fail, not run the wrong one
         bp = os.environ.get("BTB_BUS_PASS")
-        bus_pass = bool(int(bp)) if bp not in (None, "") else bool(getattr(sm, "bus_pass", False))
+        bus_pass = bool(int(bp)) if bp not in (None, "") else bool(sm.bus_pass)
         self.res = (BusPass if bus_pass else Riders)(lambda: self.live() - len(self.ring))
+        self.res_tag = PassTag.EXPERT_BUS_PASS if bus_pass else PassTag.EXPERT_LINE
         self.lru = self.res.t1
         # the depot's pages held in RAM (`store_pin`, BTB_STORE_PIN over it: 0 pageable, 1 pinned, "auto" pinned
         # beside a card): a drive writing straight into a page the machine has trimmed pays the fault on the read
         sp: str | int | None = os.environ.get("BTB_STORE_PIN")
-        sp = sp if sp not in (None, "") else getattr(sm, "store_pin", 0)
+        sp = sp if sp not in (None, "") else sm.store_pin
         dev = getattr(sm, "dev", None)
         on_card = dev is not None and getattr(dev, "type", "") == Device.CUDA
         self.pin = on_card if str(sp).strip().lower() == "auto" else bool(int(sp or 0)) and on_card
@@ -555,7 +573,8 @@ class _ExpertStore:
                 except RuntimeError as e:
                     self.pin = False
                     self.sm.log(
-                        f"[experts] store: the machine would not pin a {k * stride / 2**30:.2f} GB block ({e}); pageable from here"
+                        f"[experts] store: the machine would not pin a {k * stride / 2**30:.2f} GB block ({e}); "
+                        "pageable from here"
                     )
             if raw is None:
                 raw = torch.empty(k * stride + 4096, dtype=torch.uint8)
@@ -638,6 +657,8 @@ class _ExpertStore:
                 names = tuple(f"blk.{layer}.ffn_{k}_exps.weight" for k in ("gate", "up", "down"))
             elif self.mx:
                 names = ("gate_up_proj_blocks", "gate_up_proj_scales", "down_proj_blocks", "down_proj_scales")
+            elif self.f8:
+                names = ("gate_up_proj", "gate_up_proj_scale_inv", "down_proj", "down_proj_scale_inv")
             else:
                 names = ("gate_up_proj", "down_proj")
             parts = []
@@ -651,6 +672,12 @@ class _ExpertStore:
                 if (b - a) % shape[0]:
                     raise RuntimeError(f"[experts] {key}: {b - a} bytes do not divide by {shape[0]} experts")
                 parts.append((self._os.path.join(self.sm.dir, shard), hoff + a, (b - a) // shape[0], shape[1:]))
+                if self.f8 and name.endswith("_scale_inv"):
+                    self.f8_sdt = self.sm.ST_DTYPES[info["dtype"]]
+                elif not (self.ggml or self.mx or self.f8):
+                    self.dt = self.sm.ST_DTYPES[info["dtype"]]
+            if self.dequant:
+                self.keys[layer] = tuple(base + name for name in names)
             r = self.recipes[layer] = parts
             sched = getattr(self.sm, "scheduler", None)
             if sched is not None and hasattr(sched, "disk"):
@@ -665,11 +692,12 @@ class _ExpertStore:
                 self.per = per
                 # bf16: (gate_up bytes, gate_up shape, down shape), what `_views` splits the slot on;
                 # MXFP4: the four tensors' per-expert shapes, and `sizes` their byte counts
-                self.shapes = shapes if self.mx else (parts[0][2], *shapes)
+                self.shapes = shapes if self.mx or self.f8 else (parts[0][2], *shapes)
                 self.sizes = tuple(p[2] for p in parts)
                 # reads straight into the slot (padded regions) unless BTB_STORE_PADDED=0 asks for the bounce
                 self.padded = (
                     self.sm.mlx is None
+                    and not self.dequant
                     and Native.read_at is not None
                     and os.environ.get("BTB_STORE_PADDED", "1") != "0"
                 )
@@ -698,7 +726,7 @@ class _ExpertStore:
         assert self.per is not None  # the store is sized before this runs
         want = getattr(self.sm, "vram_experts_gb", 0)
         dev = getattr(self.sm, "dev", None)
-        if self.mx or dev is None or dev.type != Device.CUDA or not want or self.stride is None:
+        if self.mx or self.f8 or dev is None or dev.type != Device.CUDA or not want or self.stride is None:
             return
         if want == "auto":
             sched = getattr(self.sm, "scheduler", None)
@@ -706,11 +734,13 @@ class _ExpertStore:
             room = (free or 0) - (1 << 30)
         else:
             room = int(float(want) * 2**30)
-        n = max(0, int(room // self.per))
+        per = self._held(self.per)
+        n = max(0, int(room // per))
         if n <= 0:
             return
-        self.vram = VramSeats(n, self.per, self.shapes, dev)
-        self.sm.log(f"[experts] {n} seats on the card ({n * self.per / 2**30:.2f} GB) for the most ridden experts")
+        gu_n, gu_shape, dn_shape = self.shapes
+        self.vram = VramSeats(n, per, (self._held(gu_n), gu_shape, dn_shape), dev)
+        self.sm.log(f"[experts] {n} seats on the card ({n * per / 2**30:.2f} GB) for the most ridden experts")
 
     @staticmethod
     def expert_s(drive: dict[str, Any], per: int) -> float:
@@ -774,13 +804,16 @@ class _ExpertStore:
         key = (layer, e)
         if key in v.seat_of or self.rides.get(key, 0) < v.min_rides or v.left <= 0:
             return
+        self._to_bf16(slot)
         region = self._region(slot)
         d = self.slot_delta.get(slot) or (0,) * len(self.sizes)
         at0 = (self.part_at[0] if self.part_at else 0) + d[0]
         at1 = (self.part_at[1] if self.part_at else self.sizes[0]) + d[1]
-        if self.padded:
-            # the seat holds the two parts back to back: gathered from their padded regions
-            packed = torch.cat([region[at0 : at0 + self.sizes[0]], region[at1 : at1 + self.sizes[1]]])
+        if self.padded or self.dt != torch.bfloat16:
+            # the seat holds the two parts' bf16 back to back: gathered from their padded regions, or from the
+            # head of each part a float32 expert was rewritten into
+            h0, h1 = self._held(self.sizes[0]), self._held(self.sizes[1])
+            packed = torch.cat([region[at0 : at0 + h0], region[at1 : at1 + h1]])
         else:
             packed = region[at0 : at0 + self.per]
         v.offer(key, self.rides.get(key, 0), packed)
@@ -833,11 +866,41 @@ class _ExpertStore:
                 rows, g = int(self.shapes[i][0]), int(self.shapes[i][1])
                 out.append(MxWeight(self._part(slot, region, i), self._part(slot, region, i + 1), rows, g * BLOCK))
             return out[0], out[1]
+        if self.f8:
+            pair = []
+            for i in (0, 2):
+                (rows, cols), grid = self.shapes[i], self.shapes[i + 1]
+                raw = self._part(slot, region, i + 1)
+                # a scale part a direct read left off its element alignment is copied to one
+                if raw.data_ptr() % self.f8_sdt.itemsize:
+                    raw = raw.clone()
+                s = raw.view(self.f8_sdt).reshape(*grid)
+                pair.append(F8Weight(self._part(slot, region, i), s, int(rows), int(cols)))
+            return pair[0], pair[1]
         _gu_n, gu_shape, dn_shape = self.shapes
-        return (
-            self._part(slot, region, 0).view(torch.bfloat16).view(*gu_shape),
-            self._part(slot, region, 1).view(torch.bfloat16).view(*dn_shape),
-        )
+        if self.dt == torch.bfloat16:
+            return (
+                self._part(slot, region, 0).view(torch.bfloat16).view(*gu_shape),
+                self._part(slot, region, 1).view(torch.bfloat16).view(*dn_shape),
+            )
+        # an fp16/fp32 expert as `_to_bf16` left it (a view taken before it lands has the shapes only)
+        gu = self._part(slot, region, 0)[: self._held(self.sizes[0])].view(torch.bfloat16).view(*gu_shape)
+        dn = self._part(slot, region, 1)[: self._held(self.sizes[1])].view(torch.bfloat16).view(*dn_shape)
+        return gu, dn
+
+    def _held(self, n: int) -> int:
+        """the bytes of `n` stored bytes of expert once held as bf16"""
+        return n // self.dt.itemsize * 2
+
+    def _to_bf16(self, slot: Any) -> None:
+        """a landed fp16/fp32 expert rewritten as bf16 in its slot, once per read, so every use after reads it as
+        a bf16 expert's bytes"""
+        if self.dt == torch.bfloat16 or slot in self.as_bf16:
+            return
+        region = self._region(slot)
+        for p in (0, 1):
+            bf16_in_place(self._part(slot, region, p), self.dt)
+        self.as_bf16.add(slot)
 
     def _views_mx(self, slot: Any) -> Any:
         assert self.per is not None  # the store is sized before this runs
@@ -857,7 +920,12 @@ class _ExpertStore:
             n0 = self.sizes[0] + self.sizes[1]
             return region[:n0], region[n0:]
         gu_n, gu_shape, dn_shape = self.shapes
-        return be.weight_slot(sh, off, gu_n, gu_shape), be.weight_slot(sh, off + gu_n, self.per - gu_n, dn_shape)
+        if self.dt == torch.bfloat16:
+            return be.weight_slot(sh, off, gu_n, gu_shape), be.weight_slot(sh, off + gu_n, self.per - gu_n, dn_shape)
+        return (
+            be.weight_slot(sh, off, self._held(gu_n), gu_shape),
+            be.weight_slot(sh, off + gu_n, self._held(self.per - gu_n), dn_shape),
+        )
 
     def _note_read(
         self, prof: Any, layer: int, e: int, part: int, path: str, off: int, n_e: int, slot: Any, dur_ns: int
@@ -875,19 +943,28 @@ class _ExpertStore:
 
     def _read(self, parts: Any, e: Any, slot: Any, layer: int = -1) -> None:
         """the expert's parts read on this thread (the path without a scheduler's Route)"""
+        self.as_bf16.discard(slot)
         region = self._region(slot)
         prof = getattr(self.sm, "expert_profile", None)
         self.slot_delta[slot] = (0,) * len(parts)
         for j, (path, off, n_e, _) in enumerate(parts):
             at = self.part_at[j] if self.part_at else sum(self.sizes[:j])
             tp = time.perf_counter_ns()
-            Native.read_direct(path, off + e * n_e, n_e, region[at : at + n_e], self.sm.cold_chunk)
+            if self.dequant:
+                w = self.sm.gguf.get(self.sm._gguf_names[self.keys[layer][j]], expert=int(e))
+                region[at : at + n_e].view(torch.bfloat16).copy_(w.reshape(-1))
+            else:
+                Native.read_direct(path, off + e * n_e, n_e, region[at : at + n_e], self.sm.cold_chunk)
             self._note_read(prof, layer, e, j, path, off + e * n_e, n_e, slot, time.perf_counter_ns() - tp)
 
     def _submit(self, sched: Any, parts: Any, e: Any, slot: Any, layer: int, priority: int) -> Any:
         """the expert's parts queued on the Route, one read each, with the profile's row and the counters
         taken as each lands; returns what `wait` and the layer's forward call `.result()` on. In a padded slot
-        the read is the sector-aligned span around the part, straight into its region."""
+        the read is the sector-aligned span around the part, straight into its region. A dequantized expert is
+        no drive read: the store's own readers fill it."""
+        self.as_bf16.discard(slot)
+        if self.dequant:
+            return Parts([self.pool.submit(self._read, parts, e, slot, layer)])
         region = self._region(slot)
         prof = getattr(self.sm, "expert_profile", None)
         futs = []
@@ -1088,6 +1165,7 @@ class _ExpertStore:
             self.rides[key] = self.rides.get(key, 0) + 1
             if self.vram is not None and key in self.vram:
                 # a first-class seat: the card multiplies it, no bytes move
+                self.sm._tag(PassTag.EXPERT_VRAM_SEAT)
                 on_card[e] = self.vram.views(key)
                 self.stat["hit"] += 1
                 if prof is not None:
@@ -1185,6 +1263,10 @@ class _ExpertStore:
         self.stat["bytes"] += len(todo) * self.per
         self.stat["s"] += time.perf_counter() - t0
         still = {e for e, _, _ in waiting}
+        if self.dt != torch.bfloat16:
+            for e, s in out.items():
+                if e not in futs and e not in still:
+                    self._to_bf16(s)
         ready = {e: self._views(s) for e, s in out.items() if e not in futs and e not in still}
         ready.update(on_card)
         pending = [(e, futs[e], out[e]) for e in todo] + waiting
@@ -1196,6 +1278,7 @@ class _ExpertStore:
         done = {}
         for e, f, s in pending:
             f.result()
+            self._to_bf16(s)
             done[e] = self._views(s)
         self.stat["wait_s"] += time.perf_counter() - t0
         return done
@@ -1215,4 +1298,5 @@ class _ExpertStore:
             for p in ready:
                 left.remove(p)
                 p[1].result()
+                self._to_bf16(p[2])
             yield ready

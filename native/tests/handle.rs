@@ -16,8 +16,8 @@ use fixture::Fixture;
 const MIB: u64 = 1 << 20;
 
 /// A destination whose first payload byte sits `skew` bytes past a sector boundary: `skew == 0` is the
-/// alignment that lets the read land in it with no bounce buffer. This is the cross-platform stand-in
-/// for the guard-page fence: the fill outside the payload plays the part of the poisoned slack.
+/// alignment that lets the read land in it with no bounce buffer. The fill outside the payload plays the
+/// part of the guard-page fence's poisoned slack; `guard_direct.rs` runs the same reads fenced.
 struct Dest {
     buf: Vec<u8>,
     at: usize,

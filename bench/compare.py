@@ -19,11 +19,9 @@ import os
 import sys
 from collections.abc import Sequence
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from lib import COMPARE_VENV, say
-from lib.records import BenchRecord
-from lib.tools import TOOLS, bench, prompts
+from bench.lib import COMPARE_VENV, say
+from bench.lib.records import BenchRecord
+from bench.lib.tools import TOOLS, bench, prompts
 
 
 def main(argv: Sequence[str] | None = None) -> int:

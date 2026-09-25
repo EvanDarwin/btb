@@ -13,12 +13,10 @@ import sys
 from collections.abc import Sequence
 from typing import cast
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from lib import COMPARE_PY, QUESTIONS, RESULTS, git_commit, say
-from lib.env import ensure_compare_env
-from lib.host import host_specs
-from lib.plan import (
+from bench.lib import COMPARE_PY, QUESTIONS, RESULTS, git_commit, say
+from bench.lib.env import ensure_compare_env
+from bench.lib.host import host_specs
+from bench.lib.plan import (
     axes_manifest,
     machine_devices,
     machine_tools,
@@ -27,9 +25,9 @@ from lib.plan import (
     plan_cells,
     resume_cells,
 )
-from lib.records import BenchGuard, BenchRunDoc, BenchStatus
-from lib.run import run_cell
-from lib.table import cell_label, cell_line, specs_line, tables
+from bench.lib.records import BenchGuard, BenchRunDoc, BenchStatus
+from bench.lib.run import run_cell
+from bench.lib.table import cell_label, cell_line, specs_line, tables
 
 _KINDS = "a device (cpu, cpu+gpu, gpu, cpu+mlx, mlx), a dtype (bf16, fp32), pack12/nopack12, mega/nomega, a tool (btb, mlx-lm, airllm, llama-cpp), greedy, t<T> (e.g. t0.7), or axis=value (the only form for model=GLOB)"
 

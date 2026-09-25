@@ -1,0 +1,144 @@
+# Benchmarks on every PR and every push to main, base against change on one runner: the native criterion benches
+# (`cargo bench`, every [[bench]] target) plus bench/e2e_bench.py (the end-to-end tiny-model loop and the MLX/CUDA
+# per-op kernels, each skipping off its backend). The base - a PR's base branch, a push's previous main commit - is
+# checked out beside it, and the two are benched interleaved on the same CPU (base, change, change, base);
+# bench.report compares the pairs, posts one sticky comment on a PR (a push's goes to the job summary) and computes
+# the perf gate. A base that predates the benches is benched as nothing, and every row lists as new.
+#
+# The PR's code runs in the `bench` job, which holds a read-only token. Posting the comment needs
+# pull-requests: write, so it is a separate job that checks out nothing and runs no repo code.
+#
+# The gate fails when a benchmark's whole 95% CI clears GATE_THRESHOLD in both pairs. On the shared runner it is
+# advisory (reported in the job summary); vars.PERF_RUNNER names a dedicated runner and vars.PERF_DEDICATED = "1"
+# makes the gate fail the job. Actions pinned to wheels.yml's SHAs.
+name: bench
+
+on:
+  pull_request:
+    paths: ["native/**", "btb/**", "bench/e2e_bench.py", "bench/e2e_delta.py", "bench/report.py", "bench/conftest.py", ".github/workflows/bench.yml", "tests/fixtures/**", "tests/cert/spec.py", "tests/cert/native_ops.py", "build.py", "setup.py", "pyproject.toml"]
+  push:
+    branches: [main]
+    paths: ["native/**", "btb/**", "bench/e2e_bench.py", "bench/e2e_delta.py", "bench/report.py", "bench/conftest.py", ".github/workflows/bench.yml", "tests/fixtures/**", "tests/cert/spec.py", "tests/cert/native_ops.py", "build.py", "setup.py", "pyproject.toml"]
+
+# a PR's newer push replaces its run; every push to main is benched, so none is cancelled
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  MAXTIME: "8"             # per-benchmark wall cap for the e2e: enough rounds that the slow whole-loop benches'
+                           # standard-error band closes to ~2%; rounds are floored at 25 by the mark
+  GATE_THRESHOLD: "0.10"   # a regression trips only when its whole 95% CI sits above +10% vs the base, in both pairs
+
+jobs:
+  bench:
+    runs-on: ${{ vars.PERF_RUNNER || 'ubuntu-latest' }}
+    env:
+      # a push's `before` is all zeros when it created the branch: nothing to compare against
+      BASE: ${{ github.event_name == 'push' && github.event.before || github.base_ref }}
+      HAS_BASE: ${{ github.event_name != 'push' || github.event.before != '0000000000000000000000000000000000000000' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - if: env.HAS_BASE == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BASE }}
+          path: base
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --quiet pytest==9.1.1 pytest-benchmark==5.3.0
+
+      # both sides built up front, so the benches below run back to back; the change's wheel brings the deps
+      - name: Build the base
+        if: env.HAS_BASE == 'true'
+        working-directory: base
+        run: |
+          python build.py build
+          if [ -d native/benches ]; then (cd native && cargo bench --bench '*' --no-run); fi
+      - name: Build the change
+        run: |
+          python build.py build
+          python -m pip install --quiet dist/*.whl
+          (cd native && cargo bench --bench '*' --no-run)
+
+      # interleaved base a, change a, change b, base b: each pair runs adjacent in time and their mean cancels a
+      # drift across the job, which one run per side read as a change. `--bench '*'` keeps the lib's own test
+      # harness, which rejects criterion's flags, out. The e2e runs go on when a known-broken cell exits pytest
+      # nonzero: pytest-benchmark still writes the JSON for everything that did time.
+      - name: Bench the base and the change, interleaved
+        run: |
+          bench() {  # $1 the tree, $2 the run
+            (cd "$1" && python -m pip install --quiet --force-reinstall --no-deps dist/*.whl)
+            if [ -d "$1/native/benches" ]; then
+              (cd "$1/native" && cargo bench --bench '*' -- --save-baseline "$2")
+            else
+              echo "$1 has no native benches"
+            fi
+            if [ -f "$1/bench/e2e_bench.py" ]; then
+              (cd "$1" && python -m pytest bench/e2e_bench.py --benchmark-json="e2e-$2.json" \
+                --benchmark-max-time=$MAXTIME -q -p no:cacheprovider) || true
+            else
+              echo "$1 has no e2e bench"
+            fi
+          }
+          if [ "$HAS_BASE" = "true" ]; then bench base a; fi
+          bench . a
+          bench . b
+          if [ "$HAS_BASE" = "true" ]; then bench base b; fi
+
+      # one render gives the comment body and the gate's exit code; the body goes to the job summary and, on a PR,
+      # to the `comment` job below; the gate fails this job only on a dedicated runner
+      - name: Compare and gate
+        env:
+          BASE_REF: ${{ github.base_ref || github.ref_name }}  # a PR's base branch, or main for a push
+        run: |
+          gate=0
+          baseline=()
+          if [ "$HAS_BASE" = "true" ]; then
+            baseline=(--baseline base --base-ref "$BASE_REF" --base-sha "$(git -C base rev-parse HEAD)")
+          fi
+          python -m bench.report . "${baseline[@]}" --gate --gate-threshold "$GATE_THRESHOLD" \
+            --out bench-comment.md || gate=$?
+          { echo "## Perf gate"; echo ""
+            if [ "$gate" = "0" ]; then echo "No benchmark's 95% CI cleared +${GATE_THRESHOLD} vs the base."
+            else echo "A benchmark regressed past the +${GATE_THRESHOLD} gate (see the step log)."; fi
+            echo ""; cat bench-comment.md; } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ vars.PERF_DEDICATED }}" = "1" ] && [ "$gate" != "0" ]; then
+            echo "dedicated runner: enforcing the perf gate"; exit 1
+          fi
+      - if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-comment
+          path: bench-comment.md
+          retention-days: 1
+
+  # the only job with a write token: no checkout, no repo code, just the rendered file and the API
+  comment:
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+    needs: bench
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bench-comment
+      # upserts the bot's own marked comment (anyone can post the marker)
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          marker='<!-- btb-bench-compare -->'
+          id=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | contains(\"$marker\"))) | .id" | head -n1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@bench-comment.md >/dev/null && echo "updated $id"
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@bench-comment.md >/dev/null && echo "posted"
+          fi

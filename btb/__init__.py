@@ -32,7 +32,7 @@ from .hf import (
 )
 
 # model discovery lives in hf.py; these names stay importable from here
-from .kinds import Json, Log
+from .kinds import Json, Log, Proposer
 from .options import Device
 
 os.environ.setdefault("KMP_BLOCKTIME", "0")
@@ -48,9 +48,10 @@ from .text import Channels, TextStream, answer, prompt_ids, template
 if TYPE_CHECKING:
     from .engine import StreamedTextModel
     from .engine.device import mlx_available, resolve_device
-    from .engine.native import kernels_path, native_path, native_tag, quiet_omp  # noqa: F401
+    from .engine.native import quiet_omp  # noqa: F401
     from .engine.scheduler import BatchScheduler, HostBudget, MemoryGrantError, Plan, PlanError
     from .engine.text import Chat, GenerateStats, Generation, Stream
+    from .native_files import kernels_path, native_path, native_tag  # noqa: F401
 
 CUDA = True
 
@@ -77,9 +78,9 @@ _LAZY = {
     "pack_model": ".engine",
     "mlx_available": ".engine.device",
     "resolve_device": ".engine.device",
-    "native_path": ".engine.native",
-    "native_tag": ".engine.native",
-    "kernels_path": ".engine.native",
+    "native_path": ".native_files",
+    "native_tag": ".native_files",
+    "kernels_path": ".native_files",
     "quiet_omp": ".engine.native",
     "BatchScheduler": ".engine.scheduler",
     "HostBudget": ".engine.scheduler",
@@ -186,8 +187,9 @@ def load(
 
     from .engine import StreamedTextModel
     from .engine.device import mlx_available, resolve_device
-    from .engine.native import native_path, quiet_omp
+    from .engine.native import quiet_omp
     from .engine.state import DRAFT_VOCAB
+    from .native_files import native_path
 
     if asked is not None and asked.kind is Device.CPU:
         cpu_only()
@@ -356,6 +358,9 @@ def load(
         vram_watch=bool(int(c.get("vram_watch", 1))),
         mlx_layers=mlx_layers,
         host_budget=pl.budget if pl is not None else None,
+        # the expert store is built inside __init__, so its policy travels as an argument, not an assignment after
+        bus_pass=bool(int(c.get("bus_pass", 1))),
+        store_pin=int(c.get("store_pin", 0)),
         log=log or (lambda *_a: None),
     )
     sm.plan = pl
@@ -414,7 +419,7 @@ def load(
     if sm.fam.own:
         sm.tree_budget = 0
         sm.v_max = 0
-    sm.proposer = "mtp_dyn" if (sm.tree_budget > 0 and has_drafter) else "ngram"
+    sm.proposer = Proposer.MTP_DYN if (sm.tree_budget > 0 and has_drafter) else Proposer.NGRAM
     # how every token is picked unless a call says otherwise: greedy, or the loaded temperature / top_p / top_k / seed
     from .sampling import Sampling
 
@@ -439,11 +444,6 @@ def load(
     )
     if sm.lookahead_rows == (0,):
         sm.lookahead_rows = ()
-    # the Bus Pass by default: 1-8% on the token over two pairs on NVMe, 11% fewer misses on the replay's warm
-    # passes (a second a token on a drive that seeks), bookkeeping its only cost
-    sm.bus_pass = bool(int(c.get("bus_pass", 1)))
-    # the store's pages held in RAM: 0 pageable, 1 pinned, "auto" pinned beside a card
-    sm.store_pin = c.get("store_pin", 0)
     # the experts seated on the card: 0 none, "auto" what the card has to spare, or a figure in GB
     ve = os.environ.get("BTB_VRAM_EXPERTS_GB", c.get("vram_experts_gb", 0))
     sm.vram_experts_gb = "auto" if str(ve).strip().lower() == "auto" else float(ve or 0)
@@ -494,7 +494,7 @@ def load(
             "you're doing!\n"
         )
         sm.drafter_weights = str(dm)
-        sm.proposer = "mtp_dyn"
+        sm.proposer = Proposer.MTP_DYN
         if not sm.tree_budget:
             sm.tree_budget = 14 if sm.mlx is not None else 16
     elif dm:

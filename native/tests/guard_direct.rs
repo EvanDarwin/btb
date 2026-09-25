@@ -3,7 +3,6 @@
 //! write past `dst + len` or before `dst` faults; every byte is compared to the file. `btb_read_at`
 //! runs the same cases on an open handle, over the aligned path (which hands the destination itself to
 //! the drive) and the bounce path.
-#![cfg(windows)]
 
 mod common;
 
@@ -133,7 +132,7 @@ fn the_open_handle_against_the_guard_pages() {
         (FILE_LEN - 4097, 4097),
     ];
     // the aligned path: the sectors land in the fenced destination itself, the last one against the
-    // guard page under Align::End (a Fence of a whole number of pages starts on a page either way)
+    // guard page under Align::End (a Fence of a whole number of sectors starts on a sector either way)
     let aligned: &[(u64, u64)] = &[
         (0, 4096),
         (4096, 4096),

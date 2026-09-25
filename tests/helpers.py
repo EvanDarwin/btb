@@ -7,15 +7,18 @@ before importing this."""
 from __future__ import annotations
 
 import collections
+import contextlib
 import http.client
 import json
 import os
+import statistics
 import threading
+import time
 import types
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from concurrent.futures import Future
 from types import ModuleType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
 import numpy as np
@@ -23,6 +26,7 @@ import pytest
 import torch
 
 from btb.kinds import Json, Parents, TokenRows, Tokens
+from btb.sampling import Sampling
 
 if TYPE_CHECKING:
     from pytest import MonkeyPatch
@@ -31,7 +35,7 @@ if TYPE_CHECKING:
     from btb.engine.experts import _ExpertStore
     from btb.engine.model import StreamedTextModel
     from btb.engine.native import _Cuda
-    from btb.serve import ModelRegistry
+    from btb.serve import Message, ModelRegistry, Server
 
 # --- the checkout and its fixtures ---------------------------------------------------------------------------
 
@@ -131,22 +135,15 @@ def mlx_core() -> ModuleType | None:
     return mx
 
 
-def native_library() -> str | None:
-    """the native library's path with its kernels bound to the engine, None where it is not built (the torch
-    path answers then)"""
+def native_library() -> str:
+    """the native library's path with its kernels bound to the engine; conftest refuses a run without it"""
     from btb import native_path
     from btb.engine import StreamedTextModel
 
     p = native_path()
-    if p:
-        StreamedTextModel.load_gemv(p)
-    return p
-
-
-def need_native() -> str:
-    p = native_library()
     if p is None:
-        pytest.skip("no native library built")
+        raise RuntimeError("no native library built for this machine: `python build.py build --no-wheel`")
+    StreamedTextModel.load_gemv(p)
     return p
 
 
@@ -371,9 +368,12 @@ class SchedulerModel:
 
 
 def stub_engine(**attrs: object) -> types.SimpleNamespace:
-    """the least an engine the scheduler or the expert store is built over: a quiet log and the CPU, plus
-    whatever the test adds"""
-    return types.SimpleNamespace(**{"log": NO_LOG, "dev": torch.device("cpu"), **attrs})
+    """the least an engine the scheduler or the expert store is built over: a quiet log, the CPU, and the store's
+    residency policy at the model's own defaults (it reads `bus_pass`/`store_pin` directly - a stub without them
+    is an AttributeError, not a quietly-wrong policy), plus whatever the test adds"""
+    return types.SimpleNamespace(
+        **{"log": NO_LOG, "dev": torch.device("cpu"), "bus_pass": True, "store_pin": 0, **attrs}
+    )
 
 
 class FakeRoute:
@@ -550,3 +550,163 @@ def request_json(base: str, method: str, path: str, body: Json | None = None) ->
     """`request` whose answer is decoded as JSON: (status, the object)"""
     status, _, text = request(base, method, path, body)
     return status, json.loads(text)
+
+
+class CharTokenizer:
+    """a token per character: enough for the stream to decode text and for Channels to see no markers"""
+
+    unk_token_id = -1
+
+    def convert_tokens_to_ids(self, s: str) -> int:
+        return -1
+
+    def decode(self, ids: Tokens, skip_special_tokens: bool = True) -> str:
+        return "".join(chr(int(i)) for i in ids)
+
+
+# what a fake engine's `run` answers: the prompt ids, the tokens, the census
+FakeRun = tuple[Tokens, list[int], Json]
+
+
+class FakeEngine:
+    """the server's engine as a canned answer: every request gets `out`, a token a character"""
+
+    name = "fake"
+    eos: tuple[int, ...] = ()
+    sampling = Sampling()
+
+    def __init__(self, out: str) -> None:
+        self._out = out
+        self.tok = CharTokenizer()
+
+    def ids_for(self, messages: Sequence[Message], tools: object = None) -> list[int]:
+        return [1, 2, 3]
+
+    def run(
+        self,
+        messages: Sequence[Message],
+        max_new: int | None,
+        on_token: Callable[[int], object] | None = None,
+        ids: Tokens | None = None,
+        sampling: Sampling | None = None,
+    ) -> FakeRun:
+        toks = [ord(ch) for ch in self._out]
+        if on_token is not None:
+            for t in toks:
+                on_token(t)
+        return (ids or [1, 2, 3]), toks, {"cap": 9999, "forwards": 0}
+
+    def text(self, toks: Tokens) -> tuple[str, str]:
+        return self._out, ""
+
+
+class FakeReg:
+    """a model registry serving one FakeEngine under the name "fake" """
+
+    def __init__(self, engine: FakeEngine) -> None:
+        self.engine = engine
+        self.lock = threading.Lock()
+        self.loaded: dict[str, FakeEngine] = {}
+        self.entries: dict[str, Json] = {"fake": {"name": "fake", "path": "fake"}}
+        self.primary_name = "fake"
+
+    def acquire(self, name: str) -> FakeEngine:
+        return self.engine
+
+    def refresh(self, force: bool = False) -> dict[str, Json]:
+        return self.entries
+
+    def loaded_names(self) -> list[str]:
+        return list(self.loaded)
+
+    def loaded_get(self, name: str) -> FakeEngine | None:
+        return self.loaded.get(name)
+
+    def resolve_name(self, n: str) -> str:
+        return "fake"
+
+    def close(self) -> None:
+        pass
+
+
+def stub_server(out: str = "ok", engine: FakeEngine | None = None) -> Server:
+    """the real server on a free loopback port, serving, over a FakeEngine that answers `out` (or `engine`)"""
+    from btb.serve import Handler, Server, _Server
+
+    srv = _Server(("127.0.0.1", 0), Handler)
+    srv.reg = FakeReg(engine or FakeEngine(out))  # type: ignore[assignment]
+    return Server(srv, srv.reg).start()
+
+
+def post_chat(server: Server, body: Json) -> tuple[int, str]:
+    """a chat completion request: (status, the body's text)"""
+    status, _, data = request(server.url, "POST", "/v1/chat/completions", body)
+    return status, data
+
+
+# --- shared load, skip and assertion helpers -----------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def loaded_model(path: str, **load_kw: Any) -> Iterator[StreamedTextModel]:
+    """`btb.load(path)` for the body of a `with`, closed on exit however it leaves; `log` is silenced unless the
+    caller passes one of their own"""
+    import btb
+
+    load_kw.setdefault("log", NO_LOG)
+    sm = btb.load(path, **load_kw)
+    try:
+        yield sm
+    finally:
+        sm.close()
+
+
+def need_cached(spec: str, why: str | None = None) -> str:
+    """`cached(spec)`, or a skip when the model is not on this machine (never a download)"""
+    p = cached(spec)
+    if p is None:
+        pytest.skip(why or f"{spec} is not cached on this machine")
+    return p
+
+
+@runtime_checkable
+class _HasTokens(Protocol):
+    """a generate result: it carries the decoded ids on `.tokens`"""
+
+    @property
+    def tokens(self) -> Sequence[int]: ...
+
+
+def assert_same_tokens(a: Sequence[int] | _HasTokens, b: Sequence[int] | _HasTokens, msg: str = "") -> None:
+    """two token runs equal, each a list of ids or an object carrying `.tokens`; a mismatch prints both"""
+    xs = list(a.tokens if isinstance(a, _HasTokens) else a)
+    ys = list(b.tokens if isinstance(b, _HasTokens) else b)
+    assert xs == ys, f"{msg + ': ' if msg else ''}tokens differ: {xs} != {ys}"
+
+
+def assert_close(a: torch.Tensor, b: torch.Tensor, *, atol_frac: float = 0.05, msg: str = "") -> None:
+    """`a` within `atol_frac` of `b`'s largest magnitude, the receipts' `atol = frac * b.abs().max()` band"""
+    atol = atol_frac * float(b.abs().max())
+    d = max_abs(a, b)
+    assert d <= atol, f"{msg + ': ' if msg else ''}max_abs {d} > atol {atol} ({atol_frac} * {b.abs().max()})"
+
+
+def assert_rel(a: torch.Tensor, b: torch.Tensor, tol: float, msg: str = "") -> None:
+    """`a` within a relative `tol` of `b`, over `b`'s largest magnitude"""
+    r = rel_err(a, b)
+    assert r <= tol, f"{msg + ': ' if msg else ''}rel_err {r} > tol {tol}"
+
+
+def ab_interleave(a: Callable[[], object], b: Callable[[], object], n: int = 16) -> tuple[float, float]:
+    """run the zero-arg `a` and `b` interleaved n times each, returning their median wall-clock seconds; the
+    shared A/B harness, interleaved so a machine's drift lands on both alike, `perf_counter` and no deps"""
+    ta: list[float] = []
+    tb: list[float] = []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        a()
+        ta.append(time.perf_counter() - t0)
+        t0 = time.perf_counter()
+        b()
+        tb.append(time.perf_counter() - t0)
+    return statistics.median(ta), statistics.median(tb)

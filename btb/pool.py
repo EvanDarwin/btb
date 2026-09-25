@@ -9,6 +9,7 @@ import contextlib
 import ctypes
 import ctypes.util
 import json
+import mmap
 import os
 import struct
 import sys
@@ -18,9 +19,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from .hf import is_gguf
+from .hf import AFFINE_TYPES, is_gguf
 from .kinds import Log
-from .quant import AFFINE_TYPES
 
 if TYPE_CHECKING:
     from .mlx import Shared
@@ -94,7 +94,7 @@ def _darwin_vm_bind() -> tuple[Any, Any, int, int]:
     host = libc.mach_host_self()
     page = ctypes.c_size_t(0)
     if libc.host_page_size(host, ctypes.byref(page)) != 0 or not page.value:
-        page.value = int(os.sysconf("SC_PAGE_SIZE"))
+        page.value = mmap.PAGESIZE
     return libc, VMStat64, int(host), int(page.value)
 
 

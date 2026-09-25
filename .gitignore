@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 dist/
 .venv/
+btb/_build.py
 
 # Claude Code's local state and worktrees
 .claude/
@@ -27,6 +28,11 @@ vtune_*
 # the test fixtures' configs and tokenizers are JSON and must be tracked (a fixture model without its
 # config.json is unloadable); this negation must follow the *.json rule above to override it
 !tests/fixtures/**/*.json
+# the oracle's reference bank is a committed fixture (tests/cert/oracle.py), not a run artifact
+!tests/cert/oracle/bank.json
+
+# macOS
+**/.DS_Store
 
 # personal scratch, never tracked
 TODO.md

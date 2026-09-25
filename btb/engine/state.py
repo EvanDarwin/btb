@@ -6,12 +6,37 @@ engine reads as `getattr(self, name, default)` is declared without a value: unse
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
 
+from ..kinds import LayerTier, PassReport, PassTag, Proposer
+
 # rows of the lm_head the drafter proposes from
 DRAFT_VOCAB = 32768
+
+# LayerTier -> the PassTag a pass records for a layer on that tier (btb/engine/device.py Placement.tier)
+_TIER_TAG: dict[LayerTier, PassTag] = {
+    LayerTier.RESIDENT: PassTag.TIER_RESIDENT,
+    LayerTier.HOST: PassTag.TIER_HOST,
+    LayerTier.COLD: PassTag.TIER_COLD,
+    LayerTier.STREAMED: PassTag.TIER_STREAMED,
+}
+
+
+@dataclass
+class _PassRecorder:
+    """The mutable accumulator behind `StreamedTextModel.last_pass_report()`: the tags a generate's forks record
+    and its running speculation counts. Reset once a `generate()`; frozen into a `PassReport` on read."""
+
+    tags: set[PassTag] = field(default_factory=set)
+    spec_proposed: int = 0
+    spec_accepted: int = 0
+
+    def report(self) -> PassReport:
+        return PassReport(frozenset(self.tags), self.spec_proposed, self.spec_accepted)
+
 
 if TYPE_CHECKING:
     import threading
@@ -19,6 +44,7 @@ if TYPE_CHECKING:
     from types import ModuleType
 
     from ..draft import Spans
+    from ..fp8 import F8Weight
     from ..gguf import GGUFModel
     from ..kinds import Json, Log, NodePath, Parents, TokenRows, Tokens
     from ..mlx import Backend, Shared
@@ -57,6 +83,10 @@ class _State:
     _gguf_names: dict[str, str]
     _gguf_hdr: dict[str, Any]
     head_key: str
+    held_cast: bool  # the checkpoint stores its weights at a float precision other than bf16 (tiers._held)
+    fp8_experts: bool  # the checkpoint's fused experts are FP8 (btb/fp8.py), multiplied as stored
+    fp8_layers: set[int]  # the host layers whose FP8 linears are multiplied as stored (`_HostLinear.f8`)
+    fp8_widened: bool  # some FP8 tensor was widened to bf16 for a path that reads it so (MLX slots, a card, cold)
     kv_bits: int | None
     kv_block: int
     kv_host: bool
@@ -137,6 +167,7 @@ class _State:
     wait_s: float
     _closed: bool
     _in_epoch: bool
+    _pass_rec: _PassRecorder | None = None  # the provenance accumulator, created on first tag or reset
 
     # -- the card graph (cuda.py); the mechanism keeps its letters --
     card_pipeline: bool
@@ -176,7 +207,7 @@ class _State:
     eos_ids: tuple[int, ...]
     ngram_p: float
     ngram_tree: bool
-    proposer: str
+    proposer: Proposer
     sampling: Sampling  # the engine's default: greedy unless loaded with temperature/top_p/top_k/seed
     tree_budget: int
     tree_min_prob: float
@@ -233,7 +264,22 @@ class _State:
     def _flush_events(self) -> None:
         raise NotImplementedError
 
-    def _get(self, key: str) -> torch.Tensor:
+    def _get(self, key: str, gguf_shortcut: bool = False, stored: bool = False) -> torch.Tensor:
+        raise NotImplementedError
+
+    def _held(self, t: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def _cast_on_read(self, info: dict[str, Any]) -> bool:
+        raise NotImplementedError
+
+    def _fp8(self, key: str) -> bool:
+        raise NotImplementedError
+
+    def _f8_weights(self, key: str) -> list[F8Weight]:
+        raise NotImplementedError
+
+    def _shape(self, key: str) -> tuple[int, ...]:
         raise NotImplementedError
 
     def _head_host(self) -> Any:
@@ -497,7 +543,7 @@ class _State:
         n_min: int = 2,
         n_max: int = 4,
         on_token: Callable[[int], Any] | None = None,
-        proposer: str = "ngram",
+        proposer: Proposer | str = Proposer.NGRAM,
         spans: Spans = (),
         session: Session | None = None,
         sampling: Any = None,
@@ -557,3 +603,47 @@ class _State:
 
     def vram_trim(self, tag: str = "") -> Any:
         raise NotImplementedError
+
+    # -- pass provenance: the tags a generate's forks record, read as a PassReport. Recording only - a fork
+    # calls `_tag`, it never changes which path runs. `last_pass_report()` is the cert's window on the path a
+    # pass actually took, so a silent fallback is caught rather than certified. --
+    def _pass_reset(self) -> None:
+        """start a fresh report; called once a `generate()` so its passes' tags accumulate into one report"""
+        self._pass_rec = _PassRecorder()
+
+    def _tag(self, *tags: PassTag) -> None:
+        """record the forks a pass took; the recorder is created lazily so a bare `forward()` reports too"""
+        rec = self._pass_rec
+        if rec is None:
+            rec = self._pass_rec = _PassRecorder()
+        rec.tags.update(tags)
+
+    def _tag_tiers(self, n_layers: int) -> None:
+        """record the placement tiers the pass's layers live on, from the same `Placement.tier` every path reads"""
+        place = self.device.snapshot()
+        self._tag(*{_TIER_TAG[place.tier(i)] for i in range(n_layers)})
+        if self.fp8_widened:
+            self._tag(PassTag.FP8_WIDENED)
+
+    def _tag_quant(self) -> None:
+        """record the stored-weight path on MLX: as-stored quant bytes (`mlx_state.affine`) vs a bf16 slot"""
+        if self.mlx is not None:
+            self._tag(PassTag.QUANT_ASSTORED if self.mlx_state.affine else PassTag.QUANT_DEQUANT)
+
+    def _tag_spec(self, proposed: int, accepted: int) -> None:
+        """record one speculative pass's outcome: the accept/reject tags and the running counts"""
+        rec = self._pass_rec
+        if rec is None:
+            rec = self._pass_rec = _PassRecorder()
+        rec.spec_proposed += int(proposed)
+        rec.spec_accepted += int(accepted)
+        if accepted > 0:
+            rec.tags.add(PassTag.SPEC_ACCEPT)
+        if proposed > accepted:
+            rec.tags.add(PassTag.SPEC_REJECT)
+
+    def last_pass_report(self) -> PassReport:
+        """The provenance of the most recent `generate()` (its passes' tags accumulated) or of a bare
+        `forward()`: the `PassTag`s its forks recorded and the speculation counts. Empty before any pass."""
+        rec = self._pass_rec
+        return rec.report() if rec is not None else PassReport()

@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from .. import mlx as mlxdev
-from ..kinds import LayerKind, NodePath, Parents, Tokens
+from ..kinds import LayerKind, NodePath, Parents, PassTag, Tokens
 from ..options import Device
 from ..quant import CARD_WIDTHS, QuantType, card_width, quant_of
 from ..sampling import GREEDY
@@ -1193,6 +1193,7 @@ class _CudaMixin(_State):
         loop's answer: the same kernels, the argmax over the same bf16 logits. Sampled, the draws come from the
         card's generator seeded before the replays: a seed repeats on the same card, and the step loop's draws,
         keyed by the cache row, are another stream."""
+        self._tag(PassTag.CUDA_GRAPH)
         max_new = int(max_new)
         smp = sampling or GREEDY
         target_len = int(ids.shape[1]) + max_new
@@ -1444,6 +1445,7 @@ class _CudaMixin(_State):
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """layers a..b-1 as one replay over `h` [1, T, H]: returns (h, None), or (None, logits [1, T, V]
         float32) when the run carries the tail"""
+        self._tag(PassTag.CUDA_GRAPH)
         cache, T, past = pas.cache, pas.T, pas.past
         st = self._card_state()
         self._card_bind(cache, st, T)
@@ -1477,6 +1479,7 @@ class _CudaMixin(_State):
         return g["h"][:T].view(1, T, -1), None
 
     def _forward_fast(self, h: torch.Tensor, pe: Any, cache: Any, last_only: bool, head: bool) -> torch.Tensor:
+        self._tag(PassTag.CUDA_GRAPH)
         g = self._graphs(h.dtype, pe)
         g["h"].copy_(h[:, -1:, :])
         rope = self._rope_by_type(pe)

@@ -28,7 +28,7 @@ classifiers = [
 ]
 dependencies = [
   "torch>=2.4",
-  "transformers>=5.16",
+  "transformers>=5.16,<6",  # upper bound: a major bump can change family/model code; tests/cert/test_deps.py forces a re-cert on any minor bump within the major
   "huggingface_hub>=0.20",
   "numpy>=1.26",
   "safetensors>=0.4",
@@ -110,7 +110,7 @@ line-ending = "lf"
 [tool.mypy]
 # the interpreter the checks run under (numpy's stubs use 3.12 syntax); ruff keeps the code itself at 3.11
 python_version = "3.13"
-files = ["btb", "bench", "tests", "setup.py"]
+files = ["btb", "bench", "tests", "setup.py", "build.py"]
 check_untyped_defs = true
 warn_unused_ignores = true
 warn_redundant_casts = true
@@ -160,7 +160,10 @@ fallback_version = "0.0.0"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-q"
-markers = ["timing: asserts on wall-clock rates or a process-wide limit; not run on shared CI runners"]
+markers = [
+    "timing: asserts on wall-clock rates or a process-wide limit; not run on shared CI runners",
+    "cert_gap: fails while a certification gap is open (cert.yml gates on it); not a code failure, so a wheel build does not stop on it",
+]
 
 [tool.pylint.messages_control]
 # W0603 global-statement: the lazy kernel caches (btb/mlx/*), the CUDA flag and MEM_START are module state

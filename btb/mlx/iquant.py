@@ -652,10 +652,6 @@ _LATT: dict[str, dict[str, Any]] = {
 }
 
 
-# the lattice kinds `matvec_lattice` takes, as `_LATT` names them (the registry's `QuantType.mlx` for those types)
-LATTICE_KINDS: frozenset[str] = frozenset(_LATT)
-
-
 def repack_lattice(kind: str, raw: Any) -> tuple[Any, ...]:
     """the side streams `matvec_lattice` wants beside the raw bytes for this kind (empty for most), built once."""
     side = _LATT[kind].get("side")

@@ -5,9 +5,14 @@ big model's tree pass (every output token the big model's own). The proposer's i
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
+
+from ..kinds import LayerKind
+
+if TYPE_CHECKING:
+    from .generate import LinSnap
 
 
 class ModelProposer:
@@ -15,7 +20,8 @@ class ModelProposer:
     the tokens committed since the last proposal and reads the root's top-ks[0]; each later pass re-runs the
     tree so far and reads its leaves' top-ks[d]; the chains are the root-to-leaf paths, at most `nodes` of
     them in the tree (the verify tile). The drafter's cache keeps the committed rows only; the tree's rows are
-    cropped after each pass. Every pass costs the small model's step (the 0.6B: 11.5 ms in its kernel)."""
+    cropped after each pass, and a hybrid's DeltaNet state put back to the committed rows'. Every pass costs the
+    small model's step (the 0.6B: 11.5 ms in its kernel)."""
 
     def __init__(
         self, engine: Any, prompt: Iterable[int], ks: Sequence[int] = (3, 2, 1), nodes: int = 14, tag: str = "draft"
@@ -29,6 +35,7 @@ class ModelProposer:
         self.n = len(ids)
         self.pending: list[int] = []
         self.passes = 0
+        self.marks: dict[int, LinSnap] = {}  # a hybrid drafter's DeltaNet state at the committed rows, by layer
 
     def add_sequence(self, ids: Iterable[int], tag: Any) -> int:
         return 0
@@ -69,9 +76,19 @@ class ModelProposer:
         mx.eval(ids)
         return np.array(ids).tolist()
 
+    def _mark(self) -> None:
+        """the DeltaNet state at the committed rows: on MLX a drafter's tree pass, which keeps no checkpoints when
+        the engine does not speculate, writes the state along the nodes it ran; `_crop` puts this back"""
+        sm = self.sm
+        linear = [i for i, kind in enumerate(sm.layer_types) if kind == LayerKind.LINEAR]
+        self.marks = {i: sm._lin_snap(self.cache.layers[i]) for i in linear}
+
     def _crop(self) -> None:
-        for cl in self.cache.layers:
-            if cl.get_seq_length() > self.n:
+        for i, cl in enumerate(self.cache.layers):
+            snap = self.marks.get(i)
+            if snap is not None:
+                self.sm._lin_restore(cl, snap)
+            elif cl.get_seq_length() > self.n:
                 cl.crop(self.n)
 
     def propose_chains(self, v: int, tree: bool = True) -> list[tuple[list[int], str]]:
@@ -83,8 +100,13 @@ class ModelProposer:
         self.pending = []
         # pass 1: the committed tokens as a chain; the last row's top-k are the depth-1 nodes
         k = min(ks[0], self.nodes)
+        base = self.n
         row = self._topk(toks, list(range(-1, len(toks) - 1)), k)[-1]
+        # the pass's rows committed as the target's verify pass commits its accepted path: on the host a tree pass
+        # leaves a hybrid's DeltaNet state to the commit, and the whole chain is committed here
+        self.sm.ad(self.cache, base, list(range(len(toks))))
         self.n += len(toks)
+        self._mark()
         nodes_t = [int(t) for t in row]  # the tree's tokens, node order
         nodes_p = [-1] * k  # each node's parent in the tree (-1 the root, which sits in the cache)
         leaves = list(range(k))

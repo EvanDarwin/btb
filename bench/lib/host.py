@@ -12,8 +12,8 @@ import shutil
 import socket
 import sys
 
-from lib import ROOT, capture
-from lib.records import BenchMemoryState, BenchSpecs
+from bench.lib import ROOT, capture
+from bench.lib.records import BenchMemoryState, BenchSpecs
 
 if sys.platform != "win32":
     import resource

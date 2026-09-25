@@ -5,11 +5,14 @@ import collections
 import contextlib
 import gc
 import hmac
+import ipaddress
 import json
+import math
 import os
 import queue
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -97,6 +100,10 @@ class Engine:
             max_new = self.max_new
         elif self.max_new is not None:
             max_new = min(int(max_new), int(self.max_new))  # --new is a ceiling: a request asks for less, not more
+        # past the window there is nothing to decode into, so a cache is never sized for it
+        room = self.sm.window - len(ids)
+        if max_new is not None and room > 0:
+            max_new = min(max_new, room)
         out, c = self.sm.generate(
             ids,
             max_new,
@@ -198,7 +205,7 @@ class ModelRegistry:
                 "name": self.primary_name,
                 "repo": self.primary_path,
                 "path": self.primary_path,
-                "type": _model_type(self.primary_path) or "",
+                "type": _model_type(self.primary_path),
                 "size": _model_bytes(self.primary_path),
                 "packed": is_packed(self.primary_path),
             }
@@ -366,6 +373,44 @@ MAX_CONNECTIONS = 64  # handler threads at once; past it a connection is answere
 LOOPBACK = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0", "::"})
 
 
+def _public(host: str) -> bool:
+    """whether a peer is on the public internet (an IPv4-mapped IPv6 address judged as its IPv4); an address that
+    does not parse is taken as public, so the check fails closed"""
+    try:
+        a = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return True
+    if isinstance(a, ipaddress.IPv6Address) and a.ipv4_mapped is not None:
+        a = a.ipv4_mapped
+    return a.is_global
+
+
+KEY_REQUIRED = "An API_KEY must be provided"
+_KEY_BODY = json.dumps({"error": KEY_REQUIRED}).encode()
+_KEYLESS_REFUSAL = (
+    b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s"
+    % (len(_KEY_BODY), _KEY_BODY)
+)
+DRAIN_S = 0.5  # how long a turned-away connection's remaining request is read and discarded before it closes
+_DRAINS = threading.BoundedSemaphore(16)  # turned-away connections draining at once
+
+
+def _drain(request: socket.socket) -> None:
+    """read and discard what a turned-away peer is still sending, until it closes or DRAIN_S is up, then close"""
+    deadline = time.monotonic() + DRAIN_S
+    try:
+        while (left := deadline - time.monotonic()) > 0:
+            request.settimeout(left)
+            if not request.recv(1 << 16):
+                break
+    except OSError:
+        pass
+    finally:
+        with contextlib.suppress(OSError):
+            request.close()
+        _DRAINS.release()
+
+
 class _Reject(Exception):
     """a request refused before its body is parsed: (the status, the line)"""
 
@@ -392,6 +437,9 @@ class _Server(ThreadingHTTPServer):
     # reusable so a restart binds at once
     daemon_threads = True
     allow_reuse_address = True
+    # a burst of connections waits to be accepted instead of meeting the default queue of 5, which macOS answers
+    # with a reset: MAX_CONNECTIONS decides who is turned away, not the kernel's accept queue
+    request_queue_size = socket.SOMAXCONN
     reg: ModelRegistry
     api_key: str | None = None  # every request must carry it as a bearer token when set
 
@@ -401,18 +449,34 @@ class _Server(ThreadingHTTPServer):
         self.loopback = str(self.server_address[0]) in LOOPBACK - {"0.0.0.0", "::"}
 
     def process_request(self, request: Any, client_address: Any) -> None:
+        # a keyless server refuses a public peer (a port forwarded to a private bind) before it holds a thread
+        if not self.api_key and _public(str(client_address[0])):
+            self._turn_away(request, _KEYLESS_REFUSAL)
+            return
         # a connection past the cap is answered at once and dropped, so a flood cannot pile up threads while the
         # one model answers one request at a time
         if not self._slots.acquire(blocking=False):
-            with contextlib.suppress(OSError):
-                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
-            self.shutdown_request(request)
+            self._turn_away(
+                request, b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            )
             return
         try:
             super().process_request(request, client_address)
         except BaseException:
             self._slots.release()
             raise
+
+    def _turn_away(self, request: socket.socket, response: bytes) -> None:
+        """answer a connection before it holds a request thread or a slot, and close it so the peer can read the
+        answer: closing over request bytes still arriving resets the connection, and a client mid-body sees a
+        broken pipe instead of the status, so the rest is drained first on a short-lived thread"""
+        with contextlib.suppress(OSError):
+            request.sendall(response)
+            request.shutdown(socket.SHUT_WR)
+        if not _DRAINS.acquire(blocking=False):
+            self.shutdown_request(request)  # draining as many as it takes already: this one closes as it is
+            return
+        threading.Thread(target=_drain, args=(request,), daemon=True, name="turn-away").start()
 
     def process_request_thread(self, request: Any, client_address: Any) -> None:
         try:
@@ -481,13 +545,44 @@ def _short(v: Any) -> str:
 
 
 def _messages(req: Request) -> list[Message]:
-    """the request's messages: a list of objects, else an OptionError (a string or a bare object is the usual slip)"""
+    """the request's messages: a list of objects, each role a string and each content a string, null or a list
+    of parts; else an OptionError (a string or a bare object is the usual slip)"""
     ms = req.get("messages")
     if ms is None:
         return []
     if not isinstance(ms, list) or not all(isinstance(m, dict) for m in ms):
         raise BadValue("messages", "a list of {role, content} objects is expected")
+    for m in ms:
+        if not isinstance(m.get("role", "user"), str):
+            raise BadValue("messages[].role", "a string", m.get("role"))
+        c = m.get("content")
+        if (
+            c is not None
+            and not isinstance(c, str)
+            and not (isinstance(c, list) and all(isinstance(p, dict) for p in c))
+        ):
+            raise BadValue("messages[].content", "a string or a list of {type, text} parts", c)
     return ms
+
+
+def _text(req: Request, name: str, default: str | None = None) -> str | None:
+    """a request's string field under `name`: absent or null the default; anything but a string an OptionError"""
+    v = req.get(name)
+    if v is None:
+        return default
+    if not isinstance(v, str):
+        raise BadValue(name, "a string", v)
+    return v
+
+
+def _object(req: Request, name: str) -> dict[str, Any]:
+    """a request's object field under `name`: absent or null {}; anything but an object an OptionError"""
+    v = req.get(name)
+    if v is None:
+        return {}
+    if not isinstance(v, dict):
+        raise BadValue(name, "an object is expected", v)
+    return v
 
 
 def _flag(req: Request, name: str, default: bool) -> bool:
@@ -505,7 +600,7 @@ def _count(req: Request, name: str) -> int | None:
     n = req.get(name)
     if n is None:
         return None
-    if isinstance(n, bool) or not isinstance(n, (int, float)) or n != int(n) or int(n) < 1:
+    if isinstance(n, bool) or not isinstance(n, (int, float)) or not math.isfinite(n) or n != int(n) or int(n) < 1:
         raise BadValue(name, "a whole number above 0", n)
     return int(n)
 
@@ -527,6 +622,8 @@ def _for_template(messages: Sequence[Message]) -> list[Message]:
                 raise BadValue("tool_calls", "a list of objects is expected")
             fixed = []
             for tc in tcs:
+                if not isinstance(tc.get("function") or {}, dict):
+                    raise BadValue("tool_calls[].function", "an object is expected", tc.get("function"))
                 fn = dict(tc.get("function") or {})
                 a = fn.get("arguments")
                 if isinstance(a, str):
@@ -581,7 +678,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Connection", "close")
             self.end_headers()
-            self.wfile.write(body)
+            self._send_body(body)
             return
         self._json(e.code, {"error": str(e)})
 
@@ -595,7 +692,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        self._send_body(body)
+
+    def _send_body(self, data: bytes) -> None:
+        """the one place a response body is written; a HEAD's is dropped (RFC 9110 9.3.2)"""
+        if self.command != "HEAD":
+            self.wfile.write(data)
 
     def _body(self) -> Any:
         """the JSON body: a missing or bad Content-Length is a 400, one past MAX_BODY a 413 (before a byte is
@@ -627,7 +729,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _write(self, s: str) -> bool:
         try:
-            self.wfile.write(s.encode("utf-8"))
+            self._send_body(s.encode("utf-8"))
             self.wfile.flush()
             return True
         except OSError:  # the client is gone, or stopped reading (the socket timeout is an OSError too)
@@ -750,15 +852,9 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "not found"})
 
     def do_HEAD(self) -> None:
-        try:
-            self._guard()
-        except _Reject as e:
-            self.send_response(e.code)
-            self.end_headers()
-            return
-        self.send_response(200 if self._route() in ("/", "/health") else 404)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        """GET's answer without its body: `_send_body` drops the bytes, so the status and every header, the
+        Content-Length GET would send included, are GET's own"""
+        self.do_GET()
 
     def do_POST(self) -> None:
         r = self._route()
@@ -777,6 +873,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._ollama_chat(req)
             if r == "/api/generate":
                 return self._ollama_generate(req)
+            if r == "/api/show":
+                return self._ollama_show(req)
         except OptionError as bad:  # a field of the wrong type or range, caught before the model runs
             return self._json(400, {"error": str(bad)})
         except Exception as err:
@@ -784,27 +882,8 @@ class Handler(BaseHTTPRequestHandler):
             # (a stream already headed ends where it is instead of a 200 that never closes)
             self.log_message("%s failed: %s", r, "".join(traceback.format_exception(err)).rstrip())
             if not getattr(self, "_headed", False):
-                return self._json(500, {"error": f"{type(err).__name__}: {err}"})
+                return self._json(500, {"error": f"{type(err).__name__}; the server's log has the details"})
             return None
-        if r == "/api/show":
-            self.reg.refresh()
-            n = self.reg.resolve_name(req.get("model") or req.get("name"))
-            if n is None:
-                return self._json(404, {"error": f"model {_short(req.get('model') or req.get('name'))!r} not found"})
-            e = self.reg.entries[n]
-            eng = self.reg.loaded_get(n)
-            fam = eng.family if eng is not None else (e.get("type") or "")
-            return self._json(
-                200,
-                {
-                    "modelfile": f"# btb\nFROM {n}\n",
-                    "parameters": "",
-                    "template": "",
-                    "details": _details(fam),
-                    "model_info": {"general.architecture": fam, "general.basename": n},
-                    "capabilities": ["completion"],
-                },
-            )
         if r in (
             "/api/pull",
             "/api/push",
@@ -817,11 +896,32 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(404, {"error": f"{r} is not supported: btb serves the models already on this machine"})
         return self._json(404, {"error": "not found"})
 
+    def _ollama_show(self, req: Request) -> Any:
+        """the model's card: its family and name, as the Ollama CLI reads them before a run"""
+        self.reg.refresh()
+        n = self.reg.resolve_name(_text(req, "model") or _text(req, "name"))
+        if n is None:
+            return self._json(404, {"error": f"model {_short(req.get('model') or req.get('name'))!r} not found"})
+        e = self.reg.entries[n]
+        eng = self.reg.loaded_get(n)
+        fam = eng.family if eng is not None else (e.get("type") or "")
+        return self._json(
+            200,
+            {
+                "modelfile": f"# btb\nFROM {n}\n",
+                "parameters": "",
+                "template": "",
+                "details": _details(fam),
+                "model_info": {"general.architecture": fam, "general.basename": n},
+                "capabilities": ["completion"],
+            },
+        )
+
     def _engine(self, req: Request) -> Engine | None:
         """Resolve the request's model to a loaded Engine, loading/unloading as needed; None on 404 (the
         caller has already written the error). Call under `self.reg.lock`."""
         try:
-            return self.reg.acquire(req.get("model"))
+            return self.reg.acquire(_text(req, "model"))
         except KeyError:
             self._json(
                 404,
@@ -836,13 +936,16 @@ class Handler(BaseHTTPRequestHandler):
         if not messages:
             return self._json(400, {"error": "messages required"})
         tools = req.get("tools") or None
-        if tools is not None and (not isinstance(tools, list) or not all(isinstance(t, dict) for t in tools)):
-            raise BadValue("tools", "a list of objects is expected")
+        if tools is not None and (
+            not isinstance(tools, list)
+            or not all(isinstance(t, dict) and isinstance(t.get("function"), dict) for t in tools)
+        ):
+            raise BadValue("tools", "a list of {type, function} objects is expected")
         if req.get("tool_choice") == "none":  # the caller asked for prose this turn, not a call
             tools = None
         max_new = _count(req, "max_tokens") or _count(req, "max_completion_tokens")
         stream = _flag(req, "stream", False)
-        want_usage = bool((req.get("stream_options") or {}).get("include_usage"))
+        want_usage = bool(_object(req, "stream_options").get("include_usage"))
         rid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
         with self.reg.lock:
@@ -975,7 +1078,7 @@ class Handler(BaseHTTPRequestHandler):
         n = (opts or {}).get("num_predict")
         if n is None:
             return None
-        if isinstance(n, bool) or not isinstance(n, (int, float)) or n != int(n) or int(n) < -2:
+        if isinstance(n, bool) or not isinstance(n, (int, float)) or not math.isfinite(n) or n != int(n) or int(n) < -2:
             raise BadValue("options.num_predict", "a whole number (above 0 a cap; -1 or -2 no cap)", n)
         return int(n) if int(n) > 0 else None
 
@@ -1024,7 +1127,7 @@ class Handler(BaseHTTPRequestHandler):
         print("[serve] " + " | ".join(bits), flush=True)
 
     def _ollama_chat(self, req: Request) -> Any:
-        messages = [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in _messages(req)]
+        messages = [{"role": m.get("role", "user"), "content": _text(m, "content", "")} for m in _messages(req)]
         if not messages:
             return self._json(400, {"error": "messages required"})
         max_new = self._limit(req)
@@ -1035,7 +1138,7 @@ class Handler(BaseHTTPRequestHandler):
             if engine is None:
                 return None
             name = engine.name
-            smp = Sampling.from_request(req.get("options") or {}, engine.sampling)
+            smp = Sampling.from_request(_object(req, "options"), engine.sampling)
             if not stream:
                 tg = time.perf_counter()
                 ids, toks, c = engine.run(messages, max_new, sampling=smp)
@@ -1085,7 +1188,9 @@ class Handler(BaseHTTPRequestHandler):
             )
 
     def _ollama_generate(self, req: Request) -> Any:
-        prompt = req.get("prompt") or ""
+        prompt = _text(req, "prompt", "") or ""
+        system = _text(req, "system")
+        raw = _flag(req, "raw", False)
         max_new = self._limit(req)
         stream = _flag(req, "stream", True)
         t0 = time.perf_counter()
@@ -1094,13 +1199,13 @@ class Handler(BaseHTTPRequestHandler):
             if engine is None:
                 return None
             name = engine.name
-            smp = Sampling.from_request(req.get("options") or {}, engine.sampling)
+            smp = Sampling.from_request(_object(req, "options"), engine.sampling)
             ids = None
             messages = None
-            if req.get("raw"):
+            if raw:
                 ids = engine.tok(prompt, add_special_tokens=False)["input_ids"]
             else:
-                messages = ([{"role": "system", "content": req["system"]}] if req.get("system") else []) + [
+                messages = ([{"role": "system", "content": system}] if system else []) + [
                     {"role": "user", "content": prompt}
                 ]
             if not stream:
@@ -1148,6 +1253,10 @@ class Handler(BaseHTTPRequestHandler):
 
 class PortInUse(RuntimeError):
     pass
+
+
+class KeyRequired(RuntimeError):
+    """a keyless bind to every interface or a public address"""
 
 
 class Server:
@@ -1239,18 +1348,11 @@ def _serve_until_interrupt(server: Server) -> None:
 
 
 def _exposure(tag: str, host: str, api_key: str | None) -> None:
-    """the line a bind beyond loopback prints: the server is reachable from the network, with or without a key"""
+    """the line a bind beyond loopback prints: who can reach the server, and whether it takes a key"""
     if host in LOOPBACK - {"0.0.0.0", "::"}:
         return
-    print(
-        f"[{tag}] listening on {host}: reachable from the network"
-        + (
-            " with an API key"
-            if api_key
-            else "; no API key set (--api-key, or BTB_API_KEY), anyone who can reach the port can use the model"
-        ),
-        flush=True,
-    )
+    key = "with an API key" if api_key else "without an API key: anyone on its network can use the model"
+    print(f"[{tag}] listening on {host} {key}", flush=True)
 
 
 def start(
@@ -1269,7 +1371,8 @@ def start(
     serves what the machine holds, on request), `host`/`port` the bind (port 0 picks a free one), `device` as
     `btb.load` takes it, `max_new` a ceiling per request, `extra_paths` directories to offer, `pattern` a regex
     over the names, `api_key` a bearer token every request must carry, `**kw` the load options. Raises
-    `PortInUse` when the port is taken. `.start()` serves on a background thread, `.close()` stops it."""
+    `PortInUse` when the port is taken, `KeyRequired` for a keyless `host` of 0.0.0.0 or a public address.
+    `.start()` serves on a background thread, `.close()` stops it."""
     import errno
 
     reg = ModelRegistry(
@@ -1294,6 +1397,11 @@ def start(
                 f"or the Ollama desktop app), so stop that one or pass --port <other>"
             ) from None
         raise
+    bound = str(srv.server_address[0])
+    if not srv.api_key and (bound in ("0.0.0.0", "::") or _public(bound)):
+        srv.server_close()
+        reg.close()
+        raise KeyRequired(f"{KEY_REQUIRED} to bind {host}")
     if reg.primary_name:
         reg.acquire(reg.primary_name)  # a named launch model is loaded up front, as before
     return Server(srv, reg)
@@ -1326,7 +1434,7 @@ def serve(
             api_key=api_key,
             **kw,
         )
-    except PortInUse as e:
+    except (PortInUse, KeyRequired) as e:
         print(f"[serve] {e}", flush=True)
         return 1
     _exposure("serve", host, api_key)
@@ -1404,7 +1512,7 @@ def ollama(
             api_key=api_key,
             **kw,
         )
-    except PortInUse as e:
+    except (PortInUse, KeyRequired) as e:
         print(f"[ollama] {e}", flush=True)
         return 1
     _exposure("ollama", host, api_key)
@@ -1538,7 +1646,7 @@ def pi(
             api_key=api_key,
             **kw,
         )
-    except PortInUse as e:
+    except (PortInUse, KeyRequired) as e:
         print(f"[pi] {e}", flush=True)
         return 1
     _exposure("pi", host, api_key)

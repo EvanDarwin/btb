@@ -1,0 +1,243 @@
+# The certification manifests as a committed check (enforcement lives here, not in gitignored local hooks).
+# Renders the cert state in prose (tests/cert/comment.py: closed vs the base branch, covered, the gaps) into the
+# job summary and, on a PR, a sticky comment; prints the matrices; then runs the torch-free gates as blocking
+# steps: a gap, a reasonless DNR, core family/quant drift, or a native-op gap fails the job. The engine-dependent
+# guards (the cert runner, the runtime drift guards) need torch, so they run against the wheel in wheels.yml.
+# Model-free, CPU-only, fast.
+#
+# The PR's code runs in the `cert` job, which holds a read-only token. Posting the comment needs
+# pull-requests: write, so it is a separate job that checks out nothing and runs no repo code.
+name: cert
+
+on:
+  push:
+    branches: [main]
+    paths:
+      [
+        "tests/cert/**",
+        "btb/kinds.py",
+        "btb/engine/families.py",
+        "btb/engine/native.py",
+        "btb/hf.py",
+        "btb/serve.py",
+        "btb/tools.py",
+        "btb/mlx/**",
+        "native/**",
+        "tests/fixtures/**",
+      ]
+  pull_request:
+    paths:
+      [
+        "tests/cert/**",
+        "btb/kinds.py",
+        "btb/engine/families.py",
+        "btb/engine/native.py",
+        "btb/hf.py",
+        "btb/serve.py",
+        "btb/tools.py",
+        "btb/mlx/**",
+        "native/**",
+        "tests/fixtures/**",
+      ]
+
+concurrency:
+  group: cert-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cert:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      # The manifests import only kinds/hf/spec + gguf + numpy, no torch or engine, so no wheel is needed to
+      # enumerate: the engine-dependent checks run in wheels.yml against the built wheel, and this job keeps the
+      # torch-free half. transformers installs without torch (its frameworks are optional); test_deps only reads
+      # its metadata
+      - name: Install torch-free deps
+        run: python -m pip install --quiet gguf numpy pytest transformers
+
+      # the test suite refuses a run without the native library, so the gates below build it first
+      - name: Build the native library
+        run: python build.py build --no-cuda --no-wheel
+
+      # Coverage is the UNION of receipts (tests/cert/receipt.py) and receipts are deliberately not committed, so
+      # the run has to collect them: each one a contributor pastes into the PR description as a ```json btb-receipt
+      # block (their GPU box, their Mac). They land in one dir and BTB_CERT_RECEIPTS points the later steps at it.
+      # The PR body is untrusted input: it reaches python only through the environment (never interpolated into
+      # this script, which would be shell injection) and is parsed as JSON, never executed.
+      - name: Collect coverage receipts
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          dir=$(mktemp -d)
+          echo "BTB_CERT_RECEIPTS=$dir" >> "$GITHUB_ENV"
+          python - "$dir" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          dest = sys.argv[1]
+          kept = 0
+          # a receipt's strings are rendered into the job summary and compared to cell ids: keep each one line, a
+          # plain charset and bounded, so a crafted body can neither inject markdown nor grant anything (a mangled
+          # id simply matches no cell). `source` lets the report label a pasted receipt as claimed, not CI-verified.
+          unsafe = re.compile(r"[^A-Za-z0-9 ._/+:-]")
+          link = re.compile(r"://|www\.", re.I)  # the two autolink triggers; ':' itself stays for the timestamp
+
+          def clean(s, limit):
+              return unsafe.sub("?", link.sub("?", s.replace("\n", " ").replace("\r", " ")))[:limit]
+
+          for block in re.findall(r"```json btb-receipt[^\n]*\n(.*?)\n?```", os.environ.get("PR_BODY") or "", re.S):
+              try:
+                  doc = json.loads(block)
+              except (ValueError, RecursionError):  # malformed, or nested past the interpreter's limit
+                  continue
+              if not isinstance(doc, dict):
+                  continue
+              machine, when, covered = doc.get("machine"), doc.get("when"), doc.get("covered")
+              if not isinstance(machine, str) or not isinstance(when, str):
+                  continue
+              if not isinstance(covered, list) or len(covered) > 20000 or not all(isinstance(c, str) for c in covered):
+                  continue
+              kept += 1
+              doc = {
+                  "machine": clean(machine, 120),
+                  "when": clean(when, 40),
+                  "covered": [clean(c, 200) for c in covered],
+                  "source": "pr-body",
+              }
+              with open(os.path.join(dest, f"pr-{kept}.json"), "w", encoding="utf-8") as f:
+                  json.dump(doc, f, indent=2, sort_keys=True)
+          print(f"pasted receipts kept: {kept}")
+          PY
+          echo "receipts in $dir:"; ls -1 "$dir" || true
+
+      # the PR's base branch, whose own findings say what this PR closed; a base that predates tests/cert/delta.py
+      # has none, and the comment leaves the section out
+      - if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.base_ref }}
+          path: base
+      - name: The base branch's findings
+        if: github.event_name == 'pull_request'
+        working-directory: base
+        run: |
+          if [ -f tests/cert/delta.py ]; then python -m tests.cert.delta bank --out ../base-findings.json
+          else echo "the base predates tests/cert/delta.py; nothing to compare"; fi
+
+      # before the gates, so the comment renders whatever they find
+      - name: Generate gaps commentary
+        run: |
+          python -m tests.cert.comment $([ -f base-findings.json ] && echo "--base base-findings.json") --out cert-comment.md
+          cat cert-comment.md >> "$GITHUB_STEP_SUMMARY"
+      - if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cert-comment
+          path: cert-comment.md
+          retention-days: 1
+
+      - name: Model-cell matrix
+        run: python -m tests.cert.manifest --report | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Native-op matrix
+        run: python -m tests.cert.native_ops --report | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: CUDA card-kernel matrix
+        run: python -m tests.cert.cuda_ops --report | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: MLX kernel matrix
+        run: python -m tests.cert.mlx_ops --report | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Tool-call parser matrix
+        run: python -m tests.cert.tool_ops --report | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Server route matrix
+        run: python -m tests.cert.serve_ops --report | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # blocking: a gap, reasonless DNR, orphan fixture, or core family/quant drift fails --check; a native-op/
+      # export gap, a CUDA or MLX kernel present-but-unregistered, a parser/family or server route with no test,
+      # fails --check; the pytest runs re-assert the same invariants as unit tests.
+      #
+      # One step per gate, not one script: the model-cell gate is expected to stay red while coverage gaps exist,
+      # and under a shared `bash -e` its failure took every gate after it with it - five checks and both pytest
+      # runs never executed. Separate steps keep each gate's own status visible and each one runs regardless.
+      - name: Gate - model-cell manifest
+        run: python -m tests.cert.manifest --check
+
+      # the standing gaps keep the gate above red; this one fails only on a gap the base branch did not have, so
+      # closing gaps never needs a list edited
+      - name: Gate - no new gaps vs the base branch
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        run: |
+          if [ -f base-findings.json ]; then python -m tests.cert.delta check --baseline base-findings.json
+          else echo "the base predates tests/cert/delta.py; nothing to compare"; fi
+
+      - name: Gate - native ops
+        if: ${{ !cancelled() }}
+        run: python -m tests.cert.native_ops --check
+
+      - name: Gate - CUDA card kernels
+        if: ${{ !cancelled() }}
+        run: python -m tests.cert.cuda_ops --check
+
+      - name: Gate - MLX kernels
+        if: ${{ !cancelled() }}
+        run: python -m tests.cert.mlx_ops --check
+
+      - name: Gate - tool-call parsers
+        if: ${{ !cancelled() }}
+        run: python -m tests.cert.tool_ops --check
+
+      - name: Gate - server routes
+        if: ${{ !cancelled() }}
+        run: python -m tests.cert.serve_ops --check
+
+      - name: Gate - matrix unit tests
+        if: ${{ !cancelled() }}
+        run: |
+          python -m pytest tests/cert/test_manifest.py tests/cert/test_native_ops.py tests/cert/test_cuda_ops.py tests/cert/test_comment.py \
+            tests/cert/test_mlx_ops.py tests/cert/test_tool_ops.py tests/cert/test_serve_ops.py \
+            tests/cert/test_deps.py -q
+
+      # the oracle's derivation + staleness gates are torch-free (the reproducibility gate needs the engine
+      # and runs against the wheel in wheels.yml, with the runner's correctness assertions)
+      - name: Gate - oracle derivation and staleness
+        if: ${{ !cancelled() }}
+        run: python -m pytest tests/cert/test_oracle.py -k "not reproducible" -q
+
+  # the only job with a write token: no checkout, no repo code, just the rendered file and the API. It runs
+  # whether or not the gates passed - the gaps are what the comment is for
+  comment:
+    if: github.event_name == 'pull_request' && !cancelled()
+    needs: cert
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: cert-comment
+      # upserts the bot's own marked comment (anyone can post the marker)
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          marker='<!-- btb-cert-gaps -->'
+          id=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | contains(\"$marker\"))) | .id" | head -n1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@cert-comment.md >/dev/null && echo "updated $id"
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@cert-comment.md >/dev/null && echo "posted"
+          fi

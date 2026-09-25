@@ -1,0 +1,2 @@
+# test data is compared byte for byte (the oracle hashes each fixture), so never convert its line endings
+tests/fixtures/** -text

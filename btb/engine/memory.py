@@ -321,6 +321,7 @@ class _MemoryMixin(_State):
                 n = 1
                 for d in info["shape"]:
                     n *= int(d)
-                b = torch.empty(0, dtype=self.ST_DTYPES[info["dtype"]]).element_size()
+                cast = self._cast_on_read(info)  # held as bf16 (tiers._held)
+                b = 2 if cast else torch.empty(0, dtype=self.ST_DTYPES[info["dtype"]]).element_size()
                 sizes[i] = sizes.get(i, 0) + n * b
         return sizes

@@ -6,16 +6,19 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypedDict, cast
 
 import torch
 import torch.nn.functional as F
 
 from .. import mlx as mlxdev
-from ..kinds import FamilyKind, LayerKind
+from ..kinds import CAPS, KIND_OF, Cap, FamilyKind, LayerKind, ModelType
+from ..mxfp4 import stored_mxfp4
+from ..options import UnsupportedModelType
 from .cache import GrowLayer
 from .fused import _fuse_mlp_cls, _fuse_norm_cls
-from .host import _Experts, _HostLinear, _NGramRows, _Router
+from .host import _Experts, _HostLinear, _NGramRows, _Router, compute_fp32
+from .native import Native
 from .state import _State
 
 
@@ -233,11 +236,59 @@ def act_name(cfg: Any) -> str:
     return str(getattr(cfg, "hidden_activation", None) or getattr(cfg, "hidden_act", "silu"))
 
 
+# the name a user would recognize for each family family() builds; an unsupported load lists these values
+FAMILY_NAMES: dict[FamilyKind, str] = {
+    FamilyKind.QWEN3: "Qwen3",
+    FamilyKind.QWEN3_5: "Qwen3.5",
+    FamilyKind.PHI3: "Phi-3",
+    FamilyKind.QWEN4: "Qwen4 (experimental)",
+    FamilyKind.GPT_OSS: "GPT-OSS",
+    FamilyKind.GEMMA3: "Gemma 3",
+}
+# the model_type view of those names, through KIND_OF (the "_text" variants read as their base family)
+NAME_OF: dict[ModelType, str] = {mt: FAMILY_NAMES[fk] for mt, fk in KIND_OF.items()}
+SUPPORTED_MODEL_TYPES = tuple(KIND_OF)  # the served model_types, from the one declaration in kinds.py
+
+
+class Flags(TypedDict):
+    """the capability booleans `family()` spreads into a Family, one field per `Cap` (the field name is the
+    Cap's value). Typed so the spread checks against Family's fields; the field set is held equal to `Cap` by
+    tests/cert/test_runtime_guards.py, which `_flags()` below builds from."""
+
+    dense: bool
+    kernel_layout: bool
+    hybrid: bool
+    moe: bool
+    mxfp4: bool
+    mrope: bool
+    attn_gate: bool
+    own: bool
+    norm_centered: bool
+    embed_scale: bool
+    dual_rope: bool
+    sandwich: bool
+    flat_cache: bool
+    eager: bool
+    fast: bool
+
+
+def _flags(kind: FamilyKind) -> Flags:
+    """the Family capability flags for a family, projected from `CAPS` - the single source of which caps a family
+    has. family() adds the transformers classes (the runtime); the booleans are read here so they never drift."""
+    caps = CAPS[kind]
+    # one entry per Cap, keyed by the Cap's value (the Family field name), so Flags cannot fall behind the enum
+    return cast(Flags, {c.value: c in caps for c in Cap})
+
+
 def family(cfg: Any) -> Family:
     import importlib
 
-    mt = str(getattr(cfg, "model_type", "") or "")
-    if mt in ("qwen3_5", "qwen3_5_text"):
+    raw = str(getattr(cfg, "model_type", "") or "")
+    try:
+        fk = KIND_OF[ModelType(raw)]  # route by FamilyKind, not a model_type string match; "_text" shares a base
+    except (ValueError, KeyError):
+        raise UnsupportedModelType(raw, list(FAMILY_NAMES.values())) from None
+    if fk is FamilyKind.QWEN3_5:
         mod = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
         # Qwen3.5's norm scales by 1 + weight (weights stored around zero), unlike the families below
         _fuse_norm_cls(mod.Qwen3_5RMSNorm, centered=True)
@@ -247,12 +298,9 @@ def family(cfg: Any) -> Family:
             layer=mod.Qwen3_5DecoderLayer,
             norm=mod.Qwen3_5RMSNorm,
             rotary=mod.Qwen3_5TextRotaryEmbedding,
-            mrope=True,
-            attn_gate=True,
-            hybrid=True,
-            norm_centered=True,
+            **_flags(FamilyKind.QWEN3_5),
         )
-    if mt == "qwen3":
+    if fk is FamilyKind.QWEN3:
         mod = importlib.import_module("transformers.models.qwen3.modeling_qwen3")
         _fuse_norm_cls(mod.Qwen3RMSNorm)
         _fuse_mlp_cls(mod.Qwen3MLP)
@@ -262,12 +310,9 @@ def family(cfg: Any) -> Family:
             layer=mod.Qwen3DecoderLayer,
             norm=mod.Qwen3RMSNorm,
             rotary=mod.Qwen3RotaryEmbedding,
-            mrope=False,
-            attn_gate=False,
-            dense=True,
-            kernel_layout=True,
+            **_flags(FamilyKind.QWEN3),
         )
-    if mt == "phi3":
+    if fk is FamilyKind.PHI3:
         mod = importlib.import_module("transformers.models.phi3.modeling_phi3")
         _fuse_norm_cls(mod.Phi3RMSNorm)
         _fuse_mlp_cls(mod.Phi3MLP)
@@ -277,65 +322,46 @@ def family(cfg: Any) -> Family:
             layer=mod.Phi3DecoderLayer,
             norm=mod.Phi3RMSNorm,
             rotary=mod.Phi3RotaryEmbedding,
-            mrope=False,
-            attn_gate=False,
-            dense=True,
+            **_flags(FamilyKind.PHI3),
         )
-    if mt in ("qwen4_exp", "qwen4_exp_text"):
+    if fk is FamilyKind.QWEN4:
         mod = importlib.import_module("transformers.models.qwen4_exp.modeling_qwen4_exp")
+        # streams (hc_count) is per-config runtime; the sparse attention is the family's own
         return Family(
             kind=FamilyKind.QWEN4,
             mod=mod,
             layer=mod.Qwen4ExpTextDecoderLayer,
             norm=None,
             rotary=mod.Qwen4ExpTextRotaryEmbedding,
-            mrope=True,
-            attn_gate=True,
-            own=True,
-            moe=True,
             streams=int(cfg.hc_count),
             attn=LayerKind.QWEN_SPARSE,
+            **_flags(FamilyKind.QWEN4),
         )
-    if mt == "gpt_oss":
+    if fk is FamilyKind.GPT_OSS:
         mod = importlib.import_module("transformers.models.gpt_oss.modeling_gpt_oss")
-        # an attention sink per query head (a logit with no value) is not expressible through sdpa: the module's eager
-        # attention runs (`fast` off)
+        # an attention sink per query head is not expressible through sdpa, so its eager attention runs (fast off)
         return Family(
             kind=FamilyKind.GPT_OSS,
             mod=mod,
             layer=mod.GptOssDecoderLayer,
             norm=mod.GptOssRMSNorm,
             rotary=mod.GptOssRotaryEmbedding,
-            mrope=False,
-            attn_gate=False,
-            fast=False,
-            moe=True,
-            mxfp4=True,
-            eager=True,
-            flat_cache=True,
+            **_flags(FamilyKind.GPT_OSS),
         )
-    if mt in ("gemma3", "gemma3_text"):
+    if fk is FamilyKind.GEMMA3:
         mod = importlib.import_module("transformers.models.gemma3.modeling_gemma3")
-        # Gemma 3's block is a sandwich norm (the attention and MLP outputs normed before their residual add) with
-        # q/k norms, its embedding scaled by sqrt(hidden), rope split local/global by layer type, and sliding
-        # layers; the host and card paths take each under `sandwich`, `dual_rope` and the layer's window (the
-        # softcapping earlier Gemmas had is gone, so SDPA is exact). Its RMSNorm scales by 1 + weight.
+        # sandwich norm with q/k norms, embedding scaled by sqrt(hidden), local/global rope, sliding layers
         return Family(
             kind=FamilyKind.GEMMA3,
             mod=mod,
             layer=mod.Gemma3DecoderLayer,
             norm=mod.Gemma3RMSNorm,
             rotary=mod.Gemma3RotaryEmbedding,
-            mrope=False,
-            attn_gate=False,
-            fast=True,
-            norm_centered=True,
-            embed_scale=True,
-            dual_rope=True,
-            sandwich=True,
-            flat_cache=True,
+            **_flags(FamilyKind.GEMMA3),
         )
-    raise RuntimeError(f"unsupported model_type {mt!r}")
+    # `raw` is served (KIND_OF answered it) but no branch above builds its family: a table this function has
+    # fallen behind, not a model the user cannot run
+    raise RuntimeError(f"{fk} is declared in kinds.KIND_OF but families.family() builds no Family for it")
 
 
 class _FamiliesMixin(_State):
@@ -346,6 +372,8 @@ class _FamiliesMixin(_State):
 
     @staticmethod
     def _dense_key(key: str) -> bool:
+        if key.endswith(("_scale_inv", ".weight_scale")):
+            return False  # an FP8 tensor's scale, read with it (btb/fp8.py)
         if ".mlp.experts." in key:
             # gpt-oss keeps one bias per expert; it is small and rides with the layer, the matrices stream
             return key.endswith("_proj_bias")
@@ -371,7 +399,15 @@ class _FamiliesMixin(_State):
         if self.fam.kind is not FamilyKind.QWEN4:
             return layer
         ex = layer.mlp.experts
-        layer.mlp.experts = _Experts(self, base + "mlp.experts.", ex.num_experts, ex.act_fn, layer=i)
+        layer.mlp.experts = _Experts(
+            self,
+            base + "mlp.experts.",
+            ex.num_experts,
+            ex.act_fn,
+            layer=i,
+            mx=stored_mxfp4(self.fam.mxfp4, self.gguf),
+            f8=self.fp8_experts,
+        )
         if getattr(layer, "ple", None) is not None:
             out_dtype = self.compute_dtype if self.compute_dtype is not None else torch.bfloat16
             layer.ple.ple_embedding.ngram_embedding = _NGramRows(
@@ -388,14 +424,32 @@ class _FamiliesMixin(_State):
             layer = self.fam.layer(self.cfg, i).eval()
         layer = self._shape_layer(layer, i)
         base = f"{self.prefix}layers.{i}."
+        fp32_owners: set[str] = set()
+        # an FP8 linear of a layer the host kernels run is multiplied as stored (`_HostLinear.f8`), its weight a
+        # shape with no bytes behind it; an MLX-bound or cold layer reads a widened copy into its slots
+        f8_host = (
+            Native.gemv_fp8 is not None and i not in self.cold and not (self.mlx is not None and i in self.mlx_layers)
+        )
+        f8_keys: set[str] = set()
         for name, _p, is_buf in self._named_tensors(layer):
-            t = self._get(base + name)
+            key = base + name
+            f8 = self._fp8(key)
             # widened once: norms, biases, sinks, the conv, Qwen4's router, gpt-oss's per-expert biases (a few MB,
             # added in float32)
-            wide = t.is_floating_point() and (
-                t.dim() <= 1 or "conv1d" in name or ".experts." in name or name.endswith("mlp.gate.weight")
-            )
-            self._set_param(layer, name, t.float() if wide else t, buffer=is_buf)
+            widened = "conv1d" in name or ".experts." in name or name.endswith("mlp.gate.weight")
+            if f8 and f8_host and not widened and len(shape := self._shape(key)) == 2:
+                f8_keys.add(key)
+                self._set_param(layer, name, torch.zeros((), dtype=torch.bfloat16).expand(*shape), buffer=is_buf)
+                continue
+            t = self._get(key, stored=True)
+            wide = t.is_floating_point() and (t.dim() <= 1 or widened)
+            self._set_param(layer, name, t.float() if wide else t.bfloat16() if f8 else self._held(t), buffer=is_buf)
+            # a widened matrix is its module's conv or linear operand; the per-expert biases are added by
+            # `_Experts`, which casts them itself
+            if wide and t.dim() >= 2 and ".experts." not in name:
+                fp32_owners.add(name.rpartition(".")[0])
+        for owner in sorted(fp32_owners):
+            compute_fp32(layer.get_submodule(owner))
         for mname, m in list(layer.named_modules()):
             for cname, child in list(m.named_children()):
                 if isinstance(child, torch.nn.Linear) and child.weight.dtype == torch.bfloat16:
@@ -414,6 +468,11 @@ class _FamiliesMixin(_State):
             layer.mlp.router = _Router(
                 _HostLinear(r.weight.data, key=base + "mlp.router.weight", bias=r.bias.data), int(r.top_k)
             )
+        if f8_keys:
+            for m in layer.modules():
+                if isinstance(m, _HostLinear) and m.key in f8_keys:
+                    m.f8 = self._f8_weights(m.key)[0]
+            self.fp8_layers.add(i)
         if hasattr(layer, "linear_attn"):
             layer.linear_attn.layer_idx = i
         if hasattr(layer, "self_attn"):

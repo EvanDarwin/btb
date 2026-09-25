@@ -15,11 +15,11 @@ from typing import Any, cast
 
 import torch
 
+from bench.lib import say
+from bench.lib.env import compare_tools, llama_cpp_supported
+from bench.lib.records import Axes, BenchDevice, BenchDtype, BenchMatrixCell, BenchRunDoc, BenchStatus
+from bench.lib.tools import TOOLS
 from btb.hf import ModelEntry, ModelInfo, _config, is_gguf, model_info
-from lib import say
-from lib.env import compare_tools, llama_cpp_supported
-from lib.records import Axes, BenchDevice, BenchDtype, BenchMatrixCell, BenchRunDoc, BenchStatus
-from lib.tools import TOOLS
 
 # per device, its `--device`/`--cpu-layers` arguments and the dtype it runs in natively - the CPU tier is fp32
 # arithmetic over the bf16 weights, the card and MLX are bf16. cpu+mlx is a split that needs an explicit

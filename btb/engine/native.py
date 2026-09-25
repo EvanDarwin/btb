@@ -7,7 +7,6 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import os
-import platform
 import sys
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -15,45 +14,20 @@ from typing import Any
 import torch
 
 from .. import mlx as mlxdev
+from ..native_files import kernels_path, native_path
 from ..quant import CARD_KERNELS
 from ..sysinfo import raise_file_limit
 
-# -- where the built library and the CUDA kernels ship: btb/native/<platform-tag>/ ---------------------------
-_LIB_NAMES = {"windows": "btb_native.dll", "linux": "libbtb_native.so", "macos": "libbtb_native.dylib"}
-# the package directory (btb/); this module sits one level down, in btb/engine/
-_PKG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-
-def native_tag() -> str:
-    """Calculate the native platform tag"""
-    system = {"win32": "windows", "linux": "linux", "darwin": "macos"}.get(sys.platform, sys.platform)
-    m = platform.machine().lower()
-    arch = {"amd64": "x86_64", "x86_64": "x86_64", "arm64": "aarch64", "aarch64": "aarch64"}.get(m, m)
-    return f"{system}-{arch}"
-
-
-def native_path() -> str | None:
-    tag = native_tag()
-    own = _LIB_NAMES.get(tag.split("-")[0])
-    names = [own] if own else list(_LIB_NAMES.values())
-    cands = [os.path.join(_PKG, "native", tag, n) for n in names]
-    cands += [os.path.join(_PKG, "native", n) for n in _LIB_NAMES.values()]
-    for p in cands:
-        if os.path.exists(p):
-            return os.path.abspath(p)
-    return None
-
-
-def kernels_path() -> str | None:
-    """the CUDA decode kernels (btb_kernels.fatbin)"""
-    tag = native_tag()
-    for p in (
-        os.path.join(_PKG, "native", tag, "btb_kernels.fatbin"),
-        os.path.join(_PKG, "native", "btb_kernels.fatbin"),
-    ):
-        if os.path.exists(p):
-            return os.path.abspath(p)
-    return None
+def isa() -> str:
+    """the kernel tier the native library selected for this process (avx512/avx2/neon/scalar; `BTB_NATIVE_ISA`
+    honored) - what a benchmark's numbers belong to"""
+    p = native_path()
+    if p is None:
+        raise NativeError("btb_isa", -1, ": no native library in this install")
+    f = ctypes.CDLL(p).btb_isa
+    f.restype = ctypes.c_char_p
+    return f().decode()
 
 
 class NativeError(RuntimeError):
@@ -64,6 +38,126 @@ class NativeError(RuntimeError):
         self.call, self.rc, self.detail = call, int(rc), detail
         self.errno = ctypes.get_errno() if os_error else 0
         super().__init__(f"{call} returned {rc}{detail}{f': {os.strerror(self.errno)}' if self.errno else ''}")
+
+
+class NativeDtypeError(TypeError):
+    """A tensor handed to a native kernel is not the element type the kernel reads through its pointer: `call`
+    the kernel, `arg` the argument, `got` its dtype and `want` what the kernel was built for. Raised before the
+    call by a binding loaded with `checked`, so a wrong tensor is refused rather than read as another type's."""
+
+    def __init__(self, call: str, arg: str, got: torch.dtype, want: tuple[torch.dtype, ...]) -> None:
+        self.call, self.arg, self.got, self.want = call, arg, got, want
+        super().__init__(f"{call}: {arg} is {got}, the kernel reads {' or '.join(str(w) for w in want)}")
+
+
+_BF16, _F32, _U8, _I32 = torch.bfloat16, torch.float32, torch.uint8, torch.int32
+# what one argument must be: a tensor (or each of a group's tensors) and the dtypes the kernel reads it as
+Want = tuple[torch.Tensor | Sequence[torch.Tensor], tuple[torch.dtype, ...]]
+
+# each fixed-type binding: its kernel, and its arguments' wants from the call's own arguments, in the order a
+# refusal names the first wrong one
+_WANTS: dict[str, tuple[str, Callable[..., dict[str, Want]]]] = {
+    "gemv": ("btb_gemv_bf16_rows", lambda w, x, y: {"w": (w, (_BF16,)), "x": (x, (_F32,)), "y": (y, (_F32,))}),
+    "gemv_p12": (
+        "btb_gemv_p12_rows",
+        lambda lo, hi4, tbl, esc_idx, esc_val, n_esc, rows, cols, x, y: {
+            "lo": (lo, (_U8,)),
+            "hi4": (hi4, (_U8,)),
+            "table": (tbl, (_U8,)),
+            **({"esc_idx": (esc_idx, (_I32,)), "esc_val": (esc_val, (_U8,))} if n_esc else {}),
+            "x": (x, (_F32,)),
+            "y": (y, (_F32,)),
+        },
+    ),
+    "gemv_group": (
+        "btb_gemv_bf16_group",
+        lambda ws, xs, ys: {"w": (ws, (_BF16,)), "x": (xs, (_F32,)), "y": (ys, (_F32,))},
+    ),
+    "gemv_mx4": (
+        "btb_gemv_mxfp4_rows",
+        lambda w, x, y: {
+            "blocks": (w.blocks, (_U8,)),
+            "scales": (w.scales, (_U8,)),
+            "x": (x, (_F32,)),
+            "y": (y, (_F32,)),
+        },
+    ),
+    "gemv_mx4_group": (
+        "btb_gemv_mxfp4_group",
+        lambda ws, xs, ys: {
+            "blocks": ([w.blocks for w in ws], (_U8,)),
+            "scales": ([w.scales for w in ws], (_U8,)),
+            "x": (xs, (_F32,)),
+            "y": (ys, (_F32,)),
+        },
+    ),
+    "gemv_mx4_ggml": (
+        "btb_gemv_mxfp4_ggml_rows",
+        lambda w, x, y: {"blocks": (w.blocks, (_U8,)), "x": (x, (_F32,)), "y": (y, (_F32,))},
+    ),
+    "gemv_mx4_ggml_group": (
+        "btb_gemv_mxfp4_ggml_group",
+        lambda ws, xs, ys: {"blocks": ([w.blocks for w in ws], (_U8,)), "x": (xs, (_F32,)), "y": (ys, (_F32,))},
+    ),
+    "gemv_fp8": (
+        "btb_gemv_fp8_rows",
+        lambda w, x, y: {"w": (w.w, (_U8,)), "scales": (w.scales, (_F32,)), "x": (x, (_F32,)), "y": (y, (_F32,))},
+    ),
+    "gemv_fp8_group": (
+        "btb_gemv_fp8_group",
+        lambda ws, xs, ys: {
+            "w": ([w.w for w in ws], (_U8,)),
+            "scales": ([w.scales for w in ws], (_F32,)),
+            "x": (xs, (_F32,)),
+            "y": (ys, (_F32,)),
+        },
+    ),
+    "delta_step": (
+        "btb_delta_step",
+        lambda mixed, conv_state, conv_w, conv_b, z, a, b, a_log, dt_bias, state, hk, hv, dk, dv, norm_w, eps, out: {
+            "conv_b": ([] if conv_b is None else conv_b, (_F32,)),
+            **{
+                k: (t, (_F32,))
+                for k, t in (
+                    ("mixed", mixed),
+                    ("conv_state", conv_state),
+                    ("conv_w", conv_w),
+                    ("z", z),
+                    ("a", a),
+                    ("b", b),
+                    ("a_log", a_log),
+                    ("dt_bias", dt_bias),
+                    ("state", state),
+                    ("norm_w", norm_w),
+                    ("out", out),
+                )
+            },
+        },
+    ),
+    "attn_decode": (
+        "btb_attn_decode",
+        lambda q, k, v, scale, out: {
+            "q": (q, (_F32,)),
+            "k": (k, (_BF16, _F32)),
+            "v": (v, (k.dtype,)),
+            "out": (out, (_F32,)),
+        },
+    ),
+}
+
+
+def _checked(name: str, fn: Callable[..., Any]) -> Callable[..., Any]:
+    """the binding `name`, refusing the first argument whose dtype its kernel does not read before calling it"""
+    call, wants = _WANTS[name]
+
+    def run(*args: Any, **kw: Any) -> Any:
+        for arg, (ts, want) in wants(*args, **kw).items():
+            for t in [ts] if isinstance(ts, torch.Tensor) else ts:
+                if t.dtype not in want:
+                    raise NativeDtypeError(call, arg, t.dtype, want)
+        return fn(*args, **kw)
+
+    return run
 
 
 def quiet_omp() -> None:
@@ -87,6 +181,8 @@ class Native:
         "gemv_mx4_group",
         "gemv_mx4_ggml",
         "gemv_mx4_ggml_group",
+        "gemv_fp8",
+        "gemv_fp8_group",
         "gemv_q4k",
         "gemv_q6k",
         "gemv_q5k",
@@ -119,6 +215,8 @@ class Native:
     gemv_mx4_group: Any = None
     gemv_mx4_ggml: Any = None
     gemv_mx4_ggml_group: Any = None
+    gemv_fp8: Any = None
+    gemv_fp8_group: Any = None
     gemv_q4k: Any = None
     gemv_q6k: Any = None
     gemv_q5k: Any = None
@@ -154,8 +252,11 @@ class Native:
 
     @classmethod
     def load_gemv(
-        cls, dll_path: str | os.PathLike[str], threads: int = 0
+        cls, dll_path: str | os.PathLike[str], threads: int = 0, checked: bool = False
     ) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None]:
+        """Bind the library's kernels onto the class; `checked` wraps each fixed-type one to refuse a tensor of
+        another dtype (`NativeDtypeError`) - a debugging aid, off by default, so a decode step pays nothing for
+        what the engine fixes at load. Returns the bf16 gemv."""
         lib = ctypes.CDLL(dll_path, use_errno=True)
         raise_file_limit()
         f = lib.btb_gemv_bf16_rows
@@ -426,6 +527,53 @@ class Native:
                     raise NativeError(sym, rc)
 
             setattr(cls, kind, gemv_latt)
+        cls.gemv_fp8 = cls.gemv_fp8_group = None
+        if hasattr(lib, "btb_gemv_fp8_rows") and hasattr(lib, "btb_gemv_fp8_group"):
+            # an FP8 matrix as stored (btb/fp8.py's F8Weight): its e4m3 bytes and its f32 scale grid
+            f8r, f8g = lib.btb_gemv_fp8_rows, lib.btb_gemv_fp8_group
+            P = ctypes.c_void_p
+            S = ctypes.c_size_t
+            f8r.restype = f8g.restype = ctypes.c_int32
+            PP, PS = ctypes.POINTER(P), ctypes.POINTER(S)
+            f8r.argtypes = [P, P, S, S, S, S, P, S, P, S]
+            f8g.argtypes = [S, PP, PP, PS, PS, PS, PS, PP, PS, PP, S]
+
+            def gemv_fp8(w: Any, x: torch.Tensor, y: torch.Tensor) -> None:
+                (rows, cols), (sr, sc) = w.shape, w.grid
+                rc = f8r(
+                    w.w.data_ptr(),
+                    w.scales.data_ptr(),
+                    rows,
+                    cols,
+                    sr,
+                    sc,
+                    x.data_ptr(),
+                    x.shape[0],
+                    y.data_ptr(),
+                    threads,
+                )
+                if rc != 0:
+                    raise NativeError("btb_gemv_fp8_rows", rc)
+
+            def gemv_fp8_group(ws: Sequence[Any], xs: Sequence[torch.Tensor], ys: Sequence[torch.Tensor]) -> None:
+                n = len(ws)
+                rc = f8g(
+                    n,
+                    (P * n)(*[w.w.data_ptr() for w in ws]),
+                    (P * n)(*[w.scales.data_ptr() for w in ws]),
+                    (S * n)(*[w.shape[0] for w in ws]),
+                    (S * n)(*[w.shape[1] for w in ws]),
+                    (S * n)(*[w.grid[0] for w in ws]),
+                    (S * n)(*[w.grid[1] for w in ws]),
+                    (P * n)(*[x.data_ptr() for x in xs]),
+                    (S * n)(*[x.shape[0] for x in xs]),
+                    (P * n)(*[y.data_ptr() for y in ys]),
+                    threads,
+                )
+                if rc != 0:
+                    raise NativeError("btb_gemv_fp8_group", rc)
+
+            cls.gemv_fp8, cls.gemv_fp8_group = gemv_fp8, gemv_fp8_group
         cls.read_direct = None
         if hasattr(lib, "btb_read_direct"):
             rd = lib.btb_read_direct
@@ -603,7 +751,12 @@ class Native:
                     raise RuntimeError(f"btb_attn_decode returned {rc}")
 
             cls.attn_decode = attn_decode
-        return gemv
+        if checked:
+            for name in _WANTS:
+                bound = getattr(cls, name)
+                if bound is not None:
+                    setattr(cls, name, _checked(name, bound))
+        return cls.gemv
 
     # the card's own kernels (a `_Cuda`), bound by `load_cuda` once per process; None until then
     cuda: Any = None
@@ -718,7 +871,6 @@ class _Cuda:
     _PROP_NORMAL, _PROP_STREAMING, _PROP_PERSISTING = 0, 1, 2
 
     def __init__(self, fatbin_path: str | os.PathLike[str]) -> None:
-        import sys
 
         name = self._NAMES.get({"win32": "windows", "linux": "linux"}.get(sys.platform, sys.platform))
         if name is None:
@@ -886,7 +1038,7 @@ class _Cuda:
             (1024, 1, 1),
             [P(x), P(kk), I(V), P(fp), P(gM), P(gpreK), P(gpreP), P(gbest)],
         )
-        self.launch("btb_sample_out", ((R + 255) // 256, 1, 1), (256, 1, 1), [P(gbest), P(out)])
+        self.launch("btb_sample_out", ((R + 255) // 256, 1, 1), (256, 1, 1), [P(gbest), P(out), I(R)])
         return out.to(torch.int64)
 
     def verify(

@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 //! Page-fenced gated DeltaNet step: the in-place states against guard pages on both sides, the
 //! parameters read-only, and the tree pass's multi-row state slab.
-#![cfg(windows)]
 
 mod common;
 

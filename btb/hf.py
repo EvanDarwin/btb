@@ -18,15 +18,13 @@ from collections.abc import Callable, Iterable
 from enum import StrEnum
 from typing import Any, TypedDict, TypeVar
 
-from .kinds import Json
+from .kinds import KIND_OF, Json, ModelType, Quant, QuantClass, quants_of
 
 T = TypeVar("T")
 
-# model_types the engine can actually serve (mirrors StreamedTextModel.family); a downloaded repo of any other
-# type is skipped by the discovery below so it never shows up as a servable model
-SERVE_TYPES = frozenset(
-    {"qwen3", "qwen3_5", "qwen3_5_text", "phi3", "qwen4_exp", "qwen4_exp_text", "gpt_oss", "gemma3", "gemma3_text"}
-)
+# model_types the engine serves, from the one family declaration in kinds.py (no hand list to drift from
+# family()); a downloaded repo of any other type is skipped by the discovery below
+SERVE_TYPES = frozenset(KIND_OF)
 
 # the files a model is: what `resolve` downloads of a repo, and what `btb pack` copies beside its packed weights
 MODEL_FILES = ("*.json", "*.safetensors", "*.txt", "*.model", "*.jinja", "*.tiktoken")
@@ -78,8 +76,28 @@ def draft_notice(model: str | None) -> str | None:
 
 
 GGUF_EXT = ".gguf"
-# btb's families by their llama.cpp architecture name (general.architecture), an explicit table
-ARCH_MODEL_TYPES = {"qwen3": "qwen3", "phi3": "phi3", "gpt-oss": "gpt_oss"}
+# btb's families by their llama.cpp architecture name (general.architecture) -> the ModelType the loader assigns.
+# The keys are llama.cpp's arch strings (its vocabulary, e.g. "gpt-oss" hyphenated); the values are ModelType so
+# a GGUF target is tied to the enum, not a loose string (consistency_problems checks each is served).
+ARCH_MODEL_TYPES = {
+    "qwen3": ModelType.QWEN3,
+    "phi3": ModelType.PHI3,
+    "gpt-oss": ModelType.GPT_OSS,
+    "qwen35": ModelType.QWEN3_5_TEXT,
+}
+# the bits an integer takes in each type the affine decoder reads; the only part of the table below that no
+# declaration derives
+_AFFINE_BITS = {Quant.Q4_0: 4, Quant.Q4_1: 4, Quant.Q8_0: 8, Quant.Q4_K: 4}
+# the GGUF storage types the affine decoder can produce (blocks an affine quantization at group 32: a scale and
+# an offset per 32 values), the form the packed kernels multiply as stored -> the bits an integer takes. The
+# AFFINE class from kinds.QUANT_KIND, plus Q4_K, which the affine decoder also produces though it is classified
+# by the k-quant kernel it binds through first.
+AFFINE_TYPES: dict[Quant, int] = {q: _AFFINE_BITS[q] for q in [*quants_of(QuantClass.AFFINE), Quant.Q4_K]}
+
+# llama.cpp's architecture for transformers' qwen4_exp, which the gguf package's releases (0.19) do not know yet:
+# btb carries its tensor names until they do (gguf.OWN_NAMES)
+QWEN4EXP = "qwen4exp"
+ARCH_MODEL_TYPES[QWEN4EXP] = ModelType.QWEN4_EXP_TEXT
 
 
 def is_gguf(path: Any) -> bool:
@@ -172,7 +190,7 @@ class ModelEntry(TypedDict):
     name: str
     repo: str
     path: str
-    type: str | None
+    type: ModelType | None
     size: int
     packed: bool
 
@@ -215,11 +233,18 @@ def _config(d: str) -> Json | None:
         return None
 
 
-def _model_type(d: str) -> str | None:
+def _model_type(d: str) -> ModelType | None:
+    """the model_type of a GGUF file (through its architecture) or of a checkpoint's config; None when the file
+    is unreadable or names a type btb does not serve, which the discovery below skips either way"""
     if is_gguf(d):
         return ARCH_MODEL_TYPES.get(gguf_arch(d) or "")
     c = _config(d)
-    return None if c is None else str(c.get("model_type") or "")
+    if c is None:
+        return None
+    try:
+        return ModelType(str(c.get("model_type") or ""))
+    except ValueError:
+        return None
 
 
 def pack_format(path: str) -> Json | None:
@@ -449,7 +474,7 @@ def available_models(paths: Iterable[str] = (), pattern: str | None = None) -> l
         if not _model_complete(d):
             continue
         mt = _model_type(d)
-        if mt not in SERVE_TYPES:
+        if mt is None or mt not in SERVE_TYPES:
             continue
         # name from the repo id (the snapshot directory is named for a commit hash, not the model), a GGUF
         # file for the file

@@ -1211,9 +1211,12 @@ extern "C" __global__ void __launch_bounds__(SMP_THREADS) btb_sample_draw(
     smp_block_argmax(best, bi, &gbest[r]);
 }
 
-// write out[r] = the picked token from the packed gbest (a tiny finalize after the draw's grid has settled)
-extern "C" __global__ void btb_sample_out(const unsigned long long* gbest, unsigned* out) {
+// write out[r] = the picked token from the packed gbest (a tiny finalize after the draw's grid has settled). The
+// launch rounds R up to whole blocks, so the threads past R leave: unguarded, a one-row pick's 255 spare threads
+// wrote ~1 KB past `out` into whatever the allocator had placed after it
+extern "C" __global__ void btb_sample_out(const unsigned long long* gbest, unsigned* out, int R) {
     const unsigned r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= (unsigned)R) return;
     out[r] = ~(unsigned)(gbest[r] & 0xFFFFFFFFull);
 }
 
