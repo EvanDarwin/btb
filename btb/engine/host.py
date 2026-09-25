@@ -171,13 +171,14 @@ class _Experts(torch.nn.Module):
         self.layer = int(layer)
         self.gate_up = None
         self.down = None
-        # gpt-oss: the experts stay MXFP4 into the matvec, the two per-expert biases ride with the layer, the gate is
-        # its own clamped GLU
+        # MXFP4 experts (gpt-oss's, or a GGUF's stored so) stay MXFP4 into the matvec; gpt-oss's two per-expert
+        # biases ride with the layer and its gate is its own clamped GLU over interleaved halves
         self.mx = bool(mx)
         self.ggml = self.mx and getattr(sm, "gguf", None) is not None  # a GGUF's experts, ggml's layout as stored
         self.gate = gate
         self.alpha = float(alpha)
         self.limit = float(limit)
+        self.biased = bool(biases)
         if biases:
             self.gate_up_proj_bias = torch.nn.Parameter(torch.zeros(0), requires_grad=False)
             self.down_proj_bias = torch.nn.Parameter(torch.zeros(0), requires_grad=False)
@@ -214,9 +215,14 @@ class _Experts(torch.nn.Module):
     def _act(self, gate_up: torch.Tensor, rows: Any = None) -> torch.Tensor:
         """The expert's middle: `gate_up` [n, 2 * intermediate] to [n, intermediate]; `rows` names the expert behind
         each row when there is a bias to add."""
-        if self.mx:
+        if self.biased:
             gate_up = gate_up + self._bias(self.gate_up_proj_bias, rows, gate_up)
         return self.gate(gate_up, self.alpha, self.limit) if self.gate is not None else self._silu_gate(gate_up)
+
+    def _join(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        """a GGUF's separate gate and up outputs in the checkpoint's [2I] order: gpt-oss's GLU interleaves its
+        halves, the other families concatenate them"""
+        return MxGateUp.interleave(gate, up) if self.gate is not None else torch.cat([gate, up], dim=-1)
 
     @staticmethod
     def _bias(param: Any, rows: Any, like: torch.Tensor) -> torch.Tensor:
@@ -246,7 +252,7 @@ class _Experts(torch.nn.Module):
 
     def _gate_up_rows(self, gemv_group: Any, ws: Any, xf: torch.Tensor, pos: Any, gu_buf: torch.Tensor) -> None:
         """`gu_buf[i] = gate_up_e x` for the experts at `pos`: one matvec each, or a GGUF's gate and up matvecs
-        interleaved into the checkpoint's [2I] order"""
+        joined into the checkpoint's [2I] order"""
         if not self.ggml:
             gemv_group([w[0] for w in ws], [xf] * len(pos), [gu_buf[i : i + 1] for i in pos])
             return
@@ -258,7 +264,7 @@ class _Experts(torch.nn.Module):
             [tg[j : j + 1] for j in range(n)] + [tu[j : j + 1] for j in range(n)],
         )
         for j, i in enumerate(pos):
-            gu_buf[i] = MxGateUp.interleave(tg[j], tu[j])
+            gu_buf[i] = self._join(tg[j], tu[j])
 
     def _one_row(
         self,
@@ -306,11 +312,11 @@ class _Experts(torch.nn.Module):
             if not pos:
                 return
             self._gate_up_rows(gemv_group, ws, xf, pos, gu_buf)
-            rows = torch.tensor([hit[i] for i in pos]) if self.mx else None
+            rows = torch.tensor([hit[i] for i in pos]) if self.biased else None
             h = self._act(gu_buf[pos].to(dt), rows).float().contiguous()
             gemv_group([w[1] for w in ws], [h[j : j + 1] for j in range(len(pos))], [dn_buf[i : i + 1] for i in pos])
             for _j, i in enumerate(pos):
-                o = dn_buf[i] + self._bias(self.down_proj_bias, hit[i], dn_buf) if self.mx else dn_buf[i]
+                o = dn_buf[i] + self._bias(self.down_proj_bias, hit[i], dn_buf) if self.biased else dn_buf[i]
                 out[i] = o.to(dt) * weights[slot[hit[i]]]
 
         ready = [i for i, e in enumerate(hit) if e in views and i not in card]
@@ -356,7 +362,8 @@ class _Experts(torch.nn.Module):
             # MXFP4 experts through the GPU's matvec, each expert its own graph queued as its bytes land, the outputs
             # summed in expert order at the end whichever were ready first
             self.sm._tag(PassTag.EXPERT_MXFP4_ASSTORED)  # the store's blocks as stored, never widened
-            bg, bd = self._mx_biases()
+            bg, bd = self._mx_biases() if self.biased else (None, None)
+            act = None if self.gate is not None else self.sm._mlx_act()  # gpt-oss's clamped GLU, else the family's
             shp = store.mx_shapes()
             xm = mlxdev.to_mx(x)
             parts = {}
@@ -364,7 +371,7 @@ class _Experts(torch.nn.Module):
             def part(e: int, pair: Any) -> None:
                 ti, wts = rows(e)
                 parts[e] = be.expert_mx(
-                    xm, ti, wts, pair, e, shp[0], shp[1], bg, bd, self.alpha, self.limit, ggml=store.ggml
+                    xm, ti, wts, pair, e, shp[0], shp[1], bg, bd, self.alpha, self.limit, ggml=store.ggml, act=act
                 )
 
             for e in hit:
@@ -409,7 +416,7 @@ class _Experts(torch.nn.Module):
 
     def _linear(self, x: torch.Tensor, w: Any) -> torch.Tensor:
         if isinstance(w, MxGateUp):
-            return MxGateUp.interleave(self._linear(x, w.gate), self._linear(x, w.up))
+            return self._join(self._linear(x, w.gate), self._linear(x, w.up))
         if isinstance(w, MxWeight):
             # the MXFP4 kernel widens a column tile once and reuses it over the batch tile, so it is the
             # path at every batch size and a row's value does not depend on how many rows travel with it
@@ -516,7 +523,7 @@ class _Experts(torch.nn.Module):
                     cur = x[token_idx]
                     h = self._act(self._linear(cur, w_gu), e)
                     h = self._linear(h, w_dn)
-                if self.mx:
+                if self.biased:
                     h = h + self._bias(self.down_proj_bias, e, h)
                 contrib[e] = (token_idx, h * w_top[token_idx, top_k_pos, None])
 

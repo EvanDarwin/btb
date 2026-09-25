@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 from .. import mlx as mlxdev
 from ..kinds import CAPS, KIND_OF, Cap, FamilyKind, LayerKind, ModelType
+from ..mxfp4 import stored_mxfp4
 from ..options import UnsupportedModelType
 from .cache import GrowLayer
 from .fused import _fuse_mlp_cls, _fuse_norm_cls
@@ -395,7 +396,9 @@ class _FamiliesMixin(_State):
         if self.fam.kind is not FamilyKind.QWEN4:
             return layer
         ex = layer.mlp.experts
-        layer.mlp.experts = _Experts(self, base + "mlp.experts.", ex.num_experts, ex.act_fn, layer=i)
+        layer.mlp.experts = _Experts(
+            self, base + "mlp.experts.", ex.num_experts, ex.act_fn, layer=i, mx=stored_mxfp4(self.fam.mxfp4, self.gguf)
+        )
         if getattr(layer, "ple", None) is not None:
             out_dtype = self.compute_dtype if self.compute_dtype is not None else torch.bfloat16
             layer.ple.ple_embedding.ngram_embedding = _NGramRows(

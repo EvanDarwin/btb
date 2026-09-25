@@ -348,12 +348,14 @@ def llama_convert(model_dir: str, out: str, outtype: str) -> None:
 
 def requantize_gguf(src: str, like: str, out: str, outtype: str) -> None:
     """`like` (a converter q8_0 output) rewritten as `outtype`: every tensor it stores as Q8_0 quantized to
-    `outtype` from `src`'s (the f32 output's) numbers, every other tensor and every metadata key copied as is."""
+    `outtype` from `src`'s (the f32 output's) numbers, every other tensor and every metadata key copied as is.
+    MXFP4 is llama.cpp's MXFP4_MOE (src/llama-quant.cpp): only the 3-D expert tensors, the rest kept Q8_0."""
     import numpy as np
     from gguf import GGMLQuantizationType, GGUFReader, GGUFValueType, GGUFWriter, Keys, LlamaFileType
     from gguf.quants import quantize
 
     qtype = GGMLQuantizationType[outtype.upper()]
+    moe = qtype is GGMLQuantizationType.MXFP4
     r, f32 = GGUFReader(like), {t.name: t for t in GGUFReader(src).tensors}
     w = GGUFWriter(out, str(r.fields[Keys.General.ARCHITECTURE].contents()))
     for f in r.fields.values():
@@ -361,9 +363,9 @@ def requantize_gguf(src: str, like: str, out: str, outtype: str) -> None:
             continue
         sub = f.types[-1] if f.types[0] is GGUFValueType.ARRAY else None
         w.add_key_value(f.name, f.contents(), f.types[0], sub_type=sub)
-    w.add_file_type(LlamaFileType[f"MOSTLY_{outtype.upper()}"])
+    w.add_file_type(LlamaFileType[f"MOSTLY_{outtype.upper()}{'_MOE' if moe else ''}"])
     for t in r.tensors:
-        if t.tensor_type is GGMLQuantizationType.Q8_0:
+        if t.tensor_type is GGMLQuantizationType.Q8_0 and (not moe or len(t.shape) == 3):
             arr = np.asarray(f32[t.name].data).reshape([int(x) for x in reversed(list(t.shape))])
             w.add_tensor(t.name, quantize(arr, qtype), raw_dtype=qtype)
         else:
@@ -381,9 +383,7 @@ def make_q4_gguf() -> None:
     import shutil
     import tempfile
 
-    from btb.kinds import QuantClass, quants_of
-
-    types = [q.value.lower() for c in (QuantClass.FLOAT, QuantClass.AFFINE) for q in quants_of(c)]
+    types = [q.value.lower() for c in (QuantClass.FLOAT, QuantClass.AFFINE, QuantClass.MXFP4) for q in quants_of(c)]
     src = os.path.join(FIXTURES, "tiny_q4")
     out = os.path.join(FIXTURES, "gguf")
     with tempfile.TemporaryDirectory() as tmp:

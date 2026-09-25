@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from .gguf import GGUFModel
 
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 """MXFP4 as gpt-oss stores it, and the one definition of the expert store's slot.
@@ -45,6 +48,12 @@ GGML_BLOCK_BYTES = 17
 
 #: the exponent bias of the e8m0 scale: `2**(scale - BIAS)`.
 BIAS = 127
+
+
+def stored_mxfp4(mxfp4_family: bool, gguf: GGUFModel | None) -> bool:
+    """whether a model's experts are MXFP4 blocks the matvec multiplies as stored: an MXFP4 family's checkpoint
+    (gpt-oss's), or a GGUF whose expert tensors llama.cpp stored as MXFP4 (its MXFP4_MOE file type, any MoE)"""
+    return mxfp4_family if gguf is None else gguf.mxfp4_experts()
 
 
 def blocks_per_row(k: int) -> int:

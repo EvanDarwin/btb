@@ -19,7 +19,7 @@ import torch
 
 from .. import mlx as mlxdev
 from ..kinds import PassTag
-from ..mxfp4 import BLOCK, MxGateUp, MxWeight
+from ..mxfp4 import BLOCK, MxGateUp, MxWeight, stored_mxfp4
 from ..options import Device
 from ..sysinfo import host_free_bytes
 from .host import bf16_in_place
@@ -429,7 +429,7 @@ class _ExpertStore:
         self.sizes = None
         self.dt = torch.bfloat16
         self.as_bf16 = set()
-        self.mx = bool(sm.fam.mxfp4)
+        self.mx = stored_mxfp4(sm.fam.mxfp4, getattr(sm, "gguf", None))
         # a GGUF's experts: gate, up and down in ggml's block layout, multiplied as stored (btb/mxfp4.py)
         self.ggml = self.mx and getattr(sm, "gguf", None) is not None
         # a GGUF's other experts, which no kernel multiplies as stored: a read dequantizes the expert (its layout

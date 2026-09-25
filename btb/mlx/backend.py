@@ -426,10 +426,12 @@ class Backend:
         alpha: float,
         limit: float,
         ggml: bool = False,
+        act: Callable[[mx_.array], mx_.array] | None = None,
     ) -> Any:
         """One MXFP4 expert over its rows as its own graph (`async_eval`): `xm` [T, H], `token_idx`/`wts` its rows and
         router weights, `pair` = (gu, dn) uint8 slot views with `gu_shape`/`dn_shape` (`ggml`: a GGUF's, gu the
-        (gate, up) views in ggml's layout), the bias tables, `alpha`/`limit` the gate's. Up to 16 rows through
+        (gate, up) views in ggml's layout), the bias tables (None for a family without them), and the gate:
+        gpt-oss's clamped GLU with `alpha`/`limit`, or `act(gate) * up` where `act` is given. Up to 16 rows through
         the batch-invariant matvec, more through a gemm. Returns (idx, y): the rows' indices (None for the whole
         input) and the weighted output in x's dtype."""
         m = mx()
@@ -439,13 +441,20 @@ class Backend:
         idx = None if whole else m.array(np.asarray(token_idx, dtype=np.int32))
         cur = xm if whole else m.take(xm, idx, axis=0)
         if ggml:
-            y = matmul_mxfp4_pair(gu[0], gu[1], gu_shape[0] // 2, gu_shape[1], cur) + gu_bias[e].astype(xm.dtype)
+            y = matmul_mxfp4_pair(gu[0], gu[1], gu_shape[0] // 2, gu_shape[1], cur)
         else:
-            y = matmul_mxfp4(gu, gu_shape[0], gu_shape[1], cur) + gu_bias[e].astype(xm.dtype)
-        gate = m.minimum(y[..., 0::2], limit)
-        up = m.clip(y[..., 1::2], -limit, limit)
-        h = ((up + 1) * (gate * m.sigmoid(alpha * gate))).astype(xm.dtype)
-        o = matmul_mxfp4(dn, dn_shape[0], dn_shape[1], h, ggml=ggml) + dn_bias[e].astype(xm.dtype)
+            y = matmul_mxfp4(gu, gu_shape[0], gu_shape[1], cur)
+        if gu_bias is not None:
+            y = y + gu_bias[e].astype(xm.dtype)
+        if act is not None:  # the pair's rows interleave gate and up
+            h = (act(y[..., 0::2]) * y[..., 1::2]).astype(xm.dtype)
+        else:
+            gate = m.minimum(y[..., 0::2], limit)
+            up = m.clip(y[..., 1::2], -limit, limit)
+            h = ((up + 1) * (gate * m.sigmoid(alpha * gate))).astype(xm.dtype)
+        o = matmul_mxfp4(dn, dn_shape[0], dn_shape[1], h, ggml=ggml)
+        if dn_bias is not None:
+            o = o + dn_bias[e].astype(xm.dtype)
         y = o * m.array(np.asarray(wts, dtype=np.float32)).astype(xm.dtype)[:, None]
         m.async_eval(y)
         return idx, y

@@ -2,10 +2,10 @@
 """GGUF models (btb/gguf.py): the fixtures' GGUF twins (tests/make_fixtures.py gguf) read through the gguf
 package - the config off the metadata, every tensor of the family mapped through llama.cpp's table, a bf16
 file decoding token for token as its safetensors twin, an f16 file within f16's rounding of it, a quantized
-file as the numbers llama.cpp dequantizes, a gpt-oss file's MXFP4 experts streamed and multiplied as stored
-(ggml's layout, in the CPU and Metal kernels), discovery and resolution of .gguf paths. The tokenizer conversion (transformers') is not exercised
-here: the fixtures' byte-level vocabulary has no merges, which that converter refuses; it is checked on a real
-release."""
+file as the numbers llama.cpp dequantizes, a gpt-oss or qwen4exp file's MXFP4 experts streamed and multiplied
+as stored (ggml's layout, in the CPU and Metal kernels), discovery and resolution of .gguf paths. The tokenizer
+conversion (transformers') is not exercised here: the fixtures' byte-level vocabulary has no merges, which that
+converter refuses; it is checked on a real release."""
 
 import json
 import os
@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 import torch
+
+from btb.kinds import PassTag
 
 if TYPE_CHECKING:
     from btb.gguf import GGUFModel
@@ -503,32 +505,65 @@ def test_a_bf16_qwen4exp_gguf_decodes_as_its_safetensors_twin() -> None:
     assert _tokens(os.path.join(GGUF, "tiny_q4-bf16.gguf")) == _tokens(Q4)
 
 
-def test_a_quantized_qwen4exp_gguf_decodes_as_its_dequantized_weights(tmp_path: Path) -> None:
-    """Q8_0, Q4_0 and Q4_1: the file decodes exactly as a checkpoint of the numbers it dequantizes to, the
-    experts dequantized into the expert store's slots as a checkpoint's are read into them"""
-    _need()
+def _q4_dequantized_twin(path: str, dest: Path) -> str:
+    """a tiny_q4 checkpoint of the numbers the GGUF at `path` dequantizes to, written at `dest`: the n-gram table
+    split back into the checkpoint's shards, and experts the file keeps as MXFP4 blocks (read by the store, not
+    mapped to an HF name) rebuilt as the checkpoint's gate/up and down tables"""
     from safetensors.torch import save_file
 
     from btb.gguf import GGUFModel
 
+    g = GGUFModel(path)
+    deq = {hf: g.get(gn).contiguous() for hf, gn in _q4_names(g).items() if not hf.endswith("_exps.weight")}
+    assert any(not torch.equal(deq[k], v) for k, v in _q4_state().items() if k in deq), path
+    for i in range(int(g.config().num_hidden_layers)):
+        pre, exps = f"model.layers.{i}.mlp.experts.", f"blk.{i}.ffn_{{}}_exps.weight"
+        if exps.format("gate") in g.tensors and pre + "gate_up_proj" not in deq:
+            deq[pre + "gate_up_proj"] = torch.cat([g.get(exps.format("gate")), g.get(exps.format("up"))], dim=1)
+            deq[pre + "down_proj"] = g.get(exps.format("down")).contiguous()
     shards: dict[str, list[int]] = {}  # the checkpoint's shard rows, in order, by PLE layer
     for k, v in sorted(safetensors_state(Q4).items(), key=lambda kv: (len(kv[0]), kv[0])):
         if NGRAM in k:
             shards.setdefault(k.partition(NGRAM)[0], []).append(int(v.shape[0]))
+    for pre, rows in shards.items():
+        for j, part in enumerate(torch.split(deq.pop(pre + NGRAM + "0.weight"), rows)):
+            deq[pre + NGRAM + f"{j}.weight"] = part.contiguous()
+    dest.mkdir()
+    for fn in ("config.json", "tokenizer.json", "tokenizer_config.json"):
+        shutil.copy(os.path.join(Q4, fn), dest / fn)
+    save_file(deq, str(dest / "model.safetensors"), metadata={"format": "pt"})
+    return str(dest)
+
+
+def test_a_quantized_qwen4exp_gguf_decodes_as_its_dequantized_weights(tmp_path: Path) -> None:
+    """Q8_0, Q4_0 and Q4_1: the file decodes exactly as a checkpoint of the numbers it dequantizes to, the
+    experts dequantized into the expert store's slots as a checkpoint's are read into them"""
+    _need()
     for qt in ("q8_0", "q4_0", "q4_1"):
         path = os.path.join(GGUF, f"tiny_q4-{qt}.gguf")
-        g = GGUFModel(path)
-        deq = {hf: g.get(gn).contiguous() for hf, gn in _q4_names(g).items()}
-        assert any(not torch.equal(deq[k], v) for k, v in _q4_state().items()), qt
-        for pre, rows in shards.items():
-            for j, part in enumerate(torch.split(deq.pop(pre + NGRAM + "0.weight"), rows)):
-                deq[pre + NGRAM + f"{j}.weight"] = part.contiguous()
-        twin = tmp_path / f"twin-{qt}"
-        twin.mkdir()
-        for fn in ("config.json", "tokenizer.json", "tokenizer_config.json"):
-            shutil.copy(os.path.join(Q4, fn), twin / fn)
-        save_file(deq, str(twin / "model.safetensors"), metadata={"format": "pt"})
-        assert _tokens(path) == _tokens(str(twin)), qt
+        assert _tokens(path) == _tokens(_q4_dequantized_twin(path, tmp_path / f"twin-{qt}")), qt
+
+
+def test_a_qwen4exp_mxfp4_gguf_multiplies_its_experts_as_stored(tmp_path: Path) -> None:
+    """llama.cpp's MXFP4_MOE of tiny_q4 (its experts MXFP4, every other matrix Q8_0): the expert store reads the
+    experts straight out of the file in ggml's layout and multiplies them as stored through the family's own
+    SiLU gate, and the file decodes as a checkpoint of its dequantized numbers on the CPU and on MLX"""
+    _need()
+    from btb.engine.device import mlx_available
+    from btb.mxfp4 import MxGateUp
+
+    path = os.path.join(GGUF, "tiny_q4-mxfp4.gguf")
+    with loaded_model(path, device="cpu") as sm:
+        assert "blk.0.ffn_gate_exps.weight" in sm.weight_map
+        out, _ = sm.generate(PROMPT, 8, eos=(), speculate=False)
+        store = sm.expert_store
+        assert store is not None and store.ggml
+        assert isinstance(store._views(store.last_slots[next(iter(store.last_slots))])[0], MxGateUp)
+        assert PassTag.EXPERT_MXFP4_ASSTORED in sm.last_pass_report()
+    twin = _q4_dequantized_twin(path, tmp_path / "twin")
+    assert [int(t) for t in out] == _tokens(twin)
+    if mlx_available():
+        assert _tokens(path, "mlx") == _tokens(twin, "mlx")
 
 
 def test_gguf_paths_are_discovered_resolved_and_not_packed() -> None:

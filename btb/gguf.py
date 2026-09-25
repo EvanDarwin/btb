@@ -522,11 +522,16 @@ class GGUFModel:
             self.undo[name] = (file, undo)
             names[hf] = name
             hdr[hf] = self._entry(file, list(undo.shape or self._shape(file)), None if name == file else "undone")
+        mx_experts = self.mxfp4_experts()
         if self.arch == QWEN4EXP:
-            self._map_qwen4exp(hf_names, get_name, names, hdr)
-        else:
+            self._map_qwen4exp(hf_names, get_name, names, hdr, rebuild_experts=not mx_experts)
+        if self.arch != QWEN4EXP or mx_experts:
             self._map_experts(hf_names, n_layers, names, hdr)
         return names, hdr
+
+    def mxfp4_experts(self) -> bool:
+        """whether the file stores its experts as MXFP4 (gpt-oss's, or llama.cpp's MXFP4_MOE of any MoE)"""
+        return any(n.endswith("_exps.weight") and t.tensor_type.name == "MXFP4" for n, t in self.tensors.items())
 
     def _undo(self, hf: str, shape: list[int]) -> Undo | None:
         """the inverse of llama.cpp's Qwen3.5 converter (`Qwen3_5TextModel.modify_tensors`, which qwen4exp's runs
@@ -577,11 +582,14 @@ class GGUFModel:
             b = b.reshape(rows, -1, size)[:, blocks].reshape(rows, -1)
         return np.ascontiguousarray(b)
 
-    def _map_qwen4exp(self, hf_names: list[str], get_name: NameMap, names: dict[str, str], hdr: Json) -> None:
+    def _map_qwen4exp(
+        self, hf_names: list[str], get_name: NameMap, names: dict[str, str], hdr: Json, rebuild_experts: bool
+    ) -> None:
         """qwen4exp's checkpoint tensors that are not one file tensor each (conversion/qwen4exp.py): the indexer's
-        projection and the experts' gate/up, each split in two by the converter and joined on read, the experts'
-        down projection under its stacked name, and the n-gram table as its one shard with its hash constants off
-        the metadata. Its per-tensor rewrites are the Qwen3.5 converter's, inverted in `weight_map`."""
+        projection and (`rebuild_experts`: experts the store dequantizes) the experts' gate/up, each split in two
+        by the converter and joined on read, the experts' down projection under its stacked name, and the n-gram
+        table as its one shard with its hash constants off the metadata. Its per-tensor rewrites are the Qwen3.5
+        converter's, inverted in `weight_map`; MXFP4 experts are `_map_experts`' spans, multiplied as stored."""
 
         def rows(a: list[np.ndarray]) -> np.ndarray:
             return np.concatenate(a, axis=-2)
@@ -614,11 +622,11 @@ class GGUFModel:
                     tensor_name(self.arch, m, int(layer)) + ".weight" for m in ("INDEXER_Q_PROJ", "INDEXER_K_PROJ")
                 )
                 derive(hf, qk_proj, rows, [shape(qk_proj[0])[0] + shape(qk_proj[1])[0], shape(qk_proj[0])[1]])
-            elif rest == "mlp.experts.gate_up_proj":
+            elif rest == "mlp.experts.gate_up_proj" and rebuild_experts:
                 gu = tuple(f"{get_name(pre + 'mlp.experts.' + k)}.weight" for k in ("gate_proj", "up_proj"))
                 e, i, h = shape(gu[0])
                 derive(hf, gu, rows, [e, 2 * i, h])
-            elif rest == "mlp.experts.down_proj":
+            elif rest == "mlp.experts.down_proj" and rebuild_experts:
                 f = f"{get_name(pre + 'mlp.experts.down_proj')}.weight"
                 names[hf], hdr[hf] = f, self._entry(f)
             elif rest.startswith("ple.ple_embedding.") and rest.rpartition(".")[2] in consts:
@@ -636,7 +644,7 @@ class GGUFModel:
         for i in range(int(n_layers)):
             pre = f"blk.{i}.ffn_"
             if pre + "gate_exps.weight" not in self.tensors:
-                return
+                continue  # a dense layer between MoE ones
             for k in ("gate", "up", "down"):
                 t = self.tensors[pre + k + "_exps.weight"]
                 if t.tensor_type.name != "MXFP4":

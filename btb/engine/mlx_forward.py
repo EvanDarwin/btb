@@ -420,7 +420,7 @@ class _MlxMixin(_State):
         self.mlx_state.bytes += int(raw.nbytes)
         return True
 
-    def _mlx_act(self) -> Any:
+    def _mlx_act(self) -> Callable[[mx_.array], mx_.array] | None:
         if self.mlx is None:
             return None
         return self.mlx.act(act_name(self.cfg))
@@ -1106,6 +1106,7 @@ class _MlxMixin(_State):
             T = int(hm.shape[0])
             dt = mlxdev.torch_dtype(hm.dtype)
         act = self._mlx_act()
+        assert act is not None  # _mlx_ok admits the family only with an MLX activation
         silu = act_name(c) in ("silu", "swish")  # the fused gate/up kernel is silu's; gelu keeps `act`
         Hq = int(c.num_attention_heads)
         Hk = int(getattr(c, "num_key_value_heads", None) or Hq)
@@ -1721,6 +1722,7 @@ class _MlxMixin(_State):
             T = int(hm.shape[0])
             dt = mlxdev.torch_dtype(hm.dtype)
         act = self._mlx_act()
+        assert act is not None  # _mlx_ok admits the family only with an MLX activation
         silu = act_name(c) in ("silu", "swish")
         past = cache.get_seq_length() if cache is not None else 0
         Hq = int(c.num_attention_heads)
