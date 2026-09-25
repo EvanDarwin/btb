@@ -199,6 +199,34 @@ def test_grow_layer_appends_rows_in_order() -> None:
     assert keys.untyped_storage().data_ptr() == layer._buf[0].untyped_storage().data_ptr()
 
 
+def test_grow_layer_crop_cuts_the_rows_on_the_torch_path() -> None:
+    """`crop` was a new length for the shared MLX buffer alone: a torch layer kept every row, so a prefill chunk
+    rolled back after a GPU recovery was appended twice, and a draft model drafted over rows it had rejected.
+    It cuts the rows, keeps them all past the length, and drops the last -n for transformers' negative form."""
+    layer = GrowLayer()
+    layer.update(*_kv(1, 2, 5, 8, fill=1.0))
+    layer.crop(3)
+    assert layer.get_seq_length() == 3 and layer.keys.shape[-2] == layer.values.shape[-2] == 3
+    keys, _values = layer.update(*_kv(1, 2, 1, 8, fill=2.0))
+    assert keys[0, 0, :, 0].tolist() == [1.0, 1.0, 1.0, 2.0], "the next row lands after the cut"
+    layer.crop(10)
+    assert layer.get_seq_length() == 4, "a length past the rows keeps them all"
+    layer.crop(-1)
+    assert layer.get_seq_length() == 3 and layer.keys[0, 0, :, 0].tolist() == [1.0, 1.0, 1.0]
+
+
+def test_grow_layer_crop_cuts_the_arena_front() -> None:
+    """a layer whose rows are the front of the card's arena (`attach`) is cut to the front's new length"""
+    layer = GrowLayer()
+    layer.update(*_kv(1, 2, 4, 8, fill=1.0))
+    kb, vb = torch.zeros(1, 2, 16, 8, dtype=torch.bfloat16), torch.zeros(1, 2, 16, 8, dtype=torch.bfloat16)
+    layer.attach(kb, vb)
+    layer.crop(2)
+    assert layer.get_seq_length() == 2 and layer.keys.data_ptr() == kb.data_ptr()
+    keys, _values = layer.update(*_kv(1, 2, 1, 8, fill=3.0))
+    assert keys[0, 0, :, 0].tolist() == [1.0, 1.0, 3.0] and kb[0, 0, 2, 0].item() == 3.0
+
+
 def test_grow_layer_reserves_the_cap_hint_and_not_the_floor() -> None:
     """`cap_hint` is prompt + max_new: the caller knows how far the sequence runs, so the buffer is that long
     and no longer. Without it every layer takes the 4096-position floor, which a batch of short decodes

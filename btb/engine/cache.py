@@ -358,9 +358,18 @@ class GrowLayer(_DynamicLayer):
         self._n += int(T)
 
     def crop(self, n: int) -> None:
-        """keep the first n rows (an int8 layer's crop, off the torch view)"""
-        self._tk = self._tv = None
-        self._n = int(n)
+        """keep the first n rows (n past the length keeps them all); a negative n drops the last -n, as
+        transformers' `DynamicLayer.crop` takes it. A shared layer's crop is a new length (an int8 layer's is off
+        the torch view); a torch layer's rows are cut, the card's arena front with them"""
+        have = self.get_seq_length()
+        n = max(0, have + int(n)) if n < 0 else min(int(n), have)
+        if self.shared and self._mx is not None:
+            self._tk = self._tv = None
+            self._n = n
+            return
+        if n < have:
+            k, v = self.keys, self.values
+            self.keys, self.values = k[..., :n, :], v[..., :n, :]
 
     def gather(self, keep: Sequence[int], base: int = 0, lazy: bool = False) -> list[Any]:
         """The rows `keep` become the cache: gathered on the GPU and written back, an int8 layer's scales with
