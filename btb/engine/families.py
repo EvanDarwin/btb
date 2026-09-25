@@ -18,6 +18,7 @@ from ..options import UnsupportedModelType
 from .cache import GrowLayer
 from .fused import _fuse_mlp_cls, _fuse_norm_cls
 from .host import _Experts, _HostLinear, _NGramRows, _Router, compute_fp32
+from .native import Native
 from .state import _State
 
 
@@ -371,6 +372,8 @@ class _FamiliesMixin(_State):
 
     @staticmethod
     def _dense_key(key: str) -> bool:
+        if key.endswith(("_scale_inv", ".weight_scale")):
+            return False  # an FP8 tensor's scale, read with it (btb/fp8.py)
         if ".mlp.experts." in key:
             # gpt-oss keeps one bias per expert; it is small and rides with the layer, the matrices stream
             return key.endswith("_proj_bias")
@@ -397,7 +400,13 @@ class _FamiliesMixin(_State):
             return layer
         ex = layer.mlp.experts
         layer.mlp.experts = _Experts(
-            self, base + "mlp.experts.", ex.num_experts, ex.act_fn, layer=i, mx=stored_mxfp4(self.fam.mxfp4, self.gguf)
+            self,
+            base + "mlp.experts.",
+            ex.num_experts,
+            ex.act_fn,
+            layer=i,
+            mx=stored_mxfp4(self.fam.mxfp4, self.gguf),
+            f8=self.fp8_experts,
         )
         if getattr(layer, "ple", None) is not None:
             out_dtype = self.compute_dtype if self.compute_dtype is not None else torch.bfloat16
@@ -416,14 +425,25 @@ class _FamiliesMixin(_State):
         layer = self._shape_layer(layer, i)
         base = f"{self.prefix}layers.{i}."
         fp32_owners: set[str] = set()
+        # an FP8 linear of a layer the host kernels run is multiplied as stored (`_HostLinear.f8`), its weight a
+        # shape with no bytes behind it; an MLX-bound or cold layer reads a widened copy into its slots
+        f8_host = (
+            Native.gemv_fp8 is not None and i not in self.cold and not (self.mlx is not None and i in self.mlx_layers)
+        )
+        f8_keys: set[str] = set()
         for name, _p, is_buf in self._named_tensors(layer):
-            t = self._get(base + name, stored=True)
+            key = base + name
+            f8 = self._fp8(key)
             # widened once: norms, biases, sinks, the conv, Qwen4's router, gpt-oss's per-expert biases (a few MB,
             # added in float32)
-            wide = t.is_floating_point() and (
-                t.dim() <= 1 or "conv1d" in name or ".experts." in name or name.endswith("mlp.gate.weight")
-            )
-            self._set_param(layer, name, t.float() if wide else self._held(t), buffer=is_buf)
+            widened = "conv1d" in name or ".experts." in name or name.endswith("mlp.gate.weight")
+            if f8 and f8_host and not widened and len(shape := self._shape(key)) == 2:
+                f8_keys.add(key)
+                self._set_param(layer, name, torch.zeros((), dtype=torch.bfloat16).expand(*shape), buffer=is_buf)
+                continue
+            t = self._get(key, stored=True)
+            wide = t.is_floating_point() and (t.dim() <= 1 or widened)
+            self._set_param(layer, name, t.float() if wide else t.bfloat16() if f8 else self._held(t), buffer=is_buf)
             # a widened matrix is its module's conv or linear operand; the per-expert biases are added by
             # `_Experts`, which casts them itself
             if wide and t.dim() >= 2 and ".experts." not in name:
@@ -448,6 +468,11 @@ class _FamiliesMixin(_State):
             layer.mlp.router = _Router(
                 _HostLinear(r.weight.data, key=base + "mlp.router.weight", bias=r.bias.data), int(r.top_k)
             )
+        if f8_keys:
+            for m in layer.modules():
+                if isinstance(m, _HostLinear) and m.key in f8_keys:
+                    m.f8 = self._f8_weights(m.key)[0]
+            self.fp8_layers.add(i)
         if hasattr(layer, "linear_attn"):
             layer.linear_attn.layer_idx = i
         if hasattr(layer, "self_attn"):

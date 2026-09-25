@@ -53,6 +53,8 @@ class StreamedTextModel(
         "BF16": torch.bfloat16,
         "F16": torch.float16,
         "F32": torch.float32,
+        "F8_E4M3": torch.float8_e4m3fn,  # fine-grained FP8 weights (btb/fp8.py)
+        "F8_E8M0": torch.float8_e8m0fnu,  # their scales stored as exponents
         "F64": torch.float64,
         "I64": torch.int64,
         "I32": torch.int32,
@@ -70,7 +72,8 @@ class StreamedTextModel(
     _NGramRows = _NGramRows
     _ExpertStore = _ExpertStore
     MTPDrafter = MTPDrafter
-    gemv = gemv_p12 = gemv_group = gemv_mx4 = gemv_mx4_group = attn_decode = delta_step = read_direct = None
+    gemv = gemv_p12 = gemv_group = gemv_mx4 = gemv_mx4_group = gemv_fp8 = gemv_fp8_group = None
+    attn_decode = delta_step = read_direct = None
     read_open = read_at = read_close = None
     # `Native.open` and `Native.close` are the reader's file handle; `close` here is the engine's own teardown,
     # so those two are mirrored under the names above
@@ -212,6 +215,9 @@ class StreamedTextModel(
         if self.gguf is None:
             _mm, hdr, _ = self._shard(self.weight_map[emb_keys[0]])
             self.held_cast = self.ST_DTYPES[hdr[emb_keys[0]]["dtype"]] != torch.bfloat16
+        self.fp8_experts = any(self._fp8(k) for k in self.weight_map if k.endswith(".mlp.experts.gate_up_proj"))
+        self.fp8_layers = set()
+        self.fp8_widened = False
         # set by close(): every decode loop ends at its next step, so no thread is mid-pass when the buffers go
         self.abort = threading.Event()
         self._decode_lock = threading.RLock()  # one decode at a time on the engine (MLX's worker serializes too)

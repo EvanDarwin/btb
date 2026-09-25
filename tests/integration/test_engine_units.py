@@ -777,6 +777,7 @@ def test_every_native_kernel_refuses_a_dtype_it_was_not_built_for(monkeypatch: p
     pairs and decoded garbage without a word. Loaded `checked`, every fixed-type binding refuses before the call,
     naming the argument, and writes nothing"""
     from btb.engine.native import Native, NativeDtypeError
+    from btb.fp8 import F8Weight
     from btb.mxfp4 import MxWeight, ggml_bytes, matrix_bytes
 
     dll = native_library()
@@ -791,6 +792,10 @@ def test_every_native_kernel_refuses_a_dtype_it_was_not_built_for(monkeypatch: p
     mx_bad = MxWeight(torch.zeros(nb, dtype=torch.int8), torch.zeros(ns, dtype=u8), r, c)
     gg = MxWeight.from_ggml(torch.zeros(ggml_bytes(r, c), dtype=u8), r, c)
     gg_bad = MxWeight.from_ggml(torch.zeros(ggml_bytes(r, c), dtype=torch.int8), r, c)
+    f8 = F8Weight(torch.zeros(r * c, dtype=u8), torch.ones(1, 1), r, c)
+    f8_bad = F8Weight(torch.zeros(r * c, dtype=torch.int8), torch.ones(1, 1), r, c)
+    f8_bad_scales = F8Weight(torch.zeros(r * c, dtype=u8), torch.ones(1, 1), r, c)
+    f8_bad_scales.scales = torch.ones(1, 1, dtype=torch.float64)
     p12 = (torch.zeros(r * c, dtype=u8), torch.zeros(r * c // 2, dtype=u8), torch.zeros(16, dtype=u8))
     no_esc = (torch.zeros(0, dtype=torch.int32), torch.zeros(0, dtype=u8), 0)
     q, kv = torch.zeros(2, 16, dtype=f32), torch.zeros(1, 3, 16, dtype=bf)
@@ -846,6 +851,16 @@ def test_every_native_kernel_refuses_a_dtype_it_was_not_built_for(monkeypatch: p
             "btb_gemv_mxfp4_ggml_group",
             "blocks",
             lambda y: Native.gemv_mx4_ggml_group([gg, gg_bad], [x, x], [y, y]),
+            f32,
+        ),
+        ("gemv_fp8", "btb_gemv_fp8_rows", "w", lambda y: Native.gemv_fp8(f8_bad, x, y), f32),
+        ("gemv_fp8", "btb_gemv_fp8_rows", "scales", lambda y: Native.gemv_fp8(f8_bad_scales, x, y), f32),
+        ("gemv_fp8", "btb_gemv_fp8_rows", "x", lambda y: Native.gemv_fp8(f8, x.half(), y), f32),
+        (
+            "gemv_fp8_group",
+            "btb_gemv_fp8_group",
+            "w",
+            lambda y: Native.gemv_fp8_group([f8, f8_bad], [x, x], [y, y]),
             f32,
         ),
         ("attn_decode", "btb_attn_decode", "k", lambda y: Native.attn_decode(q, kv.half(), kv, 1.0, y), f32),

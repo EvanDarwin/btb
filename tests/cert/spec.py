@@ -306,6 +306,14 @@ def residency_tag(kind: FamilyKind, knobs: dict[str, object]) -> PassTag | None:
     return PassTag.EXPERT_LINE if knobs.get("bus_pass", 1) == 0 else PassTag.EXPERT_BUS_PASS
 
 
+def storage_tag(storage: Storage, hw: Hardware) -> PassTag | None:
+    """the tag a storage's own read leaves, or None where it has none: FP8 multiplied as stored on the host's
+    kernels, widened into the bf16 slots MLX and a card read (families.py `f8_host`)"""
+    if storage is not Storage.SAFE_FP8:
+        return None
+    return PassTag.FP8_ASSTORED if hw is Hardware.CPU else PassTag.FP8_WIDENED
+
+
 @dataclass(frozen=True)
 class DeviceSubpath:
     """one set of engine branches, named by `key` and selected by `knobs` (every one a real `options.KNOWN`
@@ -323,10 +331,11 @@ class DeviceSubpath:
     needs: Cap | None = None
 
     def expects(self, kind: FamilyKind, storage: Storage) -> frozenset[PassTag]:
-        """every tag a run of this cell must carry: the sub-path's own, plus the residency policy this cell's
-        own knobs select where the family has an expert store - so the default's Bus Pass is asserted too."""
-        res = residency_tag(kind, self.knobs)
-        return frozenset({self.expect(kind, storage), *([res] if res is not None else [])})
+        """every tag a run of this cell must carry: the sub-path's own, the residency policy this cell's own knobs
+        select where the family has an expert store - so the default's Bus Pass is asserted too - and the
+        storage's own read where it leaves one (`storage_tag`)."""
+        extra = (residency_tag(kind, self.knobs), storage_tag(storage, self.hardware))
+        return frozenset({self.expect(kind, storage), *(t for t in extra if t is not None)})
 
 
 # device sub-paths, not devices: each a distinct set of branches

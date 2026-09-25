@@ -281,6 +281,8 @@ class PassTag(StrEnum):
     # the stored weight path a linear read (mlx_state.affine; only on MLX)
     QUANT_ASSTORED = "quant_asstored"  # a GGUF quant bound as its own bytes (matvec kernels)
     QUANT_DEQUANT = "quant_dequant"  # a bf16 slot (float weights, or a GGUF dequantized to bf16)
+    FP8_ASSTORED = "fp8_asstored"  # FP8 weights multiplied as stored, e4m3 bytes and scale grid (the native kernel)
+    FP8_WIDENED = "fp8_widened"  # FP8 weights widened by their scales to bf16 before the matmul
     # where a MoE layer's experts came from, and how their blocks were multiplied (host.py, experts.py)
     EXPERT_TABLES = "expert_tables"  # the checkpoint's whole expert tables, no store
     EXPERT_STORE = "expert_store"  # the store served the layer's experts out of its slots

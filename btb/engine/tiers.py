@@ -18,7 +18,9 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from .. import fp8
 from .. import mlx as mlxdev
+from ..fp8 import F8Weight
 from ..gguf import GROUP
 from ..hf import AFFINE_TYPES
 from ..kinds import Json, LayerKind, Proposer, Tier
@@ -443,15 +445,53 @@ class _TiersMixin(_State):
         if info.get("gguf") is not None:
             return False
         dt = self.ST_DTYPES[info["dtype"]]
-        return dt == torch.float16 or (self.held_cast and dt.is_floating_point and dt != torch.bfloat16)
+        return dt in (torch.float16, fp8.E4M3) or (self.held_cast and dt.is_floating_point and dt != torch.bfloat16)
+
+    def _shape(self, key: str) -> tuple[int, ...]:
+        """a tensor's shape from its header, nothing read"""
+        _mm, hdr, _ = self._shard(self.weight_map[key])
+        return tuple(int(x) for x in hdr[key]["shape"])
+
+    def _fp8(self, key: str) -> bool:
+        """whether a safetensors tensor is stored as FP8, a scale beside it (btb/fp8.py)"""
+        shard = self.weight_map.get(key)
+        if shard is None or self.gguf is not None:
+            return False
+        _mm, hdr, _ = self._shard(shard)
+        return self.ST_DTYPES.get(hdr[key].get("dtype", "")) == fp8.E4M3
+
+    def _fp8_scale(self, key: str) -> torch.Tensor:
+        """the stored scale of FP8 tensor `key`, as the checkpoint holds it"""
+        sk = fp8.scale_key(key, self.weight_map)
+        if sk is None:
+            raise KeyError(f"[stream] FP8 tensor {key!r} has no scale beside it")
+        return self._get(sk, stored=True)
+
+    def _f8_weights(self, key: str) -> list[F8Weight]:
+        """FP8 tensor `key` as stored, views of the checkpoint's bytes: one F8Weight, or one per expert of a fused
+        `[E, rows, cols]` expert tensor"""
+        mm, hdr, base = self._shard(self.weight_map[key])
+        info = hdr[key]
+        shape = [int(x) for x in info["shape"]]
+        rows, cols = shape[-2:]
+        n = rows * cols
+        count = n * (shape[0] if len(shape) == 3 else 1)
+        raw = torch.frombuffer(mm, dtype=torch.uint8, count=count, offset=base + info["data_offsets"][0])
+        s = self._fp8_scale(key)
+        if len(shape) == 2:
+            return [F8Weight(raw, s, rows, cols)]
+        per = s.reshape(-1, *s.shape[-2:]) if s.dim() >= 2 else s.reshape(1, 1, 1)
+        return [
+            F8Weight(raw[e * n : (e + 1) * n], per[e if per.shape[0] > 1 else 0], rows, cols) for e in range(shape[0])
+        ]
 
     def _stored_span(self, key: str) -> tuple[str, int, tuple[int, torch.dtype]] | None:
         """where a tensor `_held` casts sits on the drive as stored: (file path, offset, (bytes, dtype)); None
-        for any other"""
+        for any other, and for an FP8 one, whose widening needs its scale (`_get` widens it)"""
         shard = self.weight_map[key]
         _mm, hdr, base = self._shard(shard)
         info = hdr[key]
-        if not self._cast_on_read(info):
+        if not self._cast_on_read(info) or self.ST_DTYPES[info["dtype"]] == fp8.E4M3:
             return None
         a, b = info["data_offsets"]
         return os.path.join(self.dir, shard), base + a, (int(b - a), self.ST_DTYPES[info["dtype"]])
@@ -519,6 +559,7 @@ class _TiersMixin(_State):
                 for m in lins
                 if m.mx is None
                 and m.packed is None
+                and m.f8 is None
                 and m.cpu_gemm is None
                 and m.key in self.weight_map
                 and m.weight.dtype == torch.bfloat16
@@ -1144,6 +1185,12 @@ class _TiersMixin(_State):
                 warnings.simplefilter("ignore")
                 t = torch.frombuffer(mm, dtype=dt, count=n, offset=base + a).view(shape)
         self.bytes_streamed += n * t.element_size()
+        if dt == fp8.E4M3:
+            # widened blockwise by its scale to the bf16 every path holds (`fp8.held`), in f32 for a caller that
+            # widens it itself
+            self.fp8_widened = True
+            w = fp8.held(t, self._fp8_scale(key))
+            return w.float() if stored else w
         return t if stored else self._held(t)
 
     @staticmethod

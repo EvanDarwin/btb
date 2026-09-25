@@ -73,7 +73,7 @@ class Missing(StrEnum):
     SPEC_OWN_LAYER = "spec-own-layer"
     FP16_FIXTURE = "fp16-fixture"
     FP32_FIXTURE = "fp32-fixture"
-    FP8_UNIMPLEMENTED = "fp8-unimplemented"
+    FP8_FIXTURE = "fp8-fixture"
     QUANT_FIXTURE = "quant-fixture"
     NO_FIXTURE = "no-fixture"
 
@@ -163,10 +163,11 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "regenerate the precision twins (`python tests/make_fixtures.py twins`); spec.fixture_paths binds a twin "
         "whose headers carry F32 and no other float dtype",
     ),
-    Missing.FP8_UNIMPLEMENTED: (
-        "fp8 checkpoint loading is unimplemented (no float8/e4m3/e5m2 path in the engine), so the fp8 storage "
-        "axis cannot be covered",
-        "implement fp8 dequant/load in the engine, then add an fp8 fixture; or record fp8 as out of scope",
+    Missing.FP8_FIXTURE: (
+        "this family has no fine-grained FP8 safetensors twin (`<stem>-f8_e4m3`, its matrices e4m3 with their "
+        "scale grids), so its FP8 load and matvec paths are exercised by nothing",
+        "regenerate the precision twins (`python tests/make_fixtures.py twins`); spec.fixture_paths binds a twin "
+        "whose headers carry F8_E4M3",
     ),
     Missing.QUANT_FIXTURE: (
         "this storage stands for several stored types (one kernel each) and only some have a tiny GGUF twin, so "
@@ -185,7 +186,7 @@ MISSING: dict[Missing, tuple[str, str]] = {
 SAFE_PRECISION_GAP: dict[spec.Storage, Missing] = {
     spec.Storage.SAFE_FP16: Missing.FP16_FIXTURE,
     spec.Storage.SAFE_FP32: Missing.FP32_FIXTURE,
-    spec.Storage.SAFE_FP8: Missing.FP8_UNIMPLEMENTED,
+    spec.Storage.SAFE_FP8: Missing.FP8_FIXTURE,
 }
 
 

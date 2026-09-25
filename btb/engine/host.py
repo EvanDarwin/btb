@@ -9,7 +9,9 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from .. import fp8
 from .. import mlx as mlxdev
+from ..fp8 import F8Weight
 from ..kinds import PassTag
 from ..mxfp4 import BLOCK, MxGateUp, MxWeight
 from ..options import Device
@@ -41,6 +43,7 @@ class _HostLinear(torch.nn.Module):
     _cpu_shared: Any
     bias: torch.Tensor | None
     cpu_gemm: Any
+    f8: F8Weight | None
     key: str | None
     mx: Any
     packed: tuple[Any, ...] | None
@@ -55,6 +58,8 @@ class _HostLinear(torch.nn.Module):
         self.key = key
         self.packed = None
         self.mx = None
+        # an FP8 checkpoint's matrix as stored (families.py binds it); `weight` is then its shape and no bytes
+        self.f8 = None
         # on a Mac's CPU tier: the same bytes as an MLX bf16 array, for the prefill's GEMM on MLX's CPU
         # stream (`bind_cpu_gemm`); the one-row step keeps the native kernel
         self.cpu_gemm = None
@@ -67,6 +72,14 @@ class _HostLinear(torch.nn.Module):
         if self.mx is not None:
             return Native.mlx.linear(x, self.mx)
         rows, cols = self.weight.shape
+        if self.f8 is not None:
+            # the FP8 kernel widens a column tile once and reuses it over the batch tile, so it is the path at
+            # every batch size, as the MXFP4 one is
+            shp = x.shape
+            x2 = x.reshape(-1, cols).float().contiguous()
+            y = torch.empty(x2.shape[0], rows, dtype=torch.float32)
+            Native.gemv_fp8(self.f8, x2, y)
+            return y.view(*shp[:-1], rows).to(x.dtype)
         if x.dtype == torch.float32 and (Native.gemv is not None):
             shp = x.shape
             x2 = x.reshape(-1, cols).contiguous()
@@ -148,6 +161,7 @@ class _Experts(torch.nn.Module):
     layer: int
     limit: float
     mx: bool
+    f8: bool
     num_experts: int
 
     def __init__(
@@ -158,6 +172,7 @@ class _Experts(torch.nn.Module):
         act_fn: Any,
         layer: int = -1,
         mx: bool = False,
+        f8: bool = False,
         gate: Any = None,
         biases: bool = False,
         alpha: float = 1.702,
@@ -175,6 +190,7 @@ class _Experts(torch.nn.Module):
         # biases ride with the layer and its gate is its own clamped GLU over interleaved halves
         self.mx = bool(mx)
         self.ggml = self.mx and getattr(sm, "gguf", None) is not None  # a GGUF's experts, ggml's layout as stored
+        self.f8 = bool(f8)  # an FP8 checkpoint's experts, e4m3 bytes and scale grids into the FP8 matvec
         self.gate = gate
         self.alpha = float(alpha)
         self.limit = float(limit)
@@ -207,6 +223,9 @@ class _Experts(torch.nn.Module):
                         MxWeight(b[e].reshape(-1), s[e].reshape(-1), rows, g * BLOCK) for e in range(int(b.shape[0]))
                     ]
                 self.gate_up, self.down = parts["gate_up_proj"], parts["down_proj"]
+            elif self.f8:
+                self.gate_up = self.sm._f8_weights(self.base + "gate_up_proj")
+                self.down = self.sm._f8_weights(self.base + "down_proj")
             else:
                 self.gate_up = self.sm._get(self.base + "gate_up_proj")
                 self.down = self.sm._get(self.base + "down_proj")
@@ -247,6 +266,8 @@ class _Experts(torch.nn.Module):
         """the grouped matvec for this layer's storage, None without the native library (`_linear` widens then)"""
         if self.ggml:
             return Native.gemv_mx4_ggml_group
+        if self.f8:
+            return Native.gemv_fp8_group
         return Native.gemv_mx4_group if self.mx else Native.gemv_group
 
     def _gate_up_rows(self, gemv_group: Any, ws: Any, xf: torch.Tensor, pos: Any, gu_buf: torch.Tensor) -> None:
@@ -280,6 +301,8 @@ class _Experts(torch.nn.Module):
         dt = x.dtype
         if self.mx:
             self.sm._tag(PassTag.EXPERT_MXFP4_ASSTORED)  # `_group()` is the mx4 matvec over the stored blocks
+        if self.f8:
+            self.sm._tag(PassTag.FP8_ASSTORED)
         k = len(hit)
         xf = x.float().contiguous()
         slot = {e: top_k_index[0].tolist().index(e) for e in hit}
@@ -426,6 +449,13 @@ class _Experts(torch.nn.Module):
                 kernel(w, x.float().contiguous().cpu(), y)
                 return y.to(x.device).to(x.dtype)
             return torch.nn.functional.linear(x.float().cpu(), w.dequantize(torch.float32)).to(x.device).to(x.dtype)
+        if isinstance(w, F8Weight):
+            self.sm._tag(PassTag.FP8_ASSTORED if Native.gemv_fp8 is not None else PassTag.FP8_WIDENED)
+            if Native.gemv_fp8 is not None:
+                y = torch.empty(x.shape[0], w.shape[0], dtype=torch.float32)
+                Native.gemv_fp8(w, x.float().contiguous().cpu(), y)
+                return y.to(x.device).to(x.dtype)
+            return torch.nn.functional.linear(x.float().cpu(), w.dequantize(torch.float32)).to(x.device).to(x.dtype)
         if x.device.type == "cpu":
             if Native.gemv is not None and x.shape[0] < Native.gemm_rows:
                 y = torch.empty(x.shape[0], w.shape[0], dtype=torch.float32)
@@ -481,14 +511,16 @@ class _Experts(torch.nn.Module):
             self.sm._tag(PassTag.EXPERT_TABLES)  # no store: the checkpoint's expert tables, held whole
             gu, dn = self._tables()
             views = {e: (gu[e], dn[e]) for e in hit}
-            if self.mx:
+            if self.mx or self.f8:
                 per_expert = gu[0].nbytes + dn[0].nbytes
             else:
                 per_expert = (gu.shape[1] * gu.shape[2] + dn.shape[1] * dn.shape[2]) * gu.element_size()
+        # FP8 experts have no MLX matvec: they stay on the host's FP8 kernels
         use_mlx = (
             self.sm.mlx is not None
             and x.device.type == "cpu"
             and bool(hit)
+            and not self.f8
             and self.layer in self.sm.mlx_layers
             and self.sm._mlx_act() is not None
             and (not self.mx or (store is not None and bool(getattr(self.sm.mlx, "mxfp4", False))))
@@ -559,6 +591,7 @@ class _NGramRows(torch.nn.Module):
     sm: Any
     base: str
     dim: Any
+    f8: list[F8Weight] | None
     out_dtype: torch.dtype
     parts: int
     rows: Any
@@ -572,11 +605,20 @@ class _NGramRows(torch.nn.Module):
         self.parts = int(parts)
         self.out_dtype = out_dtype
         self.shards = None
+        self.f8 = None
         self.weight = torch.zeros(0)
 
     def _open(self) -> Any:
         if self.shards is None:
-            self.shards = [self.sm._get(self.base + f"shard_{k}.weight") for k in range(self.parts)]
+            keys = [self.base + f"shard_{k}.weight" for k in range(self.parts)]
+            # an FP8 table with one scale (`FP8Embedding`, too big to widen) stays e4m3: the rows a lookup gathers
+            # are rescaled; one scaled by blocks is widened whole
+            f8 = [self.sm._f8_weights(k)[0] for k in keys if self.sm._fp8(k)]
+            self.f8 = f8 if len(f8) == len(keys) and all(w.grid == (1, 1) for w in f8) else None
+            if self.f8 is not None:
+                self.shards = [w.w.view(torch.float8_e4m3fn).reshape(w.shape) for w in self.f8]
+            else:
+                self.shards = [self.sm._get(k) for k in keys]
             self.rows = int(self.shards[0].shape[0])
             self.dim = int(self.shards[0].shape[1])
         return self.shards
@@ -584,10 +626,13 @@ class _NGramRows(torch.nn.Module):
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         sh = self._open()
         flat = ids.reshape(-1).cpu().long()
-        out = torch.empty(flat.shape[0], self.dim, dtype=sh[0].dtype)
+        f8 = self.f8
+        out = torch.empty(flat.shape[0], self.dim, dtype=torch.float32 if f8 is not None else sh[0].dtype)
         k = flat // self.rows
         r = flat - k * self.rows
         for j in torch.unique(k).tolist():
             m = k == j
-            out[m] = sh[j][r[m]]
+            out[m] = fp8.held(sh[j][r[m]], f8[j].scales).float() if f8 is not None else sh[j][r[m]]
+        if f8 is not None:
+            self.sm._tag(PassTag.FP8_ASSTORED)
         return out.to(self.out_dtype).view(*ids.shape, self.dim).to(ids.device)
