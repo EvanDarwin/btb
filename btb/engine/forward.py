@@ -964,7 +964,44 @@ class _ForwardMixin(_State):
             probe(i, q, kf, vf, at.scaling)
         parents: Any = getattr(self, "ap", None) if getattr(self, "aq", False) else None
         tree = parents is not None and any(parents[j] != j - 1 for j in range(T))
-        if T > 1 and not tree and q.device.type == "cuda" and not win:
+        # a one-row step, or a verify pass (between `aa` and `ab`) whose rows must be the steps' own; a prefill's rows
+        # need no step's bits (plain and speculative decodes prefill alike) and keep the card's blocks
+        native = (
+            (T == 1 or bool(getattr(self, "aq", False)))
+            and B == 1
+            and Native.attn_decode is not None
+            and kf.device.type == "cpu"
+            and kf.dtype in (torch.bfloat16, torch.float32)
+            and vf.dtype == kf.dtype
+            and kf.stride(-1) == 1
+            and kf.stride(-2) == kf.shape[-1]
+            and vf.stride(-1) == 1
+            and vf.stride(-2) == vf.shape[-1]
+        )
+        if native:
+            # every row as a one-row step computes it: btb's kernel over the row's own keys in order - the prefix (its
+            # last `win` under a window), then its ancestors (the chain before it), then itself - so a verify pass
+            # gives each row the bits of the steps along its path and a speculative decode is the plain loop's (the
+            # card's blocks and torch's sdpa each sum in an order of their own, and parted from the steps at a
+            # near-tie). A chain row's keys are one run of the cache; a tree row's are gathered into one
+            path = parents if parents is not None else list(range(-1, T - 1))
+            qf = q[0].float().cpu()
+            out = torch.empty(T, qf.shape[0], qf.shape[2], dtype=torch.float32)
+            with torch.profiler.record_function("btb_attn_decode"):
+                for p in range(T):
+                    allow = node_mask(past, p, path, win)
+                    if allow is None:
+                        kp, vp = kf[0][:, : past + p + 1], vf[0][:, : past + p + 1]
+                    else:
+                        seen = allow.nonzero().flatten()
+                        lo, n = int(seen[0]), int(seen.numel())
+                        if int(seen[-1]) - lo + 1 == n:  # one run: a window's cut, the chain's rows before it
+                            kp, vp = kf[0][:, lo : lo + n], vf[0][:, lo : lo + n]
+                        else:
+                            kp, vp = kf[0][:, seen].contiguous(), vf[0][:, seen].contiguous()
+                    Native.attn_decode(qf[:, p].contiguous(), kp, vp, at.scaling, out[p])
+            attn = out.view(1, T, qf.shape[0], qf.shape[2])
+        elif T > 1 and not tree and q.device.type == "cuda" and not win:
             attn = self._attn_card_blocks(q, k, v, kf, vf, past, at.scaling).transpose(1, 2)
         elif tree:
             qc = q.cpu()
@@ -979,24 +1016,6 @@ class _ForwardMixin(_State):
                 )
                 outs.append(a.transpose(1, 2))
             attn = torch.cat(outs, dim=1)
-        elif (
-            T == 1
-            and B == 1
-            and Native.attn_decode is not None
-            and kf.device.type == "cpu"
-            and kf.dtype in (torch.bfloat16, torch.float32)
-            and vf.dtype == kf.dtype
-            and kf.stride(-1) == 1
-            and kf.stride(-2) == kf.shape[-1]
-            and vf.stride(-1) == 1
-            and vf.stride(-2) == vf.shape[-1]
-        ):
-            qf = q[0, :, 0].float().cpu().contiguous()
-            out = torch.empty(qf.shape, dtype=torch.float32)
-            first = max(0, past + 1 - win) if win else 0  # a sliding layer's last rows alone
-            with torch.profiler.record_function("btb_attn_decode"):
-                Native.attn_decode(qf, kf[0][:, first:], vf[0][:, first:], at.scaling, out)
-            attn = out.view(1, 1, qf.shape[0], qf.shape[1])
         else:
             qc = q.cpu()
             mask = None

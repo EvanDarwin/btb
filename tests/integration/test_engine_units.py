@@ -648,6 +648,57 @@ def test_speculative_is_the_greedy_answer_on_the_card_with_the_ngram_tree() -> N
             assert spec == greedy, "a misleading draft changed the answer"
 
 
+@pytest.mark.parametrize("stem", ["tiny_qwen3", "tiny_q35"])
+def test_a_verify_pass_over_a_host_cache_is_the_one_row_steps_bit_for_bit(stem: str) -> None:
+    """With the attention cache in host RAM (kv_host), each row of a verify pass - a chain's, and a tree's with a
+    sibling beside the path - attends as the one-row step at its position does, over the same keys through the same
+    kernel, so the rows' logits are the steps' bit for bit and a speculative decode is the plain loop's (the card's
+    blocks and torch's sdpa each summed in an order of their own, and parted from the steps at a near-tie)."""
+    dev = need_cuda()
+    from btb.engine.native import Native
+
+    if Native.attn_decode is None:
+        pytest.skip("the native attention kernel is not built")
+    with loaded_model(fixture(stem), device=dev, kv_host=True) as sm, torch.inference_mode():
+        prompt = REPEATING[0]
+        toks = [int(t) for t in sm.generate(list(prompt), 5, eos=(), speculate=False).tokens]
+        cache = sm.new_cache()
+        sm.forward([list(prompt)], cache=cache)
+        steps = []
+        for t in toks:
+            out = sm.forward([[t]], cache=cache)
+            assert out is not None
+            steps.append(out[0, -1].float().cpu())
+        P = len(prompt)
+        # the chain: the five tokens as one pass
+        chain = sm.new_cache()
+        sm.forward([list(prompt)], cache=chain)
+        sm.aa(None)
+        try:
+            out = sm.forward([toks], cache=chain, last_only=False)
+        finally:
+            sm.ab()
+        assert out is not None
+        for r in range(len(toks)):
+            assert torch.equal(out[0, r].float().cpu(), steps[r]), f"chain row {r}"
+        if LayerKind.LINEAR in sm.layer_types:
+            return  # a hybrid's verify is a chain (its recurrent states take one path a pass)
+        # the tree: the path 0 -> 1 -> 2 with a wrong sibling of node 1 between them
+        wrong = (toks[1] + 7) % int(sm.cfg.vocab_size)
+        tree = sm.new_cache()
+        sm.forward([list(prompt)], cache=tree)
+        sm.aa([-1, 0, 0, 1])
+        try:
+            out = sm.forward(
+                [[toks[0], wrong, toks[1], toks[2]]], cache=tree, last_only=False, positions=[[P, P + 1, P + 1, P + 2]]
+            )
+        finally:
+            sm.ab()
+        assert out is not None
+        for r, want in ((0, 0), (2, 1), (3, 2)):
+            assert torch.equal(out[0, r].float().cpu(), steps[want]), f"tree node {r}"
+
+
 def test_the_drafter_answers_the_greedy_loop_over_a_head_slice_on_the_card_and_on_the_host() -> None:
     """With the head cut to `draft_vocab` rows, the speculative tokens must equal the greedy loop's on the card at
     8 and 16 bits and on the host. The head must be the slice's size, and at 8 bits the bf16 fc must be released."""
