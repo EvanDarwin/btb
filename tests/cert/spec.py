@@ -18,7 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from btb.kinds import QUANT_KIND, Cap, FamilyKind, Json, PassTag, Proposer, Quant, QuantClass, quants_of
+from btb.kinds import PROPOSER_TAG, QUANT_KIND, Cap, FamilyKind, Json, PassTag, Proposer, Quant, QuantClass, quants_of
 
 from . import core
 
@@ -455,16 +455,55 @@ CONTAINER_SURFACE: dict[Container, Surface] = {
     Container.GGUF: Surface.GGUF,
 }
 
-# which device sub-paths the runner exercises on each surface. Safetensors takes every sub-path whose knob is
-# not container-specific; the rest are the representative sets the shape/store runs use (a combination absent
-# here is a reported NO_RUNNER_CELL gap, never a silent hole).
+
+def container_subpaths(container: Container) -> tuple[str, ...]:
+    """every sub-path a container's cells run: those whose knob is no other container's"""
+    return tuple(d.key for d in DEVICE_SUBPATHS if d.only in (None, container))
+
+
+# which device sub-paths the runner exercises on each surface: a container's every sub-path, and for the shape
+# axes the representative one per backend (a combination absent here is a manifest error, never a silent hole)
 SURFACE_SUBPATHS: dict[Surface, tuple[str, ...]] = {
-    Surface.SAFETENSORS: tuple(d.key for d in DEVICE_SUBPATHS if d.only is None),
-    Surface.GGUF: ("cpu", "mlx-dequant", "mlx-packed"),
-    Surface.PACK12: ("cpu", "mlx-step"),
+    **{CONTAINER_SURFACE[c]: container_subpaths(c) for c in Container},
     Surface.BATCH: ("cpu", "mlx-step"),
     Surface.CONTEXT: ("cpu", "mlx-step"),
 }
+
+
+@dataclass(frozen=True)
+class SpecSetup:
+    """how the runner drives a speculative decode path: `knobs` on the load (a verify budget, which a MoE
+    family's load defaults to none), the proposer set on the loaded model (no load option picks the MTP chain
+    or fixed tree), `draft` for the family's own fixture loaded again as its sibling draft model, and `echo`
+    for the plain decode handed to the n-gram proposer as a span (a tiny random fixture's output seldom repeats
+    itself, and repeats are what n-grams draft from)"""
+
+    knobs: dict[str, object]
+    proposer: Proposer
+    draft: bool = False
+    echo: bool = False
+
+
+def _spec_setup(decode: DecodePath) -> SpecSetup:
+    proposer = DECODE_PROPOSER[decode] or Proposer.NGRAM
+    draft = DECODE_KIND[decode] is DecodeKind.DRAFT_MODEL
+    knobs: dict[str, object] = {"v_max": 4}
+    if proposer is Proposer.MTP_DYN:
+        knobs["tree_min_prob"] = 0.0  # a tiny random model's flat distribution clears no path-probability floor
+    return SpecSetup(knobs, proposer, draft, echo=proposer is Proposer.NGRAM and not draft)
+
+
+SPEC_SETUP: dict[DecodePath, SpecSetup] = {
+    d: _spec_setup(d) for d in DecodePath if DECODE_KIND[d] is not DecodeKind.PLAIN
+}
+
+
+def decode_tag(decode: DecodePath) -> PassTag:
+    """the tag a decode path's run must show: the proposer it ran, a sibling draft model's own, or none drafted"""
+    setup = SPEC_SETUP.get(decode)
+    if setup is None:
+        return PassTag.SPEC_OFF
+    return PassTag.SPEC_DRAFT if setup.draft else PROPOSER_TAG[setup.proposer]
 
 
 def totality_problems() -> list[str]:

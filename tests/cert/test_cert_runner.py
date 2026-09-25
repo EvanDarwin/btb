@@ -3,7 +3,8 @@ on this machine, assert the engine loads it, that the sub-path's OWN `PassTag` e
 deterministic (two independent loads of the same fixture produce identical tokens). A greedy cell is also held to
 the banked oracle (`oracle.assert_matches`), so a deterministically-wrong path fails here rather than certifying
 itself; a sampled cell is held to the oracle's banked seeded draw where it computes in fp32, and elsewhere holds a
-greedy decode of the same load to the greedy reference (`oracle.holds_sampled` says why).
+greedy decode of the same load to the greedy reference (`oracle.holds_sampled` says why). A speculative cell
+decodes one load both plainly and down its drafting path, and holds the two to the same tokens.
 
 The tag assertion is what makes a receipt worth something: it is the sub-path's own `expect`, carried on
 `spec.DeviceSubpath`, so a renamed key cannot quietly turn it off and a fallback (torch on a card without the
@@ -63,8 +64,9 @@ def _why_not(
     """why a cell does not run on this machine, None when it does. A cell that is not this cell: one whose knob
     has nothing to act on (the manifest's dnr - a GGUF knob off GGUF, an expert-store knob on a dense family),
     one the engine cannot engage at all, which would decode down another path and bank a receipt for one it
-    never took (the manifest's subpath_gap), then hardware this machine lacks and a fixture not built. `decode`
-    None for a shape axis, which has no storage cell to be distinct from."""
+    never took (the manifest's subpath_gap), a decode path the engine does not take for the family (its
+    gap_reason), then hardware this machine lacks and a fixture not built. `decode` None for a shape axis, which
+    has no storage cell to be distinct from."""
     name = os.path.basename(path)
     if decode is not None:
         if kind is None or storage is None:
@@ -75,6 +77,9 @@ def _why_not(
         refused = manifest.subpath_gap(kind, storage, dev)
         if refused is not None:
             return f"GAP (manifest --check fails on this): {refused}"
+        gap = manifest.gap_reason(kind, storage, dev, decode) if decode is not spec.DecodePath.GREEDY else None
+        if gap is not None:
+            return f"GAP (manifest --check fails on this): {gap.value}"
     if not _hardware_here(dev.hardware):
         return f"{dev.hardware.value} not available on this machine"
     if not os.path.exists(path):
@@ -160,11 +165,17 @@ def _assert_path_engaged(
     dev: spec.DeviceSubpath,
     decode: spec.Decode | None,
     subject: str,
+    path: spec.DecodePath = spec.DecodePath.GREEDY,
 ) -> None:
     """the intended path must actually engage - else a fallback (torch on cuda without the fatbin, the per-op
     path, the step path standing in for the megakernel) would decode fine and certify the wrong thing. The tags
-    come from the sub-path itself (spec.DeviceSubpath.expects), never from a table keyed by name here."""
+    come from the sub-path itself (spec.DeviceSubpath.expects) and the decode path (spec.decode_tag), never from
+    a table keyed by name here."""
     report = sm.last_pass_report()
+    want_decode = spec.decode_tag(path)
+    assert want_decode in report, (
+        f"{subject} on {dev.key}/{path.value}: {want_decode} never engaged (got {sorted(report.tags)})"
+    )
     if decode is not None:
         # the sampler: a sampled run must show the stochastic draw (proof the sample kernels ran), greedy the argmax
         sampled = decode is spec.Decode.SAMPLED
@@ -208,6 +219,48 @@ def test_gguf_cell_loads_and_is_deterministic(
     runs = _run_twice(path, dict(dev.knobs), lambda sm: _assert_path_engaged(sm, kind, storage, dev, None, fname))
     assert_same_tokens(runs[0], runs[1], f"{fname} on {dev.key} decoded differently across two loads")
     receipt.record(manifest.gguf_id(fname, dev.key))
+
+
+# Speculative decoding: every fixture a greedy cell loads, on every sub-path its surface runs, down each decode
+# path that drafts. The verify pass keeps only the tokens the model itself would pick, so a speculative decode
+# must equal the plain loop's on the same load; each cell decodes both ways and holds them equal, with the
+# proposer it meant to run (and the sub-path's own tags) engaged, and requires that drafts were proposed at all.
+
+
+def _spec_cells() -> list[ParameterSet]:
+    out: list[ParameterSet] = []
+    for kind in core.served_kinds():
+        for storage, info in spec.STORAGE.items():
+            surface = spec.CONTAINER_SURFACE[info.container]
+            for path in spec.fixture_paths(kind, storage):
+                for dev in _subpaths(surface):
+                    for decode in spec.SPEC_SETUP:
+                        cid = manifest.spec_id(kind, storage, path, dev.key, decode).replace("/", "-")
+                        why = _why_not(kind, storage, dev, path, decode)
+                        out.append(_cell(kind, storage, path, dev, decode, cid=cid, why=why))
+    return out
+
+
+@pytest.mark.parametrize("kind,storage,path,dev,decode", _spec_cells())
+def test_speculation_decodes_as_the_plain_loop(
+    kind: FamilyKind, storage: spec.Storage, path: str, dev: spec.DeviceSubpath, decode: spec.DecodePath
+) -> None:
+    name = os.path.basename(path)
+    setup = spec.SPEC_SETUP[decode]
+    knobs = {**dev.knobs, **setup.knobs, **({"draft_model": path} if setup.draft else {})}
+    with loaded_model(path, **knobs) as sm:
+        sm.proposer = setup.proposer
+        # the pass-cost curves the load times size a pass to what drafts have been yielding, which on a tiny random
+        # fixture is one row: no draft at all. The cell certifies the drafting path, so it takes the configured budget
+        sm._host_cost, sm._mlx_cost, sm._card_cost = {}, {}, {}
+        plain = [int(t) for t in sm.generate(list(PROMPT), N, speculate=False).tokens]
+        spans = [("plain", [*PROMPT, *plain])] if setup.echo else []
+        drafted = [int(t) for t in sm.generate(list(PROMPT), N, speculate=True, spans=spans).tokens]
+        _assert_path_engaged(sm, kind, storage, dev, None, name, decode)
+        proposed = sm.last_pass_report().spec_proposed
+    assert proposed > 0, f"{name} on {dev.key}/{decode.value} proposed no draft: nothing was verified"
+    assert_same_tokens(drafted, plain, f"{name} on {dev.key}/{decode.value} drafted other tokens than the plain loop")
+    receipt.record(manifest.spec_id(kind, storage, path, dev.key, decode))
 
 
 # The 12-bit store (btb pack) is architecture-agnostic - it requantizes weights, so every family has a
