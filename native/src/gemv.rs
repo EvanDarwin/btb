@@ -3798,9 +3798,9 @@ affine_core!(gemv_q41_core, Q41);
 affine_core!(gemv_q80_core, Q80);
 
 /// [`gemv_q4k_core`] for an IQ lattice type: the raw superblocks plus the type's grid and (where used) the
-/// shared sign table, both passed as buffers. All are 256-weight superblocks.
+/// shared sign table, both passed as buffers. All are 256-weight superblocks. `$ks`: the type reads `ksigns`.
 macro_rules! latt_core {
-    ($name:ident, $w:ident) => {
+    ($name:ident, $w:ident, $ks:literal) => {
         #[allow(clippy::too_many_arguments)]
         pub(crate) unsafe fn $name(
             raw: *const u8,
@@ -3813,7 +3813,12 @@ macro_rules! latt_core {
             y: *mut f32,
             threads: usize,
         ) -> i32 {
-            if raw.is_null() || grid.is_null() || x.is_null() || y.is_null() {
+            if raw.is_null()
+                || grid.is_null()
+                || x.is_null()
+                || y.is_null()
+                || ($ks && ksigns.is_null())
+            {
                 return ERR_NULL;
             }
             if !kq_shape_ok(rows, cols, b) || !aligned(x) || !aligned(y) {
@@ -3833,13 +3838,13 @@ macro_rules! latt_core {
         }
     };
 }
-latt_core!(gemv_iq3xxs_core, Iq3xxs);
-latt_core!(gemv_iq2xxs_core, Iq2xxs);
-latt_core!(gemv_iq2xs_core, Iq2xs);
-latt_core!(gemv_iq2s_core, Iq2s);
-latt_core!(gemv_iq1s_core, Iq1s);
-latt_core!(gemv_iq3s_core, Iq3s);
-latt_core!(gemv_iq1m_core, Iq1m);
+latt_core!(gemv_iq3xxs_core, Iq3xxs, true);
+latt_core!(gemv_iq2xxs_core, Iq2xxs, true);
+latt_core!(gemv_iq2xs_core, Iq2xs, true);
+latt_core!(gemv_iq2s_core, Iq2s, false);
+latt_core!(gemv_iq1s_core, Iq1s, false);
+latt_core!(gemv_iq3s_core, Iq3s, false);
+latt_core!(gemv_iq1m_core, Iq1m, false);
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn gemv_mxfp4_group_core(
@@ -4854,6 +4859,7 @@ mod tests {
 
     /// `rows * cols / 256` Q4_K superblocks of random bytes, the two f16 factors held to a small finite
     /// positive range (a real quantizer's deltas, never inf/nan) so the weights stay finite.
+    #[cfg(target_arch = "aarch64")]
     fn q4k_random(rows: usize, cols: usize, seed: u64) -> Vec<u8> {
         let nsb = rows * cols / KQ_SB;
         let mut state = seed;
@@ -4878,47 +4884,6 @@ mod tests {
         raw
     }
 
-    /// weight `idx` (0..256) of a Q4_K superblock, straight from llama.cpp's definition in f64.
-    fn q4k_weight_ref(blk: &[u8], idx: usize) -> f64 {
-        let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])) as f64;
-        let dmin = f16_to_f32(u16::from_le_bytes([blk[2], blk[3]])) as f64;
-        let sb = idx / 32;
-        let lane = idx % 32;
-        let k = sb / 2;
-        let byte = blk[16 + 32 * k + lane];
-        let q = if sb.is_multiple_of(2) {
-            byte & 0x0F
-        } else {
-            byte >> 4
-        };
-        let (sc, mn) = unsafe { q4k_scale_min(blk[4..16].as_ptr(), sb) };
-        d * sc as f64 * q as f64 - dmin * mn as f64
-    }
-
-    fn q4k_call(
-        raw: &[u8],
-        rows: usize,
-        cols: usize,
-        x: &[f32],
-        b: usize,
-        threads: usize,
-    ) -> Vec<f32> {
-        let mut y = vec![f32::NAN; b * rows];
-        let code = unsafe {
-            gemv_q4k_core(
-                raw.as_ptr(),
-                rows,
-                cols,
-                x.as_ptr(),
-                b,
-                y.as_mut_ptr(),
-                threads,
-            )
-        };
-        assert_eq!(code, OK);
-        y
-    }
-
     #[test]
     fn f16_to_f32_matches_ieee() {
         // (half bits, exact f32) across normals, both signs, and subnormals (a tiny k-quant delta/min: the
@@ -4940,75 +4905,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn q4k_matvec_matches_the_f64_reference() {
-        let mut state = 0x0f0f_a5a5_1234_9999u64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            ((state >> 40) as f32 / 16_777_216.0) * 2.0 - 1.0
-        };
-        for (rows, cols) in [
-            (1usize, 256usize),
-            (5, 512),
-            (12, 512),
-            (17, 768),
-            (1024, 1024),
-            (2048, 1024),
-        ] {
-            let raw = q4k_random(rows, cols, 0x9e37_79b9_7f4a_7c15 ^ cols as u64);
-            let nsb_row = cols / KQ_SB;
-            let x: Vec<f32> = (0..cols).map(|_| next()).collect();
-            let y = q4k_call(&raw, rows, cols, &x, 1, 1);
-            for r in 0..rows {
-                let mut want = 0.0f64;
-                let mut scale = 1e-30f64;
-                for c in 0..cols {
-                    let blk = &raw[(r * nsb_row + c / KQ_SB) * Q4K_BYTES..];
-                    let w = q4k_weight_ref(&blk[..Q4K_BYTES], c % KQ_SB);
-                    want += w * x[c] as f64;
-                    scale += (w * x[c] as f64).abs();
-                }
-                assert!(
-                    ((y[r] as f64 - want).abs() / scale) < 1e-6,
-                    "{rows}x{cols} row {r}: got {} want {want}",
-                    y[r]
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn q4k_tiling_threads_and_batching_do_not_move_a_single_bit() {
-        let (rows, cols) = (37usize, 768usize);
-        let raw = q4k_random(rows, cols, 0xabcd_0f0f_5151_2468);
-        let mut state = 0x2468_ace0_1357_9bdfu64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            ((state >> 40) as f32 / 16_777_216.0) * 2.0 - 1.0
-        };
-        let x: Vec<f32> = (0..3 * cols).map(|_| next()).collect();
-        let base = q4k_call(&raw, rows, cols, &x, 3, 1);
-        for t in [2usize, 3, 5, 8, 0] {
-            let got = q4k_call(&raw, rows, cols, &x, 3, t);
-            assert_eq!(
-                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                base.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                "threads = {t}"
-            );
-        }
-        // row r of a 3-row pass is bit-for-bit its own one-row solo: the verify pass's contract
-        for i in 0..3 {
-            let solo = q4k_call(&raw, rows, cols, &x[i * cols..(i + 1) * cols], 1, 0);
-            for r in 0..rows {
-                assert_eq!(solo[r].to_bits(), base[i * rows + r].to_bits());
-            }
-        }
-    }
-
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn q4k_scalar_and_neon_widen_to_the_same_bits() {
@@ -5026,29 +4922,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn q4k_rejects_null_and_bad_shapes() {
-        let raw = q4k_random(2, 256, 7);
-        let x = [0.0f32; 256];
-        let mut y = [0.0f32; 2];
-        unsafe {
-            assert_eq!(
-                gemv_q4k_core(std::ptr::null(), 2, 256, x.as_ptr(), 1, y.as_mut_ptr(), 0),
-                ERR_NULL
-            );
-            // cols must be a whole number of 256-weight superblocks
-            assert_eq!(
-                gemv_q4k_core(raw.as_ptr(), 2, 128, x.as_ptr(), 1, y.as_mut_ptr(), 0),
-                ERR_DOMAIN
-            );
-            assert_eq!(
-                gemv_q4k_core(raw.as_ptr(), 0, 256, x.as_ptr(), 1, y.as_mut_ptr(), 0),
-                ERR_DOMAIN
-            );
-        }
-    }
-
     /// `rows * cols / 256` Q6_K superblocks of random bytes with a finite positive f16 delta.
+    #[cfg(target_arch = "aarch64")]
     fn q6k_random(rows: usize, cols: usize, seed: u64) -> Vec<u8> {
         let nsb = rows * cols / KQ_SB;
         let mut state = seed;
@@ -5069,114 +4944,6 @@ mod tests {
             raw[o + 208..o + 210].copy_from_slice(&d.to_le_bytes());
         }
         raw
-    }
-
-    /// weight `idx` (0..256) of a Q6_K superblock, straight from llama.cpp's definition in f64.
-    fn q6k_weight_ref(blk: &[u8], idx: usize) -> f64 {
-        let d = f16_to_f32(u16::from_le_bytes([blk[208], blk[209]])) as f64;
-        let sc = |i: usize| blk[192 + i] as i8 as f64;
-        let h = idx / 128;
-        let within = idx % 128;
-        let lane = within % 32;
-        let quad = within / 32; // 0..4: which of the lane's four weights
-        let (qlo, qho, sco) = (h * 64, h * 32, h * 8);
-        let isc = sco + lane / 16;
-        let l0 = blk[qlo + lane];
-        let l1 = blk[qlo + lane + 32];
-        let hb = blk[128 + qho + lane];
-        let (src, shift, sci) = match quad {
-            0 => (l0, 0u32, isc),
-            1 => (l1, 2, isc + 2),
-            2 => (l0 >> 4, 4, isc + 4),
-            _ => (l1 >> 4, 6, isc + 6),
-        };
-        let q = ((src & 0x0F) | (((hb >> shift) & 3) << 4)) as i32 - 32;
-        d * sc(sci) * q as f64
-    }
-
-    fn q6k_call(
-        raw: &[u8],
-        rows: usize,
-        cols: usize,
-        x: &[f32],
-        b: usize,
-        threads: usize,
-    ) -> Vec<f32> {
-        let mut y = vec![f32::NAN; b * rows];
-        let code = unsafe {
-            gemv_q6k_core(
-                raw.as_ptr(),
-                rows,
-                cols,
-                x.as_ptr(),
-                b,
-                y.as_mut_ptr(),
-                threads,
-            )
-        };
-        assert_eq!(code, OK);
-        y
-    }
-
-    #[test]
-    fn q6k_matvec_matches_the_f64_reference() {
-        let mut state = 0x5151_2222_c3c3_7777u64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            ((state >> 40) as f32 / 16_777_216.0) * 2.0 - 1.0
-        };
-        for (rows, cols) in [(1usize, 256usize), (5, 512), (12, 512), (17, 768)] {
-            let raw = q6k_random(rows, cols, 0xdead_c0de_1234_0001 ^ cols as u64);
-            let nsb_row = cols / KQ_SB;
-            let x: Vec<f32> = (0..cols).map(|_| next()).collect();
-            let y = q6k_call(&raw, rows, cols, &x, 1, 1);
-            for r in 0..rows {
-                let mut want = 0.0f64;
-                let mut scale = 1e-30f64;
-                for c in 0..cols {
-                    let blk = &raw[(r * nsb_row + c / KQ_SB) * Q6K_BYTES..];
-                    let w = q6k_weight_ref(&blk[..Q6K_BYTES], c % KQ_SB);
-                    want += w * x[c] as f64;
-                    scale += (w * x[c] as f64).abs();
-                }
-                assert!(
-                    ((y[r] as f64 - want).abs() / scale) < 1e-6,
-                    "{rows}x{cols} row {r}: got {} want {want}",
-                    y[r]
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn q6k_tiling_threads_and_batching_do_not_move_a_single_bit() {
-        let (rows, cols) = (37usize, 768usize);
-        let raw = q6k_random(rows, cols, 0x0f0f_abcd_2468_5151);
-        let mut state = 0x1357_2468_9bdf_ace0u64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            ((state >> 40) as f32 / 16_777_216.0) * 2.0 - 1.0
-        };
-        let x: Vec<f32> = (0..3 * cols).map(|_| next()).collect();
-        let base = q6k_call(&raw, rows, cols, &x, 3, 1);
-        for t in [2usize, 3, 5, 8, 0] {
-            let got = q6k_call(&raw, rows, cols, &x, 3, t);
-            assert_eq!(
-                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                base.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                "threads = {t}"
-            );
-        }
-        for i in 0..3 {
-            let solo = q6k_call(&raw, rows, cols, &x[i * cols..(i + 1) * cols], 1, 0);
-            for r in 0..rows {
-                assert_eq!(solo[r].to_bits(), base[i * rows + r].to_bits());
-            }
-        }
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -5229,274 +4996,6 @@ mod tests {
         raw
     }
 
-    fn q5k_weight_ref(blk: &[u8], idx: usize) -> f64 {
-        let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])) as f64;
-        let dm = f16_to_f32(u16::from_le_bytes([blk[2], blk[3]])) as f64;
-        let (sb, lane, k) = (idx / 32, idx % 32, idx / 64);
-        let hbit = blk[16 + lane];
-        let byte = blk[48 + 32 * k + lane];
-        let q = if sb % 2 == 0 {
-            (byte & 0x0F) | (((hbit >> (2 * k)) & 1) << 4)
-        } else {
-            (byte >> 4) | (((hbit >> (2 * k + 1)) & 1) << 4)
-        };
-        let (sc, mn) = unsafe { q4k_scale_min(blk[4..].as_ptr(), sb) };
-        d * sc as f64 * q as f64 - dm * mn as f64
-    }
-
-    fn q2k_weight_ref(blk: &[u8], idx: usize) -> f64 {
-        let d = f16_to_f32(u16::from_le_bytes([blk[80], blk[81]])) as f64;
-        let dm = f16_to_f32(u16::from_le_bytes([blk[82], blk[83]])) as f64;
-        let (h, within) = (idx / 128, idx % 128);
-        let (j, lane) = (within / 32, within % 32);
-        let s = blk[h * 8 + 2 * j + (lane >> 4)];
-        let q = ((blk[16 + h * 32 + lane] >> (2 * j)) & 3) as f64;
-        d * (s & 0x0F) as f64 * q - dm * (s >> 4) as f64
-    }
-
-    fn q3k_weight_ref(blk: &[u8], idx: usize) -> f64 {
-        let d = f16_to_f32(u16::from_le_bytes([blk[108], blk[109]])) as f64;
-        let sc = &blk[96..108];
-        let word = |i: usize| u32::from_le_bytes([sc[i], sc[i + 1], sc[i + 2], sc[i + 3]]);
-        let (a0, a1, a2) = (word(0), word(4), word(8));
-        let (k1, k2) = (0x0303_0303u32, 0x0F0F_0F0Fu32);
-        let aux = [
-            (a0 & k2) | ((a2 & k1) << 4),
-            (a1 & k2) | (((a2 >> 2) & k1) << 4),
-            ((a0 >> 4) & k2) | (((a2 >> 4) & k1) << 4),
-            ((a1 >> 4) & k2) | (((a2 >> 6) & k1) << 4),
-        ];
-        let mut scl = [0u8; 16];
-        for (w, a) in aux.iter().enumerate() {
-            scl[w * 4..w * 4 + 4].copy_from_slice(&a.to_le_bytes());
-        }
-        let (h, within) = (idx / 128, idx % 128);
-        let (j, lane) = (within / 32, within % 32);
-        let q2 = ((blk[32 + h * 32 + lane] >> (2 * j)) & 3) as i32;
-        let bit = ((blk[lane] >> (h * 4 + j)) & 1) as i32;
-        d * (scl[h * 8 + 2 * j + (lane >> 4)] as i32 - 32) as f64 * (q2 - 4 + 4 * bit) as f64
-    }
-
-    type KqCore = unsafe fn(*const u8, usize, usize, *const f32, usize, *mut f32, usize) -> i32;
-
-    fn kq_call(
-        core: KqCore,
-        raw: &[u8],
-        rows: usize,
-        cols: usize,
-        x: &[f32],
-        b: usize,
-        threads: usize,
-    ) -> Vec<f32> {
-        let mut y = vec![f32::NAN; b * rows];
-        assert_eq!(
-            unsafe {
-                core(
-                    raw.as_ptr(),
-                    rows,
-                    cols,
-                    x.as_ptr(),
-                    b,
-                    y.as_mut_ptr(),
-                    threads,
-                )
-            },
-            OK
-        );
-        y
-    }
-
-    /// the matvec against an f64 reference at b=1, and row 0 of a 3-row pass bit-for-bit its own one-row call.
-    fn kq_certify(
-        nb: usize,
-        bw: usize,
-        core: KqCore,
-        rnd: fn(usize, usize, u64) -> Vec<u8>,
-        refn: fn(&[u8], usize) -> f64,
-        seed: u64,
-    ) {
-        let mut state = seed;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            ((state >> 40) as f32 / 16_777_216.0) * 2.0 - 1.0
-        };
-        for (rows, cols) in [(1usize, 256usize), (5, 512), (12, 512), (17, 768)] {
-            let raw = rnd(rows, cols, seed ^ cols as u64);
-            let nblk_row = cols / bw;
-            let x: Vec<f32> = (0..cols).map(|_| next()).collect();
-            let y = kq_call(core, &raw, rows, cols, &x, 1, 1);
-            for r in 0..rows {
-                let (mut want, mut scale) = (0.0f64, 1e-30f64);
-                for c in 0..cols {
-                    let blk = &raw[(r * nblk_row + c / bw) * nb..];
-                    let w = refn(&blk[..nb], c % bw);
-                    want += w * x[c] as f64;
-                    scale += (w * x[c] as f64).abs();
-                }
-                assert!(
-                    (y[r] as f64 - want).abs() / scale < 1e-6,
-                    "b1 {rows}x{cols} row {r}"
-                );
-            }
-        }
-        // row invariance: row 0 of a 3-row pass equals its own solo, across thread counts
-        let (rows, cols) = (37usize, 768usize);
-        let raw = rnd(rows, cols, seed);
-        let x: Vec<f32> = (0..3 * cols).map(|_| next()).collect();
-        let base = kq_call(core, &raw, rows, cols, &x, 3, 1);
-        for t in [2usize, 5, 0] {
-            assert_eq!(
-                kq_call(core, &raw, rows, cols, &x, 3, t)
-                    .iter()
-                    .map(|v| v.to_bits())
-                    .collect::<Vec<_>>(),
-                base.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                "threads {t}"
-            );
-        }
-        for i in 0..3 {
-            let solo = kq_call(core, &raw, rows, cols, &x[i * cols..(i + 1) * cols], 1, 0);
-            for r in 0..rows {
-                assert_eq!(solo[r].to_bits(), base[i * rows + r].to_bits());
-            }
-        }
-    }
-
-    fn iq4nl_weight_ref(blk: &[u8], idx: usize) -> f64 {
-        let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])) as f64;
-        let byte = blk[2 + (idx % 16)];
-        let q = if idx < 16 { byte & 0x0F } else { byte >> 4 };
-        d * IQ4_KV[q as usize] as f64
-    }
-
-    fn iq4xs_weight_ref(blk: &[u8], idx: usize) -> f64 {
-        let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])) as f64;
-        let sh = u16::from_le_bytes([blk[2], blk[3]]) as u32;
-        let (ib, col) = (idx / 32, idx % 32);
-        let ls = unsafe { iq4xs_ls(blk[4..].as_ptr(), sh, ib) };
-        let byte = blk[8 + 16 * ib + (col % 16)];
-        let q = if col < 16 { byte & 0x0F } else { byte >> 4 };
-        d * (ls - 32) as f64 * IQ4_KV[q as usize] as f64
-    }
-
-    #[test]
-    fn q5k_matvec_and_invariance() {
-        kq_certify(
-            Q5K_BYTES,
-            KQ_SB,
-            gemv_q5k_core,
-            |r, c, s| kq_random(Q5K_BYTES, KQ_SB, &[0, 2], r, c, s),
-            q5k_weight_ref,
-            0xA5,
-        );
-    }
-
-    #[test]
-    fn q2k_matvec_and_invariance() {
-        kq_certify(
-            Q2K_BYTES,
-            KQ_SB,
-            gemv_q2k_core,
-            |r, c, s| kq_random(Q2K_BYTES, KQ_SB, &[80, 82], r, c, s),
-            q2k_weight_ref,
-            0xB2,
-        );
-    }
-
-    #[test]
-    fn q3k_matvec_and_invariance() {
-        kq_certify(
-            Q3K_BYTES,
-            KQ_SB,
-            gemv_q3k_core,
-            |r, c, s| kq_random(Q3K_BYTES, KQ_SB, &[108], r, c, s),
-            q3k_weight_ref,
-            0xC3,
-        );
-    }
-
-    #[test]
-    fn iq4nl_matvec_and_invariance() {
-        kq_certify(
-            IQ4NL_BYTES,
-            IQ4NL_BLK,
-            gemv_iq4nl_core,
-            |r, c, s| kq_random(IQ4NL_BYTES, IQ4NL_BLK, &[0], r, c, s),
-            iq4nl_weight_ref,
-            0x4E,
-        );
-    }
-
-    #[test]
-    fn iq4xs_matvec_and_invariance() {
-        kq_certify(
-            IQ4XS_BYTES,
-            KQ_SB,
-            gemv_iq4xs_core,
-            |r, c, s| kq_random(IQ4XS_BYTES, KQ_SB, &[0], r, c, s),
-            iq4xs_weight_ref,
-            0x4C,
-        );
-    }
-
-    fn q40_weight_ref(blk: &[u8], idx: usize) -> f64 {
-        let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])) as f64;
-        let byte = blk[2 + (idx % 16)];
-        let q = if idx < 16 { byte & 0x0F } else { byte >> 4 };
-        d * (q as f64 - 8.0)
-    }
-
-    fn q41_weight_ref(blk: &[u8], idx: usize) -> f64 {
-        let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])) as f64;
-        let m = f16_to_f32(u16::from_le_bytes([blk[2], blk[3]])) as f64;
-        let byte = blk[4 + (idx % 16)];
-        let q = if idx < 16 { byte & 0x0F } else { byte >> 4 };
-        d * q as f64 + m
-    }
-
-    fn q80_weight_ref(blk: &[u8], idx: usize) -> f64 {
-        let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])) as f64;
-        d * blk[2 + idx] as i8 as f64
-    }
-
-    #[test]
-    fn q40_matvec_and_invariance() {
-        kq_certify(
-            Q40_BYTES,
-            AFFINE_BLK,
-            gemv_q40_core,
-            |r, c, s| kq_random(Q40_BYTES, AFFINE_BLK, &[0], r, c, s),
-            q40_weight_ref,
-            0x40,
-        );
-    }
-
-    #[test]
-    fn q41_matvec_and_invariance() {
-        kq_certify(
-            Q41_BYTES,
-            AFFINE_BLK,
-            gemv_q41_core,
-            |r, c, s| kq_random(Q41_BYTES, AFFINE_BLK, &[0, 2], r, c, s),
-            q41_weight_ref,
-            0x41,
-        );
-    }
-
-    #[test]
-    fn q80_matvec_and_invariance() {
-        kq_certify(
-            Q80_BYTES,
-            AFFINE_BLK,
-            gemv_q80_core,
-            |r, c, s| kq_random(Q80_BYTES, AFFINE_BLK, &[0], r, c, s),
-            q80_weight_ref,
-            0x80,
-        );
-    }
-
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn affine_scalar_and_neon_widen_to_the_same_bits() {
@@ -5529,8 +5028,7 @@ mod tests {
         }
     }
 
-    // ---- IQ lattice: the grid comes from gguf, so Rust checks the framework contract (thread/batch bit-
-    // invariance) with a synthetic grid; correctness against real grids is the Python gguf cert. --------------
+    // ---- IQ lattice: the throughput probe's cores and bytes; the C-ABI parity is tests/gemv_quant.rs ----------
 
     type LattCore = unsafe fn(
         *const u8,
@@ -5554,78 +5052,6 @@ mod tests {
                 (state >> 32) as u8
             })
             .collect()
-    }
-
-    /// thread and batch bit-invariance for a lattice core over a synthetic grid: row `r` is the same at any
-    /// thread count, and row 0 of a 3-row pass is its own one-row call, bit for bit (the verify pass's contract).
-    fn latt_invariance(core: LattCore, bytes: usize, entries: usize, vals: usize, seed: u64) {
-        let (rows, cols) = (37usize, 768usize);
-        // bit 6 of every raw byte cleared: it is the top exponent bit of each type's f16 delta (the leading
-        // f16's high byte; for IQ1_M the nibble its delta is assembled from), so every delta is finite.
-        let raw: Vec<u8> = latt_bytes(rows * cols / KQ_SB * bytes, seed)
-            .iter()
-            .map(|&u| u & 0xBF)
-            .collect();
-        let grid: Vec<i8> = latt_bytes(entries * vals, seed ^ 0x9e37)
-            .iter()
-            .map(|&u| u as i8)
-            .collect();
-        let ks = latt_bytes(128, seed ^ 0x1234);
-        let x: Vec<f32> = latt_bytes(3 * cols, seed ^ 0xabcd)
-            .iter()
-            .map(|&u| (u as i8) as f32 * 0.01)
-            .collect();
-        let call = |b: usize, xs: &[f32], threads: usize| -> Vec<f32> {
-            let mut y = vec![0.0f32; b * rows];
-            assert_eq!(
-                unsafe {
-                    core(
-                        raw.as_ptr(),
-                        grid.as_ptr(),
-                        ks.as_ptr(),
-                        rows,
-                        cols,
-                        xs.as_ptr(),
-                        b,
-                        y.as_mut_ptr(),
-                        threads,
-                    )
-                },
-                OK
-            );
-            y
-        };
-        let base = call(3, &x, 1);
-        // a NaN pass would certify nothing, and is not even stable: x86 picks a NaN's payload by operand order,
-        // which the 4-row and 1-row kernels need not share. The contract is over finite results.
-        assert!(base.iter().all(|v| v.is_finite()), "non-finite pass");
-        for t in [2usize, 5, 0] {
-            assert_eq!(
-                call(3, &x, t)
-                    .iter()
-                    .map(|v| v.to_bits())
-                    .collect::<Vec<_>>(),
-                base.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                "threads {t}"
-            );
-        }
-        for i in 0..3 {
-            let solo = call(1, &x[i * cols..(i + 1) * cols], 0);
-            for r in 0..rows {
-                assert_eq!(solo[r].to_bits(), base[i * rows + r].to_bits());
-            }
-        }
-    }
-
-    #[test]
-    fn iq_lattice_is_thread_and_batch_invariant() {
-        latt_invariance(gemv_iq3xxs_core, 98, 256, 4, 0x3E);
-        latt_invariance(gemv_iq2xxs_core, 66, 256, 8, 0x2E);
-        latt_invariance(gemv_iq2xs_core, 74, 512, 8, 0x2F);
-        latt_invariance(gemv_iq2s_core, 82, 1024, 8, 0x25);
-        latt_invariance(gemv_iq1s_core, 50, 2048, 8, 0x15);
-        latt_invariance(gemv_iq3s_core, 110, 512, 4, 0x35);
-        latt_invariance(gemv_iq1m_core, 56, 2048, 8, 0x1D);
     }
 
     #[cfg(target_arch = "aarch64")]

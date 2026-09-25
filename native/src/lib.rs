@@ -428,8 +428,8 @@ pub unsafe extern "C" fn btb_gemv_q80_rows(
 
 /// [`btb_gemv_q4k_rows`] over a GGUF IQ lattice matrix (256-weight superblocks): `raw` the file's bytes,
 /// `grid` the type's int8 codebook flattened (entries * values), `ksigns` the shared 128-entry sign table
-/// (null for the types that carry explicit signs or none). A weight is a signed, scaled grid entry. `cols`
-/// a multiple of 256.
+/// (null for the types that carry explicit signs or none; `ERR_NULL` for IQ3_XXS/IQ2_XXS/IQ2_XS, which read
+/// it). A weight is a signed, scaled grid entry. `cols` a multiple of 256.
 macro_rules! latt_rows {
     ($name:ident, $core:ident) => {
         /// A GGUF IQ lattice matvec: see [`latt_rows`]'s documentation for the layout.
