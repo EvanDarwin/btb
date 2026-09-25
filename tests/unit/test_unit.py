@@ -546,15 +546,10 @@ def test_the_span_bank_keeps_the_index_and_a_proposer_looks_it_up() -> None:
     assert (7, 8) not in bank.ext[2] and bank.lookup(2, (21, 22)) is None and bank.lookup(2, (30, 31)) is not None
 
 
-def test_a_seed_keeps_its_bits_and_a_stream_flag_is_a_boolean() -> None:
-    from btb.options import BadValue, check_value
-    from btb.serve import _flag
+def test_a_seed_keeps_its_bits() -> None:
+    from btb.options import check_value
 
     assert check_value("seed", 2**60 + 1) == 2**60 + 1 and check_value("seed", "7") == 7
-    assert _flag({"stream": True}, "stream", False) is True and _flag({}, "stream", True) is True
-    assert _flag({"stream": 0}, "stream", True) is False
-    with pytest.raises(BadValue):
-        _flag({"stream": "false"}, "stream", False)
 
 
 def test_the_card_without_its_kernels_is_a_reason_kept_and_one_warning(

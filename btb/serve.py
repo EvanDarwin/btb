@@ -437,6 +437,9 @@ class _Server(ThreadingHTTPServer):
     # reusable so a restart binds at once
     daemon_threads = True
     allow_reuse_address = True
+    # a burst of connections waits to be accepted instead of meeting the default queue of 5, which macOS answers
+    # with a reset: MAX_CONNECTIONS decides who is turned away, not the kernel's accept queue
+    request_queue_size = socket.SOMAXCONN
     reg: ModelRegistry
     api_key: str | None = None  # every request must carry it as a bearer token when set
 

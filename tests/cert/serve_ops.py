@@ -79,38 +79,43 @@ class Route:
 # dispatch branch and behavior are one row with a `paths` tuple (as native_ops groups a kernel's exports), the
 # `test` a request that exercises the branch.
 OPS: tuple[Route, ...] = (
-    Route("discovery", ("GET",), ("/", "/health"), "tests/unit/test_cli.py::test_server_routes_without_a_model"),
+    Route("discovery", ("GET",), ("/", "/health"), "tests/unit/test_serve.py::test_server_routes_without_a_model"),
     Route(
         "head",
         ("HEAD",),
         ("/", "/health", "/v1/models", "/api/tags", "/api/ps", "/api/version"),
-        "tests/unit/test_cli.py::test_server_head_is_get_without_the_body",
+        "tests/unit/test_serve.py::test_server_head_is_get_without_the_body",
     ),
-    Route("openai_models", ("GET",), ("/v1/models",), "tests/unit/test_cli.py::test_server_routes_without_a_model"),
+    Route("openai_models", ("GET",), ("/v1/models",), "tests/unit/test_serve.py::test_server_routes_without_a_model"),
     Route(
         "openai_chat",
         ("POST",),
         ("/v1/chat/completions",),
         "tests/unit/test_pi.py::test_openai_stays_plain_text_without_tools",
     ),
-    Route("ollama_tags", ("GET",), ("/api/tags",), "tests/unit/test_cli.py::test_server_routes_without_a_model"),
-    Route("ollama_ps", ("GET",), ("/api/ps",), "tests/unit/test_cli.py::test_ollama_ps_lists_the_loaded_models"),
-    Route("ollama_version", ("GET",), ("/api/version",), "tests/unit/test_cli.py::test_server_routes_without_a_model"),
+    Route("ollama_tags", ("GET",), ("/api/tags",), "tests/unit/test_serve.py::test_server_routes_without_a_model"),
+    Route("ollama_ps", ("GET",), ("/api/ps",), "tests/unit/test_serve.py::test_ollama_ps_lists_the_loaded_models"),
     Route(
-        "ollama_chat", ("POST",), ("/api/chat",), "tests/unit/test_pi.py::test_a_bad_request_field_is_a_400_naming_it"
+        "ollama_version", ("GET",), ("/api/version",), "tests/unit/test_serve.py::test_server_routes_without_a_model"
+    ),
+    Route(
+        "ollama_chat",
+        ("POST",),
+        ("/api/chat",),
+        "tests/unit/test_serve.py::test_a_bad_request_field_is_a_400_naming_it",
     ),
     Route(
         "ollama_generate",
         ("POST",),
         ("/api/generate",),
-        "tests/unit/test_pi.py::test_a_bad_request_field_is_a_400_naming_it",
+        "tests/unit/test_serve.py::test_a_bad_request_field_is_a_400_naming_it",
     ),
-    Route("ollama_show", ("POST",), ("/api/show",), "tests/unit/test_pi.py::test_show_names_the_model_not_its_path"),
+    Route("ollama_show", ("POST",), ("/api/show",), "tests/unit/test_serve.py::test_show_names_the_model_not_its_path"),
     Route(
         "ollama_unsupported",
         ("POST",),
         ("/api/pull", "/api/push", "/api/create", "/api/copy", "/api/delete", "/api/embed", "/api/embeddings"),
-        "tests/unit/test_cli.py::test_server_routes_without_a_model",
+        "tests/unit/test_serve.py::test_server_routes_without_a_model",
     ),
 )
 
