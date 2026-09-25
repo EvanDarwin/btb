@@ -17,6 +17,8 @@ import re
 import sys
 from enum import StrEnum
 
+from btb.quant import CARD_KERNELS
+
 from .core import BTB_SRC
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -36,13 +38,14 @@ MISSING: dict[Missing, tuple[str, str]] = {
     Missing.DEFINED_NOT_LOADED: (
         "kernel {s} is defined in native/cuda/*.cu|.cuh but the engine never loads it (not in _Cuda.KERNELS) - "
         "a new card kernel with no wiring or cert",
-        "add {s} to _Cuda.KERNELS in btb/engine/native.py and launch it where it belongs, or remove the "
-        "definition if the kernel is dead",
+        "add {s} to _Cuda._REQUIRED in btb/engine/native.py (a packed gemv: its type's `card` stem in "
+        "btb/quant.py) and launch it where it belongs, or remove the definition if the kernel is dead",
     ),
     Missing.LOADED_NOT_DEFINED: (
         "the engine loads {s} (_Cuda.KERNELS) but native/cuda defines no such kernel - the fatbin load would "
         "fail on a GPU",
-        "define {s} in native/cuda (or its generating macro), or drop it from _Cuda.KERNELS if it was renamed",
+        "define {s} in native/cuda (or its generating macro), or drop it from _Cuda._REQUIRED (a packed gemv: "
+        "its type's `card` stem in btb/quant.py) if it was renamed",
     ),
 }
 
@@ -52,7 +55,7 @@ _EXTERN = re.compile(r'extern\s+"C"\s+__global__\s+void\s+(?:__launch_bounds__\(
 _TEMPLATE = re.compile(r"(btb_\w+)##")  # a macro body's templated name(s), e.g. btb_gemv_bf16_m##M
 _DEFINE = re.compile(r"#define\s+(\w+)\(")  # a macro definition head
 _INST = re.compile(r"^(\w+)\((\d+)\)", re.M)  # a macro instantiation, e.g. GEMV(16)
-_KERNELS_BLOCK = re.compile(r"KERNELS\s*=\s*\((.*?)\)", re.S)
+_KERNELS_BLOCK = re.compile(r"_REQUIRED\s*=\s*\((.*?)\)", re.S)
 
 
 def _cuda_source() -> str:
@@ -66,13 +69,13 @@ def _cuda_source() -> str:
 
 
 def loaded_kernels() -> set[str]:
-    """the card kernels the engine loads by name, from `_Cuda.KERNELS` in native.py (parsed as source, so no
-    torch import); a missing one fails at load on a GPU, so this is the authoritative required set."""
+    """the card kernels the engine loads by name, `_Cuda.KERNELS`: the `_REQUIRED` literals in native.py (parsed
+    as source, so no torch import) plus the registry's packed gemvs, `quant.CARD_KERNELS` (torch-free)."""
     with open(NATIVE_PY, encoding="utf-8") as f:
         block = _KERNELS_BLOCK.search(f.read())
     if block is None:
         return set()
-    return set(re.findall(r'"(btb_\w+)"', block.group(1)))
+    return set(re.findall(r'"(btb_\w+)"', block.group(1))) | CARD_KERNELS
 
 
 def defined_kernels() -> set[str]:
