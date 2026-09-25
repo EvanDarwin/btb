@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from btb.kinds import Json
-from tests.helpers import MB, checkout, fixture
+from tests.helpers import MB, checkout, fixture, need_mlx
 
 
 def _run(name: str, *args: str) -> Json:
@@ -100,6 +100,19 @@ def test_foreign_model_gets_the_scheduler_over_a_transformers_model() -> None:
     r = _run("foreign_model", "--new", "64")
     assert r["row_bytes"] > 0 and r["batch"] == 8, "off the card the epoch is every pending row"
     assert r["refused"] and "REFUSED my impossible cache" in r["refused"]
+    assert r["granted"]["kv@cpu"] == 4 * r["row_bytes"]
+
+
+def test_foreign_model_prices_unified_memory_on_mlx() -> None:
+    """--device mlx: the cache priced against the RAM Apple silicon's GPU shares, the grants on the host"""
+    need_mlx()
+    path = checkout("examples", "foreign_model.py")
+    spec = importlib.util.spec_from_file_location("example_foreign_model_mlx", path)
+    assert spec is not None and spec.loader is not None
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    r = m.main(["--model", fixture("tiny_qwen3"), "--device", "mlx", "--new", "64"])
+    assert r["row_bytes"] > 0 and r["batch"] == 8 and "REFUSED my impossible cache" in r["refused"]
     assert r["granted"]["kv@cpu"] == 4 * r["row_bytes"]
 
 

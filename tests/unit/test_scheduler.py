@@ -2341,3 +2341,31 @@ def test_free_bytes_adds_this_processs_own_reclaimable_pool_over_the_physical_fr
 def test_free_bytes_falls_back_to_mem_get_info_when_the_physical_free_is_unreadable() -> None:
     with cuda_stats(free=4 * GB, physical=None):  # no nvidia-smi / not NVIDIA: keep the per-process reading
         assert device_mod.free_bytes(torch.device("cuda:0")) == 4 * GB
+
+
+def test_a_foreign_model_on_mlx_is_priced_against_the_ram_the_gpu_shares() -> None:
+    """`for_model(device="mlx")` prices a transformers model as `btb.plan` prices an MLX load: the cache against
+    the host's RAM (Apple silicon's GPU spends the same), no card margin; its grants and free reads take 'mlx'"""
+    if not device_mod.mlx_available():
+        pytest.skip("MLX is Apple-silicon only")
+    sched = BatchScheduler.for_model(model_config(num_hidden_layers=2, vocab_size=1000), device="mlx")
+    assert sched.sm.dev == torch.device("cpu") and sched.sm.vram_margin == 0
+    assert device_mod.torch_device("mlx") == torch.device("cpu")
+    free = sched.free_for("mlx")
+    assert free is not None and free > 0
+    sched.grant(MB, "kv", requester="a row", device="mlx")
+    assert sched.granted == {"kv@cpu": MB}
+    assert sched.kv_row_bytes(64) > 0
+
+
+def test_a_foreign_model_on_a_device_btb_cannot_run_is_an_option_error() -> None:
+    """a name that is no device, or a card this machine lacks, is refused as `btb.load` refuses it - naming the
+    device and what runs here - never a torch error from inside the pricing"""
+    from btb.options import BadDevice
+
+    cfg = model_config(num_hidden_layers=2, vocab_size=1000)
+    with pytest.raises(BadDevice, match="tpu"):
+        BatchScheduler.for_model(cfg, device="tpu")
+    if not torch.cuda.is_available():
+        with pytest.raises(BadDevice, match="runs here"):
+            BatchScheduler.for_model(cfg, device="cuda")

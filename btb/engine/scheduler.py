@@ -342,7 +342,11 @@ class BatchScheduler:
     ) -> BatchScheduler:
         """The scheduler over a transformers model (or its config) that is not the engine's: the KV priced from
         the config's heads, the host floor as a plan takes it (`ram_reserve_gb` names one), the
-        card's margin as a load takes it (`vram_margin_gb`; `vram_reserve_gb` names one)."""
+        card's margin as a load takes it (`vram_margin_gb`; `vram_reserve_gb` names one). `device` is named and
+        checked as `btb.load` takes it; on 'mlx' the cache is priced against the RAM the GPU shares, as
+        `btb.plan` prices an MLX load."""
+        from .device import resolve_device, torch_device
+
         cfg = getattr(model, "config", model)
         cfg = getattr(cfg, "text_config", cfg)
         L = int(getattr(cfg, "num_hidden_layers", 0) or 0)
@@ -351,7 +355,7 @@ class BatchScheduler:
         params = getattr(model, "parameters", None)
         if callable(params):
             dtype = next((p.dtype for p in params()), None)
-        dev = torch.device(device)
+        dev = torch_device(resolve_device(device))
         if vram_reserve_gb is None:
             vram_reserve_gb = (
                 BatchScheduler.vram_margin_gb(torch.cuda.get_device_properties(dev).total_memory)
@@ -450,9 +454,9 @@ class BatchScheduler:
         dv = getattr(self.sm, "device", None)
         if dv is not None:
             return dv.free(device)
-        from .device import free_bytes
+        from .device import free_bytes, torch_device
 
-        dev = self.sm.dev if device is None else torch.device(device)
+        dev = self.sm.dev if device is None else torch_device(device)
         if dev.type == Device.CUDA:
             if self.sm.dev.type != Device.CUDA:
                 return None
@@ -488,7 +492,9 @@ class BatchScheduler:
         free = self.free_for(device)
         if free is None:
             return
-        dev = self.sm.dev if device is None else torch.device(device)
+        from .device import torch_device
+
+        dev = self.sm.dev if device is None else torch_device(device)
         # the card's margin is its OOM guard and the host's floor is the OS's own (or the one --ram-reserve
         # names): a request past either is refused
         if nbytes > free:

@@ -109,6 +109,17 @@ def _warn_mlx_missing() -> None:
     )
 
 
+def torch_device(device: Any) -> torch.device:
+    """A device as torch spells it, to price or allocate on: 'mlx' is the host, whose RAM the GPU spends on
+    Apple silicon's unified memory. A name that is not a device (or mlx off Apple silicon) is an OptionError."""
+    if isinstance(device, torch.device):
+        return device
+    d = check_device(device)
+    if d is None:
+        raise BadDevice(device, f"a device is named here: {DeviceKind.CPU}, {DeviceKind.MLX} or {DeviceKind.CUDA}[:N]")
+    return torch.device(DeviceKind.CPU) if d.kind is DeviceKind.MLX else torch.device(str(d))
+
+
 def resolve_device(device: Any) -> DeviceName:
     """The device a load runs on: None (or 'auto') picks the card when one is visible, else MLX on Apple
     silicon, else the CPU; a device named must exist here - 'mlx' off Apple silicon or 'cuda' without a card
@@ -278,7 +289,7 @@ class Device:
         there; with `unreserved`, less what `reserve()` has spoken for on it. On unified memory the ledger is
         the engine's own: the RAM the load started with, less the reserve, less everything MLX holds."""
         sm = self.sm
-        dev = sm.dev if device is None else torch.device(device)
+        dev = sm.dev if device is None else torch_device(device)
         if dev.type == DeviceKind.CUDA:
             if sm.dev.type != DeviceKind.CUDA:
                 return None
@@ -294,12 +305,12 @@ class Device:
     def reserve(self, tag: str, nbytes: int, device: Any = None) -> None:
         """Memory spoken for under `tag` on `device` (the engine's own when None); a tag reserved again is
         replaced, not added."""
-        dev = self.sm.dev if device is None else torch.device(device)
+        dev = self.sm.dev if device is None else torch_device(device)
         self._reserved[tag] = (dev.type, max(0, int(nbytes)))
 
     def release(self, tag: str) -> None:
         self._reserved.pop(tag, None)
 
     def reserved(self, device: Any = None) -> int:
-        dev = self.sm.dev if device is None else torch.device(device)
+        dev = self.sm.dev if device is None else torch_device(device)
         return sum(n for t, n in self._reserved.values() if t == dev.type)
