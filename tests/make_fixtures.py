@@ -23,7 +23,7 @@ import shutil
 import sys
 from typing import TYPE_CHECKING
 
-from btb.kinds import Json, TokenRows
+from btb.kinds import Json, QuantClass, TokenRows, quants_of
 from tests.helpers import (
     CHUNK,
     FIXTURES,
@@ -95,7 +95,8 @@ def write_tokenizer(model_dir: str) -> None:
 
 # --- GGUF twins: a fixture written in llama.cpp's format through the gguf package's writer ------------------
 
-GGUF_TYPES = ("bf16", "f16", "q8_0", "q4_0")  # the storage types the reader is tested on (the ones gguf-py writes)
+# the storage types the reader is tested on: every float and affine type (the ones gguf-py writes)
+GGUF_TYPES = tuple(q.value.lower() for c in (QuantClass.FLOAT, QuantClass.AFFINE) for q in quants_of(c))
 
 
 def write_gguf(model_dir: str, out: str, outtype: str) -> None:

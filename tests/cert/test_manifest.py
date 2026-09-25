@@ -39,7 +39,7 @@ EXPECTED_GAPS: dict[manifest.Missing, list[str]] = {
     manifest.Missing.FP8_UNIMPLEMENTED: [
         "tiny_gemma3", "tiny_gpt_oss", "tiny_phi3", "tiny_q35", "tiny_q4", "tiny_qwen3",
     ],
-    manifest.Missing.QUANT_FIXTURE: ["tiny_phi3", "tiny_qwen3"],
+    manifest.Missing.QUANT_FIXTURE: ["tiny_phi3"],
     manifest.Missing.NO_RUNNER_CELL: [
         "tiny_gemma3", "tiny_gpt_oss", "tiny_phi3", "tiny_q35", "tiny_q4", "tiny_qwen3",
     ],
