@@ -6,7 +6,7 @@ import gc
 import json
 import os
 import sys
-from collections.abc import Generator, Iterator
+from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 import pytest
@@ -19,7 +19,6 @@ if TYPE_CHECKING:
 
 # every skip of a session, collected across phases and written at the end; a full `tests` run banks the ledger
 _SKIPS: dict[str, str] = {}
-_SKIPPED = pytest.StashKey[bool]()  # a test whose setup or call skipped, so its teardown has nothing to release
 
 
 @pytest.fixture(autouse=True)
@@ -40,26 +39,13 @@ def _release_cuda_cache() -> None:
         torch.cuda.empty_cache()
 
 
-@pytest.hookimpl(wrapper=True)
-def pytest_runtest_makereport(
-    item: pytest.Item, call: pytest.CallInfo[None]
-) -> Generator[None, TestReport, TestReport]:
-    report = yield
-    if report.skipped:
-        item.stash[_SKIPPED] = True
-    return report
-
-
 @pytest.fixture(autouse=True)
-def _release_allocator_caches(request: pytest.FixtureRequest) -> Iterator[None]:
+def _release_allocator_caches() -> Iterator[None]:
     """Every allocator keeps freed buffers cached, and the scheduler's ledger counts them as held, so a long session
     starves later loads whatever the backend - the draft-model test refused a 16 MB KV grow at the end of the cert
     runner with "0 KiB free, 7.49 GiB held by MLX". After each test: drop the cyclic garbage that pins tensors, then
-    return the CUDA and MLX caches, so memory reads the same in any order. A skipped test allocated nothing, and a
-    collection over a loaded torch costs ~90 ms, which thousands of skipped cert cells turned into minutes."""
+    return the CUDA and MLX caches, so memory reads the same in any order."""
     yield
-    if request.node.stash.get(_SKIPPED, False):
-        return
     gc.collect()
     _release_cuda_cache()
     mx = sys.modules.get("mlx.core")  # only a test that loaded MLX has an MLX cache to return

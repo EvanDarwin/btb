@@ -15,6 +15,7 @@ that gap's reason. Run the MLX cells on an Apple-silicon box, ideally under the 
 
 from __future__ import annotations
 
+import functools
 import os
 import subprocess
 import sys
@@ -36,6 +37,7 @@ from . import core, manifest, oracle, receipt, spec
 from .oracle import PROMPT, N  # the decodes the oracle banks; the cells must not drift from them
 
 
+@functools.cache
 def _hardware_here(hw: spec.Hardware) -> bool:
     if hw is spec.Hardware.CPU:
         return True
@@ -51,16 +53,39 @@ def _subpaths(surface: spec.Surface) -> tuple[spec.DeviceSubpath, ...]:
     return spec.subpaths(*spec.SURFACE_SUBPATHS[surface])
 
 
-def _skip_unless_distinct(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath) -> None:
-    """skip a cell that is not this cell: one whose knob has nothing to act on (the manifest's dnr - a GGUF knob
-    off GGUF, an expert-store knob on a dense family), and one the engine cannot engage at all, which would
-    otherwise decode down another path and bank a receipt for one it never took (the manifest's subpath_gap)."""
-    same = manifest.dnr(kind, storage, dev, spec.DecodePath.GREEDY)
-    if same is not None:
-        pytest.skip(same)
-    why = manifest.subpath_gap(kind, storage, dev)
-    if why is not None:
-        pytest.skip(f"GAP (manifest --check fails on this): {why}")
+def _why_not(
+    kind: FamilyKind | None,
+    storage: spec.Storage | None,
+    dev: spec.DeviceSubpath,
+    path: str,
+    decode: spec.DecodePath | None = spec.DecodePath.GREEDY,
+) -> str | None:
+    """why a cell does not run on this machine, None when it does. A cell that is not this cell: one whose knob
+    has nothing to act on (the manifest's dnr - a GGUF knob off GGUF, an expert-store knob on a dense family),
+    one the engine cannot engage at all, which would decode down another path and bank a receipt for one it
+    never took (the manifest's subpath_gap), then hardware this machine lacks and a fixture not built. `decode`
+    None for a shape axis, which has no storage cell to be distinct from."""
+    name = os.path.basename(path)
+    if decode is not None:
+        if kind is None or storage is None:
+            return f"{name}: no served family or supported quant claims it (a manifest orphan fixture)"
+        same = manifest.dnr(kind, storage, dev, spec.DecodePath.GREEDY)
+        if same is not None:
+            return same
+        refused = manifest.subpath_gap(kind, storage, dev)
+        if refused is not None:
+            return f"GAP (manifest --check fails on this): {refused}"
+    if not _hardware_here(dev.hardware):
+        return f"{dev.hardware.value} not available on this machine"
+    if not os.path.exists(path):
+        return f"fixture {name} not built"
+    return None
+
+
+def _cell(*values: object, cid: str, why: str | None) -> ParameterSet:
+    """a runner cell, marked skipped when it cannot run here: decided at collection, so a skipped cell never
+    sets up the fixtures whose teardown keeps each test's memory its own"""
+    return pytest.param(*values, id=cid, marks=[pytest.mark.skip(reason=why)] if why else [])
 
 
 def _run_twice(
@@ -94,10 +119,10 @@ def _cells() -> list[ParameterSet]:
                 continue  # no twin at this precision - the manifest's precision gap, not a runner cell
             subject = manifest.safetensors_subject(kind, storage)
             for dev in _subpaths(spec.Surface.SAFETENSORS):
+                why = _why_not(kind, storage, dev, paths[0])
                 for decode in spec.Decode:
-                    out.append(
-                        pytest.param(kind, storage, paths[0], dev, decode, id=f"{subject}-{dev.key}-{decode.value}")
-                    )
+                    cid = f"{subject}-{dev.key}-{decode.value}"
+                    out.append(_cell(kind, storage, paths[0], dev, decode, cid=cid, why=why))
     return out
 
 
@@ -105,17 +130,10 @@ def _cells() -> list[ParameterSet]:
 def test_cell_loads_and_is_deterministic(
     kind: FamilyKind, storage: spec.Storage, path: str, dev: spec.DeviceSubpath, decode: spec.Decode
 ) -> None:
-    # do not FALSELY pass a device sub-path the engine cannot engage for this family or this fixture (the
-    # manifest's gap_reason): running mlx-mega on a head_dim-16 fixture just uses the step path and would pass
-    # without exercising anything. Those are gaps the manifest reports and fails --check on; here they skip, so
-    # the runner never banks a receipt a fallback earned.
-    _skip_unless_distinct(kind, storage, dev)
-    if not _hardware_here(dev.hardware):
-        pytest.skip(f"{dev.hardware.value} not available on this machine")
+    # a device sub-path the engine cannot engage for this family or this fixture never gets here (`_why_not`):
+    # running mlx-mega on a head_dim-16 fixture just uses the step path and would pass without exercising
+    # anything, so the runner never banks a receipt a fallback earned.
     stem = os.path.basename(path)
-    if not os.path.isdir(path):
-        pytest.skip(f"fixture {stem} not built")
-
     sampled = decode is spec.Decode.SAMPLED
     runs: list[list[int]] = []
     held: list[int] | None = None  # the greedy decode a bf16 sampled cell holds to the oracle instead of its draw
@@ -173,23 +191,21 @@ def _gguf_cells() -> list[ParameterSet]:
     for fname in sorted(os.listdir(GGUF_FIXTURES)):
         if not fname.endswith(".gguf"):
             continue
+        kind = spec.kind_of_stem(fname[: -len(".gguf")].rsplit("-", 1)[0])
+        storage = spec.storage_of_gguf(fname)
+        path = os.path.join(GGUF_FIXTURES, fname)
         for dev in _subpaths(spec.Surface.GGUF):
-            out.append(pytest.param(fname, dev, id=f"{fname[: -len('.gguf')]}-{dev.key}"))
+            why = _why_not(kind, storage, dev, path)
+            out.append(_cell(kind, storage, fname, dev, cid=f"{fname[: -len('.gguf')]}-{dev.key}", why=why))
     return out
 
 
-@pytest.mark.parametrize("fname,dev", _gguf_cells())
-def test_gguf_cell_loads_and_is_deterministic(fname: str, dev: spec.DeviceSubpath) -> None:
-    if not _hardware_here(dev.hardware):
-        pytest.skip(f"{dev.hardware.value} not available on this machine")
-    kind = spec.kind_of_stem(fname[: -len(".gguf")].rsplit("-", 1)[0])
-    storage = spec.storage_of_gguf(fname)
-    if kind is None or storage is None:
-        pytest.skip(f"{fname}: no served family or supported quant claims it (a manifest orphan fixture)")
-    fam, st = kind, storage
-    _skip_unless_distinct(fam, st, dev)
+@pytest.mark.parametrize("kind,storage,fname,dev", _gguf_cells())
+def test_gguf_cell_loads_and_is_deterministic(
+    kind: FamilyKind, storage: spec.Storage, fname: str, dev: spec.DeviceSubpath
+) -> None:
     path = os.path.join(GGUF_FIXTURES, fname)
-    runs = _run_twice(path, dict(dev.knobs), lambda sm: _assert_path_engaged(sm, fam, st, dev, None, fname))
+    runs = _run_twice(path, dict(dev.knobs), lambda sm: _assert_path_engaged(sm, kind, storage, dev, None, fname))
     assert_same_tokens(runs[0], runs[1], f"{fname} on {dev.key} decoded differently across two loads")
     receipt.record(manifest.gguf_id(fname, dev.key))
 
@@ -205,20 +221,17 @@ def _pack12_cells() -> list[ParameterSet]:
         stem = spec.FIXTURE_STEM.get(kind)
         if stem is None:
             continue
+        path = os.path.join(FIXTURES, stem + "-pack12")
         for dev in _subpaths(spec.Surface.PACK12):
-            out.append(pytest.param(kind, stem, dev, id=f"{kind.value}-pack12-{dev.key}"))
+            why = _why_not(kind, spec.Storage.PACK12, dev, path)
+            out.append(_cell(kind, stem, dev, cid=f"{kind.value}-pack12-{dev.key}", why=why))
     return out
 
 
 @pytest.mark.parametrize("kind,stem,dev", _pack12_cells())
 def test_pack12_cell_loads_and_is_deterministic(kind: FamilyKind, stem: str, dev: spec.DeviceSubpath) -> None:
-    if not _hardware_here(dev.hardware):
-        pytest.skip(f"{dev.hardware.value} not available on this machine")
     path = os.path.join(FIXTURES, stem + "-pack12")
-    if not os.path.isdir(path):
-        pytest.skip(f"{stem}-pack12 not built")
     storage = spec.Storage.PACK12
-    _skip_unless_distinct(kind, storage, dev)
     runs = _run_twice(
         path,
         {**dev.knobs, **PACK12_KNOBS},
@@ -243,18 +256,15 @@ def _shape_cells(surface: spec.Surface) -> list[ParameterSet]:
         if stem is None:
             continue
         for dev in _subpaths(surface):
-            out.append(pytest.param(stem, dev, id=f"{kind.value}-{surface.value}-{dev.key}"))
+            why = _why_not(kind, None, dev, os.path.join(FIXTURES, stem), None)
+            out.append(_cell(stem, dev, cid=f"{kind.value}-{surface.value}-{dev.key}", why=why))
     return out
 
 
 @pytest.mark.parametrize("stem,dev", _shape_cells(spec.Surface.BATCH))
 def test_batch_is_deterministic(stem: str, dev: spec.DeviceSubpath) -> None:
     """the batched decode loop (several rows at once) is reproducible per row across two independent loads."""
-    if not _hardware_here(dev.hardware):
-        pytest.skip(f"{dev.hardware.value} not available on this machine")
     path = os.path.join(FIXTURES, stem)
-    if not os.path.isdir(path):
-        pytest.skip(f"fixture {stem} not built")
     runs = []
     for _ in range(2):
         with loaded_model(path, **dev.knobs) as sm:
@@ -269,11 +279,7 @@ def test_batch_is_deterministic(stem: str, dev: spec.DeviceSubpath) -> None:
 def test_context_growth_is_deterministic(stem: str, dev: spec.DeviceSubpath) -> None:
     """a longer prompt (past gemma3's sliding window, and real cache growth) decodes reproducibly across two loads.
     Does NOT reach the 1024 attention split - tiny fixtures cap at 512; that path needs a cached real model."""
-    if not _hardware_here(dev.hardware):
-        pytest.skip(f"{dev.hardware.value} not available on this machine")
     path = os.path.join(FIXTURES, stem)
-    if not os.path.isdir(path):
-        pytest.skip(f"fixture {stem} not built")
     runs = []
     for _ in range(2):
         with loaded_model(path, **dev.knobs) as sm:
