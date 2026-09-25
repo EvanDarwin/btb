@@ -37,11 +37,11 @@ PARA = (
 )
 
 
-def _build(model_dir: str, dtype: torch.dtype = torch.float32) -> None:
+def _build(model_dir: str, dtype: torch.dtype = torch.bfloat16) -> None:
     """A tiny Gemma 3 text model: four layers alternating sliding/full (a window of 4, shorter than the prompt),
     distinct local/global rope, a non-head-dim query scale, and norm weights perturbed off zero so the 1 + weight
-    centering matters. float32 for the transformers-parity check; bf16 for the MLX fused path, which binds its
-    resident weights only when they are bf16."""
+    centering matters. Saved as bf16, the precision the engine holds any checkpoint's weights at; transformers'
+    float32 reference reads the same values widened, so the parity is exact."""
     from transformers import Gemma3ForCausalLM, Gemma3TextConfig
 
     cfg = Gemma3TextConfig(
@@ -158,7 +158,7 @@ def test_gemma3_fused_matches_eager(tmp_path: Path) -> None:
     MLX, so this isolates the sandwich-norm ordering, the dual local/global rope, and the sliding-window attention
     the fused path adds from the numerics. The eager path is already pinned to transformers above."""
     model_dir = str(tmp_path / "tiny_gemma3")
-    _build(model_dir, torch.bfloat16)  # the fused MLX path binds resident weights only when they are bf16
+    _build(model_dir)
     with loaded_model(model_dir, device="mlx") as sm:
         speculation(sm, tree_budget=0, v_max=0, ngram_p=0.0, tree_read="step")
         assert sm.mlx is not None, "the tiny model did not land on the MLX device"
