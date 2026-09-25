@@ -7,7 +7,8 @@ reported GAP. Every gap carries a `Missing` kind whose plain-language what/how l
 The ISA axis is per kernel family: which of the Rust `Isa` tiers (native/src/gemv.rs) each family implements,
 read from the crate's `<kernel>_<tier>` naming in native/src/<family>.rs. A tier a family lacks is surfaced as
 a non-blocking finding (on that CPU the family runs its next narrower path), never a silent fallback. Tiers are
-certified by wheels.yml, which runs the parity suite on every shipped platform at the tier that CPU detects.
+certified by wheels.yml, which runs the parity and guard-page suites on every shipped platform at the tier that CPU
+detects.
 
     python -m tests.cert.native_ops --report    # the op table plus the plain-language gaps
     python -m tests.cert.native_ops --missing   # only the gaps in plain language: what is missing and how to close

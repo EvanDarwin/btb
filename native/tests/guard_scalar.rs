@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 //! The same fenced sweeps on the scalar path, pinned with `BTB_NATIVE_ISA=scalar` before the
 //! crate's first kernel call in this process (every test sets it; the first one wins).
-#![cfg(windows)]
 
 mod common;
 

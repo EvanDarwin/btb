@@ -22,6 +22,10 @@ rayon = "1"
 # `harness = false` and drives criterion itself.
 criterion = "0.5"
 
+# The guard-page fence (`tests/common/mod.rs`) maps its pages with mmap/mprotect off Windows.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 # One `[[bench]]` per op family, all custom-harness. The benches build inputs with the parity
 # tests' generators (`tests/common/refs.rs`, `fixture.rs`) included by path, so core is untouched.
 [[bench]]

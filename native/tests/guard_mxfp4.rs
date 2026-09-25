@@ -3,7 +3,6 @@
 //! guard page, so a read or a write past any of them faults. The output must not move with the
 //! thread count, the alignment or the batch width, a grouped task must equal its own rows call,
 //! and every row must match an f64 reference built from the e2m1 table and `2^(scale - 127)`.
-#![cfg(windows)]
 
 mod common;
 

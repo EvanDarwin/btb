@@ -3,8 +3,7 @@
 //! read-only, so a read past either end of them faults, and the output tokens sit against a guard
 //! page of their own. Both the greedy argmax and the top-k / top-p draw are fenced, at both
 //! alignments and three thread counts, and every fenced pick equals the plain unfenced call. The
-//! cross-platform parity of the same sampler lives in `sample.rs`.
-#![cfg(windows)]
+//! unfenced parity of the same sampler lives in `sample.rs`.
 
 mod common;
 
@@ -22,6 +21,7 @@ const SHAPES: &[(usize, usize)] = &[(1, 1), (1, 7), (1, 50257), (3, 4001), (16, 
 
 /// The sampler on fenced, read-only inputs into a fenced output. Faults on any read past x or keys;
 /// panics if the output was left with its poison sentinel or any slack byte moved.
+#[allow(clippy::too_many_arguments)]
 fn fenced_call(
     x: &Fence<f32>,
     rows: usize,
@@ -91,7 +91,7 @@ fn fenced_inputs_and_output_both_alignments() {
     for &(rows, v) in SHAPES {
         let x_all = gen_f32(rows * v, 0x5A_11_CE + (v as u64));
         let key_vals: Vec<u64> = (0..rows as u64)
-            .map(|r| r.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5)
+            .map(|r| r.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x0001_2345)
             .collect();
         for &(t, k, p) in CFGS {
             let want = reference(&x_all, rows, v, &key_vals, t, k, p);

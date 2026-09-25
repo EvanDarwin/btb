@@ -188,12 +188,12 @@ jobs:
         with:
           name: fatbin
           path: native/cuda
-      - name: Rust tests (the kernel suites; the fenced guard-page suites build on Windows only)
+      - name: Rust tests (the kernel suites, then the same crate against guard pages)
         shell: bash
         run: |
           cd native
           cargo test --release
-          case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) cargo test --profile guard ;; esac
+          cargo test --profile guard
       - name: Build the wheel
         shell: bash
         env:
