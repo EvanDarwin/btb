@@ -679,8 +679,23 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self._send_body(body)
-            return
-        self._json(e.code, {"error": str(e)})
+        else:
+            self._json(e.code, {"error": str(e)})
+        self._linger()
+
+    def _linger(self) -> None:
+        """a refused request's close, as `_Server._turn_away` closes a turned-away connection: the answer out and
+        the write side shut, then what the peer is still sending read and discarded (up to DRAIN_S) before the
+        handler closes. Closing over the unread body resets the connection - Windows sends the reset at once - and
+        the peer reads the reset instead of the status (a 400, 401 or 403 arrived as ConnectionResetError)"""
+        with contextlib.suppress(OSError):
+            self.wfile.flush()
+            self.connection.shutdown(socket.SHUT_WR)
+            deadline = time.monotonic() + DRAIN_S
+            while (left := deadline - time.monotonic()) > 0:
+                self.connection.settimeout(left)
+                if not self.connection.recv(1 << 16):
+                    break
 
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("[serve] " + (fmt % args) + "\n")
