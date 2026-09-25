@@ -200,7 +200,8 @@ class Backend:
                 m.set_wired_limit(int(self.info.get("max_recommended_working_set_size", 0)))
         if log:
             log(
-                f"[mlx] {self.info.get('device_name')}: unified memory {self.info.get('memory_size', 0) / 2**30:.0f} GB, "
+                f"[mlx] {self.info.get('device_name')}: "
+                f"unified memory {self.info.get('memory_size', 0) / 2**30:.0f} GB, "
                 f"recommended working set {self.info.get('max_recommended_working_set_size', 0) / 2**30:.1f} GB"
             )
 

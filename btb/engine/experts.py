@@ -567,7 +567,8 @@ class _ExpertStore:
                 except RuntimeError as e:
                     self.pin = False
                     self.sm.log(
-                        f"[experts] store: the machine would not pin a {k * stride / 2**30:.2f} GB block ({e}); pageable from here"
+                        f"[experts] store: the machine would not pin a {k * stride / 2**30:.2f} GB block ({e}); "
+                        "pageable from here"
                     )
             if raw is None:
                 raw = torch.empty(k * stride + 4096, dtype=torch.uint8)
