@@ -4,7 +4,7 @@
 //! ordered bits, no sort), the masses in 64-bit fixed point, the draw the argmax of the kept tokens' logits
 //! plus Gumbel noise hashed from the row's key and the token (the Metal kernel's formula: a draw only moves
 //! when two candidates tie to the ulp). Deterministic for a (key, row); rows across the thread pool. The NEON
-//! passes pick bit-for-bit what the scalar ones pick.
+//! and AVX2 passes pick bit-for-bit what the scalar ones pick (an AVX-512 CPU runs the AVX2 passes).
 
 use crate::codes::*;
 use crate::gemv::Isa;
@@ -312,6 +312,234 @@ unsafe fn draw_neon(s: &[f32], m: f32, floor: u32, key: u64) -> u32 {
     draw_from(s, m, floor, key, i, best, bi).1 as u32
 }
 
+// AVX2: the NEON passes' shape eight lanes at a time, each lane the scalar operation - no fused multiply-add,
+// `f32::round`'s ties away from zero rebuilt from a truncate (AVX2 rounds ties to even), the unsigned compares
+// done signed on sign-flipped operands - so a pick is bit-for-bit the scalar one.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn ordered_avx2(a: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+    let u = _mm256_castps_si256(a);
+    let neg = _mm256_srai_epi32::<31>(u);
+    _mm256_xor_si256(u, _mm256_or_si256(neg, _mm256_set1_epi32(i32::MIN)))
+}
+
+/// lanes where `a < b` as unsigned 32-bit
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn lt_u32_avx2(
+    a: std::arch::x86_64::__m256i,
+    b: std::arch::x86_64::__m256i,
+) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+    let s = _mm256_set1_epi32(i32::MIN);
+    _mm256_cmpgt_epi32(_mm256_xor_si256(b, s), _mm256_xor_si256(a, s))
+}
+
+/// `f32::round` per lane: the truncation, one step away from zero where the dropped part is at least a half
+/// (x - trunc(x) is exact; a lane with less keeps its truncation, sign of zero included)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn round_away_avx2(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let t = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(x);
+    let abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF));
+    let half =
+        _mm256_cmp_ps::<_CMP_GE_OQ>(_mm256_and_ps(_mm256_sub_ps(x, t), abs), _mm256_set1_ps(0.5));
+    let step = _mm256_or_ps(_mm256_set1_ps(1.0), _mm256_andnot_ps(abs, x)); // 1 with x's sign
+    _mm256_blendv_ps(t, _mm256_add_ps(t, step), half)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn fast_exp_avx2(t: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let n = round_away_avx2(_mm256_mul_ps(t, _mm256_set1_ps(std::f32::consts::LOG2_E)));
+    let r = _mm256_sub_ps(
+        _mm256_sub_ps(t, _mm256_mul_ps(n, _mm256_set1_ps(0.693_145_75))),
+        _mm256_mul_ps(n, _mm256_set1_ps(1.428_606_8e-6)),
+    );
+    let mut p = _mm256_mul_ps(r, _mm256_set1_ps(0.000_198_412_7));
+    for c in [
+        0.001_388_889f32,
+        0.008_333_334,
+        0.041_666_668,
+        0.166_666_67,
+        0.5,
+        1.0,
+    ] {
+        p = _mm256_mul_ps(r, _mm256_add_ps(_mm256_set1_ps(c), p));
+    }
+    p = _mm256_add_ps(_mm256_set1_ps(1.0), p);
+    let e = _mm256_add_epi32(_mm256_cvtps_epi32(n), _mm256_set1_epi32(127));
+    let e = _mm256_min_epi32(
+        _mm256_max_epi32(e, _mm256_set1_epi32(1)),
+        _mm256_set1_epi32(254),
+    );
+    let y = _mm256_mul_ps(_mm256_castsi256_ps(_mm256_slli_epi32::<23>(e)), p);
+    let under = _mm256_cmp_ps::<_CMP_LT_OQ>(t, _mm256_set1_ps(-87.0));
+    _mm256_blendv_ps(y, _mm256_setzero_ps(), under)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::needless_range_loop)]
+unsafe fn argmax_avx2(row: &[f32]) -> u32 {
+    use std::arch::x86_64::*;
+    let n = row.len();
+    if n > u32::MAX as usize {
+        return argmax(row);
+    }
+    let p = row.as_ptr();
+    // thirty-two lanes, each the lowest-index maximum of its own column of the row
+    let mut best = [_mm256_set1_ps(f32::NEG_INFINITY); 4];
+    let mut idx = [_mm256_setzero_si256(); 4];
+    let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let mut cur = [0i32, 8, 16, 24].map(|o| _mm256_add_epi32(lane, _mm256_set1_epi32(o)));
+    let mut i = 0;
+    while i + 32 <= n {
+        for k in 0..4 {
+            let v = _mm256_loadu_ps(p.add(i + 8 * k));
+            let gt = _mm256_cmp_ps::<_CMP_GT_OQ>(v, best[k]); // a NaN never wins, as the scalar `>`
+            best[k] = _mm256_blendv_ps(best[k], v, gt);
+            idx[k] = _mm256_blendv_epi8(idx[k], cur[k], _mm256_castps_si256(gt));
+            cur[k] = _mm256_add_epi32(cur[k], _mm256_set1_epi32(32));
+        }
+        i += 32;
+    }
+    let (mut bv, mut bx) = ([0.0f32; 32], [0u32; 32]);
+    for k in 0..4 {
+        _mm256_storeu_ps(bv.as_mut_ptr().add(8 * k), best[k]);
+        _mm256_storeu_si256(bx.as_mut_ptr().add(8 * k) as *mut __m256i, idx[k]);
+    }
+    // no lane holds a NaN; -0 == +0 here as in the scalar compare, so the first zero wins
+    let m = bv
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, |a, b| if b > a { b } else { a });
+    let bi = (0..32)
+        .filter(|&l| bv[l] == m)
+        .map(|l| bx[l])
+        .min()
+        .unwrap_or(0);
+    argmax_from(row, i, m, bi as usize)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn scale_max_avx2(x: &[f32], inv_t: f32, s: &mut Vec<f32>) -> f32 {
+    use std::arch::x86_64::*;
+    let n = x.len();
+    s.clear();
+    s.reserve(n);
+    let (src, dst) = (x.as_ptr(), s.as_mut_ptr());
+    let it = _mm256_set1_ps(inv_t);
+    let mut mx = [_mm256_set1_ps(f32::NEG_INFINITY); 4];
+    let mut i = 0;
+    while i + 32 <= n {
+        for (k, acc) in mx.iter_mut().enumerate() {
+            let v = _mm256_mul_ps(_mm256_loadu_ps(src.add(i + 8 * k)), it);
+            _mm256_storeu_ps(dst.add(i + 8 * k), v);
+            *acc = _mm256_max_ps(v, *acc); // a NaN `v` returns the accumulator: NaN never wins, as f32::max
+        }
+        i += 32;
+    }
+    while i + 8 <= n {
+        let v = _mm256_mul_ps(_mm256_loadu_ps(src.add(i)), it);
+        _mm256_storeu_ps(dst.add(i), v);
+        mx[0] = _mm256_max_ps(v, mx[0]);
+        i += 8;
+    }
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(
+        lanes.as_mut_ptr(),
+        _mm256_max_ps(_mm256_max_ps(mx[0], mx[1]), _mm256_max_ps(mx[2], mx[3])),
+    );
+    let mut m = lanes.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    while i < n {
+        let v = *src.add(i) * inv_t;
+        *dst.add(i) = v;
+        m = m.max(v);
+        i += 1;
+    }
+    s.set_len(n);
+    m
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn masses_avx2(s: &[f32], m: f32, floor: u32, w: &mut Vec<u64>) {
+    use std::arch::x86_64::*;
+    let n = s.len();
+    w.clear();
+    w.reserve(n);
+    let (src, dst) = (s.as_ptr(), w.as_mut_ptr());
+    let (mv, fl) = (_mm256_set1_ps(m), _mm256_set1_epi32(floor as i32));
+    let mut i = 0;
+    while i + 8 <= n {
+        let a = _mm256_loadu_ps(src.add(i));
+        let t = _mm256_sub_ps(a, mv);
+        let keep = _mm256_andnot_si256(
+            lt_u32_avx2(ordered_avx2(a), fl),
+            _mm256_castps_si256(_mm256_cmp_ps::<_CMP_GE_OQ>(t, _mm256_set1_ps(-21.0))),
+        );
+        let e = _mm256_and_ps(_mm256_castsi256_ps(keep), fast_exp_avx2(t));
+        // e * 2^30 is exact and at most 2^30, so the truncating i32 convert is `(e * MASS_SCALE) as u64` and
+        // widens to u64 by zero-extension
+        let q = _mm256_cvttps_epi32(_mm256_mul_ps(e, _mm256_set1_ps(MASS_SCALE)));
+        _mm256_storeu_si256(
+            dst.add(i) as *mut __m256i,
+            _mm256_cvtepu32_epi64(_mm256_castsi256_si128(q)),
+        );
+        _mm256_storeu_si256(
+            dst.add(i + 4) as *mut __m256i,
+            _mm256_cvtepu32_epi64(_mm256_extracti128_si256::<1>(q)),
+        );
+        i += 8;
+    }
+    while i < n {
+        *dst.add(i) = mass(*src.add(i), m, floor);
+        i += 1;
+    }
+    w.set_len(n);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn draw_avx2(s: &[f32], m: f32, floor: u32, key: u64) -> u32 {
+    use std::arch::x86_64::*;
+    let n = s.len();
+    let p = s.as_ptr();
+    let (mv, fl, lim) = (
+        _mm256_set1_ps(m),
+        _mm256_set1_epi32(floor as i32),
+        _mm256_set1_ps(-21.0),
+    );
+    let (mut best, mut bi) = (f32::NEG_INFINITY, 0usize);
+    let mut i = 0;
+    while i + 16 <= n {
+        let mut skip = _mm256_set1_epi32(-1);
+        for k in 0..2 {
+            let a = _mm256_loadu_ps(p.add(i + 8 * k));
+            let out = _mm256_or_si256(
+                lt_u32_avx2(ordered_avx2(a), fl),
+                _mm256_castps_si256(_mm256_cmp_ps::<_CMP_LT_OQ>(_mm256_sub_ps(a, mv), lim)),
+            );
+            skip = _mm256_and_si256(skip, out);
+        }
+        // a lane some token of the sixteen stays in: race them in order, as the scalar loop does
+        if _mm256_movemask_epi8(skip) != -1 {
+            (best, bi) = draw_from(&s[..i + 16], m, floor, key, i, best, bi);
+        }
+        i += 16;
+    }
+    draw_from(s, m, floor, key, i, best, bi).1 as u32
+}
+
 /// the radix select over `s` (scaled logits): the threshold u (ordered bits) at which the count of tokens with
 /// u' >= u first reaches `need`, over the tokens with u' >= floor
 fn select_count(s: &[f32], need: u32, floor: u32) -> u32 {
@@ -413,6 +641,14 @@ def_pick_row!(
     masses_neon,
     draw_neon
 );
+#[cfg(target_arch = "x86_64")]
+def_pick_row!(
+    pick_row_avx2,
+    argmax_avx2,
+    scale_max_avx2,
+    masses_avx2,
+    draw_avx2
+);
 
 #[inline]
 unsafe fn pick_on(
@@ -426,6 +662,10 @@ unsafe fn pick_on(
     #[cfg(target_arch = "aarch64")]
     if isa == Isa::Neon {
         return pick_row_neon(x, key, c, s, w);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if matches!(isa, Isa::Avx512 | Isa::Avx2) {
+        return pick_row_avx2(x, key, c, s, w);
     }
     let _ = isa;
     pick_row(x, key, c, s, w)
@@ -650,6 +890,145 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// The AVX2 passes against the scalar ones over the NEON test's rows. The max is compared by value: which
+    /// zero a row of +0 and -0 reports is order-dependent (`f32::max` leaves it open), and no pick can see it -
+    /// `a - m` against -21 and fast_exp(+-0) agree - so every pass after it is still held to the bit.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_passes_are_bit_identical_to_scalar() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut st = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            st = st
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            st
+        };
+        let uni = |r: u64| ((r >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 24.0;
+        let special = [
+            f32::NAN,
+            -f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            -0.0,
+            f32::MIN_POSITIVE / 4.0,
+            f32::MAX,
+        ];
+        let cfgs = [
+            (0.0f32, 0u32, 1.0f32),
+            (1.0, 0, 1.0),
+            (0.8, 40, 0.9),
+            (0.7, 0, 0.8),
+            (1.5, 3, 0.5),
+            (0.3, 0, 0.99),
+        ];
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+        for v in (1..=70).chain([255, 256, 257, 3001, 50257]) {
+            for kind in 0..4 {
+                let row: Vec<f32> = (0..v)
+                    .map(|_| {
+                        let r = next();
+                        match kind {
+                            0 => uni(r),
+                            1 => (r >> 61) as f32 - 3.0,
+                            2 if r % 5 == 0 => special[(r >> 32) as usize % special.len()],
+                            2 => uni(r),
+                            _ => [0.0, -0.0, f32::NEG_INFINITY][(r >> 32) as usize % 3],
+                        }
+                    })
+                    .collect();
+                let ctx = format!("v={v} kind={kind}");
+                unsafe {
+                    assert_eq!(argmax(&row), argmax_avx2(&row), "{ctx}: argmax");
+                    for &(t, _, _) in &cfgs[1..] {
+                        let (mut s, mut sv) = (Vec::new(), Vec::new());
+                        let m = scale_max(&row, 1.0 / t, &mut s);
+                        let mv = scale_max_avx2(&row, 1.0 / t, &mut sv);
+                        assert!(
+                            m == mv || (m.is_nan() && mv.is_nan()),
+                            "{ctx} t={t}: max {m} vs {mv}"
+                        );
+                        assert_eq!(bits(&s), bits(&sv), "{ctx} t={t}: scaled");
+                        let floors = [0, if v > 7 { select_count(&s, 7, 0) } else { 0 }];
+                        for floor in floors {
+                            let (mut w, mut wv) = (Vec::new(), Vec::new());
+                            masses(&s, m, floor, &mut w);
+                            masses_avx2(&s, m, floor, &mut wv);
+                            assert_eq!(w, wv, "{ctx} t={t} floor={floor}: masses");
+                            for key in 0..3u64 {
+                                assert_eq!(
+                                    draw(&s, m, floor, key),
+                                    draw_avx2(&s, m, floor, key),
+                                    "{ctx} t={t} floor={floor} key={key}: draw"
+                                );
+                            }
+                        }
+                    }
+                    for &(t, k, p) in &cfgs {
+                        let inv_t = if t > 0.0 { 1.0 / t } else { 0.0 };
+                        let c = Cfg {
+                            inv_t,
+                            top_k: k,
+                            top_p: p,
+                        };
+                        for key in [0u64, 0xDEAD_BEEF, u64::MAX] {
+                            let (mut s, mut w) = (Vec::new(), Vec::new());
+                            let a = pick_row(&row, key, c, &mut s, &mut w);
+                            let b = pick_row_avx2(&row, key, c, &mut s, &mut w);
+                            assert_eq!(a, b, "{ctx} t={t} k={k} p={p} key={key}: pick");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// fast_exp's rounding step is the one place AVX2 differs from the scalar ops (ties to even): every tie of
+    /// t * log2(e) in fast_exp's range, and the values a ulp either side, round alike
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_rounds_ties_away_from_zero_as_f32_round() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        use std::arch::x86_64::*;
+        let mut xs = Vec::new();
+        for k in -260i32..=260 {
+            let h = k as f32 * 0.5;
+            xs.extend([
+                h,
+                f32::from_bits(h.to_bits().wrapping_add(1)),
+                f32::from_bits(h.to_bits().wrapping_sub(1)),
+            ]);
+        }
+        xs.extend([
+            0.0,
+            -0.0,
+            0.49999997,
+            -0.49999997,
+            8_388_607.5,
+            -8_388_607.5,
+        ]);
+        xs.retain(|x| x.is_finite()); // 0.0's bits less one are a NaN, whose payload f32::round does not promise
+        for chunk in xs.chunks(8) {
+            let mut lane = [0.0f32; 8];
+            lane[..chunk.len()].copy_from_slice(chunk);
+            let mut got = [0.0f32; 8];
+            unsafe {
+                _mm256_storeu_ps(
+                    got.as_mut_ptr(),
+                    round_away_avx2(_mm256_loadu_ps(lane.as_ptr())),
+                )
+            };
+            for (x, g) in lane.iter().zip(got) {
+                assert_eq!(x.round().to_bits(), g.to_bits(), "round({x})");
             }
         }
     }
