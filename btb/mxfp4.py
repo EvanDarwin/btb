@@ -149,6 +149,10 @@ class MxWeight:
         """a matrix in ggml's layout: `raw` its 17-byte blocks"""
         return cls(raw, None, rows, k, ggml=True)
 
+    @property
+    def nbytes(self) -> int:
+        return self.blocks.numel() + (0 if self.scales is None else self.scales.numel())
+
     def __repr__(self) -> str:
         return f"MxWeight[{self.shape[0]}, {self.shape[1]}{', ggml' if self.ggml else ''}]"
 
@@ -175,6 +179,10 @@ class MxGateUp:
             raise ValueError(f"[mxfp4] gate {gate.shape} and up {up.shape} differ")
         self.gate, self.up = gate, up
         self.shape = (2 * gate.shape[0], gate.shape[1])
+
+    @property
+    def nbytes(self) -> int:
+        return self.gate.nbytes + self.up.nbytes
 
     def __repr__(self) -> str:
         return f"MxGateUp[{self.shape[0]}, {self.shape[1]}]"

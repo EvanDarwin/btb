@@ -244,9 +244,8 @@ class _Experts(torch.nn.Module):
         return (up + 1) * (gate * torch.sigmoid(gate * alpha))
 
     def _group(self) -> Any:
+        """the grouped matvec for this layer's storage, None without the native library (`_linear` widens then)"""
         if self.ggml:
-            if Native.gemv_mx4_ggml_group is None:
-                raise RuntimeError("[experts] a GGUF's MXFP4 experts need the native library built with ggml's layout")
             return Native.gemv_mx4_ggml_group
         return Native.gemv_mx4_group if self.mx else Native.gemv_group
 
@@ -483,7 +482,7 @@ class _Experts(torch.nn.Module):
             gu, dn = self._tables()
             views = {e: (gu[e], dn[e]) for e in hit}
             if self.mx:
-                per_expert = sum(w.blocks.numel() + w.scales.numel() for w in (gu[0], dn[0]))
+                per_expert = gu[0].nbytes + dn[0].nbytes
             else:
                 per_expert = (gu.shape[1] * gu.shape[2] + dn.shape[1] * dn.shape[2]) * gu.element_size()
         use_mlx = (
