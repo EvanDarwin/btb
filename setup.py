@@ -19,10 +19,9 @@ try:
 except ImportError:  # older setuptools that has not vendored wheel yet
     from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
-# btb ships prebuilt wheels for these platforms; other platforms have no wheel and no in-tree compile step, so an
-# install falls back to the sdist and would produce a library-less, unimportable package. The wheel build below
-# refuses that case with a clear message instead; the guard passes whenever build.py has placed
-# the library.
+# btb ships prebuilt wheels for these platforms. Elsewhere pip falls back to the sdist, and setuptools never runs
+# cargo, so a bare `pip install` would package no library; the wheel build refuses that and points at
+# `build.py build`, which compiles the library from the sdist or a checkout.
 SUPPORTED_WHEELS = "linux x86_64 and aarch64 (manylinux_2_28), windows x86_64 and arm64, macos arm64 (Apple Silicon)"
 _NATIVE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "btb", "native")
 _LIB_NAMES = ("btb_native.dll", "libbtb_native.so", "libbtb_native.dylib")
@@ -35,8 +34,8 @@ class bdist_wheel(_bdist_wheel):  # type: ignore[misc]  # wheel ships no stubs
         if not any(glob.glob(os.path.join(_NATIVE, "*", n)) for n in _LIB_NAMES):
             raise SystemExit(
                 "btb has no native library to package: it ships wheels for "
-                f"{SUPPORTED_WHEELS}. On those, pip installs the wheel. On other platforms build the library "
-                "first with `python build.py`; btb cannot be built from the sdist alone."
+                f"{SUPPORTED_WHEELS}. On those, pip installs the wheel. Elsewhere, run `python build.py build` in this "
+                "source tree (it needs a Rust toolchain) and install the wheel it writes to dist/."
             )
 
     def get_tag(self) -> tuple[str, str, str]:
