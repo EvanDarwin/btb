@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 
@@ -19,8 +19,20 @@ from ..session import Session
 from .drafter import MTPDrafter
 from .state import _State
 
+# one of a DeltaNet layer's two states, as the layer holds it: a tensor, or a dict of them by index
+LinState = torch.Tensor | dict[int, torch.Tensor]
+# a DeltaNet layer's (conv, recurrent) states copied, for a later `_lin_restore`
+LinSnap = tuple[LinState, LinState]
 
-def _lin(cl: Any) -> tuple[torch.Tensor, torch.Tensor]:
+
+class LinLayer(Protocol):
+    """a cache layer of a DeltaNet (linear attention) layer, as the helpers below read and write it"""
+
+    conv_states: LinState
+    recurrent_states: LinState
+
+
+def _lin(cl: LinLayer) -> tuple[torch.Tensor, torch.Tensor]:
     c, r = cl.conv_states, cl.recurrent_states
     if isinstance(c, dict):
         c = c[0]
@@ -77,24 +89,24 @@ class _GenerateMixin(_State):
     _lin = staticmethod(_lin)
 
     @staticmethod
-    def _lin_snap(cl: Any) -> tuple[dict[Any, Any], dict[Any, Any]]:
-        c, r = cl.conv_states, cl.recurrent_states
-        if isinstance(c, dict):
-            return (
-                {k: v.clone() for k, v in c.items() if isinstance(v, torch.Tensor)},
-                {k: v.clone() for k, v in r.items() if isinstance(v, torch.Tensor)},
-            )
-        return c.clone(), r.clone()
+    def _lin_snap(cl: LinLayer) -> LinSnap:
+        def copy(s: LinState) -> LinState:
+            if isinstance(s, dict):
+                return {k: v.clone() for k, v in s.items() if isinstance(v, torch.Tensor)}
+            return s.clone()
+
+        return copy(cl.conv_states), copy(cl.recurrent_states)
 
     @staticmethod
-    def _lin_restore(cl: Any, snap: tuple[torch.Tensor, torch.Tensor]) -> None:
+    def _lin_restore(cl: LinLayer, snap: LinSnap) -> None:
         conv, rec = snap
-        if isinstance(conv, dict):
+        if isinstance(conv, dict) and isinstance(rec, dict):
             for k, v in conv.items():
                 cl.conv_states[k].copy_(v)
             for k, v in rec.items():
                 cl.recurrent_states[k].copy_(v)
             return
+        assert isinstance(conv, torch.Tensor) and isinstance(rec, torch.Tensor)  # _lin_snap copies both alike
         c, r = _lin(cl)
         c.copy_(conv)
         r.copy_(rec)
@@ -139,7 +151,7 @@ class _GenerateMixin(_State):
         return logits, anchors
 
     @staticmethod
-    def _lin_set(cl: Any, conv: torch.Tensor, rec: torch.Tensor) -> None:
+    def _lin_set(cl: LinLayer, conv: torch.Tensor, rec: torch.Tensor) -> None:
         if isinstance(cl.conv_states, dict):
             cl.conv_states[0] = conv
         else:

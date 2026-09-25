@@ -20,7 +20,7 @@ from btb.draft import NGramProposer, Spans
 from btb.engine import StreamedTextModel
 from btb.engine.cache import GrowLayer
 from btb.engine.generate import _chains_tree
-from btb.kinds import Json, TokenRows
+from btb.kinds import Json, LayerKind, TokenRows
 from tests.cert import spec
 from tests.helpers import (
     ROOT,
@@ -400,6 +400,39 @@ def test_speculative_is_the_greedy_answer_on_the_host() -> None:
             assert census["proposed"] > census["accepted"], "no draft was rejected: the crop was never taken"
         finally:
             sm.close()
+
+
+@pytest.mark.parametrize("device", ["cpu", "mlx"])
+def test_a_hybrid_draft_model_keeps_its_deltanet_state_at_the_committed_rows(device: str) -> None:
+    """tiny_q35 as a draft model: after a proposal round its DeltaNet state is a prefill's of the committed rows,
+    and a speculative decode with it drafting answers as the plain loop. Its pass over the committed rows used
+    to leave that state where it was (a host tree pass leaves it to the commit, which a drafter never made), and
+    its tree passes crop by a length MLX's linear layers do not have; either way it drafted from a stale state"""
+    from btb.engine.generate import _lin
+    from btb.engine.propose import ModelProposer
+
+    if device == "mlx":
+        need_mlx()
+    path = fixture("tiny_q35")
+    prompt, more = VARIED[0][:8], VARIED[0][8:12]
+    with loaded_model(path, device=device, v_max=0) as sm, torch.inference_mode():
+        mp = ModelProposer(sm, prompt, ks=(2, 2, 1))
+        for t in more:
+            mp.extend(t)
+        assert mp.propose_chains(3), "the drafter proposed nothing"
+        ref = sm.new_cache()
+        sm._prefill(torch.tensor([prompt + more]), ref)
+        for i, kind in enumerate(sm.layer_types):
+            if kind == LayerKind.LINEAR:
+                for got, want in zip(_lin(mp.cache.layers[i]), _lin(ref.layers[i]), strict=True):
+                    err = float((got.float() - want.float()).abs().max())
+                    assert err <= 1e-2 * float(want.float().abs().max()), f"layer {i}: {err:.3e} off the prefill"
+    with loaded_model(path, device=device, draft_model=path, v_max=4, tree_budget=0) as sm:
+        sm._host_cost, sm._mlx_cost = {}, {}  # the load's cost curve sizes a tiny model's passes to one row
+        greedy = list(sm.generate(VARIED, 32, speculate=False).tokens)
+        spec = sm.generate(VARIED, 32, speculate=True)
+    assert spec.stats["proposed"] > 0, "nothing was drafted: the path under test never ran"
+    assert list(spec.tokens) == greedy
 
 
 def test_speculative_is_the_sampled_answer_on_the_host() -> None:
