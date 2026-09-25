@@ -384,6 +384,86 @@ pub fn mxfp4_reference(m: &Mxfp4, rows: usize, cols: usize, x: &[f32]) -> (Vec<f
     (y, mag)
 }
 
+// ---------------------------------------------------------------- fp8 reference
+
+/// An FP8 matrix: `rows * cols` e4m3fn bytes and an `[sr, sc]` grid of f32 scales.
+pub struct Fp8 {
+    pub w: Vec<u8>,
+    pub scales: Vec<f32>,
+    pub sr: usize,
+    pub sc: usize,
+}
+
+/// An FP8 matrix whose bytes take every finite code (never 0x7F/0xFF, the NaNs a quantizer does not
+/// write) and whose scales stay within a decade, so the f32 accumulation, not the widening, sets the error.
+pub fn gen_fp8(rows: usize, cols: usize, sr: usize, sc: usize, seed: u64) -> Fp8 {
+    assert!(
+        rows.is_multiple_of(sr) && cols.is_multiple_of(sc),
+        "the grid must divide the matrix"
+    );
+    let mut rng = Rng::new(seed);
+    let w: Vec<u8> = (0..rows * cols)
+        .map(|_| {
+            let v = (rng.next_u64() & 0xFF) as u8;
+            if v & 0x7F == 0x7F {
+                v ^ 1
+            } else {
+                v
+            }
+        })
+        .collect();
+    let scales: Vec<f32> = (0..sr * sc)
+        .map(|_| (1 + rng.below(10)) as f32 / 4480.0)
+        .collect();
+    Fp8 { w, scales, sr, sc }
+}
+
+/// An e4m3fn byte's value from the definition: (-1)^s * 2^(e-7) * (1 + m/8), and 2^-6 * m/8 at e == 0.
+pub fn e4m3(b: u8) -> f64 {
+    let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
+    let (e, m) = (((b >> 3) & 0x0F) as i32, (b & 7) as f64);
+    if e == 0 {
+        sign * 2f64.powi(-6) * m / 8.0
+    } else {
+        sign * 2f64.powi(e - 7) * (1.0 + m / 8.0)
+    }
+}
+
+/// `p` to the nearest bf16 (8 significant bits, ties to even), by arithmetic rather than the kernel's bits.
+pub fn bf16_nearest(p: f64) -> f64 {
+    if p == 0.0 {
+        return p;
+    }
+    let ulp = 2f64.powi(p.abs().log2().floor().max(-126.0) as i32 - 7);
+    (p / ulp).round_ties_even() * ulp
+}
+
+/// Weight `i` of an FP8 matrix as the kernel holds it: `bf16(e4m3 * scale)`, the product in f32.
+pub fn fp8_weight(m: &Fp8, bm: usize, bn: usize, cols: usize, i: usize) -> f64 {
+    let (r, c) = (i / cols, i % cols);
+    bf16_nearest((e4m3(m.w[i]) as f32 * m.scales[(r / bm) * m.sc + c / bn]) as f64)
+}
+
+/// `(y, mag)` for an FP8 matrix, as [`gemv_reference`] is for bf16.
+pub fn fp8_reference(m: &Fp8, rows: usize, cols: usize, x: &[f32]) -> (Vec<f64>, Vec<f64>) {
+    let (bm, bn) = (rows / m.sr, cols / m.sc);
+    let mut y = Vec::with_capacity(rows);
+    let mut mag = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let mut acc = 0.0f64;
+        let mut sum = 0.0f64;
+        for (c, &xc) in x.iter().enumerate().take(cols) {
+            let w = fp8_weight(m, bm, bn, cols, r * cols + c);
+            let t = w * xc as f64;
+            acc += t;
+            sum += t.abs();
+        }
+        y.push(acc);
+        mag.push(sum);
+    }
+    (y, mag)
+}
+
 // ---------------------------------------------------------------- delta reference
 
 pub struct DeltaShape {

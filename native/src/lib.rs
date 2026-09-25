@@ -231,6 +231,59 @@ pub unsafe extern "C" fn btb_gemv_mxfp4_ggml_group(
     })
 }
 
+/// `y[i][r] = sum_c e4m3(w[r][c]) * scale(r, c) * x[i][c]` in f32 over an FP8 matrix as fine-grained FP8
+/// checkpoints store it: `w` its `rows * cols` e4m3fn bytes row-major, `scales` an `[sr, sc]` f32 grid
+/// row-major whose block is `rows / sr` rows by `cols / sc` columns (`[1, 1]` for one per-tensor scale;
+/// a scale stored as an e8m0 exponent is widened to f32 by the caller). `sr` must divide `rows` and `sc`
+/// `cols`. Bit-identical for every `threads` and every `b`, and across the scalar, AVX2, AVX-512 and NEON
+/// paths.
+///
+/// # Safety
+/// `w` readable for `rows * cols` bytes, `scales` for `sr * sc` f32, `x` for `b * cols` f32, `y` writable
+/// for `b * rows` f32; `y` must not overlap an input.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn btb_gemv_fp8_rows(
+    w: *const u8,
+    scales: *const f32,
+    rows: usize,
+    cols: usize,
+    sr: usize,
+    sc: usize,
+    x: *const f32,
+    b: usize,
+    y: *mut f32,
+    threads: usize,
+) -> i32 {
+    guard(|| unsafe { gemv::gemv_fp8_core(w, scales, rows, cols, sr, sc, x, b, y, threads) })
+}
+
+/// [`btb_gemv_fp8_rows`] for `n` independent tasks under one thread-pool dispatch: one layer's active
+/// experts are one call. The output of task `t` is bit-identical to its own [`btb_gemv_fp8_rows`] call.
+///
+/// # Safety
+/// Every array readable for `n` elements, each task's arrays valid for the lengths [`btb_gemv_fp8_rows`]
+/// states; the `n` output buffers must not overlap each other or an input.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn btb_gemv_fp8_group(
+    n: usize,
+    w: *const *const u8,
+    scales: *const *const f32,
+    rows: *const usize,
+    cols: *const usize,
+    sr: *const usize,
+    sc: *const usize,
+    x: *const *const f32,
+    b: *const usize,
+    y: *mut *mut f32,
+    threads: usize,
+) -> i32 {
+    guard(|| unsafe {
+        gemv::gemv_fp8_group_core(n, w, scales, rows, cols, sr, sc, x, b, y, threads)
+    })
+}
+
 /// One decode step of grouped-query attention over a bf16 key/value cache, f32 arithmetic throughout.
 /// Unlike every other kernel here, the result is not bit-identical across `threads`: the rows are split by
 /// the thread count and merged, so the last bits vary with `threads`, not the value. `q` and `out` are

@@ -36,6 +36,15 @@ fn gemv_rows_and_packed() {
     gemvk::group_check("scalar group", &[1, 0]);
 }
 
+/// The FP8 rows and grouped sweeps with no vector path selected, held to the f64 reference the vector
+/// path's `guard_fp8` is.
+#[test]
+fn fp8_rows_and_group() {
+    pin();
+    fp8k::rows_sweep("scalar", &[1, 0]);
+    fp8k::group_check("scalar", &[1, 0]);
+}
+
 /// The DeltaNet step and the state slab with no vector path selected.
 #[test]
 fn delta_step() {
