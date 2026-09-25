@@ -127,6 +127,7 @@ def _attn_split(
     par: Sequence[int],
     scale: float,
     split: int = 1024,
+    win: int = 0,
 ) -> torch.Tensor:
     T, Hq, D = q.shape
     Hk, cap = K.shape[0], K.shape[1]
@@ -159,6 +160,9 @@ def _attn_split(
             P(pa),
             P(cnt),
             I(S),
+            # the kernel's last parameter (0: the whole prefix, no sliding window); left off, the driver read the
+            # argument array past its end - an access violation on Windows
+            I(win),
         ],
     )
     assert int(cnt.abs().sum()) == 0, "every (head, row) count is reset by its last block"
