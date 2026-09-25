@@ -900,7 +900,7 @@ class _Cuda:
             (1024, 1, 1),
             [P(x), P(kk), I(V), P(fp), P(gM), P(gpreK), P(gpreP), P(gbest)],
         )
-        self.launch("btb_sample_out", ((R + 255) // 256, 1, 1), (256, 1, 1), [P(gbest), P(out)])
+        self.launch("btb_sample_out", ((R + 255) // 256, 1, 1), (256, 1, 1), [P(gbest), P(out), I(R)])
         return out.to(torch.int64)
 
     def verify(
