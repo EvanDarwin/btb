@@ -902,5 +902,7 @@ def test_a_layer_shed_to_the_drive_off_a_weight_not_stored_as_bf16_answers_as_fr
         during, _ = sm.generate(REPEATING, 12, speculate=False)
         assert during == before, "a layer read through the ring each pass answers as it did from RAM"
         assert sm.ram_regrow() == i and not sm.cold
+        if name.startswith("gguf/") and device == "cpu":  # regrown, its Q8_0 blocks multiply as stored again
+            assert any(getattr(m, "quant", None) is not None for m in sm.host[i].modules()), "not rebound as stored"
         after, _ = sm.generate(REPEATING, 12, speculate=False)
         assert after == before

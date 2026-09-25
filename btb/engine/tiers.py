@@ -728,6 +728,12 @@ class _TiersMixin(_State):
             for m in self.host[i].modules():
                 if not (isinstance(m, _HostLinear) and m.key):
                     continue
+                if m.quant is not None:  # bound as stored while resident: streamed as bf16 like any cold layer
+                    rows, cols = m.quant.rows, m.quant.cols
+                    m.weight = torch.nn.Parameter(
+                        torch.zeros((), dtype=torch.bfloat16).expand(rows, cols), requires_grad=False
+                    )
+                    m.quant = None
                 pk = getattr(self, "_packed", {}).get(m.key)
                 cur = (cur + 63) // 64 * 64
                 if pk is not None and not pk["raw"]:
@@ -981,7 +987,8 @@ class _TiersMixin(_State):
 
     def _rebind_warm(self, i: int) -> None:
         """layer `i` back on the store it came from: every linear's weight the checkpoint's mapped bytes again,
-        its packed form beside it under the 12-bit store, no slot of the ring behind it"""
+        its packed form beside it under the 12-bit store, a GGUF tensor bound as stored again, no slot of the ring
+        behind it"""
         layer = self.host[i]
         for m in layer.modules():
             if isinstance(m, _HostLinear) and m.key:
@@ -989,6 +996,7 @@ class _TiersMixin(_State):
                 m.packed = None
         if getattr(self, "_packed", None):
             self._bind_host_packed_layer(layer)
+        self._bind_host_quant_layer(i, layer)
 
     def _next_template(self, lt: str) -> Any:
         k = self._toggle[lt]
