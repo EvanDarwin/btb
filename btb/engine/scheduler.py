@@ -46,6 +46,9 @@ def _size(n: int) -> str:
     return f"{n / 2**10:.1f} KiB"
 
 
+EPOCH = "epoch"  # the ledger's tag for an epoch's KV, reserved by `plan` and spent by its cache's growth
+
+
 class MemoryGrantError(MemoryError):
     """A memory request the scheduler refused. Raised before the allocation, so the message names what asked
     and for how much - torch's own OOM is raised from inside the allocator and names neither."""
@@ -459,11 +462,12 @@ class BatchScheduler:
         """What an allocation on `device` (the engine's own when None) may take: the card's free VRAM above
         the engine's margin, MLX's ledger on the unified device (the host and the GPU spend one pool), or the
         host's free RAM above the engine's RAM reserve. None when nothing here can price the device. The
-        arithmetic is the device's (`Device.free`), the one ledger the plan and the memory policy read too;
-        an engine built without one (a stub under test) is priced the same way directly."""
+        arithmetic is the device's (`Device.free`), the one ledger the plan and the memory policy read too:
+        less what rooms and loans are promised, all but the epoch's own KV, which its cache's growth spends. An
+        engine built without one (a stub under test) is priced the same way directly."""
         dv = getattr(self.sm, "device", None)
         if dv is not None:
-            return dv.free(device)
+            return dv.free(device, unreserved=True, own=EPOCH)
         from .device import free_bytes, torch_device
 
         dev = self.sm.dev if device is None else torch_device(device)
@@ -548,14 +552,14 @@ class BatchScheduler:
         if dv is not None and mb is not None:
             # the epoch's KV is spoken for from here to `release()`, ahead of the cache allocating it: the
             # memory policies must not read that room as free and grow a shed layer back into it
-            dv.reserve("epoch", self.kv_row_bytes(target_len) * batch)
+            dv.reserve(EPOCH, self.kv_row_bytes(target_len) * batch)
         return batch, target_len
 
     def release(self) -> None:
         """The epoch is over: its KV reservation is let go (the buffers themselves free with the cache)."""
         dv = getattr(self.sm, "device", None)
         if dv is not None:
-            dv.release("epoch")
+            dv.release(EPOCH)
 
     @staticmethod
     def plan_placement(

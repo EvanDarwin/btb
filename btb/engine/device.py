@@ -10,6 +10,7 @@ import importlib.util
 import platform
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -206,6 +207,8 @@ class Device:
         self._holds = 0
         self._pending: list[tuple[str, Callable[[], Any]]] = []
         self._reserved: dict[str, tuple[str, int]] = {}
+        # the reservations' and the rooms': written by finalizers, on whatever thread lets a loan go
+        self.lock = threading.RLock()
         self.returned = False  # lent memory came back since the lending policy last looked
 
     # -- placement -----------------------------------------------------------------------------------------
@@ -295,10 +298,11 @@ class Device:
 
     # -- memory --------------------------------------------------------------------------------------------
 
-    def free(self, device: Any = None, unreserved: bool = False) -> int | None:
+    def free(self, device: Any = None, unreserved: bool = False, own: str | None = None) -> int | None:
         """Memory free for an allocation on `device` (the engine's own when None), above the engine's margin
-        there; with `unreserved`, less what `reserve()` has spoken for on it. On unified memory the ledger is
-        the engine's own: the RAM the load started with, less the reserve, less everything MLX holds."""
+        there; with `unreserved`, less what `reserve()` has spoken for on it - all but the caller's `own` tag,
+        which is its to spend. On unified memory the ledger is the engine's own: the RAM the load started with,
+        less the reserve, less everything MLX holds."""
         sm = self.sm
         dev = sm.dev if device is None else torch_device(device)
         if dev.type == DeviceKind.CUDA:
@@ -311,17 +315,22 @@ class Device:
             out = free_bytes(torch.device("cpu"), int(getattr(sm, "ram_reserve", 0) or 0))
         if out is None or not unreserved:
             return out
-        return max(0, out - self.reserved(dev))
+        return max(0, out - self.reserved(dev, but=own))
 
     def reserve(self, tag: str, nbytes: int, device: Any = None) -> None:
         """Memory spoken for under `tag` on `device` (the engine's own when None); a tag reserved again is
         replaced, not added."""
         dev = self.sm.dev if device is None else torch_device(device)
-        self._reserved[tag] = (dev.type, max(0, int(nbytes)))
+        with self.lock:
+            self._reserved[tag] = (dev.type, max(0, int(nbytes)))
 
     def release(self, tag: str) -> None:
-        self._reserved.pop(tag, None)
+        with self.lock:
+            self._reserved.pop(tag, None)
 
-    def reserved(self, device: Any = None) -> int:
+    def reserved(self, device: Any = None, but: str | None = None) -> int:
         dev = self.sm.dev if device is None else torch_device(device)
-        return sum(n for t, n in self._reserved.values() if t == dev.type)
+        with self.lock:
+            # a copy: a finalizer run by a collection mid-sum re-enters the lock on this thread
+            held = self._reserved.copy()
+        return sum(n for k, (t, n) in held.items() if t == dev.type and k != but)

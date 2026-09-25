@@ -6,6 +6,7 @@ takes every live cache's rows with it, an idle session's and a fork's included."
 from __future__ import annotations
 
 import gc
+import threading
 import time
 import weakref
 from collections.abc import Callable, Iterator
@@ -16,8 +17,10 @@ import torch
 
 from btb.engine import StreamedTextModel
 from btb.engine.cache import ForkLayer, GrowLayer
+from btb.engine.device import Device
 from btb.engine.host import _HostLinear
-from btb.engine.scheduler import MemoryGrantError
+from btb.engine.memory import Room
+from btb.engine.scheduler import EPOCH, MemoryGrantError
 from tests.helpers import fixture, loaded_model, need_cuda, need_mlx
 
 if TYPE_CHECKING:
@@ -111,9 +114,9 @@ def test_a_cache_growth_is_priced_before_the_pass(sm: StreamedTextModel, monkeyp
     asked: list[int] = []
     make = sm._make_room
 
-    def record(dev: torch.device, nbytes: int, what: str, unreserved: bool = True) -> set[str]:
+    def record(dev: torch.device, nbytes: int, what: str, own: str | None = None) -> set[str]:
         asked.append(nbytes)
-        return make(dev, nbytes, what, unreserved)
+        return make(dev, nbytes, what, own)
 
     monkeypatch.setattr(sm, "_make_room", record)
     s = sm.session(PROMPT)
@@ -183,6 +186,158 @@ def test_a_rooms_own_tensors_count_against_it(sm: StreamedTextModel) -> None:
         r.empty(1)
 
 
+def test_the_grant_prices_what_rooms_hold_but_not_the_epochs_own_room(sm: StreamedTextModel) -> None:
+    """a room is memory promised away: the grant and the batch sizing read it as taken, as `memory()` does - all
+    but the epoch's own KV, which the cache's growth inside the epoch draws on"""
+
+    def near(a: int | None, b: int) -> bool:  # two readings of the host's free RAM, a moment apart
+        return a is not None and abs(a - b) < 64 * MiB
+
+    with sm.room(256 * MiB):
+        assert near(sm.scheduler.free_for("cpu"), sm.memory()["cpu"].free)
+        with pytest.raises(MemoryGrantError):
+            sm.scheduler.grant(sm.memory()["cpu"].free + 128 * MiB, "scratch", device="cpu")
+        sm.device.reserve(EPOCH, 256 * MiB, "cpu")
+        try:
+            assert near(sm.scheduler.free_for("cpu"), sm.memory()["cpu"].free + 256 * MiB)
+        finally:
+            sm.device.release(EPOCH)
+
+
+class _Releasing(str):
+    """a device name whose comparison drops a room, as a finalizer on another thread can mid-read"""
+
+    room: Room | None = None
+
+    def __eq__(self, other: object) -> bool:
+        r, type(self).room = type(self).room, None
+        if r is not None:
+            r.release()
+        return str.__eq__(self, other)
+
+    __hash__ = str.__hash__
+
+
+def test_a_room_given_back_while_the_ledger_is_read_is_not_a_crash(sm: StreamedTextModel) -> None:
+    r = sm.room(MiB)
+    _Releasing.room = r
+    sm.device._reserved["reading"] = (_Releasing("cpu"), 0)
+    try:
+        assert sm.device.reserved("cpu") in (0, MiB)
+    finally:
+        sm.device.release("reading")
+    assert not r.held and sm.device.reserved("cpu") == 0
+
+
+def test_a_room_released_as_its_tensor_goes_holds_nothing_after(
+    sm: StreamedTextModel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """a room tensor's finalizer re-holds the room's bytes as another thread releases the room: the release is the
+    last word, not a reservation nothing ever lets go"""
+    r = sm.room(4 * MiB)
+    t = r.zeros(MiB, dtype=torch.uint8)
+    reserve = sm.device.reserve
+    other: list[threading.Thread] = []
+
+    def racing(tag: str, nbytes: int, device: object = None) -> None:
+        if tag == r._loan and not other:
+            other.append(threading.Thread(target=r.release))
+            other[0].start()
+            other[0].join(0.3)
+        reserve(tag, nbytes, device)
+
+    monkeypatch.setattr(sm.device, "reserve", racing)
+    del t
+    gc.collect()
+    other[0].join()
+    assert not r.held and sm.device.reserved("cpu") == 0
+
+
+def test_two_threads_filling_a_room_never_take_more_than_it_holds(
+    sm: StreamedTextModel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    r = sm.room(3 * MiB)
+    empty = torch.empty
+    inside, go = threading.Event(), threading.Event()
+
+    def slow(*shape: object, **kw: object) -> torch.Tensor:
+        if shape == ((2 * MiB,),) and not inside.is_set():
+            inside.set()
+            go.wait(0.3)
+        return empty(*shape, **kw)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(torch, "empty", slow)
+    got: list[object] = []
+    a = threading.Thread(target=lambda: got.append(r.empty(2 * MiB, dtype=torch.uint8)))
+    a.start()
+    assert inside.wait(5)
+    try:
+        got.append(r.empty(2 * MiB, dtype=torch.uint8))
+    except MemoryGrantError as e:
+        got.append(e)
+    go.set()
+    a.join()
+    assert sum(isinstance(g, torch.Tensor) for g in got) == 1 and r.used == 2 * MiB
+    r.release()
+
+
+def test_a_room_outliving_its_model_keeps_no_ledger_alive() -> None:
+    class Stub:
+        dev = torch.device("cpu")
+
+        def _called(self, tag: object) -> None:
+            pass
+
+    eng = Stub()
+    led = Device(eng)
+    gone = weakref.ref(led)
+    r = Room(led, "orphan#1", MiB, torch.device("cpu"), True, eng)  # type: ignore[arg-type]
+    del led
+    gc.collect()
+    assert gone() is None
+    r.release()
+    with pytest.raises(ValueError, match="released"):
+        r.empty(1)
+
+
+def test_memory_read_while_a_layer_moves_is_not_a_crash(sm: StreamedTextModel, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`memory()` takes no decode lock: a shed or regrow on the decode's thread can move a layer as it counts"""
+    stored = sm._layer_bytes_stored
+    moved: list[int] = []
+
+    def moving(i: int, packed: bool = False) -> int:
+        if not moved:
+            moved.append(i)
+            sm.host[sm.L + 7] = sm.host[i]  # a layer arriving mid-count
+        return stored(i, packed)
+
+    monkeypatch.setattr(sm, "_layer_bytes_stored", moving)
+    try:
+        assert sm.memory()["cpu"].sheddable > 0
+    finally:
+        sm.host.pop(sm.L + 7, None)
+
+
+def test_a_host_shed_for_a_tensor_grows_back_once_it_is_gone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """where the ledger sees torch's allocations (the CPU off MLX) and no RAM policy runs, the layer given up for a
+    lent tensor still grows back once the tensor is gone"""
+    with loaded_model(fixture("tiny_qwen3"), device="cpu") as sm:
+        sm.ram_watch = False
+        make = sm._make_room
+
+        def one_step(dev: torch.device, nbytes: int, what: str, own: str | None = None) -> set[str]:
+            assert sm._give_up_one(dev, nbytes, set())
+            return make(dev, 0, what, own)
+
+        monkeypatch.setattr(sm, "_make_room", one_step)
+        t = sm.empty(MiB, dtype=torch.uint8)
+        monkeypatch.undo()
+        assert sm.cold
+        del t
+        gc.collect()
+        assert _until(lambda: not sm.cold, sm), f"still from the drive: {sorted(sm.cold)}"
+
+
 def test_memory_names_each_device_btb_runs_on(sm: StreamedTextModel) -> None:
     mem = sm.memory()
     assert list(mem) == ["cpu"]
@@ -229,24 +384,31 @@ def test_what_a_refusal_shed_grows_back_once_there_is_room() -> None:
         assert _until(lambda: not sm.cold, sm), f"still from the drive: {sorted(sm.cold)}"
 
 
-def test_a_card_gives_layers_up_for_a_tensor_and_every_cache_follows() -> None:
-    """a squeezed card sheds layers for a tensor; an idle session's rows follow each layer to the host (its next
-    turn runs, no device mismatch); once the tensor is gone the layers grow back with no memory policy running"""
+def test_a_card_gives_layers_up_for_a_tensor_and_every_cache_follows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """a card short of room sheds layers for a tensor; an idle session's rows follow each layer to the host (its
+    next turn runs, no device mismatch); once the tensor is gone the layers grow back with no memory policy running.
+    The shortage is stood in for: the tiny fixture's layers free less than an allocator block, which no free reading
+    shows, so the steps making room are taken as a short card would take them"""
     dev = need_cuda()
     with loaded_model(fixture("tiny_qwen3"), device=dev, adapt=False) as sm:
         idle = sm.session(PROMPT)
-        card = str(sm.dev)
-        before, margin = set(sm.resident), sm.vram_margin
-        sm.vram_margin += max(0, sm.memory()[card].free - MiB)
-        want = sm.memory()[card].sheddable // 2
-        t = sm.empty(want, dtype=torch.uint8)
+        before = set(sm.resident)
+        make = sm._make_room
+
+        def short(dev: torch.device, nbytes: int, what: str, own: str | None = None) -> set[str]:
+            for _ in range(2):
+                assert sm._give_up_one(dev, nbytes, set())
+            return make(dev, 0, what, own)
+
+        monkeypatch.setattr(sm, "_make_room", short)
+        t = sm.empty(MiB, dtype=torch.uint8)
+        monkeypatch.undo()
         assert t.device.type == "cuda" and set(sm.resident) < before
         for i in before - set(sm.resident):
             assert idle.rows(i)[0].device.type == "cpu", i
         assert len(idle.generate(2, eos=(), speculate=False).tokens) == 2
         del t
         gc.collect()
-        sm.vram_margin = margin
         assert _until(lambda: set(sm.resident) == before, sm), f"still shed: {sorted(before - set(sm.resident))}"
 
 
