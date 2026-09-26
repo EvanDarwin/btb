@@ -61,6 +61,8 @@ window; past the model's own window btb applies YaRN automatically.
   the layer's experts is read from the drive once for the whole prompt, and on the card is held there for all the
   chunks (a 16k prompt on the 180B: a third of the reads, 528 s to 288 s). Same bits as the chunks one at a time;
   `BTB_PREFILL_LAYERS=0` and `BTB_PREFILL_DEPOT=0` turn the two halves off.
+- `--sparse 1` (Qwen4): the sparse attention scores every row's blocks in one pass - opt-in, since a near-tie may
+  keep a different block than the reference's indexer.
 - `btb pack` writes a lossless [12-bit copy](./pack-12.md) at 0.75× the bytes, so more experts stay cached and
   cold reads are shorter, with identical output.
 - the residency policy, the disk readers, and the router lookahead are the [disk scheduler](./disk-scheduler.md)

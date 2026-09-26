@@ -112,6 +112,7 @@ class StreamedTextModel(
         host_budget: Any = None,
         bus_pass: bool = True,
         store_pin: int = 0,
+        sparse: bool = False,
     ) -> None:
         from transformers import AutoConfig
 
@@ -171,6 +172,9 @@ class StreamedTextModel(
         # a mixture's chunked prefill layer by layer (each expert read once a prompt); 0 takes the chunks through
         # every layer in turn, the path it replaced and its bits' reference
         self.prefill_layers = os.environ.get("BTB_PREFILL_LAYERS", "1") != "0"
+        # Qwen4's sparse attention picks its blocks for every row in one pass (`--sparse`): not the reference's
+        # mask bit for bit at a near-tie; off, the selection is the reference's exactly (qsa.py)
+        self.sparse = bool(sparse)
         # Gemma scales the input embedding by sqrt(hidden); the engine gathers rows itself, so it applies the
         # scale the module's scaled embedding would (the tied head's output projection stays unscaled)
         self.embed_scale = float(cfg.hidden_size) ** 0.5 if self.fam.embed_scale else None

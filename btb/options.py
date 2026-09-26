@@ -180,6 +180,7 @@ FLAGS = (
     "prefetch",
     "store_pin",
     "bus_pass",
+    "sparse",
 )
 COUNTS = {  # whole numbers, with the least each allows
     "context": 0,

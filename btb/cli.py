@@ -81,6 +81,7 @@ PLACEMENT = (
     "kv_bits",
     "tree_min_prob",
     "mlx_mega",
+    "sparse",
     "gguf_packed",
     "tree_step_mass",
     "draft_vocab",
@@ -432,6 +433,15 @@ def _common(ap: argparse.ArgumentParser, path_required: bool = True) -> None:
         help="the dense pass as one Metal dispatch (the megakernel; bit-exact with the fused path; the small "
         "models 15-40%% ahead of the fused path on an M3 Pro, the 4B at parity; 600 MB of arena and scratch); "
         "1 by default where it builds (dense Qwen3, every layer resident)",
+    )
+    s.add_argument(
+        "--sparse",
+        dest="sparse",
+        type=int,
+        choices=(0, 1),
+        default=None,
+        help="Qwen4's sparse attention scores every row's blocks in one pass: faster prefill, but a near-tie at the "
+        "budget's edge may keep another block than the reference's indexer (not the certified path); 0 by default",
     )
     s.add_argument(
         "--gguf-packed",

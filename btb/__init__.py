@@ -370,6 +370,7 @@ def load(
         # the expert store is built inside __init__, so its policy travels as an argument, not an assignment after
         bus_pass=bool(int(c.get("bus_pass", 1))),
         store_pin=int(c.get("store_pin", 0)),
+        sparse=bool(int(c.get("sparse", 0))),
         log=log or (lambda *_a: None),
     )
     sm.plan = pl

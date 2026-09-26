@@ -404,6 +404,13 @@ class _FamiliesMixin(_State):
             layer.ple.ple_embedding.ngram_embedding = _NGramRows(
                 self, base + "ple.ple_embedding.ngram_embedding.", int(self.cfg.split_ngram_parts), out_dtype
             )
+        indexer = getattr(getattr(layer, "self_attn", None), "indexer", None)
+        if indexer is not None:
+            # the sparse attention's block selection without the reference's per-query rebuild of the keys: the
+            # reference's mask bit for bit, or with `sparse` the rows scored in one pass (qsa.py)
+            from .qsa import install
+
+            install(indexer, sparse=bool(getattr(self, "sparse", False)))
         return layer
 
     @staticmethod

@@ -175,6 +175,7 @@ Every command that loads a model takes these. The placement is planned from the 
 | `--draft-vocab N` | the drafting head scores only the first $N$ token ids (the frequent part of a BPE vocabulary); `0` scores all | `32768` with a drafting head, else all |
 | `--draft-bits 4\|8\|16`<br/><sub>This option is only recognized when running under MLX.</sub> | the drafting head's weights packed in memory at first use to N bits | `8` on MLX only, otherwise ignored |
 | `--mlx-mega 0\|1`<br/><sub>When enabled, requires ~600MB of arena/scratch space | MLX: the dense pass as one Metal dispatch (the megakernel; bit-exact w/ fused path) | `1` where it builds (dense Qwen3, every layer resident) |
+| `--sparse 0\|1`<br/><sub>Opt-in, and not the certified path: a near-tie at the budget's edge may keep a different block than the reference's indexer | Qwen4's sparse attention scores every row's blocks in one pass instead of one row at a time: a faster prefill of a long prompt (a 16k prompt on the 180B: 131 s to 105 s) | `0`: the selection is the reference indexer's, bit for bit |
 | `--temperature T` | `0` takes the likeliest token; above `0`, each logit is divided by $T$, deterministic noise keyed by the seed and the token's position is added, and the argmax is taken, so higher $T$ draws more widely and one seed repeats its answer. | `0` |
 | `--top-p P` | draw from the fewest likeliest tokens whose probability reaches $P$ | `1` (every token) |
 | `--top-k K` | draw from the $K$ likeliest tokens | `0` (every token) |
