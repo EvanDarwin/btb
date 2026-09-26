@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from typing import TYPE_CHECKING
 
 from btb.kinds import QUANT_KIND, Cap, FamilyKind, PassTag, Proposer, Quant, QuantClass
@@ -173,7 +174,7 @@ def test_a_precision_cell_binds_only_its_own_twin(tmp_path: Path, monkeypatch: M
     stem = spec.FIXTURE_STEM[FamilyKind.QWEN3]
     bf16 = spec.twin_path(stem, spec.Storage.SAFE_BF16)
     monkeypatch.setattr(spec, "FIXTURES", str(tmp_path))
-    os.symlink(bf16, spec.twin_path(stem, spec.Storage.SAFE_FP16))
+    shutil.copytree(bf16, spec.twin_path(stem, spec.Storage.SAFE_FP16))  # a copy: Windows symlinks take a privilege
     assert spec.fixture_paths(FamilyKind.QWEN3, spec.Storage.SAFE_FP16) == ()
     why = manifest.gap_reason(FamilyKind.QWEN3, spec.Storage.SAFE_FP16, spec.SUBPATH["cpu"], spec.DecodePath.GREEDY)
     assert why is manifest.Missing.FP16_FIXTURE
