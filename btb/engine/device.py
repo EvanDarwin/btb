@@ -25,19 +25,23 @@ from ..options import BadDevice, DeviceName, check_device
 from ..options import Device as DeviceKind
 from ..sysinfo import host_free_bytes
 
-_PHYS_FREE: dict[int, tuple[float, int | None]] = {}
+# a card's last physical free reading: (when, this process's reserved VRAM then, the free bytes)
+_PHYS_FREE: dict[int, tuple[float, int, int | None]] = {}
 
 
 def _physical_free_bytes(dev: torch.device) -> int | None:
     """The card's free VRAM across every process, from nvidia-smi (NVML), or None when it cannot be read.
     `torch.cuda.mem_get_info` is a per-process figure on Windows - WDDM virtualizes VRAM, so it reads high while
-    another process holds the card - and only NVML sees the true physical free. Cached for a second: this is an
-    allocation-path read, not a per-token one, so one subprocess a second is nothing."""
+    another process holds the card - and only NVML sees the true physical free. Cached for a second while this
+    process's own hold on the card stands as it was: a shed or an allocation of ours since changes what the driver
+    reads, so it is read again (a stale reading after a shed read the card still short, and making room shed layer
+    after layer - half the model for one pass's buffer). An allocation-path read, not a per-token one."""
     idx = dev.index if dev.index is not None else torch.cuda.current_device()
     now = time.monotonic()
+    ours = int(torch.cuda.memory_reserved(dev))
     hit = _PHYS_FREE.get(idx)
-    if hit is not None and now - hit[0] < 1.0:
-        return hit[1]
+    if hit is not None and now - hit[0] < 1.0 and hit[1] == ours:
+        return hit[2]
     free: int | None = None
     try:
         out = subprocess.run(
@@ -50,7 +54,7 @@ def _physical_free_bytes(dev: torch.device) -> int | None:
         free = int(out.strip().splitlines()[0]) * (1 << 20)  # MiB -> bytes
     except Exception:
         free = None
-    _PHYS_FREE[idx] = (now, free)
+    _PHYS_FREE[idx] = (now, ours, free)
     return free
 
 

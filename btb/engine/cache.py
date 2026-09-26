@@ -956,12 +956,15 @@ class ForkLayer(_DynamicLayer):
             return None
         return self._tk[b : b + 1, :, : self._t].clone(), self._tv[b : b + 1, :, : self._t].clone()
 
-    def to(self, dev: str | torch.device) -> None:
-        """every row to `dev`, where the layer now runs: the prefix becomes a copy of its own there"""
-        self._pk, self._pv = self._pk.to(dev), self._pv.to(dev)
+    def to(self, dev: str | torch.device, dtype: torch.dtype | None = None) -> None:
+        """every row to `dev`, where the layer now runs (in `dtype`, the rows' there, when given): the prefix
+        becomes a copy of its own there"""
+        self._pk, self._pv = self._pk.to(dev, dtype), self._pv.to(dev, dtype)
         if self._tk is not None and self._tv is not None:
-            self._tk, self._tv = self._tk.to(dev), self._tv.to(dev)
+            self._tk, self._tv = self._tk.to(dev, dtype), self._tv.to(dev, dtype)
         self.device = torch.device(dev)
+        if dtype is not None:
+            self.dtype = dtype
         self._cat = None
 
 
@@ -998,9 +1001,9 @@ class ForkIndexedLayer(ForkLayer):
             return kv
         return (*kv, self._ti[b : b + 1].clone())
 
-    def to(self, dev: str | torch.device) -> None:
-        super().to(dev)
-        self._pi = self._pi.to(dev)
+    def to(self, dev: str | torch.device, dtype: torch.dtype | None = None) -> None:
+        super().to(dev, dtype)
+        self._pi = self._pi.to(dev)  # the indexer's keys keep their own dtype
         if self._ti is not None:
             self._ti = self._ti.to(dev)
 
@@ -1097,14 +1100,14 @@ class CardRowsLayer(_DynamicLayer):
             return None
         return self._tails(0, [self.cols[b]]), self._tails(1, [self.cols[b]])
 
-    def to_fork(self, dev: str | torch.device | None = None) -> ForkLayer:
+    def to_fork(self, dev: str | torch.device | None = None, dtype: torch.dtype | None = None) -> ForkLayer:
         """the rows as a fork's layer holds them (a shared prefix, or a batch's left-padded one, then each row's
         own), for the torch pass once the card cannot take them; a batch's pass masks the padding"""
         fl = ForkLayer(self._prefix(0), self._prefix(1), len(self.cols))
         if self._t:
             fl._tk, fl._tv, fl._t = self._tails(0, self.cols), self._tails(1, self.cols), self._t
         if dev is not None:
-            fl.to(dev)
+            fl.to(dev, dtype)
         return fl
 
     def select(self, slots: Sequence[int]) -> None:

@@ -544,12 +544,13 @@ class _MemoryMixin(_State):
         """where layer i's cache rows live and in what dtype: its buffer's, or where the layer runs"""
         if cl._buf is not None:
             return cl._buf[0].device, cl._buf[0].dtype
-        cdt = self.compute_dtype if self.compute_dtype is not None else torch.bfloat16
         if cl.shared or getattr(self, "mlx", None) is not None:
-            return torch.device("cpu"), cdt
-        if i in self.resident:
-            return (torch.device("cpu") if getattr(self, "kv_host", False) else self.dev), cdt
-        return torch.device("cpu"), torch.float32  # a host layer runs in float32 on the CPU
+            dev = torch.device("cpu")
+        elif i in self.resident:
+            dev = torch.device("cpu") if getattr(self, "kv_host", False) else self.dev
+        else:
+            dev = torch.device("cpu")  # a host layer's rows, on the CPU where it runs
+        return dev, self._kv_dtype(i, dev)
 
     def _give_up_one(self, dev: torch.device, short: int, tried: set[str]) -> bool:
         """the cheapest thing btb holds on `dev`, given up toward `short` bytes: on a card the drafter, then layers

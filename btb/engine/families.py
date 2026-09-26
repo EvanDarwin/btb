@@ -77,7 +77,8 @@ def attention_sinks(
     sm: Any = getattr(module, "_sm", None)
     cl = None
     if sm is not None and sm.mlx is not None and B == 1 and getattr(module, "layer_idx", None) is not None:
-        ctx = getattr(sm, "_attn_ctx", None)
+        ref = getattr(sm, "_attn_ctx", None)
+        ctx = ref() if ref is not None else None
         cl = ctx.layers[module.layer_idx] if ctx is not None and module.layer_idx < len(ctx.layers) else None
         if not (
             isinstance(cl, GrowLayer)

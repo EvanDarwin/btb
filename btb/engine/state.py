@@ -128,7 +128,7 @@ class _State:
     rotary: Any
     shadow: dict[str, Any]
     templates: dict[str, Any]
-    _attn_ctx: Any
+    _attn_ctx: Any  # the running pass's cache, weakly (`forward._weak`)
     _batched_cont: bool
     _worker: ThreadPoolExecutor | None
     _worker_thread: threading.Thread
@@ -249,8 +249,10 @@ class _State:
     def _bind_host_packed_layer(self, layer: Any) -> Any:
         raise NotImplementedError
 
-    @staticmethod
-    def _cache_to(cache: Any, i: int, dev: str | torch.device) -> None:
+    def _cache_to(self, cache: Any, i: int, dev: str | torch.device) -> None:
+        raise NotImplementedError
+
+    def _kv_dtype(self, i: int, dev: str | torch.device) -> torch.dtype:
         raise NotImplementedError
 
     def _track(self, cache: KvCache) -> KvCache:

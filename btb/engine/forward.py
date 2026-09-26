@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import time
+import weakref
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -34,6 +35,11 @@ PassRope = Rope | dict[str, Rope]
 _GPU_PREFILL_RETRIES = 3
 # the fewest rows a prefill chunk takes, however short of room: a pass of no more rows is never chunked
 PREFILL_MIN_ROWS = 64
+
+
+def _weak(cache: Any) -> weakref.ref[Any] | None:
+    """a pass's cache as the engine may keep it: weakly, so the engine never holds it alive"""
+    return weakref.ref(cache) if cache is not None else None
 
 
 def pe_for(pe: PassRope | None, lt: str) -> Rope | None:
@@ -249,7 +255,7 @@ class _ForwardMixin(_State):
         # mask together cost more host time than the graph's replay on a small model
         graph_ok = self._card_pass_ok(cache, B, T, past, am, on_layer, stop_after)
         if graph_ok and self._card_segment_at(0, n_layers) == (0, n_layers) and n_layers == self.L:
-            self._attn_ctx = cache
+            self._attn_ctx = _weak(cache)
             pas = _Pass(
                 cache=cache,
                 pe=None,
@@ -293,8 +299,9 @@ class _ForwardMixin(_State):
         n_layers = self.L if stop_after is None else min(self.L, int(stop_after))
         if self._mlx_ok(cache, B, T, am, positions, n_layers):
             return self._forward_mlx(h, pe, cache, on_layer, last_only, head, n_layers, pick=pick)
-        # the module-run attention (`attention_sinks`) reads this pass's cache off the engine
-        self._attn_ctx = cache if am is None else None
+        # the module-run attention (`attention_sinks`) reads this pass's cache off the engine - held weakly, so
+        # the engine never keeps a pass's cache (and its memory) alive past the caller's last reference
+        self._attn_ctx = _weak(cache) if am is None else None
         tier_owns_attention = (
             getattr(self, "kv_host", False)
             and cache is not None

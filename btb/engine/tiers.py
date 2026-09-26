@@ -603,41 +603,53 @@ class _TiersMixin(_State):
         for c in {id(c): c for c in [*live, *([cache] if cache is not None else [])]}.values():
             self._cache_to(c, i, dev)
 
-    @staticmethod
-    def _cache_to(cache: Any, i: int, dev: str | torch.device) -> None:
+    def _kv_dtype(self, i: int, dev: str | torch.device) -> torch.dtype:
+        """the dtype layer i's rows take on `dev`: on a card the compute dtype its attention runs in there; on the
+        host a host layer's float32 (it runs there in float32), a resident layer's compute dtype (its rows kept
+        in RAM beside a card layer, `kv_host`, or MLX's unified memory)"""
+        cdt = self.compute_dtype if self.compute_dtype is not None else torch.bfloat16
+        host = torch.device(dev).type == "cpu" and i not in self.resident and getattr(self, "mlx", None) is None
+        return torch.float32 if host else cdt
+
+    def _cache_to(self, cache: Any, i: int, dev: str | torch.device) -> None:
+        """layer i's rows in `cache` moved to `dev`, in the dtype they take there (`_kv_dtype`): a move is the one
+        place rows cross a tier, so rows never sit on a card in the host's float32 (a card layer's bf16 queries
+        met a regrown layer's float32 keys) nor on the host in the card's bf16. Recurrent states keep theirs"""
         if cache is None or i >= len(cache.layers):
             return
         cl = cache.layers[i]
+        to, dt = torch.device(dev), self._kv_dtype(i, dev)
         if isinstance(cl, ForkLayer):
-            cl.to(dev)
+            cl.to(to, dt)
             return
         if isinstance(cl, CardRowsLayer):
             # a fork's or a batch's rows leaving the card's arena: a fork's layer where the layer now runs (the
             # batch takes the torch pass from its next step)
-            if torch.device(dev).type != cl.device.type:
-                cache.layers[i] = cl.to_fork(dev)
+            if to.type != cl.device.type:
+                cache.layers[i] = cl.to_fork(to, dt)
             return
         if (
             isinstance(cl, GrowLayer)
             and not cl.shared
             and cl._buf is not None
-            and cl._buf[0].device != torch.device(dev)
+            and (cl._buf[0].device != to or cl._buf[0].dtype != dt)
         ):
             # the rows copied out and the buffer they grew in let go now, not at the cache's next append
             k, v = cl.keys, cl.values
             cl._buf, cl._an = None, None
             cl._set_rows(k, v)
         if isinstance(cl, GrowLayer) and cl.is_initialized and isinstance(cl.keys, torch.Tensor):
-            if cl.keys.device != torch.device(dev):
-                cl._set_rows(cl.keys.to(dev), cl.values.to(dev))
+            if cl.keys.device != to or cl.keys.dtype != dt:
+                cl._set_rows(cl.keys.to(to, dt), cl.values.to(to, dt))
         for attr in ("keys", "values", "conv_states", "recurrent_states", "indexer_keys"):
             t = getattr(cl, attr, None)
+            rows = attr in ("keys", "values")  # attention rows take the tier's dtype; states keep their own
             if isinstance(t, dict):
                 for k, v in t.items():
-                    if isinstance(v, torch.Tensor) and v.device != torch.device(dev):
-                        t[k] = v.to(dev)
-            elif isinstance(t, torch.Tensor) and t.device != torch.device(dev):
-                setattr(cl, attr, t.to(dev))
+                    if isinstance(v, torch.Tensor) and (v.device != to or (rows and v.dtype != dt)):
+                        t[k] = v.to(to, dt) if rows else v.to(to)
+            elif isinstance(t, torch.Tensor) and (t.device != to or (rows and t.dtype != dt)):
+                setattr(cl, attr, t.to(to, dt) if rows else t.to(to))
 
     def _layer_bytes(self, i: int) -> int:
         base = f"{self.prefix}layers.{i}."

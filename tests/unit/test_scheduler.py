@@ -2349,6 +2349,32 @@ def test_free_bytes_falls_back_to_mem_get_info_when_the_physical_free_is_unreada
         assert device_mod.free_bytes(torch.device("cuda:0")) == 4 * GB
 
 
+def test_the_physical_free_is_read_again_once_this_process_frees_or_takes_card_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """the NVML reading is kept for a second only while this process's own hold on the card stands: a shed of
+    ours since frees what the driver reads, and a reading from before it read the card still short - making room
+    then shed layer after layer (14 of Qwen3-4B's 36 for one pass's 96 MiB buffer)"""
+    import subprocess
+
+    reads: list[int] = []
+    reserved = {"now": 6 * GB}
+
+    def smi(*a: object, **k: object) -> subprocess.CompletedProcess[str]:
+        reads.append(1)
+        return subprocess.CompletedProcess([], 0, stdout=f"{1024 * len(reads)}\n")
+
+    monkeypatch.setattr(device_mod.subprocess, "run", smi)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *a, **k: reserved["now"])
+    monkeypatch.setattr(device_mod, "_PHYS_FREE", {})
+    card = torch.device("cuda:0")
+    first = device_mod._physical_free_bytes(card)
+    assert device_mod._physical_free_bytes(card) == first and len(reads) == 1, "read again with nothing changed"
+    reserved["now"] -= GB  # a layer shed, the pool emptied: the driver has more free now
+    assert device_mod._physical_free_bytes(card) == 2 * 1024 * 2**20 and len(reads) == 2
+    assert device_mod._physical_free_bytes(card) == 2 * 1024 * 2**20 and len(reads) == 2
+
+
 def test_a_foreign_model_on_mlx_is_priced_against_the_ram_the_gpu_shares() -> None:
     """`for_model(device="mlx")` prices a transformers model as `btb.plan` prices an MLX load: the cache against
     the host's RAM (Apple silicon's GPU spends the same), no card margin; its grants and free reads take 'mlx'"""

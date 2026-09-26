@@ -408,6 +408,47 @@ def test_a_layer_move_reaches_every_live_cache() -> None:
         br.close()
 
 
+def test_rows_a_layer_move_carries_take_the_dtype_of_where_they_land() -> None:
+    """a session's rows at a layer shed to the host are float32 there (the host layer's own), and a regrow carries
+    them back in the card's bf16 - not the host's float32, which a card layer's bf16 queries then met in a fork's
+    shared prefix. Whatever tier the rows went through, the session and its fork answer as a fresh one does"""
+    dev = need_cuda()
+    with loaded_model(fixture("tiny_qwen3"), device=dev, adapt=False) as sm:
+        before = sm.session(PROMPT)
+        top = max(sm.resident)
+        assert sm.vram_shed() == f"layer {top}"
+        made_there = sm.session(PROMPT)
+        for s in (before, made_there):
+            k, v = s.rows(top)
+            assert (k.dtype, v.dtype, k.device.type) == (torch.float32, torch.float32, "cpu")
+        assert sm.vram_regrow() == f"layer {top}"
+        for s in (before, made_there):
+            for i in range(sm.L):
+                k, v = s.rows(i)
+                assert (k.dtype, v.dtype, k.device.type) == (torch.bfloat16, torch.bfloat16, "cuda"), (i, k.dtype)
+        ref = sm.session(PROMPT)
+        with ref.fork(2) as br:
+            want = br.step([1, 2]).logits
+        for s in (before, made_there):
+            with s.fork(2) as br:
+                got = br.step([1, 2]).logits
+            assert torch.allclose(got, want, atol=0.05), float((got - want).abs().max())
+            assert torch.allclose(s.feed([3]).logits, sm.session([*PROMPT, 3]).next_logits()[None], atol=0.05)
+
+
+def test_a_pass_keeps_no_cache_alive_past_its_callers() -> None:
+    """a forward over a cache of the caller's own holds it only while it runs: the engine keeps no reference that
+    held a dead cache's memory until the next forward (a 1200-token cache of Qwen3-4B's is 576 MiB of VRAM)"""
+    with loaded_model(fixture("tiny_qwen3"), device="cpu") as sm:
+        for hook in (None, lambda i, h: None):
+            cache = sm.new_cache()
+            sm.forward([PROMPT], cache=cache, last_only=True, on_layer=hook)
+            gone = weakref.ref(cache)
+            del cache
+            gc.collect()
+            assert gone() is None, "the engine kept the pass's cache alive"
+
+
 # -- lifetimes: late, on another thread, through views, out of order -----------------------------------------------
 
 
