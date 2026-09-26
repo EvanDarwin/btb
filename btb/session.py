@@ -14,7 +14,7 @@ import enum
 import weakref
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, TypedDict, Unpack, overload
+from typing import TYPE_CHECKING, TypedDict, Unpack
 
 from .api import api
 from .kinds import LayerKind, PassTag, Tokens
@@ -44,6 +44,17 @@ class State(enum.Enum):
     READY = "ready"
     PENDING = "pending"
     LENT = "lent"
+
+
+@dataclass(frozen=True, eq=False)
+class Step:
+    """What a feed or a rows' step gives back (docs/api.md), one shape whatever was asked: `logits` after each fed
+    token, float32 - [T, V] for a session's feed (the last one's, [1, V], with `last_only`), [live, V] for rows -
+    and `hidden`, the `taps` layers' states at the fed tokens ({layer: [T, H]} or {layer: [live, H]}; empty when no
+    taps were asked for)."""
+
+    logits: torch.Tensor
+    hidden: Taps = field(default_factory=dict)
 
 
 class Anchor(TypedDict):
@@ -115,7 +126,7 @@ class _Txn:
     def __init__(self, s: Session, eng: _State, states: bool) -> None:
         self.s, self.eng, self.done = s, eng, False
         s._flush(eng)
-        self.point = _Point(len(s.ids), s.pending, s.logits, s._snap(eng) if states else None, s.n_prompt)
+        self.point = _Point(len(s.ids), s._pending, s.logits, s._snap(eng) if states else None, s.n_prompt)
 
     def keep(self, point: _Point) -> None:
         """the point moved to where the call keeps the session: the tokens past it are the call's to replace"""
@@ -140,7 +151,7 @@ class _Txn:
         if cache is not None:
             s.cache = cache
         s.ids = [int(t) for t in ids]
-        s.pending, s.logits = (int(pending) if pending is not None else None), logits
+        s._pending, s.logits = (int(pending) if pending is not None else None), logits
         s.n_prompt = len(s.ids) if n_prompt is None else int(n_prompt)
         if anchors is not None:
             s.anchor = list(anchors)
@@ -159,7 +170,7 @@ class _Txn:
             dr.reset()
         self.done = True
         if p.n == 0 and p.pending is None and p.logits is None:
-            s.cache, s.anchor, s.ids, s.n_prompt, s.pending, s.logits = None, [], [], 0, None, None
+            s.cache, s.anchor, s.ids, s.n_prompt, s._pending, s.logits = None, [], [], 0, None, None
             return
         if p.n == 0 or s.cache is None:
             # a point over no rows: a fresh cache. No rows is no recurrent state either, and a snapshot taken there
@@ -178,7 +189,7 @@ class _Txn:
         del s.ids[p.n :]
         s.anchor = [a for a in s.anchor if a["n"] <= p.n]
         s.n_prompt = min(p.n_prompt, p.n)
-        s.pending, s.logits = p.pending, p.logits
+        s._pending, s.logits = p.pending, p.logits
 
 
 @api("session")
@@ -202,7 +213,7 @@ class Session:
         self.engine = engine
         # written only by a transaction's commit or rollback: the sequence's last token when a decode drew it and
         # the cache does not hold it yet; else the next token's logits [V]
-        self.pending: int | None = None
+        self._pending: int | None = None
         self.logits: torch.Tensor | None = None
         self._forked: weakref.ref[_Rows] | None = None
         self._active: _Txn | None = None  # the transaction under way, one at a time
@@ -217,7 +228,7 @@ class Session:
             return State.LENT
         if self.cache is None:
             return State.EMPTY
-        return State.PENDING if self.pending is not None else State.READY
+        return State.PENDING if self._pending is not None else State.READY
 
     @property
     def forked(self) -> _Rows | None:
@@ -238,10 +249,10 @@ class Session:
     @property
     def tokens(self) -> list[int]:
         """the sequence's ids, in order"""
-        return [*self.ids, self.pending] if self.pending is not None else list(self.ids)
+        return [*self.ids, self._pending] if self._pending is not None else list(self.ids)
 
     def __len__(self) -> int:
-        return len(self.ids) + (self.pending is not None)
+        return len(self.ids) + (self._pending is not None)
 
     def _called(self, tag: PassTag) -> None:
         if self.engine is not None:
@@ -293,16 +304,8 @@ class Session:
             if not t.done:
                 t.rollback()
 
-    @overload
-    def feed(self, ids: Tokens, last_only: bool = False) -> torch.Tensor: ...
-
-    @overload
-    def feed(self, ids: Tokens, last_only: bool = False, *, taps: Sequence[int]) -> tuple[torch.Tensor, Taps]: ...
-
-    def feed(
-        self, ids: Tokens, last_only: bool = False, *, taps: Sequence[int] | None = None
-    ) -> torch.Tensor | tuple[torch.Tensor, Taps]:
-        """Append `ids` to the sequence and return the logits after each of them, [T, V] in float32 - the
+    def feed(self, ids: Tokens, last_only: bool = False, taps: Sequence[int] = ()) -> Step:
+        """Append `ids` to the sequence: a `Step` of the logits after each of them, [T, V] in float32 - the
         building block of a loop of your own: feed a draft, read its logits, `rewind` what you reject.
         `last_only`: the last one's alone, [1, V], and the head run on that row alone (a long prelude's [T, V]
         is gigabytes). `taps`: also those layers' states at each fed position, {layer: [T, H]} float32 - layer i's
@@ -311,16 +314,26 @@ class Session:
         new = [int(t) for t in ids]
         if not new:
             raise ValueError("feed needs at least one token")
-        lead = 0 if self.pending is None else 1
-        want = tuple(int(i) % eng.L for i in taps) if taps is not None else ()
+        lead = 0 if self._pending is None else 1
+        want = tuple(int(i) % eng.L for i in taps)
 
-        def run() -> tuple[torch.Tensor, Taps]:
+        def run() -> Step:
             with self._txn(eng) as t:
                 out, hidden = self._append(t, new, last_only, want)
-            return (out if last_only else out[lead:]), {i: h[lead:] for i, h in hidden.items()}
+            return Step(out if last_only else out[lead:], {i: h[lead:] for i, h in hidden.items()})
 
-        logits, hidden = eng._serial(run)
-        return logits if taps is None else (logits, hidden)
+        return eng._serial(run)
+
+    def next_logits(self) -> torch.Tensor:
+        """The next token's logits [V] float32: `logits`, the token a decode drew last fed first when one waits
+        (a pass, so a call rather than a read)"""
+        eng = self._bound()
+        if self.cache is None and self._pending is None:
+            raise ValueError("an empty session has nothing to go on from: feed it a prompt first")
+        if self._pending is not None:
+            eng._serial(self._settle, eng)
+        assert self.logits is not None
+        return self.logits
 
     def _append(
         self, t: _Txn, new: list[int], last_only: bool = False, taps: Sequence[int] = ()
@@ -328,7 +341,7 @@ class Session:
         """the pending token and `new` into the cache and committed: the logits after each, [T, V] float32 (the
         last one's, [1, V], with `last_only`), and the `taps` layers' states at each, {layer: [T, H]}"""
         eng = t.eng
-        new = [self.pending, *new] if self.pending is not None else new
+        new = [self._pending, *new] if self._pending is not None else new
         cache = self.cache if self.cache is not None else eng.new_cache()
         seen: dict[int, list[torch.Tensor]] = {i: [] for i in taps}
 
@@ -355,9 +368,9 @@ class Session:
     def _settle(self, eng: StreamedTextModel, owner: _Rows | None = None) -> None:
         """every token in the cache and the next token's logits in hand, `Ready` (what a fork starts from): a
         pending token fed"""
-        if self.cache is None and self.pending is None:
+        if self.cache is None and self._pending is None:
             raise ValueError("an empty session has nothing to go on from: feed it a prompt first")
-        if self.pending is not None:
+        if self._pending is not None:
             with self._txn(eng, owner=owner) as t:
                 self._append(t, [], last_only=True)
 
@@ -365,12 +378,12 @@ class Session:
         """this point of the sequence, to `rewind` to later"""
         eng = self._bound()
         if self.cache is None or LayerKind.LINEAR not in eng.layer_types:
-            return Mark(len(self.ids), {}, self.pending, self.logits, tuple(self.tokens))
+            return Mark(len(self.ids), {}, self._pending, self.logits, tuple(self.tokens))
 
         def run() -> Mark:
             self._unforked()
             self._flush(eng)
-            return Mark(len(self.ids), self._snap(eng) or {}, self.pending, self.logits, tuple(self.tokens))
+            return Mark(len(self.ids), self._snap(eng) or {}, self._pending, self.logits, tuple(self.tokens))
 
         return eng._serial(run)
 
@@ -401,8 +414,8 @@ class Session:
 
     def crop(self, n: int) -> None:
         """Keep the sequence's first `n` tokens, the rest dropped from the tokens and the cache; the n-th is left
-        drawn and not fed (`pending`), as a decode leaves its last. A hybrid's recurrent states cannot be cut back:
-        `mark` the point beforehand and `rewind` to it."""
+        drawn and not fed (`next_logits()` feeds it), as a decode leaves its last. A hybrid's recurrent states
+        cannot be cut back: `mark` the point beforehand and `rewind` to it."""
         eng = self._bound()
         n = int(n)
         if not 0 <= n <= len(self):
@@ -504,7 +517,7 @@ class Session:
             return None, 0, None
         if (
             whole
-            and self.pending is None
+            and self._pending is None
             and self.logits is not None
             and getattr(eng, "mlx", None) is None
             and prompt == self.ids
@@ -516,7 +529,7 @@ class Session:
         if 0 < len(self.ids) and m == len(self.ids) and len(prompt) > len(self.ids):
             # the prompt extends the tokens (a pending token among them): every row kept, the point where it stands
             t.point.states = self._snap(eng)
-            self.pending, self.logits = None, None
+            self._pending, self.logits = None, None
             return self.cache, len(self.ids), None
         if LayerKind.LINEAR in eng.layer_types:
             anchored = self._anchored(m)
@@ -529,7 +542,7 @@ class Session:
                 crop(self.cache, eng, a)
                 del self.ids[a:]
                 self.anchor = [x for x in self.anchor if x["n"] <= a]
-                self.pending, self.logits = None, None
+                self._pending, self.logits = None, None
                 t.keep(_Point(a, None, anchored["logits"], dict(anchored["states"]), min(self.n_prompt, a)))
                 return self.cache, a, anchored
         elif m > 0:
@@ -545,7 +558,7 @@ class Session:
             crop(self.cache, eng, m)
             del self.ids[m:]
             self.anchor = [x for x in self.anchor if x["n"] <= m]
-            self.pending, self.logits = None, None
+            self._pending, self.logits = None, None
             return self.cache, m, None
         # nothing of the last conversation serves this one: its cache goes now, not when the new turn's commit
         # replaces it, or the new prefill runs beside a full cache of the old (7 GB twice at 40k); the drafter's own
@@ -557,7 +570,7 @@ class Session:
         first = toks[0] if toks and prompt and prompt[0] == toks[0] else None
         dr = self.dr
         self.cache, self.anchor, self.ids, self.n_prompt = None, [], [], 0
-        self.pending, self.logits = None, None
+        self._pending, self.logits = None, None
         self.dr, self.dr_len, self.pend_h = None, 0, None
         if dr is not None and hasattr(dr, "reset"):
             dr.reset()

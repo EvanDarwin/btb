@@ -8,6 +8,7 @@ context manager. Every decode below goes through the same loops the token layer 
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import queue
 import threading
 from collections.abc import Callable, Iterator, Sequence
@@ -63,42 +64,20 @@ LogprobsT = TypeVar("LogprobsT")
 TapsT = TypeVar("TapsT")
 
 
-class Generation(tuple[TokensT, GenerateStats], Generic[TokensT, LogprobsT, TapsT]):
+@dataclasses.dataclass(frozen=True, eq=False)
+class Generation(Generic[TokensT, LogprobsT, TapsT]):
     """
     What `generate` returns: the new tokens (one row: a flat list; rows: a list per row) and the counts, plus
     what the call's hooks collected - `logprobs` a `TokenLogprob` per token, `hidden` {layer: [new, H]} - each a
     list per row for rows - and `report`, the call's own pass report (`last_pass_report()` is the model's latest,
-    whichever thread's). Unpacks and indexes as `(tokens, stats)`, and compares as that pair; it pickles and copies
-    whole.
+    whichever thread's). A record: read by name, compared by identity (its `hidden` holds tensors), pickled whole.
     """
 
-    logprobs: LogprobsT | None
-    hidden: TapsT | None
-    report: PassReport
-
-    def __new__(
-        cls,
-        tokens: TokensT,
-        stats: GenerateStats,
-        logprobs: LogprobsT | None = None,
-        hidden: TapsT | None = None,
-    ) -> Generation[TokensT, LogprobsT, TapsT]:
-        self = super().__new__(cls, (tokens, stats))
-        self.logprobs, self.hidden = logprobs, hidden
-        self.report = PassReport()
-        return self
-
-    def __getnewargs__(self) -> tuple[TokensT, GenerateStats, LogprobsT | None, TapsT | None]:
-        # a tuple's own reduce hands `__new__` the pair alone; the attributes follow as the instance's state
-        return self[0], self[1], self.logprobs, self.hidden
-
-    @property
-    def tokens(self) -> TokensT:
-        return self[0]
-
-    @property
-    def stats(self) -> GenerateStats:
-        return self[1]
+    tokens: TokensT
+    stats: GenerateStats
+    logprobs: LogprobsT | None = None
+    hidden: TapsT | None = None
+    report: PassReport = dataclasses.field(default_factory=PassReport)
 
 
 # one row's generation: its tokens, each token's logprob, the tapped layers' states over them
@@ -610,8 +589,8 @@ class _TextMixin(_State):
         # hook raising, memory refused, a pass failing part way)
         with session._decoding(self) if session is not None else contextlib.nullcontext():
             gen = self._decode(rows, max_new, stop, session, on_token, spans, speculate, smp, seed, hooks)
-        gen.report = self.last_pass_report()  # frozen here, under the lock: this call's, whoever decodes next
-        return gen
+        # the report frozen here, under the lock: this call's, whoever decodes next
+        return dataclasses.replace(gen, report=self.last_pass_report())
 
     def _decode(
         self,

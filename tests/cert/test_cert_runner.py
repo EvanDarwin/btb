@@ -405,10 +405,10 @@ def test_fork_and_batch_are_deterministic(stem: str, dev: spec.DeviceSubpath) ->
             rows = br.generate(N, eos=(), sampling=oracle.sampling("sampled")).tokens
             if i == 0:
                 _axis_tags(sm, spec.Surface.FORK, stem, dev, calls=False)
-            br.step()
+            br.advance()
             br.reorder([0, 0, 2])
             assert br.logits is not None
-            _, tapped = br.step([int(t) for t in br.logits.argmax(-1)], taps=[-1])
+            tapped = br.step([int(t) for t in br.logits.argmax(-1)], taps=[-1]).hidden
             br.leave(2)
             forked = [br.tokens(r) for r in range(br.n)]
             more = list(br.keep(1).generate(4, eos=(), speculate=False).tokens)
@@ -420,8 +420,7 @@ def test_fork_and_batch_are_deterministic(stem: str, dev: spec.DeviceSubpath) ->
             with sm.batch([sm.session(r) for r in RAGGED[:2]]) as bt:
                 batched = bt.generate(N, eos=()).tokens
                 joined = bt.join(sm.session(RAGGED[2]))
-                assert bt.logits is not None
-                bt.step([int(t) for t in bt.logits.argmax(-1)])
+                bt.step([int(t) for t in bt.next_logits().argmax(-1)])
                 bt.leave(0)
                 rejoined = [bt.tokens(r) for r in range(joined + 1)]
             if i == 0:
@@ -487,10 +486,11 @@ def test_a_sessions_calls_are_deterministic(stem: str, dev: spec.DeviceSubpath) 
             hybrid = LayerKind.LINEAR in sm.layer_types
             s = sm.session(list(PROMPT))
             m = s.mark()
-            fed = s.feed(OTHER)
-            last, tapped = s.feed([4], last_only=True, taps=[-1])
+            fed = s.feed(OTHER).logits
+            step = s.feed([4], last_only=True, taps=[-1])
+            last, tapped = step.logits, step.hidden
             s.rewind(m)
-            assert torch.equal(s.feed(OTHER), fed), f"{stem} on {dev.key}: a rewind left the mark's logits"
+            assert torch.equal(s.feed(OTHER).logits, fed), f"{stem} on {dev.key}: a rewind left the mark's logits"
             k, _v = s.rows(next(j for j, kind in enumerate(sm.layer_types) if kind != LayerKind.LINEAR))
             if hybrid:
                 with pytest.raises(ValueError, match="mark the point"):
@@ -500,10 +500,19 @@ def test_a_sessions_calls_are_deterministic(stem: str, dev: spec.DeviceSubpath) 
             synced = s.sync(list(PROMPT) + OTHER)
             s.fork(2).close()
             toks = list(s.generate(N, eos=(), speculate=False).tokens)
+            after = int(s.next_logits().argmax())  # the decode's last token fed first
             if i == 0:
                 _axis_tags(sm, spec.Surface.SESSION, stem, dev)
             runs.append(
-                (fed.argmax(-1).tolist(), int(last.argmax()), sorted(tapped), list(k.shape), int(synced.argmax()), toks)
+                (
+                    fed.argmax(-1).tolist(),
+                    int(last.argmax()),
+                    sorted(tapped),
+                    list(k.shape),
+                    int(synced.argmax()),
+                    toks,
+                    after,
+                )
             )
     assert runs[0] == runs[1], f"{stem} on {dev.key}: a session's calls answered differently across two loads"
     receipt.record(manifest.stem_id(spec.Surface.SESSION, stem, dev.key))

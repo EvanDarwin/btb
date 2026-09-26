@@ -3,8 +3,8 @@
 What you can hook into a decode. `processors` rewrite every pick's logits - `(ids, logits) -> logits`, called on
 every row a speculative pass verifies too, so a decode is the same with speculation or without; `logprobs` returns
 each token's log-probability and its `k` likeliest alternatives; `taps` the chosen layers' state at each new token;
-`on_pass` is called with each pass's counts. What comes back is a `Generation`: it unpacks as `(tokens, stats)` and
-carries `logprobs`, `hidden` and `report` (the paths the decode took). A callback runs between two steps of the
+`on_pass` is called with each pass's counts. What comes back is a `Generation`, a record of `tokens`, `stats`,
+`logprobs`, `hidden` and `report` (the paths the decode took). A callback runs between two steps of the
 decode: it may read (the model's `memory()`), not call back into the model.
 """
 
@@ -35,7 +35,7 @@ def main(argv=None):
         passes = []
         last = model.L - 1
         g = model.generate(ids, a.new, eos=(), processors=[never], logprobs=2, taps=[last], on_pass=passes.append)
-        tokens, stats = g  # a Generation unpacks as the pair
+        tokens, stats = g.tokens, g.stats
         print(model.tokenizer.decode(tokens, skip_special_tokens=True))
         for t, lp in list(zip(tokens, g.logprobs))[:3]:
             alts = ", ".join(f"{model.tokenizer.decode([i])!r} {v:.2f}" for i, v in lp.top)

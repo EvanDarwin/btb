@@ -410,16 +410,16 @@ def test_the_ram_policy_sheds_a_warm_layer_to_the_ring_and_takes_it_back() -> No
 
     with loaded_model(fixture("tiny_qwen3-pack12"), device="cpu", v_max=0) as sm:
         assert sm.host and not sm.cold and sm.ram_watch
-        before, _ = sm.generate(REPEATING, 12, speculate=False)
+        before = sm.generate(REPEATING, 12, speculate=False).tokens
         i = sm.ram_shed("the test")
         assert i == max(sm.host) and sm.cold == {i} and sm.ram_state.shed == [i]
         assert sm.cold_ring.slots and i in sm.cold_ring.slot_of
         lins = [m for m in sm.host[i].modules() if isinstance(m, _HostLinear) and m.key]
         assert lins and all(m.packed is not None for m in lins)
-        during, _ = sm.generate(REPEATING, 12, speculate=False)
+        during = sm.generate(REPEATING, 12, speculate=False).tokens
         assert during == before, "a layer read from the drive each pass answers as it did from RAM"
         assert sm.ram_regrow() == i and not sm.cold and not sm.ram_state.shed and not sm.cold_ring.slots
-        after, _ = sm.generate(REPEATING, 12, speculate=False)
+        after = sm.generate(REPEATING, 12, speculate=False).tokens
         assert after == before
 
 
@@ -448,14 +448,14 @@ def test_the_12_bit_model_answers_as_its_parent_with_and_without_the_native_kern
     src, pack = fixture("tiny_qwen3"), fixture("tiny_qwen3-pack12")
     with loaded_model(src, device="cpu", v_max=0) as a, loaded_model(pack, device="cpu", v_max=0) as b:
         assert b.pack is not None and b._packed
-        assert a.generate(REPEATING, 12, speculate=False)[0] == b.generate(REPEATING, 12, speculate=False)[0]
+        assert a.generate(REPEATING, 12, speculate=False).tokens == b.generate(REPEATING, 12, speculate=False).tokens
     code = (
         "import json, sys, btb\n"
         "src, pack, ids = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])\n"
         "out = []\n"
         "for p in (src, pack):\n"
         "    with btb.load(p, device='cpu', native='', v_max=0) as m:\n"
-        "        out.append(m.generate(ids, 12, speculate=False)[0])\n"
+        "        out.append(m.generate(ids, 12, speculate=False).tokens)\n"
         "from btb.engine.native import Native\n"
         "assert Native.gemv is None and Native.gemv_p12 is None, 'the torch-alone arm loaded a kernel library'\n"
         "print(json.dumps(out))\n"
@@ -878,8 +878,8 @@ def test_hybrid_session_continues_past_16_new_rows_on_mlx() -> None:
     with loaded_model(fixture("tiny_q35"), device="mlx", v_max=0) as sm:
         s = Session()
         sm.generate(first, 4, session=s)
-        with_session = sm.generate(second, 8, session=s)[0]
-        fresh = sm.generate(second, 8)[0]
+        with_session = sm.generate(second, 8, session=s).tokens
+        fresh = sm.generate(second, 8).tokens
     assert with_session == fresh
 
 
@@ -889,9 +889,9 @@ def test_hybrid_prefill_chunks_with_the_drafter_hook_on_mlx() -> None:
     need_mlx()
     prompt = REPEATING[0] * 4
     with loaded_model(fixture("tiny_q35"), device="mlx") as sm:
-        whole = sm.generate(prompt, 12)[0]
+        whole = sm.generate(prompt, 12).tokens
         sm.prefill_chunk = 24
-        chunked = sm.generate(prompt, 12)[0]
+        chunked = sm.generate(prompt, 12).tokens
     assert chunked == whole
 
 
@@ -908,12 +908,12 @@ def test_mlx_decodes_run_on_one_worker_thread_whichever_thread_asks() -> None:
         for _ in range(2):
             t = threading.Thread(
                 target=lambda: outs.append(
-                    sm.generate(REPEATING[0], 4, on_token=lambda _t: seen.append(threading.current_thread()))[0]
+                    sm.generate(REPEATING[0], 4, on_token=lambda _t: seen.append(threading.current_thread())).tokens
                 )
             )
             t.start()
             t.join()
-        outs.append(sm.generate(REPEATING[0], 4, on_token=lambda _t: seen.append(threading.current_thread()))[0])
+        outs.append(sm.generate(REPEATING[0], 4, on_token=lambda _t: seen.append(threading.current_thread())).tokens)
         assert outs[0] == outs[1] == outs[2]
         workers = set(seen)
         assert len(workers) == 1, workers
@@ -1103,14 +1103,14 @@ def test_a_layer_shed_to_the_drive_off_a_weight_not_stored_as_bf16_answers_as_fr
     if device == "mlx":
         need_mlx()
     with loaded_model(path, device=device, v_max=0) as sm:
-        before, _ = sm.generate(REPEATING, 12, speculate=False)
+        before = sm.generate(REPEATING, 12, speculate=False).tokens
         with torch.inference_mode():
             i = sm.ram_shed("the test")
         assert i is not None and sm.cold == {i}
         kind = "mem" if name.startswith("gguf/") else "cast"
         assert {it[5] for it in sm.cold_ring.recipe[i]} == {kind}, "every linear of the shed layer is read cast"
-        during, _ = sm.generate(REPEATING, 12, speculate=False)
+        during = sm.generate(REPEATING, 12, speculate=False).tokens
         assert during == before, "a layer read through the ring each pass answers as it did from RAM"
         assert sm.ram_regrow() == i and not sm.cold
-        after, _ = sm.generate(REPEATING, 12, speculate=False)
+        after = sm.generate(REPEATING, 12, speculate=False).tokens
         assert after == before

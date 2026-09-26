@@ -119,7 +119,7 @@ def test_logprobs_are_the_distribution_the_token_was_drawn_from(stem: str, devic
     toks = list(g.tokens)
     s = sm.session(PROMPT)
     assert g.logprobs is not None and s.logits is not None
-    ref = torch.log_softmax(torch.cat([s.logits[None], s.feed(toks[:-1])]).float(), -1)
+    ref = torch.log_softmax(torch.cat([s.logits[None], s.feed(toks[:-1]).logits]).float(), -1)
     for k, t in enumerate(g.logprobs):
         close(torch.tensor(t.logprob), ref[k, t.token], device)
         if device == "cpu":
@@ -136,7 +136,7 @@ def test_speculative_logprobs_are_each_positions_own(stem: str, device: str) -> 
     toks = list(g.tokens)
     s = sm.session(PROMPT)
     assert g.logprobs is not None and s.logits is not None
-    ref = torch.log_softmax(torch.cat([s.logits[None], s.feed(toks[:-1])]).float(), -1)
+    ref = torch.log_softmax(torch.cat([s.logits[None], s.feed(toks[:-1]).logits]).float(), -1)
     got = torch.tensor([t.logprob for t in g.logprobs])
     want = ref[torch.arange(len(toks)), torch.tensor(toks)]
     # a verify pass and a sequential feed differ like a prefill and a step do (a hybrid's chunked DeltaNet most)
@@ -207,11 +207,11 @@ def test_rewind_returns_the_session_to_the_mark(stem: str, device: str) -> None:
     sm = model(stem, device)
     s = sm.session(PROMPT)
     m = s.mark()
-    first = s.feed(OTHER)
+    first = s.feed(OTHER).logits
     s.feed([1, 2, 3])
     s.rewind(m)
     assert s.tokens == PROMPT
-    again = s.feed(OTHER)
+    again = s.feed(OTHER).logits
     assert torch.equal(first, again)
     s.rewind(m)
     assert list(s.generate(N, eos=(), speculate=False).tokens) == solo(sm, PROMPT, N)
@@ -224,7 +224,7 @@ def test_a_session_goes_on_after_generate(stem: str, device: str) -> None:
     sm = model(stem, device)
     s = sm.session(PROMPT)
     a = list(s.generate(4, eos=(), speculate=False).tokens)
-    assert s.tokens == PROMPT + a and s.pending == a[-1]
+    assert s.tokens == PROMPT + a and s.state is State.PENDING and s.logits is None
     b = list(s.generate(4, eos=(), speculate=False).tokens)
     assert a + b == solo(sm, PROMPT, 8)
 
@@ -259,11 +259,11 @@ def test_rows_are_copies_of_the_caches_rows(stem: str, device: str) -> None:
     i = next(j for j, kind in enumerate(sm.layer_types) if kind != LayerKind.LINEAR)
     k, v = s.rows(i)
     assert k.shape[0] == 1 and k.shape[-2] <= len(PROMPT) and v.shape == k.shape
-    before = s.feed(OTHER)
+    before = s.feed(OTHER).logits
     s.rewind(m)
     k.fill_(0.0)
     v.fill_(0.0)
-    assert torch.equal(s.feed(OTHER), before)
+    assert torch.equal(s.feed(OTHER).logits, before)
     if LayerKind.LINEAR in sm.layer_types:
         with pytest.raises(ValueError, match="linear-attention"):
             s.rows(sm.layer_types.index(LayerKind.LINEAR))
@@ -276,11 +276,11 @@ def test_feed_last_only_is_the_last_row(stem: str, device: str) -> None:
     session where the whole feed leaves it"""
     sm = model(stem, device)
     whole, last = sm.session(PROMPT), sm.session(PROMPT)
-    every = whole.feed(OTHER)
-    one = last.feed(OTHER, last_only=True)
+    every = whole.feed(OTHER).logits
+    one = last.feed(OTHER, last_only=True).logits
     assert one.shape == (1, every.shape[-1])
     close(one[0], every[-1], device)
-    close(last.feed([4])[-1], whole.feed([4])[-1], device)
+    close(last.feed([4]).logits[-1], whole.feed([4]).logits[-1], device)
 
 
 @cells
@@ -289,7 +289,8 @@ def test_feed_taps_are_the_layers_at_each_fed_position(stem: str, device: str) -
     """the tapped layers' states at each fed position, [T, H]: what `hidden` computes over the whole sequence"""
     sm = model(stem, device)
     s = sm.session(PROMPT)
-    logits, hid = s.feed(OTHER, last_only=True, taps=(1, -1))
+    step = s.feed(OTHER, last_only=True, taps=(1, -1))
+    logits, hid = step.logits, step.hidden
     assert sorted(hid) == [1, sm.L - 1] and logits.shape[0] == 1
     ref = sm.hidden(PROMPT + OTHER, layers=(1,))[1][len(PROMPT) :]
     assert hid[1].shape == ref.shape
@@ -302,12 +303,14 @@ def test_a_long_feed_goes_in_the_prefills_chunks(stem: str, device: str) -> None
     """a feed longer than a chunk goes in the chunks a prompt's prefill takes (a long prelude is never one pass):
     the same logits and taps as the one pass gives"""
     sm = model(stem, device)
-    whole, whole_taps = sm.session(PROMPT).feed(LONG, taps=(1,))
+    step = sm.session(PROMPT).feed(LONG, taps=(1,))
+    whole, whole_taps = step.logits, step.hidden
     keep = sm.prefill_chunk
     sm.prefill_chunk = 4
     try:
-        chunked, chunked_taps = sm.session(PROMPT).feed(LONG, taps=(1,))
-        last = sm.session(PROMPT).feed(LONG, last_only=True)
+        step = sm.session(PROMPT).feed(LONG, taps=(1,))
+        chunked, chunked_taps = step.logits, step.hidden
+        last = sm.session(PROMPT).feed(LONG, last_only=True).logits
     finally:
         sm.prefill_chunk = keep
     assert chunked.shape == whole.shape and chunked_taps[1].shape == whole_taps[1].shape
@@ -355,7 +358,7 @@ def test_a_forks_rows_are_the_sessions_own_draws(stem: str, device: str) -> None
     assert s.forked is None and s.tokens == PROMPT + g.tokens[1]
     by_hand = sm.session(PROMPT)
     by_hand.feed(g.tokens[1])
-    close(s.feed([7])[-1], by_hand.feed([7])[-1], device)
+    close(s.feed([7]).logits[-1], by_hand.feed([7]).logits[-1], device)
 
 
 @cells
@@ -369,10 +372,10 @@ def test_a_forks_step_is_each_rows_own_pass(stem: str, device: str) -> None:
         close(br.logits[0], s.logits, device)
         br.step([1, 2])
         br.reorder([1, 1, 0])
-        lg = br.step([4, 5, 6])
-        close(lg[0], sm.session(PROMPT + [2]).feed([4])[-1], device)
-        close(lg[1], sm.session(PROMPT + [2]).feed([5])[-1], device)
-        close(lg[2], sm.session(PROMPT + [1]).feed([6])[-1], device)
+        lg = br.step([4, 5, 6]).logits
+        close(lg[0], sm.session(PROMPT + [2]).feed([4]).logits[-1], device)
+        close(lg[1], sm.session(PROMPT + [2]).feed([5]).logits[-1], device)
+        close(lg[2], sm.session(PROMPT + [1]).feed([6]).logits[-1], device)
         assert br.rows == [[2, 4], [2, 5], [1, 6]]
     assert s.forked is None and s.tokens == PROMPT
 
@@ -383,10 +386,11 @@ def test_a_step_taps_each_rows_fed_token(stem: str, device: str) -> None:
     """a tapped step's layer states [live, H] are each row's at the token it was fed, as a session fed it has"""
     sm = model(stem, device)
     with sm.session(PROMPT).fork(2) as br:
-        lg, hid = br.step([1, 2], taps=(1,))
+        step = br.step([1, 2], taps=(1,))
+        lg, hid = step.logits, step.hidden
         assert hid[1].shape[0] == 2 and lg.shape[0] == 2
         for r, t in enumerate((1, 2)):
-            _, want = sm.session(PROMPT).feed([t], taps=(1,))
+            want = sm.session(PROMPT).feed([t], taps=(1,)).hidden
             assert (hid[1][r] - want[1][-1]).abs().max().item() <= 3e-2 * want[1].abs().max().item()
 
 
@@ -401,14 +405,14 @@ def test_a_row_left_early_keeps_the_numbering(stem: str, device: str) -> None:
         br.step([1, 2, 3])
         br.leave(1)
         assert br.live == [0, 2]
-        lg = br.step([4, 6])
-        close(lg[1], sm.session(PROMPT + [3]).feed([6])[-1], device)
+        lg = br.step([4, 6]).logits
+        close(lg[1], sm.session(PROMPT + [3]).feed([6]).logits[-1], device)
         assert br.rows == [[1, 4], [2], [3, 6]]
         with pytest.raises(ValueError, match="not in the batch"):
             br.leave(1)
         br.keep(1)
     assert s.tokens == PROMPT + [2]
-    close(s.feed([7])[-1], sm.session(PROMPT + [2]).feed([7])[-1], device)
+    close(s.feed([7]).logits[-1], sm.session(PROMPT + [2]).feed([7]).logits[-1], device)
 
 
 @cells
@@ -427,7 +431,7 @@ def test_a_row_leaves_at_its_stop_token(stem: str, device: str) -> None:
             assert g.tokens[r] == cut, r
         assert (r in br.live) == (stop not in g.tokens[r])
     kept = br.keep(1)
-    assert kept.pending == stop and kept.tokens == PROMPT + g.tokens[1]
+    assert kept.state is State.PENDING and kept.tokens == PROMPT + g.tokens[1]
 
 
 @cells
@@ -451,7 +455,7 @@ def test_a_row_leaves_when_until_says_so(stem: str, device: str) -> None:
     if device == "cpu" or br.mode == "rows":
         assert g.tokens == [ref[0], ref[1][:2], ref[2]]
     kept = br.keep(1)
-    assert kept.pending == g.tokens[1][-1] and kept.tokens == PROMPT + g.tokens[1]
+    assert kept.state is State.PENDING and kept.tokens == PROMPT + g.tokens[1]
 
 
 def test_a_forked_session_holds_still() -> None:
@@ -503,7 +507,7 @@ def test_a_batch_row_is_written_back_when_it_stops(stem: str, device: str) -> No
     with sm.batch([a, b]) as bt:
         g = bt.generate(N, eos=(stop,))
         assert b.forked is None and 1 not in bt.live
-        assert b.tokens == OTHER + g.tokens[1] and b.pending == stop
+        assert b.tokens == OTHER + g.tokens[1] and b.state is State.PENDING
         if device == "cpu" or bt.mode == "rows":
             assert g.tokens[1] == ref[: ref.index(stop) + 1]
     assert a.forked is None
@@ -536,7 +540,7 @@ def in_step(sm: StreamedTextModel, s: Session) -> None:
     if not len(s):
         return
     toks = s.tokens
-    close(s.feed([7])[-1], sm.session(toks).feed([7])[-1], "cpu")
+    close(s.feed([7]).logits[-1], sm.session(toks).feed([7]).logits[-1], "cpu")
 
 
 @families
@@ -599,8 +603,8 @@ def test_a_callback_raising_mid_decode_leaves_every_row_its_draw(stem: str) -> N
     br = sm.session(PROMPT).fork(2)
     with pytest.raises(Boom):
         br.generate(3, eos=(), on_token=boom)
-    assert br.pending is not None and [len(r) for r in br.rows] == [1, 1]
-    br.step()
+    assert br.logits is None and [len(r) for r in br.rows] == [1, 1]
+    br.advance()
     kept = br.keep(0)
     assert br.live == []
     in_step(sm, kept)
@@ -686,8 +690,8 @@ def test_a_reorder_after_a_row_left_is_refused_and_the_fork_goes_on(stem: str) -
     br.leave(1)
     with pytest.raises(ValueError, match="reorder"):
         br.reorder([0, 0])
-    lg = br.step([4, 5])
-    close(lg[1], sm.session(PROMPT + [3]).feed([5])[-1], "cpu")
+    lg = br.step([4, 5]).logits
+    close(lg[1], sm.session(PROMPT + [3]).feed([5]).logits[-1], "cpu")
     kept = br.keep(2)
     assert kept.tokens == PROMPT + [3, 5]
     in_step(sm, kept)
@@ -740,7 +744,7 @@ def test_a_callback_raising_mid_batch_leaves_every_row_its_draw(stem: str) -> No
     bt = sm.batch([a, b])
     with pytest.raises(Boom):
         bt.generate(3, eos=(), on_token=boom)
-    assert bt.pending is not None and [len(r) for r in bt.rows] == [1, 1]
+    assert bt.logits is None and [len(r) for r in bt.rows] == [1, 1]
     bt.close()
     assert a.tokens == PROMPT + bt.rows[0] and b.tokens == OTHER + bt.rows[1]
     in_step(sm, a)
@@ -817,9 +821,9 @@ def test_a_rows_step_failing_part_way_is_as_if_it_never_ran(stem: str, rows: str
     with pytest.raises(Boom), failing_pass(sm, sm.L - 1):
         rs.step([3, 4])
     assert rs.rows == [[1], [2]] and rs.logits is not None
-    lg = rs.step([3, 4])
+    lg = rs.step([3, 4]).logits
     for r, (p, toks) in enumerate(zip(firsts, ([1, 3], [2, 4]), strict=True)):
-        close(lg[r], sm.session(p + toks[:-1]).feed(toks[-1:])[-1], "cpu")
+        close(lg[r], sm.session(p + toks[:-1]).feed(toks[-1:]).logits[-1], "cpu")
     if rows == "fork":
         assert isinstance(rs, Branches)
         kept = rs.keep(1)

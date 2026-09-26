@@ -48,7 +48,7 @@ def _need() -> None:
 
 def _tokens(path: str, device: str = "cpu") -> list[int]:
     with loaded_model(path, device=device) as sm:
-        out, _ = sm.generate(PROMPT, 8, eos=(), speculate=False)
+        out = sm.generate(PROMPT, 8, eos=(), speculate=False).tokens
     return [int(t) for t in out]
 
 
@@ -227,7 +227,7 @@ def test_a_gpt_oss_gguf_streams_its_experts_as_stored_and_decodes_as_its_twin(tm
         assert "blk.0.ffn_gate_exps.weight" in sm.weight_map
         bias = sm._get("model.layers.0.mlp.experts.gate_up_proj_bias")
         assert tuple(bias.shape) == (want["num_local_experts"], 2 * want["intermediate_size"])
-        out, _ = sm.generate(PROMPT, 8, eos=(), speculate=False)
+        out = sm.generate(PROMPT, 8, eos=(), speculate=False).tokens
         store = sm.expert_store
         if store is not None:
             assert store.ggml and isinstance(store._views(store.last_slots[next(iter(store.last_slots))])[0], MxGateUp)
@@ -554,7 +554,7 @@ def test_a_qwen4exp_mxfp4_gguf_multiplies_its_experts_as_stored(tmp_path: Path) 
     path = os.path.join(GGUF, "tiny_q4-mxfp4.gguf")
     with loaded_model(path, device="cpu") as sm:
         assert "blk.0.ffn_gate_exps.weight" in sm.weight_map
-        out, _ = sm.generate(PROMPT, 8, eos=(), speculate=False)
+        out = sm.generate(PROMPT, 8, eos=(), speculate=False).tokens
         store = sm.expert_store
         assert store is not None and store.ggml
         assert isinstance(store._views(store.last_slots[next(iter(store.last_slots))])[0], MxGateUp)
@@ -623,13 +623,13 @@ def test_real_qwen3_gguf_files_when_cached() -> None:
             assert tok.chat_template and tok("hello world")["input_ids"], q
             assert sm.stop_ids, q
             ids = sm.prompt_ids(prompt)
-            out, _ = sm.generate(ids, 8, speculate=False)
+            out = sm.generate(ids, 8, speculate=False).tokens
             answers[q] = (ids, [int(t) for t in out], sm.tokenizer.decode(out, skip_special_tokens=True))
     print({q: a[2] for q, a in answers.items()})
     if ref and "BF16" in answers:
         with loaded_model(ref, device="cpu") as sm:
             ids = sm.prompt_ids(prompt)
-            out, _ = sm.generate(ids, 8, speculate=False)
+            out = sm.generate(ids, 8, speculate=False).tokens
         assert answers["BF16"][0] == ids and answers["BF16"][1] == [int(t) for t in out]
 
 
@@ -647,7 +647,7 @@ def test_a_q6k_gguf_multiplies_its_blocks_as_stored_on_mlx() -> None:
             lg = sm.forward(PROMPT, cache=sm.new_cache())
             assert lg is not None
             logits[packed] = lg.float()[0, -1]
-            out, _ = sm.generate(PROMPT, 8, speculate=False)
+            out = sm.generate(PROMPT, 8, speculate=False).tokens
             toks[packed] = [int(t) for t in out]
     a, b = logits[1], logits[0]
     assert_close(a, b)
@@ -740,7 +740,7 @@ def test_a_native_kernel_gguf_multiplies_its_blocks_as_stored_on_mlx(quant: str,
             lg = sm.forward(PROMPT, cache=sm.new_cache())
             assert lg is not None
             logits[packed] = lg.float()[0, -1]
-            out, _ = sm.generate(PROMPT, 8, speculate=False)
+            out = sm.generate(PROMPT, 8, speculate=False).tokens
             toks[packed] = [int(t) for t in out]
     a, b = logits[1], logits[0]
     assert a.argmax().item() == b.argmax().item()

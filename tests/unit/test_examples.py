@@ -142,7 +142,9 @@ def test_session_loop_rewinds_and_goes_on() -> None:
     r = _run("session_loop", "--new", "6")
     assert r["same"], "a feed after a rewind gave other logits"
     assert r["tokens"] == r["plain"], "the session decoded otherwise than a plain decode of the prompt"
-    assert r["session"] == r["prompt"] + r["tokens"] and r["pending"] == r["tokens"][-1]
+    assert r["session"] == r["prompt"] + r["tokens"] and r["waiting"], "the decode's last token was fed unasked"
+    ref = _run("session_loop", "--new", "7")
+    assert r["after"] == ref["tokens"][-1], "next_logits() is not the next token's"
     assert r["tap"] == (1, r["hidden"])
 
 

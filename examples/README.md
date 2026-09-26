@@ -11,7 +11,7 @@ Examples of using `btb` via its Python interface.
 | `coexist.py`         | your own tensors beside the engine: grant and reserve through the same ledger                         |
 | `shed_and_regrow.py` | the policies' moves by hand: a layer shed to the drive or off the card and back, the answer unchanged |
 | `custom_loop.py`     | your own tokens and your own loop over `forward` and the cache                                        |
-| `session_loop.py`    | a session by hand: `feed`, `mark`/`rewind`, and the drawn token a decode leaves pending               |
+| `session_loop.py`    | a session by hand: `feed`, `mark`/`rewind`, and `next_logits()` after a decode                        |
 | `hooks.py`           | logits processors, logprobs, taps and a pass callback on one decode; what a `Generation` carries      |
 | `beam.py`            | a beam search of your own over a fork: `reorder` the survivors, `step` them, `keep` the best          |
 | `batch_sessions.py`  | sessions decoded as one batch: `join`, `leave`, and every row written back when the block ends        |

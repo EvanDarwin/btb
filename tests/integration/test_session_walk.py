@@ -100,19 +100,19 @@ class Walk:
         st = s.state
         assert st in (State.EMPTY, State.READY, State.PENDING), f"{st} after {where}"
         if st is State.EMPTY:
-            assert s.cache is None and not s.ids and s.pending is None and s.logits is None, where
+            assert s.cache is None and not s.ids and s._pending is None and s.logits is None, where
             return
         assert s.cache is not None
         assert s.cache.get_seq_length() == len(s.ids), f"{s.cache.get_seq_length()} rows for {len(s.ids)}: {where}"
         if st is State.READY:
-            assert s.logits is not None and s.pending is None, where
+            assert s.logits is not None and s._pending is None, where
         else:
-            assert s.pending is not None and s.logits is None, where
+            assert s._pending is not None and s.logits is None, where
         # the reference: a fresh session fed the same tokens gives the same next logits (a probe, rewound after)
         here = s.mark()
-        got = s.feed([7])[-1]
+        got = s.feed([7]).logits[-1]
         s.rewind(here)
-        want = sm.session(s.tokens).feed([7])[-1]
+        want = sm.session(s.tokens).feed([7]).logits[-1]
         d = float((got - want).abs().max())
         assert d <= 1e-4 * max(1.0, float(want.abs().max())), f"logits {d} apart after {where}"
         assert s.cache.get_seq_length() == len(s.ids) and s.tokens == list(here.path or ()), where
@@ -201,13 +201,13 @@ class Walk:
         (the tokens they hold, pending or not) and the same step is taken again"""
         at = self.fault()
         if at is not None:
-            rows, pend = [list(r) for r in rs.rows], rs.pending
+            rows, pend = [list(r) for r in rs.rows], rs._pend
             self.log.append(f"step!{at}")
             try:
                 with failing(self.sm, at):
                     rs.step(toks)
             except Boom:
-                assert [list(r) for r in rs.rows] == rows and rs.pending == pend, "a failed step moved the rows"
+                assert [list(r) for r in rs.rows] == rows and rs._pend == pend, "a failed step moved the rows"
             else:
                 return
         rs.step(toks)

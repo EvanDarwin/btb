@@ -88,8 +88,9 @@ def test_every_forward_entry_records_a_tag() -> None:
 
 
 def _api_called() -> set[PassTag]:
-    """the API calls the declared classes record: every module under btb/ spelling `@api(` imported (a class
-    registers as it is built), then each owner's classes' public methods read off `btb.api.OWNERS`"""
+    """the API calls the declared classes record: every module under btb/ spelling `@api(` imported, then the
+    public methods of each class it declares under an owner (`__btb_owner__`, set on the class `@api` builds)"""
+    declared: list[tuple[str, type]] = []
     for root, _dirs, files in os.walk(BTB):
         for name in files:
             path = os.path.join(root, name)
@@ -99,13 +100,15 @@ def _api_called() -> set[PassTag]:
                 declares = "@api(" in f.read()
             if declares:
                 rel = os.path.relpath(path[: -len(".py")], os.path.dirname(BTB))
-                importlib.import_module(rel.replace(os.sep, ".").removesuffix(".__init__"))
-    from btb.api import OWNERS
-
+                mod = importlib.import_module(rel.replace(os.sep, ".").removesuffix(".__init__"))
+                declared += [
+                    (vars(c)["__btb_owner__"], c)
+                    for c in vars(mod).values()
+                    if isinstance(c, type) and c.__module__ == mod.__name__ and "__btb_owner__" in vars(c)
+                ]
     return {
         PassTag(f"{owner}.{n}")
-        for owner, classes in OWNERS.items()
-        for cls in classes
+        for owner, cls in declared
         for n, member in vars(cls).items()
         if not n.startswith("_") and inspect.isfunction(member) and not getattr(member, "__isabstractmethod__", False)
     }

@@ -6,6 +6,7 @@ inside, and a `Generation` survives pickling. On the CPU with the tiny fixtures.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import functools
 import pickle
 import threading
@@ -18,7 +19,7 @@ from btb.api import api
 from btb.engine import StreamedTextModel
 from btb.kinds import PassTag
 from btb.sampling import Sampling
-from btb.session import Session
+from btb.session import Session, State, Step
 from tests.helpers import fixture, loaded_model
 
 PROMPT = [5, 17, 99, 3, 42, 8, 61, 7, 12, 30]
@@ -54,10 +55,10 @@ def test_a_callback_calling_back_into_the_engine_is_refused(sm: StreamedTextMode
     of its own, is refused (the decode stops with the refusal); reading the model's memory is not a call into it"""
     s = sm.session(PROMPT)
     with pytest.raises(RuntimeError, match="callback"):
-        s.generate(4, eos=(), speculate=False, on_token=lambda _t: s.feed([1, 2, 3]))
+        s.generate(4, eos=(), speculate=False, on_token=lambda _t: s.feed([1, 2, 3]).logits)
     toks = s.tokens
     ref = sm.session(toks)
-    assert torch.allclose(s.feed([7])[-1], ref.feed([7])[-1], atol=1e-4)
+    assert torch.allclose(s.feed([7]).logits[-1], ref.feed([7]).logits[-1], atol=1e-4)
     with pytest.raises(RuntimeError, match="callback"):
         sm.generate(PROMPT, 4, eos=(), speculate=False, on_token=lambda _t: sm.generate(PROMPT, 2))
     seen: list[int] = []
@@ -110,7 +111,54 @@ def test_a_generation_survives_pickling_and_copying(sm: StreamedTextModel) -> No
     g = sm.generate(PROMPT, 3, eos=(), speculate=False, logprobs=2)
     for h in (pickle.loads(pickle.dumps(g)), copy.copy(g), copy.deepcopy(g)):
         assert list(h.tokens) == list(g.tokens) and h.stats == g.stats
-        assert h.logprobs == g.logprobs and h.hidden == g.hidden
+        assert h.logprobs == g.logprobs and h.hidden == g.hidden and h.report == g.report
+
+
+def test_a_generation_is_a_record_not_a_pair(sm: StreamedTextModel) -> None:
+    """docs/api.md: read by name; it neither unpacks nor indexes as (tokens, stats), and it is not written to"""
+    g = sm.generate(PROMPT, 3, eos=(), speculate=False)
+    with pytest.raises(TypeError):
+        _tokens, _stats = g  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        g[0]  # type: ignore[index]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        g.tokens = []  # type: ignore[misc]
+
+
+def test_a_feed_and_a_step_give_one_shape_whatever_is_asked(sm: StreamedTextModel) -> None:
+    """a `Step` either way: its states empty without taps, a layer's with them"""
+    s = sm.session(PROMPT)
+    plain, tapped = s.feed([1, 2]), s.feed([3], taps=[-1])
+    assert isinstance(plain, Step) and plain.logits.shape[0] == 2 and plain.hidden == {}
+    assert isinstance(tapped, Step) and list(tapped.hidden) == [sm.L - 1]
+    with s.fork(2) as br:
+        got = br.step([4, 5], taps=[0])
+        assert isinstance(got, Step) and got.logits.shape[0] == 2 and list(got.hidden) == [0]
+
+
+def test_the_drawn_token_is_fed_when_asked_for_what_follows_it(sm: StreamedTextModel) -> None:
+    """a decode leaves its last token drawn: `logits` is None until it is fed, `next_logits()` feeds it and is what
+    a session fed the same tokens gives; a session's and rows' `pending` are gone"""
+    s = sm.session(PROMPT)
+    s.generate(3, eos=(), speculate=False)
+    before, waiting = s.state, s.logits
+    assert before is State.PENDING and waiting is None and not hasattr(s, "pending")
+    got = s.next_logits()
+    assert s.state is State.READY and s.logits is got
+    assert torch.allclose(got, sm.session(s.tokens).next_logits(), atol=1e-4)
+    assert s.next_logits() is got, "a second ask feeds nothing"
+    with sm.session(PROMPT).fork(2) as br:
+        br.generate(3, eos=())
+        drawn = br.logits
+        assert drawn is None and not hasattr(br, "pending")
+        with pytest.raises(ValueError, match="advance"):
+            br.step([1, 2])
+        lg = br.next_logits()
+        assert lg.shape[0] == 2 and br.logits is lg
+        with pytest.raises(ValueError, match=r"step\(tokens\)"):
+            br.advance()
+        with pytest.raises(TypeError):
+            br.step()  # type: ignore[call-arg]
 
 
 @pytest.mark.parametrize("stem", ["tiny_qwen3", "tiny_q35"])

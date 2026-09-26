@@ -551,7 +551,7 @@ def test_session_reuses_the_shared_prefix_and_learns_the_tail() -> None:
         assert s.fresh and s._begin_decode(eng0, [1, 2, 3]) == (None, 0, None)
     eng, cache = engine_and_cache(6)
     decoded(s, eng, [1, 2, 3, 4], [9, 8, 7], cache)  # the cache holds the prompt and the answer but its last token
-    assert s.ids == [1, 2, 3, 4, 9, 8] and s.pending == 7 and s.n_prompt == 4 and s.state is State.PENDING
+    assert s.ids == [1, 2, 3, 4, 9, 8] and s._pending == 7 and s.n_prompt == 4 and s.state is State.PENDING
     # the next turn extends the previous text: the whole cache is reused
     with s._decoding(eng):
         c, reuse, anc = s._begin_decode(eng, [1, 2, 3, 4, 9, 8, 7, 5, 6])

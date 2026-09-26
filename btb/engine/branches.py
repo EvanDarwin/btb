@@ -10,7 +10,7 @@ import time
 from abc import abstractmethod
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Self, overload
+from typing import TYPE_CHECKING, Self
 
 import torch
 
@@ -18,6 +18,7 @@ from .. import mlx as mlxdev
 from ..api import api, in_hook
 from ..kinds import LayerKind, PassReport, PassTag, Tokens
 from ..sampling import GREEDY, Sampling
+from ..session import Step
 from .cache import (
     CardRowsLayer,
     ForkIndexedLayer,
@@ -159,13 +160,9 @@ class _Rows:
 
     @property
     def logits(self) -> torch.Tensor | None:
-        """the live rows' next-token logits [live, V] float32; None while `generate`'s last tokens wait to be fed"""
+        """the live rows' next-token logits [live, V] float32; None while `generate`'s last tokens wait to be fed
+        (`advance()` feeds them, `next_logits()` whichever is the case)"""
         return self._logits
-
-    @property
-    def pending(self) -> list[int] | None:
-        """the tokens `generate` drew last for the live rows and has not fed; `step()` feeds them"""
-        return None if self._pend is None else list(self._pend)
 
     def tokens(self, r: int) -> list[int]:
         """row r's whole sequence"""
@@ -177,39 +174,46 @@ class _Rows:
             raise ValueError(f"this {type(self).__name__} is closed")
         return self.cache
 
-    @overload
-    def step(self, tokens: Tokens | None = None) -> torch.Tensor: ...
-
-    @overload
-    def step(self, tokens: Tokens | None = None, *, taps: Sequence[int]) -> tuple[torch.Tensor, Taps]: ...
-
-    def step(
-        self, tokens: Tokens | None = None, *, taps: Sequence[int] | None = None
-    ) -> torch.Tensor | tuple[torch.Tensor, Taps]:
-        """Feed a token to each live row, in `live` order (None: the ones `generate` drew last), and return the
-        next token's logits there, [live, V] float32; with `taps`, also those layers' states at the fed
-        tokens, {layer: [live, H]} float32 (as `Session.feed` taps them)."""
+    def step(self, tokens: Tokens, taps: Sequence[int] = ()) -> Step:
+        """Feed a token to each live row, in `live` order: a `Step` of the next token's logits there, [live, V]
+        float32, and with `taps` those layers' states at the fed tokens, {layer: [live, H]} float32 (as
+        `Session.feed` taps them). A ValueError while `generate`'s last tokens wait: `advance()` feeds those."""
         self._check()
+        if self._pend is not None:
+            raise ValueError("the live rows hold the tokens `generate` drew last, not fed yet: advance() feeds them")
+        return self._feed([int(t) for t in tokens], taps, drawn=False)
+
+    def advance(self, taps: Sequence[int] = ()) -> Step:
+        """Feed each live row the token `generate` drew last for it: a `Step` as `step` gives one. A ValueError when
+        there are none (the rows were stepped since, or never decoded)"""
+        self._check()
+        if self._pend is None:
+            raise ValueError("no drawn tokens wait to be fed: step(tokens) feeds tokens of your own")
+        return self._feed(list(self._pend), taps, drawn=True)
+
+    def next_logits(self) -> torch.Tensor:
+        """the live rows' next-token logits [live, V] float32: `logits`, `generate`'s last tokens fed first when
+        they wait (a pass, so a call rather than a read)"""
+        if self._pend is not None:
+            return self.advance().logits
+        self._check()
+        if self._logits is None:
+            raise ValueError("no row is live")
+        return self._logits
+
+    def _feed(self, toks: list[int], taps: Sequence[int], drawn: bool) -> Step:
         live = self.live
         if not live:
             raise ValueError("no row is live")
-        if tokens is None:
-            if self._pend is None:
-                raise ValueError("step needs a token a live row")
-            toks = list(self._pend)
-        else:
-            if self._pend is not None:
-                raise ValueError("the live rows hold drawn tokens not fed yet: step() feeds them first")
-            toks = [int(t) for t in tokens]
         if len(toks) != len(live):
             raise ValueError(f"{len(toks)} tokens for {len(live)} live rows")
-        want = tuple(int(i) % self.eng.L for i in taps) if taps is not None else ()
+        want = tuple(int(i) % self.eng.L for i in taps)
         out, hidden = self.eng._serial(self._advance, toks, want)
-        if tokens is not None:
+        if not drawn:  # a drawn token is in the row's tokens already
             for r, t in zip(live, toks):
                 self.rows[r].append(t)
         self._pend, self._logits = None, out
-        return out if taps is None else (out, hidden)
+        return Step(out, hidden)
 
     def leave(self, r: int) -> None:
         """Row r out of the batch before its stop token (a candidate done early): the others step on, every row
@@ -329,8 +333,8 @@ class _Rows:
     ) -> BatchGeneration:
         """Decode every live row up to `max_new` tokens, a row leaving the batch at a stop token (`eos`, the
         model's by default). Returns a `Generation` whose tokens (and `logprobs`) are a list a row - empty for a
-        row not live. The live rows' last tokens are drawn and not fed (`pending`); hooks as `generate` takes them,
-        and `on_token(row, token)` called with each token drawn. `until(row)`, asked of each live row once its
+        row not live. The live rows' last tokens are drawn and not fed (`advance()` feeds them); hooks as
+        `generate` takes them, and `on_token(row, token)` called with each token drawn. `until(row)`, asked of each live row once its
         token is drawn (and `on_token` has seen it): true, the row leaves the batch there as its stop token would
         make it - a stop string, a client gone - and the rest go on."""
         self._check()
@@ -416,8 +420,7 @@ class _Rows:
         if not smp.greedy and smp.seed is not None:
             stats["seed"] = smp.seed
         stats["seconds"] = time.perf_counter() - t0
-        gen: BatchGeneration = Generation(new, stats, hk.lp if hk.logprobs is not None else None, None)
-        gen.report = report
+        gen: BatchGeneration = Generation(new, stats, hk.lp if hk.logprobs is not None else None, None, report)
         return gen
 
     # -- re-forming the batch --

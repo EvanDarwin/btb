@@ -621,7 +621,8 @@ def cmd_run(a: argparse.Namespace) -> None:
         for idx, prompt in enumerate(prompts):
             ids = sm.prompt_ids(prompt)
             t0 = time.perf_counter()
-            out, c = sm.generate(ids, a.new, eos=es, speculate=not a.no_spec)
+            gen = sm.generate(ids, a.new, eos=es, speculate=not a.no_spec)
+            out, c = gen.tokens, gen.stats
             s = time.perf_counter() - t0
             stop = "eos" if (out and out[-1] in eset) else "length"
             tpp = round(len(out) / c["forwards"], 3) if (c and "forwards" in c) else 1.0
@@ -742,7 +743,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
                 m.append(time.perf_counter())
 
             t0 = time.perf_counter()
-            g, _ = sm.generate(ids, n_new, eos=(), speculate=False, on_token=mark, sampling=samp)
+            g = sm.generate(ids, n_new, eos=(), speculate=False, on_token=mark, sampling=samp).tokens
             t1 = time.perf_counter()
             firsts.append(marks[0] - t0)
             tg = (t1 - marks[0]) / max(1, len(g) - 1)
@@ -752,9 +753,10 @@ def cmd_bench(a: argparse.Namespace) -> None:
                 # timed as every engine's baseline row is: the first token from the prompt, the rate after it
                 marks_s: list[float] = []
                 t0 = time.perf_counter()
-                o, c = sm.generate(
+                gen = sm.generate(
                     ids, n_new, eos=(), on_token=lambda _t, m=marks_s: m.append(time.perf_counter()), sampling=samp
                 )
+                o, c = gen.tokens, gen.stats
                 t1 = time.perf_counter()
                 ts = (t1 - marks_s[0]) / max(1, len(o) - 1)
                 s_all.append(ts)

@@ -188,18 +188,18 @@ def test_the_step_graph_loop_gives_the_step_by_step_tokens(
     sm, _ = engine
     ids, toks, _ = greedy_reference
     assert sm._card_greedy_ok(None, 1, None, None, False, None)
-    out, _ = sm.generate(ids, len(toks), eos=(), speculate=False)
+    out = sm.generate(ids, len(toks), eos=(), speculate=False).tokens
     assert out == toks
     # against the step loop itself, with the pipeline switched off, and with an eos that stops it early
     for pid in prompt_ids:
         sm.card_pipeline = False
         try:
-            ref, _ = sm.generate(pid, 40, eos=(), speculate=False)
+            ref = sm.generate(pid, 40, eos=(), speculate=False).tokens
         finally:
             sm.card_pipeline = True
-        got, _ = sm.generate(pid, 40, eos=(), speculate=False)
+        got = sm.generate(pid, 40, eos=(), speculate=False).tokens
         assert got == ref
-        cut, _ = sm.generate(pid, 40, eos=(ref[20],), speculate=False)
+        cut = sm.generate(pid, 40, eos=(ref[20],), speculate=False).tokens
         assert cut == ref[: ref.index(ref[20]) + 1]
 
 
@@ -271,7 +271,8 @@ def test_the_default_engine_takes_one_gemv_for_every_width_and_is_exact(default_
             wide = forward_logits(sm, [g[:15]], cache=cache, last_only=False)[0]
         for i, step in enumerate(steps):
             assert torch.equal(step, wide[i]), f"position {i}: a one-row step and a 15-row pass differ"
-        s, census = sm.generate(ids, 128, eos=())
+        gen = sm.generate(ids, 128, eos=())
+        s, census = gen.tokens, gen.stats
         assert s == g, f"diverged at token {next(i for i, (a, b) in enumerate(zip(g, s)) if a != b)} of {len(g)}"
         assert census["forwards"] < len(s)
 
@@ -287,17 +288,18 @@ def test_the_step_graph_samples_as_the_step_loop_and_repeats_under_a_seed(
     sm, _ = engine
     s1, s2 = Sampling(temperature=0.8, top_p=0.9, seed=1), Sampling(temperature=0.8, top_p=0.9, seed=2)
     ids = prompt_ids[0]
-    a, _ = sm.generate(ids, 40, eos=(), speculate=False, sampling=s1)
-    b, _ = sm.generate(ids, 40, eos=(), speculate=False, sampling=s1)
-    c, _ = sm.generate(ids, 40, eos=(), speculate=False, sampling=s2)
-    g, _ = sm.generate(ids, 40, eos=(), speculate=False)
+    a = sm.generate(ids, 40, eos=(), speculate=False, sampling=s1).tokens
+    b = sm.generate(ids, 40, eos=(), speculate=False, sampling=s1).tokens
+    c = sm.generate(ids, 40, eos=(), speculate=False, sampling=s2).tokens
+    g = sm.generate(ids, 40, eos=(), speculate=False).tokens
     assert a == b and a != c and a != g
     sm.card_pipeline = False
     try:
-        ref, _ = sm.generate(ids, 40, eos=(), speculate=False, sampling=s1)
+        ref = sm.generate(ids, 40, eos=(), speculate=False, sampling=s1).tokens
     finally:
         sm.card_pipeline = True
-    spec, census = sm.generate(ids, 40, eos=(), sampling=s1)
+    gen = sm.generate(ids, 40, eos=(), sampling=s1)
+    spec, census = gen.tokens, gen.stats
     assert spec == ref, f"diverged at token {next(i for i, (x, y) in enumerate(zip(ref, spec)) if x != y)}"
     assert census["seed"] == 1
 
@@ -306,8 +308,9 @@ def test_the_speculative_answer_is_the_greedy_answer(engine: EngineTok, prompt_i
 
     sm, _ = engine
     for ids in prompt_ids:
-        g, _ = sm.generate(ids, 128, eos=(), speculate=False)
-        o, census = sm.generate(ids, 128, eos=())
+        g = sm.generate(ids, 128, eos=(), speculate=False).tokens
+        gen = sm.generate(ids, 128, eos=())
+        o, census = gen.tokens, gen.stats
         assert o == g, f"diverged at token {next(i for i, (a, b) in enumerate(zip(g, o)) if a != b)} of {len(g)}"
         assert census["forwards"] < len(o)
 
@@ -321,7 +324,7 @@ def _stepped(sm: StreamedTextModel, prompt: Sequence[int], toks: Sequence[int]) 
     s = sm.session(list(prompt))
     lg = None
     for t in toks:
-        lg = s.feed([t])
+        lg = s.feed([t]).logits
     assert lg is not None
     return lg[-1].float().cpu()
 
@@ -339,27 +342,27 @@ def test_a_forks_rows_are_its_sessions_one_row_steps_bit_for_bit(
         assert br.mode == "card"
         br.step([1, 2, 3])
         br.reorder([2, 0, 2])
-        lg = br.step([4, 5, 6])
+        lg = br.step([4, 5, 6]).logits
         for r, toks in enumerate([[3, 4], [1, 5], [3, 6]]):
             assert torch.equal(lg[r], _stepped(sm, P, toks)), r
         br.reorder([0, 1, 2, 1, 0])  # five rows over three columns: every row's steps move to a wider stretch
-        lg = br.step([7, 8, 9, 10, 11])
+        lg = br.step([7, 8, 9, 10, 11]).logits
         for r, toks in enumerate([[3, 4, 7], [1, 5, 8], [3, 6, 9], [1, 5, 10], [3, 4, 11]]):
             assert torch.equal(lg[r], _stepped(sm, P, toks)), r
         br.leave(1)
-        lg = br.step([12, 13, 14, 15])
+        lg = br.step([12, 13, 14, 15]).logits
         for r, toks in enumerate([[3, 4, 7, 12], [3, 6, 9, 13], [1, 5, 10, 14], [3, 4, 11, 15]]):
             assert torch.equal(lg[r], _stepped(sm, P, toks)), r
         kept = br.keep(3)
     assert kept.tokens == P + [1, 5, 10, 14]
-    assert torch.equal(kept.feed([16])[-1].float().cpu(), _stepped(sm, P, [1, 5, 10, 14, 16]))
+    assert torch.equal(kept.feed([16]).logits[-1].float().cpu(), _stepped(sm, P, [1, 5, 10, 14, 16]))
 
 
 def test_a_forks_greedy_rows_are_the_sessions_greedy_decode(engine: EngineTok, prompt_ids: list[list[int]]) -> None:
     """every row of a greedy fork decodes the tokens the session's own greedy decode does (the step graph's)"""
     sm, _ = engine
     P = prompt_ids[1]
-    want = list(sm.generate(P, 24, eos=(), speculate=False)[0])
+    want = list(sm.generate(P, 24, eos=(), speculate=False).tokens)
     with sm.session(P).fork(4) as br:
         assert br.mode == "card"
         g = br.generate(24, eos=())
@@ -375,13 +378,14 @@ def test_a_batchs_rows_are_each_sessions_own_steps(engine: EngineTok, prompt_ids
     sessions = [sm.session(p) for p in ps]
     with sm.batch(sessions) as bt:
         assert bt.mode == "card"
-        lg = bt.step([1, 2, 3])
+        lg = bt.step([1, 2, 3]).logits
         for r in range(3):
             assert torch.equal(lg[r], _stepped(sm, ps[r], [r + 1])), r
-        lg, hid = bt.step([4, 5, 6], taps=(0, sm.L // 2, sm.L - 1))
+        step = bt.step([4, 5, 6], taps=(0, sm.L // 2, sm.L - 1))
+        lg, hid = step.logits, step.hidden
         for r in range(3):
             assert torch.equal(lg[r], _stepped(sm, ps[r], [r + 1, r + 4])), r
-            _, want = sm.session(ps[r] + [r + 1]).feed([r + 4], taps=(0, sm.L // 2, sm.L - 1))
+            want = sm.session(ps[r] + [r + 1]).feed([r + 4], taps=(0, sm.L // 2, sm.L - 1)).hidden
             for i in (0, sm.L // 2, sm.L - 1):
                 ref = want[i][-1].float()
                 # the session's tapped feed runs the torch modules (a tap stands the graph aside): a tolerance,
@@ -405,7 +409,7 @@ def test_the_rows_go_on_through_torch_when_a_layer_leaves_the_card(
         for i in range(sm.L):
             sm._cache_to(bt.cache, i, "cpu")
             sm._cache_to(bt.cache, i, sm.dev)
-        lg = bt.step([4, 5])
+        lg = bt.step([4, 5]).logits
         assert bt.mode == "fork"
         for r, (p, toks) in enumerate([(a, [1, 4]), (b, [2, 5])]):
             ref = _stepped(sm, p, toks)

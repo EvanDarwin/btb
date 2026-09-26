@@ -19,9 +19,6 @@ from .kinds import PassTag, api_tags
 C = TypeVar("C", bound=type)
 F = TypeVar("F", bound=Callable[..., Any])
 
-# owner -> the classes declared under it, for the lint that every declared tag names a method
-OWNERS: dict[str, list[type]] = {}
-
 # the calls a callback inside a decode may make: reads that neither step nor move anything the decode holds
 READS = frozenset(
     {
@@ -151,7 +148,7 @@ def api(owner: str) -> Callable[[C], C]:
             _declare(sub, owner, declared, inherited=True)
 
         cls.__init_subclass__ = classmethod(init_subclass)  # type: ignore[assignment]
-        OWNERS.setdefault(owner, []).append(cls)
+        cls.__btb_owner__ = owner  # type: ignore[attr-defined]  # the class's own, not its subclasses': a lint's
         return cls
 
     return declare
