@@ -57,6 +57,10 @@ window; past the model's own window btb applies YaRN automatically.
   fewer disk reads.
 - `--vram-experts-gb 0|auto|GB` (`BTB_VRAM_EXPERTS_GB`) seats bf16 experts on the card ahead of the store.
 - keep the trunk resident on the card and stream only the experts.
+- a long prompt prefills layer by layer: every chunk of it passes through a layer before the next, so each of
+  the layer's experts is read from the drive once for the whole prompt, and on the card is held there for all the
+  chunks (a 16k prompt on the 180B: a third of the reads, 528 s to 288 s). Same bits as the chunks one at a time;
+  `BTB_PREFILL_LAYERS=0` and `BTB_PREFILL_DEPOT=0` turn the two halves off.
 - `btb pack` writes a lossless [12-bit copy](./pack-12.md) at 0.75× the bytes, so more experts stay cached and
   cold reads are shorter, with identical output.
 - the residency policy, the disk readers, and the router lookahead are the [disk scheduler](./disk-scheduler.md)
@@ -145,6 +149,8 @@ ignored elsewhere.
 | `BTB_STORE_PIN` | 0 | store RAM pages: `0` pageable, `1` pinned, `auto` beside a card (the `store_pin` option) |
 | `BTB_STORE_PADDED` | 1 | native reader: read into the slot's padded region; `0` bounces through a buffer |
 | `BTB_ROUTE_DEPTH` | probe | drive readers in flight, over the load-time probe's choice |
+| `BTB_PREFILL_LAYERS` | 1 | a mixture's chunked prefill layer by layer (each expert read once a prompt); `0` takes the chunks through every layer in turn |
+| `BTB_PREFILL_DEPOT` | 1 | card: a layer's experts held on the card across the chunks of a layer-by-layer prefill; `0` uploads them each chunk |
 
 The store, the lookahead, the residency policy, and the readers are covered in full in
 [the disk scheduler](./disk-scheduler.md).

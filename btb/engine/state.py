@@ -122,6 +122,7 @@ class _State:
     prefetch: bool
     prefill_card: bool
     prefill_card_min: int
+    prefill_layers: bool
     resident: dict[int, Any]
     resident_fp32: bool
     resident_head: bool
@@ -145,6 +146,7 @@ class _State:
     _staging: dict[Any, Any]
     _streamed_any: bool
     _sweep_keep: bool
+    _depot: Any
     _thread_mod: ModuleType
     _toggle: dict[str, int]
 

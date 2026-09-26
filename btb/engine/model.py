@@ -168,6 +168,9 @@ class StreamedTextModel(
         # itself reads one rope (`_rope_fn`), whichever of them runs first
         self._frope = os.environ.get("BTB_FUSED_ROPE", "1") != "0"
         self._fmlp = os.environ.get("BTB_FUSED_MLP", "1") != "0"
+        # a mixture's chunked prefill layer by layer (each expert read once a prompt); 0 takes the chunks through
+        # every layer in turn, the path it replaced and its bits' reference
+        self.prefill_layers = os.environ.get("BTB_PREFILL_LAYERS", "1") != "0"
         # Gemma scales the input embedding by sqrt(hidden); the engine gathers rows itself, so it applies the
         # scale the module's scaled embedding would (the tied head's output projection stays unscaled)
         self.embed_scale = float(cfg.hidden_size) ** 0.5 if self.fam.embed_scale else None

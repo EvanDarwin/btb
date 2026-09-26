@@ -147,6 +147,22 @@ def compute_fp32(module: torch.nn.Module) -> None:
     object.__setattr__(module, "forward", forward)
 
 
+def group_picks(top_k_index: torch.Tensor, num_experts: int) -> tuple[torch.Tensor, torch.Tensor, list[int], list[int]]:
+    """A call's (pick, row) pairs grouped by expert in one sort on the picks' own device: (top_k_pos, token_idx)
+    of every pair sorted by expert, and each expert's offset and count into them. An expert's pairs come pick-major,
+    then row - the order `torch.where(one_hot(top_k_index).permute(2, 1, 0)[e])` lists them - so a product over its
+    slice is the per-expert lookup's, bit for bit. The counts are the one read back to the host."""
+    T = int(top_k_index.shape[0])
+    flat = top_k_index.t().reshape(-1)
+    order = torch.argsort(flat, stable=True)
+    counts = torch.bincount(flat, minlength=int(num_experts)).tolist()
+    offs, a = [], 0
+    for n in counts:
+        offs.append(a)
+        a += int(n)
+    return order // T, order % T, offs, [int(n) for n in counts]
+
+
 class _Experts(torch.nn.Module):
     sm: Any
     _mx_bias: Any
@@ -539,11 +555,23 @@ class _Experts(torch.nn.Module):
             self._one_row(x, w_top, top_k_index, hit, views, pending, store, final, hidden_states if on_host else None)
         else:
             contrib = {}
+            # a prefill sweeping this layer's chunks on the card: the layer's experts cross the bus once for them all
+            depot = getattr(self.sm, "_depot", None) if (not on_host and x.device.type == "cuda") else None
+            # rows on the card: every expert's rows found by one sort there, not a host lookup and a copy an expert,
+            # each of which waited for the card to finish what was queued before it
+            groups = group_picks(top_k_index, self.num_experts) if x.device.type != "cpu" else None
 
             def run(e: int, w_gu: Any, w_dn: Any) -> None:
-                top_k_pos, token_idx = torch.where(expert_mask[e])
-                if not on_host:
-                    top_k_pos, token_idx = top_k_pos.to(dev), token_idx.to(dev)
+                if groups is not None:
+                    pos_s, row_s, offs, counts = groups
+                    a, n = offs[e], counts[e]
+                    top_k_pos, token_idx = pos_s[a : a + n], row_s[a : a + n]
+                else:
+                    top_k_pos, token_idx = torch.where(expert_mask[e])
+                    if not on_host:
+                        top_k_pos, token_idx = top_k_pos.to(dev), token_idx.to(dev)
+                if depot is not None:
+                    w_gu, w_dn = depot.get(self.layer, e, w_gu, w_dn)
                 if isinstance(w_gu, torch.Tensor) and w_gu.device.type != "cpu" and x.device != w_gu.device:
                     # an expert seated on the card while the rows are on the host: its rows go to the card and
                     # are multiplied there in float32 over the stored bf16, as the one-row path does
@@ -564,6 +592,8 @@ class _Experts(torch.nn.Module):
             for batch in store.landed(pending) if pending else ():
                 for e, _f, s in batch:
                     run(e, *store._views(s))
+            if depot is not None:
+                depot.settle()
             for e in hit:
                 token_idx, h = contrib[e]
                 final.index_add_(0, token_idx, h.to(final.dtype))

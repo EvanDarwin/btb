@@ -330,6 +330,104 @@ class BusPass(Riders):
         yield from self.t2.items()
 
 
+class LayerDepot:
+    """A layer's experts held on the card while a prefill sweeps its chunks through it (`_prefill_by_layer`): each
+    expert crosses the bus once for the whole prompt, not once a chunk. An expert is seated the first time the
+    layer asks for it, its copy queued on a stream of its own so the next expert's bytes move under this one's
+    matmuls; the compute waits on that expert's copy alone. A new layer takes the slots over once the card is
+    done with the last one's. The weights are the store's bf16 bytes as they are, so a product over a seated
+    expert is the one the call's own upload (`w.to(card).to(x.dtype)`) gives. Slots are bounded by `cap` bytes;
+    past them an expert rides one of two scratch slots, on the same copy stream: uploaded again by every chunk
+    that asks, but under the matmuls rather than as a pageable copy that waits for the card to drain."""
+
+    SCRATCH = 2
+
+    def __init__(self, dev: torch.device, cap: int) -> None:
+        self.dev = dev
+        self.cap = int(cap)
+        self.copy = torch.cuda.Stream(device=dev)
+        self.layer = -1
+        self.seat: dict[int, int] = {}
+        self.gu: torch.Tensor | None = None
+        self.dn: torch.Tensor | None = None
+        self.n_seats = 0
+        # scratch j is free once the matmuls handed it are done: the event recorded at the next `get`, after
+        # the caller queued them
+        self.turn = 0
+        self.lent: int | None = None
+        self.free: list[torch.cuda.Event | None] = [None] * self.SCRATCH
+        self.stat = {"seated": 0, "reused": 0, "scratch": 0, "passed": 0, "bytes": 0}
+
+    def _open(self, gu: torch.Tensor, dn: torch.Tensor) -> bool:
+        per = gu.numel() * gu.element_size() + dn.numel() * dn.element_size()
+        n = self.cap // max(1, per)
+        if n <= self.SCRATCH:
+            return False
+        self.gu = torch.empty((n, *gu.shape), dtype=gu.dtype, device=self.dev)
+        self.dn = torch.empty((n, *dn.shape), dtype=dn.dtype, device=self.dev)
+        self.n_seats = n - self.SCRATCH
+        return True
+
+    def _upload(self, s: int, gu: torch.Tensor, dn: torch.Tensor, main: torch.cuda.Stream) -> None:
+        assert self.gu is not None and self.dn is not None
+        ready = torch.cuda.Event()
+        with torch.cuda.stream(self.copy):
+            self.gu[s].copy_(gu, non_blocking=True)
+            self.dn[s].copy_(dn, non_blocking=True)
+            ready.record(self.copy)
+        main.wait_event(ready)
+        self.stat["bytes"] += gu.numel() * gu.element_size() + dn.numel() * dn.element_size()
+
+    def get(self, layer: int, e: int, gu: Any, dn: Any) -> tuple[Any, Any]:
+        """expert `e` of `layer` on the card: its seat, seated now, or a scratch slot; the host tensors back where
+        the card's matmul does not take the stored form (a quantized expert, one already on the card)"""
+        if not (isinstance(gu, torch.Tensor) and isinstance(dn, torch.Tensor)) or gu.device.type != "cpu":
+            self.stat["passed"] += 1
+            return gu, dn
+        main = torch.cuda.current_stream(self.dev)
+        if self.lent is not None:
+            done = torch.cuda.Event()
+            done.record(main)
+            self.free[self.lent], self.lent = done, None
+        if layer != self.layer:
+            # the last layer's slots are the card's until its queued matmuls have read them
+            done = torch.cuda.Event()
+            done.record(main)
+            self.copy.wait_event(done)
+            self.layer, self.seat = layer, {}
+        s = self.seat.get(e)
+        if s is not None:
+            self.stat["reused"] += 1
+            assert self.gu is not None and self.dn is not None  # a seat exists only once the slots are open
+            return self.gu[s], self.dn[s]
+        if self.gu is None and not self._open(gu, dn):
+            self.stat["passed"] += 1
+            return gu, dn
+        assert self.gu is not None and self.dn is not None
+        if self.gu.shape[1:] != gu.shape or self.dn.shape[1:] != dn.shape:
+            self.stat["passed"] += 1
+            return gu, dn
+        if len(self.seat) < self.n_seats:
+            s = self.seat[e] = len(self.seat)
+            self._upload(s, gu, dn, main)
+            self.stat["seated"] += 1
+            return self.gu[s], self.dn[s]
+        j = self.turn
+        self.turn = (j + 1) % self.SCRATCH
+        ev = self.free[j]
+        if ev is not None:
+            self.copy.wait_event(ev)
+        s = self.n_seats + j
+        self._upload(s, gu, dn, main)
+        self.lent = j
+        self.stat["scratch"] += 1
+        return self.gu[s], self.dn[s]
+
+    def settle(self) -> None:
+        """every queued copy landed: the store may hand the host bytes behind them to another expert after this"""
+        self.copy.synchronize()
+
+
 class VramSeats:
     """The first-class seats: the regulars with the most rides copied onto the card, where an expert costs no
     host memory traffic and no read. A rider earns a seat with `min_rides` rides; the seats are given up by

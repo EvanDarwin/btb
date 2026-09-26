@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from .. import mlx as mlxdev
-from ..kinds import LayerKind, Parents, PassTag, TokenRows
+from ..kinds import LayerKind, LayerTier, Parents, PassTag, TokenRows
 from ..options import Device
 from ..sampling import as_pick
 from ..sysinfo import host_free_bytes, host_total_bytes
@@ -722,9 +722,16 @@ class _ForwardMixin(_State):
         C = int(self.prefill_chunk or self._auto_chunk(past))
         if T <= C:
             return self.forward(ids, cache=cache, on_layer=on_layer, last_only=last_only)
-        # a mixture of experts with the whole trunk resident prefills layer by layer, so a layer's experts
-        # are read once for the whole prompt instead of once per chunk
-        if self.fam.moe and not self.host and len(self.resident) == self.L and on_layer is None and last_only:
+        # a mixture of experts prefills layer by layer, so a layer's experts are read once for the whole prompt
+        # instead of once per chunk (the chunks of a 16k prompt read the 180B's experts 3.35 times over)
+        if (
+            self.fam.moe
+            and on_layer is None
+            and last_only
+            and self.mlx is None
+            and not self.cold
+            and self.prefill_layers
+        ):
             return self._prefill_by_layer(ids, cache, C)
         self.log(f"[prefill] {T} tokens in chunks of {C} from position {past}")
         # a layer hook sees the last layer's rows for the whole prompt once, joined at the end, as it would from
@@ -800,58 +807,170 @@ class _ForwardMixin(_State):
 
     @torch.inference_mode()
     def _prefill_by_layer(self, ids: torch.Tensor, cache: Any, C: int) -> Any:
+        """The prompt through one layer at a time, every chunk of it before the next layer, so a mixture's layer
+        reads its experts once for the whole prompt instead of once per chunk. Each chunk meets each layer as the
+        chunked prefill's pass would have it - the same cache rows before it, the same rope, mask, placement and
+        module, crossing the tier's edge the same way - so the rows come out as the chunked path's: a layer runs
+        on the card (resident, or the template a card pass streams in, taken once for all the chunks) or on the
+        host kernels, and a host layer's cache rides to the card and back around each chunk it runs there on."""
         B, T = ids.shape
-        past0 = cache.get_seq_length()
-        self.log(f"[prefill] {T} tokens layer by layer in chunks of {C} (each layer's experts read once)")
-        h_all = self.embed(ids)
-        if self.compute_dtype is not None:
-            h_all = h_all.to(self.compute_dtype)
-        if self.fam.streams > 1:
-            h_all = h_all.repeat(1, 1, self.fam.streams)
-        h_all = h_all.cpu().pin_memory() if self.dev.type == Device.CUDA else h_all
-        rope_all = self._positions(B, past0 + T, 0, None)[1]
-        eos = self.cfg.eos_token_id
-        eos = eos[0] if isinstance(eos, (list, tuple)) else eos
-        starts = list(range(0, T, C))
+        past0 = int(cache.get_seq_length())
+        own = bool(self.fam.own)
+        self.vram_policy(cache)
+        self.ram_policy()
+        self.lend_policy()
+        self.cache_room(cache, B, T)
+        self._tag_tiers(self.L)
+        self._tag_quant()
+        self._attn_ctx = cache
+        cd = self.compute_dtype
+        spans = [(a, min(T, a + C)) for a in range(0, T, C)]
+        # a chunk the chunked prefill would take on the card: every chunk past the first continues a batch there
+        on_card = bool(getattr(self, "prefill_card", False)) and bool(self.templates) and bool(self.host)
+        card = [on_card and getattr(self, "prefill_card_min", 64) <= b - a for a, b in spans]
+        if any(card):
+            self._tag(PassTag.PREFILL_CARD)
+        tier_owns_attention = (
+            getattr(self, "kv_host", False)
+            and not own
+            and self.fam.fast
+            and all(i in self.resident for i, lt in enumerate(self.layer_types) if lt == LayerKind.FULL)
+        )
+        self.log(f"[prefill] {T} tokens layer by layer in {len(spans)} chunks of {C} (each layer's experts read once)")
+
+        def frame(a: int, b: int) -> dict[str, Any]:
+            """a chunk's pass preamble, as `forward` builds it for these rows at this position"""
+            ids_c = ids[:, a:b]
+            h = self.embed(ids_c)
+            if cd is not None:
+                h = h.to(cd)
+            if self.fam.streams > 1:
+                h = h.repeat(1, 1, self.fam.streams)
+            past = past0 + a
+            text_pos, rope_pos = self._positions(B, b - a, past, None)
+            if own:
+                pe: Any = self.rotary(h, self._positions(B, past + (b - a), 0, None)[1])
+            elif self.fam.dual_rope:
+                pe = {lt: self.rotary(h, text_pos, lt) for lt in set(self.layer_types)}
+            else:
+                pe = self.rotary(h, rope_pos if self.fam.mrope else text_pos)
+            return {"h": h, "past": past, "text_pos": text_pos, "pe": pe, "ple": ids_c if own else None}
+
+        frames = [frame(a, b) for a, b in spans]
+        hs = [f.pop("h") for f in frames]
+        # the rows between layers stay on the card while they take no more than a quarter of its room; past that
+        # they wait in pinned RAM, in the dtype they came out in (a copy, never a cast)
+        row_b = (
+            int(self.cfg.hidden_size) * int(self.fam.streams) * (4 if (cd is not None and cd != torch.bfloat16) else 2)
+        )
+        park = self.dev.type == Device.CUDA and T * row_b > self.prefill_room() // 4
+        parked: list[torch.Tensor | None] = [None] * len(spans)
+
+        def keep(c: int, h: torch.Tensor) -> torch.Tensor:
+            if not park or h.device.type == "cpu":
+                return h
+            buf = parked[c]
+            if buf is None or buf.shape != h.shape or buf.dtype != h.dtype:
+                buf = parked[c] = torch.empty(h.shape, dtype=h.dtype, pin_memory=True)
+            buf.copy_(h)
+            return buf
+
+        def chunk_pass(c: int, i: int, lt: str, on_card_now: bool, h: torch.Tensor) -> _Pass:
+            f, (a, b) = frames[c], spans[c]
+            causal = None
+            if lt != LayerKind.LINEAR and not tier_owns_attention:
+                # this layer's own cache length is the chunk's position now: the mask the chunked pass built
+                causal = self._causal(h, None, cache, f["text_pos"], True, layer_idx=i)
+            return _Pass(
+                cache=cache,
+                pe=f["pe"],
+                text_pos=f["text_pos"],
+                causal=causal,
+                linear_mask=None,
+                ple_ids=f["ple"],
+                T=b - a,
+                past=f["past"],
+                am=None,
+                batched=True,
+                own=own,
+                card_pass=on_card_now,
+                n_layers=self.L,
+                on_layer=None,
+            )
+
         t0 = time.time()
+        by_kind: dict[str, list[Any]] = {}
         self._sweep_keep = True
+        if self.dev.type == Device.CUDA and os.environ.get("BTB_PREFILL_DEPOT", "1") != "0":
+            from .experts import LayerDepot
+
+            # half the card's free memory at the start holds a layer's experts for its sweep (a 180B layer's ~485
+            # asked: 4.6 GB); the rest stays the chunks' working room, which the chunk size was priced against
+            self._depot = LayerDepot(self.dev, int(self.device.free(self.dev, unreserved=True) or 0) // 2)
         try:
-            for i in range(self.L):
-                tmpl = self.resident[i]
-                lt = self.layer_types[i]
-                if lt in self.shadow and not self.resident_fp32:
-                    tmpl = self._upcast(lt, tmpl, i)
-                for a in starts:
-                    b = min(T, a + C)
-                    h = h_all[:, a:b].to(self.dev, non_blocking=True)
-                    past = past0 + a
-                    text_pos = torch.arange(past, past + (b - a), device=self.dev).view(1, -1).expand(B, -1)
-                    # the own-layer family's rotary takes every position up to here, the others this chunk's; a
-                    # dual-rope family reads the rope for this layer's type
-                    if self.fam.dual_rope:
-                        pe = self.rotary(h, text_pos, lt)
-                    else:
-                        pe = self.rotary(h, rope_all[:, :, : past + (b - a)] if self.fam.own else text_pos)
-                    causal = None
-                    if lt != LayerKind.LINEAR:
-                        causal = self._causal(h, None, cache, text_pos, True, layer_idx=i)
-                    h = tmpl(
-                        h,
-                        position_embeddings=pe,
-                        past_key_values=cache,
-                        use_cache=True,
-                        **self._layer_kw(lt, causal, None, text_pos, ids[:, a:b]),
-                    )
-                    h_all[:, a:b].copy_(h, non_blocking=True)
-                self._sync()
-                if (i + 1) % 8 == 0 or i + 1 == self.L:
-                    self.log(f"[prefill] layer {i + 1}/{self.L} done, {time.time() - t0:.0f}s")
+            with self.device.hold() as place:
+                proto = _Pass(card_pass=any(card), n_layers=self.L, place=None)
+                if self.prefetch:
+                    self._prefetch_next(0, proto)
+                for i in range(self.L):
+                    lt = self.layer_types[i]
+                    tl, es = time.perf_counter(), float(self.expert_stat.get("s", 0.0))
+                    host = place.tier(i) in (LayerTier.HOST, LayerTier.COLD)
+                    tmpl = self._card_layer(i, proto) if (not host or any(card)) else None
+                    for c in range(len(spans)):
+                        h = hs[c]
+                        if host and not card[c]:
+                            if h.device.type != "cpu" or h.dtype != torch.float32:
+                                h = h.detach().float().cpu()
+                            pas = chunk_pass(c, i, lt, False, h)
+                            pas.place = place
+                            hs[c] = keep(c, self._run_host_layer(i, h, pas))
+                            continue
+                        assert tmpl is not None  # a card chunk of a host layer took the template above
+                        wd = self._layer_dtype(tmpl)
+                        if h.device != self.dev or (wd is not None and h.dtype != wd):
+                            h = h.to(self.dev, wd) if wd is not None else h.to(self.dev)
+                        if host and frames[c]["past"] > 0:
+                            self._cache_to(cache, i, self.dev)
+                        pas = chunk_pass(c, i, lt, True, h)
+                        pas.place = place
+                        h = self._run_card_layer(i, tmpl, h, pas)
+                        if host:
+                            self._cache_to(cache, i, "cpu")
+                        hs[c] = keep(c, h)
+                    # the layer's time, its experts' share apart: where a sweep's time goes, by layer kind
+                    self._sync()
+                    kind = by_kind.setdefault(lt, [0, 0.0, 0.0])
+                    kind[0] += 1
+                    kind[1] += time.perf_counter() - tl
+                    kind[2] += float(self.expert_stat.get("s", 0.0)) - es
+                    if (i + 1) % 8 == 0 or i + 1 == self.L:
+                        self.log(f"[prefill] layer {i + 1}/{self.L} done, {time.time() - t0:.0f}s")
         finally:
             self._sweep_keep = False
-        h = h_all[:, -1:].to(self.dev)
+            depot, self._depot = getattr(self, "_depot", None), None
+            if depot is not None:
+                depot.settle()
+                st = depot.stat
+                if st["seated"]:
+                    self.log(
+                        f"[prefill] depot: {st['seated']} experts seated ({st['bytes'] / 2**30:.1f} GB over the bus), "
+                        f"{st['reused']} reused by a later chunk, {st['scratch']} through scratch, "
+                        f"{st['passed']} not seated"
+                    )
+            if by_kind:
+                self.log(
+                    "[prefill] time by layer kind: "
+                    + "; ".join(
+                        f"{lt} {n} layers {wall:.1f} s (experts {ex:.1f} s)" for lt, (n, wall, ex) in by_kind.items()
+                    )
+                )
+        self._flush_events()
+        h = hs[-1][:, -1:]
+        if h.device != self.dev:
+            h = h.to(self.dev)
         h = self._final_norm(h)
-        cd = self.compute_dtype if self.compute_dtype is not None else h.dtype
-        return self._apply_head(h.to(cd))
+        return self._apply_head(h.to(cd if cd is not None else h.dtype))
 
     def _attn_card_blocks(
         self,
