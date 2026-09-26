@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import threading
@@ -338,9 +339,16 @@ class LayerDepot:
     done with the last one's. The weights are the store's bf16 bytes as they are, so a product over a seated
     expert is the one the call's own upload (`w.to(card).to(x.dtype)`) gives. Slots are bounded by `cap` bytes;
     past them an expert rides one of two scratch slots, on the same copy stream: uploaded again by every chunk
-    that asks, but under the matmuls rather than as a pageable copy that waits for the card to drain."""
+    that asks, but under the matmuls rather than as a pageable copy that waits for the card to drain.
+
+    The store's pages are pageable (and on Windows a pinned store is refused), so a copy from them holds the host
+    until it lands, at the driver's pageable rate. Each upload goes through a small ring of pinned buffers instead:
+    the host copies the expert into one (a memcpy torch spreads over the cores), and the bus takes it from there at
+    the pinned rate while the host moves on; a buffer is filled again once its last copy out has landed.
+    `BTB_PREFILL_STAGE=0`, or a machine that will not pin the ring, uploads from the store's pages."""
 
     SCRATCH = 2
+    STAGE = 4
 
     def __init__(self, dev: torch.device, cap: int) -> None:
         self.dev = dev
@@ -356,7 +364,11 @@ class LayerDepot:
         self.turn = 0
         self.lent: int | None = None
         self.free: list[torch.cuda.Event | None] = [None] * self.SCRATCH
-        self.stat = {"seated": 0, "reused": 0, "scratch": 0, "passed": 0, "bytes": 0}
+        self.stat: dict[str, float] = {"seated": 0, "reused": 0, "scratch": 0, "passed": 0, "bytes": 0, "upload_s": 0.0}
+        self.stage: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+        self.stage_done: list[torch.cuda.Event | None] = [None] * self.STAGE
+        self.stage_turn = 0
+        self.staged = os.environ.get("BTB_PREFILL_STAGE", "1") != "0"
 
     def _open(self, gu: torch.Tensor, dn: torch.Tensor) -> bool:
         per = gu.numel() * gu.element_size() + dn.numel() * dn.element_size()
@@ -366,17 +378,41 @@ class LayerDepot:
         self.gu = torch.empty((n, *gu.shape), dtype=gu.dtype, device=self.dev)
         self.dn = torch.empty((n, *dn.shape), dtype=dn.dtype, device=self.dev)
         self.n_seats = n - self.SCRATCH
+        if self.staged:
+            try:
+                self.stage = [
+                    (torch.empty_like(gu).pin_memory(), torch.empty_like(dn).pin_memory()) for _ in range(self.STAGE)
+                ]
+            except RuntimeError:  # the machine would not pin even these: the store's pages it is
+                self.stage = None
         return True
 
     def _upload(self, s: int, gu: torch.Tensor, dn: torch.Tensor, main: torch.cuda.Stream) -> None:
         assert self.gu is not None and self.dn is not None
+        t0 = time.perf_counter()
         ready = torch.cuda.Event()
+        src_gu, src_dn = gu, dn
+        j = -1
+        if self.stage is not None:
+            # into the next pinned buffer once its last copy out has landed, then from there over the bus
+            j = self.stage_turn
+            self.stage_turn = (j + 1) % self.STAGE
+            done = self.stage_done[j]
+            if done is not None:
+                done.synchronize()
+            src_gu, src_dn = self.stage[j]
+            src_gu.copy_(gu)
+            src_dn.copy_(dn)
         with torch.cuda.stream(self.copy):
-            self.gu[s].copy_(gu, non_blocking=True)
-            self.dn[s].copy_(dn, non_blocking=True)
+            self.gu[s].copy_(src_gu, non_blocking=True)
+            self.dn[s].copy_(src_dn, non_blocking=True)
             ready.record(self.copy)
+        if j >= 0:
+            self.stage_done[j] = ready
         main.wait_event(ready)
         self.stat["bytes"] += gu.numel() * gu.element_size() + dn.numel() * dn.element_size()
+        # the host's share of the upload: the pageable copy until it lands, or the copy into a pinned buffer
+        self.stat["upload_s"] += time.perf_counter() - t0
 
     def get(self, layer: int, e: int, gu: Any, dn: Any) -> tuple[Any, Any]:
         """expert `e` of `layer` on the card: its seat, seated now, or a scratch slot; the host tensors back where
@@ -599,6 +635,8 @@ class _ExpertStore:
         # promoted into the store) or the ring wraps (the slot is reused); never the store's own slots
         self.ring_n = 64
         self.ring: list[int] = []
+        # the layer a layer-by-layer prefill last read ahead from: one lookahead a layer, at its first chunk
+        self.sweep_layer = -1
         self.ahead: dict[tuple[int, int], dict[str, Any]] = {}
         self._routers: dict[int, Any] = {}
         # the slot's layout: `stride` bytes a slot, each part's region starting at `part_at[p]`. Padded (the
@@ -1116,11 +1154,11 @@ class _ExpertStore:
         self._routers[layer] = (mod, w)
         return w
 
-    def _ring_slot(self, sched: Any) -> Any:
-        """a slot for a new prediction: the ring grows to `ring_n` slots out of the store's free ones (a grown
-        block, or the oldest resident's slot), then reuses its oldest entry - unless that one is still in flight,
-        in which case the ring is full and the prediction is not made"""
-        if len(self.ring) < self.ring_n:
+    def _ring_slot(self, sched: Any, cap: int | None = None) -> Any:
+        """a slot for a new prediction: the ring grows to `ring_n` slots (a sweep's `cap`) out of the store's free
+        ones (a grown block, or the oldest resident's slot), then reuses its oldest entry - unless that one is still
+        in flight, in which case the ring is full and the prediction is not made"""
+        if len(self.ring) < (self.ring_n if cap is None else cap):
             if not self.free and self.live() < self.n_slots:
                 self._grow(1)
             if self.free:
@@ -1147,29 +1185,40 @@ class _ExpertStore:
         self.ring.append(s)
         return s
 
-    def lookahead(self, layer: int, h: torch.Tensor) -> int:
+    def lookahead(self, layer: int, h: torch.Tensor, sweep: int = 0) -> int:
         """Run the routers of the layers after `layer` on its MoE input `h` [T, hidden] and queue the reads of
         their top picks that are neither resident nor already predicted, the next layer's first: `sm.lookahead`
         gives the picks per depth ((10, 6): the next layer's top-10, the one after's top-6; measured on the
         180B, the next layer's top-10 holds 57% of its misses, top-20 78%). Over several rows (a verify
         pass) the picks are the union of each row's top-k, at most 2k of them by their best logit across the
-        rows. Returns the reads queued."""
+        rows. Returns the reads queued.
+
+        `sweep` (a layer-by-layer prefill, at a layer's first chunk; the experts that chunk asked): the next layer
+        only, every expert some row's routing picks - a prefill layer asks for most of them - read into a ring as
+        large as the store's room past this layer's own experts, while this layer's chunks compute. The decode's
+        verdicts (a saturated drive, a slow one) do not hold it back: its reads queue behind every demand read
+        and issue in the gaps between them; a drive that allows no prediction in flight still gets none."""
         # one row: few picks - measured on the 180B, a prediction past the third pick is right one time in four
         # and costs a read the layer waiting now then queues behind; a pass of several rows (a prefill, a tree):
         # more, the union of the rows' picks is right nine times in ten there
         rows = int(h.shape[0]) if h.dim() > 1 else 1
         ks = getattr(self.sm, "lookahead", ()) if rows == 1 else getattr(self.sm, "lookahead_rows", (10, 6))
+        if sweep:
+            ks = (int(getattr(self.sm.cfg, "num_experts_per_tok", 10) or 10),)
         sched = getattr(self.sm, "scheduler", None)
         if not ks or sched is None or not hasattr(sched, "disk_read") or self.per is None:
             return 0
-        if self.saturated or (self.drive is not None and int(self.drive.get("ahead", 1)) == 0):
-            # a drive with no idle time (its misses outlast the compute, or one read outlasts the window the
-            # rule allows): a prediction is a read taken from the layer waiting now, right or wrong
+        if self.drive is not None and int(self.drive.get("ahead", 1)) == 0:
+            # one read outlasts the window the rule allows: a prediction is a read taken from the layer waiting now
+            return 0
+        if not sweep and self.saturated:
+            # a drive with no idle time (its misses outlast the compute): the same, right or wrong
             return 0
         slow = getattr(sched, "disk_slow", None)
-        if slow is not None and slow():
+        if not sweep and slow is not None and slow():
             # the drive is delivering under half the probe's rate right now: the same arithmetic, live
             return 0
+        cap = max(self.ring_n, int(self.n_slots) - int(sweep) - 64) if sweep else None
         n = 0
         prof = getattr(self.sm, "expert_profile", None)
         for d, k in enumerate(ks, start=1):
@@ -1198,13 +1247,17 @@ class _ExpertStore:
                 else:
                     best = logits.max(dim=0).values
                     cand = torch.unique(torch.topk(logits, kk, dim=-1).indices)
-                    keep = torch.topk(best[cand], min(2 * kk, cand.shape[0])).indices
-                    picks = cand[keep].tolist()
+                    if cap is not None:
+                        # every expert some row picks, the strongest first, as many as the ring can take
+                        picks = cand[torch.argsort(best[cand], descending=True)].tolist()[:cap]
+                    else:
+                        keep = torch.topk(best[cand], min(2 * kk, cand.shape[0])).indices
+                        picks = cand[keep].tolist()
             for e in picks:
                 key = (target, int(e))
                 if key in self.res or key in self.ahead or (self.vram is not None and key in self.vram):
                     continue
-                s = self._ring_slot(sched)
+                s = self._ring_slot(sched, cap)
                 if s is None:
                     return n
                 parts_f = self._submit(sched, parts, int(e), s, target, sched.DISK_AHEAD + d - 1)
@@ -1214,6 +1267,23 @@ class _ExpertStore:
                 if prof is not None:
                     prof.add(prof.AHEAD, target, int(e), self.per, slot=s, aux=d)
         return n
+
+    def sweep_end(self) -> None:
+        """a layer-by-layer prefill done: the ring back to `ring_n` slots, the rest the store's again - a
+        prediction still reading is withdrawn or let land (its slot is being written), then forgotten"""
+        self.sweep_layer = -1
+        sched = getattr(self.sm, "scheduler", None)
+        while len(self.ring) > self.ring_n:
+            s = self.ring.pop()
+            old = next((k for k, a in self.ahead.items() if a["slot"] == s), None)
+            if old is not None:
+                parts = self.ahead.pop(old)["parts"]
+                if sched is not None and hasattr(sched, "disk_drop"):
+                    sched.disk_drop(old)
+                with contextlib.suppress(Exception):  # a withdrawn read's future is cancelled: nothing lands
+                    parts.result()
+                self.stat["ahead_dropped"] += 1
+            self.free.append(s)
 
     def _lapsed(self, layer: int, asked: Any, sched: Any) -> None:
         """the predictions for `layer` it did not ask for: reads not yet issued are withdrawn and their slots put

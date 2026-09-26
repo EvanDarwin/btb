@@ -6,6 +6,7 @@ card pass whose short last chunk stays on the host."""
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from typing import Any
 
@@ -102,7 +103,7 @@ def test_the_depot_holds_a_layers_experts_on_the_card(monkeypatch: pytest.Monkey
     got_log = _same({**kw, "prefill_card_min": 1, "prefetch": True}, chunk=3)
     line = next((ln for ln in got_log if "depot:" in ln), None)
     assert line is not None, got_log
-    seated, reused = (int(ln.split()[0]) for ln in (line.split("depot: ")[1], line.split("GB over the bus), ")[1]))
+    seated, reused = (int(re.search(rf"(\d+) {what}", line).group(1)) for what in ("experts seated", "reused"))  # type: ignore[union-attr]
     assert seated > 0 and reused > 0, line
 
 
@@ -128,7 +129,7 @@ def test_experts_past_the_depot_ride_the_scratch_slots(monkeypatch: pytest.Monke
     got_log = _same({**kw, "prefill_card_min": 1, "prefetch": True}, chunk=3)
     line = next((ln for ln in got_log if "depot:" in ln), None)
     assert line is not None, got_log
-    scratch = int(line.split("reused by a later chunk, ")[1].split()[0])
+    scratch = int(re.search(r"(\d+) through scratch", line).group(1))  # type: ignore[union-attr]
     assert scratch > 0, line
 
 

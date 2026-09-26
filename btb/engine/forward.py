@@ -901,6 +901,10 @@ class _ForwardMixin(_State):
         t0 = time.time()
         by_kind: dict[str, list[Any]] = {}
         self._sweep_keep = True
+        # the next layer's experts read ahead while a layer's chunks compute (`_ExpertStore.lookahead`, `sweep`)
+        self._sweep_ahead = os.environ.get("BTB_PREFILL_AHEAD", "1") != "0"
+        store = getattr(self, "expert_store", None)
+        s0 = dict(store.stat) if store is not None else {}
         if self.dev.type == Device.CUDA and os.environ.get("BTB_PREFILL_DEPOT", "1") != "0":
             from .experts import LayerDepot
 
@@ -948,15 +952,25 @@ class _ForwardMixin(_State):
                         self.log(f"[prefill] layer {i + 1}/{self.L} done, {time.time() - t0:.0f}s")
         finally:
             self._sweep_keep = False
+            self._sweep_ahead = False
+            store = getattr(self, "expert_store", None) or store
+            if store is not None:
+                store.sweep_end()
+                d = {k: store.stat.get(k, 0) - s0.get(k, 0) for k in ("miss", "wait_s", "s", "ahead", "ahead_used")}
+                self.log(
+                    f"[prefill] store: {int(d['miss'])} read, {d['wait_s']:.1f} s waited on the drive, "
+                    f"{d['s']:.1f} s in its own bookkeeping; {int(d['ahead'])} read ahead, "
+                    f"{int(d['ahead_used'])} of them used"
+                )
             depot, self._depot = getattr(self, "_depot", None), None
             if depot is not None:
                 depot.settle()
                 st = depot.stat
                 if st["seated"]:
                     self.log(
-                        f"[prefill] depot: {st['seated']} experts seated ({st['bytes'] / 2**30:.1f} GB over the bus), "
-                        f"{st['reused']} reused by a later chunk, {st['scratch']} through scratch, "
-                        f"{st['passed']} not seated"
+                        f"[prefill] depot: {st['seated']} experts seated ({st['bytes'] / 2**30:.1f} GB over the bus, "
+                        f"{st['upload_s']:.1f} s of it holding the host), {st['reused']} reused by a later chunk, "
+                        f"{st['scratch']} through scratch, {st['passed']} not seated"
                     )
             if by_kind:
                 self.log(

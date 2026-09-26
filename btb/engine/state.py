@@ -148,6 +148,7 @@ class _State:
     _streamed_any: bool
     _sweep_keep: bool
     _depot: Any
+    _sweep_ahead: bool
     _thread_mod: ModuleType
     _toggle: dict[str, int]
 

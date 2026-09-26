@@ -521,6 +521,11 @@ class _Experts(torch.nn.Module):
                 # read ahead while this layer runs
                 store.lookahead(self.layer, hidden_states)
             views, pending = store.get(self.layer, self.base, hit, keep=keep, rows=int(hidden_states.shape[0]))
+            if getattr(self.sm, "_sweep_ahead", False) and store.sweep_layer != self.layer:
+                # a layer-by-layer prefill at this layer's first chunk: its reads are queued, and the next layer's
+                # experts are read ahead behind them while this layer's chunks compute
+                store.sweep_layer = self.layer
+                store.lookahead(self.layer, hidden_states, sweep=len(hit))
             per_expert = store.per
             w0 = store.stat["wait_s"]
         else:
