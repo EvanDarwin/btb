@@ -15,6 +15,7 @@ from .. import mlx as mlxdev
 from ..fp8 import F8Weight
 from ..kinds import PassTag
 from ..mxfp4 import BLOCK, MxGateUp, MxWeight
+from ..mxfp4_torch import dequant_blocks
 from ..options import Device
 from .native import Native
 from .pack import unpack_bf16
@@ -148,6 +149,26 @@ def compute_fp32(module: torch.nn.Module) -> None:
     object.__setattr__(module, "forward", forward)
 
 
+def stored_parts(gu: Any, dn: Any) -> tuple[torch.Tensor, ...] | None:
+    """an expert's bytes as the store holds them, for the card: bf16 (gate_up, down), or MXFP4 in the checkpoint's
+    layout (gate_up's blocks and scales, down's blocks and scales); None for a form the card path does not take
+    (ggml's MXFP4, FP8) or an expert already on the card"""
+    if isinstance(gu, torch.Tensor) and isinstance(dn, torch.Tensor):
+        parts: tuple[torch.Tensor, ...] = (gu, dn)
+    elif (
+        isinstance(gu, MxWeight)
+        and isinstance(dn, MxWeight)
+        and not gu.ggml
+        and not dn.ggml
+        and gu.scales is not None
+        and dn.scales is not None
+    ):
+        parts = (gu.blocks, gu.scales, dn.blocks, dn.scales)
+    else:
+        return None
+    return parts if all(p.device.type == "cpu" for p in parts) else None
+
+
 def group_picks(top_k_index: torch.Tensor, num_experts: int) -> tuple[torch.Tensor, torch.Tensor, list[int], list[int]]:
     """A call's (pick, row) pairs grouped by expert in one sort on the picks' own device: (top_k_pos, token_idx)
     of every pair sorted by expert, and each expert's offset and count into them. An expert's pairs come pick-major,
@@ -165,6 +186,8 @@ def group_picks(top_k_index: torch.Tensor, num_experts: int) -> tuple[torch.Tens
 
 
 class _Experts(torch.nn.Module):
+    # MXFP4 experts widened on the card at a time in a grouped call: gpt-oss-120b's are 50 MB a piece widened
+    MX_BATCH = 16
     sm: Any
     _mx_bias: Any
     act_fn: Any
@@ -486,12 +509,12 @@ class _Experts(torch.nn.Module):
         return getattr(self.sm, "_depot", None) if (not on_host and x.device.type == "cuda") else None
 
     def _grouped_ok(self, x: torch.Tensor) -> bool:
-        """whether a call's experts can go as grouped matmuls over the depot's slots: plain bf16 experts (no stored
-        form of their own, no biases, the family's own gate) over bf16 rows, where the torch build has the grouped
-        matmul (`BTB_GROUPED_EXPERTS=0` keeps the per-expert loop, the bits' reference)"""
+        """whether a call's experts can go as grouped matmuls on the card: bf16 experts, or MXFP4 ones in the
+        checkpoint's layout (gpt-oss's, their biases and gate with them), over bf16 rows, where the torch build has
+        the grouped matmul (`BTB_GROUPED_EXPERTS=0` keeps the per-expert loop)"""
         return (
             x.dtype == torch.bfloat16
-            and not (self.mx or self.f8 or self.biased or self.gate is not None)
+            and not (self.f8 or self.ggml)
             and bool(getattr(self.sm, "grouped_experts", False))
             and hasattr(torch, "_grouped_mm")
         )
@@ -515,7 +538,13 @@ class _Experts(torch.nn.Module):
         `torch.where` lists them, and the grouped matmul's product over them is the per-expert one bit for bit on
         the card, so each (row, pick) contribution is the loop's. They are summed as the loop sums them: each row's
         in ascending expert order, from zero, one add at a time (a row's picks are distinct, so its k
-        contributions fill `k` places, ranked by expert)."""
+        contributions fill `k` places, ranked by expert).
+
+        MXFP4 experts (gpt-oss's) cross the bus as stored and are widened to bf16 on the card `MX_BATCH` at a time
+        (`dequant_blocks`, exact: every value times its power-of-two scale is a bf16), their biases added and their
+        gate taken per row. The per-expert loop multiplies them on the host's kernel in float32 and hands the card
+        the bf16 of it, so the steps are the loop's, dtype for dtype; only the order of the float32 sums inside a
+        product differs, and with it now and then a bf16's last bit."""
         T, k = int(top_k_index.shape[0]), int(top_k_index.shape[1])
         pos_s, row_s, offs, counts = group_picks(top_k_index, self.num_experts)
         ranks = torch.argsort(torch.argsort(top_k_index, dim=1), dim=1)
@@ -527,20 +556,47 @@ class _Experts(torch.nn.Module):
                 placed = sorted((sl, e) for (e, _gu, _dn), sl in zip(items, slots, strict=True) if sl is not None)
                 if not placed:
                     raise RuntimeError(f"[experts] layer {self.layer}: no expert of the wave has a place on the card")
-                per_slot = [0] * int(depot.gu.shape[0])
-                rows_l, poss_l = [], []
-                for sl, e in placed:
-                    a, n = offs[e], counts[e]
-                    per_slot[sl] = n
-                    rows_l.append(row_s[a : a + n])
-                    poss_l.append(pos_s[a : a + n])
-                rows, poss = torch.cat(rows_l), torch.cat(poss_l)
-                ends = torch.tensor(list(accumulate(per_slot)), dtype=torch.int32).to(x.device, non_blocking=True)
-                h = torch._grouped_mm(x.index_select(0, rows), depot.gu.transpose(1, 2), offs=ends)
-                h = self._act(h, None)
-                y = torch._grouped_mm(h, depot.dn.transpose(1, 2), offs=ends)
-                buf[rows, ranks[rows, poss]] = (y * w_top[rows, poss, None]).to(buf.dtype)
+                if self.mx:
+                    for a in range(0, len(placed), self.MX_BATCH):
+                        multiply(placed[a : a + self.MX_BATCH])
+                else:
+                    multiply(placed)
                 items = [it for it, sl in zip(items, slots, strict=True) if sl is None]
+
+        def multiply(placed: list[tuple[int, int]]) -> None:
+            """the grouped products of `placed` (slot, expert), in slot order, into their rows' places"""
+            stacks = depot.stacks
+            if self.mx:
+                # the batch's bytes gathered and widened: one group an expert, in the batch's order
+                idx = torch.tensor([sl for sl, _e in placed], device=x.device)
+                gu_w, dn_w = (
+                    dequant_blocks(
+                        stacks[2 * i].index_select(0, idx).view(len(placed), rows, cols // 32, 16),
+                        stacks[2 * i + 1].index_select(0, idx).view(len(placed), rows, cols // 32),
+                    ).reshape(len(placed), rows, cols)
+                    for i, (rows, cols) in enumerate(store.mx_shapes())
+                )
+                per = [counts[e] for _sl, e in placed]
+            else:
+                gu_w, dn_w = stacks[0], stacks[1]
+                per = [0] * int(gu_w.shape[0])
+                for sl, e in placed:
+                    per[sl] = counts[e]
+            rows_l, poss_l = [], []
+            for _sl, e in placed:
+                a, n = offs[e], counts[e]
+                rows_l.append(row_s[a : a + n])
+                poss_l.append(pos_s[a : a + n])
+            rows, poss = torch.cat(rows_l), torch.cat(poss_l)
+            ends = torch.tensor(list(accumulate(per)), dtype=torch.int32).to(x.device, non_blocking=True)
+            # each row's expert: the biases' rows, and what `_act` reads them by
+            who = top_k_index[rows, poss]
+            h = torch._grouped_mm(x.index_select(0, rows), gu_w.transpose(1, 2), offs=ends)
+            h = self._act(h, who)
+            y = torch._grouped_mm(h, dn_w.transpose(1, 2), offs=ends)
+            if self.biased:
+                y = y + self._bias(self.down_proj_bias, who, y)
+            buf[rows, ranks[rows, poss]] = (y * w_top[rows, poss, None]).to(buf.dtype)
 
         wave([(e, *views[e]) for e in hit if e in views])
         for batch in store.landed(pending) if pending else ():
@@ -630,7 +686,7 @@ class _Experts(torch.nn.Module):
         elif (
             (depot := self._depot_for(x, on_host)) is not None
             and self._grouped_ok(x)
-            and all(isinstance(v[0], torch.Tensor) and v[0].device.type == "cpu" for v in views.values())
+            and all(stored_parts(*v) is not None for v in views.values())
         ):
             self._card_grouped(x, w_top, top_k_index, hit, views, pending, store, depot, final)
         else:

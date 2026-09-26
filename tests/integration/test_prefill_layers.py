@@ -35,7 +35,7 @@ def _prefill(layers: bool, ids: list[int], **kw: Any) -> tuple[torch.Tensor, dic
     """the prompt's last-row logits and its cache's tensors, prefilled with `prefill_layers` as given"""
     log: list[str] = []
     sm = StreamedTextModel(
-        fixture("tiny_q4"),
+        fixture(kw.pop("fx", "tiny_q4")),
         resident_head=True,
         log=lambda *a, **k: log.append(" ".join(str(x) for x in a)),
         compute_dtype=kw.pop("compute_dtype", torch.float32),
@@ -116,10 +116,9 @@ def test_experts_past_the_depot_ride_the_scratch_slots(monkeypatch: pytest.Monke
     from btb.engine.experts import LayerDepot
     from btb.engine.native import Native
 
-    def one_seat(self: LayerDepot, gu: torch.Tensor, dn: torch.Tensor) -> bool:
+    def one_seat(self: LayerDepot, parts: tuple[torch.Tensor, ...]) -> bool:
         n = self.SCRATCH + 1
-        self.gu = torch.empty((n, *gu.shape), dtype=gu.dtype, device=self.dev)
-        self.dn = torch.empty((n, *dn.shape), dtype=dn.dtype, device=self.dev)
+        self.stacks = [torch.empty((n, *p.shape), dtype=p.dtype, device=self.dev) for p in parts]
         self.n_seats = 1
         return True
 
@@ -197,10 +196,9 @@ def test_grouped_waves_through_a_small_scratch_are_the_loops_bits(monkeypatch: p
     from btb.engine.experts import LayerDepot
     from btb.engine.native import Native
 
-    def one_seat(self: LayerDepot, gu: torch.Tensor, dn: torch.Tensor) -> bool:
+    def one_seat(self: LayerDepot, parts: tuple[torch.Tensor, ...]) -> bool:
         n = self.SCRATCH + 1
-        self.gu = torch.empty((n, *gu.shape), dtype=gu.dtype, device=self.dev)
-        self.dn = torch.empty((n, *dn.shape), dtype=dn.dtype, device=self.dev)
+        self.stacks = [torch.empty((n, *p.shape), dtype=p.dtype, device=self.dev) for p in parts]
         self.n_seats = 1
         return True
 
@@ -317,3 +315,49 @@ def test_the_lookahead_finds_each_familys_router(fx: str) -> None:
             assert made > 0, "the lookahead predicted nothing"
     finally:
         sm.close()
+
+
+def test_mxfp4_experts_on_the_card_match_the_hosts_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """gpt-oss's MXFP4 experts on a card pass, widened on the card and multiplied as grouped matmuls, against the
+    per-expert loop (each expert on the host's MXFP4 kernel, handed back to the card as bf16): the same steps dtype
+    for dtype, so the logits agree to bf16's rounding and the greedy token is the same; the cache's every tensor too"""
+    dev = need_cuda()
+    from btb.engine.host import _Experts
+    from btb.engine.native import Native
+
+    fx = "tiny_gpt_oss"
+    L = layer_count(fixture(fx))
+    StreamedTextModel.register_attention()
+    monkeypatch.setattr(Native, "gemm_rows", 2)
+    calls = [0]
+    inner = _Experts._card_grouped
+
+    def counted(self: Any, *a: Any, **k: Any) -> Any:
+        calls[0] += 1 if self.mx else 0
+        return inner(self, *a, **k)
+
+    kw = {
+        "fx": fx,
+        "device": dev,
+        "cpu_layers": range(L - 1),
+        "resident_layers": range(L - 1, L),
+        "prefill_card": True,
+        "prefill_card_min": 1,
+        "prefetch": True,
+        "compute_dtype": torch.bfloat16,
+        "prefill_chunk": 3,
+    }
+    ids = list(range(3, 23))
+    ref, ref_cache, _ = _prefill(True, ids, grouped=False, **dict(kw))
+    monkeypatch.setattr(_Experts, "_card_grouped", counted)
+    got, got_cache, _ = _prefill(True, ids, grouped=True, **dict(kw))
+    assert calls[0] > 0, "no MXFP4 call took the card's grouped path"
+    scale = float(ref.abs().max())
+    d = float((got - ref).abs().max())
+    print(f"[mxfp4] logits part by {d:.3e} of a {scale:.3e} scale; argmax {int(got.argmax())} vs {int(ref.argmax())}")
+    assert int(got.argmax()) == int(ref.argmax())
+    assert d <= 2e-2 * scale, (d, scale)
+    for name, t in ref_cache.items():
+        g = got_cache[name]
+        assert g.shape == t.shape, name
+        assert float((g - t).abs().max()) <= 5e-2 * max(1.0, float(t.abs().max())), name

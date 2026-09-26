@@ -24,7 +24,7 @@ from ..kinds import PassTag
 from ..mxfp4 import BLOCK, MxGateUp, MxWeight, stored_mxfp4
 from ..options import Device
 from ..sysinfo import host_free_bytes
-from .host import bf16_in_place
+from .host import bf16_in_place, stored_parts
 from .native import Native
 
 if TYPE_CHECKING:
@@ -336,13 +336,14 @@ class LayerDepot:
     expert crosses the bus once for the whole prompt, not once a chunk. An expert is seated the first time the
     layer asks for it, its copy queued on a stream of its own so the next expert's bytes move under this one's
     matmuls; the compute waits on that expert's copy alone. A new layer takes the slots over once the card is
-    done with the last one's. The weights are the store's bf16 bytes as they are, so a product over a seated
-    expert is the one the call's own upload (`w.to(card).to(x.dtype)`) gives. Slots are bounded by `cap` bytes;
-    past them an expert rides one of the scratch slots, on the same copy stream: uploaded again by every chunk
-    that asks, but under the matmuls rather than as a pageable copy that waits for the card to drain.
+    done with the last one's. The weights are the store's bytes as they are - bf16, or MXFP4 as stored, a quarter
+    of the bytes over the bus (`stored_parts`) - one stacked tensor per part; a product over a seated bf16 expert is
+    the one the call's own upload (`w.to(card).to(x.dtype)`) gives. Slots are bounded by `cap` bytes; past them an
+    expert rides one of the scratch slots, on the same copy stream: uploaded again by every chunk that asks, but
+    under the matmuls rather than as a pageable copy that waits for the card to drain.
 
-    The slots are one stacked tensor a layer, so a call's experts go to the card in waves (`place`) and each wave
-    is one grouped matmul over the stack: a slot's rows its expert's, an idle slot none.
+    A call's experts go to the card in waves (`place`) and each wave is one grouped matmul over the stack: a slot's
+    rows its expert's, an idle slot none.
 
     The store's pages are pageable (and on Windows a pinned store is refused), so a copy from them holds the host
     until it lands, at the driver's pageable rate. Each upload goes through a small ring of pinned buffers instead:
@@ -359,8 +360,8 @@ class LayerDepot:
         self.copy = torch.cuda.Stream(device=dev)
         self.layer = -1
         self.seat: dict[int, int] = {}
-        self.gu: torch.Tensor | None = None
-        self.dn: torch.Tensor | None = None
+        # one stack a stored part: bf16's gate_up and down, or MXFP4's four
+        self.stacks: list[torch.Tensor] | None = None
         self.n_seats = 0
         # scratch j is free once the matmuls handed it are done: the event recorded at the next `get`, after
         # the caller queued them
@@ -370,33 +371,48 @@ class LayerDepot:
         self.stat: dict[str, float] = {"seated": 0, "reused": 0, "scratch": 0, "passed": 0, "bytes": 0, "upload_s": 0.0}
         # a wave took the scratch slots over: the next `get` to take one waits for the card to finish what came before
         self.fence_scratch = False
-        self.stage: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+        self.stage: list[tuple[torch.Tensor, ...]] | None = None
         self.stage_done: list[torch.cuda.Event | None] = [None] * self.STAGE
         self.stage_turn = 0
         self.staged = os.environ.get("BTB_PREFILL_STAGE", "1") != "0"
 
-    def _open(self, gu: torch.Tensor, dn: torch.Tensor) -> bool:
-        per = gu.numel() * gu.element_size() + dn.numel() * dn.element_size()
+    @property
+    def gu(self) -> torch.Tensor | None:
+        """a bf16 depot's gate_up stack"""
+        return self.stacks[0] if self.stacks is not None else None
+
+    @property
+    def dn(self) -> torch.Tensor | None:
+        """a bf16 depot's down stack"""
+        return self.stacks[1] if self.stacks is not None else None
+
+    def _fits(self, parts: tuple[torch.Tensor, ...]) -> bool:
+        """whether `parts` has the stacks' form: opened by the first expert, every expert after the same"""
+        if self.stacks is None:
+            return self._open(parts)
+        return len(parts) == len(self.stacks) and all(
+            st.shape[1:] == p.shape and st.dtype == p.dtype for st, p in zip(self.stacks, parts, strict=True)
+        )
+
+    def _open(self, parts: tuple[torch.Tensor, ...]) -> bool:
+        per = sum(p.numel() * p.element_size() for p in parts)
         n = self.cap // max(1, per)
         if n <= self.SCRATCH:
             return False
-        self.gu = torch.empty((n, *gu.shape), dtype=gu.dtype, device=self.dev)
-        self.dn = torch.empty((n, *dn.shape), dtype=dn.dtype, device=self.dev)
+        self.stacks = [torch.empty((n, *p.shape), dtype=p.dtype, device=self.dev) for p in parts]
         self.n_seats = n - self.SCRATCH
         if self.staged:
             try:
-                self.stage = [
-                    (torch.empty_like(gu).pin_memory(), torch.empty_like(dn).pin_memory()) for _ in range(self.STAGE)
-                ]
+                self.stage = [tuple(torch.empty_like(p).pin_memory() for p in parts) for _ in range(self.STAGE)]
             except RuntimeError:  # the machine would not pin even these: the store's pages it is
                 self.stage = None
         return True
 
-    def _upload(self, s: int, gu: torch.Tensor, dn: torch.Tensor, main: torch.cuda.Stream) -> None:
-        assert self.gu is not None and self.dn is not None
+    def _upload(self, s: int, parts: tuple[torch.Tensor, ...], main: torch.cuda.Stream) -> None:
+        assert self.stacks is not None
         t0 = time.perf_counter()
         ready = torch.cuda.Event()
-        src_gu, src_dn = gu, dn
+        src: tuple[torch.Tensor, ...] = parts
         j = -1
         if self.stage is not None:
             # into the next pinned buffer once its last copy out has landed, then from there over the bus
@@ -405,24 +421,25 @@ class LayerDepot:
             done = self.stage_done[j]
             if done is not None:
                 done.synchronize()
-            src_gu, src_dn = self.stage[j]
-            src_gu.copy_(gu)
-            src_dn.copy_(dn)
+            src = self.stage[j]
+            for buf, p in zip(src, parts, strict=True):
+                buf.copy_(p)
         with torch.cuda.stream(self.copy):
-            self.gu[s].copy_(src_gu, non_blocking=True)
-            self.dn[s].copy_(src_dn, non_blocking=True)
+            for st, p in zip(self.stacks, src, strict=True):
+                st[s].copy_(p, non_blocking=True)
             ready.record(self.copy)
         if j >= 0:
             self.stage_done[j] = ready
         main.wait_event(ready)
-        self.stat["bytes"] += gu.numel() * gu.element_size() + dn.numel() * dn.element_size()
+        self.stat["bytes"] += sum(p.numel() * p.element_size() for p in parts)
         # the host's share of the upload: the pageable copy until it lands, or the copy into a pinned buffer
         self.stat["upload_s"] += time.perf_counter() - t0
 
     def get(self, layer: int, e: int, gu: Any, dn: Any) -> tuple[Any, Any]:
-        """expert `e` of `layer` on the card: its seat, seated now, or a scratch slot; the host tensors back where
-        the card's matmul does not take the stored form (a quantized expert, one already on the card)"""
-        if not (isinstance(gu, torch.Tensor) and isinstance(dn, torch.Tensor)) or gu.device.type != "cpu":
+        """bf16 expert `e` of `layer` on the card, for the per-expert loop: its seat, seated now, or a scratch slot;
+        the host's views back for any other form (the loop takes those on the host's kernels)"""
+        parts = stored_parts(gu, dn)
+        if parts is None or len(parts) != 2:
             self.stat["passed"] += 1
             return gu, dn
         main = torch.cuda.current_stream(self.dev)
@@ -439,20 +456,17 @@ class LayerDepot:
         s = self.seat.get(e)
         if s is not None:
             self.stat["reused"] += 1
-            assert self.gu is not None and self.dn is not None  # a seat exists only once the slots are open
-            return self.gu[s], self.dn[s]
-        if self.gu is None and not self._open(gu, dn):
+            assert self.stacks is not None  # a seat exists only once the slots are open
+            return self.stacks[0][s], self.stacks[1][s]
+        if not self._fits(parts):
             self.stat["passed"] += 1
             return gu, dn
-        assert self.gu is not None and self.dn is not None
-        if self.gu.shape[1:] != gu.shape or self.dn.shape[1:] != dn.shape:
-            self.stat["passed"] += 1
-            return gu, dn
+        assert self.stacks is not None
         if len(self.seat) < self.n_seats:
             s = self.seat[e] = len(self.seat)
-            self._upload(s, gu, dn, main)
+            self._upload(s, parts, main)
             self.stat["seated"] += 1
-            return self.gu[s], self.dn[s]
+            return self.stacks[0][s], self.stacks[1][s]
         j = self.turn
         self.turn = (j + 1) % self.SCRATCH
         ev = self.free[j]
@@ -464,15 +478,15 @@ class LayerDepot:
             self.copy.wait_event(done)
             self.fence_scratch = False
         s = self.n_seats + j
-        self._upload(s, gu, dn, main)
+        self._upload(s, parts, main)
         self.lent = j
         self.stat["scratch"] += 1
-        return self.gu[s], self.dn[s]
+        return self.stacks[0][s], self.stacks[1][s]
 
     def place(self, layer: int, items: Sequence[tuple[int, Any, Any]]) -> list[int | None]:
         """A wave of a call's experts on the card together, for one grouped matmul over the slots: each expert's slot
         - its seat, seated now, or a scratch slot - in the order given, or None where it has no place this wave (the
-        scratch is taken, or the stored form is not one the card's matmul takes). The uploads are queued, the card's
+        scratch is taken, or the stored form is not one the card path takes). The uploads are queued, the card's
         compute waits on each; the scratch is this wave's once the card is done with everything queued before it."""
         main = torch.cuda.current_stream(self.dev)
         before = torch.cuda.Event()
@@ -485,7 +499,8 @@ class LayerDepot:
         scratch = 0
         fenced = False
         for e, gu, dn in items:
-            if not (isinstance(gu, torch.Tensor) and isinstance(dn, torch.Tensor)) or gu.device.type != "cpu":
+            parts = stored_parts(gu, dn)
+            if parts is None:
                 self.stat["passed"] += 1
                 out.append(None)
                 continue
@@ -494,16 +509,13 @@ class LayerDepot:
                 self.stat["reused"] += 1
                 out.append(s)
                 continue
-            if (self.gu is None and not self._open(gu, dn)) or (
-                self.gu is not None
-                and (self.gu.shape[1:] != gu.shape or self.dn is None or self.dn.shape[1:] != dn.shape)
-            ):
+            if not self._fits(parts):
                 self.stat["passed"] += 1
                 out.append(None)
                 continue
             if len(self.seat) < self.n_seats:
                 s = self.seat[e] = len(self.seat)
-                self._upload(s, gu, dn, main)
+                self._upload(s, parts, main)
                 self.stat["seated"] += 1
                 out.append(s)
                 continue
@@ -513,7 +525,7 @@ class LayerDepot:
                     fenced = True
                 s = self.n_seats + scratch
                 scratch += 1
-                self._upload(s, gu, dn, main)
+                self._upload(s, parts, main)
                 self.stat["scratch"] += 1
                 out.append(s)
                 continue
