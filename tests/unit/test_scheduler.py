@@ -1675,6 +1675,7 @@ def test_padded_slots_read_the_aligned_span_straight_in_and_the_views_find_the_b
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 def test_vram_seats_hold_the_most_ridden_experts_and_serve_them_from_the_card(monkeypatch: MonkeyPatch) -> None:
     from btb.engine.experts import VramSeats
 
