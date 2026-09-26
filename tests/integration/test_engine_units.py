@@ -8,6 +8,7 @@ marked so need a card. Everything here runs in seconds: the fixtures are a few h
 import json
 import os
 import shutil
+import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -470,6 +471,26 @@ def test_the_12_bit_model_answers_as_its_parent_with_and_without_the_native_kern
     assert r.returncode == 0, r.stderr[-2000:]
     plain, packed = json.loads(r.stdout.strip().splitlines()[-1])
     assert plain == packed and len(packed) == 12
+
+
+def test_a_kernel_handle_is_the_installs_before_any_load_and_none_after_a_torch_alone_one() -> None:
+    """a handle read before any model has loaded binds the install's library as a load would - never None for want
+    of a load, which skipped a test run first in its process and ran it after another; a torch-alone load after a
+    native one lets the kernels go. In a process of its own: "before any load" is only there at its start"""
+    code = (
+        "import sys, btb\n"
+        "from btb.engine.native import Native\n"
+        "from btb.native_files import native_path\n"
+        "assert (Native.attn_decode is not None) == (native_path() is not None), 'a handle read before a load'\n"
+        "with btb.load(sys.argv[1], device='cpu', v_max=0):\n"
+        "    pass\n"
+        "with btb.load(sys.argv[1], device='cpu', native='', v_max=0):\n"
+        "    assert Native.gemv is None and Native.attn_decode is None, 'a torch-alone load kept the kernels'\n"
+    )
+    r = subprocess.run(
+        [sys.executable, "-c", code, fixture("tiny_qwen3")], capture_output=True, text=True, cwd=ROOT, timeout=600
+    )
+    assert r.returncode == 0, r.stderr[-2000:]
 
 
 def test_load_places_the_layers_the_cpu_share_names() -> None:

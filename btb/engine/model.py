@@ -64,20 +64,13 @@ class StreamedTextModel(
         "BOOL": torch.bool,
     }
 
-    # the tests reach the helpers as `StreamedTextModel._HostLinear`; the native handles are mirrored from
-    # `Native` by `load_gemv`
+    # the tests reach the helpers as `StreamedTextModel._HostLinear`; the native handles live on `Native` alone
     _HostLinear = _HostLinear
     _Router = _Router
     _Experts = _Experts
     _NGramRows = _NGramRows
     _ExpertStore = _ExpertStore
     MTPDrafter = MTPDrafter
-    gemv = gemv_p12 = gemv_group = gemv_mx4 = gemv_mx4_group = gemv_fp8 = gemv_fp8_group = None
-    attn_decode = delta_step = read_direct = None
-    read_open = read_at = read_close = None
-    # `Native.open` and `Native.close` are the reader's file handle; `close` here is the engine's own teardown,
-    # so those two are mirrored under the names above
-    _HANDLE_NAMES = {"open": "read_open", "close": "read_close"}
     mlx: Any = None
     gemm_rows = Native.gemm_rows
     cpu_gemm_rows = Native.cpu_gemm_rows
@@ -85,10 +78,7 @@ class StreamedTextModel(
     @classmethod
     def load_gemv(cls, dll_path: str | os.PathLike[str], threads: int = 0) -> Callable[..., Any]:
         """bind the native library's kernels (once per process); see `Native.load_gemv`"""
-        gemv = Native.load_gemv(dll_path, threads)
-        for name in Native.HANDLES:
-            setattr(cls, cls._HANDLE_NAMES.get(name, name), getattr(Native, name))
-        return gemv
+        return Native.load_gemv(dll_path, threads)
 
     def __init__(
         self,

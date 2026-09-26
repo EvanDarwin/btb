@@ -197,7 +197,7 @@ def load(
 
     from .engine import StreamedTextModel
     from .engine.device import mlx_available, resolve_device
-    from .engine.native import quiet_omp
+    from .engine.native import Native, quiet_omp
     from .engine.state import DRAFT_VOCAB
     from .native_files import native_path
 
@@ -208,6 +208,9 @@ def load(
         # 0 = the kernels' own pool over every core: torch's count is the physical cores, and fewer threads than the
         # pool routes through a second one (b=1 86 -> 92 GB/s, b=4 42 -> 51); the bits are the same at any count
         StreamedTextModel.load_gemv(dll, threads=0)
+    else:
+        # torch alone (`native=''`, or no library here): whatever an earlier load in the process bound is let go
+        Native.unbind()
     quiet_omp()
     from .gguf import config_of
 

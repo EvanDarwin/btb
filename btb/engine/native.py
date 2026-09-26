@@ -167,9 +167,23 @@ def quiet_omp() -> None:
             ctypes.CDLL(p).kmp_set_blocktime(0)
 
 
-class Native:
-    """Process-wide handles: the native kernels once `load_gemv` bound them (None without the library), the MLX
-    backend once an engine made one, and the row thresholds routing a matmul between kernels and GEMMs."""
+class _Binding(type):
+    """A kernel handle read before any load binds the install's library first (`Native.bind_install`), as
+    `btb.load` binds it: a handle is never None only because no model has loaded yet in this process - None means
+    the library lacks that kernel, or a load chose none (`native=''`, `Native.unbind`)."""
+
+    def __getattr__(cls, name: str) -> Any:
+        # reached only for a handle not bound yet: a bound one (None included) is a plain class attribute
+        if name in type.__getattribute__(cls, "HANDLES"):
+            type.__getattribute__(cls, "bind_install")()
+            return type.__getattribute__(cls, name)
+        raise AttributeError(f"type object {cls.__name__!r} has no attribute {name!r}")
+
+
+class Native(metaclass=_Binding):
+    """Process-wide handles: the native kernels `load_gemv` bound (bound on the first read when nothing bound them
+    yet; None where the library lacks one, or with no library), the MLX backend once an engine made one, and the
+    row thresholds routing a matmul between kernels and GEMMs."""
 
     _gemv_lib: Any = None
     HANDLES = (
@@ -184,28 +198,30 @@ class Native:
         "gemv_fp8_group",
         "attn_decode",
         "delta_step",
+        "sample_pick",
         "read_direct",
         "open",
         "read_at",
         "close",
     )
 
-    gemv: Any = None
-    gemv_p12: Any = None
-    gemv_group: Any = None
-    gemv_mx4: Any = None
-    gemv_mx4_group: Any = None
-    gemv_mx4_ggml: Any = None
-    gemv_mx4_ggml_group: Any = None
-    gemv_fp8: Any = None
-    gemv_fp8_group: Any = None
-    attn_decode: Any = None
-    delta_step: Any = None
-    sample_pick: Any = None
-    read_direct: Any = None
-    open: Any = None
-    read_at: Any = None
-    close: Any = None
+    # the handles: unset until bound (the metaclass binds them on the first read), each then a kernel or None
+    gemv: Any
+    gemv_p12: Any
+    gemv_group: Any
+    gemv_mx4: Any
+    gemv_mx4_group: Any
+    gemv_mx4_ggml: Any
+    gemv_mx4_ggml_group: Any
+    gemv_fp8: Any
+    gemv_fp8_group: Any
+    attn_decode: Any
+    delta_step: Any
+    sample_pick: Any
+    read_direct: Any
+    open: Any
+    read_at: Any
+    close: Any
     # the MLX backend (`mlxdev.Backend`) of the engine on the MLX device
     mlx: Any = None
     # a matmul of this many rows or more goes to the GEMM; fewer rows take the one-row kernel per row
@@ -214,6 +230,25 @@ class Native:
     # a prefill of this many rows or more goes to the CPU-stream GEMM; fewer (one-row steps, verify passes of <= 16
     # rows) stay on the native kernel, so a verify row computes as the one-row step does
     cpu_gemm_rows = 17
+
+    @classmethod
+    def bind_install(cls) -> None:
+        """the install's library bound as `btb.load` binds it (the kernels' own pool over every core), or every
+        handle None where this install has none"""
+        from ..native_files import native_path
+
+        p = native_path()
+        if p:
+            cls.load_gemv(p)
+        else:
+            cls.unbind()
+
+    @classmethod
+    def unbind(cls) -> None:
+        """every handle None: the torch-alone path (`load(native='')`), whatever an earlier load bound"""
+        for name in cls.HANDLES:
+            setattr(cls, name, None)
+        cls._gemv_lib = None
 
     @classmethod
     def load_gemv(
