@@ -1056,6 +1056,10 @@ class _ExpertStore:
         at = (self.part_at[p] if self.part_at else sum(self.sizes[:p])) + (self.slot_delta.get(slot) or (0,) * 8)[p]
         return region[at : at + self.sizes[p]]
 
+    def f8_shapes(self) -> tuple[tuple[int, int], tuple[int, int]]:
+        """the FP8 experts' shapes, (gate_up [2I, H], down [H, I])"""
+        return (int(self.shapes[0][0]), int(self.shapes[0][1])), (int(self.shapes[2][0]), int(self.shapes[2][1]))
+
     def mx_shapes(self) -> tuple[tuple[int, int], tuple[int, int]]:
         """the MXFP4 experts' logical shapes, (gate_up [2I, H], down [H, I]), in either layout"""
         if self.ggml:

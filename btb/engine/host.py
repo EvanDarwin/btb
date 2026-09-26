@@ -150,9 +150,9 @@ def compute_fp32(module: torch.nn.Module) -> None:
 
 
 def stored_parts(gu: Any, dn: Any) -> tuple[torch.Tensor, ...] | None:
-    """an expert's bytes as the store holds them, for the card: bf16 (gate_up, down), or MXFP4 in the checkpoint's
-    layout (gate_up's blocks and scales, down's blocks and scales); None for a form the card path does not take
-    (ggml's MXFP4, FP8) or an expert already on the card"""
+    """an expert's bytes as the store holds them, for the card: bf16 (gate_up, down), MXFP4 in the checkpoint's
+    layout (gate_up's blocks and scales, down's blocks and scales), or FP8 (gate_up's e4m3 bytes and scale grid,
+    down's); None for a form the card path does not take (ggml's MXFP4) or an expert already on the card"""
     if isinstance(gu, torch.Tensor) and isinstance(dn, torch.Tensor):
         parts: tuple[torch.Tensor, ...] = (gu, dn)
     elif (
@@ -164,6 +164,8 @@ def stored_parts(gu: Any, dn: Any) -> tuple[torch.Tensor, ...] | None:
         and dn.scales is not None
     ):
         parts = (gu.blocks, gu.scales, dn.blocks, dn.scales)
+    elif isinstance(gu, F8Weight) and isinstance(dn, F8Weight):
+        parts = (gu.w, gu.scales, dn.w, dn.scales)
     else:
         return None
     return parts if all(p.device.type == "cpu" for p in parts) else None
@@ -186,8 +188,8 @@ def group_picks(top_k_index: torch.Tensor, num_experts: int) -> tuple[torch.Tens
 
 
 class _Experts(torch.nn.Module):
-    # MXFP4 experts widened on the card at a time in a grouped call: gpt-oss-120b's are 50 MB a piece widened
-    MX_BATCH = 16
+    # MXFP4 or FP8 experts widened on the card at a time in a grouped call: gpt-oss-120b's are 50 MB a piece widened
+    WIDEN_BATCH = 16
     sm: Any
     _mx_bias: Any
     act_fn: Any
@@ -509,12 +511,12 @@ class _Experts(torch.nn.Module):
         return getattr(self.sm, "_depot", None) if (not on_host and x.device.type == "cuda") else None
 
     def _grouped_ok(self, x: torch.Tensor) -> bool:
-        """whether a call's experts can go as grouped matmuls on the card: bf16 experts, or MXFP4 ones in the
-        checkpoint's layout (gpt-oss's, their biases and gate with them), over bf16 rows, where the torch build has
-        the grouped matmul (`BTB_GROUPED_EXPERTS=0` keeps the per-expert loop)"""
+        """whether a call's experts can go as grouped matmuls on the card: bf16 experts, MXFP4 ones in the
+        checkpoint's layout (gpt-oss's, their biases and gate with them) or FP8 ones, over bf16 rows, where the torch
+        build has the grouped matmul (`BTB_GROUPED_EXPERTS=0` keeps the per-expert loop)"""
         return (
             x.dtype == torch.bfloat16
-            and not (self.f8 or self.ggml)
+            and not self.ggml
             and bool(getattr(self.sm, "grouped_experts", False))
             and hasattr(torch, "_grouped_mm")
         )
@@ -540,11 +542,12 @@ class _Experts(torch.nn.Module):
         in ascending expert order, from zero, one add at a time (a row's picks are distinct, so its k
         contributions fill `k` places, ranked by expert).
 
-        MXFP4 experts (gpt-oss's) cross the bus as stored and are widened to bf16 on the card `MX_BATCH` at a time
-        (`dequant_blocks`, exact: every value times its power-of-two scale is a bf16), their biases added and their
-        gate taken per row. The per-expert loop multiplies them on the host's kernel in float32 and hands the card
-        the bf16 of it, so the steps are the loop's, dtype for dtype; only the order of the float32 sums inside a
-        product differs, and with it now and then a bf16's last bit."""
+        MXFP4 experts (gpt-oss's) and FP8 ones cross the bus as stored and are widened to bf16 on the card
+        `WIDEN_BATCH` at a time - MXFP4 by `dequant_blocks` (exact: every value times its power-of-two scale is a
+        bf16), FP8 by `fp8.held` (the nearest bf16 to e4m3 times its scale, the weight every tier reads) - their biases
+        added and their gate taken per row. The per-expert loop multiplies them on the host's kernels in float32 and
+        hands the card the bf16 of it, so the steps are the loop's, dtype for dtype; only the order of the float32
+        sums inside a product differs, and with it now and then a bf16's last bit."""
         T, k = int(top_k_index.shape[0]), int(top_k_index.shape[1])
         pos_s, row_s, offs, counts = group_picks(top_k_index, self.num_experts)
         ranks = torch.argsort(torch.argsort(top_k_index, dim=1), dim=1)
@@ -556,9 +559,9 @@ class _Experts(torch.nn.Module):
                 placed = sorted((sl, e) for (e, _gu, _dn), sl in zip(items, slots, strict=True) if sl is not None)
                 if not placed:
                     raise RuntimeError(f"[experts] layer {self.layer}: no expert of the wave has a place on the card")
-                if self.mx:
-                    for a in range(0, len(placed), self.MX_BATCH):
-                        multiply(placed[a : a + self.MX_BATCH])
+                if self.mx or self.f8:
+                    for a in range(0, len(placed), self.WIDEN_BATCH):
+                        multiply(placed[a : a + self.WIDEN_BATCH])
                 else:
                     multiply(placed)
                 items = [it for it, sl in zip(items, slots, strict=True) if sl is None]
@@ -566,16 +569,26 @@ class _Experts(torch.nn.Module):
         def multiply(placed: list[tuple[int, int]]) -> None:
             """the grouped products of `placed` (slot, expert), in slot order, into their rows' places"""
             stacks = depot.stacks
-            if self.mx:
+            if self.mx or self.f8:
                 # the batch's bytes gathered and widened: one group an expert, in the batch's order
                 idx = torch.tensor([sl for sl, _e in placed], device=x.device)
-                gu_w, dn_w = (
-                    dequant_blocks(
-                        stacks[2 * i].index_select(0, idx).view(len(placed), rows, cols // 32, 16),
-                        stacks[2 * i + 1].index_select(0, idx).view(len(placed), rows, cols // 32),
-                    ).reshape(len(placed), rows, cols)
-                    for i, (rows, cols) in enumerate(store.mx_shapes())
-                )
+                n = len(placed)
+                if self.mx:
+                    gu_w, dn_w = (
+                        dequant_blocks(
+                            stacks[2 * i].index_select(0, idx).view(n, rows, cols // 32, 16),
+                            stacks[2 * i + 1].index_select(0, idx).view(n, rows, cols // 32),
+                        ).reshape(n, rows, cols)
+                        for i, (rows, cols) in enumerate(store.mx_shapes())
+                    )
+                else:
+                    gu_w, dn_w = (
+                        fp8.held(
+                            stacks[2 * i].index_select(0, idx).view(n, rows, cols),
+                            stacks[2 * i + 1].index_select(0, idx),
+                        )
+                        for i, (rows, cols) in enumerate(store.f8_shapes())
+                    )
                 per = [counts[e] for _sl, e in placed]
             else:
                 gu_w, dn_w = stacks[0], stacks[1]
