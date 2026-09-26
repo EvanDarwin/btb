@@ -344,7 +344,7 @@ class _Experts(torch.nn.Module):
         if self.mx:
             self.sm._tag(PassTag.EXPERT_MXFP4_ASSTORED)  # `_group()` is the mx4 matvec over the stored blocks
         if self.f8:
-            self.sm._tag(PassTag.FP8_ASSTORED)
+            self.sm._tag(PassTag.EXPERT_FP8_ASSTORED)  # `_group()` is the FP8 matvec over the stored bytes
         k = len(hit)
         xf = x.float().contiguous()
         slot = {e: top_k_index[0].tolist().index(e) for e in hit}
@@ -492,7 +492,7 @@ class _Experts(torch.nn.Module):
                 return y.to(x.device).to(x.dtype)
             return torch.nn.functional.linear(x.float().cpu(), w.dequantize(torch.float32)).to(x.device).to(x.dtype)
         if isinstance(w, F8Weight):
-            self.sm._tag(PassTag.FP8_ASSTORED if Native.gemv_fp8 is not None else PassTag.FP8_WIDENED)
+            self.sm._tag(PassTag.EXPERT_FP8_ASSTORED if Native.gemv_fp8 is not None else PassTag.EXPERT_FP8_WIDENED)
             if Native.gemv_fp8 is not None:
                 y = torch.empty(x.shape[0], w.shape[0], dtype=torch.float32)
                 Native.gemv_fp8(w, x.float().contiguous().cpu(), y)

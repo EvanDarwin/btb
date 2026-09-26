@@ -343,6 +343,18 @@ def storage_tag(storage: Storage, hw: Hardware) -> PassTag | None:
     return PassTag.FP8_ASSTORED if hw is Hardware.CPU else PassTag.FP8_WIDENED
 
 
+def expert_tag(kind: FamilyKind, storage: Storage) -> PassTag | None:
+    """the stored form a MoE family's experts must be multiplied in where the storage decides it, or None: an FP8
+    twin stores its fused expert tensors e4m3, multiplied as stored on every tier (MLX has no FP8 matvec, and a
+    card's few-row pass takes the host's kernels) - except where the family's experts are MXFP4 in every
+    checkpoint (gpt-oss): the twin keeps their packed blocks as they are, so it is an FP8 trunk over MXFP4
+    experts, and its cells assert the experts it has. `storage_tag`'s FP8 tag alone would pass on the trunk."""
+    fl = core.flags(kind)
+    if storage is not Storage.SAFE_FP8 or Cap.MOE not in fl:
+        return None
+    return PassTag.EXPERT_MXFP4_ASSTORED if Cap.MXFP4 in fl else PassTag.EXPERT_FP8_ASSTORED
+
+
 @dataclass(frozen=True)
 class DeviceSubpath:
     """one set of engine branches, named by `key` and selected by `knobs` (every one a real `options.KNOWN`
@@ -365,8 +377,9 @@ class DeviceSubpath:
     def expects(self, kind: FamilyKind, storage: Storage) -> frozenset[PassTag]:
         """every tag a run of this cell must carry: the sub-path's own, the residency policy this cell's own knobs
         select where the family has an expert store - so the default's Bus Pass is asserted too - and the
-        storage's own read where it leaves one (`storage_tag`)."""
-        extra = (residency_tag(kind, self.knobs), storage_tag(storage, self.hardware))
+        storage's own read where it leaves one (`storage_tag`), and the form a MoE family's experts take there
+        (`expert_tag`)."""
+        extra = (residency_tag(kind, self.knobs), storage_tag(storage, self.hardware), expert_tag(kind, storage))
         return frozenset({self.expect(kind, storage), *(t for t in extra if t is not None)})
 
 

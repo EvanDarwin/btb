@@ -707,7 +707,8 @@ def fp8_state(state: dict[str, torch.Tensor]) -> tuple[dict[str, torch.Tensor], 
     """`state` as a fine-grained FP8 checkpoint stores it, and the modules left at bf16: every decoder matrix
     (a projection, a fused expert tensor) whose shape splits into `FP8_BLOCK` in e4m3 with its `_scale_inv` grid,
     an n-gram table with one per-tensor `weight_scale` (`FP8Embedding`), and the rest (embeddings, norms, the
-    head, the routers, a matrix too small to block) as they are"""
+    head, the routers, a matrix too small to block) as they are. A packed integer tensor stays as stored too:
+    gpt-oss's MXFP4 expert blocks, so its twin is an FP8 trunk over MXFP4 experts (spec.expert_tag)"""
     from btb import fp8
 
     out: dict[str, torch.Tensor] = {}

@@ -268,6 +268,10 @@ FORK_NOTES: dict[PassTag, str] = {
         "MXFP4 experts widened instead of multiplied as stored (host.py:376) happens only where the native "
         "library was built without the mx4 matvec, which the cert's own machines are not"
     ),
+    PassTag.EXPERT_FP8_WIDENED: (
+        "FP8 experts widened instead of multiplied as stored (host.py `_linear`) happens only where the native "
+        "library was built without the FP8 matvec, which the cert's own machines are not"
+    ),
     PassTag.SPEC_ACCEPT: (
         "a draft's outcome, not a path a cell selects: a speculative cell requires drafts and holds its tokens to "
         "the plain decode's, and how many of a tiny random fixture's drafts are accepted is the fixture's doing"
