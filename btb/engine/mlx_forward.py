@@ -1626,7 +1626,7 @@ class _MlxMixin(_State):
         m = mlxdev.mx()
         smp = sampling or GREEDY
         prompt = ids[0].tolist()
-        cache, reuse, _anchored = session._open(self, prompt) if session is not None else (None, 0, None)
+        cache, reuse, _anchored = session._begin_decode(self, prompt) if session is not None else (None, 0, None)
         if cache is None:
             cache = self.new_cache()
         logits, anchors = self._session_prefill(ids, cache, reuse, session)
@@ -1637,7 +1637,7 @@ class _MlxMixin(_State):
 
         def keep() -> tuple[list[int], dict[str, Any]]:
             if session is not None:
-                session._keep(prompt, out, cache, anchors)
+                session._commit_decode(prompt, out, cache, anchors)
             census["seconds"] = time.time() - t0
             census["forwards"] = len(out)
             return out, census

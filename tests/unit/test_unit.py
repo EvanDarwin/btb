@@ -509,15 +509,17 @@ def test_probe_tail_reads_the_generation_prompt_a_template_keeps_for_the_last_tu
 
 
 def test_session_reuses_the_shared_prefix_and_learns_the_tail() -> None:
-    """a session opens a new prompt on what its cache holds: the whole cache when the prompt extends it, a crop to
-    the shared prefix otherwise, nothing on a fresh one; the template's tail is learned from the divergence"""
+    """a decode over a session opens its prompt on what the cache holds: the whole cache when the prompt extends it,
+    a crop to the shared prefix otherwise, nothing on a fresh one; the template's tail is learned from the
+    divergence. Each opening is a transaction left uncommitted here, as a decode failing there would leave it: the
+    session goes back to the point the opening kept"""
     import types
 
     from transformers.cache_utils import DynamicCache, DynamicLayer
 
     from btb.engine.drafter import MTPDrafter
     from btb.engine.state import _State
-    from btb.session import Session
+    from btb.session import Session, State
 
     class Layer(DynamicLayer):
         def __init__(self, n: int) -> None:
@@ -532,31 +534,51 @@ def test_session_reuses_the_shared_prefix_and_learns_the_tail() -> None:
         eng = types.SimpleNamespace(layer_types=["full_attention", "full_attention"], L=2)
         return cast("_State", eng), cache
 
+    def held(cache: DynamicCache, i: int) -> int:
+        """the rows layer i of the cache holds"""
+        cl = cache.layers[i]
+        assert isinstance(cl, Layer) and cl.keys is not None
+        return int(cl.keys.shape[-2])
+
+    def decoded(s: Session, eng: _State, prompt: list[int], out: list[int], cache: DynamicCache) -> None:
+        with s._decoding(eng):
+            s._begin_decode(eng, prompt)
+            s._commit_decode(prompt, out, cache, None)
+
     s = Session()
-    assert s.fresh and s._open(engine_and_cache(1)[0], [1, 2, 3]) == (None, 0, None)
+    eng0 = engine_and_cache(1)[0]
+    with s._decoding(eng0):
+        assert s.fresh and s._begin_decode(eng0, [1, 2, 3]) == (None, 0, None)
     eng, cache = engine_and_cache(6)
-    s._keep([1, 2, 3, 4], [9, 8, 7], cache, None)  # the cache holds the prompt and the answer but its last token
-    assert s.ids == [1, 2, 3, 4, 9, 8] and s.n_prompt == 4 and not s.fresh
+    decoded(s, eng, [1, 2, 3, 4], [9, 8, 7], cache)  # the cache holds the prompt and the answer but its last token
+    assert s.ids == [1, 2, 3, 4, 9, 8] and s.pending == 7 and s.n_prompt == 4 and s.state is State.PENDING
     # the next turn extends the previous text: the whole cache is reused
-    c, reuse, anc = s._open(eng, [1, 2, 3, 4, 9, 8, 5, 6])
-    assert c is cache and reuse == 6 and anc is None and cache.layers[0].keys.shape[-2] == 6
-    # a prompt that diverges two tokens before the previous prompt's end: a crop to the shared prefix, tail learned
-    c, reuse, _ = s._open(eng, [1, 2, 7, 7, 7])
-    assert reuse == 2 and cache.layers[1].keys.shape[-2] == 2 and s.tail == 2
+    with s._decoding(eng):
+        c, reuse, anc = s._begin_decode(eng, [1, 2, 3, 4, 9, 8, 7, 5, 6])
+        assert c is cache and reuse == 6 and anc is None and held(cache, 0) == 6
+    assert s.tokens == [1, 2, 3, 4, 9, 8, 7], "an opening left uncommitted changed the session"
+    # a prompt that diverges two tokens before the previous prompt's end: a crop to the shared prefix, tail learned;
+    # left uncommitted, the session is the shared prefix with its last token drawn (the rows past it were replaced)
+    with s._decoding(eng):
+        c, reuse, _ = s._begin_decode(eng, [1, 2, 7, 7, 7])
+        assert reuse == 2 and held(cache, 1) == 2 and s.tail == 2
+    assert s.tokens == [1, 2] and s.state is State.PENDING and held(cache, 1) == 1
     # nothing shared: nothing reused, and the old cache is released before the new prefill, not after it, the
     # drafter's cache with it
     drafter = types.SimpleNamespace(resets=0)
     drafter.reset = lambda: setattr(drafter, "resets", drafter.resets + 1)
     s.dr = cast("MTPDrafter", drafter)
-    assert s._open(eng, [5, 5, 5]) == (None, 0, None) and s.cache is None and s.ids == [] and s.fresh
-    assert s.dr is None and drafter.resets == 1
+    with s._decoding(eng):
+        assert s._begin_decode(eng, [5, 5, 5]) == (None, 0, None) and s.cache is None and s.ids == [] and s.fresh
+    assert s.dr is None and drafter.resets == 1 and s.state is State.EMPTY
     # a prompt that parts from a long previous prompt far from its end is another conversation: the crop still
     # happens, the tail is not re-learned from it (a learned tail of thousands once resumed a whole prompt as one)
-    eng, cache = engine_and_cache(300)
-    s._keep(list(range(1, 201)), [9, 8], cache, None)
+    eng, cache = engine_and_cache(201)
+    decoded(s, eng, list(range(1, 201)), [9, 8], cache)
     s.tail = 2
-    c, reuse, _ = s._open(eng, [1, 2, 3, 7, 7, 7])
-    assert reuse == 3 and s.tail == 2
+    with s._decoding(eng):
+        c, reuse, _ = s._begin_decode(eng, [1, 2, 3, 7, 7, 7])
+        assert reuse == 3 and s.tail == 2
 
 
 def test_the_engine_vocabularies_are_spelled_once() -> None:

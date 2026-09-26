@@ -42,7 +42,7 @@ os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 from .draft import SpanBank
-from .session import Mark, Session
+from .session import Mark, Session, State
 from .text import Channels, TextStream, answer, prompt_ids, template
 
 if TYPE_CHECKING:
@@ -629,6 +629,7 @@ __all__ = [
     "Sampling",
     "Session",
     "SpanBank",
+    "State",
     "Stream",
     "StreamedTextModel",
     "TextStream",

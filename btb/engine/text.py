@@ -606,13 +606,10 @@ class _TextMixin(_State):
         seed: dict[str, Any] = {} if smp.greedy else {"seed": smp.seed}
         if len(rows) > 1 and session is not None:
             raise ValueError("a session holds one sequence: batch sessions with model.batch(sessions)")
-        try:
+        # a decode over a session is one transaction: committed at its end, rolled back however else it is left (a
+        # hook raising, memory refused, a pass failing part way)
+        with session._decoding(self) if session is not None else contextlib.nullcontext():
             gen = self._decode(rows, max_new, stop, session, on_token, spans, speculate, smp, seed, hooks)
-        except BaseException:
-            if session is not None:
-                # a hook raising, memory refused, a stop mid-prefill: the session back in step with its cache
-                session._abandon(self)
-            raise
         gen.report = self.last_pass_report()  # frozen here, under the lock: this call's, whoever decodes next
         return gen
 

@@ -19,7 +19,7 @@ from btb.engine import StreamedTextModel
 from btb.engine.hooks import HookArgs, PassStats
 from btb.kinds import LayerKind
 from btb.sampling import Sampling
-from btb.session import Session
+from btb.session import Session, State
 from btb.text import template
 from tests.cert import spec
 from tests.helpers import fixture, loaded_model, need_mlx
@@ -546,8 +546,8 @@ def test_a_decode_that_fails_leaves_the_session_in_step_with_its_cache(stem: str
 
 @families
 def test_a_feed_that_fails_part_way_feeds_nothing(stem: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    """a feed whose pass fails after some layers took their rows leaves the session as it was (a hybrid, whose
-    recurrent states moved on, fresh)"""
+    """a feed whose pass fails after some layers took their rows leaves the session as it was - a hybrid too,
+    whose recurrent states had moved on: the transaction noted them at its point"""
     sm = model(stem, "cpu")
     s = sm.session(PROMPT)
     run = sm.device.run_layer
@@ -561,7 +561,7 @@ def test_a_feed_that_fails_part_way_feeds_nothing(stem: str, monkeypatch: pytest
     with pytest.raises(Boom):
         s.feed(OTHER)
     monkeypatch.undo()
-    assert s.tokens == ([] if LayerKind.LINEAR in sm.layer_types else PROMPT)
+    assert s.tokens == PROMPT and s.state is State.READY
     in_step(sm, s)
 
 

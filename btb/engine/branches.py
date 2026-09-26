@@ -18,7 +18,6 @@ from .. import mlx as mlxdev
 from ..api import api, in_hook
 from ..kinds import LayerKind, PassReport, PassTag, Tokens
 from ..sampling import GREEDY, Sampling
-from ..session import crop
 from .cache import (
     CardRowsLayer,
     ForkIndexedLayer,
@@ -427,13 +426,13 @@ class _Rows:
         return out
 
     def _write(self, r: int, row: _Row) -> None:
-        """row r written into its session: its own rows appended to the session's cache, its states restored"""
+        """row r committed into its session, one transaction (`Session._merge_row`): its own rows appended to the
+        session's cache, its states put in, its tokens and its pending token or logits the session's"""
         from transformers.cache_utils import CacheLayerMixin, DynamicIndexedLayer
 
-        s, eng = self.sess[r], self.eng
-        cache = _cache_of(s)
-        n0 = len(s.ids)
-        try:
+        eng = self.eng
+
+        def write(cache: KvCache) -> None:
             for i, kv in row.kv.items():
                 pl = cache.layers[i]
                 if isinstance(kv, list):
@@ -451,17 +450,11 @@ class _Rows:
                     pl.update(kv[0], kv[1])
                     if len(kv) > 2 and isinstance(pl, DynamicIndexedLayer):
                         pl.update_indexer(kv[2])
-        except BaseException:
-            # the layers written so far cut back: the session stays where it was forked (its recurrent states are
-            # only restored below, once every row is in)
-            crop(cache, eng, n0)
-            raise
-        for i, snap in row.lin.items():
-            eng._lin_restore(lin_layer(cache.layers[i]), snap)
-        s.ids.extend(self.rows[r][:-1] if row.pending is not None else self.rows[r])
-        s.n_prompt = len(s.ids)
-        s.pending, s.logits = row.pending, row.logits
-        s.dr, s.dr_len, s.pend_h = None, 0, None
+            for i, snap in row.lin.items():
+                eng._lin_restore(lin_layer(cache.layers[i]), snap)
+
+        toks = self.rows[r][:-1] if row.pending is not None else self.rows[r]
+        self.sess[r]._merge_row(eng, self, toks, write, row.pending, row.logits)
 
     def _leave(self, slots: list[int]) -> None:
         """the batch's rows at `slots` leave it (their stop token drawn), the rest re-formed. A row's write-back
@@ -659,7 +652,7 @@ class Batch(_Rows):
         """the batch formed anew over `sessions`, row nums[j] the j-th: their caches copied into the batch's"""
         eng = self.eng
         for s in sessions:
-            s._settle(eng)
+            s._settle(eng, owner=self)
             s._flush(eng)
         B = len(sessions)
         lens = [len(s.ids) for s in sessions]

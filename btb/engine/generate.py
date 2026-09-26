@@ -129,7 +129,7 @@ class _GenerateMixin(_State):
         resume from (the prompt's end, and the point the re-rendering will diverge at once the tail is known)."""
         n = int(ids.shape[1])
         hybrid = LayerKind.LINEAR in self.layer_types
-        # every row reused (`Session._open`'s whole): the session's logits for its last token, nothing to run
+        # every row reused (`Session._begin_decode`'s whole): the session's logits for its last token, nothing to run
         held = None
         if session is not None and reuse == n:
             held, session._held = session._held, None
@@ -139,9 +139,12 @@ class _GenerateMixin(_State):
             return (held if held is not None else self._prefill(ids[:, reuse:], cache, on_layer=on_layer)), None
         hs: list[torch.Tensor] = []
 
-        def snap(at: int) -> Any:
+        def snap(at: int, logits: Any) -> Any:
+            # the point's own next-token logits: an anchor is a state of its own (`Ready`), which a failed call
+            # goes back to
             return {
                 "n": at,
+                "logits": logits[0, -1].float().cpu().clone(),
                 "states": {
                     i: self._lin_snap(cache.layers[i]) for i in range(self.L) if self.layer_types[i] == LayerKind.LINEAR
                 },
@@ -157,17 +160,17 @@ class _GenerateMixin(_State):
 
         hook = gather if on_layer is not None else None
         if held is not None:
-            return held, [snap(n)]
+            return held, [snap(n, held)]
         anchors = []
         d = int(session.tail)
         cut = n - d
         if d > 0 and reuse < cut:
-            self._prefill(ids[:, reuse:cut], cache, on_layer=hook)
-            anchors.append(snap(cut))
+            at_cut = self._prefill(ids[:, reuse:cut], cache, on_layer=hook)
+            anchors.append(snap(cut, at_cut))
             logits = self._prefill(ids[:, cut:], cache, on_layer=hook)
         else:
             logits = self._prefill(ids[:, reuse:], cache, on_layer=hook)
-        anchors.append(snap(n))
+        anchors.append(snap(n, logits))
         if on_layer is not None:
             on_layer(self.L - 1, hs[0] if len(hs) == 1 else torch.cat(hs, dim=1))
         return logits, anchors
@@ -263,7 +266,7 @@ class _GenerateMixin(_State):
         # a decode needing the last token's layers (the drafting head, taps) re-runs it; else a fed session goes on
         # from the logits it holds
         whole = not (use_mtp or tapped)
-        cache, reuse, anchored = session._open(self, prompt, whole) if session is not None else (None, 0, None)
+        cache, reuse, anchored = session._begin_decode(self, prompt, whole) if session is not None else (None, 0, None)
         if cache is None:
             cache = self.new_cache()
         logits: Any
@@ -341,9 +344,11 @@ class _GenerateMixin(_State):
             if session is None:
                 return
             if use_mtp:
-                session._keep(prompt, committed, cache, anchors, dr, last_base if len(committed) > 1 else n - 1, pend_h)
+                session._commit_decode(
+                    prompt, committed, cache, anchors, dr, last_base if len(committed) > 1 else n - 1, pend_h
+                )
             else:
-                session._keep(prompt, committed, cache, anchors)
+                session._commit_decode(prompt, committed, cache, anchors)
 
         prop.extend(first)
         if on_token:
