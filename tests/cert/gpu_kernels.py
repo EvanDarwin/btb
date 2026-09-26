@@ -9,6 +9,7 @@ claims is a finding, so a new kernel cannot land outside the table. Torch-free.
 from __future__ import annotations
 
 import glob
+import importlib.util
 import os
 import re
 
@@ -17,8 +18,17 @@ from btb.kinds import Json
 from . import spec
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-MLX_SRC = os.path.join(ROOT, "btb", "mlx")
 CUDA_SRC = os.path.join(ROOT, "native", "cuda")
+
+
+def _mlx_src() -> str:
+    """where `btb.mlx` is imported from: the checkout's, or the installed wheel's once CI moves the source tree
+    aside (`mv btb btb.src`) so the tests run against the wheel. Found without importing it (and torch)"""
+    found = importlib.util.find_spec("btb.mlx")
+    if found is None or found.origin is None:
+        raise ModuleNotFoundError("btb.mlx is neither in the checkout nor installed")
+    return os.path.dirname(found.origin)
+
 
 _METAL_NAME = re.compile(r'metal_kernel\(\s*name=f?"([^"]+)"')
 _METAL_HELPER = re.compile(r'\b_kernel\(\s*"(btb_\w+)"')  # fused.py builds through one cached helper
@@ -50,7 +60,7 @@ def _stem(name: str) -> str:
 
 def mlx_kernels() -> set[str]:
     out: set[str] = set()
-    for fn in glob.glob(os.path.join(MLX_SRC, "*.py")):
+    for fn in glob.glob(os.path.join(_mlx_src(), "*.py")):
         with open(fn, encoding="utf-8") as f:
             src = f.read()
         out |= {_stem(n) for n in _METAL_NAME.findall(src) + _METAL_HELPER.findall(src)}
