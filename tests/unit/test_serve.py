@@ -14,7 +14,7 @@ import socket
 import threading
 from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from pytest import CaptureFixture
@@ -254,7 +254,7 @@ def test_a_request_never_sizes_a_decode_past_the_window() -> None:
     class _Model:
         window = 64
 
-        def generate(self, ids: Tokens, max_new: int | None, **kw: object) -> RowGeneration:
+        def _decode_call(self, cancel: object, ids: Tokens, max_new: int | None, **kw: object) -> RowGeneration:
             asked.append(max_new)
             return Generation([], {"cap": max_new or 0})
 
@@ -513,47 +513,55 @@ def test_registry_close_stops_the_request_in_flight_before_the_model_closes() ->
     assert order == ["running", "stopped", "closed"] and not reg.loaded
 
 
+class _SM:
+    def __init__(self) -> None:
+        self.abort = threading.Event()
+
+
+class _Slow(FakeEngine):
+    """an answer of `a`s at `pause` a token, stopped at its next step by the request's cancel"""
+
+    def __init__(self, pause: float) -> None:
+        super().__init__("x")
+        self.sm = _SM()
+        self.pause = pause
+        self.emitted = 0
+        self.done = threading.Event()
+
+    def run(
+        self,
+        messages: Sequence[Message],
+        max_new: int | None,
+        on_token: Callable[[int], object] | None = None,
+        ids: Tokens | None = None,
+        sampling: Sampling | None = None,
+        cancel: threading.Event | None = None,
+        **_hooks: object,
+    ) -> FakeRun:
+        import time
+
+        toks = []
+        try:
+            for _ in range(int(max_new) if max_new else 1000):
+                if cancel is not None and cancel.is_set():
+                    break
+                toks.append(ord("a"))
+                self.emitted += 1
+                if on_token is not None:
+                    on_token(ord("a"))
+                time.sleep(self.pause)
+            return (ids or [1, 2, 3]), toks, {"cap": 9999, "forwards": 0}, None
+        finally:
+            self.done.set()
+
+
 @pytest.mark.timing
 def test_openai_stream_client_disconnect_stops_the_model_and_frees_the_next_turn() -> None:
-    # a cancelled stream must stop the generation at its next step, not finish the answer while the next request
-    # waits on the registry's lock; the abort is cleared afterwards so the next turn runs
+    """a cancelled stream stops its generation at its next step - its own stop, not the model's `abort`, which
+    is left alone - rather than finishing the answer while the next request waits on the registry's lock"""
     import time
 
-    class _SM:
-        def __init__(self) -> None:
-            self.abort = threading.Event()
-
-    class _Slow(FakeEngine):
-        def __init__(self) -> None:
-            super().__init__("x")
-            self.sm = _SM()
-            self.emitted = 0
-            self.done = threading.Event()
-
-        def run(
-            self,
-            messages: Sequence[Message],
-            max_new: int | None,
-            on_token: Callable[[int], object] | None = None,
-            ids: Tokens | None = None,
-            sampling: Sampling | None = None,
-            **_hooks: object,
-        ) -> FakeRun:
-            toks = []
-            try:
-                for _ in range(int(max_new) if max_new else 1000):
-                    if self.sm.abort.is_set():
-                        break
-                    toks.append(ord("a"))
-                    self.emitted += 1
-                    if on_token is not None:
-                        on_token(ord("a"))
-                    time.sleep(0.01)
-                return (ids or [1, 2, 3]), toks, {"cap": 9999, "forwards": 0}, None
-            finally:
-                self.done.set()
-
-    eng = _Slow()
+    eng = _Slow(0.01)
     server = stub_server(engine=eng)
     try:
         c = http.client.HTTPConnection(server.host, server.port, timeout=10)
@@ -566,10 +574,7 @@ def test_openai_stream_client_disconnect_stops_the_model_and_frees_the_next_turn
         c.close()
         assert eng.done.wait(10), "the generation kept running after the client left"
         assert eng.emitted < 900, eng.emitted
-        deadline = time.perf_counter() + 5
-        while eng.sm.abort.is_set() and time.perf_counter() < deadline:  # the handler clears it after the join
-            time.sleep(0.01)
-        assert not eng.sm.abort.is_set(), "the abort is cleared for the next request"
+        assert not eng.sm.abort.is_set(), "the model's abort is a shutdown's, never a request's"
         eng.done.clear()
         t0 = time.perf_counter()
         status, data = post_chat(
@@ -582,51 +587,26 @@ def test_openai_stream_client_disconnect_stops_the_model_and_frees_the_next_turn
 
 
 def test_a_write_that_raises_mid_stream_stops_the_model_before_the_lock_goes() -> None:
-    """a client that stops reading raises TimeoutError out of the write (an OSError `_write` absorbs); an emit
-    that raises anything else still stops the decode and joins it before the exception leaves `_decode`, so the
-    next request never runs on an engine still decoding; the abort is cleared afterwards"""
-    import time
+    """a client that stops reading raises TimeoutError out of the write (an OSError `_write` absorbs); a write
+    that raises anything else still stops the decode, which runs on the handler's own thread, so it is over
+    before the exception leaves - the next request never runs on an engine still decoding"""
+    from btb.reply import Reply
 
-    class _SM:
-        def __init__(self) -> None:
-            self.abort = threading.Event()
-
-    class _Slow(FakeEngine):
-        def __init__(self) -> None:
-            super().__init__("x")
-            self.sm = _SM()
-            self.emitted = 0
-
-        def run(
-            self,
-            messages: Sequence[Message],
-            max_new: int | None,
-            on_token: Callable[[int], object] | None = None,
-            ids: Tokens | None = None,
-            sampling: Sampling | None = None,
-            **_hooks: object,
-        ) -> FakeRun:
-            toks = []
-            for _ in range(1000):
-                if self.sm.abort.is_set():
-                    break
-                toks.append(ord("a"))
-                self.emitted += 1
-                if on_token is not None:
-                    on_token(ord("a"))
-                time.sleep(0.005)
-            return (ids or [1, 2, 3]), toks, {"cap": 9999, "forwards": 0}, None
-
-    eng = _Slow()
+    eng = _Slow(0.005)
     h = Handler.__new__(Handler)
     h.command = "POST"  # what parse_request sets on a real handler: the streams answer a POST
 
-    def emit(delta: str, kind: str) -> bool:
-        raise RuntimeError("the callback failed")
+    def boom(s: str) -> bool:
+        raise RuntimeError("the write failed")
 
-    with pytest.raises(RuntimeError, match="callback"):
-        Handler._decode(h, cast("Engine", eng), [{"role": "user", "content": "hi"}], None, emit)
-    assert not eng.sm.abort.is_set() and eng.emitted < 900
+    h._write = boom  # type: ignore[method-assign]
+    reply = Reply(cast("Any", eng.tok), eng.eos, 1)
+    with pytest.raises(RuntimeError, match="write failed"), h._stream(reply, lambda ev: "a piece"):
+        h._answer(cast("Engine", eng), reply, [1, 2, 3], None, Sampling())
+    assert eng.done.is_set() and eng.emitted < 900 and not eng.sm.abort.is_set()
+
+    h = Handler.__new__(Handler)
+    h.command = "POST"
 
     class _Wf:
         def write(self, b: bytes) -> None:

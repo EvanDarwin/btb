@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import collections
 import contextlib
-import functools
 import gc
 import hmac
 import ipaddress
@@ -20,10 +19,10 @@ import threading
 import time
 import traceback
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any
 
 from . import available_models, load, model_stem, resolve, serve_name
 from .draft import SpanBank
@@ -32,11 +31,12 @@ from .engine.device import resolve_device
 from .engine.hooks import LogitsProcessor, OnRowToken, OnToken, TokenLogprob
 from .kinds import Json, Log, Tokens
 from .options import BadValue, DeviceName, OptionError
+from .reply import Event, Reply, Row
 from .sampling import Sampling
 from .session import Session
 from .sysinfo import host_total_bytes
-from .text import Channels, TextStream, answer, probe_tail
-from .tools import ToolFormat, tool_format
+from .text import answer, probe_tail
+from .tools import tool_format
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -55,12 +55,6 @@ Request = Json
 RunResult = tuple[list[int], list[int], "GenerateStats", list[TokenLogprob] | None]
 # `n` answers to one prompt: each one's tokens (stop tokens out), whether it ended at one, the counts, the logprobs
 RowsResult = tuple[list[list[int]], list[bool], "GenerateStats", list[list[TokenLogprob]] | None]
-# a streamed answer's sink: (row, a piece of text, "content" or "thinking"); a falsy return stops that row's text
-RowSink = Callable[[int, str, str], object]
-# one answer's sink: (a piece of text, its kind)
-TextSink = Callable[[str, str], object]
-# what `_pump` runs: a decode reporting each token as `on_token(row, token)`
-R = TypeVar("R")
 
 
 class Engine:
@@ -124,11 +118,15 @@ class Engine:
         sampling: Sampling | None = None,
         processors: Sequence[LogitsProcessor] = (),
         logprobs: int | None = None,
+        cancel: threading.Event | None = None,
     ) -> RunResult:
-        """(prompt ids, answer tokens without the stop tokens, stats, a `TokenLogprob` per answer token or None)"""
+        """(prompt ids, answer tokens without the stop tokens, stats, a `TokenLogprob` per answer token or None);
+        `cancel` set stops the decode at its next step (this request's own stop: the model's `abort` is left to a
+        shutdown)"""
         if ids is None:
             ids = self.ids_for(messages)
-        gen = self.sm.generate(
+        gen = self.sm._decode_call(
+            cancel,
             ids,
             self._cap(ids, max_new),
             eos=self.eos,
@@ -155,9 +153,11 @@ class Engine:
         processors: Sequence[LogitsProcessor] = (),
         logprobs: int | None = None,
         on_token: OnRowToken | None = None,
+        until: Callable[[int], object] | None = None,
     ) -> RowsResult:
         """`n` answers to one prompt, the session forked after its prefill: (their tokens without the stop tokens,
-        whether each ended at a stop token, stats, their logprobs or None). The session keeps the prompt."""
+        whether each ended at a stop token, stats, their logprobs or None). The session keeps the prompt. `until(row)`
+        true, the row leaves the decode at the token it has just drawn, the others going on."""
         max_new = self._cap(ids, max_new)
         if max_new is None:
             max_new = max(1, self.sm.window - len(ids))
@@ -171,6 +171,7 @@ class Engine:
                 processors=processors,
                 logprobs=logprobs,
                 on_token=on_token,
+                until=until,
             )
         es = set(self.eos)
         rows = [[t for t in r if t not in es] for r in gen.tokens]
@@ -569,42 +570,6 @@ def _content_text(content: Any) -> str:
     return content
 
 
-class _ToolGate:
-    """The streamed prose of a tool-calling turn: pieces go out as they decode until a call's opener, from which
-    the text is buffered (a partial call never leaks as content); `finish` emits the prose that followed the
-    call once the blocks are known and struck."""
-
-    def __init__(self, fmt: ToolFormat, emit: Callable[..., Any], tools: Any = None) -> None:
-        self.fmt, self.emit, self.tools = fmt, emit, tools
-        self.buf, self.sent, self.in_call = "", 0, False
-
-    def push(self, delta: str) -> Any:
-        self.buf += delta
-        if self.in_call:
-            return True
-        p = self.fmt.opener_at(self.buf, self.sent)
-        if p is not None:
-            self.in_call = True
-            out, self.sent = self.buf[self.sent : p], p
-            return self.emit(out, "content") if out else True
-        upto = len(self.buf) - self.fmt.holdback(self.buf)
-        if upto > self.sent:
-            out, self.sent = self.buf[self.sent : upto], upto
-            return self.emit(out, "content")
-        return True
-
-    def finish(self) -> Any:
-        """the prose after the last call, and whatever a holdback kept, with the call blocks struck"""
-        prose = (
-            self.fmt.strip(self.buf) if self.fmt.calls(self.buf, self.tools) else self.buf
-        )  # struck where calls parsed
-        sent = self.buf[: self.sent]
-        tail = prose[len(sent) :] if prose.startswith(sent) else ""
-        if self.in_call:
-            tail = tail.lstrip()
-        return self.emit(tail, "content") if tail.strip() else True
-
-
 def _short(v: Any) -> str:
     """a request's value as a message shows it: at most 120 characters"""
     s = str(v)
@@ -757,79 +722,56 @@ def _lp_json(tok: PreTrainedTokenizerBase, lp: Sequence[TokenLogprob] | None) ->
     }
 
 
-def _cut(text: str, stops: Sequence[str]) -> tuple[str, bool]:
-    """the text up to the first stop string in it, and whether there was one"""
-    at = min((i for i in (text.find(s) for s in stops) if i >= 0), default=-1)
-    return (text[:at], True) if at >= 0 else (text, False)
+class _Writer:
+    """A stream's writes on a thread of their own, in order (docs/streaming.md): `put(item)` queues an event
+    (`render(event)` makes its text there) or a text, and never waits on the client; a write that fails - the
+    client gone, or not reading - calls `gone()` once and the rest are dropped; with a `keepalive`, `every` seconds
+    with nothing to write (a tool call buffered whole) sends it, so a client gone then is found too. `close()`
+    writes what is queued and joins; a write or a render that raised anything but the client gone raises there."""
 
+    def __init__(
+        self,
+        write: Callable[[str], bool],
+        render: Callable[[Event], str],
+        gone: Callable[[], None],
+        keepalive: str | None = None,
+        every: float = 0.5,
+    ) -> None:
+        self._write, self._render, self._gone = write, render, gone
+        self.keepalive, self.every = keepalive, float(every)
+        self._q: queue.Queue[Event | str | None] = queue.Queue()
+        self._err: BaseException | None = None
+        self.lost = False
+        self._th = threading.Thread(target=self._run, daemon=True, name="btb-stream-write")
+        self._th.start()
 
-class _Stops:
-    """Stop strings over text arriving in pieces: `push(piece)` releases what is safe (a tail that could open a
-    stop string is held back) and sets `hit` once one appears, cutting there; `flush()` the held tail at the end"""
+    def put(self, item: Event | str) -> None:
+        self._q.put(item)
 
-    def __init__(self, stops: Sequence[str]) -> None:
-        self.stops = list(stops)
-        self.buf, self.hit = "", False
+    def _run(self) -> None:
+        while True:
+            try:
+                item = self._q.get(timeout=self.every if self.keepalive is not None and not self.lost else None)
+            except queue.Empty:
+                item = self.keepalive
+            if item is None:
+                return
+            if self.lost:
+                continue
+            try:
+                text = item if isinstance(item, str) else self._render(item)
+                ok = self._write(text) if text else True
+            except BaseException as e:
+                self._err, ok = e, False
+            if not ok:
+                self.lost = True
+                self._gone()
 
-    def push(self, piece: str) -> str:
-        if self.hit:
-            return ""
-        self.buf += piece
-        text, self.hit = _cut(self.buf, self.stops)
-        if self.hit:
-            self.buf = ""
-            return text
-        hold = next(
-            (
-                k
-                for k in range(min(len(self.buf), max(map(len, self.stops)) - 1), 0, -1)
-                if any(s.startswith(self.buf[-k:]) for s in self.stops)
-            ),
-            0,
-        )
-        out, self.buf = self.buf[: len(self.buf) - hold], self.buf[len(self.buf) - hold :]
-        return out
-
-    def flush(self) -> str:
-        out, self.buf = ("" if self.hit else self.buf), ""
-        return out
-
-
-def _stop_at(tok: PreTrainedTokenizerBase, eos: Sequence[int], toks: Tokens, stops: Sequence[str]) -> int | None:
-    """how many of an answer's tokens it took to write a stop string into its content, None when none is in it:
-    the tokens a stopped answer counts (a decode stopped at a stop string runs a step or two past it)"""
-    if not stops:
-        return None
-    pieces, st = _Pieces(tok, eos), _Stops(stops)
-    for k, t in enumerate(toks):
-        for kind, delta in pieces.push(int(t)):
-            if kind == "content":
-                st.push(delta)
-        if st.hit:
-            return k + 1
-    return None
-
-
-class _Pieces:
-    """One answer's tokens as text pieces as they decode: gpt-oss's channels split (`push(t)` returns
-    [(kind, delta)], kind "content" or "thinking"), a stop token and a call's body never text"""
-
-    def __init__(self, tok: PreTrainedTokenizerBase, eos: Sequence[int]) -> None:
-        self.ch = Channels(tok)
-        self.streams = {"content": TextStream(tok), "thinking": TextStream(tok)}
-        self.eos = set(eos)
-
-    def push(self, t: int) -> list[tuple[str, str]]:
-        if t in self.eos:
-            return []
-        kind = self.ch.push(t)
-        if kind is None or kind == "call":  # a harmony call's body is never content
-            return []
-        delta = self.streams[kind].push(t)
-        return [(kind, delta)] if delta else []
-
-    def flush(self) -> list[tuple[str, str]]:
-        return [(kind, tail) for kind, st in self.streams.items() if (tail := st.flush())]
+    def close(self, quiet: bool = False) -> None:
+        self._q.put(None)
+        self._th.join()
+        if self._err is not None and not quiet:
+            raise self._err
 
 
 def _for_template(messages: Sequence[Message]) -> list[Message]:
@@ -961,124 +903,77 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _write(self, s: str) -> bool:
+        """a piece of a streamed body written and flushed: False when the client is gone"""
         try:
             self._send_body(s.encode("utf-8"))
             self.wfile.flush()
-            self._writes = getattr(self, "_writes", 0) + 1
             return True
         except OSError:  # the client is gone, or stopped reading (the socket timeout is an OSError too)
-            self._gone = True  # every row of the answer shares the connection
             return False
 
-    # tokens a stream may decode writing nothing (a tool call buffered whole) before a keepalive asks after the client
-    QUIET = 32
+    # seconds a stream may go writing nothing (a tool call buffered whole) before a keepalive asks after the client
+    KEEPALIVE = 0.5
 
-    def _pump(
-        self,
-        engine: Engine,
-        run: Callable[[OnRowToken], R],
-        rows: int,
-        emit: RowSink,
-        ping: Callable[[], bool] | None = None,
-    ) -> tuple[R, float | None]:
-        """`run(on_token)` on a thread of its own, the tokens it reports as `on_token(row, token)` turned into text
-        pieces for `emit(row, delta, kind)` as they decode - the answer and the reasoning (gpt-oss's channels) as
-        two texts, kind "content" or "thinking". A row whose `emit` returns False is not written to again; once
-        none is left that has not ended at its stop token the model stops at its next step, and at once when a
-        write finds the client gone. `ping()` (a stream's keepalive) is sent after `QUIET` tokens that wrote
-        nothing, so a client gone while a row is buffered is found too. Returns (what `run` returned, the first
-        token's time)."""
-        q: queue.Queue[tuple[int, int] | None] = queue.Queue()
-        out: list[R] = []
-        err: list[str] = []
-
-        def work() -> None:
-            try:
-                out.append(run(lambda r, t: q.put((int(r), int(t)))))
-            except Exception as e:
-                err.append(repr(e))
-            finally:
-                q.put(None)
-
-        th = threading.Thread(target=work, daemon=True)
-        th.start()
-        pieces = [_Pieces(engine.tok, engine.eos) for _ in range(rows)]
-        alive = [True] * rows
-        ended = [False] * rows  # at its stop token: the decode has nothing more for the row
-        eos = set(engine.eos)
-        quiet, wrote = 0, getattr(self, "_writes", 0)
-        t_first = None
-        stopped = False
+    @contextlib.contextmanager
+    def _stream(self, reply: Reply, render: Callable[[Event], str], keepalive: str | None = None) -> Iterator[_Writer]:
+        """the reply's events written as they come, on a thread of their own, while the body decodes: a client gone
+        leaves every row of the reply; the writes are done and joined before the body's end is"""
+        w = _Writer(self._write, render, reply.leave, keepalive, self.KEEPALIVE)
+        reply.emit = w.put
         try:
-            while (item := q.get()) is not None:
-                if t_first is None:
-                    t_first = time.perf_counter()
-                r, t = item
-                ended[r] = ended[r] or t in eos
-                for kind, delta in pieces[r].push(t) if alive[r] else ():
-                    alive[r] = alive[r] and bool(emit(r, delta, kind))
-                if getattr(self, "_writes", 0) != wrote:
-                    quiet, wrote = 0, getattr(self, "_writes", 0)
-                elif ping is not None and (quiet := quiet + 1) >= self.QUIET:
-                    quiet = 0
-                    ping()
-                    wrote = getattr(self, "_writes", 0)
-                if getattr(self, "_gone", False):
-                    alive = [False] * rows
-                if not stopped and not all(ended) and not any(a and not e for a, e in zip(alive, ended)):
-                    # nothing more is wanted (the client is gone, or a stop string came): the model stops at its
-                    # next step instead of finishing while the next request waits on the lock; the session keeps
-                    # what was decoded
-                    engine.sm.abort.set()
-                    stopped = True
-            for r in range(rows):
-                for kind, tail in pieces[r].flush() if alive[r] else ():
-                    alive[r] = alive[r] and bool(emit(r, tail, kind))
+            yield w
         except BaseException:
-            # a failure `_write` does not absorb, or a callback's: the decode is stopped and joined below before
-            # the lock is released, or the next request would run on an engine still decoding
-            engine.sm.abort.set()
-            stopped = True
+            reply.leave()
+            w.close(quiet=True)
             raise
-        finally:
-            th.join()
-            if stopped:
-                engine.sm.abort.clear()
-        if err:
-            raise RuntimeError(err[0])
-        return out[0], t_first
+        w.close()
 
-    def _decode(
+    def _answer(
         self,
         engine: Engine,
-        messages: Sequence[Message],
+        reply: Reply,
+        ids: Tokens,
         max_new: int | None,
-        emit: TextSink,
-        ids: Tokens | None = None,
-        on_content: Callable[[str], object] | None = None,
-        sampling: Sampling | None = None,
+        sampling: Sampling,
         processors: Sequence[LogitsProcessor] = (),
         logprobs: int | None = None,
-    ) -> tuple[list[int], list[int], GenerateStats, float | None, list[TokenLogprob] | None]:
-        """one answer streamed: `emit(delta, kind)` its pieces (the content through `on_content` when given);
-        (prompt ids, tokens, stats, the first token's time, logprobs)"""
+        messages: Sequence[Message] = (),
+    ) -> tuple[GenerateStats, float | None]:
+        """the reply's rows decoded on this thread, each token into the reply as it is drawn, and the reply finished:
+        one answer stops at its next step once its row is done (its own cancel), `n` answers are a fork whose rows
+        leave the batch as the reply is done with them. (stats, the first token's time)"""
+        first: list[float] = []
 
-        def run(on_token: OnRowToken) -> RunResult:
-            return engine.run(
+        def drawn(r: int, t: int) -> None:
+            if not first:
+                first.append(time.perf_counter())
+            reply.token(r, t)
+
+        if len(reply.rows) > 1:
+            _rows, _ended, c, lps = engine.run_rows(
+                ids,
+                len(reply.rows),
+                max_new,
+                sampling=sampling,
+                processors=processors,
+                logprobs=logprobs,
+                on_token=drawn,
+                until=reply.done,
+            )
+        else:
+            _ids, _toks, c, lp = engine.run(
                 messages,
                 max_new,
-                on_token=lambda t: on_token(0, t),
+                on_token=lambda t: drawn(0, t),
                 ids=ids,
                 sampling=sampling,
                 processors=processors,
                 logprobs=logprobs,
+                cancel=reply.cancel,
             )
-
-        def out(_r: int, delta: str, kind: str) -> object:
-            return on_content(delta) if kind == "content" and on_content is not None else emit(delta, kind)
-
-        (ids_used, toks, c, lp), t_first = self._pump(engine, run, 1, out)
-        return ids_used, toks, c, t_first, lp
+            lps = None if lp is None else [lp]
+        reply.finish(lps)
+        return c, (first[0] if first else None)
 
     def do_GET(self) -> None:
         try:
@@ -1236,244 +1131,89 @@ class Handler(BaseHTTPRequestHandler):
             ids = engine.ids_for(messages, tools_kw)
             procs = _processors(req, engine, len(ids))
 
-            def message(toks: Tokens) -> tuple[Message, bool, bool]:
-                """an answer's message, whether it calls a tool, and whether a stop string cut it: the stop string
-                cuts the answer first and the calls are read from what is left, as the stream reads them"""
-                calls: list[ToolCall] = []
-                if tools and not fmt.in_text:
-                    # the calls are channel tokens (gpt-oss), which no stop string in the prose reaches
-                    text, think, calls = fmt.from_tokens(engine.tok, toks, tools)
-                    text, cut = _cut(text, stops)
-                else:
-                    text, think = engine.text(toks)
-                    text, cut = _cut(text, stops)
-                    if tools:
-                        text, calls = fmt.split(text, tools)
-                msg: Message = {"role": "assistant", "content": (text or None) if calls else text}
-                if think:
-                    msg["reasoning_content"] = think
-                if calls:
-                    msg["tool_calls"] = [
-                        {
-                            "id": "call_" + uuid.uuid4().hex[:24],
-                            "type": "function",
-                            "function": {"name": c["name"], "arguments": c["arguments"]},
-                        }
-                        for c in calls
-                    ]
-                return msg, bool(calls), cut
+            def calls_json(calls: Sequence[ToolCall], index: bool) -> list[Json]:
+                return [
+                    {
+                        **({"index": j} if index else {}),
+                        "id": "call_" + uuid.uuid4().hex[:24],
+                        "type": "function",
+                        "function": {"name": c["name"], "arguments": c["arguments"]},
+                    }
+                    for j, c in enumerate(calls)
+                ]
 
-            def reason(calls: bool, cut: bool, ended: bool) -> str:
-                return "tool_calls" if calls else ("stop" if cut or ended else "length")
+            def usage(reply: Reply) -> Json:
+                out = sum(row.spent for row in reply.rows)
+                return {"prompt_tokens": len(ids), "completion_tokens": out, "total_tokens": len(ids) + out}
 
-            def spent(toks: Tokens) -> int:
-                """the answer's tokens up to its stop string (all of them without one): what the usage counts"""
-                k = _stop_at(engine.tok, engine.eos, toks, stops)
-                return len(toks) if k is None else k
+            reply = Reply(engine.tok, engine.eos, n, stops, tools, fmt)
+            t0 = time.perf_counter()
+            if not stream:
+                c, t_first = self._answer(engine, reply, ids, max_new, smp, procs, top, messages)
+                self._flex(engine, [t for row in reply.rows for t in row.tokens], c, t0, t_first, time.perf_counter())
+                choices = []
+                for row in reply.rows:
+                    msg: Message = {"role": "assistant", "content": (row.content or None) if row.calls else row.content}
+                    if row.thinking:
+                        msg["reasoning_content"] = row.thinking
+                    if row.calls:
+                        msg["tool_calls"] = calls_json(row.calls, False)
+                    choice: Json = {"index": row.index, "message": msg, "finish_reason": row.finish}
+                    if top is not None:
+                        choice["logprobs"] = _lp_json(engine.tok, row.logprobs)
+                    choices.append(choice)
+                return self._json(
+                    200,
+                    {
+                        "id": rid,
+                        "object": "chat.completion",
+                        "created": created,
+                        "model": engine.name,
+                        "choices": choices,
+                        "usage": usage(reply),
+                    },
+                )
+            self._stream_head("text/event-stream")
 
-            def lp_upto(lp: list[TokenLogprob] | None, toks: Tokens) -> list[TokenLogprob] | None:
-                return None if lp is None else lp[: spent(toks)]
-
-            def body(choices: list[Json], out: int) -> Json:
-                return {
+            def chunk(choices: list[Json], **more: Any) -> str:
+                body = {
                     "id": rid,
-                    "object": "chat.completion",
+                    "object": "chat.completion.chunk",
                     "created": created,
                     "model": engine.name,
                     "choices": choices,
-                    "usage": {"prompt_tokens": len(ids), "completion_tokens": out, "total_tokens": len(ids) + out},
+                    **more,
                 }
+                return "data: " + json.dumps(body) + "\n\n"
 
-            if not stream and n > 1:
-                t0 = time.perf_counter()
-                if stops:
-                    # streamed to nowhere, so the decode ends once every row has come to a stop string or its end
-                    at = [_Stops(stops) for _ in range(n)]
+            first = [True] * n  # a row's first delta names the role
 
-                    def watch(i: int, delta: str, kind: str) -> bool:
-                        return kind != "content" or (at[i].push(delta), not at[i].hit)[1]
-
-                    def all_rows(on_token: OnRowToken) -> RowsResult:
-                        return engine.run_rows(
-                            ids, n, max_new, sampling=smp, processors=procs, logprobs=top, on_token=on_token
-                        )
-
-                    (rows, ended, c, lps), _t = self._pump(engine, all_rows, n, watch)
-                else:
-                    rows, ended, c, lps = engine.run_rows(ids, n, max_new, sampling=smp, processors=procs, logprobs=top)
-                self._flex(engine, [t for r in rows for t in r], c, t0, None, time.perf_counter())
-                choices = []
-                for i, toks in enumerate(rows):
-                    msg, called, cut = message(toks)
-                    choices.append({"index": i, "message": msg, "finish_reason": reason(called, cut, ended[i])})
-                    if top is not None:
-                        choices[-1]["logprobs"] = _lp_json(engine.tok, lp_upto(lps[i] if lps else None, toks))
-                return self._json(200, body(choices, sum(spent(r) for r in rows)))
-            if not stream:
-                t0 = time.perf_counter()
-                if stops:
-                    # streamed to nowhere, so a stop string ends the decode where it appears
-                    seen = _Stops(stops)
-                    ids, toks, c, _t, lp = self._decode(
-                        engine,
-                        messages,
-                        max_new,
-                        lambda *_a: True,
-                        ids=ids,
-                        on_content=lambda d: (seen.push(d), not seen.hit)[1],
-                        sampling=smp,
-                        processors=procs,
-                        logprobs=top,
-                    )
-                else:
-                    ids, toks, c, lp = engine.run(
-                        messages, max_new, ids=ids, sampling=smp, processors=procs, logprobs=top
-                    )
-                self._flex(engine, toks, c, t0, None, time.perf_counter())
-                msg, called, cut = message(toks)
-                choice: Json = {
-                    "index": 0,
-                    "message": msg,
-                    "finish_reason": reason(called, cut, len(toks) < int(c.get("cap", 0))),
-                }
-                if top is not None:
-                    choice["logprobs"] = _lp_json(engine.tok, lp_upto(lp, toks))
-                return self._json(200, body([choice], spent(toks)))
-            self._stream_head("text/event-stream")
-
-            def send(delta: Json, finish: str | None = None, index: int = 0, logprobs: Json | None = None) -> bool:
-                choice: Json = {"index": index, "delta": delta, "finish_reason": finish}
-                if logprobs is not None:
-                    choice["logprobs"] = logprobs
-                chunk = {
-                    "id": rid,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": engine.name,
-                    "choices": [choice],
-                }
-                return self._write("data: " + json.dumps(chunk) + "\n\n")
-
-            def send_usage(prompt: int, out: int) -> bool:
-                # OpenAI's include_usage: a final chunk with no choices carries the token counts
-                chunk = {
-                    "id": rid,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": engine.name,
-                    "choices": [],
-                    "usage": {"prompt_tokens": prompt, "completion_tokens": out, "total_tokens": prompt + out},
-                }
-                return self._write("data: " + json.dumps(chunk) + "\n\n")
-
-            first = [True] * n
-            stoppers = [_Stops(stops) if stops else None for _ in range(n)]
-
-            def emit(i: int, delta: str, kind: str = "content") -> bool:
-                part = {"content": delta} if kind == "content" else {"reasoning_content": delta}
+            def delta(i: int, part: Json, finish: str | None = None, **more: Any) -> str:
                 if first[i]:
-                    part = dict({"role": "assistant"}, **part)
-                    first[i] = False
-                return send(part, index=i)
+                    part, first[i] = {"role": "assistant", **part}, False
+                return chunk([{"index": i, "delta": part, "finish_reason": finish, **more}])
 
-            # the prose streams as it decodes; with tools, from a call's opener the text is buffered and parsed whole
-            gates = [_ToolGate(fmt, functools.partial(emit, i), tools) if tools else None for i in range(n)]
+            def render(ev: Event) -> str:
+                """a reply's event as the chunks OpenAI streams"""
+                if ev[0] == "text":
+                    _, i, kind, piece = ev
+                    return delta(i, {"content": piece} if kind == "content" else {"reasoning_content": piece})
+                if ev[0] == "calls":
+                    return delta(ev[1], {"tool_calls": calls_json(ev[2], True)})
+                _, i, finish = ev
+                lead = delta(i, {}) if first[i] else ""  # a row a stop string cut to nothing is the assistant's
+                row = reply.rows[i]
+                if row.logprobs is not None:
+                    lead += delta(i, {}, logprobs=_lp_json(engine.tok, row.logprobs))
+                return lead + delta(i, {}, finish)
 
-            def out(i: int, delta: str, kind: str) -> bool:
-                """a piece of row i: the content through its stop strings and its tool gate"""
-                if kind != "content":
-                    return bool(emit(i, delta, kind))
-                st, g = stoppers[i], gates[i]
-                piece = st.push(delta) if st is not None else delta
-                ok = (g.push(piece) if g is not None else emit(i, piece)) if piece else True
-                return bool(ok) and not (st is not None and st.hit)
-
-            def run(on_token: OnRowToken) -> RowsResult:
-                if n > 1:
-                    return engine.run_rows(
-                        ids, n, max_new, sampling=smp, processors=procs, logprobs=top, on_token=on_token
-                    )
-                _ids, toks, c, lp = engine.run(
-                    messages,
-                    max_new,
-                    on_token=lambda t: on_token(0, t),
-                    ids=ids,
-                    sampling=smp,
-                    processors=procs,
-                    logprobs=top,
-                )
-                return [toks], [len(toks) < int(c.get("cap", 0))], c, (None if lp is None else [lp])
-
-            t0 = time.perf_counter()
-            (rows, ended, c, lps), t_first = self._pump(engine, run, n, out, ping=lambda: self._write(": \n\n"))
-            self._flex(engine, [t for r in rows for t in r], c, t0, t_first, time.perf_counter())
-            for i, toks in enumerate(rows):
-                st, g = stoppers[i], gates[i]
-                if st is not None and not st.hit and (tail := st.flush()):
-                    _ = g.push(tail) if g is not None else emit(i, tail)
-                calls: list[ToolCall] = []
-                if g is not None:
-                    # read from the text the gate saw, cut at the stop string as `message` cuts it
-                    calls = fmt.calls(g.buf, tools) if fmt.in_text else fmt.from_tokens(engine.tok, toks, tools)[2]
-                    g.finish()
-                if calls:
-                    part: Json = {
-                        "tool_calls": [
-                            {
-                                "index": j,
-                                "id": "call_" + uuid.uuid4().hex[:24],
-                                "type": "function",
-                                "function": {"name": c2["name"], "arguments": c2["arguments"]},
-                            }
-                            for j, c2 in enumerate(calls)
-                        ]
-                    }
-                    if first[i]:
-                        part = dict({"role": "assistant"}, **part)
-                        first[i] = False
-                    send(part, index=i)
-                if first[i]:  # a row a stop string cut to nothing is the assistant's all the same
-                    send({"role": "assistant"}, index=i)
-                    first[i] = False
-                if top is not None:
-                    send({}, index=i, logprobs=_lp_json(engine.tok, lp_upto(lps[i] if lps else None, toks)))
-                send({}, reason(bool(calls), st is not None and st.hit, ended[i]), index=i)
-            if want_usage:
-                send_usage(len(ids), sum(spent(r) for r in rows))
-            return self._write("data: [DONE]\n\n")
-
-    def _ollama_run(
-        self,
-        engine: Engine,
-        messages: Sequence[Message],
-        max_new: int | None,
-        ids: Tokens,
-        smp: Sampling,
-        procs: Sequence[LogitsProcessor],
-        stops: Sequence[str],
-        emit: TextSink | None = None,
-    ) -> tuple[list[int], list[int], GenerateStats, float | None, bool]:
-        """an Ollama route's decode, (prompt ids, tokens, stats, the first token's time, whether a stop string cut
-        it): streamed to `emit` when given, the content through the stop strings (one ends the decode where it
-        appears, the tokens counted up to it)"""
-        if emit is None and not stops:
-            used, toks, c, _lp = engine.run(messages, max_new, ids=ids, sampling=smp, processors=procs)
-            return used, toks, c, None, False
-        send = emit if emit is not None else (lambda *_a: True)
-        st = _Stops(stops) if stops else None
-
-        def content(d: str) -> bool:
-            piece = st.push(d) if st is not None else d
-            ok = send(piece, "content") if piece else True
-            return bool(ok) and not (st is not None and st.hit)
-
-        used, toks, c, t_first, _lp = self._decode(
-            engine, messages, max_new, send, ids=ids, on_content=content, sampling=smp, processors=procs
-        )
-        if st is not None and not st.hit and (tail := st.flush()):
-            send(tail, "content")
-        k = _stop_at(engine.tok, engine.eos, toks, stops)
-        return used, (toks if k is None else toks[:k]), c, t_first, k is not None
+            with self._stream(reply, render, keepalive=": \n\n") as w:
+                c, t_first = self._answer(engine, reply, ids, max_new, smp, procs, top, messages)
+                if want_usage:  # OpenAI's include_usage: a last chunk with no choices carries the counts
+                    w.put(chunk([], usage=usage(reply)))
+                w.put("data: [DONE]\n\n")
+            self._flex(engine, [t for row in reply.rows for t in row.tokens], c, t0, t_first, time.perf_counter())
+            return None
 
     def _limit(self, req: Request) -> int | None:
         """Ollama's options.num_predict: a cap above 0; -1 (until the turn ends) and -2 (fill the context) as
@@ -1488,24 +1228,16 @@ class Handler(BaseHTTPRequestHandler):
             raise BadValue("options.num_predict", "a whole number (above 0 a cap; -1 or -2 no cap)", n)
         return int(n) if int(n) > 0 else None
 
-    def _stats(
-        self,
-        ids: Tokens,
-        toks: Tokens,
-        c: GenerateStats,
-        t0: float,
-        t_first: float | None,
-        t_end: float,
-        cut: bool = False,
-    ) -> Json:
+    def _stats(self, ids: Tokens, row: Row, t0: float, t_first: float | None, t_end: float) -> Json:
+        """an Ollama answer's closing counts: the tokens it counts are those up to its stop string"""
         ns = lambda s: int(max(0.0, s) * 1e9)
         return {
-            "done_reason": "stop" if cut or len(toks) < int(c.get("cap", 0)) else "length",
+            "done_reason": "length" if row.finish == "length" else "stop",
             "total_duration": ns(t_end - t0),
             "load_duration": 0,
             "prompt_eval_count": len(ids),
             "prompt_eval_duration": ns((t_first or t_end) - t0),
-            "eval_count": len(toks),
+            "eval_count": row.spent,
             "eval_duration": ns(t_end - (t_first or t_end)),
         }
 
@@ -1533,87 +1265,96 @@ class Handler(BaseHTTPRequestHandler):
             bits.append(f"{n / fwd:.2f} tok/pass")
         print("[serve] " + " | ".join(bits), flush=True)
 
+    def _ollama(
+        self,
+        engine: Engine,
+        req: Request,
+        ids: Tokens,
+        messages: Sequence[Message],
+        stream: bool,
+        t0: float,
+        piece: Callable[[str, str], Json],
+        whole: Callable[[Row], Json],
+        last: Json,
+    ) -> None:
+        """an Ollama route's answer: streamed, a line a piece (`piece(kind, text)` its fields) and `last`'s fields
+        closing it; else `whole(row)`'s fields at once; the counts beside the end either way"""
+        opts = _object(req, "options")
+        smp = Sampling.from_request(opts, engine.sampling)
+        procs = _processors({**opts, "format": req.get("format")}, engine, len(ids), json_field="format")
+        reply = Reply(engine.tok, engine.eos, 1, _stops(opts.get("stop"), "options.stop"))
+        max_new, name, row = self._limit(req), engine.name, reply.rows[0]
+        tg = time.perf_counter()
+        if not stream:
+            c, t_first = self._answer(engine, reply, ids, max_new, smp, procs, messages=messages)
+            t_end = time.perf_counter()
+            self._flex(engine, row.tokens, c, tg, t_first, t_end)
+            end = {"done": True, **self._stats(ids, row, t0, t_first, t_end)}
+            return self._json(200, {"model": name, "created_at": _now(), **whole(row), **end})
+        self._stream_head("application/x-ndjson")
+
+        def render(ev: Event) -> str:
+            if ev[0] != "text":
+                return ""
+            return json.dumps({"model": name, "created_at": _now(), **piece(ev[2], ev[3]), "done": False}) + "\n"
+
+        with self._stream(reply, render) as w:
+            c, t_first = self._answer(engine, reply, ids, max_new, smp, procs, messages=messages)
+            t_end = time.perf_counter()
+            end = {"done": True, **self._stats(ids, row, t0, t_first, t_end)}
+            w.put(json.dumps({"model": name, "created_at": _now(), **last, **end}) + "\n")
+        self._flex(engine, row.tokens, c, tg, t_first, t_end)
+        return None
+
     def _ollama_chat(self, req: Request) -> Any:
         messages = [{"role": m.get("role", "user"), "content": _text(m, "content", "")} for m in _messages(req)]
         if not messages:
             return self._json(400, {"error": "messages required"})
-        max_new = self._limit(req)
+        self._limit(req)  # a bad num_predict is refused before the model is taken
         stream = _flag(req, "stream", True)
         t0 = time.perf_counter()
+
+        def piece(kind: str, text: str) -> Json:
+            if kind == "content":
+                return {"message": {"role": "assistant", "content": text}}
+            return {"message": {"role": "assistant", "content": "", "thinking": text}}
+
+        def whole(row: Row) -> Json:
+            return {
+                "message": {
+                    "role": "assistant",
+                    "content": row.content,
+                    **({"thinking": row.thinking} if row.thinking else {}),
+                }
+            }
+
         with self.reg.lock:
             engine = self._engine(req)
             if engine is None:
                 return None
-            name = engine.name
-            opts = _object(req, "options")
-            smp = Sampling.from_request(opts, engine.sampling)
             ids = engine.ids_for(messages)
-            procs = _processors({**opts, "format": req.get("format")}, engine, len(ids), json_field="format")
-            stops = _stops(opts.get("stop"), "options.stop")
-            if not stream:
-                tg = time.perf_counter()
-                ids, toks, c, _t, cut = self._ollama_run(engine, messages, max_new, ids, smp, procs, stops)
-                t_end = time.perf_counter()
-                self._flex(engine, toks, c, tg, None, t_end)
-                text, think = engine.text(toks)
-                text = _cut(text, stops)[0]
-                msg = {"role": "assistant", "content": text}
-                if think:
-                    msg["thinking"] = think
-                return self._json(
-                    200,
-                    {
-                        "model": name,
-                        "created_at": _now(),
-                        "message": msg,
-                        "done": True,
-                        **self._stats(ids, toks, c, t0, None, t_end, cut),
-                    },
-                )
-            self._stream_head("application/x-ndjson")
-
-            def emit(delta: Any, kind: str = "content") -> Any:
-                msg = (
-                    {"role": "assistant", "content": delta}
-                    if kind == "content"
-                    else {"role": "assistant", "content": "", "thinking": delta}
-                )
-                return self._write(
-                    json.dumps({"model": name, "created_at": _now(), "message": msg, "done": False}) + "\n"
-                )
-
-            tg = time.perf_counter()
-            ids, toks, c, t_first, cut = self._ollama_run(engine, messages, max_new, ids, smp, procs, stops, emit)
-            t_end = time.perf_counter()
-            self._flex(engine, toks, c, tg, t_first, t_end)
-            return self._write(
-                json.dumps(
-                    {
-                        "model": name,
-                        "created_at": _now(),
-                        "message": {"role": "assistant", "content": ""},
-                        "done": True,
-                        **self._stats(ids, toks, c, t0, t_first, t_end, cut),
-                    }
-                )
-                + "\n"
-            )
+            last = {"message": {"role": "assistant", "content": ""}}
+            return self._ollama(engine, req, ids, messages, stream, t0, piece, whole, last)
 
     def _ollama_generate(self, req: Request) -> Any:
         prompt = _text(req, "prompt", "") or ""
         system = _text(req, "system")
         raw = _flag(req, "raw", False)
-        max_new = self._limit(req)
+        self._limit(req)  # a bad num_predict is refused before the model is taken
         stream = _flag(req, "stream", True)
         t0 = time.perf_counter()
+
+        def piece(kind: str, text: str) -> Json:
+            return {"response": text} if kind == "content" else {"response": "", "thinking": text}
+
+        def whole(row: Row) -> Json:
+            return {"response": row.content, **({"thinking": row.thinking} if row.thinking else {}), "context": []}
+
         with self.reg.lock:
             engine = self._engine(req)
             if engine is None:
                 return None
-            name = engine.name
-            opts = _object(req, "options")
-            smp = Sampling.from_request(opts, engine.sampling)
-            messages = None
+            messages: list[Message] = []
             if raw:
                 ids = [int(t) for t in engine.tok(prompt, add_special_tokens=False)["input_ids"]]
             else:
@@ -1621,52 +1362,7 @@ class Handler(BaseHTTPRequestHandler):
                     {"role": "user", "content": prompt}
                 ]
                 ids = engine.ids_for(messages)
-            procs = _processors({**opts, "format": req.get("format")}, engine, len(ids), json_field="format")
-            stops = _stops(opts.get("stop"), "options.stop")
-            if not stream:
-                tg = time.perf_counter()
-                ids_used, toks, c, _t, cut = self._ollama_run(engine, messages or [], max_new, ids, smp, procs, stops)
-                t_end = time.perf_counter()
-                self._flex(engine, toks, c, tg, None, t_end)
-                text, think = engine.text(toks)
-                text = _cut(text, stops)[0]
-                return self._json(
-                    200,
-                    {
-                        "model": name,
-                        "created_at": _now(),
-                        "response": text,
-                        **({"thinking": think} if think else {}),
-                        "done": True,
-                        "context": [],
-                        **self._stats(ids_used, toks, c, t0, None, t_end, cut),
-                    },
-                )
-            self._stream_head("application/x-ndjson")
-
-            def emit(delta: Any, kind: str = "content") -> Any:
-                body = {"response": delta} if kind == "content" else {"response": "", "thinking": delta}
-                return self._write(json.dumps({"model": name, "created_at": _now(), **body, "done": False}) + "\n")
-
-            tg = time.perf_counter()
-            ids_used, toks, c, t_first, cut = self._ollama_run(
-                engine, messages or [], max_new, ids, smp, procs, stops, emit
-            )
-            t_end = time.perf_counter()
-            self._flex(engine, toks, c, tg, t_first, t_end)
-            return self._write(
-                json.dumps(
-                    {
-                        "model": name,
-                        "created_at": _now(),
-                        "response": "",
-                        "done": True,
-                        "context": [],
-                        **self._stats(ids_used, toks, c, t0, t_first, t_end, cut),
-                    }
-                )
-                + "\n"
-            )
+            return self._ollama(engine, req, ids, messages, stream, t0, piece, whole, {"response": "", "context": []})
 
 
 class PortInUse(RuntimeError):

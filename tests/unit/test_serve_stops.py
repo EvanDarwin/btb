@@ -15,7 +15,7 @@ import pytest
 
 from btb.engine.hooks import LogitsProcessor
 from btb.sampling import Sampling
-from btb.serve import Message
+from btb.serve import Handler, Message
 from tests.helpers import FakeEngine, FakeRun, post_chat, request, stub_server
 
 EOS = 1
@@ -23,14 +23,10 @@ CALL = 'Reading it.\n<tool_call>\n{"name":"read_file","arguments":{"path":"main.
 TOOLS = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {}}}}]
 
 
-class _SM:
-    def __init__(self) -> None:
-        self.abort = threading.Event()
-
-
 class Scripted(FakeEngine):
     """rows decoded a step at a time: row r's script (a character a token, EOS ending it), then `runaway` to the
-    cap; every step checks the abort, as the engine's loops do, and counts itself in `steps`"""
+    cap; a step checks the request's cancel, a row leaves once `until(row)` says so, as the engine's loops do;
+    `steps` counts the steps and `drawn[r]` row r's tokens"""
 
     eos = (EOS,)
 
@@ -38,8 +34,8 @@ class Scripted(FakeEngine):
         super().__init__("")
         self.scripts = [[ord(c) for c in s] if isinstance(s, str) else list(s) for s in scripts]
         self.cap, self.pause = cap, pause
-        self.sm = _SM()
         self.steps = 0
+        self.drawn: list[int] = []
         self.done = threading.Event()
 
     def run_rows(
@@ -51,29 +47,38 @@ class Scripted(FakeEngine):
         processors: Sequence[LogitsProcessor] = (),
         logprobs: int | None = None,
         on_token: Callable[[int, int], object] | None = None,
+        until: Callable[[int], object] | None = None,
+        cancel: threading.Event | None = None,
     ) -> tuple[list[list[int]], list[bool], dict[str, int], None]:
         try:
-            return self._rows(n, max_new, on_token)
+            return self._rows(n, max_new, on_token, until, cancel)
         finally:
             self.done.set()
 
     def _rows(
-        self, n: int, max_new: int | None, on_token: Callable[[int, int], object] | None
+        self,
+        n: int,
+        max_new: int | None,
+        on_token: Callable[[int, int], object] | None,
+        until: Callable[[int], object] | None,
+        cancel: threading.Event | None,
     ) -> tuple[list[list[int]], list[bool], dict[str, int], None]:
         cap = min(self.cap, max_new or self.cap)
         outs: list[list[int]] = [[] for _ in range(n)]
+        self.drawn = [0] * n
         live = list(range(n))
         for k in range(cap):
-            if self.sm.abort.is_set() or not live:
+            if (cancel is not None and cancel.is_set()) or not live:
                 break
             self.steps += 1
             for r in list(live):
                 sc = self.scripts[r % len(self.scripts)]
                 t = sc[k] if k < len(sc) else ord("z")
                 outs[r].append(t)
+                self.drawn[r] += 1
                 if on_token is not None:
                     on_token(r, t)
-                if t == EOS:
+                if t == EOS or (until is not None and until(r)):
                     live.remove(r)
             time.sleep(self.pause)
         rows = [[t for t in o if t != EOS] for o in outs]
@@ -86,10 +91,15 @@ class Scripted(FakeEngine):
         on_token: Callable[[int], object] | None = None,
         ids: Sequence[int] | None = None,
         sampling: Sampling | None = None,
+        cancel: threading.Event | None = None,
         **_hooks: object,
     ) -> FakeRun:
         rows, _ended, c, _ = self.run_rows(
-            ids or [1, 2, 3], 1, max_new, on_token=None if on_token is None else (lambda _r, t: on_token(t))
+            ids or [1, 2, 3],
+            1,
+            max_new,
+            on_token=None if on_token is None else (lambda _r, t: on_token(t)),
+            cancel=cancel,
         )
         return list(ids or [1, 2, 3]), rows[0], c, None
 
@@ -162,7 +172,7 @@ def test_rows_all_at_a_stop_string_or_their_stop_token_end_the_decode() -> None:
         finally:
             server.close()
         assert status == 200, data
-        assert eng.steps < 50, (stream, eng.steps)
+        assert eng.steps == 6 and eng.drawn == [3, 6], (stream, eng.steps, eng.drawn)
         assert [a[0] for a in _answers(stream, data)] == ["hi", "ab"]
         usage = json.loads(data)["usage"] if not stream else json.loads(data.split("data: ")[-2])["usage"]
         assert usage["completion_tokens"] == 2 + 6, usage
@@ -193,9 +203,12 @@ def _leave_after(server: object, body: dict[str, object], chunks: int) -> None:
         (['Hi.\n<tool_call>\n{"name":"read_file","arguments":{"path":"' + "a" * 400], {"tools": TOOLS}, 4),
     ],
 )
-def test_a_client_gone_stops_the_decode(scripts: list[str], extra: dict[str, object], chunks: int) -> None:
+def test_a_client_gone_stops_the_decode(
+    scripts: list[str], extra: dict[str, object], chunks: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """a client that leaves mid-answer stops the decode at its next step: beside a row already ended, or while a
-    tool call is buffered and nothing is being written"""
+    tool call is buffered and nothing is being written (the keepalive finds it gone)"""
+    monkeypatch.setattr(Handler, "KEEPALIVE", 0.05)
     eng = Scripted(scripts, cap=400, pause=0.005)
     server = stub_server(engine=eng)
     try:
@@ -240,7 +253,8 @@ LONG_ROW = "the other row goes on to its own end" + chr(EOS)
 @pytest.mark.parametrize("stream", [False, True])
 def test_one_row_at_its_stop_string_leaves_the_others_decoding(stream: bool) -> None:
     """row 0 comes to a stop string at its sixth token; row 1 has thirty more to go to its stop token: row 1 is
-    answered whole, row 0 cut, and the decode ends once both are done, not at row 0's stop nor at the cap"""
+    answered whole, row 0 cut and out of the batch at the step that cut it, and the decode ends once both are
+    done, not at the cap"""
     eng = Scripted(["abSTOP" + "z" * 200, LONG_ROW], pause=0.002)
     server = stub_server(engine=eng)
     try:
@@ -250,7 +264,7 @@ def test_one_row_at_its_stop_string_leaves_the_others_decoding(stream: bool) -> 
     assert status == 200, data
     (c0, _, f0), (c1, _, f1) = _answers(stream, data)
     assert (c0, f0) == ("ab", "stop") and (c1, f1) == (LONG_ROW[:-1], "stop")
-    assert len(LONG_ROW) <= eng.steps < len(LONG_ROW) + 40, eng.steps
+    assert eng.drawn == [6, len(LONG_ROW)] and eng.steps == len(LONG_ROW), (eng.drawn, eng.steps)
 
 
 def test_a_request_stopped_early_leaves_the_next_one_whole() -> None:
@@ -263,9 +277,66 @@ def test_a_request_stopped_early_leaves_the_next_one_whole() -> None:
             status, data = post_chat(server, _body(stream, n=2, stop=["STOP"]))
             assert status == 200, data
             assert [a[0] for a in _answers(stream, data)] == ["ab", "xy"]
-            assert not eng.sm.abort.is_set()
             status, data = post_chat(server, _body(stream, n=2))
             assert status == 200, data
             assert [a[0] for a in _answers(stream, data)] == ["abSTOP" + "c" * 30, "xySTOP" + "d" * 30]
     finally:
         server.close()
+
+
+# one request, every way (docs/streaming.md): each row's script, and what its answer must be - its content, its
+# finish, the tokens its usage counts (up to its stop string), and the tokens the decode drew for it (the step its
+# stop came at: a row leaves there)
+X = chr(EOS)
+WAYS = {
+    "its stop token": [("hello there" + X, "hello there", "stop", 11, 12)],
+    "a stop string": [("say STOP then more" + X, "say", "stop", 8, 8)],
+    "a stop string at once": [("STOP and on", "", "stop", 4, 4)],
+    "a stop string's head held back, then let go": [("aSTxSTOP", "aSTx", "stop", 8, 8)],
+    "the cap": [("runs on", "runs onzzzzz", "length", 12, 12)],
+    "rows apart": [
+        ("ab" + X, "ab", "stop", 2, 3),
+        ("cdSTOPef", "cd", "stop", 6, 6),
+        ("gh", "ghzzzzzzzzzz", "length", 12, 12),
+    ],
+}
+
+
+def _ollama(stream: bool, data: str) -> tuple[str, str, int]:
+    """an Ollama chat's (content, done reason, eval count), streamed or not"""
+    lines = [json.loads(ln) for ln in data.splitlines() if ln.strip()] if stream else [json.loads(data)]
+    content = "".join(ln["message"]["content"] for ln in lines)
+    return content.strip(), lines[-1]["done_reason"], lines[-1]["eval_count"]
+
+
+@pytest.mark.parametrize("n", [1, 3])
+@pytest.mark.parametrize("way", WAYS)
+def test_one_request_answered_alike_every_way(way: str, n: int) -> None:
+    """the same request streamed and whole, one answer or three, on OpenAI's route and Ollama's: the same content,
+    finish and usage, and each row drawn up to the step its stop came at and no further"""
+    rows = [WAYS[way][r % len(WAYS[way])] for r in range(n)]
+    want: list[tuple[str, list[str], str | None]] = [(c, [], f) for _s, c, f, _u, _d in rows]
+    for stream in (False, True):
+        eng = Scripted([r[0] for r in rows])
+        server = stub_server(engine=eng)
+        try:
+            body = _body(stream, n=n, stop=["STOP"], max_tokens=12, stream_options={"include_usage": True})
+            status, data = post_chat(server, body)
+            assert status == 200, data
+            assert _answers(stream, data) == want, (stream, data)
+            usage = json.loads(data)["usage"] if not stream else json.loads(data.split("data: ")[-2])["usage"]
+            assert usage["completion_tokens"] == sum(r[3] for r in rows), (stream, usage)
+            assert eng.drawn == [r[4] for r in rows], (stream, eng.drawn)
+            if n == 1:
+                body = {
+                    "model": "fake",
+                    "messages": [{"role": "user", "content": "go"}],
+                    "stream": stream,
+                    "options": {"num_predict": 12, "stop": ["STOP"]},
+                }
+                status, _, data = request(server.url, "POST", "/api/chat", body)
+                assert status == 200, data
+                assert _ollama(stream, data) == (rows[0][1], rows[0][2], rows[0][3]), (stream, data)
+                assert eng.drawn == [rows[0][4]], (stream, eng.drawn)
+        finally:
+            server.close()

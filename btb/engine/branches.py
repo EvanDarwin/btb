@@ -325,11 +325,14 @@ class _Rows:
         logprobs: int | None = None,
         on_pass: OnPass | None = None,
         on_token: OnRowToken | None = None,
+        until: Callable[[int], object] | None = None,
     ) -> BatchGeneration:
         """Decode every live row up to `max_new` tokens, a row leaving the batch at a stop token (`eos`, the
         model's by default). Returns a `Generation` whose tokens (and `logprobs`) are a list a row - empty for a
         row not live. The live rows' last tokens are drawn and not fed (`pending`); hooks as `generate` takes them,
-        and `on_token(row, token)` called with each token drawn."""
+        and `on_token(row, token)` called with each token drawn. `until(row)`, asked of each live row once its
+        token is drawn (and `on_token` has seen it): true, the row leaves the batch there as its stop token would
+        make it - a stop string, a client gone - and the rest go on."""
         self._check()
         from .text import GenerateStats, Generation
 
@@ -348,6 +351,7 @@ class _Rows:
             None if on_pass is None else in_hook(on_pass),
         )
         on_token = None if on_token is None else in_hook(on_token)
+        until = None if until is None else in_hook(until)
         hk.rows(len(self.sess))
         new: list[list[int]] = [[] for _ in self.sess]
         t0 = time.perf_counter()
@@ -386,6 +390,12 @@ class _Rows:
                     hk.record(r, lg[j], t)
                     if on_token is not None:
                         on_token(r, t)
+                if until is not None:
+                    # the caller's say, once the rows' tokens are theirs: a row it is done with leaves here
+                    now = self.live
+                    quit = [b for b, r in enumerate(now) if until(r)]
+                    if quit:
+                        self._leave(quit)
                 if hk.on_pass is not None:
                     hk.on_pass(
                         {

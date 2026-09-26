@@ -430,6 +430,30 @@ def test_a_row_leaves_at_its_stop_token(stem: str, device: str) -> None:
     assert kept.pending == stop and kept.tokens == PROMPT + g.tokens[1]
 
 
+@cells
+@families
+def test_a_row_leaves_when_until_says_so(stem: str, device: str) -> None:
+    """`until(row)` true, the row leaves at the token it has just drawn, as at a stop token - asked once
+    `on_token` has seen that token; the others go on to the cap and draw their own tokens"""
+    sm = model(stem, device)
+    ref = [solo(sm, PROMPT, N, SMP.row(r)) for r in range(3)]
+    seen: list[list[int]] = [[], [], []]
+    asked: list[tuple[int, int]] = []
+
+    def until(r: int) -> bool:
+        asked.append((r, len(seen[r])))
+        return r == 1 and len(seen[r]) == 2
+
+    br = sm.session(PROMPT).fork(3)
+    g = br.generate(N, eos=(), sampling=SMP, on_token=lambda r, t: seen[r].append(t), until=until)
+    assert [len(t) for t in g.tokens] == [N, 2, N] and g.tokens == seen
+    assert br.live == [0, 2] and (1, 3) not in asked
+    if device == "cpu" or br.mode == "rows":
+        assert g.tokens == [ref[0], ref[1][:2], ref[2]]
+    kept = br.keep(1)
+    assert kept.pending == g.tokens[1][-1] and kept.tokens == PROMPT + g.tokens[1]
+
+
 def test_a_forked_session_holds_still() -> None:
     sm = model(STEMS[0], "cpu")
     s = sm.session(PROMPT)

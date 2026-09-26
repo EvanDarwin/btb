@@ -574,10 +574,11 @@ FakeRun = tuple[Tokens, list[int], Json, None]
 
 
 class FakeEngine:
-    """the server's engine as a canned answer: every request gets `out`, a token a character"""
+    """the server's engine as a canned answer: every request gets `out`, a token a character, and its stop token
+    (as the engine's decode reports it; the tokens it returns are without it)"""
 
     name = "fake"
-    eos: tuple[int, ...] = ()
+    eos: tuple[int, ...] = (0,)
     sampling = Sampling()
 
     def __init__(self, out: str) -> None:
@@ -594,11 +595,12 @@ class FakeEngine:
         on_token: Callable[[int], object] | None = None,
         ids: Tokens | None = None,
         sampling: Sampling | None = None,
+        cancel: threading.Event | None = None,
         **_hooks: object,
     ) -> FakeRun:
         toks = [ord(ch) for ch in self._out]
         if on_token is not None:
-            for t in toks:
+            for t in [*toks, *self.eos[:1]]:
                 on_token(t)
         return (ids or [1, 2, 3]), toks, {"cap": 9999, "forwards": 0}, None
 
