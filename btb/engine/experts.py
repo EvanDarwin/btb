@@ -1154,17 +1154,17 @@ class _ExpertStore:
         self._routers[layer] = (mod, w)
         return w
 
-    def _ring_slot(self, sched: Any, cap: int | None = None) -> Any:
+    def _ring_slot(self, sched: Any, cap: int | None = None, skip: Any = ()) -> Any:
         """a slot for a new prediction: the ring grows to `ring_n` slots (a sweep's `cap`) out of the store's free
-        ones (a grown block, or the oldest resident's slot), then reuses its oldest entry - unless that one is still
-        in flight, in which case the ring is full and the prediction is not made"""
+        ones (a grown block, or the oldest resident's slot other than those in `skip`), then reuses its oldest entry
+        - unless that one is still in flight, in which case the ring is full and the prediction is not made"""
         if len(self.ring) < (self.ring_n if cap is None else cap):
             if not self.free and self.live() < self.n_slots:
                 self._grow(1)
             if self.free:
                 s = self.free.pop()
             else:
-                v = self.res.victim()
+                v = self.res.victim(skip)
                 if v is None:
                     return None
                 key, s = v
@@ -1219,6 +1219,9 @@ class _ExpertStore:
             # the drive is delivering under half the probe's rate right now: the same arithmetic, live
             return 0
         cap = max(self.ring_n, int(self.n_slots) - int(sweep) - 64) if sweep else None
+        # a sweep reads ahead after the layer's own call was handed its slots and before the call has read them: the
+        # ring must not take one, or a prediction lands in the bytes the call is about to multiply
+        skip = set(self.last_slots.values()) if sweep else ()
         n = 0
         prof = getattr(self.sm, "expert_profile", None)
         for d, k in enumerate(ks, start=1):
@@ -1257,7 +1260,7 @@ class _ExpertStore:
                 key = (target, int(e))
                 if key in self.res or key in self.ahead or (self.vram is not None and key in self.vram):
                     continue
-                s = self._ring_slot(sched, cap)
+                s = self._ring_slot(sched, cap, skip)
                 if s is None:
                     return n
                 parts_f = self._submit(sched, parts, int(e), s, target, sched.DISK_AHEAD + d - 1)

@@ -178,3 +178,43 @@ def test_the_switch_names_the_reference() -> None:
             os.environ.pop("BTB_PREFILL_LAYERS", None)
         else:
             os.environ["BTB_PREFILL_LAYERS"] = old
+
+
+def test_the_prefill_lookahead_never_takes_the_calls_own_slots() -> None:
+    """layer 0's call holds its slots, the store has no free one and the ring may grow over all of it: the sweep's
+    predictions for layer 1 evict other riders, never the call's own - a prediction read into one would land in the
+    bytes the call is about to multiply (it once did, and a 180B prefill's routing collapsed)"""
+    L = layer_count(fixture("tiny_q4"))
+    StreamedTextModel.register_attention()
+    sm = StreamedTextModel(
+        fixture("tiny_q4"),
+        resident_head=True,
+        log=NO_LOG,
+        device="cpu",
+        cpu_layers=range(L),
+        compute_dtype=torch.float32,
+        prefill_chunk=3,
+    )
+    try:
+        with torch.inference_mode():
+            sm._prefill(torch.tensor([_prompt()]), sm.new_cache())
+            store = sm.expert_store
+            assert store is not None and store.per is not None
+            ex = sm.host[0].mlp.experts
+            ids = list(range(int(ex.num_experts)))
+            views, pending = store.get(0, ex.base, ids, keep=True, rows=len(ids))
+            store.wait(pending)
+            held = set(store.last_slots.values())
+            # the store down to layer 0's call alone: every other rider off it, no free slot, no room to grow - the
+            # ring can grow only by evicting, and only the call's own riders are left to evict
+            for key, _s in list(store.res.items()):
+                if key[0] != 0:
+                    store.res.pop(key)
+            store.free.clear()
+            store.n_slots = store.live()
+            store.ring_n = store.n_slots
+            h = torch.randn(len(ids), int(sm.cfg.hidden_size))
+            made = store.lookahead(0, h, sweep=len(ids))
+            assert not (set(store.ring) & held), (sorted(set(store.ring) & held), made)
+    finally:
+        sm.close()
