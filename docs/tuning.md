@@ -154,6 +154,7 @@ ignored elsewhere.
 | `BTB_PREFILL_LAYERS` | 1 | a mixture's chunked prefill layer by layer (each expert read once a prompt); `0` takes the chunks through every layer in turn |
 | `BTB_PREFILL_DEPOT` | 1 | card: a layer's experts held on the card across the chunks of a layer-by-layer prefill; `0` uploads them each chunk |
 | `BTB_PREFILL_AHEAD` | 1 | a layer-by-layer prefill reads the next layer's experts from the drive while a layer's chunks compute; `0` reads each layer's when it asks |
+| `BTB_GROUPED_EXPERTS` | 1 | card: a prefill's expert calls as grouped matmuls over the depot's slots, a few launches a call (the per-expert loop's bits); `0` keeps the loop |
 | `BTB_PREFILL_STAGE` | 1 | card: the depot's uploads go through a small ring of pinned buffers (the store's pages are pageable); `0` uploads from the store's pages |
 
 The store, the lookahead, the residency policy, and the readers are covered in full in

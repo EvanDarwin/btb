@@ -338,8 +338,11 @@ class LayerDepot:
     matmuls; the compute waits on that expert's copy alone. A new layer takes the slots over once the card is
     done with the last one's. The weights are the store's bf16 bytes as they are, so a product over a seated
     expert is the one the call's own upload (`w.to(card).to(x.dtype)`) gives. Slots are bounded by `cap` bytes;
-    past them an expert rides one of two scratch slots, on the same copy stream: uploaded again by every chunk
+    past them an expert rides one of the scratch slots, on the same copy stream: uploaded again by every chunk
     that asks, but under the matmuls rather than as a pageable copy that waits for the card to drain.
+
+    The slots are one stacked tensor a layer, so a call's experts go to the card in waves (`place`) and each wave
+    is one grouped matmul over the stack: a slot's rows its expert's, an idle slot none.
 
     The store's pages are pageable (and on Windows a pinned store is refused), so a copy from them holds the host
     until it lands, at the driver's pageable rate. Each upload goes through a small ring of pinned buffers instead:
@@ -347,7 +350,7 @@ class LayerDepot:
     the pinned rate while the host moves on; a buffer is filled again once its last copy out has landed.
     `BTB_PREFILL_STAGE=0`, or a machine that will not pin the ring, uploads from the store's pages."""
 
-    SCRATCH = 2
+    SCRATCH = 32
     STAGE = 4
 
     def __init__(self, dev: torch.device, cap: int) -> None:
@@ -365,6 +368,8 @@ class LayerDepot:
         self.lent: int | None = None
         self.free: list[torch.cuda.Event | None] = [None] * self.SCRATCH
         self.stat: dict[str, float] = {"seated": 0, "reused": 0, "scratch": 0, "passed": 0, "bytes": 0, "upload_s": 0.0}
+        # a wave took the scratch slots over: the next `get` to take one waits for the card to finish what came before
+        self.fence_scratch = False
         self.stage: list[tuple[torch.Tensor, torch.Tensor]] | None = None
         self.stage_done: list[torch.cuda.Event | None] = [None] * self.STAGE
         self.stage_turn = 0
@@ -453,11 +458,69 @@ class LayerDepot:
         ev = self.free[j]
         if ev is not None:
             self.copy.wait_event(ev)
+        if self.fence_scratch:
+            done = torch.cuda.Event()
+            done.record(main)
+            self.copy.wait_event(done)
+            self.fence_scratch = False
         s = self.n_seats + j
         self._upload(s, gu, dn, main)
         self.lent = j
         self.stat["scratch"] += 1
         return self.gu[s], self.dn[s]
+
+    def place(self, layer: int, items: Sequence[tuple[int, Any, Any]]) -> list[int | None]:
+        """A wave of a call's experts on the card together, for one grouped matmul over the slots: each expert's slot
+        - its seat, seated now, or a scratch slot - in the order given, or None where it has no place this wave (the
+        scratch is taken, or the stored form is not one the card's matmul takes). The uploads are queued, the card's
+        compute waits on each; the scratch is this wave's once the card is done with everything queued before it."""
+        main = torch.cuda.current_stream(self.dev)
+        before = torch.cuda.Event()
+        before.record(main)
+        if layer != self.layer:
+            # the last layer's slots are the card's until its queued matmuls have read them
+            self.copy.wait_event(before)
+            self.layer, self.seat = layer, {}
+        out: list[int | None] = []
+        scratch = 0
+        fenced = False
+        for e, gu, dn in items:
+            if not (isinstance(gu, torch.Tensor) and isinstance(dn, torch.Tensor)) or gu.device.type != "cpu":
+                self.stat["passed"] += 1
+                out.append(None)
+                continue
+            s = self.seat.get(e)
+            if s is not None:
+                self.stat["reused"] += 1
+                out.append(s)
+                continue
+            if (self.gu is None and not self._open(gu, dn)) or (
+                self.gu is not None
+                and (self.gu.shape[1:] != gu.shape or self.dn is None or self.dn.shape[1:] != dn.shape)
+            ):
+                self.stat["passed"] += 1
+                out.append(None)
+                continue
+            if len(self.seat) < self.n_seats:
+                s = self.seat[e] = len(self.seat)
+                self._upload(s, gu, dn, main)
+                self.stat["seated"] += 1
+                out.append(s)
+                continue
+            if scratch < self.SCRATCH:
+                if not fenced:
+                    self.copy.wait_event(before)
+                    fenced = True
+                s = self.n_seats + scratch
+                scratch += 1
+                self._upload(s, gu, dn, main)
+                self.stat["scratch"] += 1
+                out.append(s)
+                continue
+            out.append(None)
+        if scratch:
+            self.fence_scratch = True
+        return out
 
     def settle(self) -> None:
         """every queued copy landed: the store may hand the host bytes behind them to another expert after this"""

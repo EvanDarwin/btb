@@ -123,6 +123,7 @@ class _State:
     prefill_card: bool
     prefill_card_min: int
     prefill_layers: bool
+    grouped_experts: bool
     sparse: bool
     resident: dict[int, Any]
     resident_fp32: bool

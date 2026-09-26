@@ -38,11 +38,13 @@ def _prefill(layers: bool, ids: list[int], **kw: Any) -> tuple[torch.Tensor, dic
         fixture("tiny_q4"),
         resident_head=True,
         log=lambda *a, **k: log.append(" ".join(str(x) for x in a)),
-        compute_dtype=torch.float32,
-        **kw,
+        compute_dtype=kw.pop("compute_dtype", torch.float32),
+        **{k: v for k, v in kw.items() if k != "grouped"},
     )
     try:
         sm.prefill_layers = layers
+        if "grouped" in kw:
+            sm.grouped_experts = bool(kw["grouped"])
         with torch.inference_mode():
             cache = sm.new_cache()
             lg = sm._prefill(torch.tensor([ids]), cache)[0, -1].float().cpu()
@@ -146,6 +148,70 @@ def test_grouped_picks_are_the_per_expert_lookup() -> None:
             pos, row = torch.where(mask[e])
             a, n = offs[e], counts[e]
             assert torch.equal(pos_s[a : a + n], pos) and torch.equal(row_s[a : a + n], row), (T, E, k, e)
+
+
+def _grouped_vs_loop(kw: dict[str, Any]) -> int:
+    """the layer-by-layer prefill with a call's experts as grouped matmuls against the per-expert loop, bit for bit;
+    how many calls went grouped"""
+    from btb.engine.host import _Experts
+
+    calls = [0]
+    inner = _Experts._card_grouped
+
+    def counted(self: Any, *a: Any, **k: Any) -> Any:
+        calls[0] += 1
+        return inner(self, *a, **k)
+
+    ids = _prompt()
+    ref, ref_cache, _ = _prefill(True, ids, prefill_chunk=3, grouped=False, **kw)
+    _Experts._card_grouped = counted  # type: ignore[method-assign]
+    try:
+        got, got_cache, _ = _prefill(True, ids, prefill_chunk=3, grouped=True, **kw)
+    finally:
+        _Experts._card_grouped = inner  # type: ignore[method-assign]
+    assert torch.equal(got, ref), f"logits part by {float((got - ref).abs().max()):.3e}"
+    assert set(got_cache) == set(ref_cache)
+    for name, t in ref_cache.items():
+        assert torch.equal(got_cache[name], t), f"{name} parts by {float((got_cache[name] - t).abs().max()):.3e}"
+    return calls[0]
+
+
+def test_grouped_experts_are_the_loops_bits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """a call's experts as grouped matmuls over the depot's slots give the per-expert loop's bits: the logits and
+    every cache tensor of a bf16 prefill whose expert calls all take the card's path"""
+    dev = need_cuda()
+    from btb.engine.native import Native
+
+    L = layer_count(fixture("tiny_q4"))
+    StreamedTextModel.register_attention()
+    monkeypatch.setattr(Native, "gemm_rows", 2)
+    kw = {"device": dev, "cpu_layers": range(L - 2), "resident_layers": range(L - 2, L), "prefill_card": True}
+    n = _grouped_vs_loop({**kw, "prefill_card_min": 1, "prefetch": True, "compute_dtype": torch.bfloat16})
+    assert n > 0, "no call took the grouped path"
+
+
+def test_grouped_waves_through_a_small_scratch_are_the_loops_bits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """a depot of one seat and two scratch slots: a call's experts go in several waves, each taking the scratch over
+    once the card is done with the last, and the bits stay the loop's"""
+    dev = need_cuda()
+    from btb.engine.experts import LayerDepot
+    from btb.engine.native import Native
+
+    def one_seat(self: LayerDepot, gu: torch.Tensor, dn: torch.Tensor) -> bool:
+        n = self.SCRATCH + 1
+        self.gu = torch.empty((n, *gu.shape), dtype=gu.dtype, device=self.dev)
+        self.dn = torch.empty((n, *dn.shape), dtype=dn.dtype, device=self.dev)
+        self.n_seats = 1
+        return True
+
+    L = layer_count(fixture("tiny_q4"))
+    StreamedTextModel.register_attention()
+    monkeypatch.setattr(Native, "gemm_rows", 2)
+    monkeypatch.setattr(LayerDepot, "SCRATCH", 2)
+    monkeypatch.setattr(LayerDepot, "_open", one_seat)
+    kw = {"device": dev, "cpu_layers": range(L - 2), "resident_layers": range(L - 2, L), "prefill_card": True}
+    n = _grouped_vs_loop({**kw, "prefill_card_min": 1, "prefetch": True, "compute_dtype": torch.bfloat16})
+    assert n > 0, "no call took the grouped path"
 
 
 def test_short_last_chunk_stays_on_the_host() -> None:

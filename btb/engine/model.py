@@ -172,6 +172,9 @@ class StreamedTextModel(
         # a mixture's chunked prefill layer by layer (each expert read once a prompt); 0 takes the chunks through
         # every layer in turn, the path it replaced and its bits' reference
         self.prefill_layers = os.environ.get("BTB_PREFILL_LAYERS", "1") != "0"
+        # a prefill's expert calls on the card as grouped matmuls over the depot's slots, the per-expert loop's bits;
+        # 0 keeps the loop
+        self.grouped_experts = os.environ.get("BTB_GROUPED_EXPERTS", "1") != "0"
         # Qwen4's sparse attention picks its blocks for every row in one pass (`--sparse`): not the reference's
         # mask bit for bit at a near-tie; off, the selection is the reference's exactly (qsa.py)
         self.sparse = bool(sparse)

@@ -5,6 +5,7 @@ the MoE router and experts, and the n-gram proposer's row table."""
 from __future__ import annotations
 
 import time
+from itertools import accumulate
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -480,6 +481,74 @@ class _Experts(torch.nn.Module):
             return torch.nn.functional.linear(x.float(), w.float()).to(x.dtype)
         return torch.nn.functional.linear(x, w.to(x.device, non_blocking=True).to(x.dtype))
 
+    def _depot_for(self, x: torch.Tensor, on_host: bool) -> Any:
+        """the depot of a layer-by-layer prefill on the card, where this call's rows are on the card"""
+        return getattr(self.sm, "_depot", None) if (not on_host and x.device.type == "cuda") else None
+
+    def _grouped_ok(self, x: torch.Tensor) -> bool:
+        """whether a call's experts can go as grouped matmuls over the depot's slots: plain bf16 experts (no stored
+        form of their own, no biases, the family's own gate) over bf16 rows, where the torch build has the grouped
+        matmul (`BTB_GROUPED_EXPERTS=0` keeps the per-expert loop, the bits' reference)"""
+        return (
+            x.dtype == torch.bfloat16
+            and not (self.mx or self.f8 or self.biased or self.gate is not None)
+            and bool(getattr(self.sm, "grouped_experts", False))
+            and hasattr(torch, "_grouped_mm")
+        )
+
+    def _card_grouped(
+        self,
+        x: torch.Tensor,
+        w_top: torch.Tensor,
+        top_k_index: torch.Tensor,
+        hit: Any,
+        views: Any,
+        pending: Any,
+        store: Any,
+        depot: Any,
+        final: torch.Tensor,
+    ) -> None:
+        """A call's experts on the card as grouped matmuls over the depot's stacked slots, a wave at a time: the
+        experts already in RAM, then each batch as it lands from the drive, each wave placed on the card
+        (`LayerDepot.place`) and multiplied as one gate_up, one gate and one down over the slots it took - a few
+        launches a wave where the per-expert loop took ~10 an expert. A slot's rows are its expert's in the order
+        `torch.where` lists them, and the grouped matmul's product over them is the per-expert one bit for bit on
+        the card, so each (row, pick) contribution is the loop's. They are summed as the loop sums them: each row's
+        in ascending expert order, from zero, one add at a time (a row's picks are distinct, so its k
+        contributions fill `k` places, ranked by expert)."""
+        T, k = int(top_k_index.shape[0]), int(top_k_index.shape[1])
+        pos_s, row_s, offs, counts = group_picks(top_k_index, self.num_experts)
+        ranks = torch.argsort(torch.argsort(top_k_index, dim=1), dim=1)
+        buf = torch.empty(T, k, x.shape[-1], dtype=final.dtype, device=x.device)
+
+        def wave(items: list[tuple[int, Any, Any]]) -> None:
+            while items:
+                slots = depot.place(self.layer, items)
+                placed = sorted((sl, e) for (e, _gu, _dn), sl in zip(items, slots, strict=True) if sl is not None)
+                if not placed:
+                    raise RuntimeError(f"[experts] layer {self.layer}: no expert of the wave has a place on the card")
+                per_slot = [0] * int(depot.gu.shape[0])
+                rows_l, poss_l = [], []
+                for sl, e in placed:
+                    a, n = offs[e], counts[e]
+                    per_slot[sl] = n
+                    rows_l.append(row_s[a : a + n])
+                    poss_l.append(pos_s[a : a + n])
+                rows, poss = torch.cat(rows_l), torch.cat(poss_l)
+                ends = torch.tensor(list(accumulate(per_slot)), dtype=torch.int32).to(x.device, non_blocking=True)
+                h = torch._grouped_mm(x.index_select(0, rows), depot.gu.transpose(1, 2), offs=ends)
+                h = self._act(h, None)
+                y = torch._grouped_mm(h, depot.dn.transpose(1, 2), offs=ends)
+                buf[rows, ranks[rows, poss]] = (y * w_top[rows, poss, None]).to(buf.dtype)
+                items = [it for it, sl in zip(items, slots, strict=True) if sl is None]
+
+        wave([(e, *views[e]) for e in hit if e in views])
+        for batch in store.landed(pending) if pending else ():
+            wave([(e, *store._views(s)) for e, _f, s in batch])
+        depot.settle()
+        for j in range(k):
+            final.add_(buf[:, j])
+
     def forward(
         self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
     ) -> torch.Tensor:
@@ -558,10 +627,16 @@ class _Experts(torch.nn.Module):
             self._mlx_forward(x, w_top, expert_mask, hit, views, pending, store, final)
         elif grouped:
             self._one_row(x, w_top, top_k_index, hit, views, pending, store, final, hidden_states if on_host else None)
+        elif (
+            (depot := self._depot_for(x, on_host)) is not None
+            and self._grouped_ok(x)
+            and all(isinstance(v[0], torch.Tensor) and v[0].device.type == "cpu" for v in views.values())
+        ):
+            self._card_grouped(x, w_top, top_k_index, hit, views, pending, store, depot, final)
         else:
             contrib = {}
             # a prefill sweeping this layer's chunks on the card: the layer's experts cross the bus once for them all
-            depot = getattr(self.sm, "_depot", None) if (not on_host and x.device.type == "cuda") else None
+            depot = self._depot_for(x, on_host)
             # rows on the card: every expert's rows found by one sort there, not a host lookup and a copy an expert,
             # each of which waited for the card to finish what was queued before it
             groups = group_picks(top_k_index, self.num_experts) if x.device.type != "cpu" else None
