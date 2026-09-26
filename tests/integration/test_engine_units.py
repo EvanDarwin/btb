@@ -668,15 +668,20 @@ def test_speculative_is_the_greedy_answer_on_the_card_with_the_ngram_tree() -> N
     with loaded_model(fixture("tiny_qwen3"), device=dev, cpu_layers=0) as sm:
         assert sm.tree_budget > 0 and not sm.host, "the tree only draws when the card holds every layer"
         with torch.inference_mode():
-            greedy, census = _exactly_greedy(sm, REPEATING, 48)
+            # the orders made to disagree whatever the fixture's weights answer (the prompt's own n-grams part only
+            # while the answer happens to re-enter them): the answer banked, so every longer order continues it
+            # right, then a span a token of it followed by one the answer never draws, which takes over the order-1
+            # keys alone (the last span banked under a key is the one proposed). Every pass then holds two chains -
+            # the right one and a one-token wrong branch - merged into a tree whose wrong node is drafted, rejected
+            # and cropped
+            answer = [int(t) for t in sm.generate_greedy(REPEATING, 48)]
+            seen = set(answer) | set(REPEATING[0])
+            wrong = next(t for t in range(int(sm.cfg.vocab_size)) if t not in seen)
+            spans = [("right", answer)] + [("misleading", [t, wrong]) for t in sorted(set(answer))]
+            greedy, census = _exactly_greedy(sm, REPEATING, 48, spans=spans)
+            assert greedy == answer
             assert "ngram_tree" in census["by_source"]["drafted"], f"no tree was built: {census['by_source']}"
             assert census["proposed"] > census["accepted"], "every node was accepted: the crop never ran"
-            # a banked sequence that disagrees with the answer: the drafter trusts it, the verify must not
-            bad = list(greedy)
-            for i in (5, 17, 31):
-                bad[i] = (bad[i] + 1) % int(sm.cfg.vocab_size)
-            spec, _c = _exactly_greedy(sm, REPEATING, 48, spans=[("misleading", bad)])
-            assert spec == greedy, "a misleading draft changed the answer"
 
 
 @pytest.mark.parametrize("stem", ["tiny_qwen3", "tiny_q35"])

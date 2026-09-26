@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from btb.engine import StreamedTextModel
+from btb.engine import device as device_mod
 from btb.engine.cache import ForkLayer, GrowLayer
 from btb.engine.device import Device
 from btb.engine.host import _HostLinear
@@ -38,11 +39,15 @@ def sm(request: pytest.FixtureRequest) -> Iterator[StreamedTextModel]:
         yield m
 
 
-def squeeze(sm: StreamedTextModel, left: int) -> None:
-    """leave `left` bytes free on the host, as btb counts it"""
+def squeeze(sm: StreamedTextModel, left: int, mp: pytest.MonkeyPatch) -> None:
+    """leave `left` bytes free on the host, as btb counts it: the host's free RAM pinned at its reading here, as
+    MLX's ledger is its own already - measured against a live reading, any other process's allocation took the
+    last bytes and a decode the test expects to run was refused"""
     if sm.mlx is not None:
         sm.ram_reserve = int(sm.mem_start) - int(sm.mlx.held_bytes()) - left
     else:
+        now = device_mod.host_free_bytes()
+        mp.setattr(device_mod, "host_free_bytes", lambda: now)
         sm.ram_reserve += max(0, sm.memory()["cpu"].free - left)
 
 
@@ -83,11 +88,13 @@ def test_a_lent_tensor_is_a_plain_tensor_counted_while_it_lives(sm: StreamedText
     assert torch.equal(sm.zeros(3, dtype=torch.int64), torch.zeros(3, dtype=torch.int64))
 
 
-def test_a_refusal_names_the_request_and_leaves_the_model_answering(sm: StreamedTextModel) -> None:
+def test_a_refusal_names_the_request_and_leaves_the_model_answering(
+    sm: StreamedTextModel, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """asked for more than btb can give, it gives up what it holds - warm layers to the drive - and refuses,
     naming the request; the model decodes the same tokens from the drive"""
     ref = list(sm.generate(PROMPT, 6, eos=(), speculate=False).tokens)
-    squeeze(sm, MiB)
+    squeeze(sm, MiB, monkeypatch)
     with pytest.raises(MemoryGrantError, match=r"shape \[67108864\].*64\.0 MiB"):
         sm.empty(64 * MiB, dtype=torch.uint8)
     assert sm.cold == set(range(sm.L))
@@ -133,7 +140,7 @@ def test_a_cache_growth_makes_room_instead_of_refusing(monkeypatch: pytest.Monke
         ref = sm.session(PROMPT).logits
         assert ref is not None
         keep = sm.ram_reserve
-        squeeze(sm, 0)
+        squeeze(sm, 0, monkeypatch)
         with monkeypatch.context() as mp:
             mp.setattr(sm, "cache_room", lambda cache, B, T: None)
             with pytest.raises(MemoryGrantError, match="only"):
@@ -154,7 +161,7 @@ def test_a_pinned_placement_makes_no_room_for_growth(monkeypatch: pytest.MonkeyP
     refuses what does not fit"""
     with loaded_model(fixture("tiny_qwen3"), device="cpu", adapt=False) as sm:
         assert not sm.adapt and not sm.ram_watch and not sm.vram_watch
-        squeeze(sm, 0)
+        squeeze(sm, 0, monkeypatch)
         gave: list[int] = []
 
         def give(dev: torch.device, short: int, tried: set[str]) -> bool:
@@ -371,12 +378,12 @@ def test_a_layer_grown_back_on_mlx_holds_its_own_weights() -> None:
         assert list(sm.generate(PROMPT, 6, eos=(), speculate=False).tokens) == ref
 
 
-def test_what_a_refusal_shed_grows_back_once_there_is_room() -> None:
+def test_what_a_refusal_shed_grows_back_once_there_is_room(monkeypatch: pytest.MonkeyPatch) -> None:
     """MLX runs no host memory policy, so the layers making room shed are grown back by the lending policy"""
     need_mlx()
     with loaded_model(fixture("tiny_qwen3"), device="mlx") as sm:
         keep = sm.ram_reserve
-        squeeze(sm, MiB)
+        squeeze(sm, MiB, monkeypatch)
         with pytest.raises(MemoryGrantError):
             sm.empty(64 * MiB, dtype=torch.uint8)
         assert sm.cold

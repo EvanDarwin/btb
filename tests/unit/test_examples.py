@@ -80,10 +80,20 @@ def test_batch_answers_every_prompt_in_one_epoch_off_the_card() -> None:
     assert r["batch"] == 3
 
 
-def test_spans_are_verified_to_the_greedy_answer() -> None:
+def test_spans_are_verified_to_the_greedy_answer(monkeypatch: pytest.MonkeyPatch) -> None:
     """the banked drafts never change the answer; they are accepted only where the answer has variety (a
     random fixture answers a byte-range prompt with one token, and the proposer drops a constant chain by
-    design: test_engine_units certifies the acceptance on chosen ids)"""
+    design: test_engine_units certifies the acceptance on chosen ids). The host's pass-cost curve is pinned flat:
+    timed at warm-up on a busy machine it prices a wide pass past a step's, the budget closes to one row and
+    nothing is drafted - whether the drafts run is then the machine's load, not the example's claim"""
+    from btb.engine import StreamedTextModel
+
+    def flat(self: StreamedTextModel, ids: object, t_max: int | None = None) -> int:
+        n = max(1, min(int(t_max or self._spec_full()), 16))
+        self._host_cost = dict.fromkeys(range(1, n + 1), 1.0)
+        return n
+
+    monkeypatch.setattr(StreamedTextModel, "host_warm", flat)
     r = _run("spans", "--new", "24")
     assert r["identical"] and r["stats"]["forwards"] >= 1
     if len(set(r["tokens"])) > 1:
