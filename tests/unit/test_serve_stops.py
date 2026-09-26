@@ -232,3 +232,40 @@ def test_ollama_names_a_stop_string_on_the_last_token_a_stop() -> None:
     assert status == 200, data
     got = json.loads(data)
     assert got["message"]["content"] == "ab" and got["done_reason"] == "stop"
+
+
+LONG_ROW = "the other row goes on to its own end" + chr(EOS)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_one_row_at_its_stop_string_leaves_the_others_decoding(stream: bool) -> None:
+    """row 0 comes to a stop string at its sixth token; row 1 has thirty more to go to its stop token: row 1 is
+    answered whole, row 0 cut, and the decode ends once both are done, not at row 0's stop nor at the cap"""
+    eng = Scripted(["abSTOP" + "z" * 200, LONG_ROW], pause=0.002)
+    server = stub_server(engine=eng)
+    try:
+        status, data = post_chat(server, _body(stream, n=2, stop=["STOP"]))
+    finally:
+        server.close()
+    assert status == 200, data
+    (c0, _, f0), (c1, _, f1) = _answers(stream, data)
+    assert (c0, f0) == ("ab", "stop") and (c1, f1) == (LONG_ROW[:-1], "stop")
+    assert len(LONG_ROW) <= eng.steps < len(LONG_ROW) + 40, eng.steps
+
+
+def test_a_request_stopped_early_leaves_the_next_one_whole() -> None:
+    """a request whose every row came to its stop string stopped the decode; the next request, with none, decodes
+    to its own end - the stop is not carried over to it"""
+    eng = Scripted(["abSTOP" + "c" * 30 + chr(EOS), "xySTOP" + "d" * 30 + chr(EOS)], pause=0.002)
+    server = stub_server(engine=eng)
+    try:
+        for stream in (True, False):
+            status, data = post_chat(server, _body(stream, n=2, stop=["STOP"]))
+            assert status == 200, data
+            assert [a[0] for a in _answers(stream, data)] == ["ab", "xy"]
+            assert not eng.sm.abort.is_set()
+            status, data = post_chat(server, _body(stream, n=2))
+            assert status == 200, data
+            assert [a[0] for a in _answers(stream, data)] == ["abSTOP" + "c" * 30, "xySTOP" + "d" * 30]
+    finally:
+        server.close()

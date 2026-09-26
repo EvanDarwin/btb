@@ -5,6 +5,7 @@ CPU, plus the processors they map to on their own."""
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
@@ -249,3 +250,35 @@ def test_a_prefix_constraint_takes_any_recognizer() -> None:
     assert allowed == [ord(c) for c in "0123456789"]
     allowed = torch.isfinite(proc([ord("7"), ord("1")], torch.zeros(128))).nonzero().flatten().tolist()
     assert allowed == [stop, *(ord(c) for c in "0123456789")]
+
+
+def _leave_after(served: tuple[Server, str], chunks: int, **fields: object) -> None:
+    """a streamed request whose client reads `chunks` chunks and goes"""
+    server, name = served
+    host, port = server.url.split("//", 1)[1].split(":")
+    c = http.client.HTTPConnection(host, int(port), timeout=30)
+    body = {"model": name, "messages": MSGS, "stream": True, **fields}
+    c.request("POST", "/v1/chat/completions", json.dumps(body), {"Content-Type": "application/json"})
+    r = c.getresponse()
+    assert r.status == 200
+    got = 0
+    while got < chunks:
+        line = r.fp.readline()
+        assert line, "the stream ended early"
+        got += line.startswith(b"data: {")
+    r.close()
+    c.close()
+
+
+def test_requests_cut_short_leave_the_session_to_answer_the_next_whole(served: tuple[Server, str]) -> None:
+    """the server's session goes on across requests; one cut short - a client gone mid-answer at n=2 and at n=1,
+    every row at a stop string - leaves it holding what it can reuse, so the next request answers as it would
+    have with none of them before it"""
+    ref = chat(served, max_tokens=8)["choices"][0]["message"]["content"]
+    _leave_after(served, 3, n=2, max_tokens=40)
+    _leave_after(served, 3, max_tokens=40)
+    first = chat(served, max_tokens=8)["choices"][0]["message"]["content"]
+    cut = chat(served, n=2, max_tokens=40, stop=[first[1:3]] if len(first) > 2 else None)
+    assert all(c["finish_reason"] in ("stop", "length") for c in cut["choices"])
+    assert first == ref
+    assert chat(served, max_tokens=8)["choices"][0]["message"]["content"] == ref
