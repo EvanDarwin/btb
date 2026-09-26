@@ -5,6 +5,7 @@ caller makes on it: feed tokens, mark a point, rewind to one, fork into rows."""
 from __future__ import annotations
 
 import contextlib
+import weakref
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypedDict, Unpack, overload
@@ -93,11 +94,23 @@ class Session:
         # `feed`, the next token's logits [V]
         self.pending: int | None = None
         self.logits: torch.Tensor | None = None
-        self.forked: _Rows | None = None  # the live `Branches` or `Batch` over this session, which holds it still
+        self._forked: weakref.ref[_Rows] | None = None
         # where a decode under way goes back to should it fail: the rows `_open` kept, and a hybrid's states there
         self._undo: tuple[int, dict[int, LinSnap] | None] | None = None
         # the next token's logits a decode reusing every row takes in place of a prefill (`_open`'s `whole`)
         self._held: torch.Tensor | None = None
+
+    @property
+    def forked(self) -> _Rows | None:
+        """the live `Branches` or `Batch` over this session, which holds it still. Held weakly: one dropped unclosed
+        is one closed - the session goes on from where it was forked, or where it joined a batch (a row the batch
+        wrote back as it left stays; `close` writes the rest)"""
+        ref = self._forked
+        return ref() if ref is not None else None
+
+    @forked.setter
+    def forked(self, rows: _Rows | None) -> None:
+        self._forked = weakref.ref(rows) if rows is not None else None
 
     @property
     def fresh(self) -> bool:

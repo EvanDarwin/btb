@@ -7,11 +7,13 @@ in different orders, so there logits are held to a tolerance and tokens only whe
 from __future__ import annotations
 
 import contextlib
+import gc
 from collections.abc import Iterator, Sequence
 from typing import Unpack
 
 import pytest
 import torch
+from transformers.cache_utils import CacheLayerMixin
 
 from btb.engine import StreamedTextModel
 from btb.engine.hooks import HookArgs, PassStats
@@ -629,4 +631,123 @@ def test_a_session_that_left_a_batch_joins_it_again(stem: str) -> None:
         assert bt.join(b) == 2 and bt.live == [0, 2]
         bt.step([4, 5])
     assert a.tokens == PROMPT + [1, 4] and b.tokens == OTHER + [2, 3, 5]
+    in_step(sm, b)
+
+
+# -- a fork's and a batch's lifecycle ----------------------------------------------------------------------------------
+
+
+@families
+def test_a_fork_closed_after_a_row_left_leaves_the_session_where_it_forked(stem: str) -> None:
+    sm = model(stem, "cpu")
+    s = sm.session(PROMPT)
+    br = s.fork(3)
+    br.step([1, 2, 3])
+    br.leave(1)
+    br.step([4, 5])
+    br.close()
+    assert s.forked is None and s.tokens == PROMPT and br.live == []
+    with pytest.raises(ValueError, match="closed"):
+        br.step([1, 2])
+    in_step(sm, s)
+
+
+@families
+def test_a_reorder_after_a_row_left_is_refused_and_the_fork_goes_on(stem: str) -> None:
+    sm = model(stem, "cpu")
+    br = sm.session(PROMPT).fork(3)
+    br.step([1, 2, 3])
+    br.leave(1)
+    with pytest.raises(ValueError, match="reorder"):
+        br.reorder([0, 0])
+    lg = br.step([4, 5])
+    close(lg[1], sm.session(PROMPT + [3]).feed([5])[-1], "cpu")
+    kept = br.keep(2)
+    assert kept.tokens == PROMPT + [3, 5]
+    in_step(sm, kept)
+
+
+@families
+def test_a_keep_whose_write_fails_part_way_leaves_the_fork_open(stem: str) -> None:
+    """a row's write-back failing after some layers took its rows: the session's layers are cut back, the fork stays
+    open, and closing it leaves the session where it was forked"""
+    sm = model(stem, "cpu")
+    s = sm.session(PROMPT)
+    br = s.fork(2)
+    br.step([1, 2])
+    cache = s.cache
+    assert cache is not None
+    attn = [cl for cl in cache.layers if isinstance(cl, CacheLayerMixin)]
+    real = attn[1].update
+
+    def failing(*a: object, **k: object) -> object:
+        raise Boom("the second layer's write")
+
+    attn[1].update = failing  # type: ignore[method-assign,assignment]
+    try:
+        with pytest.raises(Boom):
+            br.keep(0)
+    finally:
+        attn[1].update = real  # type: ignore[method-assign]
+    assert s.forked is br and s.tokens == PROMPT
+    br.close()
+    in_step(sm, s)
+
+
+@families
+def test_a_batch_left_by_an_exception_writes_its_rows_back(stem: str) -> None:
+    sm = model(stem, "cpu")
+    a, b = sm.session(PROMPT), sm.session(OTHER)
+    with pytest.raises(Boom), sm.batch([a, b]) as bt:
+        bt.step([1, 2])
+        boom()
+    assert a.forked is None and b.forked is None
+    assert a.tokens == PROMPT + [1] and b.tokens == OTHER + [2]
+    in_step(sm, a)
+    in_step(sm, b)
+
+
+@families
+def test_a_callback_raising_mid_batch_leaves_every_row_its_draw(stem: str) -> None:
+    sm = model(stem, "cpu")
+    a, b = sm.session(PROMPT), sm.session(OTHER)
+    bt = sm.batch([a, b])
+    with pytest.raises(Boom):
+        bt.generate(3, eos=(), on_token=boom)
+    assert bt.pending is not None and [len(r) for r in bt.rows] == [1, 1]
+    bt.close()
+    assert a.tokens == PROMPT + bt.rows[0] and b.tokens == OTHER + bt.rows[1]
+    in_step(sm, a)
+    in_step(sm, b)
+
+
+@families
+def test_a_fork_dropped_unclosed_lets_its_session_go(stem: str) -> None:
+    """a fork nobody keeps, closes or holds is a fork closed: its session goes on from where it was forked (the
+    session held its fork, so a dropped one left the session forked for good)"""
+    sm = model(stem, "cpu")
+    s = sm.session(PROMPT)
+    br = s.fork(2)
+    br.step([1, 2])
+    del br
+    gc.collect()
+    assert s.forked is None and s.tokens == PROMPT
+    in_step(sm, s)
+
+
+@families
+def test_a_batch_dropped_unclosed_lets_its_sessions_go(stem: str) -> None:
+    """a batch nobody closes or holds lets its sessions go where they joined it: a row written back as it left
+    stays, the steps of the rows still in it are not written (`close` writes them)"""
+    sm = model(stem, "cpu")
+    a, b = sm.session(PROMPT), sm.session(OTHER)
+    bt = sm.batch([a, b])
+    bt.step([1, 2])
+    bt.leave(1)
+    bt.step([3])
+    del bt
+    gc.collect()
+    assert a.forked is None and b.forked is None
+    assert a.tokens == PROMPT and b.tokens == OTHER + [2]
+    in_step(sm, a)
     in_step(sm, b)
