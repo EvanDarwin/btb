@@ -951,13 +951,13 @@ class _TiersMixin(_State):
         return self.templates[lt][k]
 
     def _retarget(self, module: Any, i: int) -> Any:
-        """Point a template or shadow at layer `i`: the attention's cache index and, for a mixture of experts, where
-        the expert store reads its experts from."""
-        if hasattr(module, "linear_attn"):
-            module.linear_attn.layer_idx = i
-        if hasattr(module, "self_attn"):
-            module.self_attn.layer_idx = i
+        """Point a template or shadow at layer `i`: every cache index its modules hold and, for a mixture of experts,
+        where the expert store reads its experts from. Every submodule that carries a `layer_idx` is one: beside the
+        attention's own, Qwen4's sparse attention indexer and its PLE and n-gram convolutions each keep theirs, and a
+        template built from layer 3 and run as layer 11 wrote layer 11's indexer keys into layer 3's cache."""
         for m in module.modules():
+            if isinstance(getattr(m, "layer_idx", None), int):
+                m.layer_idx = i
             if isinstance(m, _Experts) and m.layer != i:
                 m.layer = i
                 m.base = f"{self.prefix}layers.{i}.mlp.experts."
