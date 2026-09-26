@@ -1081,7 +1081,7 @@ class _CudaMixin(_State):
 
         n_replays = (steps + U - 1) // U
         for j in range(n_replays):
-            if self.abort.is_set():
+            if self._stop_asked():
                 stop = True
                 break
             graphs[j & 1].replay()

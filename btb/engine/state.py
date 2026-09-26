@@ -5,6 +5,7 @@ engine reads as `getattr(self, name, default)` is declared without a value: unse
 
 from __future__ import annotations
 
+import threading
 import weakref
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -16,6 +17,9 @@ from ..kinds import LayerTier, PassReport, PassTag, Proposer
 
 # rows of the lm_head the drafter proposes from
 DRAFT_VOCAB = 32768
+
+# an API call's record in _calls: made from any thread
+_CALLS_LOCK = threading.Lock()
 
 # a call handed to the decode's thread (`_serial`): its parameters and its result
 P = ParamSpec("P")
@@ -44,7 +48,6 @@ class _PassRecorder:
 
 
 if TYPE_CHECKING:
-    import threading
     from concurrent.futures import ThreadPoolExecutor
     from types import ModuleType
 
@@ -177,6 +180,7 @@ class _State:
     _in_epoch: bool
     _pass_rec: _PassRecorder | None = None  # the provenance accumulator, created on first tag or reset
     _calls: frozenset[PassTag] = frozenset()  # every API call made on the model (btb.api), never reset
+    _cancel: threading.Event | None = None  # the running decode's own stop (a Stream's), set under the lock
 
     # -- the card graph (cuda.py); the mechanism keeps its letters --
     card_pipeline: bool
@@ -680,8 +684,16 @@ class _State:
             rec.tags.add(PassTag.SPEC_REJECT)
 
     def _called(self, tag: PassTag) -> None:
-        """record an API call (btb.api): a call is not one pass's fork, so a generate's reset keeps it"""
-        self._calls = self._calls | {tag}
+        """record an API call (btb.api): a call is not one pass's fork, so a generate's reset keeps it. Calls come
+        from any thread (a read while another decodes): the set is replaced under a lock, no call lost"""
+        with _CALLS_LOCK:
+            self._calls = self._calls | {tag}
+
+    def _stop_asked(self) -> bool:
+        """whether the running decode is to stop at this step: the model's `abort` (whichever decode runs), or the
+        running call's own cancel (a `Stream` closed)"""
+        c = self._cancel
+        return self.abort.is_set() or (c is not None and c.is_set())
 
     def last_pass_report(self) -> PassReport:
         """The provenance of the most recent `generate()` (its passes' tags accumulated) or of a bare

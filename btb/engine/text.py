@@ -16,9 +16,9 @@ from typing import TYPE_CHECKING, Any, Generic, TypedDict, TypeVar, Unpack, cast
 
 import torch
 
-from ..api import api
+from ..api import api, carried, in_hook
 from ..draft import Spans
-from ..kinds import Json, Proposer, TokenRows, Tokens
+from ..kinds import Json, PassReport, Proposer, TokenRows, Tokens
 from ..sampling import GREEDY, Sampling
 from ..session import Session
 from ..text import Channels, Messages, TextStream, ToolSpecs, answer, messages_of, prompt_ids
@@ -67,11 +67,14 @@ class Generation(tuple[TokensT, GenerateStats], Generic[TokensT, LogprobsT, Taps
     """
     What `generate` returns: the new tokens (one row: a flat list; rows: a list per row) and the counts, plus
     what the call's hooks collected - `logprobs` a `TokenLogprob` per token, `hidden` {layer: [new, H]} - each a
-    list per row for rows. Unpacks and indexes as `(tokens, stats)`.
+    list per row for rows - and `report`, the call's own pass report (`last_pass_report()` is the model's latest,
+    whichever thread's). Unpacks and indexes as `(tokens, stats)`, and compares as that pair; it pickles and copies
+    whole.
     """
 
     logprobs: LogprobsT | None
     hidden: TapsT | None
+    report: PassReport
 
     def __new__(
         cls,
@@ -82,7 +85,12 @@ class Generation(tuple[TokensT, GenerateStats], Generic[TokensT, LogprobsT, Taps
     ) -> Generation[TokensT, LogprobsT, TapsT]:
         self = super().__new__(cls, (tokens, stats))
         self.logprobs, self.hidden = logprobs, hidden
+        self.report = PassReport()
         return self
+
+    def __getnewargs__(self) -> tuple[TokensT, GenerateStats, LogprobsT | None, TapsT | None]:
+        # a tuple's own reduce hands `__new__` the pair alone; the attributes follow as the instance's state
+        return self[0], self[1], self.logprobs, self.hidden
 
     @property
     def tokens(self) -> TokensT:
@@ -138,11 +146,19 @@ class Stream:
         self._stop = set(model.stop_ids)
         self._ch = Channels(model.tokenizer)
         self._text = TextStream(model.tokenizer)
+        self._cancel = threading.Event()  # this stream's decode's own stop: another caller's runs on
 
         def work() -> None:
             try:
-                self.result = model.generate(
-                    ids, max_new, session=session, on_token=self._q.put, spans=spans, sampling=sampling, **hooks
+                self.result = model._decode_call(
+                    self._cancel,
+                    ids,
+                    max_new,
+                    session=session,
+                    on_token=self._q.put,
+                    spans=spans,
+                    sampling=sampling,
+                    **hooks,
                 )
             except BaseException as e:  # handed to the reader, whatever it was
                 self._err = e
@@ -156,9 +172,8 @@ class Stream:
         """stop the decode at its next step and wait for it: what breaking out of the iterator leaves running"""
         if not self._th.is_alive():
             return
-        self.model.abort.set()
+        self._cancel.set()
         self._th.join()
-        self.model.abort.clear()
 
     def __enter__(self) -> Stream:
         return self
@@ -212,16 +227,18 @@ class Chat:
         self.last: dict[str, Any] = {}
 
     def _prompt(self, text: str, prefill: str | None = None) -> list[int]:
-        self.history.append({"role": "user", "content": text})
-        ids = self.model._reply_ids(self.history, self.thinking, prefill)
+        """the turn's ids: the history and `text` as the user's message, which joins the history only with its
+        answer (`_keep`) - a turn that fails or is abandoned leaves no message unanswered"""
+        ids = self.model._reply_ids([*self.history, {"role": "user", "content": text}], self.thinking, prefill)
         if self.session.fresh:
-            self.session.tail = self._tail(ids)
+            self.session.tail = self._tail(ids, text)
         return ids
 
-    def _keep(self, ids: Tokens, gen: RowGeneration, prefill: str | None = None) -> str:
+    def _keep(self, text: str, ids: Tokens, gen: RowGeneration, prefill: str | None = None) -> str:
         stop = set(self.model.stop_ids)
         ans, think = answer(self.model.tokenizer, [t for t in gen.tokens if t not in stop])
         ans = (prefill or "") + ans
+        self.history.append({"role": "user", "content": text})
         self.history.append({"role": "assistant", "content": ans})
         self.last = dict(gen.stats, prompt=len(ids), new=len(gen.tokens), reasoning=think)
         return ans
@@ -240,7 +257,7 @@ class Chat:
         gen = self.model.generate(
             ids, max_new or self.max_new, session=self.session, sampling=self.sampling, processors=processors
         )
-        return self._keep(ids, gen, prefill)
+        return self._keep(text, ids, gen, prefill)
 
     def stream(
         self, text: str, max_new: int | None = None, prefill: str | None = None, **hooks: Unpack[HookArgs]
@@ -253,14 +270,19 @@ class Chat:
         s = Stream(self.model, ids, max_new or self.max_new, self.session, (), self.sampling, **hooks)
         yield from s
         if s.result is not None:
-            self._keep(ids, s.result, prefill)
+            self._keep(text, ids, s.result, prefill)
 
-    def _tail(self, ids: Tokens) -> int:
+    def _tail(self, ids: Tokens, text: str) -> int:
         """how many tokens of the generation prompt's tail the next turn re-renders differently (the state
         snapshot for the next turn is left before them)"""
         tok = self.model.tokenizer
         # the answer must not be the final message: templates keep the think block on the last turn only
-        probe = [*self.history, {"role": "assistant", "content": "x"}, {"role": "user", "content": "y"}]
+        probe = [
+            *self.history,
+            {"role": "user", "content": text},
+            {"role": "assistant", "content": "x"},
+            {"role": "user", "content": "y"},
+        ]
         try:
             try:
                 text = tok.apply_chat_template(
@@ -372,7 +394,8 @@ class _TextMixin(_State):
                     self._worker_thread = w.submit(threading.current_thread).result()
         if threading.current_thread() is self._worker_thread:
             return fn(*args, **kw)
-        return w.submit(fn, *args, **kw).result()
+        # at the asking thread's depths: the worker's calls are the asking call's, and a callback's still refused
+        return w.submit(carried(fn), *args, **kw).result()
 
     @overload
     def generate(
@@ -437,21 +460,52 @@ class _TextMixin(_State):
         `taps` returns the chosen layers' hidden state at each new token (layer i's is the residual stream leaving
         block i, before the final norm: transformers' `hidden_states[i + 1]`); `on_pass` is called with each pass's
         `btb.PassStats`. The processors, logprobs and taps need the logits or the layers in hand, so a hooked
-        decode skips the paths that pick inside their graph (recorded as `PassTag.PICK_HOOKED`).
+        decode skips the paths that pick inside their graph (recorded as `PassTag.PICK_HOOKED`). A callback runs
+        between two steps of the decode: it may read the model's memory, not call into it (a `RuntimeError`).
         """
+        return self._decode_call(
+            None, ids, max_new, eos, session, on_token, spans, speculate, sampling, processors, logprobs, taps, on_pass
+        )
+
+    def _decode_call(
+        self,
+        cancel: threading.Event | None,
+        ids: Tokens | TokenRows,
+        max_new: int | None = None,
+        eos: Tokens | None = None,
+        session: Session | None = None,
+        on_token: OnToken | None = None,
+        spans: Spans = (),
+        speculate: bool = True,
+        sampling: Sampling | None = None,
+        processors: Sequence[LogitsProcessor] = (),
+        logprobs: int | None = None,
+        taps: Sequence[int] = (),
+        on_pass: OnPass | None = None,
+    ) -> Any:
+        """`generate`, stopped at its next step once `cancel` is set (a `Stream`'s close): the call's own stop,
+        which leaves another caller's decode be, where the model's `abort` stops whichever runs"""
         hooks = Hooks(
-            tuple(processors),
+            tuple(in_hook(p) for p in processors),
             None if logprobs is None else int(logprobs),
             tuple(int(i) % self.L for i in taps),
-            on_pass,
+            None if on_pass is None else in_hook(on_pass),
         )
-        args = (ids, max_new, eos, session, on_token, spans, speculate, sampling, hooks)
+        tok = None if on_token is None else in_hook(on_token)
+        args = (ids, max_new, eos, session, tok, spans, speculate, sampling, hooks)
         if getattr(self, "mlx", None) is not None and threading.current_thread() is not getattr(
             self, "_worker_thread", None
         ):
-            gen: RowGeneration | BatchGeneration = self._on_worker(self._locked, self._generate, *args)
-            return gen
-        return self._locked(self._generate, *args)
+            return self._on_worker(self._locked, self._cancellable, cancel, lambda: self._generate(*args))
+        return self._locked(self._cancellable, cancel, lambda: self._generate(*args))
+
+    def _cancellable(self, cancel: threading.Event | None, fn: Callable[[], R]) -> R:
+        """`fn()` holding the decode lock, `cancel` the running call's own stop meanwhile"""
+        prev, self._cancel = self._cancel, cancel
+        try:
+            return fn()
+        finally:
+            self._cancel = prev
 
     def _locked(self, fn: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
         """`fn` holding the decode lock: one decode at a time on an engine"""
@@ -552,14 +606,15 @@ class _TextMixin(_State):
         seed: dict[str, Any] = {} if smp.greedy else {"seed": smp.seed}
         if len(rows) > 1 and session is not None:
             raise ValueError("a session holds one sequence: batch sessions with model.batch(sessions)")
-        if session is None:
-            return self._decode(rows, max_new, stop, None, on_token, spans, speculate, smp, seed, hooks)
         try:
-            return self._decode(rows, max_new, stop, session, on_token, spans, speculate, smp, seed, hooks)
+            gen = self._decode(rows, max_new, stop, session, on_token, spans, speculate, smp, seed, hooks)
         except BaseException:
-            # a hook raising, memory refused, a stop mid-prefill: the session back in step with its cache
-            session._abandon(self)
+            if session is not None:
+                # a hook raising, memory refused, a stop mid-prefill: the session back in step with its cache
+                session._abandon(self)
             raise
+        gen.report = self.last_pass_report()  # frozen here, under the lock: this call's, whoever decodes next
+        return gen
 
     def _decode(
         self,

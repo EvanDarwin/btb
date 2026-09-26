@@ -129,8 +129,14 @@ class _GenerateMixin(_State):
         resume from (the prompt's end, and the point the re-rendering will diverge at once the tail is known)."""
         n = int(ids.shape[1])
         hybrid = LayerKind.LINEAR in self.layer_types
+        # every row reused (`Session._open`'s whole): the session's logits for its last token, nothing to run
+        held = None
+        if session is not None and reuse == n:
+            held, session._held = session._held, None
+            assert held is not None, "a prompt the cache holds whole comes with its logits"
+            held = held.view(1, 1, -1)
         if session is None or not hybrid:
-            return self._prefill(ids[:, reuse:], cache, on_layer=on_layer), None
+            return (held if held is not None else self._prefill(ids[:, reuse:], cache, on_layer=on_layer)), None
         hs: list[torch.Tensor] = []
 
         def snap(at: int) -> Any:
@@ -150,6 +156,8 @@ class _GenerateMixin(_State):
                 on_layer(i, h)
 
         hook = gather if on_layer is not None else None
+        if held is not None:
+            return held, [snap(n)]
         anchors = []
         d = int(session.tail)
         cut = n - d
@@ -252,7 +260,10 @@ class _GenerateMixin(_State):
             if i in tap_ids:
                 taps[i] = h
 
-        cache, reuse, anchored = session._open(self, prompt) if session is not None else (None, 0, None)
+        # a decode needing the last token's layers (the drafting head, taps) re-runs it; else a fed session goes on
+        # from the logits it holds
+        whole = not (use_mtp or tapped)
+        cache, reuse, anchored = session._open(self, prompt, whole) if session is not None else (None, 0, None)
         if cache is None:
             cache = self.new_cache()
         logits: Any
@@ -363,7 +374,7 @@ class _GenerateMixin(_State):
         # the drafter's steps and time of this call's passes (its prefill excluded)
         dr_steps0 = int(getattr(getattr(self, "aj", None), "steps", 0) or 0)
         dr_step_s0 = float(getattr(getattr(self, "aj", None), "step_s", 0.0) or 0.0)
-        while len(committed) < max_new and not self.abort.is_set():
+        while len(committed) < max_new and not self._stop_asked():
             tp = time.perf_counter()
             v = min(v_max, max_new - len(committed) - 1)
             budget = self._spec_budget(ema_tokens, census["forwards"], v_max, cache.get_seq_length())
@@ -698,7 +709,7 @@ class _GenerateMixin(_State):
         self.vram_trim("prefill")
         pos0 = int(ids.shape[1]) - 1  # the row the prompt's last token holds: step k picks at pos0 + k
         for step in range(max_new):
-            if self.abort.is_set():
+            if self._stop_asked():
                 break
             ts = time.perf_counter()
             last = logits[:, -1]

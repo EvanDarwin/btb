@@ -409,6 +409,11 @@ def test_fork_and_batch_are_deterministic(stem: str, dev: spec.DeviceSubpath) ->
             br.leave(2)
             forked = [br.tokens(r) for r in range(br.n)]
             more = list(br.keep(1).generate(4, eos=(), speculate=False).tokens)
+            # a fork let go: the session stands where it was forked (`keep` closes its fork too, but a call made
+            # inside another is not the caller's, so the close is made here as a caller makes it)
+            held = sm.session(list(PROMPT))
+            held.fork(2).close()
+            assert held.tokens == list(PROMPT) and held.forked is None
             with sm.batch([sm.session(r) for r in RAGGED[:2]]) as bt:
                 batched = bt.generate(N, eos=()).tokens
                 joined = bt.join(sm.session(RAGGED[2]))

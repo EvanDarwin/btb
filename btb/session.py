@@ -96,6 +96,8 @@ class Session:
         self.forked: _Rows | None = None  # the live `Branches` or `Batch` over this session, which holds it still
         # where a decode under way goes back to should it fail: the rows `_open` kept, and a hybrid's states there
         self._undo: tuple[int, dict[int, LinSnap] | None] | None = None
+        # the next token's logits a decode reusing every row takes in place of a prefill (`_open`'s `whole`)
+        self._held: torch.Tensor | None = None
 
     @property
     def fresh(self) -> bool:
@@ -402,12 +404,27 @@ class Session:
                 best = a
         return best
 
-    def _open(self, engine: _State, prompt: Tokens) -> tuple[KvCache | None, int, Anchor | None]:
+    def _open(self, engine: _State, prompt: Tokens, whole: bool = False) -> tuple[KvCache | None, int, Anchor | None]:
         """What a new prompt reuses: (cache, rows reused, the snapshot restored), or (None, 0, None). A dense
         cache is cropped to the shared prefix; a hybrid's DeltaNet states cannot be cropped, so they come
-        back from the latest snapshot inside it."""
+        back from the latest snapshot inside it. With `whole` (a decode needing only the next token's logits, not
+        the last token's layers), a prompt that is the session's tokens, fed and their logits in hand, reuses every
+        row: the logits wait in `_held` for the prefill, which runs nothing - a hybrid's states are where the feed
+        left them, which no snapshot need restore."""
         if self.forked is not None:
             raise ValueError("this session is forked: `keep` a row or `close` the branches first")
+        self._held = None
+        if (
+            whole
+            and self.cache is not None
+            and self.pending is None
+            and self.logits is not None
+            and getattr(engine, "mlx", None) is None
+            and [int(t) for t in prompt] == self.ids
+        ):
+            self._held, self.logits = self.logits, None
+            self._undo = (len(self.ids), None)
+            return self.cache, len(self.ids), None
         self.pending, self.logits = None, None
         if self.cache is None:
             self._undo = (0, None)

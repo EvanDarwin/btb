@@ -1565,7 +1565,7 @@ class _MlxMixin(_State):
             pending = build(m.array(cur, dtype=m.int32))
             m.async_eval(pending)
         for step in range(1, int(max_new)):
-            if self.abort.is_set():
+            if self._stop_asked():
                 m.eval(pending)
                 break
             steps += 1
@@ -1670,7 +1670,7 @@ class _MlxMixin(_State):
         cur = build(m.array([first], dtype=m.int32))
         m.async_eval(cur)
         for step in range(1, max_new):
-            if self.abort.is_set():
+            if self._stop_asked():
                 m.eval(cur)  # the queued step lands (its rows are the last token's) and nothing stays in flight
                 break
             ahead = step + 1 < max_new

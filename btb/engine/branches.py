@@ -15,8 +15,8 @@ from typing import TYPE_CHECKING, Self, overload
 import torch
 
 from .. import mlx as mlxdev
-from ..api import api
-from ..kinds import LayerKind, PassTag, Tokens
+from ..api import api, in_hook
+from ..kinds import LayerKind, PassReport, PassTag, Tokens
 from ..sampling import GREEDY, Sampling
 from ..session import crop
 from .cache import (
@@ -289,7 +289,14 @@ class _Rows:
         eng._tag(PassTag.SPEC_OFF, PassTag.SAMPLE_GREEDY if smp.greedy else PassTag.SAMPLE_STOCHASTIC)
         if processors or logprobs is not None:
             eng._tag(PassTag.PICK_HOOKED)
-        hk = Hooks(tuple(processors), None if logprobs is None else int(logprobs), (), on_pass)
+        # the caller's callbacks run between two steps: a call from them into the engine is refused (btb.api)
+        hk = Hooks(
+            tuple(in_hook(p) for p in processors),
+            None if logprobs is None else int(logprobs),
+            (),
+            None if on_pass is None else in_hook(on_pass),
+        )
+        on_token = None if on_token is None else in_hook(on_token)
         hk.rows(len(self.sess))
         new: list[list[int]] = [[] for _ in self.sess]
         t0 = time.perf_counter()
@@ -299,7 +306,7 @@ class _Rows:
             nonlocal steps
             for k in range(int(max_new)):
                 live = self.live
-                if eng.abort.is_set() or not live:
+                if eng._stop_asked() or not live:
                     break
                 ts = time.perf_counter()
                 if self._pend is not None:
@@ -339,12 +346,18 @@ class _Rows:
                         }
                     )
 
-        eng._serial(run)
+        def reported() -> PassReport:
+            run()
+            return eng.last_pass_report()  # under the lock: this call's report
+
+        report = eng._serial(reported)
         stats: GenerateStats = {"cap": int(max_new), "proposer": "greedy", "forwards": steps}
         if not smp.greedy and smp.seed is not None:
             stats["seed"] = smp.seed
         stats["seconds"] = time.perf_counter() - t0
-        return Generation(new, stats, hk.lp if hk.logprobs is not None else None, None)
+        gen: BatchGeneration = Generation(new, stats, hk.lp if hk.logprobs is not None else None, None)
+        gen.report = report
+        return gen
 
     # -- re-forming the batch --
     def _select(self, slots: list[int]) -> None:
