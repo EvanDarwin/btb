@@ -708,7 +708,7 @@ def test_a_verify_pass_over_a_host_cache_is_the_one_row_steps_bit_for_bit(stem: 
         wrong = (toks[1] + 7) % int(sm.cfg.vocab_size)
         tree = sm.new_cache()
         sm.forward([list(prompt)], cache=tree)
-        sm.aa([-1, 0, 0, 1])
+        sm.aa([-1, 0, 0, 2])
         try:
             out = sm.forward(
                 [[toks[0], wrong, toks[1], toks[2]]], cache=tree, last_only=False, positions=[[P, P + 1, P + 1, P + 2]]

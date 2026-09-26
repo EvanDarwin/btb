@@ -400,6 +400,9 @@ class _State:
     def _spec_full(self, v_max: int | None = None) -> int:
         raise NotImplementedError
 
+    def _rope_fn(self) -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
+        raise NotImplementedError
+
     def aa(self, parents: Parents | None = None) -> None:
         raise NotImplementedError
 

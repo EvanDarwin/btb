@@ -10,7 +10,7 @@ import os
 import sys
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -146,8 +146,18 @@ class _CudaMixin(_State):
         """the pass's rope as one (cos, sin) per layer type: a dual-rope family's own, the others' one for all"""
         return pe if isinstance(pe, dict) else dict.fromkeys(set(self.layer_types), pe)
 
+    def _rope_fn(self) -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
+        """the one rope the engine applies where it rotates q and k itself - a one-row step's graph, a kv_host pass,
+        the card's own attention - so a step and a verify pass over the same rows rotate them alike: the fused one
+        (BTB_FUSED_ROPE, on by default) for a family whose rope is the reference's full or partial rotary, else
+        the module's. The fused one is not the module's bit for bit in bf16 (addcmul rounds once where the
+        reference rounds twice): two paths reading different ropes parted a kv_host verify from its steps"""
+        if self._frope and (self.fam.dense or self.fam.sandwich):
+            return _fused_rope
+        return cast(Callable[..., tuple[torch.Tensor, torch.Tensor]], self.fam.mod.apply_rotary_pos_emb)
+
     def _seg_a(self, g: dict[str, Any], i: int) -> None:
-        apply_rotary_pos_emb = _fused_rope if self._frope else self.fam.mod.apply_rotary_pos_emb
+        apply_rotary_pos_emb = self._rope_fn()
         tmpl = self.resident[i]
         at = tmpl.self_attn
         hd = at.head_dim
@@ -203,8 +213,6 @@ class _CudaMixin(_State):
         g = getattr(self, "_g", None)
         if g is not None:
             return g
-        self._frope = os.environ.get("BTB_FUSED_ROPE", "1") != "0"
-        self._fmlp = os.environ.get("BTB_FUSED_MLP", "1") != "0"
         c = self.cfg
         hq = int(c.num_attention_heads)
         hk = int(getattr(c, "num_key_value_heads", None) or hq)
@@ -1850,7 +1858,7 @@ class _CudaMixin(_State):
     ) -> torch.Tensor:
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-        apply_rotary_pos_emb = self.fam.mod.apply_rotary_pos_emb
+        apply_rotary_pos_emb = self._rope_fn()
         eager_attention_forward = self.fam.mod.eager_attention_forward
         residual = h
         outs = []

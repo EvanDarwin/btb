@@ -164,6 +164,10 @@ class StreamedTextModel(
         cfg._attn_implementation = attn_impl
         self.cfg = cfg
         self.fam = family(cfg)
+        # the fused rope and the in-place SwiGLU, fixed here for the engine's life: every path that rotates q and k
+        # itself reads one rope (`_rope_fn`), whichever of them runs first
+        self._frope = os.environ.get("BTB_FUSED_ROPE", "1") != "0"
+        self._fmlp = os.environ.get("BTB_FUSED_MLP", "1") != "0"
         # Gemma scales the input embedding by sqrt(hidden); the engine gathers rows itself, so it applies the
         # scale the module's scaled embedding would (the tied head's output projection stays unscaled)
         self.embed_scale = float(cfg.hidden_size) ** 0.5 if self.fam.embed_scale else None

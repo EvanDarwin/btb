@@ -924,7 +924,7 @@ class _ForwardMixin(_State):
         return acc.to(q.dtype)
 
     def _kv_split(self, tmpl: Any, i: int, h: torch.Tensor, pe: PassRope, cache: Any) -> torch.Tensor:
-        apply_rotary_pos_emb = self.fam.mod.apply_rotary_pos_emb
+        apply_rotary_pos_emb = self._rope_fn()  # the one-row step's own (its graph rotates with it)
         B, T, _ = h.shape
         cl = cache.layers[i]
         past = cl.keys.shape[-2] if getattr(cl, "keys", None) is not None and cl.keys.numel() else 0
