@@ -17,7 +17,7 @@ from transformers.cache_utils import CacheLayerMixin
 
 from btb.engine import StreamedTextModel
 from btb.engine.hooks import HookArgs, PassStats
-from btb.kinds import LayerKind
+from btb.kinds import LayerKind, Proposer
 from btb.sampling import Sampling
 from btb.session import Session, State
 from btb.text import template
@@ -529,12 +529,13 @@ def test_a_decoded_session_feeds_on_as_a_fresh_one_of_its_tokens(stem: str, spec
 @pytest.mark.parametrize("speculate", [False, True])
 def test_a_decode_that_fails_leaves_the_session_in_step_with_its_cache(stem: str, speculate: bool) -> None:
     """a decode over a session that raises after the session gave it its cache (a hook, a refusal) leaves the session
-    at the rows it reused - or fresh, for a hybrid it cannot cut back - never tokens its cache does not hold"""
+    at what the prompt keeps of it - a dense one the three tokens they share; a hybrid with no anchor inside them,
+    which it cannot cut back to, its first token pending over no rows - never tokens its cache does not hold"""
     sm = model(stem, "cpu")
     s = sm.session(PROMPT)
     with pytest.raises(Boom):
         sm.generate(PROMPT[:3] + [9, 9, 9], 4, eos=(), speculate=speculate, session=s, on_token=boom)
-    assert s.tokens in (PROMPT[:3], [])
+    assert s.tokens == (PROMPT[:1] if LayerKind.LINEAR in sm.layer_types else PROMPT[:3])
     in_step(sm, s)
     t = sm.session(PROMPT)
     with pytest.raises(Boom):
@@ -751,3 +752,41 @@ def test_a_batch_dropped_unclosed_lets_its_sessions_go(stem: str) -> None:
     assert a.tokens == PROMPT and b.tokens == OTHER + [2]
     in_step(sm, a)
     in_step(sm, b)
+
+
+@contextlib.contextmanager
+def failing_pass(sm: StreamedTextModel, at: int) -> Iterator[None]:
+    """the `at`-th layer pass from here raises"""
+    run = sm.device.run_layer
+    calls = [0]
+
+    def once(i: int, h: torch.Tensor, pas: object) -> torch.Tensor:
+        calls[0] += 1
+        if calls[0] == at:
+            raise Boom(f"layer pass {at}")
+        return run(i, h, pas)
+
+    sm.device.run_layer = once  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        sm.device.run_layer = run  # type: ignore[method-assign]
+
+
+@families
+def test_a_rewind_to_a_point_before_any_row_leaves_no_state_behind(stem: str) -> None:
+    """a failed decode can leave a session its first token pending over no rows (a hybrid it must re-run); a mark
+    there and a rewind to it after a feed leave nothing of the feed - a hybrid's recurrent states included, which a
+    snapshot taken over no rows holds none of"""
+    sm = model(stem, "cpu")
+    s = sm.session(PROMPT)
+    with pytest.raises(Boom), failing_pass(sm, 1):
+        s.generate(2, eos=(), speculate=True)
+    if LayerKind.LINEAR in sm.layer_types and Proposer.of(sm.proposer).mtp:
+        # a hybrid decoding with its drafting head re-runs its last tokens: failed, it keeps its first pending
+        assert s.state is State.PENDING and s.ids == [] and s.tokens == PROMPT[:1], "not the state under test"
+    here = s.mark()
+    s.feed([7, 8])
+    s.rewind(here)
+    assert s.tokens == list(here.path or ())
+    in_step(sm, s)

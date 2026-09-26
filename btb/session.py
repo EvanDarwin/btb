@@ -161,7 +161,11 @@ class _Txn:
         if p.n == 0 and p.pending is None and p.logits is None:
             s.cache, s.anchor, s.ids, s.n_prompt, s.pending, s.logits = None, [], [], 0, None, None
             return
-        if s.cache is not None:
+        if p.n == 0 or s.cache is None:
+            # a point over no rows: a fresh cache. No rows is no recurrent state either, and a snapshot taken there
+            # holds none to restore - a hybrid's states the transaction's passes made would be left standing
+            s.cache = eng.new_cache()
+        else:
             import torch
 
             from .engine.generate import lin_layer
@@ -546,13 +550,18 @@ class Session:
         # nothing of the last conversation serves this one: its cache goes now, not when the new turn's commit
         # replaces it, or the new prefill runs beside a full cache of the old (7 GB twice at 40k); the drafter's own
         # cache, which the engine holds, goes with it (a gigabyte at 120k rows)
+        # Should the call fail, the session keeps what the prompt still shares with it: its first token, pending over
+        # no rows, where the prompt starts as the session does (a one-token session re-run, a prompt too short for a
+        # row to be kept); else nothing
+        toks = self.tokens
+        first = toks[0] if toks and prompt and prompt[0] == toks[0] else None
         dr = self.dr
         self.cache, self.anchor, self.ids, self.n_prompt = None, [], [], 0
         self.pending, self.logits = None, None
         self.dr, self.dr_len, self.pend_h = None, 0, None
         if dr is not None and hasattr(dr, "reset"):
             dr.reset()
-        t.keep(_Point(0, None, None, None, 0))
+        t.keep(_Point(0, first, None, None, 0))
         return None, 0, None
 
     # -- a decode over the session (`generate(session=...)`): the transaction spans the engine's decode loop --------
