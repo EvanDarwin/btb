@@ -247,11 +247,6 @@ FORK_NOTES: dict[PassTag, str] = {
         "the head held where the model runs, which is what every cell but cpu-headstream takes (or not - the "
         "planner's `head_on_card` decides where `resident_head` is unset); none asserts it"
     ),
-    PassTag.PREFILL_CARD: (
-        "a prefill's host layers on the card (forward.py:324): the planner decides `prefill_card` and the "
-        "`prefill_card_min` option only sets the rows it takes, so a cell would need a card, a cpu/card split "
-        "and a prompt that long - none of which the tiny fixtures reach here"
-    ),
     PassTag.EXPERT_TABLES: (
         "the MoE experts with no store (host.py:434), which needs expert_cache_gb=0 - and that option takes a "
         "figure above 0, so nothing a caller may pass selects this arm; it is the no-native-read_direct path"
@@ -264,13 +259,11 @@ FORK_NOTES: dict[PassTag, str] = {
         "an expert seated in VRAM (`vram_experts_gb`, experts.py:1093) needs a card, which this grid's MoE "
         "fixtures have no cell for"
     ),
-    PassTag.EXPERT_MXFP4_DEQUANT: (
-        "MXFP4 experts widened instead of multiplied as stored (host.py:376) happens only where the native "
-        "library was built without the mx4 matvec, which the cert's own machines are not"
-    ),
     PassTag.EXPERT_FP8_WIDENED: (
-        "FP8 experts widened instead of multiplied as stored (host.py `_linear`) happens only where the native "
-        "library was built without the FP8 matvec, which the cert's own machines are not"
+        "FP8 experts widened instead of multiplied as stored: on the host only where the native library was built "
+        "without the FP8 matvec, which the cert's own machines are not; on the card by a layer-by-layer prefill's "
+        "grouped call, which the long-prompt axis runs on the base fixtures alone (cuda-prefill), and no base "
+        "fixture's experts are FP8; tests/integration/test_prefill_layers.py holds tiny_q4-f8_e4m3's to the loop"
     ),
     PassTag.SPEC_ACCEPT: (
         "a draft's outcome, not a path a cell selects: a speculative cell requires drafts and holds its tokens to "
@@ -427,6 +420,11 @@ def dnr(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath, decode
         return (
             f"not a distinct cell: {dev.key}'s knob is a no-op on a family without {dev.needs.value} "
             f"(identical to the plain {dev.hardware.value} run)"
+        )
+    if dev.long_prompt:
+        return (
+            f"not a distinct cell: {dev.key}'s knobs act on a prompt past one prefill chunk, and a storage cell's "
+            f"prompt fits one (identical to the plain {dev.hardware.value} run); it runs on the long-prompt axis"
         )
     # a family with no GGUF path has no MXFP4 file to repeat another; its cells are GGUF_LOAD gaps
     if spec.quant_class(storage) is QuantClass.MXFP4 and Cap.MOE not in core.flags(kind) and kind in core.gguf_kinds():

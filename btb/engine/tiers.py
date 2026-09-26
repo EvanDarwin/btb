@@ -173,6 +173,9 @@ class _TiersMixin(_State):
             else:
                 break
         resident = sorted(resident)
+        # the card has room for the templates: a split the caller forces (`cpu_layers`) prefills its host layers
+        # there, where a plan that holds every layer on the card has no host layer to prefill
+        prefill_card_room = prefill_card
         if len(resident) == L:
             prefill_card = False
         rest = [i for i in range(L) if i not in resident]
@@ -224,6 +227,7 @@ class _TiersMixin(_State):
             "cold": cold,
             "warm": warm,
             "prefill_card": prefill_card,
+            "prefill_card_room": prefill_card_room,
             "bytes": {
                 "vram_layers": sum(bf16[i] for i in resident) * (2 if (fp32 and resident_fp32) else 1),
                 "head": head_b if head_on_card else head_host_b,

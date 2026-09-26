@@ -373,6 +373,9 @@ class DeviceSubpath:
     # the card graph runs the sub-path's passes: its knobs leave the card's kernels on (the rows of a fork or a
     # batch then take the card graph's rows pass where the family's layers do)
     card_graph: bool = False
+    # its knobs act on a prompt past one prefill chunk: it runs on the long-prompt axis (Surface.CONTEXT) alone,
+    # and a storage cell's short prompt, which one chunk takes, is the plain run of its hardware
+    long_prompt: bool = False
 
     def expects(self, kind: FamilyKind, storage: Storage) -> frozenset[PassTag]:
         """every tag a run of this cell must carry: the sub-path's own, the residency policy this cell's own knobs
@@ -482,6 +485,15 @@ DEVICE_SUBPATHS: tuple[DeviceSubpath, ...] = (
         "cpu/card split",
     ),
     DeviceSubpath(
+        "cuda-prefill",
+        Hardware.CUDA,
+        lambda k, s: PassTag.PREFILL_CARD,
+        {"device": "cuda", "cpu_layers": 1, "prefill_chunk": 64},
+        "a long prompt's host layers prefilled on the card a 64-row chunk at a time (a chunk reaches the card's "
+        "row floor, `Native.gemm_rows`): a mixture layer by layer, its experts grouped on the card",
+        long_prompt=True,
+    ),
+    DeviceSubpath(
         "cuda-kvhost",
         Hardware.CUDA,
         lambda k, s: PassTag.CUDA_TORCH_FALLBACK,
@@ -541,7 +553,7 @@ CONTAINER_SURFACE: dict[Container, Surface] = {
 
 def container_subpaths(container: Container) -> tuple[str, ...]:
     """every sub-path a container's cells run: those whose knob is no other container's"""
-    return tuple(d.key for d in DEVICE_SUBPATHS if d.only in (None, container))
+    return tuple(d.key for d in DEVICE_SUBPATHS if d.only in (None, container) and not d.long_prompt)
 
 
 # which device sub-paths the runner exercises on each surface: a container's every sub-path, and for the shape
@@ -549,7 +561,7 @@ def container_subpaths(container: Container) -> tuple[str, ...]:
 SURFACE_SUBPATHS: dict[Surface, tuple[str, ...]] = {
     **{CONTAINER_SURFACE[c]: container_subpaths(c) for c in Container},
     Surface.BATCH: ("cpu", "mlx-step"),
-    Surface.CONTEXT: ("cpu", "mlx-step"),
+    Surface.CONTEXT: ("cpu", "mlx-step", "cuda-prefill"),
     Surface.HOOKED: ("cpu", "mlx-step", "cuda-torch"),
     Surface.FORK: ("cpu", "mlx-step", "cuda-graph", "cuda-torch"),
     Surface.MODEL: ("cpu", "mlx-step", "cuda-torch"),
@@ -571,7 +583,23 @@ def rows_tag(kind: FamilyKind, dev: DeviceSubpath) -> PassTag:
 # the tags a cell of an axis beside the cartesian must show, by family and device sub-path (the sub-path's own
 # `expects` is about the single stream these axes leave). The API surfaces take every call their owners declare
 # (btb.kinds.api_tags), so a method added to an API class is a tag its cell must show.
+def prefill_tags(kind: FamilyKind, dev: DeviceSubpath) -> frozenset[PassTag]:
+    """the forks a long prompt's prefill must show on a sub-path made for it: the card's prefill of the host
+    layers, and for a mixture the grouped expert calls of its layer-by-layer prefill - gpt-oss's MXFP4 experts
+    widened on the card for them. The plain sub-paths assert none: the axis holds them to determinism alone."""
+    if not dev.long_prompt:
+        return frozenset()
+    fl = core.flags(kind)
+    out = {dev.expect(kind, Storage.SAFE_BF16)}
+    if Cap.MOE in fl:
+        out.add(PassTag.EXPERT_CARD_GROUPED)
+        if Cap.MXFP4 in fl:
+            out.add(PassTag.EXPERT_MXFP4_DEQUANT)
+    return frozenset(out)
+
+
 SURFACE_TAGS: dict[Surface, Callable[[FamilyKind, DeviceSubpath], frozenset[PassTag]]] = {
+    Surface.CONTEXT: prefill_tags,
     Surface.HOOKED: lambda k, dev: frozenset({PassTag.PICK_HOOKED}),
     Surface.FORK: lambda k, dev: (
         frozenset({rows_tag(k, dev)}) | api_tags("rows") | api_tags("branches") | api_tags("batch")

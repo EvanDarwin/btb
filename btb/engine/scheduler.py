@@ -185,6 +185,8 @@ class Plan:
     budget: HostBudget | None = None
     drive: DriveBenchmark | None = None  # the drive's measurement where layers stream from it
     gpu_bps: float | None = None  # Apple silicon's GPU read rate (`btb.mlx.read_bps`) an MLX plan is priced at
+    # the card has room for the prefill's templates, whether or not this plan leaves any host layer to prefill
+    prefill_card_room: bool = False
 
     def __str__(self) -> str:
         b = self.bytes
@@ -679,6 +681,7 @@ class BatchScheduler:
             head_on_card=bool(out["head_on_card"]),
             drafter_on_card=bool(out["drafter_on_card"]),
             prefill_card=bool(out["prefill_card"]),
+            prefill_card_room=bool(out.get("prefill_card_room", out["prefill_card"])),
             kv_host=kv_chosen,
             has_mtp=has_mtp,
             moe=bool(probe.fam.moe),

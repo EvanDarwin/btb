@@ -304,7 +304,8 @@ def test_pack12_cell_loads_and_is_deterministic(kind: FamilyKind, stem: str, dev
 # is device-specific, family-orthogonal enough that a representative device per backend exercises it. The 1024+
 # attention split (ATTN_SPLIT) still needs a real model: tiny fixtures cap at max_position_embeddings=512.
 BATCH_ROWS = [[1, 2, 3, 4], [5, 6, 7, 8]]  # two rows through the batched loop (rectangular: one tensor)
-LONG_PROMPT = list(range(1, 65))  # 64 tokens: past gemma3's sliding_window (32), and real cache growth
+# 96 tokens: past gemma3's sliding_window (32), real cache growth, and two of cuda-prefill's 64-row chunks
+LONG_PROMPT = list(range(1, 97))
 
 
 def _shape_cells(surface: spec.Surface) -> list[ParameterSet]:
@@ -335,13 +336,17 @@ def test_batch_is_deterministic(stem: str, dev: spec.DeviceSubpath) -> None:
 
 @pytest.mark.parametrize("stem,dev", _shape_cells(spec.Surface.CONTEXT))
 def test_context_growth_is_deterministic(stem: str, dev: spec.DeviceSubpath) -> None:
-    """a longer prompt (past gemma3's sliding window, and real cache growth) decodes reproducibly across two loads.
-    Does NOT reach the 1024 attention split - tiny fixtures cap at 512; that path needs a cached real model."""
+    """a longer prompt (past gemma3's sliding window, and real cache growth) decodes reproducibly across two loads,
+    and on a sub-path made for it the prefill takes its forks (`spec.prefill_tags`: the card's prefill, a mixture's
+    grouped experts). Does NOT reach the 1024 attention split - tiny fixtures cap at 512; that path needs a cached
+    real model."""
     path = os.path.join(FIXTURES, stem)
     runs = []
-    for _ in range(2):
+    for i in range(2):
         with loaded_model(path, **dev.knobs) as sm:
             runs.append(list(sm.generate(list(LONG_PROMPT), N, speculate=False).tokens))
+            if i == 0:
+                _axis_tags(sm, spec.Surface.CONTEXT, stem, dev, calls=False)
     assert_same_tokens(runs[0], runs[1], f"{stem} on {dev.key}: long-context decode differed across two loads")
     receipt.record(manifest.stem_id(spec.Surface.CONTEXT, stem, dev.key))
 

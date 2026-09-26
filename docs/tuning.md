@@ -60,7 +60,8 @@ window; past the model's own window btb applies YaRN automatically.
 - a long prompt prefills layer by layer: every chunk of it passes through a layer before the next, so each of
   the layer's experts is read from the drive once for the whole prompt, and on the card is held there for all the
   chunks (a 16k prompt on the 180B: a third of the reads, 528 s to 288 s). Same bits as the chunks one at a time;
-  `BTB_PREFILL_LAYERS=0` and `BTB_PREFILL_DEPOT=0` turn the two halves off.
+  `BTB_PREFILL_LAYERS=0` and `BTB_PREFILL_DEPOT=0` turn the two halves off. `btb.load(..., prefill_chunk=N)`
+  fixes the rows a prefill takes at once; unset (the default), the free memory prices the chunk.
 - `--sparse 1` (Qwen4): the sparse attention scores every row's blocks in one pass - opt-in, since a near-tie may
   keep a different block than the reference's indexer.
 - `btb pack` writes a lossless [12-bit copy](./pack-12.md) at 0.75× the bytes, so more experts stay cached and

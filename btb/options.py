@@ -192,6 +192,7 @@ COUNTS = {  # whole numbers, with the least each allows
     "draft_vocab": 0,
     "top_k": 0,
     "prefill_card_min": 0,
+    "prefill_chunk": 1,
     "original_max_position_embeddings": 1,
 }
 UNIT = ("tree_min_prob", "tree_step_mass", "ngram_p", "top_p")  # 0 to 1

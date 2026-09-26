@@ -295,6 +295,10 @@ def load(
             c.setdefault("cold_slots", pl.cold_slots(warm_bytes=warm_b, n_cold=len(cold)))
         c.setdefault("resident_head", int(pl.head_on_card))
         c["prefill_card"] = int(pl.prefill_card)
+        if dev.kind is not Device.CPU and c.get("cpu_layers") is not None and cpu:
+            # the caller's split wins: a plan that held every layer on the card had no host layer to prefill there,
+            # and the layers named for the CPU prefill on the card wherever it has room for the templates
+            c["prefill_card"] = int(pl.prefill_card or pl.prefill_card_room)
         c.setdefault("kv_host", int(pl.kv_host))
         # the tree's budget: a drafting head draws it; without one the n-gram continuations merge into one tree on a
         # card holding every layer, where its rows verify at about the cost of one; 15 rows and the root are the
@@ -355,6 +359,8 @@ def load(
         resident_head=bool(int(c.get("resident_head", 1))),
         prefill_card=bool(int(c.get("prefill_card", 0))) and dev.kind is not Device.CPU,
         prefill_card_min=int(c.get("prefill_card_min", 64)),
+        # the rows a prefill takes at once; unset, the free memory prices it (`_auto_chunk`)
+        prefill_chunk=int(c.get("prefill_chunk", 0) or 0) or None,
         kv_host=bool(int(c.get("kv_host", 0))),
         context=int(c.get("context", 0) or 0) or None,
         kv_bits=(int(c.get("kv_bits", 0) or 0) or None) if dev.kind is Device.MLX else None,

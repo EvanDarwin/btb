@@ -308,6 +308,8 @@ class PassTag(StrEnum):
     EXPERT_MXFP4_DEQUANT = "expert_mxfp4_dequant"  # MXFP4 experts widened to float before the matmul
     EXPERT_FP8_ASSTORED = "expert_fp8_asstored"  # FP8 experts multiplied as stored, e4m3 bytes and scale grid
     EXPERT_FP8_WIDENED = "expert_fp8_widened"  # FP8 experts widened by their scales to bf16 before the matmul
+    # a prefill's expert call as grouped matmuls over the depot's slots on the card (`_card_grouped`)
+    EXPERT_CARD_GROUPED = "expert_card_grouped"
     # the head, and the route a long prefill took (btb/engine/forward.py)
     HEAD_RESIDENT = "head_resident"  # the head multiplied where the model runs
     HEAD_STREAMED = "head_streamed"  # the head read from the checkpoint for the pass (`resident_head` off)

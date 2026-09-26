@@ -548,6 +548,11 @@ class _Experts(torch.nn.Module):
         added and their gate taken per row. The per-expert loop multiplies them on the host's kernels in float32 and
         hands the card the bf16 of it, so the steps are the loop's, dtype for dtype; only the order of the float32
         sums inside a product differs, and with it now and then a bf16's last bit."""
+        self.sm._tag(PassTag.EXPERT_CARD_GROUPED)
+        if self.mx:
+            self.sm._tag(PassTag.EXPERT_MXFP4_DEQUANT)  # widened on the card, `dequant_blocks`
+        elif self.f8:
+            self.sm._tag(PassTag.EXPERT_FP8_WIDENED)  # widened on the card, `fp8.held`
         T, k = int(top_k_index.shape[0]), int(top_k_index.shape[1])
         pos_s, row_s, offs, counts = group_picks(top_k_index, self.num_experts)
         ranks = torch.argsort(torch.argsort(top_k_index, dim=1), dim=1)
