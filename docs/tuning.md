@@ -31,9 +31,9 @@ free memory at load. The knobs below either change how much it may take or force
 
 **How much it may take.** `--ram-reserve GB|%` and `--vram-reserve GB|%` set what btb leaves for everything else
 (default: 10% of RAM; 0.5 GB or 8% of a small card). Lower them to fit more resident, raise them if the machine
-needs to do other work. `--vram-watch 1` (default) frees layers back to the OS when another program claims the
-card and reclaims them when it frees; `--vram-watch 0` plans once and holds the placement, which is faster but
-will make the other program OOM instead of btb.
+needs to do other work. `--adapt 1` (default) gives layers up when another program needs the memory - off the
+card, or from RAM to the drive - and takes them back once it frees; `--adapt 0` plans once and holds the
+placement, which is faster but will make the other program OOM instead of btb.
 
 **Where the layers live.** The planner keeps as many layers resident as fit. To force it:
 

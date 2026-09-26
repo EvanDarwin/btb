@@ -11,6 +11,7 @@ native gemv kernel is loaded first so the receipts match the tolerance the suite
     python tests/make_fixtures.py            # all families
     python tests/make_fixtures.py qwen3 q4   # a subset
     python tests/make_fixtures.py twins      # only the precision twins of every cert fixture
+    python -m tests.make_fixtures seed phi3  # a family's first draw the oracle's margin floor accepts (its *_SEED)
 
 Families: qwen3, q35, phi3, q4, gpt_oss.
 """
@@ -21,9 +22,10 @@ import json
 import os
 import shutil
 import sys
-from typing import TYPE_CHECKING
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Protocol
 
-from btb.kinds import Json, QuantClass, TokenRows, quants_of
+from btb.kinds import FamilyKind, Json, QuantClass, TokenRows, quants_of
 from tests.helpers import (
     CHUNK,
     FIXTURES,
@@ -435,14 +437,18 @@ def _reshard(out_dir: str, state: dict[str, torch.Tensor], cap: int = 100_000) -
     return total
 
 
-def build_qwen3(out_dir: str) -> None:
+# a draw whose oracle decodes (base and FP8 twin) keep every greedy top-2 gap above the oracle's margin floor
+QWEN3_SEED = 0
+
+
+def build_qwen3(out_dir: str, seed: int = QWEN3_SEED) -> None:
     import torch
     from transformers import Qwen3Config, Qwen3ForCausalLM
 
-    torch.manual_seed(0)
+    torch.manual_seed(seed)
     kw: Json = {
         "vocab_size": 256, "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 4,
-        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16, "max_position_embeddings": 512,
+        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 128, "max_position_embeddings": 512,
         "rms_norm_eps": 1e-6, "tie_word_embeddings": True, "hidden_act": "silu", "rope_theta": 1000000.0,
         "use_sliding_window": False, "attention_bias": False, "pad_token_id": 1, "eos_token_id": 1,
         "bos_token_id": 0, "torch_dtype": "bfloat16",
@@ -452,15 +458,19 @@ def build_qwen3(out_dir: str) -> None:
     m.save_pretrained(out_dir, max_shard_size="100KB", safe_serialization=True)
 
 
-def build_phi3(out_dir: str) -> None:
+# a draw whose oracle decodes (base and FP8 twin) keep every greedy top-2 gap above the oracle's margin floor
+PHI3_SEED = 2
+
+
+def build_phi3(out_dir: str, seed: int = PHI3_SEED) -> None:
     import torch
     from transformers import Phi3Config, Phi3ForCausalLM
 
-    torch.manual_seed(0)
-    rot = 12
+    torch.manual_seed(seed)
+    rot = 96
     kw: Json = {
-        "vocab_size": 256, "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 4,
-        "num_attention_heads": 4, "num_key_value_heads": 2, "max_position_embeddings": 512,
+        "vocab_size": 256, "hidden_size": 256, "intermediate_size": 256, "num_hidden_layers": 4,
+        "num_attention_heads": 2, "num_key_value_heads": 1, "max_position_embeddings": 512,
         "original_max_position_embeddings": 64, "rms_norm_eps": 1e-5, "tie_word_embeddings": True,
         "hidden_act": "silu", "partial_rotary_factor": 0.75, "rope_theta": 10000.0, "sliding_window": 4096,
         "pad_token_id": 1, "eos_token_id": 1, "bos_token_id": 0,
@@ -473,19 +483,23 @@ def build_phi3(out_dir: str) -> None:
     m.save_pretrained(out_dir, max_shard_size="100KB", safe_serialization=True)
 
 
-def build_gemma3(out_dir: str) -> None:
+# a draw whose oracle decodes (base and FP8 twin) keep every greedy top-2 gap above the oracle's margin floor
+GEMMA3_SEED = 44
+
+
+def build_gemma3(out_dir: str, seed: int = GEMMA3_SEED) -> None:
     import torch
     from transformers import Gemma3ForCausalLM, Gemma3TextConfig
 
-    torch.manual_seed(0)
+    torch.manual_seed(seed)
     # 6 layers so the default 5-sliding : 1-full pattern gives at least one global-attention layer, exercising
     # the dual (local/global) rope; a small window so the sliding path is real at a tiny context. gelu_pytorch_tanh
     # and the sandwich norm come from the config's model_type, and the input embedding is scaled by sqrt(hidden).
     kw: Json = {
         "vocab_size": 256, "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 6,
-        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16, "max_position_embeddings": 512,
+        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 256, "max_position_embeddings": 512,
         "sliding_window": 32, "rms_norm_eps": 1e-6, "tie_word_embeddings": True,
-        "hidden_activation": "gelu_pytorch_tanh", "query_pre_attn_scalar": 16,
+        "hidden_activation": "gelu_pytorch_tanh", "query_pre_attn_scalar": 256,
         "pad_token_id": 0, "eos_token_id": 1, "bos_token_id": 2,
     }  # fmt: skip
     m = Gemma3ForCausalLM(Gemma3TextConfig(**kw)).eval().to(torch.bfloat16)
@@ -493,12 +507,16 @@ def build_gemma3(out_dir: str) -> None:
     m.save_pretrained(out_dir, max_shard_size="100KB", safe_serialization=True)
 
 
-def build_q4(out_dir: str) -> None:
+# a draw whose oracle decodes (base and FP8 twin) keep every greedy top-2 gap above the oracle's margin floor
+Q4_SEED = 0
+
+
+def build_q4(out_dir: str, seed: int = Q4_SEED) -> None:
     import torch
     from transformers import Qwen4ExpForCausalLM
     from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
 
-    torch.manual_seed(0)
+    torch.manual_seed(seed)
     lt = ["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 2
     cfg = Qwen4ExpTextConfig(
         vocab_size=512, hidden_size=64, num_hidden_layers=8, num_attention_heads=4, num_key_value_heads=2,
@@ -527,7 +545,7 @@ def build_q4(out_dir: str) -> None:
 
 
 # a draw whose oracle decodes (base and FP8 twin) keep every greedy top-2 gap above the oracle's margin floor
-Q35_SEED = 94
+Q35_SEED = 59
 
 
 def _q35_model(seed: int = Q35_SEED) -> tuple[PretrainedConfig, GenerativePreTrainedModel]:
@@ -540,11 +558,11 @@ def _q35_model(seed: int = Q35_SEED) -> tuple[PretrainedConfig, GenerativePreTra
     lt = ["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 2
     kw: Json = {
         "vocab_size": 512, "hidden_size": 128, "intermediate_size": 256, "num_hidden_layers": 8,
-        "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 64, "max_position_embeddings": 4096,
+        "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 256, "max_position_embeddings": 4096,
         "rms_norm_eps": 1e-6, "tie_word_embeddings": False, "hidden_act": "silu", "attention_bias": False,
         "attn_output_gate": True, "layer_types": lt, "partial_rotary_factor": 0.25,
         "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.25,
-                            "mrope_section": [3, 3, 2], "mrope_interleaved": True},
+                            "mrope_section": [11, 11, 10], "mrope_interleaved": True},
         "linear_conv_kernel_dim": 4, "linear_key_head_dim": 32, "linear_value_head_dim": 32,
         "linear_num_key_heads": 2, "linear_num_value_heads": 4, "pad_token_id": 1, "eos_token_id": 1,
         "bos_token_id": 0, "dtype": "bfloat16",
@@ -553,8 +571,8 @@ def _q35_model(seed: int = Q35_SEED) -> tuple[PretrainedConfig, GenerativePreTra
     return cfg, Qwen3_5ForCausalLM(cfg).eval().to(torch.bfloat16)
 
 
-def build_q35(out_dir: str) -> None:
-    cfg, m = _q35_model()
+def build_q35(out_dir: str, seed: int = Q35_SEED) -> None:
+    cfg, m = _q35_model(seed)
     os.makedirs(out_dir, exist_ok=True)
     m.save_pretrained(out_dir, max_shard_size="100KB", safe_serialization=True)  # config + generation_config
     sd = {k: v.detach().contiguous() for k, v in m.state_dict().items()}
@@ -569,7 +587,8 @@ def _mtp_head(cfg: PretrainedConfig) -> dict[str, torch.Tensor]:
     import torch
 
     torch.manual_seed(1)
-    h, hd, nq, nkv, inter = 128, 64, 2, 1, 256
+    h, hd, inter = int(cfg.hidden_size), int(cfg.head_dim), int(cfg.intermediate_size)
+    nq, nkv = int(cfg.num_attention_heads), int(cfg.num_key_value_heads)
     gate = 2 if getattr(cfg, "attn_output_gate", False) else 1
 
     def r(*shape: int) -> torch.Tensor:
@@ -666,9 +685,9 @@ def _gpt_oss_tensors(seed: int = GPT_OSS_SEED) -> dict[str, torch.Tensor]:
     return t
 
 
-def build_gpt_oss(out_dir: str) -> None:
+def build_gpt_oss(out_dir: str, seed: int = GPT_OSS_SEED) -> None:
     os.makedirs(out_dir, exist_ok=True)
-    _reshard(out_dir, _gpt_oss_tensors())
+    _reshard(out_dir, _gpt_oss_tensors(seed))
     with open(os.path.join(out_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(_gpt_oss_config(), f, indent=2)
     gen = {"_from_model_config": True, "bos_token_id": 0, "eos_token_id": 1, "pad_token_id": 1}
@@ -912,7 +931,68 @@ def bank_gpt_oss(base_dir: str, out: str) -> None:
 
 # --- orchestration -----------------------------------------------------------------------------------------
 
-FAMILIES = ("qwen3", "q35", "phi3", "q4", "gpt_oss", "gemma3")
+
+class Builder(Protocol):
+    """a family's builder: its tiny checkpoint drawn into `out_dir` under `seed` (the family's `*_SEED` by default)"""
+
+    def __call__(self, out_dir: str, seed: int = ...) -> None: ...
+
+
+BUILDERS: dict[str, Builder] = {
+    "qwen3": build_qwen3,
+    "q35": build_q35,
+    "phi3": build_phi3,
+    "q4": build_q4,
+    "gpt_oss": build_gpt_oss,
+    "gemma3": build_gemma3,
+}
+FAMILIES = tuple(BUILDERS)
+
+
+def _worst_margin(kind: FamilyKind, paths: Sequence[str]) -> float:
+    """the smallest greedy top-2 gap over every oracle prompt decoded from each checkpoint in `paths`, on CPU;
+    it stops at the first under the floor"""
+    from tests.cert import oracle
+
+    low = 1.0
+    for path in paths:
+        for ids in oracle.PROMPTS.values():
+            _toks, gaps = oracle.reference_margins(kind, ids, "cpu", path)
+            low = min(low, *(g for g in gaps if g is not None))
+            if low < oracle.MARGIN_FLOOR:
+                return low
+    return low
+
+
+def find_seed(name: str, tries: int = 400) -> int:
+    """The first seed whose tiny_<name> draw keeps every oracle decode - the fixture's and each lossy twin's, every
+    prompt - at or above oracle.MARGIN_FLOOR, drawn in a scratch directory (the committed fixtures untouched).
+    Set the family's `*_SEED` to it and regenerate."""
+    import tempfile
+
+    from tests.cert import oracle, spec
+
+    kind = spec.kind_of_stem(f"tiny_{name}")
+    if kind is None or name not in BUILDERS:
+        raise SystemExit(f"unknown family {name!r}; one of {FAMILIES}")
+    stem = spec.FIXTURE_STEM[kind]
+    real = spec.FIXTURES
+    with tempfile.TemporaryDirectory() as root:
+        spec.FIXTURES = root  # the twins land beside the scratch draw
+        try:
+            for seed in range(tries):
+                base = os.path.join(root, stem)
+                shutil.rmtree(base, ignore_errors=True)
+                BUILDERS[name](base, seed)
+                write_tokenizer(base)
+                write_twins(base)
+                low = _worst_margin(kind, [base, *(spec.twin_path(stem, s) for s in oracle.LOSSY)])
+                print(f"[seed] {name} {seed}: smallest top-2 gap {low:.2%}", flush=True)
+                if low >= oracle.MARGIN_FLOOR:
+                    return seed
+        finally:
+            spec.FIXTURES = real
+    raise SystemExit(f"[seed] no seed of 0..{tries - 1} clears the {oracle.MARGIN_FLOOR:.0%} floor for {name}")
 
 
 def make(name: str) -> None:
@@ -929,20 +1009,10 @@ def make(name: str) -> None:
         make_gguf_q35()
         return
     base = os.path.join(FIXTURES, f"tiny_{name}")
-    if name == "qwen3":
-        build_qwen3(base)
-    elif name == "phi3":
-        build_phi3(base)
-    elif name == "q4":
-        build_q4(base)
-    elif name == "q35":
-        build_q35(base)
-    elif name == "gpt_oss":
-        build_gpt_oss(base)
-    elif name == "gemma3":
-        build_gemma3(base)
-    else:
+    build = BUILDERS.get(name)
+    if build is None:
         raise SystemExit(f"unknown family {name!r}; one of {FAMILIES}")
+    build(base)
     write_tokenizer(base)
     # every family packs to a 12-bit store (btb pack), incl. the MoE and Gemma paths, so the pack12 storage cell
     # has a tiny fixture for each - verified they load and decode on CPU
@@ -975,6 +1045,10 @@ def _rebank_oracle() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if argv and argv[0] == "seed":
+        for name in argv[1:] or FAMILIES:
+            print(f"{name.upper()}_SEED = {find_seed(name)}")
+        return 0
     names = argv or list(FAMILIES)
     native_library()  # the receipts are banked by the native gemv kernel, so the suite's 1e-6 tolerance holds
     for name in names:

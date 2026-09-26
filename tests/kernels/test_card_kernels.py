@@ -127,6 +127,7 @@ def _attn_split(
     par: Sequence[int],
     scale: float,
     split: int = 1024,
+    win: int = 0,
 ) -> torch.Tensor:
     T, Hq, D = q.shape
     Hk, cap = K.shape[0], K.shape[1]
@@ -159,6 +160,9 @@ def _attn_split(
             P(pa),
             P(cnt),
             I(S),
+            # the kernel's last parameter (0: the whole prefix, no sliding window); left off, the driver read the
+            # argument array past its end - an access violation on Windows
+            I(win),
         ],
     )
     assert int(cnt.abs().sum()) == 0, "every (head, row) count is reset by its last block"
@@ -186,6 +190,172 @@ def test_split_attention_matches_the_reference_across_splits_and_reproduces_one_
     K2[:, n0 + 1], V2[:, n0 + 1] = K[:, n0 + 3], V[:, n0 + 3]
     one = _attn_split(cu, q[3:4], K2, V2, n0 + 1, [-1], scale)
     assert torch.equal(one[0], out[3])
+
+
+# ---------------------------------------------------------------------------------------------------------
+# the rows kernels: T sequences a token each over one cache - a prefix per row (shared by a fork's rows, end to
+# end for a batch's), then every row's step i in the stretch base + i * W, row at its column. Each row must
+# come out as its own one-row step over its keys laid end to end, whatever rows step beside it.
+# ---------------------------------------------------------------------------------------------------------
+
+RowSpec = tuple[int, int, int] | None  # (column, prefix offset, prefix length); None a padding row
+
+
+def _rows_layout(base: int, step: int, W: int, rows: Sequence[RowSpec]) -> torch.Tensor:
+    flat = [base, step, W]
+    for r in rows:
+        flat += [0, 0, -1] if r is None else list(r)
+    return torch.tensor(flat, dtype=torch.int32, device=dev)
+
+
+def _row_slots(base: int, step: int, W: int, r: tuple[int, int, int]) -> list[int]:
+    """a row's keys in logical order, as slots of the shared cache: its prefix, then its steps to this one"""
+    col, off, n = r
+    return list(range(off, off + n)) + [base + i * W + col for i in range(step + 1)]
+
+
+def _attn_rows(
+    cu: _Cuda, q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, rw: torch.Tensor, scale: float, win: int = 0
+) -> torch.Tensor:
+    T, Hq, D = q.shape
+    Hk, cap = K.shape[0], K.shape[1]
+    S = (cap + 1023) // 1024
+    out = torch.full((T, Hq, D), 7.0, device=dev, dtype=bf)  # a padding row's stays as it was
+    pm = torch.zeros(S * T * Hq, device=dev)
+    pl = torch.zeros(S * T * Hq, device=dev)
+    pa = torch.zeros(S * T * Hq * D, device=dev)
+    cnt = torch.zeros(T * Hq, dtype=torch.int32, device=dev)
+    cu.launch(
+        f"btb_attn_rows_d{D}",
+        (Hq, T, S),
+        (256, 1, 1),
+        [
+            P(q),
+            P(K),
+            P(V),
+            P(out),
+            P(rw),
+            I(T),
+            I(Hq),
+            I(Hk),
+            I(cap),
+            Fl(scale),
+            P(pm),
+            P(pl),
+            P(pa),
+            P(cnt),
+            I(S),
+            I(win),
+        ],
+    )
+    assert int(cnt.abs().sum()) == 0, "every (head, row) count is reset by its last block"
+    return out
+
+
+# a fork: one prefix across two splits, the rows' columns shuffled (rows left and a beam reordered), a padding
+# row last; a batch: three prompts end to end, their steps past 2K keys, one row padding in the middle
+FORK = (1500, 37, 4, [(2, 0, 1500), (0, 0, 1500), (3, 0, 1500), (1, 0, 1500), None])
+BATCH = (1900, 700, 3, [(0, 0, 700), None, (1, 700, 1100), (2, 1800, 90)])
+
+
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("layout", [FORK, BATCH], ids=["fork", "batch"])
+@pytest.mark.parametrize("win", [0, 512])
+def test_rows_attention_is_each_rows_own_one_row_step(
+    cu: _Cuda, D: int, layout: tuple[int, int, int, list[RowSpec]], win: int
+) -> None:
+    torch.manual_seed(8)
+    base, step, W, rows = layout
+    Hq, Hk, T = 8, 4, len(rows)
+    cap = (base + (step + 1) * W + 1023) // 1024 * 1024
+    K = torch.randn(Hk, cap, D, device=dev, dtype=bf)
+    V = torch.randn(Hk, cap, D, device=dev, dtype=bf)
+    q = torch.randn(T, Hq, D, device=dev, dtype=bf)
+    scale = 1.0 / math.sqrt(D)
+    rw = _rows_layout(base, step, W, rows)
+    out = _attn_rows(cu, q, K, V, rw, scale, win)
+    assert torch.equal(out, _attn_rows(cu, q, K, V, rw, scale, win))
+    for t, r in enumerate(rows):
+        if r is None:
+            assert bool((out[t] == 7.0).all()), "a padding row computes nothing"
+            continue
+        slots = _row_slots(base, step, W, r)
+        seen = slots[-win:] if win else slots
+        ref = _attn_ref(q[t], K, V, seen, scale)
+        assert (out[t].float() - ref.float()).abs().max().item() < 4e-3
+        # the row alone: its keys end to end from slot 0, the one-row step at its position
+        n = len(slots)
+        K1 = torch.zeros(Hk, (n + 1023) // 1024 * 1024, D, device=dev, dtype=bf)
+        V1 = torch.zeros_like(K1)
+        K1[:, :n], V1[:, :n] = K[:, slots], V[:, slots]
+        one = _attn_split(cu, q[t : t + 1], K1, V1, n - 1, [-1], scale, win=win)
+        assert torch.equal(one[0], out[t])
+
+
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("layout", [FORK, BATCH], ids=["fork", "batch"])
+def test_norm_rope_kv_rows_writes_each_row_as_its_own_step(
+    cu: _Cuda, D: int, layout: tuple[int, int, int, list[RowSpec]]
+) -> None:
+    torch.manual_seed(9)
+    base, step, W, rows = layout
+    Hq, Hk, T, eps = 8, 4, len(rows), 1e-6
+    cap = (base + (step + 1) * W + 1023) // 1024 * 1024
+    wq = torch.rand(D, device=dev, dtype=bf) + 0.5
+    wk = torch.rand(D, device=dev, dtype=bf) + 0.5
+    cos_t, sin_t = _rope_tables(cap, D)
+    qkv = torch.randn(T, (Hq + 2 * Hk) * D, device=dev, dtype=bf)
+    K = torch.zeros(Hk, cap, D, device=dev, dtype=bf)
+    V = torch.zeros_like(K)
+    qo = torch.zeros(T, Hq, D, device=dev, dtype=bf)
+    rw = _rows_layout(base, step, W, rows)
+    common = [I(T), I(Hq), I(Hk), I(cap), I(0)]
+    cu.launch(
+        f"btb_norm_rope_kv_rows_d{D}",
+        (Hq + 2 * Hk, T, 1),
+        (32, 1, 1),
+        [P(qkv), P(wq), P(wk), Fl(eps), P(cos_t), P(sin_t), P(rw), P(K), P(V), P(qo), *common],
+    )
+    written = torch.zeros(cap, dtype=torch.bool, device=dev)
+    for t, r in enumerate(rows):
+        if r is None:
+            assert bool((qo[t] == 0).all()), "a padding row writes nothing"
+            continue
+        pos = r[2] + step
+        slot = _row_slots(base, step, W, r)[-1]
+        written[slot] = True
+        # the tree kernel's one-row step at the row's position, its row at slot `pos` of a cache of its own
+        K1, V1 = torch.zeros_like(K), torch.zeros_like(V)
+        q1 = torch.empty(1, Hq, D, device=dev, dtype=bf)
+        x1 = qkv[t : t + 1].contiguous()
+        n0t = torch.tensor([pos], dtype=torch.int32, device=dev)
+        d0 = torch.zeros(1, dtype=torch.int32, device=dev)
+        cu.launch(
+            f"btb_norm_rope_kv_d{D}",
+            (Hq + 2 * Hk, 1, 1),
+            (32, 1, 1),
+            [
+                P(x1),
+                P(wq),
+                P(wk),
+                Fl(eps),
+                P(cos_t),
+                P(sin_t),
+                P(n0t),
+                P(d0),
+                P(K1),
+                P(V1),
+                P(q1),
+                I(1),
+                I(Hq),
+                I(Hk),
+                I(cap),
+                I(0),
+            ],
+        )
+        assert torch.equal(qo[t], q1[0])
+        assert torch.equal(K[:, slot], K1[:, pos]) and torch.equal(V[:, slot], V1[:, pos])
+    assert bool((K[:, ~written] == 0).all()) and bool((V[:, ~written] == 0).all()), "no other slot is touched"
 
 
 def _rope_tables(cap: int, D: int) -> tuple[torch.Tensor, torch.Tensor]:

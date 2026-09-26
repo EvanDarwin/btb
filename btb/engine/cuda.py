@@ -5,11 +5,12 @@ pass over the host-side attention cache."""
 from __future__ import annotations
 
 import ctypes
+import itertools
 import os
 import sys
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -18,7 +19,7 @@ from .. import mlx as mlxdev
 from ..kinds import LayerKind, NodePath, Parents, PassTag, Tokens
 from ..options import Device
 from ..sampling import GREEDY
-from .cache import GrowLayer
+from .cache import CardRowsLayer, GrowLayer, attention_rows, forked, set_rows
 from .families import act_name
 from .forward import layer_window, node_mask, pe_for
 from .fused import _fused_rope
@@ -145,8 +146,18 @@ class _CudaMixin(_State):
         """the pass's rope as one (cos, sin) per layer type: a dual-rope family's own, the others' one for all"""
         return pe if isinstance(pe, dict) else dict.fromkeys(set(self.layer_types), pe)
 
+    def _rope_fn(self) -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
+        """the one rope the engine applies where it rotates q and k itself - a one-row step's graph, a kv_host pass,
+        the card's own attention - so a step and a verify pass over the same rows rotate them alike: the fused one
+        (BTB_FUSED_ROPE, on by default) for a family whose rope is the reference's full or partial rotary, else
+        the module's. The fused one is not the module's bit for bit in bf16 (addcmul rounds once where the
+        reference rounds twice): two paths reading different ropes parted a kv_host verify from its steps"""
+        if self._frope and (self.fam.dense or self.fam.sandwich):
+            return _fused_rope
+        return cast(Callable[..., tuple[torch.Tensor, torch.Tensor]], self.fam.mod.apply_rotary_pos_emb)
+
     def _seg_a(self, g: dict[str, Any], i: int) -> None:
-        apply_rotary_pos_emb = _fused_rope if self._frope else self.fam.mod.apply_rotary_pos_emb
+        apply_rotary_pos_emb = self._rope_fn()
         tmpl = self.resident[i]
         at = tmpl.self_attn
         hd = at.head_dim
@@ -202,8 +213,6 @@ class _CudaMixin(_State):
         g = getattr(self, "_g", None)
         if g is not None:
             return g
-        self._frope = os.environ.get("BTB_FUSED_ROPE", "1") != "0"
-        self._fmlp = os.environ.get("BTB_FUSED_MLP", "1") != "0"
         c = self.cfg
         hq = int(c.num_attention_heads)
         hk = int(getattr(c, "num_key_value_heads", None) or hq)
@@ -319,6 +328,7 @@ class _CudaMixin(_State):
             and on_layer is None
             and stop_after is None
             and cache is not None
+            and not forked(cache)
             and self._card_ready()
         )
 
@@ -464,13 +474,16 @@ class _CudaMixin(_State):
             for i, j in ar["slot"].items():
                 if i in slot:
                     A[slot[i], :, :, : ar["cap"]].copy_(ar["A"][j])
-                    if owner is not None:
+                    if owner is not None and isinstance(owner.layers[i], CardRowsLayer):
+                        # a fork's or a batch's rows keep their slots: only the slices move
+                        if owner.layers[i]._buf is not None:
+                            owner.layers[i]._buf = (A[slot[i], 0], A[slot[i], 1])
+                    elif owner is not None:
                         layer = owner.layers[i]
                         n = int(layer.keys.shape[-2]) if (layer.is_initialized and layer.keys is not None) else 0
                         layer._buf = (A[slot[i], 0][None], A[slot[i], 1][None])
                         if n:
-                            layer.keys = layer._buf[0][..., :n, :]
-                            layer.values = layer._buf[1][..., :n, :]
+                            layer._set_rows(layer._buf[0][..., :n, :], layer._buf[1][..., :n, :])
         st["arena"] = new
         st["graphs"].clear()
         # how much of the arena's front sits in persisting L2 is the scheduler's call (it holds the
@@ -517,10 +530,7 @@ class _CudaMixin(_State):
         ar = self._card_arena(st, need)
         owner = ar["owner"]() if ar["owner"] is not None else None
         if owner is not cache:
-            if owner is not None:
-                for i in ar["slot"]:
-                    if isinstance(owner.layers[i], GrowLayer):
-                        owner.layers[i].detach()
+            self._card_evict(ar)
             ar["owner"] = weakref.ref(cache)
         A = ar["A"]
         for i, j in ar["slot"].items():
@@ -580,13 +590,14 @@ class _CudaMixin(_State):
         return (R + 15) // 16
 
     def _card_buffers(
-        self, st: dict[str, Any], a: int, b: int, T: int, tail: bool, mma: bool | None = None
+        self, st: dict[str, Any], a: int, b: int, T: int, tail: bool, mma: bool | None = None, rows: bool = False
     ) -> dict[str, Any]:
         """the static buffers of the (run, T, GEMV) graph, made once; the graph itself is captured by
-        `_card_capture` on the first pass, after that pass's inputs are in place"""
+        `_card_capture` on the first pass, after that pass's inputs are in place. `rows`: the T rows are sequences
+        of their own (a fork's or a batch's), laid out by `st["rw"]`, and the key carries it"""
         if mma is None:
             mma = self._card_mma_for(T)
-        key = (a, b, T, tail, bool(mma))
+        key = (a, b, T, tail, bool(mma), "rows") if rows else (a, b, T, tail, bool(mma))
         g = st["graphs"].get(key)
         if g is not None:
             return g
@@ -644,16 +655,21 @@ class _CudaMixin(_State):
         P, ci, cf = k.ptr, ctypes.c_int, ctypes.c_float
         Ls = [self._card_weights(st, i) for i in range(a, b)]
         mma = bool(g.get("mma"))
+        rows = g["key"][5:] == ("rows",)
         sandwich = self.fam.sandwich
         cen = ci(1 if self.fam.norm_centered else 0)  # the norms scale by 1 + w
         act = "gelu" if act_name(self.cfg) == "gelu_pytorch_tanh" else "silu"
         gemv = f"btb_gemv_bf16_m{M}"
         gemv_act = f"btb_gemv_{act}_bf16_m{M}"
-        attn = f"btb_attn_split_d{D}"
-        nrk = f"btb_norm_rope_kv_d{D}"
+        attn = f"btb_attn_rows_d{D}" if rows else f"btb_attn_split_d{D}"
+        nrk = f"btb_norm_rope_kv_rows_d{D}" if rows else f"btb_norm_rope_kv_d{D}"
         if attn not in k.fn or nrk not in k.fn:
             raise RuntimeError(f"[card] no kernel for head_dim {D}")
         S = int(g["S"])
+        # where each row's keys lie: the tree's (its prefix length, the rows' depths and parents), or the rows'
+        # layout, one array for every rows graph
+        where = [P(st["rw"])] if rows else [P(g["n0"]), P(g["depth"])]
+        walk = [P(st["rw"])] if rows else [P(g["n0"]), P(g["par"])]
 
         def matvec(W: torch.Tensor, xin: torch.Tensor, yout: torch.Tensor, R: int, C: int) -> None:
             if mma:
@@ -690,8 +706,7 @@ class _CudaMixin(_State):
                     cf(L["eps"]),
                     P(cos_t),
                     P(sin_t),
-                    P(g["n0"]),
-                    P(g["depth"]),
+                    *where,
                     P(kb),
                     P(vb),
                     P(g["q"]),
@@ -711,8 +726,7 @@ class _CudaMixin(_State):
                     P(kb),
                     P(vb),
                     P(g["att"]),
-                    P(g["n0"]),
-                    P(g["par"]),
+                    *walk,
                     ci(T),
                     ci(Hq),
                     ci(Hk),
@@ -1075,7 +1089,7 @@ class _CudaMixin(_State):
 
         n_replays = (steps + U - 1) // U
         for j in range(n_replays):
-            if self.abort.is_set():
+            if self._stop_asked():
                 stop = True
                 break
             graphs[j & 1].replay()
@@ -1288,6 +1302,172 @@ class _CudaMixin(_State):
             return None, g["logits"][:T].view(1, T, -1)
         return g["h"][:T].view(1, T, -1), None
 
+    # -- rows: a fork's or a batch's rows stepped together, a token each at its own position -------------------
+
+    ROWS_ROOM = 256  # steps of room a regrowth of the arena makes for the rows (a regrowth drops the graphs)
+
+    def _card_rows_ok(self, B: int, cache: Any = None) -> bool:
+        """the card graph's rows pass takes B rows: the whole model one resident run, the final norm and the head
+        on the card (a step is one replay, the logits its last node) - and, for a formed cache, every layer the
+        arena's rows layer"""
+        if not 1 <= B <= self.CARD_T_MAX or not self._card_ready():
+            return False
+        st = self._card_state()
+        head, norm = self.head, self.norm
+        if (
+            st["segments"] != [(0, self.L)]
+            or head is None
+            or norm is None
+            or head.weight.device.type != "cuda"
+            or head.weight.dtype != torch.bfloat16
+            or norm.weight.device.type != "cuda"
+        ):
+            return False
+        return cache is None or all(isinstance(cache.layers[i], CardRowsLayer) for i in range(self.L))
+
+    def _card_evict(self, ar: dict[str, Any]) -> None:
+        """the arena's holder lets it go: the rows it has become copies of their own"""
+        owner = ar["owner"]() if ar["owner"] is not None else None
+        if owner is not None:
+            for i in ar["slot"]:
+                if isinstance(owner.layers[i], (GrowLayer, CardRowsLayer)):
+                    owner.layers[i].detach()
+        ar["owner"] = None
+
+    def _card_rows_form(self, cache: Any, srcs: list[Any], rows: list[int]) -> list[int]:
+        """`cache`'s layers as the arena's rows layers, row b going on from the rows of cache srcs[rows[b]] (a
+        fork's rows all from its session's, a batch's each from its own): the sources end to end at the arena's
+        front, the rows' steps after them. The session holding the arena keeps its rows where they are. Returns
+        the rows' prefix lengths."""
+        import weakref
+
+        st = self._card_state()
+        layers = [i for a, b in st["segments"] for i in range(a, b)]
+        lens = [int(c.layers[layers[0]].get_seq_length()) for c in srcs]
+        offs = [sum(lens[:j]) for j in range(len(srcs))]
+        base, W = sum(lens), len(rows)
+        ar = self._card_arena(st, base + W * self.ROWS_ROOM)
+        owner = ar["owner"]() if ar["owner"] is not None else None
+        in_place = {
+            j
+            for j, c in enumerate(srcs)
+            if owner is not None
+            and c is owner
+            and offs[j] == 0
+            and all(isinstance(c.layers[i], GrowLayer) and c.layers[i]._attached() for i in layers)
+        }
+        self._card_evict(ar)
+        ar["owner"] = weakref.ref(cache)
+        A = ar["A"]
+        for i in layers:
+            kb, vb = A[ar["slot"][i], 0], A[ar["slot"][i], 1]
+            for j, c in enumerate(srcs):
+                if j in in_place:
+                    continue
+                k, v = attention_rows(c.layers[i])
+                if int(k.shape[0]) != 1 or int(k.shape[-2]) != lens[j]:
+                    raise RuntimeError(
+                        f"[card] layer {i}: a source of {tuple(k.shape)} rows, not one sequence of {lens[j]}"
+                    )
+                kb[:, offs[j] : offs[j] + lens[j]].copy_(k[0])
+                vb[:, offs[j] : offs[j] + lens[j]].copy_(v[0])
+            cache.layers[i] = CardRowsLayer(kb, vb, [offs[r] for r in rows], [lens[r] for r in rows], base, W)
+        return [lens[r] for r in rows]
+
+    def _card_rows_bind(self, cache: Any, st: dict[str, Any], need: int = 0) -> dict[str, Any]:
+        """the arena holding `cache`'s rows with room for their next step (and `need` slots): taken back from any
+        other cache holding it, grown when the rows outrun it"""
+        import weakref
+
+        l0 = cache.layers[0]
+        need = max(int(need), l0.used + l0.W)
+        ar = st["arena"]
+        owner = ar["owner"]() if ar is not None and ar["owner"] is not None else None
+        if (
+            owner is not None
+            and owner is cache
+            and ar["cap"] >= need
+            and all(cache.layers[i]._buf is not None for i in ar["slot"])
+        ):
+            return ar
+        if ar is None or ar["cap"] < need:
+            ar = self._card_arena(st, max(need, l0.used + l0.W * max(self.ROWS_ROOM, l0._t)))
+            owner = ar["owner"]() if ar["owner"] is not None else None
+        if owner is not cache:
+            self._card_evict(ar)
+            ar["owner"] = weakref.ref(cache)
+        for i, j in ar["slot"].items():
+            cl = cache.layers[i]
+            kb = ar["A"][j, 0]
+            if cl._buf is None or cl._buf[0].data_ptr() != kb.data_ptr():
+                cl.attach(kb, ar["A"][j, 1])
+        return ar
+
+    def _card_rows_select(self, cache: Any, slots: list[int]) -> None:
+        """the rows at `slots` become the rows (see `CardRowsLayer.select`), the arena made room for first"""
+        st = self._card_state()
+        self._card_rows_bind(cache, st, cache.layers[0].used_after(slots))
+        for cl in cache.layers:
+            cl.select(slots)
+
+    def _card_rows_release(self, cache: Any) -> None:
+        """`cache` closed: the arena is free for the next cache without copying the rows out"""
+        st = getattr(self, "_cg", None)
+        ar = st["arena"] if st is not None else None
+        if ar is not None and ar["owner"] is not None and ar["owner"]() is cache:
+            ar["owner"] = None
+        for cl in cache.layers:
+            if isinstance(cl, CardRowsLayer):
+                cl._buf = cl._own = None
+
+    def _card_rows_step(
+        self, cache: Any, toks: list[int], taps: tuple[int, ...] = ()
+    ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
+        """One token into each row of `cache` (formed by `_card_rows_form`): the rows' logits [B, V] float32 on the
+        card, and the residual leaving each `taps` layer, {layer: [B, H] float32}. One replay (one a stretch between
+        taps) of the graph captured at the GEMV's padded width; the rows past B are padding the kernels skip."""
+        self._tag(PassTag.CUDA_GRAPH)
+        B = len(toks)
+        st = self._card_state()
+        self._card_rows_bind(cache, st)
+        l0 = cache.layers[0]
+        Tb = self._card_m(B)
+        rw = st.get("rw")
+        if rw is None:
+            rw = st["rw"] = torch.zeros(3 + 3 * self.CARD_T_MAX, dtype=torch.int32, device=self.dev)
+        lay = [l0.base, l0._t, l0.W]
+        for c, o, n in zip(l0.cols, l0.offs, l0.lens):
+            lay += [c, o, n]
+        lay += [0, 0, -1] * (Tb - B)
+        rw[: len(lay)].copy_(torch.tensor(lay, dtype=torch.int32))
+        h = self.embed(torch.tensor(toks, dtype=torch.long, device=self.dev).view(B, 1))
+        if self.compute_dtype is not None:
+            h = h.to(self.compute_dtype)
+        x = h.reshape(B, -1)
+        edges = [0, *sorted({int(i) + 1 for i in taps if 0 <= int(i) < self.L - 1}), self.L]
+        seen: dict[int, torch.Tensor] = {}
+        logits = None
+        with self.device.hold():
+            for a, b in itertools.pairwise(edges):
+                tail = b == self.L
+                g = self._card_buffers(st, a, b, Tb, tail, rows=True)
+                if "graph" not in g:
+                    # the capture's eager run writes this step's slots, which the replay rewrites
+                    g["h"][:B].copy_(x)
+                    self._card_capture(st, g)
+                g["h"][:B].copy_(x)
+                g["graph"].replay()
+                x = g["h"][:B]
+                if b - 1 in taps:
+                    seen[b - 1] = x.float().cpu()
+                if tail:
+                    logits = g["logits"][:B]
+        for cl in cache.layers:
+            cl._t += 1
+        assert logits is not None  # the last stretch carries the head
+        # a copy: the graph's own buffer is the next replay's
+        return logits.float(), seen
+
     def _forward_fast(self, h: torch.Tensor, pe: Any, cache: Any, last_only: bool, head: bool) -> torch.Tensor:
         self._tag(PassTag.CUDA_GRAPH)
         g = self._graphs(h.dtype, pe)
@@ -1341,12 +1521,10 @@ class _CudaMixin(_State):
                     continue
                 if getattr(layer, "keys", None) is not None:
                     if path == list(range(len(path))):
-                        layer.keys = layer.keys[..., : len(keep), :]
-                        layer.values = layer.values[..., : len(keep), :]
+                        set_rows(layer, layer.keys[..., : len(keep), :], layer.values[..., : len(keep), :])
                     else:
                         idx = torch.tensor(keep, device=layer.keys.device)
-                        layer.keys = layer.keys.index_select(-2, idx)
-                        layer.values = layer.values.index_select(-2, idx)
+                        set_rows(layer, layer.keys.index_select(-2, idx), layer.values.index_select(-2, idx))
                     if hasattr(layer, "cumulative_length"):
                         layer.cumulative_length = int(layer.keys.shape[-2])
             else:
@@ -1680,7 +1858,7 @@ class _CudaMixin(_State):
     ) -> torch.Tensor:
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-        apply_rotary_pos_emb = self.fam.mod.apply_rotary_pos_emb
+        apply_rotary_pos_emb = self._rope_fn()
         eager_attention_forward = self.fam.mod.eager_attention_forward
         residual = h
         outs = []

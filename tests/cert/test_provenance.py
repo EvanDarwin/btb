@@ -6,6 +6,8 @@ torch or the per-op path is caught instead of certified."""
 from __future__ import annotations
 
 import ast
+import importlib
+import inspect
 import os
 import re
 
@@ -85,10 +87,59 @@ def test_every_forward_entry_records_a_tag() -> None:
     )
 
 
+def _api_called() -> set[PassTag]:
+    """the API calls the declared classes record: every module under btb/ spelling `@api(` imported, then the
+    public methods of each class it declares under an owner (`__btb_owner__`, set on the class `@api` builds)"""
+    declared: list[tuple[str, type]] = []
+    for root, _dirs, files in os.walk(BTB):
+        for name in files:
+            path = os.path.join(root, name)
+            if not name.endswith(".py"):
+                continue
+            with open(path, encoding="utf-8") as f:
+                declares = "@api(" in f.read()
+            if declares:
+                rel = os.path.relpath(path[: -len(".py")], os.path.dirname(BTB))
+                mod = importlib.import_module(rel.replace(os.sep, ".").removesuffix(".__init__"))
+                declared += [
+                    (vars(c)["__btb_owner__"], c)
+                    for c in vars(mod).values()
+                    if isinstance(c, type) and c.__module__ == mod.__name__ and "__btb_owner__" in vars(c)
+                ]
+    return {
+        PassTag(f"{owner}.{n}")
+        for owner, cls in declared
+        for n, member in vars(cls).items()
+        if not n.startswith("_") and inspect.isfunction(member) and not getattr(member, "__isabstractmethod__", False)
+    }
+
+
+def test_every_api_tag_is_a_declared_method() -> None:
+    """every `owner.method` PassTag names a public method of a class `@api(owner)` builds - a tag whose method
+    was removed or renamed is a reported gap, as a public method with no tag is a class that refuses to build"""
+    declared = {t for t in PassTag if "." in t.value}
+    stale = sorted(t.value for t in declared - _api_called())
+    assert not stale, f"these API tags name no method of their owner's classes (drop or rename them): {stale}"
+
+
+def test_an_undeclared_public_method_refuses_to_build() -> None:
+    """the hoop: a public method on an API class with no PassTag of its own is a class that does not build"""
+    from btb.api import api
+
+    with pytest.raises(TypeError, match=r"declares no session\.bogus"):
+
+        @api("session")
+        class _Stray:
+            def _called(self, tag: PassTag) -> None: ...
+
+            def bogus(self) -> None: ...
+
+
 def test_every_pass_tag_is_emitted() -> None:
     """the reverse lint: every PassTag member is recorded somewhere under btb/, so a tag nothing produces - a fork
-    that was removed, or one declared and never wired - is a reported gap rather than a member no report can carry."""
-    used: set[str] = set()
+    that was removed, or one declared and never wired - is a reported gap rather than a member no report can carry.
+    An API call's tag is recorded by its declared method (test_every_api_tag_is_a_declared_method)."""
+    used: set[str] = {t.name for t in _api_called()}
     for root, _dirs, files in os.walk(BTB):
         for name in files:
             if name.endswith(".py"):
@@ -126,18 +177,16 @@ def test_cpu_native_and_sampling_tags() -> None:
 
 @pytest.mark.skipif(not btb.mlx_available(), reason="MLX is not available on this machine")
 def test_mlx_mega_and_step_tags() -> None:
-    """qwen3 on MLX: greedy decode runs the megakernel (MLX_MEGA) when the load built it, else the fused step
-    (MLX_STEP); with mlx_mega=0 it is always the step and never the megakernel. A bf16 checkpoint is the
-    dequantized path, QUANT_DEQUANT. The tiny fixtures carry head_dim 16, below the megakernel's 64-multiple, so
-    MLX_MEGA is only reachable on a real model here - the step path is what the fixtures exercise."""
+    """qwen3 on MLX: greedy decode runs the megakernel (MLX_MEGA), which the fixture's head of 128 builds; with
+    mlx_mega=0 it is always the step and never the megakernel. A bf16 checkpoint is the dequantized path,
+    QUANT_DEQUANT."""
     if not os.path.isdir(QWEN3):
         pytest.skip("tiny_qwen3 not built")
     with loaded_model(QWEN3, device="mlx") as sm:
-        built = sm._mega is not None
+        assert sm._mega is not None, "the megakernel did not build on the head-128 fixture"
         sm.generate([1, 2, 3, 4], 6, speculate=False)
         default = sm.last_pass_report()
-    want = PassTag.MLX_MEGA if built else PassTag.MLX_STEP
-    assert want in default, f"expected {want.value}, got {sorted(t.value for t in default.tags)}"
+    assert PassTag.MLX_MEGA in default, f"expected mlx_mega, got {sorted(t.value for t in default.tags)}"
     assert PassTag.QUANT_DEQUANT in default and PassTag.SAMPLE_GREEDY in default
 
     with loaded_model(QWEN3, device="mlx", mlx_mega=0) as sm:

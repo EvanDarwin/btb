@@ -7,7 +7,9 @@
 //   btb_gemv_{silu,gelu}_bf16_m{1,..,32}  the down projection with act(g) * u folded into its x load
 //   btb_attn_split_d{64,128,256}  one pass of T queries over the cache (a sliding layer's window of it), a tree of
 //                                 T rows at its end, split over the sequence
+//   btb_attn_rows_d{64,128,256}   the same over T sequences a token each (a fork's or a batch's rows)
 //   btb_norm_rope_kv_d{64,128,256} q/k RMSNorm, rope, the pass's rows written into the cache
+//   btb_norm_rope_kv_rows_d{64,128,256}  the same for T sequences, each at its own position
 //   btb_add_rmsnorm               h += y; x = rmsnorm(h) * w   (or * (1 + w), the zero-centred norm)
 //   btb_sandwich_add              h += rmsnorm(y) * w          (the sandwich block: the delta normed, then added)
 //   btb_{silu,gelu}_mul           m = act(g) * u  over a [T, 2I] gate/up block
@@ -223,36 +225,64 @@ GEMV_ACT(32)
 // every length, the bits of the one-row steps at long contexts too, where one block per head left the card
 // latency-bound. `part_*` hold S x T x Hq states, `cnt` T x Hq arrival counts (zero between launches: the
 // last block resets its own).
+//
+// ROWS: the T queries are T sequences instead of one tree - a fork's rows, or a batch's - each one token at its
+// own position. Row t's keys are its prefix, lens[t] rows from slot offs[t] (a fork's rows share one prefix, a
+// batch's lie end to end), then its own steps, step i at slot base + i * W + col[t]: every row's step i in one
+// stretch of W slots. The walk is row t's logical keys in order, the sequence a one-row step of that sequence
+// alone walks over a contiguous cache, so a row's bits are its own decode's whatever rows step beside it.
 // ---------------------------------------------------------------------------------------------------------
 #define ATTN_SPLIT 1024
 
-template <int D>
+// the rows' layout, one int32 array on the card: [base, steps, W, then per row (col, off, len)]; a row with
+// len < 0 is padding (the pass is launched for a width its graph was captured at) and computes nothing
+struct RowsLayout {
+    int base = 0, step = 0, W = 0, col = 0, off = 0, len = 0;
+    RowsLayout() = default;
+    __device__ __forceinline__ RowsLayout(const int* __restrict__ rw, int t)
+        : base(rw[0]), step(rw[1]), W(rw[2]), col(rw[3 + 3 * t]), off(rw[4 + 3 * t]), len(rw[5 + 3 * t]) {}
+    // the cache slot of the row's logical key j
+    __device__ __forceinline__ int slot(int j) const { return j < len ? off + j : base + (j - len) * W + col; }
+};
+
+template <int D, bool ROWS>
 __device__ __forceinline__ void attn_decode_split(const bf16* __restrict__ q, const bf16* __restrict__ K,
                                                   const bf16* __restrict__ V, bf16* __restrict__ out,
                                                   const int* __restrict__ n0p, const int* __restrict__ par,
-                                                  int T, int Hq, int Hk, int cap, float scale,
-                                                  float* __restrict__ part_m, float* __restrict__ part_l,
-                                                  float* __restrict__ part_acc, int* __restrict__ cnt, int S,
-                                                  int win) {
+                                                  const int* __restrict__ rw, int T, int Hq, int Hk, int cap,
+                                                  float scale, float* __restrict__ part_m,
+                                                  float* __restrict__ part_l, float* __restrict__ part_acc,
+                                                  int* __restrict__ cnt, int S, int win) {
     constexpr int E = D / 32;
     const int h = blockIdx.x, t = blockIdx.y, s = blockIdx.z;
     const int g = h / (Hq / Hk);
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
-    const int n0 = *n0p;
-    // no query of this pass reaches past n0 + T rows: a block whose range starts beyond that leaves before
-    // the walk and the barrier, so at a short context the launch costs what the unsplit kernel costs
-    if (s * ATTN_SPLIT >= n0 + T) return;
-    __shared__ int anc[32];
-    __shared__ int s_d;
-    if (threadIdx.x == 0) {
-        int tmp[32];
-        int len = 0;
-        for (int p = t; p >= 0 && p < T && len < 32; p = par[p]) tmp[len++] = p;
-        for (int e = 0; e < len; ++e) anc[e] = tmp[len - 1 - e];
-        s_d = len - 1;
+    // the tree's walk (its prefix length and each row's ancestors) or the rows' layout: one of the two is used
+    [[maybe_unused]] __shared__ int anc[32];
+    [[maybe_unused]] __shared__ int s_d;
+    [[maybe_unused]] int n0 = 0;
+    [[maybe_unused]] RowsLayout r;
+    int n;
+    if constexpr (ROWS) {
+        r = RowsLayout(rw, t);
+        if (r.len < 0) return;
+        n = r.len + r.step + 1;
+        if (s * ATTN_SPLIT >= n) return;
+    } else {
+        n0 = *n0p;
+        // no query of this pass reaches past n0 + T rows: a block whose range starts beyond that leaves before
+        // the walk and the barrier, so at a short context the launch costs what the unsplit kernel costs
+        if (s * ATTN_SPLIT >= n0 + T) return;
+        if (threadIdx.x == 0) {
+            int tmp[32];
+            int len = 0;
+            for (int p = t; p >= 0 && p < T && len < 32; p = par[p]) tmp[len++] = p;
+            for (int e = 0; e < len; ++e) anc[e] = tmp[len - 1 - e];
+            s_d = len - 1;
+        }
+        __syncthreads();
+        n = n0 + s_d + 1;
     }
-    __syncthreads();
-    const int d = s_d;
     float qf[E];
     const bf16* qp = q + ((size_t)t * Hq + h) * D + lane * E;
 #pragma unroll
@@ -263,7 +293,6 @@ __device__ __forceinline__ void attn_decode_split(const bf16* __restrict__ q, co
     float m = NEG_INF, l = 0.f, acc[E];
 #pragma unroll
     for (int e = 0; e < E; ++e) acc[e] = 0.f;
-    const int n = n0 + d + 1;
     // a sliding layer (win > 0) sees the last win logical keys, [first, n): the walk below keeps its key -> warp
     // map and passes over the keys before first, so a windowed row folds as the full row's tail would
     const int first = win > 0 ? max(n - win, 0) : 0;
@@ -280,7 +309,12 @@ __device__ __forceinline__ void attn_decode_split(const bf16* __restrict__ q, co
             for (int u = 0; u < 4; ++u) {
                 if (u < c4 && j + u >= first) {
                     const int jj = j + u;
-                    const int slot = jj < n0 ? jj : n0 + anc[jj - n0];
+                    int slot;
+                    if constexpr (ROWS) {
+                        slot = r.slot(jj);
+                    } else {
+                        slot = jj < n0 ? jj : n0 + anc[jj - n0];
+                    }
                     kv[u].load(Kg + (size_t)slot * rowstride);
                     vv[u].load(Vg + (size_t)slot * rowstride);
                 }
@@ -393,12 +427,21 @@ __device__ __forceinline__ void attn_decode_split(const bf16* __restrict__ q, co
         bf16* __restrict__ out, const int* __restrict__ n0p, const int* __restrict__ par, int T, int Hq,     \
         int Hk, int cap, float scale, float* __restrict__ part_m, float* __restrict__ part_l,                \
         float* __restrict__ part_acc, int* __restrict__ cnt, int S, int win) {                               \
-        attn_decode_split<D>(q, K, V, out, n0p, par, T, Hq, Hk, cap, scale, part_m, part_l, part_acc, cnt, S,   \
-                             win);                                                                           \
+        attn_decode_split<D, false>(q, K, V, out, n0p, par, nullptr, T, Hq, Hk, cap, scale, part_m, part_l,    \
+                                    part_acc, cnt, S, win);                                                  \
+    }                                                                                                        \
+    extern "C" __global__ void __launch_bounds__(256) btb_attn_rows_d##D(                                    \
+        const bf16* __restrict__ q, const bf16* __restrict__ K, const bf16* __restrict__ V,                  \
+        bf16* __restrict__ out, const int* __restrict__ rw, int T, int Hq, int Hk, int cap, float scale,     \
+        float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,                \
+        int* __restrict__ cnt, int S, int win) {                                                             \
+        attn_decode_split<D, true>(q, K, V, out, nullptr, nullptr, rw, T, Hq, Hk, cap, scale, part_m, part_l,  \
+                                   part_acc, cnt, S, win);                                                   \
     }
 ATTN_SPLIT_K(64)
 ATTN_SPLIT_K(128)
 ATTN_SPLIT_K(256)
+
 
 // ---------------------------------------------------------------------------------------------------------
 // norm + rope + cache write: qkv [T, (Hq + 2 Hk) * D] bf16 (the merged projection's output), wq/wk [D] the
@@ -407,21 +450,32 @@ ATTN_SPLIT_K(256)
 // the head's dims and 16-31 the second, so rotate_half is a shuffle with lane ^ 16. The norm is the fused
 // F.rms_norm (fp32 throughout, one rounding), the rope the engine's fused form: q*cos rounded to bf16, then
 // one fused multiply-add with the rotated half and sin, rounded once. Warps past Hq + Hk copy the v rows.
+// ROWS: row t is a sequence of its own (the attention's RowsLayout), at position len + steps, its row written
+// to its step's slot.
 // ---------------------------------------------------------------------------------------------------------
-template <int D>
+template <int D, bool ROWS>
 __device__ __forceinline__ void norm_rope_kv(const bf16* __restrict__ qkv, const bf16* __restrict__ wq,
                                              const bf16* __restrict__ wk, float eps, const bf16* __restrict__ cos_t,
                                              const bf16* __restrict__ sin_t, const int* __restrict__ n0p,
-                                             const int* __restrict__ depth, bf16* __restrict__ K,
-                                             bf16* __restrict__ V, bf16* __restrict__ qo, int T, int Hq, int Hk,
-                                             int cap, int centered) {
+                                             const int* __restrict__ depth, const int* __restrict__ rw,
+                                             bf16* __restrict__ K, bf16* __restrict__ V, bf16* __restrict__ qo,
+                                             int T, int Hq, int Hk, int cap, int centered) {
     constexpr int E = D / 32;
     const int head = blockIdx.x, t = blockIdx.y;
     const int lane = threadIdx.x & 31;
-    const int n0 = *n0p;
+    int slot, pos;
+    if constexpr (ROWS) {
+        const RowsLayout r(rw, t);
+        if (r.len < 0) return;
+        pos = r.len + r.step;
+        slot = r.slot(pos);
+    } else {
+        const int n0 = *n0p;
+        slot = n0 + t;
+        pos = n0 + depth[t];
+    }
     const int width = (Hq + 2 * Hk) * D;
     const bf16* src = qkv + (size_t)t * width + (size_t)head * D + lane * E;
-    const int slot = n0 + t;
     if (head >= Hq + Hk) {
         const int g = head - Hq - Hk;
         bf16* dst = V + ((size_t)g * cap + slot) * D + lane * E;
@@ -447,7 +501,6 @@ __device__ __forceinline__ void norm_rope_kv(const bf16* __restrict__ qkv, const
         }
     }
     // rope: out = bf16(bf16(v * cos) + rot * sin), rot = -v[i + D/2] for the first half, v[i - D/2] after
-    const int pos = n0 + depth[t];
     const bf16* cp = cos_t + (size_t)pos * D + lane * E;
     const bf16* sp = sin_t + (size_t)pos * D + lane * E;
     float rot[E];
@@ -472,7 +525,16 @@ __device__ __forceinline__ void norm_rope_kv(const bf16* __restrict__ qkv, const
         const bf16* __restrict__ cos_t, const bf16* __restrict__ sin_t, const int* __restrict__ n0p,         \
         const int* __restrict__ depth, bf16* __restrict__ K, bf16* __restrict__ V, bf16* __restrict__ qo,    \
         int T, int Hq, int Hk, int cap, int centered) {                                                      \
-        norm_rope_kv<D>(qkv, wq, wk, eps, cos_t, sin_t, n0p, depth, K, V, qo, T, Hq, Hk, cap, centered);     \
+        norm_rope_kv<D, false>(qkv, wq, wk, eps, cos_t, sin_t, n0p, depth, nullptr, K, V, qo, T, Hq, Hk, cap,  \
+                               centered);                                                                    \
+    }                                                                                                        \
+    extern "C" __global__ void __launch_bounds__(32) btb_norm_rope_kv_rows_d##D(                             \
+        const bf16* __restrict__ qkv, const bf16* __restrict__ wq, const bf16* __restrict__ wk, float eps,   \
+        const bf16* __restrict__ cos_t, const bf16* __restrict__ sin_t, const int* __restrict__ rw,          \
+        bf16* __restrict__ K, bf16* __restrict__ V, bf16* __restrict__ qo, int T, int Hq, int Hk, int cap,   \
+        int centered) {                                                                                      \
+        norm_rope_kv<D, true>(qkv, wq, wk, eps, cos_t, sin_t, nullptr, nullptr, rw, K, V, qo, T, Hq, Hk, cap,  \
+                              centered);                                                                     \
     }
 NORMROPE(64)
 NORMROPE(128)

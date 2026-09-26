@@ -35,7 +35,7 @@ from .forward import _ForwardMixin
 from .fused import fast_causal_conv1d
 from .generate import _GenerateMixin
 from .host import _Experts, _HostLinear, _NGramRows, _Router
-from .memory import RamPolicyState, VramPolicyState, _MemoryMixin
+from .memory import RamPolicyState, VramPolicyState, _LendMixin
 from .mlx_forward import MlxState, _MlxMixin
 from .native import Native
 from .scheduler import BatchScheduler
@@ -44,7 +44,7 @@ from .tiers import ColdRing, _TiersMixin
 
 
 class StreamedTextModel(
-    _FamiliesMixin, _TiersMixin, _MemoryMixin, _MlxMixin, _CudaMixin, _ForwardMixin, _GenerateMixin, _TextMixin
+    _FamiliesMixin, _TiersMixin, _LendMixin, _MlxMixin, _CudaMixin, _ForwardMixin, _GenerateMixin, _TextMixin
 ):
     """The engine over one model. Construction and lifetime live here; the forward, the tiers, memory, the
     MLX and CUDA paths and decoding are the mixins (one module each in this package)."""
@@ -64,20 +64,13 @@ class StreamedTextModel(
         "BOOL": torch.bool,
     }
 
-    # the tests reach the helpers as `StreamedTextModel._HostLinear`; the native handles are mirrored from
-    # `Native` by `load_gemv`
+    # the tests reach the helpers as `StreamedTextModel._HostLinear`; the native handles live on `Native` alone
     _HostLinear = _HostLinear
     _Router = _Router
     _Experts = _Experts
     _NGramRows = _NGramRows
     _ExpertStore = _ExpertStore
     MTPDrafter = MTPDrafter
-    gemv = gemv_p12 = gemv_group = gemv_mx4 = gemv_mx4_group = gemv_fp8 = gemv_fp8_group = None
-    attn_decode = delta_step = read_direct = None
-    read_open = read_at = read_close = None
-    # `Native.open` and `Native.close` are the reader's file handle; `close` here is the engine's own teardown,
-    # so those two are mirrored under the names above
-    _HANDLE_NAMES = {"open": "read_open", "close": "read_close"}
     mlx: Any = None
     gemm_rows = Native.gemm_rows
     cpu_gemm_rows = Native.cpu_gemm_rows
@@ -85,10 +78,7 @@ class StreamedTextModel(
     @classmethod
     def load_gemv(cls, dll_path: str | os.PathLike[str], threads: int = 0) -> Callable[..., Any]:
         """bind the native library's kernels (once per process); see `Native.load_gemv`"""
-        gemv = Native.load_gemv(dll_path, threads)
-        for name in Native.HANDLES:
-            setattr(cls, cls._HANDLE_NAMES.get(name, name), getattr(Native, name))
-        return gemv
+        return Native.load_gemv(dll_path, threads)
 
     def __init__(
         self,
@@ -115,7 +105,7 @@ class StreamedTextModel(
         expert_cache_gb: float | None = None,
         ram_reserve_gb: float | None = None,
         vram_reserve_gb: float | None = None,
-        vram_watch: bool = True,
+        adapt: bool = True,
         mlx_layers: Iterable[int] | None = None,
         kv_bits: int | None = None,
         gguf_packed: bool = True,
@@ -174,6 +164,10 @@ class StreamedTextModel(
         cfg._attn_implementation = attn_impl
         self.cfg = cfg
         self.fam = family(cfg)
+        # the fused rope and the in-place SwiGLU, fixed here for the engine's life: every path that rotates q and k
+        # itself reads one rope (`_rope_fn`), whichever of them runs first
+        self._frope = os.environ.get("BTB_FUSED_ROPE", "1") != "0"
+        self._fmlp = os.environ.get("BTB_FUSED_MLP", "1") != "0"
         # Gemma scales the input embedding by sqrt(hidden); the engine gathers rows itself, so it applies the
         # scale the module's scaled embedding would (the tied head's output projection stays unscaled)
         self.embed_scale = float(cfg.hidden_size) ** 0.5 if self.fam.embed_scale else None
@@ -371,10 +365,13 @@ class StreamedTextModel(
             else:
                 budget = int(float(expert_cache_gb) * 2**30)
             self.expert_store = _ExpertStore(self, budget, self.ram_reserve)
-        self.vram_watch = bool(vram_watch) and self.dev.type == DeviceKind.CUDA
+        # the memory policies give layers up when another program needs the memory and take them back after;
+        # `adapt` off pins the placement taken at load
+        self.adapt = bool(adapt)
+        self.vram_watch = self.adapt and self.dev.type == DeviceKind.CUDA
         self.vram_state = VramPolicyState()
         # the host tier's policy: on where layers run from RAM off unified memory (which keeps its own ledger)
-        self.ram_watch = bool(self.host) and self.mlx is None
+        self.ram_watch = self.adapt and bool(self.host) and self.mlx is None
         self.ram_state = RamPolicyState()
         self._shed = []
         self.drafter_dev = None
@@ -387,16 +384,25 @@ class StreamedTextModel(
         self._batched_cont = False
         self.resident_fp32 = bool(resident_fp32)
         if self.compute_dtype is not None and self.compute_dtype != torch.bfloat16:
-            srcs = {lt: self.templates[lt][0] for lt in self.templates}
+            # one float32 shadow per layer kind and structure, built from a layer of that structure: layers of one
+            # kind can differ (tiny_q4's layer 1 carries a `ple` block its kind's other layers lack), and a shadow
+            # of the wrong one had the upcast copy a (256, 64) weight into a 64-wide slot. The kind stays in the
+            # key: two kinds can share a structure (gemma3's sliding and full layers) and still run apart
+            srcs: dict[tuple[Any, tuple[Any, ...]], tuple[int, Any]] = {}
+            for lt in self.templates:
+                tmpl = self.templates[lt][0]
+                srcs.setdefault((lt, self._structure(tmpl)), (self.layer_types.index(lt), tmpl))
             if not self.resident_fp32:
                 for i, tmpl in self.resident.items():
-                    srcs.setdefault(self.layer_types[i], tmpl)
-            for lt, src_mod in srcs.items():
-                idx = self.layer_types.index(lt)
+                    srcs.setdefault((self.layer_types[i], self._structure(tmpl)), (i, tmpl))
+            for (lt, key), (idx, src_mod) in srcs.items():
                 sh = self._new_layer(idx)
-                for name, src in list(src_mod.named_parameters()):
-                    self._set_param(sh, name, src.data.to(self.compute_dtype))
-                self.shadow[lt] = sh
+                # the buffers too, at their own dtype: a layer's buffer (tiny_q4's `ple.layer_multipliers`) left as
+                # `_new_layer` made it stayed on the meta device
+                for name, src, is_buf in list(self._named_tensors(src_mod)):
+                    t = src.data if is_buf else src.data.to(self.compute_dtype)
+                    self._set_param(sh, name, t.clone() if is_buf else t, buffer=is_buf)
+                self.shadow.setdefault(lt, {})[key] = sh
             for m in (self.norm, self.mixer):
                 if m is not None:
                     for p in m.parameters():
@@ -539,7 +545,7 @@ class StreamedTextModel(
             self.draft_engine = None
             draft.close()
         self.abort.set()
-        # the MLX tier's teardown runs on the model's worker thread, where its arrays were built (see `on_worker`),
+        # the MLX tier's teardown runs on the model's worker thread, where its arrays were built (see `_on_worker`),
         # then the worker itself is retired
         w = getattr(self, "_worker", None)
         if w is not None and threading.current_thread() is not getattr(self, "_worker_thread", None):
@@ -663,7 +669,7 @@ class StreamedTextModel(
                 )
         if self.dev.type == DeviceKind.CUDA:
             self._card_adopt_cache(cache)
-        return cache
+        return self._track(cache)
 
     def reset_stats(self) -> None:
         self.bytes_streamed = 0

@@ -5,13 +5,18 @@ RAM, the GPU pressure counter) live in `btb.sysinfo`; the free-memory ledger it 
 
 from __future__ import annotations
 
+import itertools
+import math
 import time
+import weakref
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ..kinds import Log
+from ..api import api
+from ..kinds import Log, PassTag
 from ..options import Device
 from ..sysinfo import (
     _darwin_available_bytes,
@@ -23,8 +28,15 @@ from ..sysinfo import (
     vram_pressure,
     vram_pressure_line,
 )
+from .cache import GrowLayer
+from .device import DeviceSpec, torch_device
+from .scheduler import EPOCH, MemoryGrantError
 from .state import _State
 from .tiers import ColdRing
+
+if TYPE_CHECKING:
+    from .cache import KvCache
+    from .device import Device as DeviceLedger
 
 
 @dataclass
@@ -58,6 +70,107 @@ class RamPolicyState:
     shed: list[int] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class DeviceMemory:
+    """One device's memory as btb sees it, in bytes: `free` above btb's margin and what is spoken for, `reserved`
+    what rooms, lent tensors btb cannot see and a batch's coming KV hold there, and `sheddable` what btb itself
+    gives up to make room. `lendable` is the most `empty` or `room` can get there."""
+
+    device: str
+    free: int
+    reserved: int
+    sheddable: int
+
+    @property
+    def lendable(self) -> int:
+        return self.free + self.sheddable
+
+
+@api("room")
+class Room:
+    """Room made for memory btb does not allocate itself - a second model, a library's workspace - and kept from
+    btb until `release()`, the end of a `with` block, or the room being dropped. Rooms add up, each its own.
+    `empty`/`zeros`/`full` hand out tensors inside it: their bytes come off what the room holds while they live, so
+    the room and the tensor are not counted twice, and a tensor outliving its room is still counted until it goes
+    (in btb's free reading, or on MLX, whose reading cannot see torch's, as a loan of its own)."""
+
+    def __init__(
+        self, ledger: DeviceLedger, tag: str, nbytes: int, device: torch.device, seen: bool, engine: _State
+    ) -> None:
+        self.nbytes, self.device = int(nbytes), device
+        # a room outliving its model keeps no model alive: the engine and its ledger are held weakly; the ledger
+        # holds the room weakly too, so a room dropped is a room let go (docs/lending.md)
+        self._ledger, self._loan, self._seen = weakref.ref(ledger), tag, seen
+        self._engine = weakref.ref(engine)
+        ledger.hold_room(tag, self, self.nbytes, device)
+
+    def _called(self, tag: PassTag) -> None:
+        eng = self._engine()
+        if eng is not None:
+            eng._called(tag)
+
+    @property
+    def held(self) -> bool:
+        ledger = self._ledger()
+        return ledger is not None and ledger.room_held(self._loan)
+
+    @property
+    def used(self) -> int:
+        """what the room's live tensors take"""
+        ledger = self._ledger()
+        return 0 if ledger is None else ledger.room_used(self._loan)
+
+    def release(self) -> None:
+        ledger = self._ledger()
+        if ledger is not None:
+            ledger.let_go(self._loan)
+
+    def empty(self, shape: int | Sequence[int], dtype: torch.dtype | None = None) -> torch.Tensor:
+        """a tensor of the room's, as `torch.empty` makes it on the room's device; a MemoryGrantError past what is
+        left of the room"""
+        return self._alloc(shape, dtype, None)
+
+    def zeros(self, shape: int | Sequence[int], dtype: torch.dtype | None = None) -> torch.Tensor:
+        """`empty`, filled with zeros"""
+        return self._alloc(shape, dtype, 0)
+
+    def full(self, shape: int | Sequence[int], value: float, dtype: torch.dtype | None = None) -> torch.Tensor:
+        """`empty`, filled with `value`"""
+        return self._alloc(shape, dtype, value)
+
+    def _alloc(self, shape: int | Sequence[int], dtype: torch.dtype | None, fill: float | None) -> torch.Tensor:
+        dt = dtype if dtype is not None else torch.get_default_dtype()
+        size = (int(shape),) if isinstance(shape, int) else tuple(int(s) for s in shape)
+        nbytes = math.prod(size) * torch.empty(0, dtype=dt).element_size()
+        ledger = self._ledger()
+        if ledger is None:
+            raise ValueError("this room was released: make another")
+        # made under the ledger's lock: two threads filling the room see each other's tensors
+        t = ledger.lend(
+            lambda: torch.empty(size, dtype=dt, device=self.device),
+            nbytes,
+            self.device,
+            counted=not self._seen,
+            room=self._loan,
+            limit=self.nbytes,
+        )
+        if t is None:
+            left = self.nbytes - self.used
+            raise MemoryGrantError(
+                f"a {dt} tensor of shape {list(size)} ({nbytes / 2**20:.1f} MiB) in a room of "
+                f"{self.nbytes / 2**20:.1f} MiB with {left / 2**20:.1f} MiB left"
+            )
+        if fill is not None:
+            t.fill_(fill)
+        return t
+
+    def __enter__(self) -> Room:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.release()
+
+
 class _MemoryMixin(_State):
     vram_pressure = staticmethod(vram_pressure)
     vram_pressure_line = staticmethod(vram_pressure_line)
@@ -65,6 +178,7 @@ class _MemoryMixin(_State):
     _darwin_available_bytes = staticmethod(_darwin_available_bytes)
     host_total_bytes = staticmethod(host_total_bytes)
     host_commit_bytes = staticmethod(host_commit_bytes)
+    _lent_returns = 0  # the ledger's returns when the lending policy last had nothing left to regrow
 
     def vram_realloc(self, log: Log | None = None) -> list[str]:
         log = log or self.log
@@ -97,7 +211,7 @@ class _MemoryMixin(_State):
             tmpl = self.resident.pop(i)
             del tmpl
             self.host[i] = self._make_host_layer(i)
-            self._cache_to(cache, i, "cpu")
+            self._caches_to(i, "cpu", cache)
             moved = f"layer {i}"
         elif self.resident_head and self.dev.type == Device.CUDA:
             self._head_host()
@@ -134,7 +248,7 @@ class _MemoryMixin(_State):
                     p.data = p.data.to(self.compute_dtype)
             self.resident[i] = tmpl
             self.host.pop(i, None)
-            self._cache_to(cache, i, self.dev)
+            self._caches_to(i, self.dev, cache)
         log(f"[vram] REGROW {what} -> card (still shed: {self._shed}); " + vram_pressure_line())
         return what
 
@@ -329,3 +443,282 @@ class _MemoryMixin(_State):
                 b = 2 if cast else torch.empty(0, dtype=self.ST_DTYPES[info["dtype"]]).element_size()
                 sizes[i] = sizes.get(i, 0) + n * b
         return sizes
+
+    # -- lending: the caller's calls are `_LendMixin`'s, over these helpers `cache_room` shares ------------------
+
+    def _lend(
+        self, shape: int | Sequence[int], dtype: torch.dtype | None, device: DeviceSpec | None, fill: float | None
+    ) -> torch.Tensor:
+        dev = self._lend_device(device)
+        dt = dtype if dtype is not None else torch.get_default_dtype()
+        size = (int(shape),) if isinstance(shape, int) else tuple(int(s) for s in shape)
+        nbytes = math.prod(size) * torch.empty(0, dtype=dt).element_size()
+        what = f"a {dt} tensor of shape {list(size)}"
+
+        def run() -> torch.Tensor:
+            self._lend_check(what)
+            tried = self._make_room(dev, nbytes, what)
+            while True:
+                try:
+                    t = torch.empty(size, dtype=dt, device=dev)
+                    break
+                except torch.OutOfMemoryError:
+                    # room enough in all but one piece (the allocator's pool is split): one more step, then again
+                    if not self._give_up_one(dev, nbytes, tried):
+                        raise MemoryGrantError(self._short(dev, nbytes, what)) from None
+            if fill is not None:
+                t.fill_(fill)
+            # a loan until its last view is gone: counted where the ledger cannot see torch's allocations (MLX's),
+            # and either way its going is the lending policy's cue to regrow what making room for it shed
+            self.device.lend(lambda: t, nbytes, dev, counted=not self._sees(dev))
+            return t
+
+        return self._serial(run)
+
+    def _lend_device(self, device: DeviceSpec | None) -> torch.device:
+        dev = torch_device(device) if device is not None else (self.dev if self.dev.type == Device.CUDA else None)
+        dev = dev if dev is not None else torch.device("cpu")
+        if dev.type not in (Device.CUDA, Device.CPU):
+            raise ValueError(f"btb lends memory on a card or the host, not {dev}")
+        return dev
+
+    def _lend_check(self, what: str) -> None:
+        if self.device.held():
+            raise RuntimeError(
+                f"{what} asked for inside a pass (a hook): btb moves nothing mid-pass; ask before the decode starts"
+            )
+
+    def _sees(self, dev: torch.device) -> bool:
+        """whether btb's ledger on `dev` counts a torch allocation once it is made (MLX's counts only its own)"""
+        return dev.type == Device.CUDA or getattr(self, "mlx", None) is None
+
+    def _short(self, dev: torch.device, nbytes: int, what: str) -> str:
+        room = int(self.device.free(dev, unreserved=True) or 0)
+        return (
+            f"{what} ({nbytes / 2**20:.1f} MiB) on {dev}: {room / 2**20:.1f} MiB free once btb gave up all it can "
+            f"(model.memory() shows the room)"
+        )
+
+    def _make_room(self, dev: torch.device, nbytes: int, what: str, own: str | None = None) -> set[str]:
+        """room for `nbytes` on `dev` above the margin and what is spoken for (all but the caller's `own`
+        reservation), cheapest first; MemoryGrantError when everything btb can give leaves too little. Nothing to
+        make where btb holds nothing (a card it does not run on). Returns the one-off steps taken, for a retry to
+        skip"""
+        tried: set[str] = set()
+        while True:
+            room = self.device.free(dev, unreserved=True, own=own)
+            if room is None or room >= nbytes:
+                return tried
+            if not self._give_up_one(dev, nbytes - room, tried):
+                self.device.refused()  # what was shed on the way grows back once there is room
+                raise MemoryGrantError(self._short(dev, nbytes, what))
+
+    def cache_room(self, cache: KvCache | None, B: int, T: int) -> None:
+        """Room made, before a pass, for the buffers its cache appends will allocate. The scheduler's grant is
+        asked for them inside the pass, where nothing may move, so a refusal there could only fail; here btb gives
+        up what it holds, cheapest first, as `empty` does. Priced as the grant prices them. With `adapt` off the
+        placement is pinned: nothing is given up, and the grant refuses what does not fit."""
+        if cache is None or not getattr(self, "adapt", True):
+            return
+        first = next(((i, cl) for i, cl in enumerate(cache.layers) if isinstance(cl, GrowLayer)), None)
+        if first is None:
+            return
+        c = self.cfg
+        hq = int(c.num_attention_heads)
+        Hk = int(getattr(c, "num_key_value_heads", None) or hq)
+        d = int(getattr(c, "head_dim", None) or c.hidden_size // hq)
+        dev0, dt0 = self._kv_home(*first)
+        if not first[1].growth(B, T, Hk, d, dt0, dev0.type == Device.CPU):
+            return  # the layers grow together: the first one fitting is the pass needing nothing
+        need: dict[torch.device, int] = {}
+        for i, cl in enumerate(cache.layers):
+            if not isinstance(cl, GrowLayer):
+                continue
+            dev, dt = self._kv_home(i, cl)
+            need[dev] = need.get(dev, 0) + cl.growth(B, T, Hk, d, dt, dev.type == Device.CPU)
+        for dev, nbytes in need.items():
+            if nbytes:
+                self._make_room(dev, nbytes, f"the cache's growth for {B}x{T} rows", own=EPOCH)
+
+    def _kv_home(self, i: int, cl: GrowLayer) -> tuple[torch.device, torch.dtype]:
+        """where layer i's cache rows live and in what dtype: its buffer's, or where the layer runs"""
+        if cl._buf is not None:
+            return cl._buf[0].device, cl._buf[0].dtype
+        cdt = self.compute_dtype if self.compute_dtype is not None else torch.bfloat16
+        if cl.shared or getattr(self, "mlx", None) is not None:
+            return torch.device("cpu"), cdt
+        if i in self.resident:
+            return (torch.device("cpu") if getattr(self, "kv_host", False) else self.dev), cdt
+        return torch.device("cpu"), torch.float32  # a host layer runs in float32 on the CPU
+
+    def _give_up_one(self, dev: torch.device, short: int, tried: set[str]) -> bool:
+        """the cheapest thing btb holds on `dev`, given up toward `short` bytes: on a card the drafter, then layers
+        from the top, then the head (each live cache following its layer); on the host MLX's cached buffers, the
+        expert store's blocks, then a warm layer to the drive. False when nothing is left"""
+        log = self.log
+        if dev.type == Device.CUDA:
+            if self.dev.type != Device.CUDA or self.device.request("lend", lambda: self.vram_shed(None, log)) is None:
+                return False
+            if not self.vram_watch:  # a running policy regrows what it sheds; none runs to regrow this
+                self._lent_shed("card")
+            return True
+        mlx = getattr(self, "mlx", None)
+        if mlx is not None and mlx.held_bytes() > mlx.active_bytes():
+            mlx.clear_cache()
+            return True
+        store = getattr(self, "expert_store", None)
+        if store is not None and store.blocks and "store" not in tried:
+            # the store gives blocks back while the host is short of its reserve: short by what is missing, now
+            tried.add("store")
+            store.reserve += short
+            try:
+                store.release()
+            finally:
+                store.reserve -= short
+            return True
+        if self.device.request("lend", lambda: self.ram_shed("room asked for", log)) is None:
+            return False
+        if mlx is not None:
+            mlx.clear_cache()
+        if mlx is not None or not self.ram_watch:
+            self._lent_shed("host")
+        return True
+
+    def _lent_shed(self, where: str) -> None:
+        """a step making room took that no memory policy regrows: the lending policy's, once a loan comes back"""
+        lent = self.__dict__.setdefault("_lent", [])
+        if not lent:
+            self._lent_returns = self.device.returns  # the returns before it: the next one is its cue
+        lent.append(where)
+
+    def lend_policy(self) -> None:
+        """Once a second: what making room shed grows back once lent memory has come back and there is room for it
+        again - where no memory policy runs to regrow it (a card with `vram_watch` off, the host on MLX)"""
+        lent = self.__dict__.get("_lent")
+        if not lent:
+            return
+        returns = self.device.returns
+        if returns == self._lent_returns:
+            return
+        now = time.time()
+        if now - self.__dict__.get("_lent_t", 0.0) < 1.0:
+            return
+        self._lent_t = now
+        if lent[-1] == "card":
+            room = self.device.free(self.dev, unreserved=True)
+            if room is not None and room > self._regrow_bytes():
+                lent.pop()
+                self.device.request("regrow", lambda: self.vram_regrow(None, self.log))
+        elif self.ram_state.shed:
+            room = self.device.free(torch.device("cpu"), unreserved=True)
+            need = self._layer_bytes_stored(self.ram_state.shed[-1], bool(getattr(self, "_packed", None)))
+            if room is not None and room > need:
+                lent.pop()
+                self.device.request("ram-regrow", lambda: self.ram_regrow(self.log))
+        else:
+            lent.pop()
+        if not lent:
+            self._lent_returns = returns
+
+    def _sheddable(self, dev: torch.device) -> int:
+        """what `_give_up_one` can free on `dev`, in bytes. `memory()` asks from any thread, as a decode's shed or
+        regrow moves layers: it counts over copies of what it reads"""
+        if dev.type == Device.CUDA:
+            if self.dev.type != Device.CUDA:
+                return 0
+            fp32 = self.compute_dtype is not None and self.compute_dtype != torch.bfloat16
+            resident = list(self.resident)
+            n = sum(self._layer_bytes(i) for i in resident) * (2 if (fp32 and self.resident_fp32) else 1)
+            head = self.head
+            if self.resident_head and head is not None:
+                n += head.weight.numel() * head.weight.element_size()
+            aj = getattr(self, "aj", None)
+            if aj is not None and aj.dev.type == Device.CUDA:
+                n += sum(self._get(k).numel() * 2 for k in self.weight_map if k.startswith("mtp."))
+            return n + sum(_bytes_on(c, dev, resident) for c in list(self.__dict__.get("_live_caches", ())))
+        packed = bool(getattr(self, "_packed", None))
+        n = sum(self._layer_bytes_stored(i, packed) for i in list(self.host) if i not in self.cold)
+        store = getattr(self, "expert_store", None)
+        if store is not None and store.per:
+            n += store.live() * int(store.per)
+        mlx = getattr(self, "mlx", None)
+        if mlx is not None:
+            n += max(0, mlx.held_bytes() - mlx.active_bytes())
+        return n
+
+
+_LOANS: Iterator[int] = itertools.count(1)
+
+
+def _bytes_on(cache: KvCache, dev: torch.device, layers: Iterable[int]) -> int:
+    """the bytes `cache` holds on `dev` for `layers`"""
+    n = 0
+    for i in layers:
+        if i >= len(cache.layers):
+            continue
+        cl = cache.layers[i]
+        for attr in ("keys", "values"):
+            t = getattr(cl, attr, None)
+            if isinstance(t, torch.Tensor) and t.device.type == dev.type:
+                n += t.numel() * t.element_size()
+    return n
+
+
+@api("model")
+class _LendMixin(_MemoryMixin):
+    """lending: memory for the caller's own tensors, the model's API over `_MemoryMixin`'s policies"""
+
+    def empty(
+        self, shape: int | Sequence[int], dtype: torch.dtype | None = None, device: DeviceSpec | None = None
+    ) -> torch.Tensor:
+        """
+        A tensor of your own beside the model, as `torch.empty` makes it, with room made for it first: btb gives up
+        what it holds there, cheapest first, instead of your allocation running out of memory. It is a plain tensor
+        and lives as long as you keep it; btb takes the room back once it is gone. `device` defaults to the one the
+        model computes on (the host on Apple silicon). A `MemoryGrantError` when even that is not enough.
+        """
+        return self._lend(shape, dtype, device, None)
+
+    def zeros(
+        self, shape: int | Sequence[int], dtype: torch.dtype | None = None, device: DeviceSpec | None = None
+    ) -> torch.Tensor:
+        """`empty`, filled with zeros"""
+        return self._lend(shape, dtype, device, 0)
+
+    def full(
+        self,
+        shape: int | Sequence[int],
+        value: float,
+        dtype: torch.dtype | None = None,
+        device: DeviceSpec | None = None,
+    ) -> torch.Tensor:
+        """`empty`, filled with `value`"""
+        return self._lend(shape, dtype, device, value)
+
+    def room(self, nbytes: int, device: DeviceSpec | None = None, name: str = "room") -> Room:
+        """
+        Room for memory btb does not allocate itself - a second model, a library's workspace - made now and kept
+        from btb until the `Room` is released (`release()`, or as a `with` block). Keep it while that memory is in
+        use; tensors taken through it (`Room.empty`) count against it, not beside it. A `MemoryGrantError` when
+        btb cannot make that much.
+        """
+        dev = self._lend_device(device)
+        tag = f"{name}#{next(_LOANS)}"
+
+        def run() -> Room:
+            self._lend_check(name)
+            self._make_room(dev, int(nbytes), f"room {name!r}")
+            return Room(self.device, tag, int(nbytes), dev, self._sees(dev), self)
+
+        return self._serial(run)
+
+    def memory(self) -> dict[str, DeviceMemory]:
+        """what btb sees of each device it runs on, by name ("cuda:0", "cpu") - what `empty` and `room` can get"""
+        out = {}
+        devs = [self.dev] if self.dev.type == Device.CUDA else []
+        for dev in [*devs, torch.device("cpu")]:
+            # the device read once and the reservations once, what is free derived from the two: the numbers agree
+            held = self.device.reserved(dev)
+            free = max(0, int(self.device.free(dev) or 0) - held)
+            out[str(dev)] = DeviceMemory(str(dev), free, held, self._sheddable(dev))
+        return out

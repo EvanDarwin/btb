@@ -82,6 +82,129 @@ def test_generate(benchmark: object, model: str, device: str, knobs: dict[str, s
         benchmark(once)  # type: ignore[operator]  # pytest-benchmark times this over many rounds
 
 
+def _api(benchmark: object, model: str, device: str, knobs: dict[str, str], what: str) -> btb.StreamedTextModel:
+    path = os.path.join(FIXTURES, model)
+    if not os.path.isdir(path):
+        pytest.skip(f"{model} fixture not built")
+    benchmark.group = f"{device}/{what}"  # type: ignore[attr-defined]
+    benchmark.name = f"{device}/{model}/{what}"  # type: ignore[attr-defined]
+    return btb.load(path, log=None, v_max=0, **knobs)
+
+
+# The programmatic API beside the plain loop, per family and device: what each costs over `test_generate`'s
+# decode of the same tokens - the hooked pick (logits in Python, the in-graph picks aside), a session driven by
+# hand, a fork's rows over one prefill, sessions of their own lengths batched, and memory lent to the caller.
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("model", FAMILIES)
+@pytest.mark.parametrize("device,knobs", DEVICES, ids=[d for d, _ in DEVICES])
+def test_generate_hooked(benchmark: object, model: str, device: str, knobs: dict[str, str]) -> None:
+    with _api(benchmark, model, device, knobs, "hooked") as sm:
+
+        def once() -> object:
+            return sm.generate(list(PROMPT), N, speculate=False, processors=[lambda ids, lg: lg], logprobs=2)
+
+        once()
+        benchmark(once)  # type: ignore[operator]
+
+
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("model", FAMILIES)
+@pytest.mark.parametrize("device,knobs", DEVICES, ids=[d for d, _ in DEVICES])
+def test_session_feed_rewind(benchmark: object, model: str, device: str, knobs: dict[str, str]) -> None:
+    with _api(benchmark, model, device, knobs, "feed-rewind") as sm:
+        s = sm.session(list(PROMPT))
+        mark = s.mark()
+
+        def once() -> object:
+            out = s.feed(list(range(5, 5 + N)))
+            s.rewind(mark)
+            return out
+
+        once()
+        benchmark(once)  # type: ignore[operator]
+
+
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("model", FAMILIES)
+@pytest.mark.parametrize("device,knobs", DEVICES, ids=[d for d, _ in DEVICES])
+def test_session_feed_tapped(benchmark: object, model: str, device: str, knobs: dict[str, str]) -> None:
+    with _api(benchmark, model, device, knobs, "feed-tapped") as sm:
+        s = sm.session(list(PROMPT))
+        mark = s.mark()
+
+        def once() -> object:
+            out = s.feed(list(range(5, 5 + N)), last_only=True, taps=(-1,))
+            s.rewind(mark)
+            return out
+
+        once()
+        benchmark(once)  # type: ignore[operator]
+
+
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("model", FAMILIES)
+@pytest.mark.parametrize("device,knobs", DEVICES, ids=[d for d, _ in DEVICES])
+def test_fork_step_leave(benchmark: object, model: str, device: str, knobs: dict[str, str]) -> None:
+    with _api(benchmark, model, device, knobs, "fork-step") as sm:
+        s = sm.session(list(PROMPT))
+
+        def once() -> object:
+            with s.fork(4) as br:
+                br.step([1, 2, 3, 4])
+                br.step([5, 6, 7, 8], taps=(-1,))
+                br.leave(1)
+                return br.step([9, 10, 11])
+
+        once()
+        benchmark(once)  # type: ignore[operator]
+
+
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("model", FAMILIES)
+@pytest.mark.parametrize("device,knobs", DEVICES, ids=[d for d, _ in DEVICES])
+def test_fork_generate(benchmark: object, model: str, device: str, knobs: dict[str, str]) -> None:
+    with _api(benchmark, model, device, knobs, "fork4") as sm:
+        s = sm.session(list(PROMPT))
+        smp = btb.Sampling(temperature=0.8, seed=1)
+
+        def once() -> object:
+            with s.fork(4) as br:
+                return br.generate(N, eos=(), sampling=smp)
+
+        once()
+        benchmark(once)  # type: ignore[operator]
+
+
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("model", FAMILIES)
+@pytest.mark.parametrize("device,knobs", DEVICES, ids=[d for d, _ in DEVICES])
+def test_batch_generate(benchmark: object, model: str, device: str, knobs: dict[str, str]) -> None:
+    rows = [list(PROMPT), [9, 8], list(range(1, 11))]  # three sessions of their own lengths
+    with _api(benchmark, model, device, knobs, "batch3") as sm:
+
+        def once() -> object:
+            with sm.batch([sm.session(r) for r in rows]) as bt:
+                return bt.generate(N, eos=())
+
+        once()
+        benchmark(once)  # type: ignore[operator]
+
+
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("device,knobs", DEVICES, ids=[d for d, _ in DEVICES])
+def test_lend(benchmark: object, device: str, knobs: dict[str, str]) -> None:
+    """a tensor and a room lent beside a loaded model with room to spare: the ledger's own cost"""
+    with _api(benchmark, FAMILIES[0], device, knobs, "lend") as sm:
+
+        def once() -> object:
+            t = sm.empty((1024, 1024), dtype=torch.bfloat16)
+            with sm.room(1 << 20):
+                return t
+
+        once()
+        benchmark(once)  # type: ignore[operator]
+
+
 # the one piece of hand data: bytes per 256-weight superblock, as the GGUF layout stores it. IQ4_NL has no entry
 # because it is not a superblock type - 32-weight blocks with the scales in a separate array, so its launcher
 # takes (d, q, x, ...) rather than one as-stored buffer and does not fit this bench's call shape.
@@ -175,4 +298,55 @@ def test_cuda_gemv_bf16(benchmark: object, m: int) -> None:
         torch.cuda.synchronize()
 
     benchmark.group = "cuda-gemv"  # type: ignore[attr-defined]
+    benchmark(run)  # type: ignore[operator]
+
+
+@cuda_only
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("how", ["rows", "per-row"])
+@pytest.mark.parametrize("n", [512, 4096])  # the shared prefix the rows attend over
+@pytest.mark.parametrize("rows", [1, 8, 32])
+def test_cuda_attn_rows(benchmark: object, rows: int, n: int, how: str) -> None:
+    """a fork's decode attention at Qwen3-0.6B's heads (16 q, 8 kv, d 128), each row 16 steps past a shared prefix:
+    `btb_attn_rows_d128` over all rows in one launch, against one `btb_attn_split_d128` launch a row over the same
+    keys (the one-row steps the rows would take one session at a time)."""
+    k = _cuda_kernels()
+    Hq, Hk, D, steps = 16, 8, 128, 16
+    cap = (n + (steps + 1) * rows + 1023) // 1024 * 1024
+    S = cap // 1024
+    K = torch.randn(Hk, cap, D, dtype=torch.bfloat16, device="cuda")
+    V = torch.randn(Hk, cap, D, dtype=torch.bfloat16, device="cuda")
+    q = torch.randn(rows, Hq, D, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty(rows, Hq, D, dtype=torch.bfloat16, device="cuda")
+    pm = torch.zeros(S * rows * Hq, device="cuda")
+    pl = torch.zeros(S * rows * Hq, device="cuda")
+    pa = torch.zeros(S * rows * Hq * D, device="cuda")
+    cnt = torch.zeros(rows * Hq, dtype=torch.int32, device="cuda")
+    # the rows' layout (base, steps, W, then col/offset/length a row): every row over the one prefix
+    rw = torch.tensor([n, steps, rows, *[x for c in range(rows) for x in (c, 0, n)]], dtype=torch.int32, device="cuda")
+    n0 = torch.tensor([n + steps], dtype=torch.int32, device="cuda")
+    root = torch.tensor([-1], dtype=torch.int32, device="cuda")
+    P, I, F = k.ptr, ctypes.c_int, ctypes.c_float
+    scale = F(D**-0.5)
+    tail = [P(pm), P(pl), P(pa), P(cnt), I(S), I(0)]
+    if how == "rows":
+        launches = [
+            ((Hq, rows, S), [P(q), P(K), P(V), P(out), P(rw), I(rows), I(Hq), I(Hk), I(cap), scale, *tail], "rows")
+        ]
+    else:
+        launches = [
+            (
+                (Hq, 1, S),
+                [P(q[r]), P(K), P(V), P(out[r]), P(n0), P(root), I(1), I(Hq), I(Hk), I(cap), scale, *tail],
+                "split",
+            )
+            for r in range(rows)
+        ]
+
+    def run() -> None:
+        for grid, args, kind in launches:
+            k.launch(f"btb_attn_{kind}_d{D}", grid, (256, 1, 1), args)
+        torch.cuda.synchronize()
+
+    benchmark.group = f"cuda-attn-rows/n{n}/rows{rows}"  # type: ignore[attr-defined]
     benchmark(run)  # type: ignore[operator]

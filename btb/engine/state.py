@@ -5,9 +5,11 @@ engine reads as `getattr(self, name, default)` is declared without a value: unse
 
 from __future__ import annotations
 
+import threading
+import weakref
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 import torch
 
@@ -15,6 +17,13 @@ from ..kinds import LayerTier, PassReport, PassTag, Proposer
 
 # rows of the lm_head the drafter proposes from
 DRAFT_VOCAB = 32768
+
+# an API call's record in _calls: made from any thread
+_CALLS_LOCK = threading.Lock()
+
+# a call handed to the decode's thread (`_serial`): its parameters and its result
+P = ParamSpec("P")
+R = TypeVar("R")
 
 # LayerTier -> the PassTag a pass records for a layer on that tier (btb/engine/device.py Placement.tier)
 _TIER_TAG: dict[LayerTier, PassTag] = {
@@ -39,7 +48,6 @@ class _PassRecorder:
 
 
 if TYPE_CHECKING:
-    import threading
     from concurrent.futures import ThreadPoolExecutor
     from types import ModuleType
 
@@ -51,12 +59,15 @@ if TYPE_CHECKING:
     from ..mlx.mega import MegaPass
     from ..sampling import Sampling
     from ..session import Session
-    from .device import Device
+    from .cache import KvCache
+    from .device import Device, DeviceSpec
     from .drafter import MTPDrafter
     from .experts import ExpertProfile, _ExpertStore
     from .families import Family
+    from .generate import LinLayer, LinSnap
+    from .hooks import Hooks
     from .host import _HostLinear
-    from .memory import RamPolicyState, VramPolicyState
+    from .memory import RamPolicyState, Room, VramPolicyState
     from .mlx_forward import MlxState
     from .model import StreamedTextModel
     from .scheduler import BatchScheduler, Plan
@@ -146,6 +157,7 @@ class _State:
     mem_start: int
     ram_reserve: int
     ram_state: RamPolicyState
+    adapt: bool  # the memory policies give way to other programs (`--adapt`); off, the placement is pinned
     ram_watch: bool
     vram_margin: int
     vram_state: VramPolicyState
@@ -153,6 +165,7 @@ class _State:
     _card_ms_min: float | None
     _last_card_ms: float | None
     _shed: list[str]
+    _live_caches: weakref.WeakSet[KvCache]  # every cache a layer's move reaches (`_track`)
 
     # -- the scheduler, and the run's counters --
     abort: threading.Event
@@ -166,6 +179,8 @@ class _State:
     _closed: bool
     _in_epoch: bool
     _pass_rec: _PassRecorder | None = None  # the provenance accumulator, created on first tag or reset
+    _calls: frozenset[PassTag] = frozenset()  # every API call made on the model (btb.api), never reset
+    _cancel: threading.Event | None = None  # the running decode's own stop (a Stream's), set under the lock
 
     # -- the card graph (cuda.py); the mechanism keeps its letters --
     card_pipeline: bool
@@ -238,6 +253,12 @@ class _State:
     def _cache_to(cache: Any, i: int, dev: str | torch.device) -> None:
         raise NotImplementedError
 
+    def _track(self, cache: KvCache) -> KvCache:
+        raise NotImplementedError
+
+    def _caches_to(self, i: int, dev: str | torch.device, cache: KvCache | None = None) -> None:
+        raise NotImplementedError
+
     def _cold_release(self, i: int) -> None:
         raise NotImplementedError
 
@@ -245,6 +266,9 @@ class _State:
         raise NotImplementedError
 
     def _cold_stop(self) -> None:
+        raise NotImplementedError
+
+    def _layer_bytes(self, i: int) -> int:
         raise NotImplementedError
 
     def _layer_bytes_stored(self, i: int, packed: bool = False) -> int:
@@ -376,6 +400,9 @@ class _State:
     def _spec_full(self, v_max: int | None = None) -> int:
         raise NotImplementedError
 
+    def _rope_fn(self) -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
+        raise NotImplementedError
+
     def aa(self, parents: Parents | None = None) -> None:
         raise NotImplementedError
 
@@ -474,8 +501,19 @@ class _State:
     def _finish(self, h: torch.Tensor, last_only: bool, head: bool) -> torch.Tensor:
         raise NotImplementedError
 
+    def _final_norm(self, h: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def _apply_head(self, hf: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
     def _prefill(
-        self, ids: torch.Tensor, cache: Any, on_layer: Any = None, attention_mask: torch.Tensor | None = None
+        self,
+        ids: torch.Tensor,
+        cache: Any,
+        on_layer: Any = None,
+        attention_mask: torch.Tensor | None = None,
+        last_only: bool = True,
     ) -> Any:
         raise NotImplementedError
 
@@ -503,6 +541,14 @@ class _State:
     def _lin(cl: Any) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
+    @staticmethod
+    def _lin_snap(cl: LinLayer) -> LinSnap:
+        raise NotImplementedError
+
+    @staticmethod
+    def _lin_restore(cl: LinLayer, snap: LinSnap) -> None:
+        raise NotImplementedError
+
     def generate_greedy(
         self,
         ids: torch.Tensor | Tokens | TokenRows,
@@ -514,6 +560,7 @@ class _State:
         prefill_only: bool = False,
         session: Any = None,
         sampling: Any = None,
+        hooks: Hooks | None = None,
     ) -> Any:
         raise NotImplementedError
 
@@ -530,6 +577,7 @@ class _State:
         spans: Spans = (),
         session: Session | None = None,
         sampling: Any = None,
+        hooks: Hooks | None = None,
     ) -> tuple[list[int], Json]:
         raise NotImplementedError
 
@@ -540,6 +588,7 @@ class _State:
         eos_ids: Tokens = (),
         pad_id: int | None = None,
         sampling: Any = None,
+        hooks: Hooks | None = None,
     ) -> list[list[int]]:
         raise NotImplementedError
 
@@ -578,6 +627,18 @@ class _State:
         raise NotImplementedError
 
     # -- memory.py --
+    def lend_policy(self) -> None:
+        raise NotImplementedError
+
+    def cache_room(self, cache: KvCache | None, B: int, T: int) -> None:
+        raise NotImplementedError
+
+    def room(self, nbytes: int, device: DeviceSpec | None = None, name: str = "room") -> Room:
+        raise NotImplementedError
+
+    def _serial(self, fn: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+        raise NotImplementedError
+
     def ram_policy(self, log: Log | None = None) -> None:
         raise NotImplementedError
 
@@ -625,8 +686,22 @@ class _State:
         if proposed > accepted:
             rec.tags.add(PassTag.SPEC_REJECT)
 
+    def _called(self, tag: PassTag) -> None:
+        """record an API call (btb.api): a call is not one pass's fork, so a generate's reset keeps it. Calls come
+        from any thread (a read while another decodes): the set is replaced under a lock, no call lost"""
+        with _CALLS_LOCK:
+            self._calls = self._calls | {tag}
+
+    def _stop_asked(self) -> bool:
+        """whether the running decode is to stop at this step: the model's `abort` (whichever decode runs), or the
+        running call's own cancel (a `Stream` closed)"""
+        c = self._cancel
+        return self.abort.is_set() or (c is not None and c.is_set())
+
     def last_pass_report(self) -> PassReport:
         """The provenance of the most recent `generate()` (its passes' tags accumulated) or of a bare
-        `forward()`: the `PassTag`s its forks recorded and the speculation counts. Empty before any pass."""
+        `forward()`: the `PassTag`s its forks recorded and the speculation counts, with every API call made on
+        the model so far. Empty before any pass or call."""
         rec = self._pass_rec
-        return rec.report() if rec is not None else PassReport()
+        rep = rec.report() if rec is not None else PassReport()
+        return PassReport(rep.tags | self._calls, rep.spec_proposed, rep.spec_accepted)

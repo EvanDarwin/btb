@@ -42,28 +42,27 @@ os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 from .draft import SpanBank
-from .session import Session
+from .session import Mark, Session, State, Step
 from .text import Channels, TextStream, answer, prompt_ids, template
 
 if TYPE_CHECKING:
     from .engine import StreamedTextModel
+    from .engine.branches import Batch, Branches
     from .engine.device import mlx_available, resolve_device
+    from .engine.hooks import LogitsProcessor, PassStats, TokenLogprob
+    from .engine.memory import DeviceMemory, Room
     from .engine.native import quiet_omp  # noqa: F401
     from .engine.scheduler import BatchScheduler, HostBudget, MemoryGrantError, Plan, PlanError
     from .engine.text import Chat, GenerateStats, Generation, Stream
     from .native_files import kernels_path, native_path, native_tag  # noqa: F401
 
-CUDA = True
-
 
 def cpu_only() -> bool:
     """
-    Disables CUDA, and additionally edits the env to hide any CUDA
-    devices from `torchao` to prevent it from automatically loading
-    its own CUDA context without consent.
+    Hides any CUDA device from torch (and from `torchao`, which would load its own CUDA context without
+    consent) for a CPU run: done before torch loads, and True then. Once torch has loaded it changes nothing and
+    returns False - the card torch holds stays there for a later load to name; a CPU load never takes it away.
     """
-    global CUDA
-    CUDA = False
     if "torch" in sys.modules:
         return False
     # torchao patch
@@ -85,12 +84,19 @@ _LAZY = {
     "BatchScheduler": ".engine.scheduler",
     "HostBudget": ".engine.scheduler",
     "MemoryGrantError": ".engine.scheduler",
+    "DeviceMemory": ".engine.memory",
+    "Room": ".engine.memory",
     "Plan": ".engine.scheduler",
     "PlanError": ".engine.scheduler",
     "Chat": ".engine.text",
     "Generation": ".engine.text",
     "GenerateStats": ".engine.text",
     "Stream": ".engine.text",
+    "Batch": ".engine.branches",
+    "Branches": ".engine.branches",
+    "LogitsProcessor": ".engine.hooks",
+    "PassStats": ".engine.hooks",
+    "TokenLogprob": ".engine.hooks",
     "Sampling": ".sampling",  # torch-backed: the root stays torch-free until a load
 }
 
@@ -187,7 +193,7 @@ def load(
 
     from .engine import StreamedTextModel
     from .engine.device import mlx_available, resolve_device
-    from .engine.native import quiet_omp
+    from .engine.native import Native, quiet_omp
     from .engine.state import DRAFT_VOCAB
     from .native_files import native_path
 
@@ -198,6 +204,9 @@ def load(
         # 0 = the kernels' own pool over every core: torch's count is the physical cores, and fewer threads than the
         # pool routes through a second one (b=1 86 -> 92 GB/s, b=4 42 -> 51); the bits are the same at any count
         StreamedTextModel.load_gemv(dll, threads=0)
+    else:
+        # torch alone (`native=''`, or no library here): whatever an earlier load in the process bound is let go
+        Native.unbind()
     quiet_omp()
     from .gguf import config_of
 
@@ -355,7 +364,7 @@ def load(
         expert_cache_gb=c.get("expert_cache_gb"),
         ram_reserve_gb=c.get("ram_reserve_gb"),
         vram_reserve_gb=c.get("vram_reserve_gb"),
-        vram_watch=bool(int(c.get("vram_watch", 1))),
+        adapt=bool(int(c.get("adapt", 1))),
         mlx_layers=mlx_layers,
         host_budget=pl.budget if pl is not None else None,
         # the expert store is built inside __init__, so its policy travels as an argument, not an assignment after
@@ -601,21 +610,31 @@ def available_devices() -> list[Json]:
 
 
 __all__ = [
+    "Batch",
     "BatchScheduler",
+    "Branches",
     "Channels",
     "Chat",
+    "DeviceMemory",
     "GenerateStats",
     "Generation",
     "HostBudget",
+    "LogitsProcessor",
+    "Mark",
     "MemoryGrantError",
+    "PassStats",
     "Plan",
     "PlanError",
+    "Room",
     "Sampling",
     "Session",
     "SpanBank",
+    "State",
+    "Step",
     "Stream",
     "StreamedTextModel",
     "TextStream",
+    "TokenLogprob",
     "answer",
     "available_devices",
     "available_models",

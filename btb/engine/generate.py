@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Sequence
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import torch
 
@@ -16,8 +16,13 @@ from ..kinds import PROPOSER_TAG, Json, LayerKind, PassTag, Proposer, TokenRows,
 from ..options import Device
 from ..sampling import GREEDY, Sampling, Verify
 from ..session import Session
+from .cache import linear_layer
 from .drafter import MTPDrafter
+from .hooks import Hooks
 from .state import _State
+
+if TYPE_CHECKING:
+    from .cache import CacheLayer
 
 # one of a DeltaNet layer's two states, as the layer holds it: a tensor, or a dict of them by index
 LinState = torch.Tensor | dict[int, torch.Tensor]
@@ -30,6 +35,12 @@ class LinLayer(Protocol):
 
     conv_states: LinState
     recurrent_states: LinState
+
+
+def lin_layer(cl: CacheLayer) -> LinLayer:
+    """`cl` as the helpers below take it; a TypeError for a layer that is not a DeltaNet's. transformers types its
+    states dict[int, Tensor | None], and `_lin_snap` copies only the ones set."""
+    return cast(LinLayer, linear_layer(cl))
 
 
 def _lin(cl: LinLayer) -> tuple[torch.Tensor, torch.Tensor]:
@@ -118,37 +129,71 @@ class _GenerateMixin(_State):
         resume from (the prompt's end, and the point the re-rendering will diverge at once the tail is known)."""
         n = int(ids.shape[1])
         hybrid = LayerKind.LINEAR in self.layer_types
+        # every row reused (`Session._begin_decode`'s whole): the session's logits for its last token, nothing to run
+        held = None
+        if session is not None and reuse == n:
+            held, session._held = session._held, None
+            assert held is not None, "a prompt the cache holds whole comes with its logits"
+            held = held.view(1, 1, -1)
         if session is None or not hybrid:
-            return self._prefill(ids[:, reuse:], cache, on_layer=on_layer), None
-        hs = []
+            return (held if held is not None else self._prefill(ids[:, reuse:], cache, on_layer=on_layer)), None
+        hs: list[torch.Tensor] = []
 
-        def collect(i: int, h: torch.Tensor) -> None:
-            if i == self.L - 1:
-                hs.append(h)
-
-        def snap(at: int) -> Any:
+        def snap(at: int, logits: Any) -> Any:
+            # the point's own next-token logits: an anchor is a state of its own (`Ready`), which a failed call
+            # goes back to
             return {
                 "n": at,
+                "logits": logits[0, -1].float().cpu().clone(),
                 "states": {
                     i: self._lin_snap(cache.layers[i]) for i in range(self.L) if self.layer_types[i] == LayerKind.LINEAR
                 },
                 "h_last": hs[-1][:, -1:].detach().clone() if hs else None,
             }
 
-        hook = collect if on_layer is not None else None
+        def gather(i: int, h: torch.Tensor) -> None:
+            # the last layer's rows are gathered across the chunks for one call below; the others go straight on
+            if i == self.L - 1:
+                hs.append(h)
+            elif on_layer is not None:
+                on_layer(i, h)
+
+        hook = gather if on_layer is not None else None
+        if held is not None:
+            return held, [snap(n, held)]
         anchors = []
         d = int(session.tail)
         cut = n - d
         if d > 0 and reuse < cut:
-            self._prefill(ids[:, reuse:cut], cache, on_layer=hook)
-            anchors.append(snap(cut))
+            at_cut = self._prefill(ids[:, reuse:cut], cache, on_layer=hook)
+            anchors.append(snap(cut, at_cut))
             logits = self._prefill(ids[:, cut:], cache, on_layer=hook)
         else:
             logits = self._prefill(ids[:, reuse:], cache, on_layer=hook)
-        anchors.append(snap(n))
+        anchors.append(snap(n, logits))
         if on_layer is not None:
             on_layer(self.L - 1, hs[0] if len(hs) == 1 else torch.cat(hs, dim=1))
         return logits, anchors
+
+    @staticmethod
+    def _path_tokens(j: int, guesses: Sequence[int], parents: Sequence[int] | None) -> list[int]:
+        """the drafted tokens between the pass's root and node j: its ancestors' in a tree, the chain's first j
+        otherwise"""
+        if parents is None:
+            return list(guesses[:j])
+        out: list[int] = []
+        while j > 0:
+            out.append(int(guesses[j - 1]))
+            j = parents[j]
+        return out[::-1]
+
+    @staticmethod
+    def _hook_commit(hk: Hooks, logits: torch.Tensor, taps: dict[int, torch.Tensor], node: int, token: int) -> None:
+        """a committed token's log-probability off its node's row, and the tapped layers' state at that row"""
+        if hk.needs_logits:
+            hk.record(0, logits[node], token)
+        for i, h in taps.items():
+            hk.tap(0, i, h[0, node])
 
     @staticmethod
     def _lin_set(cl: LinLayer, conv: torch.Tensor, rec: torch.Tensor) -> None:
@@ -187,6 +232,7 @@ class _GenerateMixin(_State):
         spans: Spans = (),
         session: Session | None = None,
         sampling: Sampling | None = None,
+        hooks: Hooks | None = None,
     ) -> tuple[list[int], Json]:
         ids = torch.as_tensor(ids, dtype=torch.long).view(1, -1)
         prompt = ids[0].tolist()
@@ -194,6 +240,11 @@ class _GenerateMixin(_State):
         eos = {int(e) for e in eos_ids}
         smp = (sampling or GREEDY).seeded()
         self._tag(PassTag.SAMPLE_GREEDY if smp.greedy else PassTag.SAMPLE_STOCHASTIC)
+        hk = hooks if hooks is not None and hooks.any else None
+        if hk is not None:
+            hk.rows(1)
+            if hk.needs_logits:
+                self._tag(PassTag.PICK_HOOKED)
         t0 = time.time()
         # a string from a caller's config reads into the enum here; an unknown one raises rather than decoding
         # as n-gram, which no report would have shown
@@ -202,17 +253,36 @@ class _GenerateMixin(_State):
         use_tree = prop_kind in (Proposer.MTP_TREE, Proposer.MTP_DYN)
         use_mtp = prop_kind.mtp
         last = {}
+        taps: dict[int, torch.Tensor] = {}
+        tap_ids = set(hk.taps) if hk is not None else set()
+        tapped = bool(tap_ids)
 
         def aw(i: int, h: torch.Tensor) -> None:
             if i == self.L - 1:
                 last["h"] = h
+            if i in tap_ids:
+                taps[i] = h
 
-        cache, reuse, anchored = session.open(self, prompt) if session is not None else (None, 0, None)
+        # a decode needing the last token's layers (the drafting head, taps) re-runs it; else a fed session goes on
+        # from the logits it holds
+        whole = not (use_mtp or tapped)
+        cache, reuse, anchored = session._begin_decode(self, prompt, whole) if session is not None else (None, 0, None)
         if cache is None:
             cache = self.new_cache()
         logits: Any
-        logits, anchors = self._session_prefill(ids, cache, reuse, session, on_layer=aw if use_mtp else None)
-        first = int(smp.pick_torch(logits[0, -1:], [smp.key_for(n - 1)])[0])
+        logits, anchors = self._session_prefill(
+            ids, cache, reuse, session, on_layer=aw if (use_mtp or tapped) else None
+        )
+        head = logits[0, -1:]
+        if hk is not None and hk.needs_logits:
+            head = hk.process([prompt], head.float())
+        first = int(smp.pick_torch(head, [smp.key_for(n - 1)])[0])
+        if hk is not None:
+            hk.record(0, head[0], first)
+            for i, h in taps.items():
+                hk.tap(0, i, h[0, -1])
+            if hk.on_pass is not None:
+                hk.on_pass({"index": 0, "drafted": 0, "accepted": 0, "tokens": 1, "seconds": time.time() - t0})
         t_prefill = time.time() - t0
         # without a drafting head the n-gram continuations at every order and follower verify as one tree where the
         # tree's rows cost next to nothing (the fused MLX path; a card holding every layer, whose memory-bound decode
@@ -274,9 +344,11 @@ class _GenerateMixin(_State):
             if session is None:
                 return
             if use_mtp:
-                session.keep(prompt, committed, cache, anchors, dr, last_base if len(committed) > 1 else n - 1, pend_h)
+                session._commit_decode(
+                    prompt, committed, cache, anchors, dr, last_base if len(committed) > 1 else n - 1, pend_h
+                )
             else:
-                session.keep(prompt, committed, cache, anchors)
+                session._commit_decode(prompt, committed, cache, anchors)
 
         prop.extend(first)
         if on_token:
@@ -296,6 +368,7 @@ class _GenerateMixin(_State):
             census["seed"] = smp.seed
         if first in eos or max_new <= 1:
             census["seconds"] = time.time() - t0
+            census["tokens_per_pass"] = 1.0
             ax()
             return committed, census
         cur = first
@@ -306,7 +379,7 @@ class _GenerateMixin(_State):
         # the drafter's steps and time of this call's passes (its prefill excluded)
         dr_steps0 = int(getattr(getattr(self, "aj", None), "steps", 0) or 0)
         dr_step_s0 = float(getattr(getattr(self, "aj", None), "step_s", 0.0) or 0.0)
-        while len(committed) < max_new and not self.abort.is_set():
+        while len(committed) < max_new and not self._stop_asked():
             tp = time.perf_counter()
             v = min(v_max, max_new - len(committed) - 1)
             budget = self._spec_budget(ema_tokens, census["forwards"], v_max, cache.get_seq_length())
@@ -390,14 +463,16 @@ class _GenerateMixin(_State):
                 pick = _verify_of(smp, len(guesses) + 1, qrows, draws)
             tf = time.perf_counter()
             phase["propose"] += tf - tp
+            taps.clear()
             try:
                 out = self.forward(
                     [[cur, *guesses]],
                     cache=cache,
                     last_only=False,
-                    on_layer=aw if (use_mtp or use_tree) else None,
+                    on_layer=aw if (use_mtp or use_tree or tapped) else None,
                     positions=([[base_len + d for d in depth]] if tree_now else None),
-                    pick=pick,
+                    # a hooked pick needs the logits here: no pick in the graph
+                    pick=None if (hk is not None and hk.needs_logits) else pick,
                 )[0]
             finally:
                 self.ab()
@@ -412,6 +487,13 @@ class _GenerateMixin(_State):
             if out.dtype in (torch.int32, torch.int64):
                 am_all = out.tolist()
             else:
+                if hk is not None and hk.needs_logits:
+                    # each node's row read with the ids that reach it: the committed ones and its drafts
+                    ctx = [
+                        prompt + committed + self._path_tokens(j, guesses, parents if tree_now else None)
+                        for j in range(len(guesses) + 1)
+                    ]
+                    out = hk.process(ctx, out.float())
                 keys = [smp.key_for(base_len + (depth[j] if tree_now else j)) for j in range(len(guesses) + 1)]
                 am_all = pick.pick_torch(out, keys).tolist()
             tc = time.perf_counter()
@@ -423,6 +505,8 @@ class _GenerateMixin(_State):
                     # Verify, the target's own draw otherwise; the walk goes on where the tree holds it
                     t = Verify.unpack(am_all[node])[1] if isinstance(pick, Verify) else am_all[node]
                     nxt = [c for c in children.get(node, []) if guesses[c - 1] == t]
+                    if hk is not None:
+                        self._hook_commit(hk, out, taps, node, t)
                     committed.append(t)
                     new.append(t)
                     prop.extend(t)
@@ -448,6 +532,8 @@ class _GenerateMixin(_State):
             else:
                 for j in range(len(guesses) + 1):
                     t = am_all[j]
+                    if hk is not None:
+                        self._hook_commit(hk, out, taps, j, t)
                     committed.append(t)
                     new.append(t)
                     prop.extend(t)
@@ -475,11 +561,22 @@ class _GenerateMixin(_State):
             if use_mtp or use_tree:
                 pend_toks, pend_h = new[:a], last["h"][:, path]
             phase["commit"] += time.perf_counter() - tc
+            if hk is not None and hk.on_pass is not None:
+                hk.on_pass(
+                    {
+                        "index": census["forwards"] - 1,
+                        "drafted": len(guesses),
+                        "accepted": a,
+                        "tokens": len(new),
+                        "seconds": time.perf_counter() - tp,
+                    }
+                )
             if stop:
                 break
             cur = committed[-1]
         ax()
         census["seconds"] = time.time() - t0
+        census["tokens_per_pass"] = round(len(committed) / max(1, census["forwards"]), 3)
         census["by_source"] = by_src
         census["phase_s"] = {k: round(x, 3) for k, x in phase.items()}
         if use_mtp:
@@ -517,6 +614,7 @@ class _GenerateMixin(_State):
         prefill_only: bool = False,
         session: Any = None,
         sampling: Sampling | None = None,
+        hooks: Hooks | None = None,
     ) -> Any:
         ids = torch.as_tensor(ids, dtype=torch.long)
         if ids.dim() == 1:
@@ -525,20 +623,29 @@ class _GenerateMixin(_State):
         eos = {int(e) for e in eos_ids}
         smp = (sampling or GREEDY).seeded()
         self._tag(PassTag.SPEC_OFF, PassTag.SAMPLE_GREEDY if smp.greedy else PassTag.SAMPLE_STOCHASTIC)
+        # hooks see every pick and every tapped layer: the paths that pick inside their graph stand aside; a pass
+        # callback alone leaves them be, the one-token loops reporting each token as a pass
+        hk = hooks if hooks is not None and hooks.any else None
+        fused = hk is None or not hk.active
+        one = hk.per_token(on_token) if hk is not None and fused else on_token
+        if hk is not None and hk.needs_logits:
+            self._tag(PassTag.PICK_HOOKED)
         t0 = time.time()
-        if self._mlx_greedy_ok(B, attention_mask, on_layer, prefill_only):
-            out_s, census = self._generate_greedy_mlx(ids, max_new, eos, on_token, t0, session, smp)
+        if fused and self._mlx_greedy_ok(B, attention_mask, on_layer, prefill_only):
+            out_s, census = self._generate_greedy_mlx(ids, max_new, eos, one, t0, session, smp)
             return (out_s, census) if session is not None else out_s
         if session is not None:
             raise ValueError("[stream] a session needs the MLX pipelined decode or the speculative loop")
-        if self._mlx_batch_ok(B, on_layer, prefill_only):
+        if hk is None and self._mlx_batch_ok(B, on_layer, prefill_only):
             return self._generate_greedy_mlx_batch(ids, max_new, eos, attention_mask, t0, smp)
-        if self.dev.type == Device.CUDA and self._card_greedy_ok(
-            None, B, attention_mask, on_layer, prefill_only, session
+        if (
+            fused
+            and self.dev.type == Device.CUDA
+            and self._card_greedy_ok(None, B, attention_mask, on_layer, prefill_only, session)
         ):
             # every layer on the card in one run: the step is a self-advancing graph and the host trails it
             try:
-                return self._card_generate_greedy(ids, max_new, eos, on_token, t0, smp)
+                return self._card_generate_greedy(ids, max_new, eos, one, t0, smp)
             except RuntimeError as e:
                 if smp.greedy:
                     raise
@@ -556,6 +663,7 @@ class _GenerateMixin(_State):
                 try:
                     for s in range(0, B, mb):
                         csz = min(mb, B - s)
+                        part = hk.child() if hk is not None else None
                         sub = self.generate_greedy(
                             ids[s : s + csz],
                             max_new,
@@ -565,8 +673,11 @@ class _GenerateMixin(_State):
                             on_layer=on_layer,
                             prefill_only=prefill_only,
                             sampling=smp,
+                            hooks=part,
                         )
                         rows.extend([sub] if csz == 1 else sub)
+                        if hk is not None and part is not None:
+                            hk.extend(part)
                 finally:
                     self._in_epoch = False
                 return rows
@@ -574,26 +685,71 @@ class _GenerateMixin(_State):
         am = None if attention_mask is None else torch.as_tensor(attention_mask, dtype=torch.long)
         out: list[list[int]] = [[] for _ in range(B)]
         done = [False] * B
-        logits: Any = self._prefill(ids, cache, on_layer=on_layer, attention_mask=am)
+        seen: dict[int, torch.Tensor] = {}
+        layer_hook = on_layer
+        ctx: list[list[int]] = []
+        if hk is not None:
+            hk.rows(B)
+            # each row's own ids for the processors: a left-padded row without its pad
+            ctx = [
+                [
+                    int(t)
+                    for t, keep in zip(ids[b].tolist(), (am[b].tolist() if am is not None else [1] * ids.shape[1]))
+                    if keep
+                ]
+                for b in range(B)
+            ]
+            taps = set(hk.taps)
+            if taps:
+
+                def tap_hook(i: int, h: torch.Tensor) -> None:
+                    if on_layer is not None:
+                        on_layer(i, h)
+                    if i in taps:
+                        seen[i] = h
+
+                layer_hook = tap_hook
+
+        logits: torch.Tensor = self._prefill(ids, cache, on_layer=layer_hook, attention_mask=am)
         self.vram_trim("prefill")
         pos0 = int(ids.shape[1]) - 1  # the row the prompt's last token holds: step k picks at pos0 + k
         for step in range(max_new):
-            if self.abort.is_set():
+            if self._stop_asked():
                 break
-            nx = smp.pick_torch(logits[:, -1], [smp.key_for(pos0 + step)] * B)
+            ts = time.perf_counter()
+            last = logits[:, -1]
+            if hk is not None and hk.needs_logits:
+                last = hk.process([ctx[b] + out[b] for b in range(B)], last.float())
+            nx = smp.pick_torch(last, [smp.key_for(pos0 + step)] * B)
+            live = B - sum(done)
             for b in range(B):
                 if not done[b]:
+                    if hk is not None:
+                        hk.record(b, last[b], int(nx[b]))
+                        for i, h in seen.items():
+                            hk.tap(b, i, h[b, -1])
                     out[b].append(int(nx[b]))
                     if int(nx[b]) in eos:
                         done[b] = True
             if on_token:
                 on_token(int(nx[0]))
+            if hk is not None and hk.on_pass is not None:
+                hk.on_pass(
+                    {
+                        "index": step,
+                        "drafted": 0,
+                        "accepted": 0,
+                        "tokens": live,
+                        "seconds": time.perf_counter() - ts,
+                    }
+                )
             if all(done) or step == max_new - 1:
                 break
             if am is not None:
                 am = torch.cat([am, torch.ones((B, 1), dtype=torch.long)], dim=1)
+            seen.clear()
             logits = self.forward(
-                nx.view(B, 1), cache=cache, attention_mask=am, on_layer=(None if prefill_only else on_layer)
+                nx.view(B, 1), cache=cache, attention_mask=am, on_layer=(None if prefill_only else layer_hook)
             )
         n_tok = sum(len(o) for o in out)
         self.log(
@@ -609,9 +765,11 @@ class _GenerateMixin(_State):
         eos_ids: Tokens = (),
         pad_id: int | None = None,
         sampling: Sampling | None = None,
+        hooks: Hooks | None = None,
     ) -> list[list[int]]:
         """Decode ragged prompts as fixed-size epochs sized by the scheduler for the longest waiting prompt, each
-        run to completion before the next forms. Returns a token list per prompt in input order."""
+        run to completion before the next forms. Returns a token list per prompt in input order; `hooks` collects
+        a row per prompt, in the same order."""
         prompts = [list(p) for p in prompts]
         if not prompts:
             return []
@@ -624,12 +782,18 @@ class _GenerateMixin(_State):
             longest = max(len(prompts[j]) for j in range(i, len(prompts)))
             B, _ = self.scheduler.plan(len(prompts) - i, longest + int(max_new))
             rows = prompts[i : i + B]
+            part = hooks.child() if hooks is not None else None
             if len(rows) == 1:
-                outs = [self.generate_greedy([rows[0]], max_new, eos_ids=eos_ids, sampling=sampling)]
+                outs = [self.generate_greedy([rows[0]], max_new, eos_ids=eos_ids, sampling=sampling, hooks=part)]
             else:
                 ids, mask = self.pad_left(rows, pad_id)
-                o = self.generate_greedy(ids, max_new, eos_ids=eos_ids, attention_mask=mask, sampling=sampling)
+                o = self.generate_greedy(
+                    ids, max_new, eos_ids=eos_ids, attention_mask=mask, sampling=sampling, hooks=part
+                )
                 outs = o if isinstance(o[0], (list, tuple)) else [o]
+            if hooks is not None and part is not None:
+                part.rows(len(rows))
+                hooks.extend(part)
             for k in range(len(rows)):
                 results[i + k] = outs[k]
             i += len(rows)

@@ -165,7 +165,7 @@ Every command that loads a model takes these. The placement is planned from the 
 | `--expert-cache-gb GB` | RAM limit for the model's MoE store | the free RAM above the reserve, grown into as needed |
 | `--ram-reserve GB\|%` | specifies how much RAM to keep free on the host for other apps | 10% of RAM, or OS floor + growth; whichever is more |
 | `--vram-reserve GB\|%` | specifies how much VRAM to keep free on the host for other apps | 0.5 GB, or 8% of a smaller card |
-| `--vram-watch 0\|1`<br/><sub>This option describes enables/disables `btb`'s behavior under contention. When true, it aims for no apps OOMing. When false, it plans once and sticks to it - making other apps take the OOM. | `1`: free RAM/VRAM under contention, reclaim it when available again<br/>`0`: fit the model to the hardware once and don't readjust | `1` |
+| `--adapt 0\|1`<br/><sub>This option enables/disables `btb`'s behavior under contention, for RAM and VRAM together. When true, it aims for no apps OOMing. When false, it plans once and sticks to it - making other apps take the OOM. | `1`: free RAM/VRAM under contention, reclaim it when available again<br/>`0`: fit the model to the hardware once and don't readjust | `1` |
 | `--no-spec` | disables speculative decoding | _disabled_ |
 | `--tree-budget N` | the draft tree's size per pass; `0` turns the tree off | with drafting head: mlx = `14`, cuda = `15`, cpu = `16`<br/>without: on a card holding every layer, `15`; otherwise `0` |
 | `--v-max N` | drafted tokens verified per pass; `0` decodes one token at a time | `4`; `0` for a mixture of experts |

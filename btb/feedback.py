@@ -191,10 +191,9 @@ def _reproduction_command(a: argparse.Namespace, sm: Any, report: Json) -> str:
     rr = getattr(sm, "ram_reserve", None)
     if rr:
         sched += ["--ram-reserve", f"{rr / 2**30:.2f}"]
-    if cuda:
-        if caps.get("vram_reserve_gb") is not None:
-            sched += ["--vram-reserve", f"{caps['vram_reserve_gb']:.2f}"]
-        sched += ["--vram-watch", "1" if getattr(sm, "vram_watch", False) else "0"]
+    if cuda and caps.get("vram_reserve_gb") is not None:
+        sched += ["--vram-reserve", f"{caps['vram_reserve_gb']:.2f}"]
+    sched += ["--adapt", "1" if getattr(sm, "adapt", False) else "0"]
     spec = [
         "--tree-budget",
         str(spec.get("tree_budget", 0)),

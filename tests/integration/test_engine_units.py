@@ -8,6 +8,7 @@ marked so need a card. Everything here runs in seconds: the fixtures are a few h
 import json
 import os
 import shutil
+import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -201,6 +202,131 @@ def test_grow_layer_appends_rows_in_order() -> None:
     assert keys.untyped_storage().data_ptr() == layer._buf[0].untyped_storage().data_ptr()
 
 
+def test_an_mlx_engine_reports_its_layers_head_and_cache_on_the_gpu() -> None:
+    """Apple silicon runs the layers, the head and the cache on the GPU over the one memory: the report and its line
+    say so (gpu, not host), and the plan it loaded from was priced on the GPU"""
+    from btb.kinds import Tier
+
+    need_mlx()
+    with loaded_model(fixture("tiny_qwen3"), device="mlx") as sm:
+        rep = sm.report()
+        pl = rep["placement"]
+        assert pl["head"] == Tier.GPU and pl["kv"] == Tier.GPU and len(pl["mlx"]) == sm.L
+        line = sm.report_line(rep)
+        assert f"gpu {sm.L}, host 0" in line and "head gpu" in line and "kv gpu" in line
+        assert sm.plan is not None and sm.plan.gpu_bps and "on the GPU" in str(sm.plan)
+
+
+def test_grow_layer_crop_cuts_the_rows_on_the_torch_path() -> None:
+    """`crop` was a new length for the shared MLX buffer alone: a torch layer kept every row, so a prefill chunk
+    rolled back after a GPU recovery was appended twice, and a draft model drafted over rows it had rejected.
+    It cuts the rows, keeps them all past the length, and drops the last -n for transformers' negative form."""
+    layer = GrowLayer()
+    layer.update(*_kv(1, 2, 5, 8, fill=1.0))
+    layer.crop(3)
+    assert layer.get_seq_length() == 3 and layer.keys.shape[-2] == layer.values.shape[-2] == 3
+    keys, _values = layer.update(*_kv(1, 2, 1, 8, fill=2.0))
+    assert keys[0, 0, :, 0].tolist() == [1.0, 1.0, 1.0, 2.0], "the next row lands after the cut"
+    layer.crop(10)
+    assert layer.get_seq_length() == 4, "a length past the rows keeps them all"
+    layer.crop(-1)
+    assert layer.get_seq_length() == 3 and layer.keys[0, 0, :, 0].tolist() == [1.0, 1.0, 1.0]
+
+
+def test_grow_layer_crop_cuts_the_arena_front() -> None:
+    """a layer whose rows are the front of the card's arena (`attach`) is cut to the front's new length"""
+    layer = GrowLayer()
+    layer.update(*_kv(1, 2, 4, 8, fill=1.0))
+    kb, vb = torch.zeros(1, 2, 16, 8, dtype=torch.bfloat16), torch.zeros(1, 2, 16, 8, dtype=torch.bfloat16)
+    layer.attach(kb, vb)
+    layer.crop(2)
+    assert layer.get_seq_length() == 2 and layer.keys.data_ptr() == kb.data_ptr()
+    keys, _values = layer.update(*_kv(1, 2, 1, 8, fill=3.0))
+    assert keys[0, 0, :, 0].tolist() == [1.0, 1.0, 3.0] and kb[0, 0, 2, 0].item() == 3.0
+
+
+def test_grow_layer_keeps_a_cut_of_its_own_rows_as_a_view() -> None:
+    """a caller's crop through the setters is no copy: the arena's front stays the front, detached rows stay theirs"""
+    layer = GrowLayer()
+    layer.update(*_kv(1, 2, 4, 8, fill=1.0))
+    kb, vb = torch.zeros(1, 2, 16, 8, dtype=torch.bfloat16), torch.zeros(1, 2, 16, 8, dtype=torch.bfloat16)
+    layer.attach(kb, vb)
+    layer.keys, layer.values = layer.keys[..., :3, :], layer.values[..., :3, :]
+    assert layer._an == 3 and layer.keys.data_ptr() == kb.data_ptr()
+    layer.detach()
+    rows = layer.keys
+    layer.keys, layer.values = layer.keys[..., :2, :], layer.values[..., :2, :]
+    assert layer.keys.data_ptr() == rows.data_ptr() and layer.get_seq_length() == 2
+
+
+def test_grow_layer_copies_rows_it_does_not_own() -> None:
+    """rows assigned from elsewhere are copied in: a later write to where they came from never reaches the layer"""
+    layer = GrowLayer()
+    layer.update(*_kv(1, 2, 4, 8, fill=1.0))
+    src_k, src_v = _kv(1, 2, 3, 8, fill=5.0)
+    layer.keys, layer.values = src_k, src_v
+    src_k.fill_(9.0)
+    assert layer.keys.data_ptr() != src_k.data_ptr() and layer.keys[0, 0, :, 0].tolist() == [5.0] * 3
+    keys, _values = layer.update(*_kv(1, 2, 1, 8, fill=2.0))
+    assert keys[0, 0, :, 0].tolist() == [5.0, 5.0, 5.0, 2.0]
+
+
+def test_grow_layer_copies_another_layers_arena_rows() -> None:
+    """two caches' layers in one arena storage (the card's): rows lifted from one into the other are copied, so the
+    first one's appends, and the arena passing to another owner, leave the second's rows as they were"""
+    arena = torch.zeros(2, 2, 1, 2, 16, 8, dtype=torch.bfloat16)
+    a, b = GrowLayer(), GrowLayer()
+    a.update(*_kv(1, 2, 4, 8, fill=1.0))
+    b.update(*_kv(1, 2, 2, 8, fill=7.0))
+    a.attach(arena[0, 0], arena[0, 1])
+    b.attach(arena[1, 0], arena[1, 1])
+    b.keys, b.values = a.keys[..., :3, :], a.values[..., :3, :]
+    assert (
+        b._an is None
+        and not b._attached()
+        and b.keys.untyped_storage().data_ptr() != arena.untyped_storage().data_ptr()
+    )
+    a.crop(1)
+    a.update(*_kv(1, 2, 3, 8, fill=4.0))
+    arena.fill_(-1.0)
+    assert b.keys[0, 0, :, 0].tolist() == [1.0, 1.0, 1.0]
+    # a cut from the middle of its own buffer is copied as well: a view that is not the front would be written
+    # over by the rows' own move back into the buffer
+    b.attach(arena[1, 0], arena[1, 1])
+    b.keys, b.values = b.keys[..., 1:3, :], b.values[..., 1:3, :]
+    assert b._an is None and b.keys.untyped_storage().data_ptr() != arena.untyped_storage().data_ptr()
+
+
+def test_grow_layer_does_not_take_a_strided_view_for_its_front() -> None:
+    layer = GrowLayer()
+    layer.update(*_kv(1, 2, 4, 8, fill=1.0))
+    kb, vb = layer._buf
+    layer.keys, layer.values = kb[:, :, ::2], vb[:, :, ::2]
+    assert layer._an is None and layer.keys.is_contiguous()
+
+
+def test_grow_layer_refuses_rows_of_the_wrong_rank() -> None:
+    layer = GrowLayer()
+    layer.update(*_kv(1, 2, 4, 8, fill=1.0))
+    with pytest.raises(ValueError, match="batch, kv heads"):
+        layer.keys = torch.zeros(2, 4, 8)
+
+
+def test_a_shared_layer_copies_rows_it_does_not_own() -> None:
+    """a shared (MLX) layer holds rows assigned from torch as an override until its next append: a copy, so the
+    caller's tensor changing in between does not change what is written in"""
+    need_mlx()
+    layer = GrowLayer(shared=True)
+    layer.update(*_kv(1, 2, 4, 8, fill=1.0, dtype=torch.bfloat16))
+    src_k, src_v = _kv(1, 2, 2, 8, fill=5.0, dtype=torch.bfloat16)
+    layer.keys, layer.values = src_k, src_v
+    src_k.fill_(9.0)
+    keys, _values = layer.update(*_kv(1, 2, 1, 8, fill=2.0, dtype=torch.bfloat16))
+    assert keys[0, 0, :, 0].tolist() == [5.0, 5.0, 2.0]
+    layer.keys, layer.values = layer.keys[..., :2, :], layer.values[..., :2, :]
+    assert layer._tk is None and layer.get_seq_length() == 2, "a cut of its own view is a new length"
+
+
 def test_grow_layer_reserves_the_cap_hint_and_not_the_floor() -> None:
     """`cap_hint` is prompt + max_new: the caller knows how far the sequence runs, so the buffer is that long
     and no longer. Without it every layer takes the 4096-position floor, which a batch of short decodes
@@ -284,16 +410,16 @@ def test_the_ram_policy_sheds_a_warm_layer_to_the_ring_and_takes_it_back() -> No
 
     with loaded_model(fixture("tiny_qwen3-pack12"), device="cpu", v_max=0) as sm:
         assert sm.host and not sm.cold and sm.ram_watch
-        before, _ = sm.generate(REPEATING, 12, speculate=False)
+        before = sm.generate(REPEATING, 12, speculate=False).tokens
         i = sm.ram_shed("the test")
         assert i == max(sm.host) and sm.cold == {i} and sm.ram_state.shed == [i]
         assert sm.cold_ring.slots and i in sm.cold_ring.slot_of
         lins = [m for m in sm.host[i].modules() if isinstance(m, _HostLinear) and m.key]
         assert lins and all(m.packed is not None for m in lins)
-        during, _ = sm.generate(REPEATING, 12, speculate=False)
+        during = sm.generate(REPEATING, 12, speculate=False).tokens
         assert during == before, "a layer read from the drive each pass answers as it did from RAM"
         assert sm.ram_regrow() == i and not sm.cold and not sm.ram_state.shed and not sm.cold_ring.slots
-        after, _ = sm.generate(REPEATING, 12, speculate=False)
+        after = sm.generate(REPEATING, 12, speculate=False).tokens
         assert after == before
 
 
@@ -322,14 +448,14 @@ def test_the_12_bit_model_answers_as_its_parent_with_and_without_the_native_kern
     src, pack = fixture("tiny_qwen3"), fixture("tiny_qwen3-pack12")
     with loaded_model(src, device="cpu", v_max=0) as a, loaded_model(pack, device="cpu", v_max=0) as b:
         assert b.pack is not None and b._packed
-        assert a.generate(REPEATING, 12, speculate=False)[0] == b.generate(REPEATING, 12, speculate=False)[0]
+        assert a.generate(REPEATING, 12, speculate=False).tokens == b.generate(REPEATING, 12, speculate=False).tokens
     code = (
         "import json, sys, btb\n"
         "src, pack, ids = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])\n"
         "out = []\n"
         "for p in (src, pack):\n"
         "    with btb.load(p, device='cpu', native='', v_max=0) as m:\n"
-        "        out.append(m.generate(ids, 12, speculate=False)[0])\n"
+        "        out.append(m.generate(ids, 12, speculate=False).tokens)\n"
         "from btb.engine.native import Native\n"
         "assert Native.gemv is None and Native.gemv_p12 is None, 'the torch-alone arm loaded a kernel library'\n"
         "print(json.dumps(out))\n"
@@ -345,6 +471,36 @@ def test_the_12_bit_model_answers_as_its_parent_with_and_without_the_native_kern
     assert r.returncode == 0, r.stderr[-2000:]
     plain, packed = json.loads(r.stdout.strip().splitlines()[-1])
     assert plain == packed and len(packed) == 12
+
+
+def test_a_kernel_handle_is_the_installs_before_any_load_and_none_after_a_torch_alone_one() -> None:
+    """a handle read before any model has loaded binds the install's library as a load would - never None for want
+    of a load, which skipped a test run first in its process and ran it after another; a torch-alone load after a
+    native one lets the kernels go. In a process of its own: "before any load" is only there at its start"""
+    code = (
+        "import sys, btb\n"
+        "from btb.engine.native import Native\n"
+        "from btb.native_files import native_path\n"
+        "assert (Native.attn_decode is not None) == (native_path() is not None), 'a handle read before a load'\n"
+        "with btb.load(sys.argv[1], device='cpu', v_max=0):\n"
+        "    pass\n"
+        "with btb.load(sys.argv[1], device='cpu', native='', v_max=0):\n"
+        "    assert Native.gemv is None and Native.attn_decode is None, 'a torch-alone load kept the kernels'\n"
+    )
+    r = subprocess.run(
+        [sys.executable, "-c", code, fixture("tiny_qwen3")], capture_output=True, text=True, cwd=ROOT, timeout=600
+    )
+    assert r.returncode == 0, r.stderr[-2000:]
+
+
+def test_a_cpu_load_leaves_the_card_for_the_next_load() -> None:
+    """a CPU load once cleared a process-wide flag that refused every later card load in the process (the tests put
+    it back by hand); the card torch holds is there for whichever load names it next"""
+    dev = need_cuda()
+    with loaded_model(fixture("tiny_qwen3"), device="cpu"):
+        pass
+    with loaded_model(fixture("tiny_qwen3"), device=dev) as sm:
+        assert sm.dev.type == "cuda"
 
 
 def test_load_places_the_layers_the_cpu_share_names() -> None:
@@ -512,15 +668,71 @@ def test_speculative_is_the_greedy_answer_on_the_card_with_the_ngram_tree() -> N
     with loaded_model(fixture("tiny_qwen3"), device=dev, cpu_layers=0) as sm:
         assert sm.tree_budget > 0 and not sm.host, "the tree only draws when the card holds every layer"
         with torch.inference_mode():
-            greedy, census = _exactly_greedy(sm, REPEATING, 48)
+            # the orders made to disagree whatever the fixture's weights answer (the prompt's own n-grams part only
+            # while the answer happens to re-enter them): the answer banked, so every longer order continues it
+            # right, then a span a token of it followed by one the answer never draws, which takes over the order-1
+            # keys alone (the last span banked under a key is the one proposed). Every pass then holds two chains -
+            # the right one and a one-token wrong branch - merged into a tree whose wrong node is drafted, rejected
+            # and cropped
+            answer = [int(t) for t in sm.generate_greedy(REPEATING, 48)]
+            seen = set(answer) | set(REPEATING[0])
+            wrong = next(t for t in range(int(sm.cfg.vocab_size)) if t not in seen)
+            spans = [("right", answer)] + [("misleading", [t, wrong]) for t in sorted(set(answer))]
+            greedy, census = _exactly_greedy(sm, REPEATING, 48, spans=spans)
+            assert greedy == answer
             assert "ngram_tree" in census["by_source"]["drafted"], f"no tree was built: {census['by_source']}"
             assert census["proposed"] > census["accepted"], "every node was accepted: the crop never ran"
-            # a banked sequence that disagrees with the answer: the drafter trusts it, the verify must not
-            bad = list(greedy)
-            for i in (5, 17, 31):
-                bad[i] = (bad[i] + 1) % int(sm.cfg.vocab_size)
-            spec, _c = _exactly_greedy(sm, REPEATING, 48, spans=[("misleading", bad)])
-            assert spec == greedy, "a misleading draft changed the answer"
+
+
+@pytest.mark.parametrize("stem", ["tiny_qwen3", "tiny_q35"])
+def test_a_verify_pass_over_a_host_cache_is_the_one_row_steps_bit_for_bit(stem: str) -> None:
+    """With the attention cache in host RAM (kv_host), each row of a verify pass - a chain's, and a tree's with a
+    sibling beside the path - attends as the one-row step at its position does, over the same keys through the same
+    kernel, so the rows' logits are the steps' bit for bit and a speculative decode is the plain loop's (the card's
+    blocks and torch's sdpa each summed in an order of their own, and parted from the steps at a near-tie)."""
+    dev = need_cuda()
+    from btb.engine.native import Native
+
+    if Native.attn_decode is None:
+        pytest.skip("the native attention kernel is not built")
+    with loaded_model(fixture(stem), device=dev, kv_host=True) as sm, torch.inference_mode():
+        prompt = REPEATING[0]
+        toks = [int(t) for t in sm.generate(list(prompt), 5, eos=(), speculate=False).tokens]
+        cache = sm.new_cache()
+        sm.forward([list(prompt)], cache=cache)
+        steps = []
+        for t in toks:
+            out = sm.forward([[t]], cache=cache)
+            assert out is not None
+            steps.append(out[0, -1].float().cpu())
+        P = len(prompt)
+        # the chain: the five tokens as one pass
+        chain = sm.new_cache()
+        sm.forward([list(prompt)], cache=chain)
+        sm.aa(None)
+        try:
+            out = sm.forward([toks], cache=chain, last_only=False)
+        finally:
+            sm.ab()
+        assert out is not None
+        for r in range(len(toks)):
+            assert torch.equal(out[0, r].float().cpu(), steps[r]), f"chain row {r}"
+        if LayerKind.LINEAR in sm.layer_types:
+            return  # a hybrid's verify is a chain (its recurrent states take one path a pass)
+        # the tree: the path 0 -> 1 -> 2 with a wrong sibling of node 1 between them
+        wrong = (toks[1] + 7) % int(sm.cfg.vocab_size)
+        tree = sm.new_cache()
+        sm.forward([list(prompt)], cache=tree)
+        sm.aa([-1, 0, 0, 2])
+        try:
+            out = sm.forward(
+                [[toks[0], wrong, toks[1], toks[2]]], cache=tree, last_only=False, positions=[[P, P + 1, P + 1, P + 2]]
+            )
+        finally:
+            sm.ab()
+        assert out is not None
+        for r, want in ((0, 0), (2, 1), (3, 2)):
+            assert torch.equal(out[0, r].float().cpu(), steps[want]), f"tree node {r}"
 
 
 def test_the_drafter_answers_the_greedy_loop_over_a_head_slice_on_the_card_and_on_the_host() -> None:
@@ -537,8 +749,6 @@ def test_the_drafter_answers_the_greedy_loop_over_a_head_slice_on_the_card_and_o
     if not arms:
         pytest.skip("neither a CUDA device nor the native kernels")
     for dev, bits in arms:
-        if dev == "cuda":
-            btb.CUDA = True  # a cpu `load()` earlier clears the package's flag; torch still holds the device
         with loaded_model(path, device=dev, draft_vocab=256, draft_bits=bits) as sm:
             assert sm.proposer == "mtp_dyn" and sm.draft_bits == bits and sm.draft_vocab == 256
             speculation(sm, tree_min_prob=0.0, tree_read="step")
@@ -668,8 +878,8 @@ def test_hybrid_session_continues_past_16_new_rows_on_mlx() -> None:
     with loaded_model(fixture("tiny_q35"), device="mlx", v_max=0) as sm:
         s = Session()
         sm.generate(first, 4, session=s)
-        with_session = sm.generate(second, 8, session=s)[0]
-        fresh = sm.generate(second, 8)[0]
+        with_session = sm.generate(second, 8, session=s).tokens
+        fresh = sm.generate(second, 8).tokens
     assert with_session == fresh
 
 
@@ -679,9 +889,9 @@ def test_hybrid_prefill_chunks_with_the_drafter_hook_on_mlx() -> None:
     need_mlx()
     prompt = REPEATING[0] * 4
     with loaded_model(fixture("tiny_q35"), device="mlx") as sm:
-        whole = sm.generate(prompt, 12)[0]
+        whole = sm.generate(prompt, 12).tokens
         sm.prefill_chunk = 24
-        chunked = sm.generate(prompt, 12)[0]
+        chunked = sm.generate(prompt, 12).tokens
     assert chunked == whole
 
 
@@ -698,12 +908,12 @@ def test_mlx_decodes_run_on_one_worker_thread_whichever_thread_asks() -> None:
         for _ in range(2):
             t = threading.Thread(
                 target=lambda: outs.append(
-                    sm.generate(REPEATING[0], 4, on_token=lambda _t: seen.append(threading.current_thread()))[0]
+                    sm.generate(REPEATING[0], 4, on_token=lambda _t: seen.append(threading.current_thread())).tokens
                 )
             )
             t.start()
             t.join()
-        outs.append(sm.generate(REPEATING[0], 4, on_token=lambda _t: seen.append(threading.current_thread()))[0])
+        outs.append(sm.generate(REPEATING[0], 4, on_token=lambda _t: seen.append(threading.current_thread())).tokens)
         assert outs[0] == outs[1] == outs[2]
         workers = set(seen)
         assert len(workers) == 1, workers
@@ -893,14 +1103,14 @@ def test_a_layer_shed_to_the_drive_off_a_weight_not_stored_as_bf16_answers_as_fr
     if device == "mlx":
         need_mlx()
     with loaded_model(path, device=device, v_max=0) as sm:
-        before, _ = sm.generate(REPEATING, 12, speculate=False)
+        before = sm.generate(REPEATING, 12, speculate=False).tokens
         with torch.inference_mode():
             i = sm.ram_shed("the test")
         assert i is not None and sm.cold == {i}
         kind = "mem" if name.startswith("gguf/") else "cast"
         assert {it[5] for it in sm.cold_ring.recipe[i]} == {kind}, "every linear of the shed layer is read cast"
-        during, _ = sm.generate(REPEATING, 12, speculate=False)
+        during = sm.generate(REPEATING, 12, speculate=False).tokens
         assert during == before, "a layer read through the ring each pass answers as it did from RAM"
         assert sm.ram_regrow() == i and not sm.cold
-        after, _ = sm.generate(REPEATING, 12, speculate=False)
+        after = sm.generate(REPEATING, 12, speculate=False).tokens
         assert after == before

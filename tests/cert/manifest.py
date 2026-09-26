@@ -43,10 +43,12 @@ FIXTURES = spec.FIXTURES
 GGUF_DIR = spec.GGUF_DIR
 
 # the shapes the card's step-graph kernels are written for (btb/engine/cuda.py:295: a lane holds D/32 dims of a
-# head), and the megakernel's head multiple (btb/mlx/mega.py:599). Neither is reachable from a torch-free
-# module, so test_manifest holds both against the source they are quoted from.
+# head), the megakernel's head multiple (btb/mlx/mega.py:599), and the heads the engine sends to its MLX attention
+# kernels (mlx_forward.ATTN_KERNEL_HEADS). None is reachable from a torch-free module, so test_manifest holds
+# each against the source it is quoted from.
 CARD_HEAD_DIMS: tuple[int, ...] = (64, 128, 256)
 MEGA_HEAD_MULTIPLE = 64
+MLX_ATTN_HEAD_DIMS: tuple[int, ...] = (128, 256)
 
 
 class Verdict(StrEnum):
@@ -69,6 +71,8 @@ class Missing(StrEnum):
     MEGA_SHAPE = "mega-shape"
     CARD_GRAPH_FAMILY = "card-graph-family"
     CARD_GRAPH_SHAPE = "card-graph-shape"
+    MLX_ATTN_FAMILY = "mlx-attn-family"
+    MLX_ATTN_SHAPE = "mlx-attn-shape"
     SPEC_MTP_HEAD = "spec-mtp-head"
     GGUF_MTP_HEAD = "gguf-mtp-head"
     SPEC_OWN_LAYER = "spec-own-layer"
@@ -116,10 +120,9 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "permanent - until then the cell is a real path the cert cannot certify",
     ),
     Missing.MEGA_SHAPE: (
-        "the megakernel takes a head of 64k dims (mega.py:599, `self.hd % 64`); every committed tiny fixture is "
-        "head_dim 16, so it never builds here and any cell asserting it would be certified by the step path",
-        "run this cell against a cached real model (Qwen3-0.6B is head_dim 128 - see the prereqs below), which "
-        "is the only way the megakernel is exercised at all",
+        "the megakernel takes a head of 64k dims (mega.py:599, `self.hd % 64`); this family's tiny fixture has "
+        "another head width, so it never builds here and any cell asserting it would be certified by the step path",
+        "widen the fixture's head to a multiple of 64 in tests/make_fixtures.py and rebank it",
     ),
     Missing.CARD_GRAPH_FAMILY: (
         "the captured card step graph is not written for this family (cuda.py:284 takes the kernel layout or "
@@ -129,9 +132,22 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "which is the path it really runs",
     ),
     Missing.CARD_GRAPH_SHAPE: (
-        "the card kernels take head_dim 64, 128 or 256 with 8-aligned widths (cuda.py:295); the tiny fixtures "
-        "are head_dim 16, so the graph never captures and a fallback would certify the cell",
-        "run this cell against a cached real model on the CUDA box (Qwen3-0.6B is head_dim 128)",
+        "the card kernels take head_dim 64, 128 or 256 with 8-aligned widths (cuda.py:295); this family's tiny "
+        "fixture has another head width, so the graph never captures and a fallback would certify the cell",
+        "widen the fixture's head to one the kernels take in tests/make_fixtures.py and rebank it",
+    ),
+    Missing.MLX_ATTN_FAMILY: (
+        "the engine's MLX attention kernels are not on this family's path: a mixture of experts runs its layers "
+        "through the per-op host path (PassTag.MLX_PEROP), whose attention is transformers' own",
+        "route the family's MLX attention through `_mlx_attend` (a fused MoE step), or leave it certified under "
+        "the per-op path it really runs",
+    ),
+    Missing.MLX_ATTN_SHAPE: (
+        "the engine routes only heads of mlx_forward.ATTN_KERNEL_HEADS to its MLX attention kernels (decode, tree, "
+        "rows, forest, head-256 prefill); this family's tiny fixture has another head width, so its passes take "
+        "MLX's own attention and a bug in how the engine feeds those kernels (b6263bd: a decode read its row "
+        "before it was written) passes the fixture",
+        "widen the fixture's head to one the kernels take in tests/make_fixtures.py and rebank it",
     ),
     Missing.SPEC_MTP_HEAD: (
         "speculation via an MTP head cannot run: this family's tiny fixture has no MTP drafter head (no `mtp.*` "
@@ -269,6 +285,10 @@ def expected_tags() -> frozenset[PassTag]:
         for kind in core.served_kinds():
             for st in spec.Storage:
                 out |= dev.expects(kind, st)
+    for surface, tags in spec.SURFACE_TAGS.items():
+        for key in spec.SURFACE_SUBPATHS[surface]:
+            for kind in core.served_kinds():
+                out |= tags(kind, spec.SUBPATH[key])
     return frozenset(out)
 
 
@@ -365,14 +385,15 @@ def spec_id(kind: FamilyKind, storage: spec.Storage, path: str, key: str, decode
 
 
 def shape_ids() -> frozenset[str]:
-    """the input-shape axes' ids (a ragged batch, a long prompt), which sit outside the storage/device grid:
-    one per served family with a fixture, per sub-path the shape runs take."""
+    """the ids of the axes that sit outside the storage/device grid (every Surface no container records under):
+    one per served family with a fixture, per sub-path the axis takes."""
     out: set[str] = set()
+    axes = [s for s in spec.Surface if s not in spec.CONTAINER_SURFACE.values()]
     for kind in core.served_kinds():
         stem = spec.FIXTURE_STEM.get(kind)
         if stem is None or not os.path.isdir(os.path.join(FIXTURES, stem)):
             continue
-        for surface in (spec.Surface.BATCH, spec.Surface.CONTEXT):
+        for surface in axes:
             out |= {stem_id(surface, stem, key) for key in spec.SURFACE_SUBPATHS[surface]}
     return frozenset(out)
 
@@ -434,6 +455,14 @@ def _card_graph_gap(kind: FamilyKind) -> Missing | None:
     return None if spec.head_dim(kind) in CARD_HEAD_DIMS else Missing.CARD_GRAPH_SHAPE
 
 
+def _mlx_attn_gap(kind: FamilyKind) -> Missing | None:
+    """why the engine's MLX attention kernels cannot engage: a family whose MLX layers never reach
+    `_mlx_attend`, then the fixture's head width."""
+    if Cap.MOE in core.flags(kind):
+        return Missing.MLX_ATTN_FAMILY
+    return None if spec.head_dim(kind) in MLX_ATTN_HEAD_DIMS else Missing.MLX_ATTN_SHAPE
+
+
 def subpath_gap(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath) -> Missing | None:
     """why this device sub-path cannot engage on this family and storage, by the engine's own gates - the one
     rule the grid and the runner share. A run of a cell this refuses would decode fine down another path and
@@ -442,6 +471,8 @@ def subpath_gap(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath
         return Missing.ROCM_BACKEND
     if dev.key == "mlx-mega":
         return _mega_gap(kind, storage)
+    if dev.key == "mlx-attn-kernel":
+        return _mlx_attn_gap(kind)
     if dev.key == "cuda-graph":
         return _card_graph_gap(kind)
     return None

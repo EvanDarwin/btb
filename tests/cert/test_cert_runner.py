@@ -24,9 +24,10 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import pytest
+import torch
 
 import btb
-from btb.kinds import FamilyKind, PassTag
+from btb.kinds import FamilyKind, LayerKind, PassTag
 from tests.helpers import FIXTURES, GGUF_FIXTURES, assert_same_tokens, loaded_model
 
 if TYPE_CHECKING:
@@ -267,7 +268,8 @@ def test_speculation_decodes_as_the_plain_loop(
 
 
 # The 12-bit store (btb pack) is architecture-agnostic - it requantizes weights, so every family has a
-# -pack12 twin. `v_max=0` turns speculation off (required for the MoE families, harmless for the dense ones).
+# -pack12 twin. `v_max=0` turns speculation off (required for the MoE families, harmless for the dense ones);
+# a sub-path whose own knobs name `v_max` keeps its own.
 PACK12_KNOBS: dict[str, object] = {"v_max": 0}
 
 
@@ -290,7 +292,7 @@ def test_pack12_cell_loads_and_is_deterministic(kind: FamilyKind, stem: str, dev
     storage = spec.Storage.PACK12
     runs = _run_twice(
         path,
-        {**dev.knobs, **PACK12_KNOBS},
+        {**PACK12_KNOBS, **dev.knobs},
         lambda sm: _assert_path_engaged(sm, kind, storage, dev, None, f"{stem}-pack12"),
     )
     assert_same_tokens(runs[0], runs[1], f"{stem}-pack12 on {dev.key} decoded differently across two loads")
@@ -342,6 +344,178 @@ def test_context_growth_is_deterministic(stem: str, dev: spec.DeviceSubpath) -> 
             runs.append(list(sm.generate(list(LONG_PROMPT), N, speculate=False).tokens))
     assert_same_tokens(runs[0], runs[1], f"{stem} on {dev.key}: long-context decode differed across two loads")
     receipt.record(manifest.stem_id(spec.Surface.CONTEXT, stem, dev.key))
+
+
+def _axis_tags(
+    sm: StreamedTextModel, surface: spec.Surface, stem: str, dev: spec.DeviceSubpath, calls: bool = True
+) -> None:
+    """the surface's tags in the report: the last pass's forks, and (`calls`) every API call made on the model"""
+    kind = next(k for k, s in spec.FIXTURE_STEM.items() if s == stem)
+    report = sm.last_pass_report()
+    for want in sorted(spec.SURFACE_TAGS[surface](kind, dev)):
+        if calls or "." not in want.value:
+            assert want in report, (
+                f"{stem} on {dev.key}/{surface.value}: {want} never engaged (got {sorted(report.tags)})"
+            )
+
+
+@pytest.mark.parametrize("stem,dev", _shape_cells(spec.Surface.HOOKED))
+def test_hooked_decode_is_the_plain_one(stem: str, dev: spec.DeviceSubpath) -> None:
+    """a decode with every hook on (a processor, logprobs, a tapped layer) picks over the logits in hand, the
+    in-graph picks standing aside, and draws the plain decode's tokens - reproducibly across two loads"""
+    if not _hardware_here(dev.hardware):
+        pytest.skip(f"{dev.hardware.value} not available on this machine")
+    path = os.path.join(FIXTURES, stem)
+    if not os.path.isdir(path):
+        pytest.skip(f"fixture {stem} not built")
+    runs = []
+    for i in range(2):
+        with loaded_model(path, **dev.knobs) as sm:
+            plain = oracle.decode(sm, PROMPT)
+            g = sm.generate(list(PROMPT), N, speculate=False, processors=[lambda ids, lg: lg], logprobs=2, taps=[-1])
+            if i == 0:
+                _axis_tags(sm, spec.Surface.HOOKED, stem, dev)
+            toks = list(g.tokens)
+            assert_same_tokens(plain, toks, f"{stem} on {dev.key}: the hooked decode left the plain one")
+            assert g.logprobs is not None and g.hidden is not None
+            assert [t.token for t in g.logprobs] == toks and all(len(t.top) == 2 for t in g.logprobs)
+            assert int(next(iter(g.hidden.values())).shape[0]) == len(toks)
+            runs.append(toks)
+    assert_same_tokens(runs[0], runs[1], f"{stem} on {dev.key}: hooked decode differed across two loads")
+    receipt.record(manifest.stem_id(spec.Surface.HOOKED, stem, dev.key))
+
+
+RAGGED = [list(PROMPT), [9, 8, 7, 6, 5], list(range(20, 33))]  # sessions of three lengths batched together
+
+
+@pytest.mark.parametrize("stem,dev", _shape_cells(spec.Surface.FORK))
+def test_fork_and_batch_are_deterministic(stem: str, dev: spec.DeviceSubpath) -> None:
+    """a session forked into sampled rows and sessions of ragged lengths batched decode, step, re-form and let
+    rows go reproducibly across two loads, and the fork's rows keep going as a session. Every call the rows,
+    a fork and a batch declare is made (spec.SURFACE_TAGS)."""
+    if not _hardware_here(dev.hardware):
+        pytest.skip(f"{dev.hardware.value} not available on this machine")
+    path = os.path.join(FIXTURES, stem)
+    if not os.path.isdir(path):
+        pytest.skip(f"fixture {stem} not built")
+    runs = []
+    for i in range(2):
+        with loaded_model(path, **dev.knobs) as sm:
+            br = sm.session(list(PROMPT)).fork(3)
+            rows = br.generate(N, eos=(), sampling=oracle.sampling("sampled")).tokens
+            if i == 0:
+                _axis_tags(sm, spec.Surface.FORK, stem, dev, calls=False)
+            br.advance()
+            br.reorder([0, 0, 2])
+            assert br.logits is not None
+            tapped = br.step([int(t) for t in br.logits.argmax(-1)], taps=[-1]).hidden
+            br.leave(2)
+            forked = [br.tokens(r) for r in range(br.n)]
+            more = list(br.keep(1).generate(4, eos=(), speculate=False).tokens)
+            # a fork let go: the session stands where it was forked (`keep` closes its fork too, but a call made
+            # inside another is not the caller's, so the close is made here as a caller makes it)
+            held = sm.session(list(PROMPT))
+            held.fork(2).close()
+            assert held.tokens == list(PROMPT) and held.forked is None
+            with sm.batch([sm.session(r) for r in RAGGED[:2]]) as bt:
+                batched = bt.generate(N, eos=()).tokens
+                joined = bt.join(sm.session(RAGGED[2]))
+                bt.step([int(t) for t in bt.next_logits().argmax(-1)])
+                bt.leave(0)
+                rejoined = [bt.tokens(r) for r in range(joined + 1)]
+            if i == 0:
+                _axis_tags(sm, spec.Surface.FORK, stem, dev)
+            runs.append((rows, forked, more, batched, rejoined, sorted(tapped)))
+    assert runs[0] == runs[1], f"{stem} on {dev.key}: a fork or a batch differed across two loads"
+    receipt.record(manifest.stem_id(spec.Surface.FORK, stem, dev.key))
+
+
+OTHER = [44, 2, 90, 13, 7, 21]  # a session's second feed
+MiB = 2**20
+
+
+@pytest.mark.parametrize("stem,dev", _shape_cells(spec.Surface.MODEL))
+def test_the_models_calls_are_deterministic(stem: str, dev: spec.DeviceSubpath) -> None:
+    """every call the model's API declares - its own and a room's (spec.SURFACE_TAGS) - made on one load, their
+    answers the same across two"""
+    if not _hardware_here(dev.hardware):
+        pytest.skip(f"{dev.hardware.value} not available on this machine")
+    path = os.path.join(FIXTURES, stem)
+    if not os.path.isdir(path):
+        pytest.skip(f"fixture {stem} not built")
+    runs = []
+    for i in range(2):
+        with loaded_model(path, **dev.knobs) as sm:
+            ids = sm.prompt_ids("hello")
+            toks = list(sm.generate(list(PROMPT), N, eos=(), speculate=False).tokens)
+            pick = int(sm.project(sm.hidden(list(PROMPT), layers=(-1,))[sm.L - 1][-1]).argmax())
+            vec = sm.encode(["hello", "there"])
+            assert torch.allclose(vec.norm(dim=-1), torch.ones(2), atol=1e-3)
+            said = sm.ask("hello", max_new=4)
+            streamed = "".join(sm.stream("hello", 4))
+            chatted = sm.chat(max_new=4).ask("hello")
+            many = sm.ask_many(["hello", "there"], max_new=4)
+            with sm.batch([sm.session(list(PROMPT))]) as bt:
+                batched = bt.generate(4, eos=()).tokens
+            with sm.reserve("cert", MiB):
+                pass
+            lent = [sm.empty(64).numel(), float(sm.zeros(64).sum()), float(sm.full(64, 2.0).sum())]
+            assert "cpu" in sm.memory()
+            with sm.room(MiB, name="cert") as room:
+                held = [room.empty(16).numel(), float(room.zeros(16).sum()), float(room.full(16, 3.0).sum())]
+            sm.peak_memory()
+            if i == 0:
+                _axis_tags(sm, spec.Surface.MODEL, stem, dev)
+            runs.append((ids, toks, pick, said, streamed, chatted, many, batched, lent, held))
+    assert runs[0] == runs[1], f"{stem} on {dev.key}: the model's calls answered differently across two loads"
+    receipt.record(manifest.stem_id(spec.Surface.MODEL, stem, dev.key))
+
+
+@pytest.mark.parametrize("stem,dev", _shape_cells(spec.Surface.SESSION))
+def test_a_sessions_calls_are_deterministic(stem: str, dev: spec.DeviceSubpath) -> None:
+    """every call a session declares (spec.SURFACE_TAGS) made on one load: a rewind gives back the mark's logits,
+    a hybrid refuses a crop, and the answers are the same across two loads"""
+    if not _hardware_here(dev.hardware):
+        pytest.skip(f"{dev.hardware.value} not available on this machine")
+    path = os.path.join(FIXTURES, stem)
+    if not os.path.isdir(path):
+        pytest.skip(f"fixture {stem} not built")
+    runs = []
+    for i in range(2):
+        with loaded_model(path, **dev.knobs) as sm:
+            hybrid = LayerKind.LINEAR in sm.layer_types
+            s = sm.session(list(PROMPT))
+            m = s.mark()
+            fed = s.feed(OTHER).logits
+            step = s.feed([4], last_only=True, taps=[-1])
+            last, tapped = step.logits, step.hidden
+            s.rewind(m)
+            assert torch.equal(s.feed(OTHER).logits, fed), f"{stem} on {dev.key}: a rewind left the mark's logits"
+            k, _v = s.rows(next(j for j, kind in enumerate(sm.layer_types) if kind != LayerKind.LINEAR))
+            if hybrid:
+                with pytest.raises(ValueError, match="mark the point"):
+                    s.crop(len(PROMPT))
+            else:
+                s.crop(len(PROMPT))
+            synced = s.sync(list(PROMPT) + OTHER)
+            s.fork(2).close()
+            toks = list(s.generate(N, eos=(), speculate=False).tokens)
+            after = int(s.next_logits().argmax())  # the decode's last token fed first
+            if i == 0:
+                _axis_tags(sm, spec.Surface.SESSION, stem, dev)
+            runs.append(
+                (
+                    fed.argmax(-1).tolist(),
+                    int(last.argmax()),
+                    sorted(tapped),
+                    list(k.shape),
+                    int(synced.argmax()),
+                    toks,
+                    after,
+                )
+            )
+    assert runs[0] == runs[1], f"{stem} on {dev.key}: a session's calls answered differently across two loads"
+    receipt.record(manifest.stem_id(spec.Surface.SESSION, stem, dev.key))
 
 
 def test_cross_process_determinism() -> None:

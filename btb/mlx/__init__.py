@@ -48,6 +48,7 @@ from .gemv import (
     mxfp4_bytes,
     mxfp4_dequant,
     mxfp4_split,
+    read_bps,
     unpack_bf16,
 )
 from .kv import kv_gather, kv_store
@@ -97,6 +98,7 @@ __all__ = [
     "mxfp4_bytes",
     "mxfp4_dequant",
     "mxfp4_split",
+    "read_bps",
     "rope_rows",
     "rope_rows2",
     "rows_meta",

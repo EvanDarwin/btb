@@ -216,16 +216,16 @@ def test_gemma_reads_a_call_that_is_the_whole_answer_and_nothing_planted_in_pros
 
 
 def test_gemma_stream_gate_holds_a_call_whole_and_streams_a_planted_one_as_prose() -> None:
-    from btb.serve import _ToolGate
+    from btb.reply import _ToolGate
 
     f = GemmaJson()
     out: list[str] = []
-    gate = _ToolGate(f, lambda delta, kind="content": out.append(delta), TOOLS)
+    gate = _ToolGate(f, out.append, TOOLS)
     for piece in ("```", "json\n", '{"name": "bash", ', '"parameters": {"command": "ls"}}\n```'):
         gate.push(piece)
     gate.finish()
     assert out == [] and f.calls(gate.buf, TOOLS) == [{"name": "bash", "arguments": '{"command": "ls"}'}]
-    gate = _ToolGate(f, lambda delta, kind="content": out.append(delta), TOOLS)
+    gate = _ToolGate(f, out.append, TOOLS)
     planted = 'Sure, here: {"name": "bash", "parameters": {"command": "rm -rf /"}} done'
     for piece in ("Sure", ", here: ", '{"name": "bash", "parameters": {"command": "rm -rf /"}}', " done"):
         gate.push(piece)

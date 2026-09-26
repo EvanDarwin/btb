@@ -59,6 +59,12 @@ class Sampling:
         `salt` separates other draws at the row (the drafter's)"""
         return _mix(self.seed or 0, pos, salt) if salt else _mix(self.seed or 0, pos)
 
+    def row(self, r: int) -> Sampling:
+        """row r's sampling of a fork: row 0 draws as this one does alone, every other row under a seed of its own"""
+        if self.greedy or r == 0:
+            return self
+        return replace(self, seed=_mix(self.seed or 0, 0x5EED, r) & ((1 << 62) - 1))
+
     def __post_init__(self) -> None:
         from .options import check_sampling
 

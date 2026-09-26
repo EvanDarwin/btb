@@ -12,6 +12,8 @@ Documentation of implementation and behavior for various components within btb.
 - **Behavior**
   - [Bus Pass Scheduler](./disk-scheduler.md)
     - How a mixture-of-experts model streams experts from disk: the Route, the Bus Pass, and the Timetable.
+  - [Sessions](./sessions.md)
+    - A session's one state, the transactions every change goes through, and the leases forks and batches take.
   - [Speculative Decoding](#) - coming soon
 - **Packed Stores**
   - [Pack-12](./pack-12.md)

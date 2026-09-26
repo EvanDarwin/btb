@@ -21,15 +21,6 @@ if TYPE_CHECKING:
 _SKIPS: dict[str, str] = {}
 
 
-@pytest.fixture(autouse=True)
-def _keep_the_cards_visibility() -> Iterator[None]:
-    """`load(device="cpu")` / `run -d cpu` calls `cpu_only()`, which clears the package's CUDA flag and decides
-    where every later load goes. Each test leaves it as it found it, so the suite reads the same in any order."""
-    was = btb.CUDA
-    yield
-    btb.CUDA = was
-
-
 def _release_cuda_cache() -> None:
     """the engine's own vram_trim idiom (synchronize, then empty_cache), when a test has loaded torch at all - the
     torch-free cert gate (cert.yml) runs this conftest without it"""

@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from btb import mxfp4
-from btb.engine import StreamedTextModel
+from btb.engine.native import Native
 from tests.helpers import mxfp4_random, mxfp4_slot, native_library
 
 
@@ -47,14 +47,14 @@ def test_mxweight_wraps_slot_bytes_without_copying() -> None:
 
 def test_native_matvec_matches_the_numpy_reference() -> None:
     native_library()
-    assert StreamedTextModel.gemv_mx4 is not None, "the native library has no MXFP4 gemv: rebuild it"
+    assert Native.gemv_mx4 is not None, "the native library has no MXFP4 gemv: rebuild it"
     rng = np.random.default_rng(13)
     for rows, k, b in ((1, 32, 1), (5, 64, 1), (128, 64, 3), (17, 2880, 8), (64, 96, 9)):
         blocks, scales = mxfp4_random(rng, rows, k, 118, 130)
         w = mxfp4.MxWeight(torch.from_numpy(blocks.reshape(-1)), torch.from_numpy(scales.reshape(-1)), rows, k)
         x = torch.from_numpy(rng.standard_normal((b, k)).astype(np.float32))
         y = torch.empty(b, rows, dtype=torch.float32)
-        StreamedTextModel.gemv_mx4(w, x, y)
+        Native.gemv_mx4(w, x, y)
         want = torch.from_numpy(mxfp4.dequantize(blocks, scales)).double() @ x.double().T
         scale = (torch.from_numpy(mxfp4.dequantize(blocks, scales)).double().abs() @ x.double().abs().T).clamp(
             min=1e-30
@@ -62,13 +62,13 @@ def test_native_matvec_matches_the_numpy_reference() -> None:
         assert float(((y.double().T - want).abs() / scale).max()) < 1e-6, (rows, k, b)
         # a row's value does not depend on how many rows travel with it
         one = torch.empty(1, rows, dtype=torch.float32)
-        StreamedTextModel.gemv_mx4(w, x[:1].contiguous(), one)
+        Native.gemv_mx4(w, x[:1].contiguous(), one)
         assert torch.equal(one[0], y[0]), (rows, k, b)
 
 
 def test_native_group_matches_the_single_calls() -> None:
     native_library()
-    assert StreamedTextModel.gemv_mx4_group is not None, "the native library has no MXFP4 group gemv: rebuild it"
+    assert Native.gemv_mx4_group is not None, "the native library has no MXFP4 group gemv: rebuild it"
     rng = np.random.default_rng(17)
     shapes = [(12, 64), (7, 128), (20, 96)]
     ws, xs, want = [], [], []
@@ -77,10 +77,10 @@ def test_native_group_matches_the_single_calls() -> None:
         ws.append(mxfp4.MxWeight(torch.from_numpy(blocks.reshape(-1)), torch.from_numpy(scales.reshape(-1)), rows, k))
         xs.append(torch.from_numpy(rng.standard_normal((1, k)).astype(np.float32)))
         y = torch.empty(1, rows, dtype=torch.float32)
-        StreamedTextModel.gemv_mx4(ws[-1], xs[-1], y)
+        Native.gemv_mx4(ws[-1], xs[-1], y)
         want.append(y)
     got = [torch.empty(1, rows, dtype=torch.float32) for rows, _ in shapes]
-    StreamedTextModel.gemv_mx4_group(ws, xs, got)
+    Native.gemv_mx4_group(ws, xs, got)
     for a, b in zip(want, got):
         assert torch.equal(a, b)
 

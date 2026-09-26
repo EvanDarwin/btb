@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import os
 import platform
 import subprocess
 import sys
+import threading
 import time
+import weakref
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -109,15 +112,29 @@ def _warn_mlx_missing() -> None:
     )
 
 
+# a device as a caller names one: 'cpu', 'mlx', 'cuda:1', the enum, a parsed name, or torch's own
+DeviceSpec = str | DeviceKind | DeviceName | torch.device
+
+
+def torch_device(device: DeviceSpec) -> torch.device:
+    """A device as torch spells it, to price or allocate on: 'mlx' is the host, whose RAM the GPU spends on
+    Apple silicon's unified memory. A name that is not a device (or mlx off Apple silicon) is an OptionError."""
+    if isinstance(device, torch.device):
+        return device
+    d = check_device(device)
+    if d is None:
+        raise BadDevice(device, f"a device is named here: {DeviceKind.CPU}, {DeviceKind.MLX} or {DeviceKind.CUDA}[:N]")
+    return torch.device(DeviceKind.CPU) if d.kind is DeviceKind.MLX else torch.device(str(d))
+
+
 def resolve_device(device: Any) -> DeviceName:
     """The device a load runs on: None (or 'auto') picks the card when one is visible, else MLX on Apple
     silicon, else the CPU; a device named must exist here - 'mlx' off Apple silicon or 'cuda' without a card
     is an OptionError saying why and what to use, never a silent fall to the CPU. 'cuda:N' names a card."""
-    # the gate `btb.cpu_only()` closes lives in the package root, which must stay torch-free; read it live
-    from .. import CUDA
-
+    # what torch sees, and nothing else: `btb.cpu_only()` hides the card from torch before torch loads (so a CPU
+    # run never makes a CUDA context), and once torch holds the card a CPU load leaves it for the next load to name
     d = check_device(device)
-    card = CUDA and torch.cuda.is_available()
+    card = torch.cuda.is_available()
     if d is None:
         if card:
             return DeviceName(DeviceKind.CUDA)
@@ -132,8 +149,13 @@ def resolve_device(device: Any) -> DeviceName:
             return d
         raise BadDevice(d, f"{mlx_reason()}; --device {DeviceKind.CPU} runs here")
     if not card:
-        why = "the CPU was chosen (btb.cpu_only)" if not CUDA else "no CUDA device is visible to torch"
-        if CUDA and torch.version.cuda is None:
+        hidden = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip() == "-1"
+        why = (
+            "the card is hidden from torch (CUDA_VISIBLE_DEVICES=-1: a CPU run's `btb.cpu_only()`, or the caller's)"
+            if hidden
+            else "no CUDA device is visible to torch"
+        )
+        if not hidden and torch.version.cuda is None:
             why += f" (torch {torch.__version__} is a CPU build)"
         alt = (
             f"{DeviceKind.CPU}, or {DeviceKind.MLX}"
@@ -178,12 +200,37 @@ class Placement:
         return LayerTier.STREAMED
 
 
+@dataclass(eq=False)
+class _Loan:
+    """memory lent on a device of type `dev`: `nbytes`, for as long as what `ref` names lives - counted in the
+    reservations when the device's free reading cannot see it (`counted`); a room's tensor names its `room`"""
+
+    dev: str
+    nbytes: int
+    ref: weakref.ref[Any]
+    counted: bool
+    room: str | None = None
+
+
+@dataclass(eq=False)
+class _Hold:
+    """a room held on a device of type `dev`: `nbytes`, while the `Room` that `ref` names lives and is not released"""
+
+    dev: str
+    nbytes: int
+    ref: weakref.ref[Any]
+
+
 class Device:
     """The engine's placement and memory ledger. Placement is read through `snapshot()`; a pass that must
     not see it change takes it through `hold()`, and a change asked for meanwhile (`request`) waits at the
     boundary where the last holder lets go - a shed no longer moves a layer under a pass that is half way
     through it. Memory is read through `free()`, one arithmetic for the plan, the scheduler and the policy;
-    an epoch's KV is `reserve()`d so the policy does not count memory the batch is about to take as free."""
+    an epoch's KV is `reserve()`d so the policy does not count memory the batch is about to take as free.
+
+    What is lent (docs/lending.md) is read, not tallied: each loan holds a weak reference to what it lends for and
+    counts while that lives; a reading drops what has gone and counts it a return (`returns`, which only grows).
+    Every change is made under `lock`, which nothing re-enters: no code of btb's runs from a collection."""
 
     def __init__(self, sm: Any) -> None:
         self.sm = sm
@@ -191,6 +238,10 @@ class Device:
         self._holds = 0
         self._pending: list[tuple[str, Callable[[], Any]]] = []
         self._reserved: dict[str, tuple[str, int]] = {}
+        self._loans: list[_Loan] = []
+        self._rooms: dict[str, _Hold] = {}
+        self._returns = 0
+        self.lock = threading.Lock()  # the reservations, the loans and the rooms
 
     # -- placement -----------------------------------------------------------------------------------------
 
@@ -201,11 +252,14 @@ class Device:
         host = tuple(i for i in sorted(getattr(sm, "host", {}) or {}) if i not in cold)
         mlx = tuple(sorted(getattr(sm, "mlx_layers", ()) or ()))
         cuda = sm.dev.type == DeviceKind.CUDA
+        unified = getattr(sm, "mlx", None) is not None
         hh = getattr(sm, "head_host", None)
         if hh is not None and getattr(hh, "packed", None) is not None:
             head = Tier.PACKED
         elif getattr(sm, "head", None) is not None and cuda:
             head = Tier.CARD
+        elif unified and hh is not None and getattr(hh, "mx", None) is not None:
+            head = Tier.GPU
         else:
             head = Tier.HOST
         aj = getattr(sm, "aj", None)
@@ -219,7 +273,10 @@ class Device:
             drafter = (
                 Tier.HOST if (dd is not None and dd.type == DeviceKind.CPU) else (Tier.CARD if cuda else Tier.HOST)
             )
-        kv = Tier.CARD if (cuda and not getattr(sm, "kv_host", False)) else Tier.HOST
+        if cuda:
+            kv = Tier.HOST if getattr(sm, "kv_host", False) else Tier.CARD
+        else:
+            kv = Tier.GPU if unified else Tier.HOST
         return Placement(self.version, resident, host, tuple(sorted(cold)), mlx, head, drafter, kv)
 
     @contextlib.contextmanager
@@ -273,12 +330,13 @@ class Device:
 
     # -- memory --------------------------------------------------------------------------------------------
 
-    def free(self, device: Any = None, unreserved: bool = False) -> int | None:
+    def free(self, device: Any = None, unreserved: bool = False, own: str | None = None) -> int | None:
         """Memory free for an allocation on `device` (the engine's own when None), above the engine's margin
-        there; with `unreserved`, less what `reserve()` has spoken for on it. On unified memory the ledger is
-        the engine's own: the RAM the load started with, less the reserve, less everything MLX holds."""
+        there; with `unreserved`, less what `reserve()` has spoken for on it - all but the caller's `own` tag,
+        which is its to spend. On unified memory the ledger is the engine's own: the RAM the load started with,
+        less the reserve, less everything MLX holds."""
         sm = self.sm
-        dev = sm.dev if device is None else torch.device(device)
+        dev = sm.dev if device is None else torch_device(device)
         if dev.type == DeviceKind.CUDA:
             if sm.dev.type != DeviceKind.CUDA:
                 return None
@@ -289,17 +347,99 @@ class Device:
             out = free_bytes(torch.device("cpu"), int(getattr(sm, "ram_reserve", 0) or 0))
         if out is None or not unreserved:
             return out
-        return max(0, out - self.reserved(dev))
+        return max(0, out - self.reserved(dev, but=own))
 
     def reserve(self, tag: str, nbytes: int, device: Any = None) -> None:
         """Memory spoken for under `tag` on `device` (the engine's own when None); a tag reserved again is
         replaced, not added."""
-        dev = self.sm.dev if device is None else torch.device(device)
-        self._reserved[tag] = (dev.type, max(0, int(nbytes)))
+        dev = self.sm.dev if device is None else torch_device(device)
+        with self.lock:
+            self._reserved[tag] = (dev.type, max(0, int(nbytes)))
 
     def release(self, tag: str) -> None:
-        self._reserved.pop(tag, None)
+        with self.lock:
+            self._reserved.pop(tag, None)
 
-    def reserved(self, device: Any = None) -> int:
-        dev = self.sm.dev if device is None else torch.device(device)
-        return sum(n for t, n in self._reserved.values() if t == dev.type)
+    def reserved(self, device: Any = None, but: str | None = None) -> int:
+        """what is spoken for on `device` now: the reservations (all but `but`), the rooms held less what their
+        tensors take, and the lent tensors the device's free reading cannot see"""
+        t = (self.sm.dev if device is None else torch_device(device)).type
+        with self.lock:
+            self._settle()
+            n = sum(b for k, (d, b) in self._reserved.items() if d == t and k != but)
+            n += sum(ln.nbytes for ln in self._loans if ln.counted and ln.dev == t)
+            return n + sum(max(0, h.nbytes - self._used(tag)) for tag, h in self._rooms.items() if h.dev == t)
+
+    # -- loans: what is lent, while it lives -----------------------------------------------------------------
+
+    def lend(
+        self,
+        make: Callable[[], torch.Tensor],
+        nbytes: int,
+        device: Any,
+        counted: bool,
+        room: str | None = None,
+        limit: int = 0,
+    ) -> torch.Tensor | None:
+        """`make()`'s tensor entered as lent on `device`, `nbytes` of it (`counted` where the device's free reading
+        cannot see it) until its storage goes. Through a room, made only while the room is held and has `nbytes`
+        left of its `limit` - a ValueError once it is released, None when it is full"""
+        dev = torch_device(device).type
+        with self.lock:
+            self._settle()
+            if room is not None:
+                if room not in self._rooms:
+                    raise ValueError("this room was released: make another")
+                if self._used(room) + nbytes > limit:
+                    return None
+            t = make()
+            self._loans.append(_Loan(dev, int(nbytes), weakref.ref(t.untyped_storage()), counted, room))
+            return t
+
+    def hold_room(self, tag: str, room: Any, nbytes: int, device: Any) -> None:
+        """room held under `tag` on `device` while the object `room` lives and is not `let_go`"""
+        with self.lock:
+            self._rooms[tag] = _Hold(torch_device(device).type, max(0, int(nbytes)), weakref.ref(room))
+
+    def let_go(self, tag: str) -> None:
+        """a room held no longer (a return); nothing when it was let go already"""
+        with self.lock:
+            if self._rooms.pop(tag, None) is not None:
+                self._returns += 1
+
+    def room_held(self, tag: str) -> bool:
+        with self.lock:
+            self._settle()
+            return tag in self._rooms
+
+    def room_used(self, room: str) -> int:
+        """what a room's live tensors take"""
+        with self.lock:
+            self._settle()
+            return self._used(room)
+
+    @property
+    def returns(self) -> int:
+        """how many loans have come back since the model loaded: a count that only grows"""
+        with self.lock:
+            self._settle()
+            return self._returns
+
+    def refused(self) -> None:
+        """a refusal counted as a return: what making room shed on the way grows back once there is room"""
+        with self.lock:
+            self._returns += 1
+
+    def _used(self, room: str) -> int:
+        return sum(ln.nbytes for ln in self._loans if ln.room == room)
+
+    def _settle(self) -> None:
+        """under the lock: the loans and rooms that have gone dropped, each a return"""
+        live = [ln for ln in self._loans if ln.ref() is not None]
+        gone = len(self._loans) - len(live)
+        if gone:
+            self._loans = live
+        for tag in [k for k, h in self._rooms.items() if h.ref() is None]:
+            del self._rooms[tag]
+            gone += 1
+        self._returns += gone

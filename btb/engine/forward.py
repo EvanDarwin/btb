@@ -32,6 +32,8 @@ Rope = tuple[torch.Tensor, torch.Tensor]
 PassRope = Rope | dict[str, Rope]
 
 _GPU_PREFILL_RETRIES = 3
+# the fewest rows a prefill chunk takes, however short of room: a pass of no more rows is never chunked
+PREFILL_MIN_ROWS = 64
 
 
 def pe_for(pe: PassRope | None, lt: str) -> Rope | None:
@@ -203,6 +205,8 @@ class _ForwardMixin(_State):
         # caller's over `forward` - sheds and regrows the same way
         self.vram_policy(cache)
         self.ram_policy()
+        self.lend_policy()
+        self.cache_room(cache, B, T)
         own = bool(self.fam.own)
         n_layers = self.L if stop_after is None else min(self.L, int(stop_after))
         # the placement tiers this pass runs layers on, and its stored-weight path, recorded whatever branch
@@ -690,15 +694,22 @@ class _ForwardMixin(_State):
         # shrink until the whole working set fits the room, and until the attention's own buffer at these rows
         # fits buf_cap - so a free reading that runs high never passes a single buffer the GPU cannot allocate,
         # the oversized ask that faults it
-        while rows > 64 and (
+        while rows > PREFILL_MIN_ROWS and (
             rows * (per_token + scores * (int(past) + rows)) > free or scores * rows * (int(past) + rows) > buf_cap
         ):
             rows //= 2
         return int(rows)
 
     def _prefill(
-        self, ids: torch.Tensor, cache: Any, on_layer: Any = None, attention_mask: torch.Tensor | None = None
+        self,
+        ids: torch.Tensor,
+        cache: Any,
+        on_layer: Any = None,
+        attention_mask: torch.Tensor | None = None,
+        last_only: bool = True,
     ) -> Any:
+        """`ids` into `cache` in chunks the free memory prices: the last row's logits, or every row's (the chunks'
+        joined) without `last_only`"""
         ids = torch.as_tensor(ids, dtype=torch.long, device=self.dev)
         if ids.dim() == 1:
             ids = ids.view(1, -1)
@@ -706,14 +717,14 @@ class _ForwardMixin(_State):
         # the host path's DeltaNet takes a prompt whole; the MLX path continues a chunk from the stored states
         whole_hybrid = LayerKind.LINEAR in self.layer_types and not self.fam.own and self.mlx is None
         if cache is None or attention_mask is not None or getattr(self, "aq", False) or whole_hybrid:
-            return self.forward(ids, cache=cache, on_layer=on_layer, attention_mask=attention_mask)
+            return self.forward(ids, cache=cache, on_layer=on_layer, attention_mask=attention_mask, last_only=last_only)
         past = int(cache.get_seq_length())
         C = int(self.prefill_chunk or self._auto_chunk(past))
         if T <= C:
-            return self.forward(ids, cache=cache, on_layer=on_layer)
+            return self.forward(ids, cache=cache, on_layer=on_layer, last_only=last_only)
         # a mixture of experts with the whole trunk resident prefills layer by layer, so a layer's experts
         # are read once for the whole prompt instead of once per chunk
-        if self.fam.moe and not self.host and len(self.resident) == self.L and on_layer is None:
+        if self.fam.moe and not self.host and len(self.resident) == self.L and on_layer is None and last_only:
             return self._prefill_by_layer(ids, cache, C)
         self.log(f"[prefill] {T} tokens in chunks of {C} from position {past}")
         # a layer hook sees the last layer's rows for the whole prompt once, joined at the end, as it would from
@@ -730,6 +741,7 @@ class _ForwardMixin(_State):
                 on_layer(i, h)
 
         hook = collect if on_layer is not None else None
+        rows: list[torch.Tensor] = []  # every chunk's logits, without `last_only`
         self._batched_cont = True
         try:
             a = 0
@@ -752,7 +764,7 @@ class _ForwardMixin(_State):
                 attempt = 0
                 while True:
                     try:
-                        out = self.forward(ids[:, a:b], cache=cache, on_layer=hook)
+                        out = self.forward(ids[:, a:b], cache=cache, on_layer=hook, last_only=last_only)
                         break
                     except Exception as e:
                         sched = getattr(self, "scheduler", None)
@@ -774,6 +786,8 @@ class _ForwardMixin(_State):
                             f"replay {attempt}/{_GPU_PREFILL_RETRIES} in {wait:.2f}s"
                         )
                         time.sleep(wait)
+                if not last_only and out is not None:
+                    rows.append(out)
                 if b >= T:
                     break
                 self.log(f"[prefill] {b}/{T} (chunks of {C})")
@@ -782,7 +796,7 @@ class _ForwardMixin(_State):
             self._batched_cont = False
         if on_layer is not None and taps:
             on_layer(last, taps[0] if len(taps) == 1 else torch.cat(taps, dim=1))
-        return out
+        return out if last_only else torch.cat(rows, dim=1)
 
     @torch.inference_mode()
     def _prefill_by_layer(self, ids: torch.Tensor, cache: Any, C: int) -> Any:
@@ -910,7 +924,7 @@ class _ForwardMixin(_State):
         return acc.to(q.dtype)
 
     def _kv_split(self, tmpl: Any, i: int, h: torch.Tensor, pe: PassRope, cache: Any) -> torch.Tensor:
-        apply_rotary_pos_emb = self.fam.mod.apply_rotary_pos_emb
+        apply_rotary_pos_emb = self._rope_fn()  # the one-row step's own (its graph rotates with it)
         B, T, _ = h.shape
         cl = cache.layers[i]
         past = cl.keys.shape[-2] if getattr(cl, "keys", None) is not None and cl.keys.numel() else 0
@@ -950,7 +964,44 @@ class _ForwardMixin(_State):
             probe(i, q, kf, vf, at.scaling)
         parents: Any = getattr(self, "ap", None) if getattr(self, "aq", False) else None
         tree = parents is not None and any(parents[j] != j - 1 for j in range(T))
-        if T > 1 and not tree and q.device.type == "cuda" and not win:
+        # a one-row step, or a verify pass (between `aa` and `ab`) whose rows must be the steps' own; a prefill's rows
+        # need no step's bits (plain and speculative decodes prefill alike) and keep the card's blocks
+        native = (
+            (T == 1 or bool(getattr(self, "aq", False)))
+            and B == 1
+            and Native.attn_decode is not None
+            and kf.device.type == "cpu"
+            and kf.dtype in (torch.bfloat16, torch.float32)
+            and vf.dtype == kf.dtype
+            and kf.stride(-1) == 1
+            and kf.stride(-2) == kf.shape[-1]
+            and vf.stride(-1) == 1
+            and vf.stride(-2) == vf.shape[-1]
+        )
+        if native:
+            # every row as a one-row step computes it: btb's kernel over the row's own keys in order - the prefix (its
+            # last `win` under a window), then its ancestors (the chain before it), then itself - so a verify pass
+            # gives each row the bits of the steps along its path and a speculative decode is the plain loop's (the
+            # card's blocks and torch's sdpa each sum in an order of their own, and parted from the steps at a
+            # near-tie). A chain row's keys are one run of the cache; a tree row's are gathered into one
+            path = parents if parents is not None else list(range(-1, T - 1))
+            qf = q[0].float().cpu()
+            out = torch.empty(T, qf.shape[0], qf.shape[2], dtype=torch.float32)
+            with torch.profiler.record_function("btb_attn_decode"):
+                for p in range(T):
+                    allow = node_mask(past, p, path, win)
+                    if allow is None:
+                        kp, vp = kf[0][:, : past + p + 1], vf[0][:, : past + p + 1]
+                    else:
+                        seen = allow.nonzero().flatten()
+                        lo, n = int(seen[0]), int(seen.numel())
+                        if int(seen[-1]) - lo + 1 == n:  # one run: a window's cut, the chain's rows before it
+                            kp, vp = kf[0][:, lo : lo + n], vf[0][:, lo : lo + n]
+                        else:
+                            kp, vp = kf[0][:, seen].contiguous(), vf[0][:, seen].contiguous()
+                    Native.attn_decode(qf[:, p].contiguous(), kp, vp, at.scaling, out[p])
+            attn = out.view(1, T, qf.shape[0], qf.shape[2])
+        elif T > 1 and not tree and q.device.type == "cuda" and not win:
             attn = self._attn_card_blocks(q, k, v, kf, vf, past, at.scaling).transpose(1, 2)
         elif tree:
             qc = q.cpu()
@@ -965,24 +1016,6 @@ class _ForwardMixin(_State):
                 )
                 outs.append(a.transpose(1, 2))
             attn = torch.cat(outs, dim=1)
-        elif (
-            T == 1
-            and B == 1
-            and Native.attn_decode is not None
-            and kf.device.type == "cpu"
-            and kf.dtype in (torch.bfloat16, torch.float32)
-            and vf.dtype == kf.dtype
-            and kf.stride(-1) == 1
-            and kf.stride(-2) == kf.shape[-1]
-            and vf.stride(-1) == 1
-            and vf.stride(-2) == vf.shape[-1]
-        ):
-            qf = q[0, :, 0].float().cpu().contiguous()
-            out = torch.empty(qf.shape, dtype=torch.float32)
-            first = max(0, past + 1 - win) if win else 0  # a sliding layer's last rows alone
-            with torch.profiler.record_function("btb_attn_decode"):
-                Native.attn_decode(qf, kf[0][:, first:], vf[0][:, first:], at.scaling, out)
-            attn = out.view(1, 1, qf.shape[0], qf.shape[1])
         else:
             qc = q.cpu()
             mask = None

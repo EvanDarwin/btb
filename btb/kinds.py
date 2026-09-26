@@ -233,6 +233,7 @@ class Tier(StrEnum):
     """where a part of the model lives: the head, the drafter and the attention cache in a Placement and a report"""
 
     CARD = "card"
+    GPU = "gpu"  # Apple silicon's GPU (MLX), over the memory the host shares
     HOST = "host"
     PACKED = "packed"  # the head read from the 12-bit store
     NONE = "none"  # no such part (a model without a drafting head)
@@ -285,6 +286,9 @@ class PassTag(StrEnum):
     # rotary, a non-bf16 state, or a batched pass
     MLX_HYBRID = "mlx_hybrid"  # the Qwen3.5 DeltaNet fused path (_forward_mlx_hybrid)
     MLX_SDPA = "mlx_sdpa"  # MLX's own fused attention, where the node kernel does not apply
+    # the engine's attention kernels over the cache buffers (btb/mlx/attn.py: decode, tree, rows, forest, head-256
+    # prefill), read from the buffer itself rather than the views an append hands back
+    MLX_ATTN_KERNEL = "mlx_attn_kernel"
     CUDA_GRAPH = "cuda_graph"  # a captured card graph ran the pass (_forward_card_segment/_forward_fast/step graph)
     CUDA_TORCH_FALLBACK = "cuda_torch_fallback"  # a card layer through torch modules, btb's kernels absent
     CPU_NATIVE = "cpu_native"  # a host layer through the native CPU gemv kernels
@@ -309,6 +313,10 @@ class PassTag(StrEnum):
     # the token draw (btb/sampling.py)
     SAMPLE_GREEDY = "sample_greedy"  # the argmax
     SAMPLE_STOCHASTIC = "sample_stochastic"  # the Gumbel-max draw under a temperature
+    PICK_HOOKED = "pick_hooked"  # the pick over logits a caller's hooks saw: the in-graph picks stood aside
+    ROWS_FLAT = "rows_flat"  # a fork's or a batch's rows on the MLX batched step, over one flat buffer
+    ROWS_JOINED = "rows_joined"  # a fork's or a batch's rows on the torch pass, prefix and own rows joined
+    ROWS_CARD = "rows_card"  # a fork's or a batch's rows on the card graph's rows pass, read in place in its arena
     # the placement tiers a pass ran layers on (btb/engine/device.py Placement.tier)
     TIER_RESIDENT = "tier_resident"
     TIER_HOST = "tier_host"
@@ -323,6 +331,55 @@ class PassTag(StrEnum):
     SPEC_NGRAM = "spec_ngram"  # the n-gram proposer
     SPEC_ACCEPT = "spec_accept"  # a pass accepted at least one drafted token
     SPEC_REJECT = "spec_reject"  # a pass rejected at least one drafted token
+    # the programmatic API, one member per public method of a class `btb.api.api(owner)` declares, valued
+    # "owner.method": the class refuses to build with a public method missing here, and each call records its member
+    API_MODEL_PEAK_MEMORY = "model.peak_memory"
+    API_MODEL_PROMPT_IDS = "model.prompt_ids"
+    API_MODEL_GENERATE = "model.generate"
+    API_MODEL_HIDDEN = "model.hidden"
+    API_MODEL_PROJECT = "model.project"
+    API_MODEL_ENCODE = "model.encode"
+    API_MODEL_ASK = "model.ask"
+    API_MODEL_STREAM = "model.stream"
+    API_MODEL_SESSION = "model.session"
+    API_MODEL_BATCH = "model.batch"
+    API_MODEL_CHAT = "model.chat"
+    API_MODEL_ASK_MANY = "model.ask_many"
+    API_MODEL_RESERVE = "model.reserve"
+    API_MODEL_EMPTY = "model.empty"
+    API_MODEL_ZEROS = "model.zeros"
+    API_MODEL_FULL = "model.full"
+    API_MODEL_ROOM = "model.room"
+    API_MODEL_MEMORY = "model.memory"
+    API_ROOM_RELEASE = "room.release"
+    API_ROOM_EMPTY = "room.empty"
+    API_ROOM_ZEROS = "room.zeros"
+    API_ROOM_FULL = "room.full"
+    API_SESSION_FEED = "session.feed"
+    API_SESSION_NEXT_LOGITS = "session.next_logits"
+    API_SESSION_MARK = "session.mark"
+    API_SESSION_REWIND = "session.rewind"
+    API_SESSION_CROP = "session.crop"
+    API_SESSION_ROWS = "session.rows"
+    API_SESSION_SYNC = "session.sync"
+    API_SESSION_FORK = "session.fork"
+    API_SESSION_GENERATE = "session.generate"
+    API_ROWS_TOKENS = "rows.tokens"
+    API_ROWS_STEP = "rows.step"
+    API_ROWS_ADVANCE = "rows.advance"
+    API_ROWS_NEXT_LOGITS = "rows.next_logits"
+    API_ROWS_LEAVE = "rows.leave"
+    API_ROWS_GENERATE = "rows.generate"
+    API_BRANCHES_REORDER = "branches.reorder"
+    API_BRANCHES_KEEP = "branches.keep"
+    API_BRANCHES_CLOSE = "branches.close"
+    API_BATCH_JOIN = "batch.join"
+    API_BATCH_CLOSE = "batch.close"
+
+
+def api_tags(owner: str) -> frozenset[PassTag]:
+    """the declared API calls of `owner` (a class's `api(owner)`), from the PassTag values"""
+    return frozenset(t for t in PassTag if t.value.partition(".")[0] == owner and "." in t.value)
 
 
 # the tag a speculative decode records for the proposer it ran (a sibling draft model's decode records SPEC_DRAFT

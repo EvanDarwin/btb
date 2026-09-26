@@ -108,14 +108,9 @@ def NO_LOG(*a: object, **k: object) -> None:
 
 
 def need_cuda() -> str:
-    """the card's device name, or a skip. A cpu `load()` earlier in the session called `cpu_only()`, which clears
-    the package's flag and would send the test to the CPU without saying so; torch still holds the device, so
-    the flag is put back (conftest restores it after the test)."""
+    """the card's device name, or a skip"""
     if not torch.cuda.is_available():
         pytest.skip("no CUDA device")
-    import btb
-
-    btb.CUDA = True
     return "cuda"
 
 
@@ -370,9 +365,19 @@ class SchedulerModel:
 def stub_engine(**attrs: object) -> types.SimpleNamespace:
     """the least an engine the scheduler or the expert store is built over: a quiet log, the CPU, and the store's
     residency policy at the model's own defaults (it reads `bus_pass`/`store_pin` directly - a stub without them
-    is an AttributeError, not a quietly-wrong policy), plus whatever the test adds"""
+    is an AttributeError, not a quietly-wrong policy), and the pass report the expert paths tag (`tags`), plus
+    whatever the test adds"""
+    tags: set[object] = set()
     return types.SimpleNamespace(
-        **{"log": NO_LOG, "dev": torch.device("cpu"), "bus_pass": True, "store_pin": 0, **attrs}
+        **{
+            "log": NO_LOG,
+            "dev": torch.device("cpu"),
+            "bus_pass": True,
+            "store_pin": 0,
+            "tags": tags,
+            "_tag": lambda *t: tags.update(t),
+            **attrs,
+        }
     )
 
 
@@ -564,15 +569,16 @@ class CharTokenizer:
         return "".join(chr(int(i)) for i in ids)
 
 
-# what a fake engine's `run` answers: the prompt ids, the tokens, the census
-FakeRun = tuple[Tokens, list[int], Json]
+# what a fake engine's `run` answers: the prompt ids, the tokens, the census, the logprobs (None: not asked)
+FakeRun = tuple[Tokens, list[int], Json, None]
 
 
 class FakeEngine:
-    """the server's engine as a canned answer: every request gets `out`, a token a character"""
+    """the server's engine as a canned answer: every request gets `out`, a token a character, and its stop token
+    (as the engine's decode reports it; the tokens it returns are without it)"""
 
     name = "fake"
-    eos: tuple[int, ...] = ()
+    eos: tuple[int, ...] = (0,)
     sampling = Sampling()
 
     def __init__(self, out: str) -> None:
@@ -589,12 +595,14 @@ class FakeEngine:
         on_token: Callable[[int], object] | None = None,
         ids: Tokens | None = None,
         sampling: Sampling | None = None,
+        cancel: threading.Event | None = None,
+        **_hooks: object,
     ) -> FakeRun:
         toks = [ord(ch) for ch in self._out]
         if on_token is not None:
-            for t in toks:
+            for t in [*toks, *self.eos[:1]]:
                 on_token(t)
-        return (ids or [1, 2, 3]), toks, {"cap": 9999, "forwards": 0}
+        return (ids or [1, 2, 3]), toks, {"cap": 9999, "forwards": 0}, None
 
     def text(self, toks: Tokens) -> tuple[str, str]:
         return self._out, ""

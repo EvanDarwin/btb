@@ -381,6 +381,38 @@ def test_plan_prices_the_cache_for_the_context() -> None:
     assert out["kv_read_ms"] == 8 * 64 * MB / RAM_BPS * 1e3 and budget()["kv_read_ms"] == 0.0
 
 
+def test_an_mlx_plan_prices_the_gpu_and_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
+    """on Apple silicon a pass reads its layers and the head on the GPU from the one memory: the prediction is those
+    bytes at the GPU's measured read rate (not the host tier's CPU price and its host head), and the summary puts
+    the layers and the head on the GPU; a card's plan reads as it did"""
+    import btb.mlx
+    from btb.engine.scheduler import BatchScheduler, HostBudget
+    from btb.engine.tiers import _TiersMixin
+
+    GB = 2**30
+    monkeypatch.setattr(btb.mlx, "read_bps", lambda: 100e9)
+    p = _probe()
+    p.plan_budget = lambda *a, **kw: _TiersMixin.plan_budget(cast("_TiersMixin", p), *a, **kw)
+    p.fam = types.SimpleNamespace(moe=False)
+    hb = HostBudget(total=64 * GB, available=48 * GB, commit=64 * GB, footprint=0, os_floor=0, growth=0, floor=4 * GB)
+    pl = BatchScheduler.plan_placement(p, "mlx", 0.0, packed=False, fp32=False, vram_reserve_gb=0.0, budget=hb)
+    assert len(pl.warm) == 8 and not pl.cold and pl.gpu_bps == 100e9
+    assert pl.predicted_ms_per_token == pytest.approx((pl.bytes.warm + pl.bytes.head) / 100e9 * 1e3)
+    s = str(pl)
+    assert "8 on the GPU" in s and "head on the GPU" in s and "the GPU reads 100 GB/s" in s and "host" not in s
+    cpu = BatchScheduler.plan_placement(p, "cpu", 0.0, packed=False, fp32=False, vram_reserve_gb=0.0, budget=hb)
+    assert cpu.gpu_bps is None and "8 host" in str(cpu) and "head host" in str(cpu)
+
+
+def test_the_report_line_puts_mlx_layers_the_head_and_the_cache_on_the_gpu() -> None:
+    from btb.engine.tiers import report_line
+    from btb.kinds import Tier
+
+    placement = {"resident": [], "host": [0, 1, 2], "cold": [2], "mlx": [0, 1], "head": Tier.GPU, "kv": Tier.GPU}
+    line = report_line({"device": "mlx", "placement": {**placement, "drafter": Tier.NONE}})
+    assert "resident 0, gpu 2, host 1, cold 1; head gpu; drafter none; kv gpu" in line
+
+
 def test_plan_prices_the_staging_a_streamed_layer_crosses() -> None:
     """once a layer streams to the card, its pinned staging (one layer a type in bf16, and the stored form beside
     it under the 12-bit store) is charged to the RAM: a plan that ends with cold layers is priced again with it"""
@@ -477,47 +509,76 @@ def test_probe_tail_reads_the_generation_prompt_a_template_keeps_for_the_last_tu
 
 
 def test_session_reuses_the_shared_prefix_and_learns_the_tail() -> None:
-    """a session opens a new prompt on what its cache holds: the whole cache when the prompt extends it, a crop to
-    the shared prefix otherwise, nothing on a fresh one; the template's tail is learned from the divergence"""
+    """a decode over a session opens its prompt on what the cache holds: the whole cache when the prompt extends it,
+    a crop to the shared prefix otherwise, nothing on a fresh one; the template's tail is learned from the
+    divergence. Each opening is a transaction left uncommitted here, as a decode failing there would leave it: the
+    session goes back to the point the opening kept"""
     import types
 
-    from btb.session import Session
+    from transformers.cache_utils import DynamicCache, DynamicLayer
 
-    class Layer:
+    from btb.engine.drafter import MTPDrafter
+    from btb.engine.state import _State
+    from btb.session import Session, State
+
+    class Layer(DynamicLayer):
         def __init__(self, n: int) -> None:
+            super().__init__()
             self.keys = torch.zeros(1, 2, n, 4)
             self.values = torch.zeros(1, 2, n, 4)
+            self.is_initialized = True
 
-    def engine_and_cache(n: int) -> tuple[types.SimpleNamespace, types.SimpleNamespace]:
-        cache = types.SimpleNamespace(layers=[Layer(n), Layer(n)])
+    def engine_and_cache(n: int) -> tuple[_State, DynamicCache]:
+        cache = DynamicCache()
+        cache.layers = [Layer(n), Layer(n)]
         eng = types.SimpleNamespace(layer_types=["full_attention", "full_attention"], L=2)
-        return eng, cache
+        return cast("_State", eng), cache
+
+    def held(cache: DynamicCache, i: int) -> int:
+        """the rows layer i of the cache holds"""
+        cl = cache.layers[i]
+        assert isinstance(cl, Layer) and cl.keys is not None
+        return int(cl.keys.shape[-2])
+
+    def decoded(s: Session, eng: _State, prompt: list[int], out: list[int], cache: DynamicCache) -> None:
+        with s._decoding(eng):
+            s._begin_decode(eng, prompt)
+            s._commit_decode(prompt, out, cache, None)
 
     s = Session()
-    assert s.fresh and s.open(None, [1, 2, 3]) == (None, 0, None)
+    eng0 = engine_and_cache(1)[0]
+    with s._decoding(eng0):
+        assert s.fresh and s._begin_decode(eng0, [1, 2, 3]) == (None, 0, None)
     eng, cache = engine_and_cache(6)
-    s.keep([1, 2, 3, 4], [9, 8, 7], cache, None)  # the cache holds the prompt and the answer but its last token
-    assert s.ids == [1, 2, 3, 4, 9, 8] and s.n_prompt == 4 and not s.fresh
+    decoded(s, eng, [1, 2, 3, 4], [9, 8, 7], cache)  # the cache holds the prompt and the answer but its last token
+    assert s.ids == [1, 2, 3, 4, 9, 8] and s._pending == 7 and s.n_prompt == 4 and s.state is State.PENDING
     # the next turn extends the previous text: the whole cache is reused
-    c, reuse, anc = s.open(eng, [1, 2, 3, 4, 9, 8, 5, 6])
-    assert c is cache and reuse == 6 and anc is None and cache.layers[0].keys.shape[-2] == 6
-    # a prompt that diverges two tokens before the previous prompt's end: a crop to the shared prefix, tail learned
-    c, reuse, _ = s.open(eng, [1, 2, 7, 7, 7])
-    assert reuse == 2 and cache.layers[1].keys.shape[-2] == 2 and s.tail == 2
+    with s._decoding(eng):
+        c, reuse, anc = s._begin_decode(eng, [1, 2, 3, 4, 9, 8, 7, 5, 6])
+        assert c is cache and reuse == 6 and anc is None and held(cache, 0) == 6
+    assert s.tokens == [1, 2, 3, 4, 9, 8, 7], "an opening left uncommitted changed the session"
+    # a prompt that diverges two tokens before the previous prompt's end: a crop to the shared prefix, tail learned;
+    # left uncommitted, the session is the shared prefix with its last token drawn (the rows past it were replaced)
+    with s._decoding(eng):
+        c, reuse, _ = s._begin_decode(eng, [1, 2, 7, 7, 7])
+        assert reuse == 2 and held(cache, 1) == 2 and s.tail == 2
+    assert s.tokens == [1, 2] and s.state is State.PENDING and held(cache, 1) == 1
     # nothing shared: nothing reused, and the old cache is released before the new prefill, not after it, the
     # drafter's cache with it
     drafter = types.SimpleNamespace(resets=0)
     drafter.reset = lambda: setattr(drafter, "resets", drafter.resets + 1)
-    s.dr = drafter
-    assert s.open(eng, [5, 5, 5]) == (None, 0, None) and s.cache is None and s.ids == [] and s.fresh
-    assert s.dr is None and drafter.resets == 1
+    s.dr = cast("MTPDrafter", drafter)
+    with s._decoding(eng):
+        assert s._begin_decode(eng, [5, 5, 5]) == (None, 0, None) and s.cache is None and s.ids == [] and s.fresh
+    assert s.dr is None and drafter.resets == 1 and s.state is State.EMPTY
     # a prompt that parts from a long previous prompt far from its end is another conversation: the crop still
     # happens, the tail is not re-learned from it (a learned tail of thousands once resumed a whole prompt as one)
-    eng, cache = engine_and_cache(300)
-    s.keep(list(range(1, 201)), [9, 8], cache, None)
+    eng, cache = engine_and_cache(201)
+    decoded(s, eng, list(range(1, 201)), [9, 8], cache)
     s.tail = 2
-    c, reuse, _ = s.open(eng, [1, 2, 3, 7, 7, 7])
-    assert reuse == 3 and s.tail == 2
+    with s._decoding(eng):
+        c, reuse, _ = s._begin_decode(eng, [1, 2, 3, 7, 7, 7])
+        assert reuse == 3 and s.tail == 2
 
 
 def test_the_engine_vocabularies_are_spelled_once() -> None:

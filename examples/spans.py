@@ -22,7 +22,8 @@ def main(argv=None):
         greedy = model.generate(ids, a.new, speculate=False).tokens
         bank = btb.SpanBank()
         bank.add("the passage", greedy)  # what the answer will say, banked ahead; a real use banks the document quoted
-        spec, stats = model.generate(ids, a.new, spans=bank.spans())
+        gen = model.generate(ids, a.new, spans=bank.spans())
+        spec, stats = gen.tokens, gen.stats
         print(model.tokenizer.decode(spec, skip_special_tokens=True))
         print(
             f"identical to the greedy answer: {spec == greedy}; {stats['accepted']} of {stats['proposed']} drafted "

@@ -11,6 +11,7 @@ import os
 import struct
 import threading
 import time
+import weakref
 from collections.abc import Sequence
 from concurrent.futures import CancelledError
 from dataclasses import dataclass, field
@@ -21,17 +22,19 @@ import torch
 from .. import fp8
 from .. import mlx as mlxdev
 from ..fp8 import F8Weight
-from ..kinds import Json, LayerKind, Proposer, Tier
+from ..kinds import Json, LayerKind, Tier
 from ..mlx.legacyq import KINDS as LEGACY_KINDS
 from ..options import Device
 from ..pack12 import entries, unpack_bf16
 from ..sysinfo import process_working_set_bytes
+from .cache import CardRowsLayer, ForkLayer, GrowLayer
 from .host import _Experts, _HostLinear, bf16_in_place, copy_bytes
 from .native import Native
 from .state import DRAFT_VOCAB, _State
 
 if TYPE_CHECKING:
     from ..mlx import Shared
+    from .cache import KvCache
 
 _DTYPE_NAME = {torch.bfloat16: "bf16", torch.float32: "fp32", torch.float16: "fp16"}
 RAM_BPS = 50 * 2**30  # the read bandwidth the plan prices a RAM tier at, weights and cache alike
@@ -62,9 +65,10 @@ class ColdRing:
 def report_line(report: Json) -> str:
     """`report()` as one line for the verbose log: the device, the tiers, the head, the drafter, the cache."""
     pl = report.get("placement") or {}
-    parts = [f"{k} {len(pl.get(k) or ())}" for k in ("resident", "host", "cold")]
-    if pl.get("mlx"):
-        parts.append(f"mlx {len(pl['mlx'])}")
+    gpu = set(pl.get("mlx") or ())  # the host layers Apple silicon's GPU runs
+    host = [i for i in pl.get("host") or () if i not in gpu]
+    parts = [f"resident {len(pl.get('resident') or ())}", *([f"gpu {len(gpu)}"] if gpu else [])]
+    parts += [f"host {len(host)}", f"cold {len(pl.get('cold') or ())}"]
     return (
         f"[report] {report.get('device')}: {', '.join(parts)}; head {pl.get('head')}; "
         f"drafter {pl.get('drafter')}; kv {pl.get('kv')}; {pl.get('compute_dtype')}"
@@ -144,7 +148,10 @@ class _TiersMixin(_State):
         types = sorted(set(self.layer_types))
         big = {lt: max(bf16[i] for i in range(L) if self.layer_types[i] == lt) for lt in types}
         big_stored = {lt: max(stored[i] for i in range(L) if self.layer_types[i] == lt) for lt in types}
-        shadow_b = sum(2 * big[lt] for lt in types) if (fp32 and not resident_fp32) else 0
+        # a float32 shadow per layer structure (model.py): a layer kind's layers can differ, and those that do differ
+        # in size, so each distinct (kind, size) is one shadow at twice its bf16 bytes
+        shapes = {(self.layer_types[i], bf16[i]) for i in range(L)}
+        shadow_b = sum(2 * b for _, b in shapes) if (fp32 and not resident_fp32) else 0
         tmpl_b = sum(big[lt] * (1 if fp32 else 2) for lt in types)
         if fp32 and not resident_fp32 and vram >= shadow_b:
             vram -= shadow_b
@@ -279,17 +286,10 @@ class _TiersMixin(_State):
         tmpl_b = 0
         for lt, mods in (getattr(self, "templates", {}) or {}).items():
             tmpl_b += len(mods) * max((bf16.get(i, 0) for i in range(L) if types[i] == lt), default=0)
-        if getattr(self, "head", None) is not None:
-            head = Tier.CARD if cuda else Tier.HOST
-        else:
-            hh = getattr(self, "head_host", None)
-            head = Tier.PACKED if (hh is not None and hh.packed is not None) else Tier.HOST
-        # a checkpoint's `mtp.*` weights are a drafter only when the proposer draws from them
-        aj = getattr(self, "aj", None)
-        dd = aj.dev if aj is not None else getattr(self, "drafter_dev", None)
-        drafter = Tier.NONE
-        if aj is not None or (mtp and Proposer.of(getattr(self, "proposer", Proposer.NGRAM)).mtp):
-            drafter = Tier.CARD if (dd if dd is not None else dev).type == Device.CUDA else Tier.HOST
+        # where the head, the drafter and the cache sit: the live placement's reading, the one the passes hold
+        dv = getattr(self, "device", None)
+        snap = dv.snapshot() if dv is not None else None
+        head, drafter, kv = (snap.head, snap.drafter, snap.kv) if snap is not None else (Tier.NONE,) * 3
         rss = peak_memory()[0]
         pl = getattr(self, "plan", None)
         # the run's growth past its plan: the working set now, less the footprint the plan was drawn at and the
@@ -339,7 +339,7 @@ class _TiersMixin(_State):
                 "mlx": sorted(getattr(self, "mlx_layers", ()) or ()),
                 "head": head,
                 "drafter": drafter,
-                "kv": Tier.CARD if (cuda and not getattr(self, "kv_host", False)) else Tier.HOST,
+                "kv": kv,
                 "kv_bits": getattr(self, "kv_bits", None),
                 "packed": packed,
                 "templates": sum(len(v) for v in (getattr(self, "templates", {}) or {}).values()),
@@ -591,11 +591,45 @@ class _TiersMixin(_State):
             total += cur
         return total
 
+    def _track(self, cache: KvCache) -> KvCache:
+        """`cache` among those a layer's move reaches while it lives: an idle session's, a fork's, the running pass's"""
+        live: weakref.WeakSet[KvCache] = self.__dict__.setdefault("_live_caches", weakref.WeakSet())
+        live.add(cache)
+        return cache
+
+    def _caches_to(self, i: int, dev: str | torch.device, cache: KvCache | None = None) -> None:
+        """layer i's rows in every live cache (and `cache`) moved to `dev`, where the layer now runs"""
+        live: list[KvCache] = list(self.__dict__.get("_live_caches", ()))
+        for c in {id(c): c for c in [*live, *([cache] if cache is not None else [])]}.values():
+            self._cache_to(c, i, dev)
+
     @staticmethod
     def _cache_to(cache: Any, i: int, dev: str | torch.device) -> None:
         if cache is None or i >= len(cache.layers):
             return
         cl = cache.layers[i]
+        if isinstance(cl, ForkLayer):
+            cl.to(dev)
+            return
+        if isinstance(cl, CardRowsLayer):
+            # a fork's or a batch's rows leaving the card's arena: a fork's layer where the layer now runs (the
+            # batch takes the torch pass from its next step)
+            if torch.device(dev).type != cl.device.type:
+                cache.layers[i] = cl.to_fork(dev)
+            return
+        if (
+            isinstance(cl, GrowLayer)
+            and not cl.shared
+            and cl._buf is not None
+            and cl._buf[0].device != torch.device(dev)
+        ):
+            # the rows copied out and the buffer they grew in let go now, not at the cache's next append
+            k, v = cl.keys, cl.values
+            cl._buf, cl._an = None, None
+            cl._set_rows(k, v)
+        if isinstance(cl, GrowLayer) and cl.is_initialized and isinstance(cl.keys, torch.Tensor):
+            if cl.keys.device != torch.device(dev):
+                cl._set_rows(cl.keys.to(dev), cl.values.to(dev))
         for attr in ("keys", "values", "conv_states", "recurrent_states", "indexer_keys"):
             t = getattr(cl, attr, None)
             if isinstance(t, dict):
@@ -898,10 +932,16 @@ class _TiersMixin(_State):
         """layer `i` back on the store it came from: every linear's weight the checkpoint's mapped bytes again,
         its packed form beside it under the 12-bit store, no slot of the ring behind it"""
         layer = self.host[i]
+        on_mlx = self.mlx is not None and i in self.mlx_layers
         for m in layer.modules():
             if isinstance(m, _HostLinear) and m.key:
                 m.weight = torch.nn.Parameter(self._get(m.key), requires_grad=False)
                 m.packed = None
+                if on_mlx:
+                    m.mx = None  # a view of a ring slot, which the rebuilt ring fills with another layer
+        if on_mlx:
+            self._bind_mlx_resident(layer)
+            self._mlx_fuse(layer)
         if getattr(self, "_packed", None):
             self._bind_host_packed_layer(layer)
 
@@ -924,10 +964,17 @@ class _TiersMixin(_State):
                 m.gate_up = m.down = None
         return module
 
+    def _structure(self, module: Any) -> tuple[Any, ...]:
+        """a layer module's parameters and buffers as (name, shape): what a float32 shadow must match to run it"""
+        return tuple((name, tuple(t.shape), is_buf) for name, t, is_buf in self._named_tensors(module))
+
     def _upcast(self, lt: str, tmpl: Any, i: int) -> Any:
-        sh = self.shadow[lt]
-        for (_, p32), (_, p16) in zip(sh.named_parameters(), tmpl.named_parameters()):
-            p32.data.copy_(p16.data)
+        """layer `i`'s bf16 weights, and its buffers (a layer's own values), into the float32 shadow of its
+        structure, copied by name"""
+        sh = self.shadow[lt][self._structure(tmpl)]
+        src = {name: t for name, t, _ in self._named_tensors(tmpl)}
+        for name, t, _ in self._named_tensors(sh):
+            t.data.copy_(src[name].data)
         return self._retarget(sh, i)
 
     def _host_copy(self, dst: torch.Tensor, src: torch.Tensor) -> None:

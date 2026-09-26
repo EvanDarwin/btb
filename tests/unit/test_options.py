@@ -121,7 +121,6 @@ def test_resolve_device_refuses_a_device_that_is_not_here() -> None:
     from btb.engine.device import mlx_available, resolve_device
 
     if not torch.cuda.is_available():
-        # the reason is "no CUDA device is visible", or "the CPU was chosen" once a test has called cpu_only()
         e = _bad(resolve_device, "cuda")
         assert isinstance(e, BadDevice) and str(e.device) == "cuda"
     else:

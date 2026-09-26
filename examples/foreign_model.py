@@ -14,7 +14,7 @@ import btb
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
-    ap.add_argument("--device", default="cuda", choices=("cuda", "cpu"))
+    ap.add_argument("--device", default="cuda", choices=("cuda", "mlx", "cpu"))
     ap.add_argument("--new", type=int, default=256)
     a = ap.parse_args(argv)
     from transformers import AutoModelForCausalLM

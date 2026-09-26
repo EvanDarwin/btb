@@ -46,6 +46,9 @@ def _size(n: int) -> str:
     return f"{n / 2**10:.1f} KiB"
 
 
+EPOCH = "epoch"  # the ledger's tag for an epoch's KV, reserved by `plan` and spent by its cache's growth
+
+
 class MemoryGrantError(MemoryError):
     """A memory request the scheduler refused. Raised before the allocation, so the message names what asked
     and for how much - torch's own OOM is raised from inside the allocator and names neither."""
@@ -181,18 +184,28 @@ class Plan:
     free: PlanFree
     budget: HostBudget | None = None
     drive: DriveBenchmark | None = None  # the drive's measurement where layers stream from it
+    gpu_bps: float | None = None  # Apple silicon's GPU read rate (`btb.mlx.read_bps`) an MLX plan is priced at
 
     def __str__(self) -> str:
         b = self.bytes
-        head = Tier.CARD if self.head_on_card else Tier.HOST
-        drafter = Tier.CARD if self.drafter_on_card else (Tier.HOST if self.has_mtp else Tier.NONE)
-        s = (
-            f"{self.device}: {len(self.resident)} resident ({b.vram_layers / 2**30:.2f} GB), {len(self.host)} host "
-            f"({len(self.cold)} streamed from the drive, {b.warm / 2**30:.2f} GB in RAM, {b.cold / 2**30:.2f} GB a pass), "
-            f"head {head}, drafter {drafter}{', cache in RAM' if self.kv_host else ''}; "
-            f"{self.predicted_ms_per_token:.1f} ms a token predicted; "
-            f"free RAM {self.free.ram_gb:.1f} GB, VRAM {self.free.vram_gb:.1f} GB"
-        )
+        if self.gpu_bps:
+            # one memory: the GPU runs every layer the RAM holds, the head with them
+            s = (
+                f"{self.device}: {len(self.warm)} on the GPU ({b.warm / 2**30:.2f} GB, unified memory), "
+                f"{len(self.cold)} streamed from the drive ({b.cold / 2**30:.2f} GB a pass), head on the GPU, "
+                f"drafter {'yes' if self.has_mtp else 'none'}; {self.predicted_ms_per_token:.1f} ms a token "
+                f"predicted (the GPU reads {self.gpu_bps / 1e9:.0f} GB/s); free RAM {self.free.ram_gb:.1f} GB"
+            )
+        else:
+            head = Tier.CARD if self.head_on_card else Tier.HOST
+            drafter = Tier.CARD if self.drafter_on_card else (Tier.HOST if self.has_mtp else Tier.NONE)
+            s = (
+                f"{self.device}: {len(self.resident)} resident ({b.vram_layers / 2**30:.2f} GB), {len(self.host)} "
+                f"host ({len(self.cold)} streamed from the drive, {b.warm / 2**30:.2f} GB in RAM, "
+                f"{b.cold / 2**30:.2f} GB a pass), head {head}, drafter {drafter}"
+                f"{', cache in RAM' if self.kv_host else ''}; {self.predicted_ms_per_token:.1f} ms a token "
+                f"predicted; free RAM {self.free.ram_gb:.1f} GB, VRAM {self.free.vram_gb:.1f} GB"
+            )
         if self.budget is not None:
             s += f"; {self.budget.floor / 2**30:.2f} GB kept free"
         if self.drive is not None:
@@ -342,7 +355,11 @@ class BatchScheduler:
     ) -> BatchScheduler:
         """The scheduler over a transformers model (or its config) that is not the engine's: the KV priced from
         the config's heads, the host floor as a plan takes it (`ram_reserve_gb` names one), the
-        card's margin as a load takes it (`vram_margin_gb`; `vram_reserve_gb` names one)."""
+        card's margin as a load takes it (`vram_margin_gb`; `vram_reserve_gb` names one). `device` is named and
+        checked as `btb.load` takes it; on 'mlx' the cache is priced against the RAM the GPU shares, as
+        `btb.plan` prices an MLX load."""
+        from .device import resolve_device, torch_device
+
         cfg = getattr(model, "config", model)
         cfg = getattr(cfg, "text_config", cfg)
         L = int(getattr(cfg, "num_hidden_layers", 0) or 0)
@@ -351,7 +368,7 @@ class BatchScheduler:
         params = getattr(model, "parameters", None)
         if callable(params):
             dtype = next((p.dtype for p in params()), None)
-        dev = torch.device(device)
+        dev = torch_device(resolve_device(device))
         if vram_reserve_gb is None:
             vram_reserve_gb = (
                 BatchScheduler.vram_margin_gb(torch.cuda.get_device_properties(dev).total_memory)
@@ -445,14 +462,15 @@ class BatchScheduler:
         """What an allocation on `device` (the engine's own when None) may take: the card's free VRAM above
         the engine's margin, MLX's ledger on the unified device (the host and the GPU spend one pool), or the
         host's free RAM above the engine's RAM reserve. None when nothing here can price the device. The
-        arithmetic is the device's (`Device.free`), the one ledger the plan and the memory policy read too;
-        an engine built without one (a stub under test) is priced the same way directly."""
+        arithmetic is the device's (`Device.free`), the one ledger the plan and the memory policy read too:
+        less what rooms and loans are promised, all but the epoch's own KV, which its cache's growth spends. An
+        engine built without one (a stub under test) is priced the same way directly."""
         dv = getattr(self.sm, "device", None)
         if dv is not None:
-            return dv.free(device)
-        from .device import free_bytes
+            return dv.free(device, unreserved=True, own=EPOCH)
+        from .device import free_bytes, torch_device
 
-        dev = self.sm.dev if device is None else torch.device(device)
+        dev = self.sm.dev if device is None else torch_device(device)
         if dev.type == Device.CUDA:
             if self.sm.dev.type != Device.CUDA:
                 return None
@@ -488,7 +506,9 @@ class BatchScheduler:
         free = self.free_for(device)
         if free is None:
             return
-        dev = self.sm.dev if device is None else torch.device(device)
+        from .device import torch_device
+
+        dev = self.sm.dev if device is None else torch_device(device)
         # the card's margin is its OOM guard and the host's floor is the OS's own (or the one --ram-reserve
         # names): a request past either is refused
         if nbytes > free:
@@ -532,14 +552,14 @@ class BatchScheduler:
         if dv is not None and mb is not None:
             # the epoch's KV is spoken for from here to `release()`, ahead of the cache allocating it: the
             # memory policies must not read that room as free and grow a shed layer back into it
-            dv.reserve("epoch", self.kv_row_bytes(target_len) * batch)
+            dv.reserve(EPOCH, self.kv_row_bytes(target_len) * batch)
         return batch, target_len
 
     def release(self) -> None:
         """The epoch is over: its KV reservation is let go (the buffers themselves free with the cache)."""
         dv = getattr(self.sm, "device", None)
         if dv is not None:
-            dv.release("epoch")
+            dv.release(EPOCH)
 
     @staticmethod
     def plan_placement(
@@ -630,6 +650,18 @@ class BatchScheduler:
             + int(b.get("kv_host", 0))
             + int(b.get("staging", 0))
         )
+        predicted, gpu_bps = float(out["predicted_ms_per_token"]), None
+        if name is not None and name.kind is Device.MLX:
+            from ..mlx import read_bps
+            from .tiers import DRIVE_BPS
+
+            # an MLX pass reads every weight it runs from the one memory: the GPU's layers and the head at the
+            # GPU's own read rate, the drive's layers streamed alongside at the drive's (the host tier's price is
+            # the CPU's, and the head there a host matvec)
+            gpu_bps = read_bps()
+            gpu_ms = (int(b["warm"]) + int(b["head"])) / gpu_bps * 1e3
+            cold_ms = int(b["cold"]) / (drive.bps if drive is not None else DRIVE_BPS) * 1e3
+            predicted = max(gpu_ms, cold_ms)
         room = min(hb.available, hb.commit) - hb.floor
         if room < least:
             raise PlanError(
@@ -650,7 +682,7 @@ class BatchScheduler:
             kv_host=kv_chosen,
             has_mtp=has_mtp,
             moe=bool(probe.fam.moe),
-            predicted_ms_per_token=float(out["predicted_ms_per_token"]),
+            predicted_ms_per_token=predicted,
             bytes=PlanBytes(
                 vram_layers=int(b["vram_layers"]),
                 head=int(b["head"]),
@@ -673,6 +705,7 @@ class BatchScheduler:
             free=PlanFree(vram_gb=vram_gb, ram_gb=ram_gb, ram_gb_first=ram0, settle_s=waited),
             budget=hb,
             drive=drive,
+            gpu_bps=gpu_bps,
         )
 
     @staticmethod
