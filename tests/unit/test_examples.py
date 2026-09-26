@@ -136,3 +136,42 @@ def test_host_monitor_reads_the_machine_without_an_engine() -> None:
     r = _run("host_monitor")
     assert r["free"] > 0 and r["budget"].total > r["budget"].available > 0
     assert isinstance(r["pressure"], dict)
+
+
+def test_session_loop_rewinds_and_goes_on() -> None:
+    r = _run("session_loop", "--new", "6")
+    assert r["same"], "a feed after a rewind gave other logits"
+    assert r["tokens"] == r["plain"], "the session decoded otherwise than a plain decode of the prompt"
+    assert r["session"] == r["prompt"] + r["tokens"] and r["pending"] == r["tokens"][-1]
+    assert r["tap"] == (1, r["hidden"])
+
+
+def test_hooks_see_every_token() -> None:
+    r = _run("hooks", "--new", "8")
+    assert r["banned"] not in r["tokens"], "the processor's ban was drawn"
+    assert len(r["logprobs"]) == len(r["tokens"]) and all(len(lp.top) == 2 for lp in r["logprobs"])
+    assert r["hidden"][0] == len(r["tokens"]) and r["passed"] == len(r["tokens"])
+    assert r["report"].tags
+
+
+def test_a_beam_of_one_is_the_greedy_answer_and_a_wider_one_scores_as_well() -> None:
+    one = _run("beam", "--width", "1", "--new", "6")
+    three = _run("beam", "--width", "3", "--new", "6")
+    assert one["tokens"] == one["greedy"]
+    assert three["score"] >= one["score"] - 1e-4
+    assert three["on"] == three["fed_on"], "the kept beam's session went on otherwise than one fed its tokens"
+
+
+def test_batch_sessions_decode_each_as_its_own_and_write_back() -> None:
+    r = _run("batch_sessions", "--new", "3")
+    a, b, c = r["sessions"]
+    assert r["refused"], "a session in the batch took a feed"
+    for s, p, alone in ((a, r["prompts"][0], r["alone"][0]), (b, r["prompts"][1], r["alone"][1])):
+        assert s[len(p) :] == alone, "a row drew otherwise than its session alone"
+    assert c == r["prompts"][2] + r["second"][r["joined"]]
+
+
+def test_lend_counts_the_room_and_refuses_by_name() -> None:
+    r = _run("lend")
+    assert r["held"] == 6 * MB and r["after"] == 0
+    assert r["mine"] == (256, 1024) and r["refused"] and "MiB" in r["refused"]
