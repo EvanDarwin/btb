@@ -90,8 +90,9 @@ class DeviceMemory:
 class Room:
     """Room made for memory btb does not allocate itself - a second model, a library's workspace - and kept from
     btb until `release()`, the end of a `with` block, or the room being dropped. Rooms add up, each its own.
-    `empty`/`zeros`/`full` hand out tensors inside it: where btb's free reading sees them (a card, the CPU off MLX)
-    their bytes come off what the room holds while they live, so the room and the tensor are not counted twice."""
+    `empty`/`zeros`/`full` hand out tensors inside it: their bytes come off what the room holds while they live, so
+    the room and the tensor are not counted twice, and a tensor outliving its room is still counted until it goes
+    (in btb's free reading, or on MLX, whose reading cannot see torch's, under a reservation of its own)."""
 
     def __init__(
         self, ledger: DeviceLedger, tag: str, nbytes: int, device: torch.device, seen: bool, engine: _State
@@ -143,6 +144,13 @@ class Room:
                 )
             t = torch.empty(size, dtype=dt, device=self.device)
             self.used += nbytes
+            ledger = self._ledger()
+            if not self._seen and ledger is not None:
+                # a ledger that cannot see torch's allocations counts the tensor itself, until its last view is
+                # gone: the room released or dropped meanwhile, the tensor is still there
+                tag = f"{self._loan}/tensor#{next(_LOANS)}"
+                ledger.reserve(tag, nbytes, self.device)
+                weakref.finalize(t.untyped_storage(), _give_back, weakref.ref(ledger), tag)
             self._hold()
         weakref.finalize(t.untyped_storage(), _emptied, weakref.ref(self), nbytes)
         if fill is not None:
@@ -150,13 +158,13 @@ class Room:
         return t
 
     def _hold(self) -> None:
-        """what the room keeps from btb now: all of it where btb's free reading cannot see its tensors, else what
-        they have not taken. Under the ledger's lock, which the release's takes too: a room let go meanwhile on
-        another thread is not held again after"""
+        """what the room keeps from btb now: what its tensors have not taken (they count themselves - in btb's free
+        reading, or where it cannot see them under tags of their own that outlive the room). Under the ledger's
+        lock, which the release's takes too: a room let go meanwhile on another thread is not held again after"""
         with self._lock:
             ledger = self._ledger()
             if self.held and ledger is not None:
-                ledger.reserve(self._loan, self.nbytes - self.used if self._seen else self.nbytes, self.device)
+                ledger.reserve(self._loan, self.nbytes - self.used, self.device)
 
     def __enter__(self) -> Room:
         return self

@@ -437,3 +437,107 @@ def test_a_layer_move_reaches_every_live_cache() -> None:
         assert fl._tk.device.type == "meta"
         assert idle.rows(1)[0].device.type == "cpu"
         br.close()
+
+
+# -- lifetimes: late, on another thread, through views, out of order -----------------------------------------------
+
+
+@pytest.mark.parametrize("gone", ["released", "dropped"])
+def test_a_rooms_tensor_btb_cannot_see_stays_counted_after_the_room_goes(sm: StreamedTextModel, gone: str) -> None:
+    """where btb's free reading cannot see torch's allocations (MLX's ledger) a room's tensor is counted by the room;
+    the room released or dropped while the tensor lives, the tensor is still counted until it is gone"""
+    tag = "unseen#1"
+    base = sm.device.reserved("cpu")
+    sm.device.reserve(tag, 4 * MiB, "cpu")
+    r = Room(sm.device, tag, 4 * MiB, torch.device("cpu"), False, sm)
+    t = r.empty(MiB, dtype=torch.uint8)
+    assert sm.device.reserved("cpu") - base == 4 * MiB
+    if gone == "released":
+        r.release()
+    else:
+        del r
+        gc.collect()
+    assert sm.device.reserved("cpu") - base == MiB, "the tensor outlived its room and went uncounted"
+    del t
+    gc.collect()
+    assert sm.device.reserved("cpu") == base
+
+
+def let_go(refs: list[torch.Tensor]) -> None:
+    """the last references dropped on this thread, and a collection run here: the finalizers run on it"""
+    refs.clear()
+    gc.collect()
+
+
+def test_a_rooms_tensor_let_go_on_another_thread_comes_back(sm: StreamedTextModel) -> None:
+    with sm.room(4 * MiB) as r:
+        held = [r.zeros(MiB, dtype=torch.uint8)]
+        view = [held[0][10:]]
+        th = threading.Thread(target=let_go, args=(held,))
+        th.start()
+        th.join()
+        assert r.used == MiB, "a view keeps the storage, and the room's count, alive"
+        th = threading.Thread(target=let_go, args=(view,))
+        th.start()
+        th.join()
+        assert r.used == 0 and sm.memory()["cpu"].reserved == 4 * MiB
+    assert sm.memory()["cpu"].reserved == 0
+
+
+def test_rooms_and_tensors_asked_for_at_once_add_up(sm: StreamedTextModel) -> None:
+    errors: list[BaseException] = []
+
+    def ask() -> None:
+        try:
+            for _ in range(20):
+                with sm.room(MiB) as r:
+                    kept = [r.zeros(1024, dtype=torch.uint8), sm.empty(4096, dtype=torch.uint8)]
+                    assert r.used == 1024
+                    del kept
+        except BaseException as e:  # handed to the test's thread
+            errors.append(e)
+
+    threads = [threading.Thread(target=ask) for _ in range(8)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    gc.collect()
+    assert not errors, errors[0]
+    assert sm.memory()["cpu"].reserved == 0
+
+
+def test_what_a_refusal_shed_on_the_host_grows_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    """a refused tensor gave up every warm layer on the way; with no RAM policy running the lending policy grows
+    them back once there is room again"""
+    with loaded_model(fixture("tiny_qwen3"), device="cpu") as sm:
+        sm.ram_watch = False
+        keep = sm.ram_reserve
+        with monkeypatch.context() as mp:
+            squeeze(sm, MiB, mp)
+            with pytest.raises(MemoryGrantError):
+                sm.empty(64 * MiB, dtype=torch.uint8)
+            assert sm.cold
+        sm.ram_reserve = keep
+        assert _until(lambda: not sm.cold, sm), f"still from the drive: {sorted(sm.cold)}"
+
+
+def test_layers_shed_for_two_tensors_grow_back_whichever_goes_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    with loaded_model(fixture("tiny_qwen3"), device="cpu") as sm:
+        sm.ram_watch = False
+        make = sm._make_room
+
+        def one_step(dev: torch.device, nbytes: int, what: str, own: str | None = None) -> set[str]:
+            assert sm._give_up_one(dev, nbytes, set())
+            return make(dev, 0, what, own)
+
+        with monkeypatch.context() as mp:
+            mp.setattr(sm, "_make_room", one_step)
+            a = sm.empty(MiB, dtype=torch.uint8)
+            b = sm.empty(MiB, dtype=torch.uint8)
+        assert len(sm.cold) == 2
+        del b
+        gc.collect()
+        del a
+        gc.collect()
+        assert _until(lambda: not sm.cold, sm), f"still from the drive: {sorted(sm.cold)}"
