@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from .. import mlx as mlxdev
-from ..kinds import CAPS, KIND_OF, Cap, FamilyKind, LayerKind, ModelType
+from ..kinds import CAPS, FAMILY_NAMES, KIND_OF, Cap, FamilyKind, LayerKind, ModelType
 from ..mxfp4 import stored_mxfp4
 from ..options import UnsupportedModelType
 from .cache import GrowLayer
@@ -236,15 +236,6 @@ def act_name(cfg: Any) -> str:
     return str(getattr(cfg, "hidden_activation", None) or getattr(cfg, "hidden_act", "silu"))
 
 
-# the name a user would recognize for each family family() builds; an unsupported load lists these values
-FAMILY_NAMES: dict[FamilyKind, str] = {
-    FamilyKind.QWEN3: "Qwen3",
-    FamilyKind.QWEN3_5: "Qwen3.5",
-    FamilyKind.PHI3: "Phi-3",
-    FamilyKind.QWEN4: "Qwen4 (experimental)",
-    FamilyKind.GPT_OSS: "GPT-OSS",
-    FamilyKind.GEMMA3: "Gemma 3",
-}
 # the model_type view of those names, through KIND_OF (the "_text" variants read as their base family)
 NAME_OF: dict[ModelType, str] = {mt: FAMILY_NAMES[fk] for mt, fk in KIND_OF.items()}
 SUPPORTED_MODEL_TYPES = tuple(KIND_OF)  # the served model_types, from the one declaration in kinds.py

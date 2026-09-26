@@ -24,8 +24,10 @@ import re
 import sys
 from typing import NotRequired, TypedDict, cast
 
-from bench.e2e_delta import Doc
+from bench.e2e_delta import Doc, Timing
 from bench.e2e_delta import deltas as e2e_deltas
+from bench.e2e_delta import timings as e2e_timings
+from btb.kinds import Json
 from tests.cert.native_ops import op_families
 from tests.cert.spec import Hardware
 
@@ -165,6 +167,65 @@ def compare(pr_root: str, base_root: str | None) -> list[Entry]:
     return out
 
 
+def _criterion_timings(root: str, run: str | None) -> list[Timing]:
+    """a root's `run` criterion medians in seconds (criterion writes nanoseconds) with their 95% bootstrap CI"""
+    out: list[Timing] = []
+    for rel, est in sorted(_criterion_runs(root, run).items()):
+        ci = ("median", "confidence_interval")
+        out.append(
+            {
+                "id": rel,
+                "section": _section(rel),
+                "median_s": _num(est, "median", "point_estimate") / 1e9,
+                "lo_s": _num(est, *ci, "lower_bound") / 1e9,
+                "hi_s": _num(est, *ci, "upper_bound") / 1e9,
+            }
+        )
+    return out
+
+
+def timings(root: str) -> list[Timing]:
+    """every benchmark's own time on a result root, its runs folded as `compare` folds them: the mean of the
+    runs' medians, the band from the lowest bound to the highest"""
+    folded: dict[str, list[Timing]] = {}
+    for run in runs(root):
+        e2e = e2e_timings(_doc(_read_json(_e2e_path(root, run))))
+        for t in _criterion_timings(root, run) + e2e:
+            folded.setdefault(t["id"], []).append(t)
+    return [
+        {
+            "id": ts[0]["id"],
+            "section": ts[0]["section"] or _section(ts[0]["id"]),
+            "median_s": sum(t["median_s"] for t in ts) / len(ts),
+            "lo_s": min(t["lo_s"] for t in ts),
+            "hi_s": max(t["hi_s"] for t in ts),
+        }
+        for ts in folded.values()
+    ]
+
+
+def results(root: str, entries: list[Entry], sha: str | None, base_sha: str | None, run_url: str | None) -> Json:
+    """the run as data: each benchmark's own time with its change against the base where there is one, and the
+    commit, ISA tier and CPU they ran on - what `--json` writes for a page to render"""
+    change = {e["id"]: e for e in entries}
+    e2e = _doc(_read_json(_e2e_path(root, runs(root)[0])))
+    cpu = (e2e.get("machine_info") or {}).get("cpu")
+    benches: list[Json] = []
+    for t in sorted(timings(root), key=lambda t: (t["section"], t["id"])):
+        c = change.get(t["id"])
+        delta = None if c is None or c["delta"] is None else {"delta": c["delta"], "lo": c["lo"], "hi": c["hi"]}
+        benches.append({**t, "change": delta})
+    return {
+        "sha": sha if sha and _SHA.fullmatch(sha) else None,
+        "base_sha": base_sha if base_sha and _SHA.fullmatch(base_sha) else None,
+        "run_url": run_url,
+        "isa": next((e["isa"] for e in entries if e.get("isa")), None),
+        "cpu": cpu.get("brand_raw") if isinstance(cpu, dict) else None,
+        "pairs": len(runs(root)),
+        "benches": benches,
+    }
+
+
 def _doc(parsed: object) -> Doc:
     """a run's e2e.json as e2e_delta reads it: what was on disk when it is an object, else an empty run"""
     return cast(Doc, parsed) if isinstance(parsed, dict) else {}
@@ -273,6 +334,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", default=None, metavar="PATH")
     ap.add_argument("--base-ref", default=None, help="the base's branch, named in the comment")
     ap.add_argument("--base-sha", default=None, help="the commit benched as the base, named in the comment")
+    ap.add_argument("--json", default=None, metavar="PATH", help="also write the run as data: times and changes")
+    ap.add_argument("--sha", default=None, help="the commit benched, recorded in --json")
+    ap.add_argument("--run-url", default=None, help="the CI run's page, recorded in --json")
     ap.add_argument(
         "--gate",
         action="store_true",
@@ -293,6 +357,9 @@ def main(argv: list[str] | None = None) -> int:
     if a.out:
         with open(a.out, "w", encoding="utf-8") as f:
             f.write(body)
+    if a.json:
+        with open(a.json, "w", encoding="utf-8") as f:
+            json.dump(results(a.pr_root, entries, a.sha, a.base_sha, a.run_url), f, indent=1)
     if regressed:
         sys.stderr.write("note: at least one benchmark regressed past the noise floor (informational)\n")
     if a.gate:

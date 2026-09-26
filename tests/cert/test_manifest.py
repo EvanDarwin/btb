@@ -1,8 +1,9 @@
 """The manifest as a suite gate. It derives families from core (`core.served_kinds`), so these hold for any
-family core adds - a new one is iterated, and uncovered it is a gap that `--check` and the base-branch delta
-report rather than passing quietly. The blocking gate is `python -m tests.cert.manifest --check`, which stays
-red while any gap or unproven cell is open; these tests hold the manifest's SHAPE: that COVERED means a receipt
-and that the axes are still total against btb.kinds."""
+family core adds - a new one is iterated, and uncovered it reports its gaps rather than passing quietly. The
+blocking gate is `python -m tests.cert.manifest --check`, which stays red while any gap or unproven cell is open,
+and `python -m tests.cert.delta check` names the gaps a change opened; these tests hold the manifest's SHAPE:
+that COVERED means a receipt, that the axes are still total against btb.kinds, and that every open gap says
+what it affects and how to close it."""
 
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from btb.kinds import QUANT_KIND, Cap, FamilyKind, PassTag, Proposer, Quant, QuantClass
 
-from . import core, manifest, spec
+from . import core, manifest, native_ops, spec
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -121,6 +122,39 @@ def test_a_receipt_cannot_buy_a_gap(tmp_path: Path, monkeypatch: MonkeyPatch) ->
     _receipts(tmp_path, monkeypatch, stale)
     cell = _cell(manifest.compute_cells(), spec.Storage.SAFE_BF16, "mlx-mega", FamilyKind.PHI3)
     assert cell.verdict is manifest.Verdict.GAP and cell.reason == manifest.Missing.MEGAKERNEL.value, cell
+
+
+def test_support_reads_unimplemented_off_the_engine(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    """with no receipts the support table claims nothing tested, is total over the axes, and calls a family and
+    storage unsupported exactly where the engine has no load path - a GGUF for a family with no llama.cpp
+    architecture - and never where a path only lacks a fixture"""
+    _receipts(tmp_path, monkeypatch, [])
+    s = manifest.support()
+    gguf = core.gguf_kinds()
+    archs = {a for a in native_ops.tier_arch().values() if a is not None}
+    keys = {f"cpu/{a}" for a in archs} | {h.value for h in spec.Hardware if h is not spec.Hardware.CPU}
+    assert {h["key"] for h in s["hardware"]} == keys
+    for kind in core.served_kinds():
+        row = s["by_storage"][kind.value]
+        assert set(row) == {st.value for st in spec.Storage}, row
+        assert s["by_hardware"][kind.value] == {
+            k: (manifest.Support.NONE if k in spec.NO_BACKEND else manifest.Support.UNTESTED).value for k in keys
+        }
+        for st in spec.Storage:
+            none = spec.STORAGE[st].container is spec.Container.GGUF and kind not in gguf
+            want = manifest.Support.NONE if none else manifest.Support.UNTESTED
+            assert row[st.value] == want.value, (kind, st, row[st.value])
+
+
+def test_a_cpu_receipt_proves_only_its_own_architecture(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    """a CPU cell banked by an arm64 Mac certifies the family's CPU on aarch64 and says nothing about x86-64: the
+    machine label's arch picks the column, in Rust's spelling"""
+    ids = list(_cell(manifest.compute_cells(), spec.Storage.SAFE_BF16, "cpu").ids)
+    (tmp_path / "mac.json").write_text(json.dumps({"machine": "mac/arm64/mlx", "covered": ids}), encoding="utf-8")
+    monkeypatch.setenv("BTB_CERT_RECEIPTS", str(tmp_path))
+    row = manifest.support()["by_hardware"][FamilyKind.QWEN3.value]
+    assert row["cpu/aarch64"] == manifest.Support.TESTED.value, row
+    assert row["cpu/x86_64"] == manifest.Support.UNTESTED.value, row
 
 
 def test_ids_are_built_in_one_place() -> None:
@@ -254,7 +288,7 @@ def test_the_residency_fork_is_a_cell_per_hardware() -> None:
         assert spec.SUBPATH[default].expects(FamilyKind.QWEN3, bf16) == {
             spec.SUBPATH[default].expect(FamilyKind.QWEN3, bf16)
         }
-    assert {d.hardware for d in spec.DEVICE_SUBPATHS if d.needs is Cap.MOE} == set(spec.Hardware)
+    assert {d.hardware for d in spec.DEVICE_SUBPATHS if d.needs is Cap.MOE} == set(spec.Hardware) - spec.NO_BACKEND
     dense = manifest.dnr(FamilyKind.QWEN3, bf16, spec.SUBPATH["cpu-riders"], spec.DecodePath.GREEDY)
     assert dense is not None and "moe" in dense
     assert manifest.dnr(FamilyKind.GPT_OSS, bf16, spec.SUBPATH["cpu-riders"], spec.DecodePath.GREEDY) is None
@@ -352,6 +386,14 @@ def test_fixture_gaps_sees_an_unbound_gguf_twin(tmp_path: Path, monkeypatch: Mon
         monkeypatch.setattr(mod, "FIXTURES", str(tmp_path))
         monkeypatch.setattr(mod, "GGUF_DIR", str(gguf))
     assert manifest.fixture_gaps() == ["gguf/tiny_qwen3-q9_9.gguf"]
+
+
+def test_every_open_gap_is_explained() -> None:
+    """each open gap names the families it affects and what closing it takes. Which gaps are open is the
+    manifest's to derive - `tests.cert.delta check` names the ones a change opened."""
+    for kind, _n, fams in manifest.missing_items():
+        what, how = manifest.MISSING[kind]
+        assert fams and what.strip() and how.strip(), kind
 
 
 def test_the_gate_stays_red_while_gaps_are_open() -> None:

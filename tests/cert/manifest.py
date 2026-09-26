@@ -26,6 +26,7 @@ count and families, what is absent, and how to close it. The taxonomy is `Missin
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from collections.abc import Callable
@@ -34,9 +35,9 @@ from enum import StrEnum
 
 from gguf import GGMLQuantizationType as GQ
 
-from btb.kinds import Cap, FamilyKind, PassTag, Quant, QuantClass
+from btb.kinds import FAMILY_NAMES, Cap, FamilyKind, Json, PassTag, Quant, QuantClass
 
-from . import core, receipt, spec
+from . import core, gpu_kernels, native_ops, receipt, spec
 
 FIXTURES = spec.FIXTURES
 GGUF_DIR = spec.GGUF_DIR
@@ -78,6 +79,7 @@ class Missing(StrEnum):
     FP16_FIXTURE = "fp16-fixture"
     FP32_FIXTURE = "fp32-fixture"
     FP8_FIXTURE = "fp8-fixture"
+    ROCM_BACKEND = "rocm-backend"
     QUANT_FIXTURE = "quant-fixture"
     NO_FIXTURE = "no-fixture"
 
@@ -185,6 +187,12 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "regenerate the precision twins (`python tests/make_fixtures.py twins`); spec.fixture_paths binds a twin "
         "whose headers carry F8_E4M3",
     ),
+    Missing.ROCM_BACKEND: (
+        "no AMD GPU backend: torch's ROCm build answers to device 'cuda', but the card kernels are CUDA fatbins "
+        "(native/cuda, built by nvcc) and nothing in btb targets HIP, so an AMD card runs no path btb certifies",
+        "build the card kernels for HIP (or a portable path the card graph can load), give the engine a way to "
+        "tell a ROCm card from an NVIDIA one, take `rocm` out of spec.NO_BACKEND, and bank receipts from an AMD box",
+    ),
     Missing.QUANT_FIXTURE: (
         "this storage stands for several stored types (one kernel each) and only some have a tiny GGUF twin, so "
         "certifying the cell off the ones that exist would claim kernels nothing reads",
@@ -204,6 +212,10 @@ SAFE_PRECISION_GAP: dict[spec.Storage, Missing] = {
     spec.Storage.SAFE_FP32: Missing.FP32_FIXTURE,
     spec.Storage.SAFE_FP8: Missing.FP8_FIXTURE,
 }
+
+# the gap kinds that mean the engine has no path at all; every other kind is a path that runs but that nothing
+# proves. The support table (`support()`, `--json`) reads a family and storage as unsupported off these alone
+UNIMPLEMENTED: frozenset[Missing] = frozenset({Missing.GGUF_LOAD, Missing.ROCM_BACKEND})
 
 
 # --- engine forks the cell grid does not reach -------------------------------------------------------------
@@ -412,7 +424,8 @@ def dnr(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath, decode
             f"not a distinct cell: {dev.key}'s knob is a no-op on a family without {dev.needs.value} "
             f"(identical to the plain {dev.hardware.value} run)"
         )
-    if spec.quant_class(storage) is QuantClass.MXFP4 and Cap.MOE not in core.flags(kind):
+    # a family with no GGUF path has no MXFP4 file to repeat another; its cells are GGUF_LOAD gaps
+    if spec.quant_class(storage) is QuantClass.MXFP4 and Cap.MOE not in core.flags(kind) and kind in core.gguf_kinds():
         return (
             "not a distinct cell: llama.cpp's MXFP4_MOE stores only 3-D expert tensors as MXFP4 and every other "
             "as Q8_0 (src/llama-quant.cpp), so a dense family's MXFP4 file is its Q8_0 file (the gguf-affine run)"
@@ -454,6 +467,8 @@ def subpath_gap(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath
     """why this device sub-path cannot engage on this family and storage, by the engine's own gates - the one
     rule the grid and the runner share. A run of a cell this refuses would decode fine down another path and
     bank a receipt for one it never took, so the runner skips exactly these."""
+    if dev.hardware in spec.NO_BACKEND:
+        return Missing.ROCM_BACKEND
     if dev.key == "mlx-mega":
         return _mega_gap(kind, storage)
     if dev.key == "mlx-attn-kernel":
@@ -470,18 +485,23 @@ def gap_reason(
     does not exercise the path. None means the cell is coverable. MISSING[kind] holds the plain-language what/how.
     Never "impossible"; a GAP that fails the gate.
 
-    The order is the order the engine hits them: a storage it cannot load at all, then a sub-path that cannot
-    engage on this family or this fixture, then an artifact the cert does not have, then a decode path nothing
-    drives. The deepest true reason wins, so a cell that would still not run with every fixture in place says so."""
+    The order is the order the engine hits them: hardware it has no backend for, a storage it cannot load at all,
+    then a sub-path that cannot engage on this family or this fixture, then an artifact the cert does not have,
+    then a decode path nothing drives. The deepest true reason wins, so a cell that would still not run with every fixture in place says so."""
     fl = core.flags(kind)
     info = spec.STORAGE[storage]
     qc = spec.quant_class(storage)
+    # 0. hardware the engine has no backend for: nothing else about the cell matters
+    if dev.hardware in spec.NO_BACKEND:
+        return Missing.ROCM_BACKEND
     # 1. storage the engine cannot load for this family
     if info.container is spec.Container.GGUF:
         if kind not in core.gguf_kinds():
             return Missing.GGUF_LOAD
         if Cap.MXFP4 in fl and qc is not QuantClass.MXFP4:
             return Missing.GPTOSS_GGUF_TWIN
+    if SAFE_PRECISION_GAP.get(storage) in UNIMPLEMENTED:
+        return SAFE_PRECISION_GAP[storage]
     # 2. the device sub-path the engine does not engage for this family or this fixture
     refused = subpath_gap(kind, storage, dev)
     if refused is not None:
@@ -679,6 +699,86 @@ def covered_quants() -> set[GQ]:
     return set(TINY_FIXTURE_QUANTS) | {t.quant for t, ok in target_status() if ok and t.quant is not None}
 
 
+# --- the support table: the grid rolled up for users ---------------------------------------------------------
+
+
+class Support(StrEnum):
+    TESTED = "tested"  # a receipt proves at least one cell of it ran with its PassTag engaged
+    UNTESTED = "untested"  # the engine has a path; nothing proves it
+    NONE = "none"  # every cell of it is an UNIMPLEMENTED gap
+
+
+def _roll_up(cells: list[Cell]) -> Support:
+    """one status for a group of cells: tested when any is proven, none when every distinct cell is a gap the
+    engine has no path for, untested otherwise (DNR cells repeat another cell and say nothing)"""
+    live = [c for c in cells if c.verdict is not Verdict.DNR]
+    if any(c.verdict is Verdict.COVERED for c in live):
+        return Support.TESTED
+    if live and all(c.verdict is Verdict.GAP and Missing(c.reason) in UNIMPLEMENTED for c in live):
+        return Support.NONE
+    return Support.UNTESTED
+
+
+def support() -> Json:
+    """the grid as users read it: per family, a status per storage and per hardware, each GGML quant as exercised
+    or not, and the native CPU ops by ISA tier. The CPU splits by architecture (the crate ties each tier to one),
+    and a CPU cell counts as proven on an architecture only from receipts a machine of it emitted."""
+    cells = compute_cells()
+    hw = {d.key: d.hardware for d in spec.DEVICE_SUBPATHS}
+    kinds = core.served_kinds()
+    tested_q = covered_quants()
+    arch_of = native_ops.tier_arch()
+    archs = list(dict.fromkeys(a for a in arch_of.values() if a is not None))
+    proven = receipt.by_arch()
+    cpu_cells = {a: compute_cells(proven.get(a, set())) for a in archs}
+    hardware: list[Json] = [
+        {"key": f"cpu/{a}", "tiers": [t for t, ta in arch_of.items() if ta == a]} for a in archs
+    ] + [{"key": h.value, "tiers": []} for h in spec.Hardware if h is not spec.Hardware.CPU]
+
+    def by_hw(k: FamilyKind, key: str) -> str:
+        if key.startswith("cpu/"):
+            group = [c for c in cpu_cells[key[4:]] if c.kind is k and hw[c.device] is spec.Hardware.CPU]
+        else:
+            group = [c for c in cells if c.kind is k and hw[c.device].value == key]
+        return _roll_up(group).value
+
+    vector = set(native_ops._vector_families())
+    return {
+        "families": [{"kind": k.value, "name": FAMILY_NAMES[k]} for k in kinds],
+        "storages": [
+            {
+                "key": s.value,
+                "container": spec.STORAGE[s].container.value,
+                "quants": [q.name for q in spec.STORAGE[s].quants],
+            }
+            for s in spec.Storage
+        ],
+        "hardware": hardware,
+        "gpu_ops": gpu_kernels.table(),
+        "isa": [{"tier": t, "arch": arch_of[t]} for t in native_ops.ISA_TIERS],
+        "ops": [
+            {
+                "name": op.name,
+                "stored": [s.value for s in op.quants],
+                "tiers": {t: t in native_ops.family_tiers(op.bench[:-3]) for t in native_ops.ISA_TIERS},
+            }
+            for op in native_ops.OPS
+            if op.bench[:-3] in vector
+        ],
+        "by_storage": {
+            k.value: {
+                s.value: _roll_up([c for c in cells if c.kind is k and c.storage is s]).value for s in spec.Storage
+            }
+            for k in kinds
+        },
+        "by_hardware": {k.value: {h["key"]: by_hw(k, h["key"]) for h in hardware} for k in kinds},
+        "quants": {
+            q.name: (Support.TESTED if q in tested_q else Support.UNTESTED).value
+            for q in sorted(SUPPORTED_QUANTS, key=lambda q: q.name)
+        },
+    }
+
+
 # --- one report / summary / gate over both halves ----------------------------------------------------------
 
 
@@ -874,9 +974,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--check", action="store_true", help="exit nonzero on any gap, reasonless DNR, or core drift")
     ap.add_argument("--strict", action="store_true", help="--check, and also fail if a real-model target is uncached")
+    ap.add_argument("--json", action="store_true", help="print the support table (families x storage and hardware)")
     a = ap.parse_args(argv)
     if a.check or a.strict:
         return check(strict=a.strict)
+    if a.json:
+        print(json.dumps(support(), indent=1))
+        return 0
     if a.missing:
         print("\n".join(render_missing()))
         return 0

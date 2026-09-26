@@ -42,6 +42,11 @@ class Hardware(StrEnum):
     CPU = "cpu"
     MLX = "mlx"
     CUDA = "cuda"
+    ROCM = "rocm"  # an AMD card: in NO_BACKEND, so every cell of it is a gap
+
+
+# hardware a user owns that btb has no backend for; its sub-paths exist so the grid carries the gap
+NO_BACKEND: frozenset[Hardware] = frozenset({Hardware.ROCM})
 
 
 class Container(StrEnum):
@@ -477,6 +482,15 @@ DEVICE_SUBPATHS: tuple[DeviceSubpath, ...] = (
         {"device": "cuda", "bus_pass": 0},
         "the expert store's plain line instead of the default Bus Pass",
         needs=Cap.MOE,
+    ),
+    # torch's ROCm build answers to device "cuda"; the tag is the torch modules', the only path such a run could
+    # take, and never asserted while the hardware is in NO_BACKEND
+    DeviceSubpath(
+        "rocm",
+        Hardware.ROCM,
+        lambda k, s: PassTag.CUDA_TORCH_FALLBACK,
+        {"device": "cuda"},
+        "an AMD card through torch's ROCm build",
     ),
 )
 

@@ -96,6 +96,27 @@ def merged(*paths: str) -> set[str]:
     return out
 
 
+def arch_of(machine: str) -> str:
+    """the CPU architecture a receipt's machine label names, in Rust's `target_arch` spelling (the crate's cfg
+    blocks tie each ISA tier to one): macOS says arm64 and Windows AMD64 where Linux says aarch64 and x86_64"""
+    raw = machine.split("/")[1].lower() if machine.count("/") else ""
+    return {"arm64": "aarch64", "amd64": "x86_64"}.get(raw, raw)
+
+
+def by_arch(*paths: str) -> dict[str, set[str]]:
+    """covered ids grouped by the CPU architecture of the machine that ran them (`arch_of`), so a CPU cell proven
+    on an arm64 Mac is not read as proof for x86-64"""
+    out: dict[str, set[str]] = {}
+    for fn in _receipt_files(list(paths)):
+        try:
+            with open(fn, encoding="utf-8") as f:
+                doc = json.load(f)
+        except (OSError, ValueError):
+            continue
+        out.setdefault(arch_of(str(doc.get("machine") or "")), set()).update(doc.get("covered", []))
+    return out
+
+
 def by_source(*paths: str) -> dict[str, set[str]]:
     """covered ids grouped by the receipt's `source`: "run" for one a cert run emitted (each cell's tag was
     asserted), "pr-body" for one a contributor pasted into the PR - a claim CI cannot verify - so a report can say

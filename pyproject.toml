@@ -90,7 +90,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"btb/cli.py" = ["T20", "RUF001"]  # RUF001: the banner art's box-drawing diagonals are intentional, not typos
+"btb/cli.py" = ["T20"]
 "btb/serve.py" = ["T20"]        # the server's console lines are its output, not stray debugging
 "bench/*" = ["T20", "SIM105"]   # a try/except/pass around a cleanup remove() reads fine in the bench harness
 "tests/*" = ["T20", "E402", "RUF059"]  # sys.path before btb; an unused shape unpack in a test is not a defect
