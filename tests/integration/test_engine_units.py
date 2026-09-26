@@ -493,6 +493,16 @@ def test_a_kernel_handle_is_the_installs_before_any_load_and_none_after_a_torch_
     assert r.returncode == 0, r.stderr[-2000:]
 
 
+def test_a_cpu_load_leaves_the_card_for_the_next_load() -> None:
+    """a CPU load once cleared a process-wide flag that refused every later card load in the process (the tests put
+    it back by hand); the card torch holds is there for whichever load names it next"""
+    dev = need_cuda()
+    with loaded_model(fixture("tiny_qwen3"), device="cpu"):
+        pass
+    with loaded_model(fixture("tiny_qwen3"), device=dev) as sm:
+        assert sm.dev.type == "cuda"
+
+
 def test_load_places_the_layers_the_cpu_share_names() -> None:
     """--cpu-layers N with no --model and no --resident-last: the first N layers on the CPU kernels, the card
     keeping what the plan gives it of the rest. N = 0 is the whole model on the card when it fits."""
@@ -734,8 +744,6 @@ def test_the_drafter_answers_the_greedy_loop_over_a_head_slice_on_the_card_and_o
     if not arms:
         pytest.skip("neither a CUDA device nor the native kernels")
     for dev, bits in arms:
-        if dev == "cuda":
-            btb.CUDA = True  # a cpu `load()` earlier clears the package's flag; torch still holds the device
         with loaded_model(path, device=dev, draft_vocab=256, draft_bits=bits) as sm:
             assert sm.proposer == "mtp_dyn" and sm.draft_bits == bits and sm.draft_vocab == 256
             speculation(sm, tree_min_prob=0.0, tree_read="step")

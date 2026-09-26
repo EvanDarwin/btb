@@ -108,14 +108,9 @@ def NO_LOG(*a: object, **k: object) -> None:
 
 
 def need_cuda() -> str:
-    """the card's device name, or a skip. A cpu `load()` earlier in the session called `cpu_only()`, which clears
-    the package's flag and would send the test to the CPU without saying so; torch still holds the device, so
-    the flag is put back (conftest restores it after the test)."""
+    """the card's device name, or a skip"""
     if not torch.cuda.is_available():
         pytest.skip("no CUDA device")
-    import btb
-
-    btb.CUDA = True
     return "cuda"
 
 

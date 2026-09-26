@@ -56,17 +56,13 @@ if TYPE_CHECKING:
     from .engine.text import Chat, GenerateStats, Generation, Stream
     from .native_files import kernels_path, native_path, native_tag  # noqa: F401
 
-CUDA = True
-
 
 def cpu_only() -> bool:
     """
-    Disables CUDA, and additionally edits the env to hide any CUDA
-    devices from `torchao` to prevent it from automatically loading
-    its own CUDA context without consent.
+    Hides any CUDA device from torch (and from `torchao`, which would load its own CUDA context without
+    consent) for a CPU run: done before torch loads, and True then. Once torch has loaded it changes nothing and
+    returns False - the card torch holds stays there for a later load to name; a CPU load never takes it away.
     """
-    global CUDA
-    CUDA = False
     if "torch" in sys.modules:
         return False
     # torchao patch

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import os
 import platform
 import subprocess
 import sys
@@ -129,11 +130,10 @@ def resolve_device(device: Any) -> DeviceName:
     """The device a load runs on: None (or 'auto') picks the card when one is visible, else MLX on Apple
     silicon, else the CPU; a device named must exist here - 'mlx' off Apple silicon or 'cuda' without a card
     is an OptionError saying why and what to use, never a silent fall to the CPU. 'cuda:N' names a card."""
-    # the gate `btb.cpu_only()` closes lives in the package root, which must stay torch-free; read it live
-    from .. import CUDA
-
+    # what torch sees, and nothing else: `btb.cpu_only()` hides the card from torch before torch loads (so a CPU
+    # run never makes a CUDA context), and once torch holds the card a CPU load leaves it for the next load to name
     d = check_device(device)
-    card = CUDA and torch.cuda.is_available()
+    card = torch.cuda.is_available()
     if d is None:
         if card:
             return DeviceName(DeviceKind.CUDA)
@@ -148,8 +148,13 @@ def resolve_device(device: Any) -> DeviceName:
             return d
         raise BadDevice(d, f"{mlx_reason()}; --device {DeviceKind.CPU} runs here")
     if not card:
-        why = "the CPU was chosen (btb.cpu_only)" if not CUDA else "no CUDA device is visible to torch"
-        if CUDA and torch.version.cuda is None:
+        hidden = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip() == "-1"
+        why = (
+            "the card is hidden from torch (CUDA_VISIBLE_DEVICES=-1: a CPU run's `btb.cpu_only()`, or the caller's)"
+            if hidden
+            else "no CUDA device is visible to torch"
+        )
+        if not hidden and torch.version.cuda is None:
             why += f" (torch {torch.__version__} is a CPU build)"
         alt = (
             f"{DeviceKind.CPU}, or {DeviceKind.MLX}"
