@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -199,12 +200,37 @@ class Placement:
         return LayerTier.STREAMED
 
 
+@dataclass(eq=False)
+class _Loan:
+    """memory lent on a device of type `dev`: `nbytes`, for as long as what `ref` names lives - counted in the
+    reservations when the device's free reading cannot see it (`counted`); a room's tensor names its `room`"""
+
+    dev: str
+    nbytes: int
+    ref: weakref.ref[Any]
+    counted: bool
+    room: str | None = None
+
+
+@dataclass(eq=False)
+class _Hold:
+    """a room held on a device of type `dev`: `nbytes`, while the `Room` that `ref` names lives and is not released"""
+
+    dev: str
+    nbytes: int
+    ref: weakref.ref[Any]
+
+
 class Device:
     """The engine's placement and memory ledger. Placement is read through `snapshot()`; a pass that must
     not see it change takes it through `hold()`, and a change asked for meanwhile (`request`) waits at the
     boundary where the last holder lets go - a shed no longer moves a layer under a pass that is half way
     through it. Memory is read through `free()`, one arithmetic for the plan, the scheduler and the policy;
-    an epoch's KV is `reserve()`d so the policy does not count memory the batch is about to take as free."""
+    an epoch's KV is `reserve()`d so the policy does not count memory the batch is about to take as free.
+
+    What is lent (docs/lending.md) is read, not tallied: each loan holds a weak reference to what it lends for and
+    counts while that lives; a reading drops what has gone and counts it a return (`returns`, which only grows).
+    Every change is made under `lock`, which nothing re-enters: no code of btb's runs from a collection."""
 
     def __init__(self, sm: Any) -> None:
         self.sm = sm
@@ -212,9 +238,10 @@ class Device:
         self._holds = 0
         self._pending: list[tuple[str, Callable[[], Any]]] = []
         self._reserved: dict[str, tuple[str, int]] = {}
-        # the reservations' and the rooms': written by finalizers, on whatever thread lets a loan go
-        self.lock = threading.RLock()
-        self.returned = False  # lent memory came back since the lending policy last looked
+        self._loans: list[_Loan] = []
+        self._rooms: dict[str, _Hold] = {}
+        self._returns = 0
+        self.lock = threading.Lock()  # the reservations, the loans and the rooms
 
     # -- placement -----------------------------------------------------------------------------------------
 
@@ -334,8 +361,85 @@ class Device:
             self._reserved.pop(tag, None)
 
     def reserved(self, device: Any = None, but: str | None = None) -> int:
-        dev = self.sm.dev if device is None else torch_device(device)
+        """what is spoken for on `device` now: the reservations (all but `but`), the rooms held less what their
+        tensors take, and the lent tensors the device's free reading cannot see"""
+        t = (self.sm.dev if device is None else torch_device(device)).type
         with self.lock:
-            # a copy: a finalizer run by a collection mid-sum re-enters the lock on this thread
-            held = self._reserved.copy()
-        return sum(n for k, (t, n) in held.items() if t == dev.type and k != but)
+            self._settle()
+            n = sum(b for k, (d, b) in self._reserved.items() if d == t and k != but)
+            n += sum(ln.nbytes for ln in self._loans if ln.counted and ln.dev == t)
+            return n + sum(max(0, h.nbytes - self._used(tag)) for tag, h in self._rooms.items() if h.dev == t)
+
+    # -- loans: what is lent, while it lives -----------------------------------------------------------------
+
+    def lend(
+        self,
+        make: Callable[[], torch.Tensor],
+        nbytes: int,
+        device: Any,
+        counted: bool,
+        room: str | None = None,
+        limit: int = 0,
+    ) -> torch.Tensor | None:
+        """`make()`'s tensor entered as lent on `device`, `nbytes` of it (`counted` where the device's free reading
+        cannot see it) until its storage goes. Through a room, made only while the room is held and has `nbytes`
+        left of its `limit` - a ValueError once it is released, None when it is full"""
+        dev = torch_device(device).type
+        with self.lock:
+            self._settle()
+            if room is not None:
+                if room not in self._rooms:
+                    raise ValueError("this room was released: make another")
+                if self._used(room) + nbytes > limit:
+                    return None
+            t = make()
+            self._loans.append(_Loan(dev, int(nbytes), weakref.ref(t.untyped_storage()), counted, room))
+            return t
+
+    def hold_room(self, tag: str, room: Any, nbytes: int, device: Any) -> None:
+        """room held under `tag` on `device` while the object `room` lives and is not `let_go`"""
+        with self.lock:
+            self._rooms[tag] = _Hold(torch_device(device).type, max(0, int(nbytes)), weakref.ref(room))
+
+    def let_go(self, tag: str) -> None:
+        """a room held no longer (a return); nothing when it was let go already"""
+        with self.lock:
+            if self._rooms.pop(tag, None) is not None:
+                self._returns += 1
+
+    def room_held(self, tag: str) -> bool:
+        with self.lock:
+            self._settle()
+            return tag in self._rooms
+
+    def room_used(self, room: str) -> int:
+        """what a room's live tensors take"""
+        with self.lock:
+            self._settle()
+            return self._used(room)
+
+    @property
+    def returns(self) -> int:
+        """how many loans have come back since the model loaded: a count that only grows"""
+        with self.lock:
+            self._settle()
+            return self._returns
+
+    def refused(self) -> None:
+        """a refusal counted as a return: what making room shed on the way grows back once there is room"""
+        with self.lock:
+            self._returns += 1
+
+    def _used(self, room: str) -> int:
+        return sum(ln.nbytes for ln in self._loans if ln.room == room)
+
+    def _settle(self) -> None:
+        """under the lock: the loans and rooms that have gone dropped, each a return"""
+        live = [ln for ln in self._loans if ln.ref() is not None]
+        gone = len(self._loans) - len(live)
+        if gone:
+            self._loans = live
+        for tag in [k for k, h in self._rooms.items() if h.ref() is None]:
+            del self._rooms[tag]
+            gone += 1
+        self._returns += gone

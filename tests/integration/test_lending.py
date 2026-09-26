@@ -211,53 +211,22 @@ def test_the_grant_prices_what_rooms_hold_but_not_the_epochs_own_room(sm: Stream
             sm.device.release(EPOCH)
 
 
-class _Releasing(str):
-    """a device name whose comparison drops a room, as a finalizer on another thread can mid-read"""
-
-    room: Room | None = None
-
-    def __eq__(self, other: object) -> bool:
-        r, type(self).room = type(self).room, None
-        if r is not None:
-            r.release()
-        return str.__eq__(self, other)
-
-    __hash__ = str.__hash__
-
-
-def test_a_room_given_back_while_the_ledger_is_read_is_not_a_crash(sm: StreamedTextModel) -> None:
-    r = sm.room(MiB)
-    _Releasing.room = r
-    sm.device._reserved["reading"] = (_Releasing("cpu"), 0)
-    try:
-        assert sm.device.reserved("cpu") in (0, MiB)
-    finally:
-        sm.device.release("reading")
-    assert not r.held and sm.device.reserved("cpu") == 0
-
-
-def test_a_room_released_as_its_tensor_goes_holds_nothing_after(
-    sm: StreamedTextModel, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """a room tensor's finalizer re-holds the room's bytes as another thread releases the room: the release is the
-    last word, not a reservation nothing ever lets go"""
+@pytest.mark.parametrize("order", ["released first", "tensor first"])
+@pytest.mark.parametrize("where", ["here", "another thread"])
+def test_a_room_released_as_its_tensor_goes_holds_nothing_after(sm: StreamedTextModel, order: str, where: str) -> None:
+    """whichever goes first, the room's release or its tensor, and on whichever thread: the room holds nothing
+    after, and the tensor's bytes are nobody's (docs/lending.md: nothing is re-held when a tensor goes)"""
     r = sm.room(4 * MiB)
-    t = r.zeros(MiB, dtype=torch.uint8)
-    reserve = sm.device.reserve
-    other: list[threading.Thread] = []
-
-    def racing(tag: str, nbytes: int, device: object = None) -> None:
-        if tag == r._loan and not other:
-            other.append(threading.Thread(target=r.release))
-            other[0].start()
-            other[0].join(0.3)
-        reserve(tag, nbytes, device)
-
-    monkeypatch.setattr(sm.device, "reserve", racing)
-    del t
-    gc.collect()
-    other[0].join()
-    assert not r.held and sm.device.reserved("cpu") == 0
+    held = [r.zeros(MiB, dtype=torch.uint8)]
+    steps = [r.release, lambda: let_go(held)]
+    for step in steps if order == "released first" else steps[::-1]:
+        if where == "here":
+            step()
+        else:
+            th = threading.Thread(target=step)
+            th.start()
+            th.join()
+    assert not r.held and r.used == 0 and sm.device.reserved("cpu") == 0
 
 
 def test_two_threads_filling_a_room_never_take_more_than_it_holds(
@@ -446,10 +415,8 @@ def test_a_layer_move_reaches_every_live_cache() -> None:
 def test_a_rooms_tensor_btb_cannot_see_stays_counted_after_the_room_goes(sm: StreamedTextModel, gone: str) -> None:
     """where btb's free reading cannot see torch's allocations (MLX's ledger) a room's tensor is counted by the room;
     the room released or dropped while the tensor lives, the tensor is still counted until it is gone"""
-    tag = "unseen#1"
     base = sm.device.reserved("cpu")
-    sm.device.reserve(tag, 4 * MiB, "cpu")
-    r = Room(sm.device, tag, 4 * MiB, torch.device("cpu"), False, sm)
+    r = Room(sm.device, "unseen#1", 4 * MiB, torch.device("cpu"), False, sm)
     t = r.empty(MiB, dtype=torch.uint8)
     assert sm.device.reserved("cpu") - base == 4 * MiB
     if gone == "released":
