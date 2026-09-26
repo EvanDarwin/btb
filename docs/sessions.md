@@ -45,9 +45,9 @@ are the states after `ids`. Everything below exists to keep it.
 Every change goes through one primitive, under the decode lock:
 
 ```python
-with session._txn(eng) as t:     # the rollback point: len(ids), the state, recurrent states, drafter length
-    ...                          # passes append to the cache past the rollback point; nothing else is touched
-    t.commit(appended, state)    # the only write of ids and state; anchors and the drafter with them
+with session._txn(eng) as t:  # the rollback point: len(ids), the state, recurrent states, drafter length
+    ...  # passes append to the cache past the rollback point; nothing else is touched
+    t.commit(appended, state)  # the only write of ids and state; anchors and the drafter with them
 # left without commit - an exception, a hook raising, memory refused, an abort - and the cache is cut back to the
 # rollback point, the recurrent states and the drafter restored, the state as it was
 ```
