@@ -284,3 +284,36 @@ def test_the_prefill_lookahead_never_takes_the_calls_own_slots() -> None:
             assert not (set(store.ring) & held), (sorted(set(store.ring) & held), made)
     finally:
         sm.close()
+
+
+@pytest.mark.parametrize("fx", ["tiny_q4", "tiny_gpt_oss"])
+def test_the_lookahead_finds_each_familys_router(fx: str) -> None:
+    """the store reads the next layer's routing off its router whatever the family names it - Qwen's `mlp.gate`,
+    gpt-oss's `mlp.router` with its bias - and so predicts on both (on gpt-oss it once found none and read nothing)"""
+    L = layer_count(fixture(fx))
+    StreamedTextModel.register_attention()
+    sm = StreamedTextModel(
+        fixture(fx),
+        resident_head=True,
+        log=NO_LOG,
+        device="cpu",
+        cpu_layers=range(L),
+        prefill_chunk=3,
+        compute_dtype=torch.float32,
+    )
+    try:
+        with torch.inference_mode():
+            sm._prefill(torch.tensor([_prompt() if fx == "tiny_q4" else list(range(3, 23))]), sm.new_cache())
+            store = sm.expert_store
+            assert store is not None
+            wb = store._router(1)
+            assert wb is not None, "no router found for layer 1"
+            w, bias = wb
+            if fx == "tiny_gpt_oss":
+                assert bias is not None, "gpt-oss's router bias was not read"
+            for key in [k for k, _s in list(store.res.items()) if k[0] == 1]:
+                store.res.pop(key)  # layer 1's experts off the store: something to predict
+            made = store.lookahead(0, torch.randn(4, int(sm.cfg.hidden_size)), sweep=4)
+            assert made > 0, "the lookahead predicted nothing"
+    finally:
+        sm.close()

@@ -1203,7 +1203,8 @@ class _ExpertStore:
     # -- the Timetable: the next layers' routers run on this layer's input, their picks read ahead into the ring --
 
     def _router(self, layer: int) -> Any:
-        """the router weight of `layer` where the layer's module lives (the card, or the host), None without one"""
+        """the router of `layer` where the layer's module lives (the card, or the host), as (weight, bias or None);
+        None without one. Qwen's is `mlp.gate`, gpt-oss's `mlp.router` (with a bias its logits add)"""
         mod = None
         for tier in ("resident", "host"):
             mod = (getattr(self.sm, tier, None) or {}).get(layer)
@@ -1212,10 +1213,17 @@ class _ExpertStore:
         hit = self._routers.get(layer)
         if hit is not None and hit[0] is mod:  # the layer's module as of the last call (a shed layer moves)
             return hit[1]
-        gate = getattr(getattr(mod, "mlp", None), "gate", None) if mod is not None else None
-        w = getattr(gate, "weight", None)
-        self._routers[layer] = (mod, w)
-        return w
+        mlp = getattr(mod, "mlp", None) if mod is not None else None
+        gate = getattr(mlp, "gate", None) or getattr(mlp, "router", None)
+        # the router's own linear: the module itself (Qwen's), or the one btb wraps it around (gpt-oss's `_Router`)
+        lin = None
+        if gate is not None:
+            lin = next((m for m in gate.modules() if isinstance(getattr(m, "weight", None), torch.Tensor)), None)
+        w = getattr(lin, "weight", None)
+        b = getattr(lin, "bias", None)
+        wb = (w, b if isinstance(b, torch.Tensor) and b.numel() else None) if isinstance(w, torch.Tensor) else None
+        self._routers[layer] = (mod, wb)
+        return wb
 
     def _ring_slot(self, sched: Any, cap: int | None = None, skip: Any = ()) -> Any:
         """a slot for a new prediction: the ring grows to `ring_n` slots (a sweep's `cap`) out of the store's free
@@ -1291,8 +1299,8 @@ class _ExpertStore:
             target = layer + d
             if k <= 0 or target >= int(self.sm.L):
                 break
-            w = self._router(target)
-            if w is None:
+            wb = self._router(target)
+            if wb is None:
                 continue
             base = self.recipes.get(target)
             if base is None:
@@ -1306,7 +1314,10 @@ class _ExpertStore:
             else:
                 parts = base
             with torch.no_grad():
-                logits = torch.matmul(h.reshape(-1, h.shape[-1]).to(w.device, w.dtype), w.T)
+                w, bias = wb
+                logits = torch.nn.functional.linear(
+                    h.reshape(-1, h.shape[-1]).to(w.device, w.dtype), w, None if bias is None else bias.to(w.dtype)
+                )
                 kk = min(int(k), logits.shape[-1])
                 if logits.shape[0] == 1:
                     picks = torch.topk(logits[0], kk).indices.tolist()
