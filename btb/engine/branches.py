@@ -8,7 +8,7 @@ from __future__ import annotations
 import copy
 import time
 from abc import abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Self, overload
 
@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
     from ..session import Session
     from .cache import CacheLayer, KvCache
-    from .generate import LinSnap
+    from .generate import LinLayer, LinSnap
     from .model import StreamedTextModel
     from .text import BatchGeneration
 
@@ -228,6 +228,58 @@ class _Rows:
         B = len(toks)
         if self.mode == "card" and not eng._card_rows_ok(B, cache):
             self._off_card()
+        # one step is one transaction over the rows: a pass failing part way leaves every row where the step began
+        undo = self._point(cache)
+        try:
+            return self._step_rows(cache, toks, taps, host)
+        except BaseException:
+            for u in undo:
+                u()
+            raise
+
+    def _point(self, cache: KvCache) -> list[Callable[[], None]]:
+        """what puts the rows back where they stand now: each layer's own step count (the rows past it are the step's
+        to write), a batch's padding mask, and a hybrid's recurrent states (copies: the pass writes them in place)"""
+        eng = self.eng
+        undo: list[Callable[[], None]] = []
+        for i, cl in enumerate(cache.layers):
+            if eng.layer_types[i] == LayerKind.LINEAR:
+                lin = lin_layer(cl)
+                snap = eng._lin_snap(lin)
+
+                def states(lin: LinLayer = lin, snap: LinSnap = snap) -> None:
+                    eng._lin_restore(lin, snap)
+
+                undo.append(states)
+            elif isinstance(cl, ForkLayer):
+                t0, ti0 = cl._t, getattr(cl, "_ti", None)
+
+                def cut(cl: ForkLayer = cl, t0: int = t0, ti0: torch.Tensor | None = ti0) -> None:
+                    cl._t, cl._cat = t0, None
+                    if isinstance(cl, ForkIndexedLayer):
+                        cl._ti = ti0
+
+                undo.append(cut)
+            elif isinstance(cl, CardRowsLayer):
+                # the card's rows pass counts a step only once its replay is through; cut back all the same
+                def steps(cl: CardRowsLayer = cl, t0: int = cl._t) -> None:
+                    cl._t = t0
+
+                undo.append(steps)
+            elif isinstance(cl, GrowLayer) and cl._ns is not None:
+                t0, ns0, n0 = cl._t, list(cl._ns), cl._n
+
+                def back(cl: GrowLayer = cl, t0: int = t0, ns0: list[int] = ns0, n0: int = n0) -> None:
+                    cl._t, cl._ns, cl._n = t0, list(ns0), n0
+
+                undo.append(back)
+        am = self._am
+        undo.append(lambda: setattr(self, "_am", am))
+        return undo
+
+    def _step_rows(self, cache: KvCache, toks: list[int], taps: Sequence[int], host: bool) -> tuple[torch.Tensor, Taps]:
+        """`_advance`'s pass, on the path the rows take"""
+        eng, B = self.eng, len(toks)
         eng._tag({"rows": PassTag.ROWS_FLAT, "card": PassTag.ROWS_CARD}.get(self.mode, PassTag.ROWS_JOINED))
         if self.mode == "card":
             lg, tapped = eng._card_rows_step(cache, toks, tuple(taps))

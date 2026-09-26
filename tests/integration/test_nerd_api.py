@@ -16,6 +16,7 @@ import torch
 from transformers.cache_utils import CacheLayerMixin
 
 from btb.engine import StreamedTextModel
+from btb.engine.branches import Batch, Branches
 from btb.engine.hooks import HookArgs, PassStats
 from btb.kinds import LayerKind, Proposer
 from btb.sampling import Sampling
@@ -771,6 +772,40 @@ def failing_pass(sm: StreamedTextModel, at: int) -> Iterator[None]:
         yield
     finally:
         sm.device.run_layer = run  # type: ignore[method-assign]
+
+
+@families
+@pytest.mark.parametrize("rows", ["fork", "batch"])
+def test_a_rows_step_failing_part_way_is_as_if_it_never_ran(stem: str, rows: str) -> None:
+    """a fork's or a batch's step failing after some layers took the rows' new tokens: every row is cut back to where
+    the step began - the same step again gives each row its own step's logits, and the rows go on and write back
+    as if the failed step had never run"""
+    sm = model(stem, "cpu")
+    if rows == "fork":
+        s = sm.session(PROMPT)
+        rs: Branches | Batch = s.fork(2)
+        firsts = [PROMPT, PROMPT]
+    else:
+        a, b = sm.session(PROMPT), sm.session(OTHER)
+        rs = sm.batch([a, b])
+        firsts = [PROMPT, OTHER]
+    rs.step([1, 2])
+    with pytest.raises(Boom), failing_pass(sm, sm.L - 1):
+        rs.step([3, 4])
+    assert rs.rows == [[1], [2]] and rs.logits is not None
+    lg = rs.step([3, 4])
+    for r, (p, toks) in enumerate(zip(firsts, ([1, 3], [2, 4]), strict=True)):
+        close(lg[r], sm.session(p + toks[:-1]).feed(toks[-1:])[-1], "cpu")
+    if rows == "fork":
+        assert isinstance(rs, Branches)
+        kept = rs.keep(1)
+        assert kept.tokens == PROMPT + [2, 4]
+        in_step(sm, kept)
+    else:
+        rs.close()
+        assert a.tokens == PROMPT + [1, 3] and b.tokens == OTHER + [2, 4]
+        in_step(sm, a)
+        in_step(sm, b)
 
 
 @families

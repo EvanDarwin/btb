@@ -21,6 +21,7 @@ import pytest
 import torch
 
 from btb.engine import StreamedTextModel
+from btb.engine.branches import Batch, Branches
 from btb.kinds import LayerKind
 from btb.session import Mark, Session, State
 from tests.cert import spec
@@ -195,6 +196,22 @@ class Walk:
             return
         assert self.s.tokens == before + list(g.tokens)
 
+    def rows_step(self, rs: Branches | Batch, toks: list[int]) -> None:
+        """a step of a fork's or a batch's rows, failing part way a third of the time: then the rows are as before
+        (the tokens they hold, pending or not) and the same step is taken again"""
+        at = self.fault()
+        if at is not None:
+            rows, pend = [list(r) for r in rs.rows], rs.pending
+            self.log.append(f"step!{at}")
+            try:
+                with failing(self.sm, at):
+                    rs.step(toks)
+            except Boom:
+                assert [list(r) for r in rs.rows] == rows and rs.pending == pend, "a failed step moved the rows"
+            else:
+                return
+        rs.step(toks)
+
     def fork(self) -> None:
         if not len(self.s):
             return
@@ -204,9 +221,13 @@ class Walk:
         assert self.s.state is State.LENT
         with pytest.raises(ValueError, match="forked"):
             self.s.feed([1])
-        br.step(self.toks(n, n))
+        self.rows_step(br, self.toks(n, n))
         if self.rng.random() < 0.5:
-            br.generate(self.rng.randint(1, 3), eos=())
+            at = self.fault()
+            self.log.append(f"rows-generate{'!' + str(at) if at else ''}")
+            # a failed step inside leaves every row its draws so far, the last pending: the rows go on from there
+            with contextlib.suppress(Boom), failing(self.sm, at):
+                br.generate(self.rng.randint(1, 3), eos=())
         if n > 1 and self.rng.random() < 0.3:
             br.leave(self.rng.randrange(n))
         how = self.rng.choice(["keep", "close", "drop"])
@@ -234,14 +255,14 @@ class Walk:
         if how == "drop":
             bt = self.sm.batch([self.s, other])
             assert self.s.state is State.LENT
-            bt.step(picks)
+            self.rows_step(bt, picks)
             del bt
             gc.collect()
             assert self.s.tokens == before, "a batch dropped unclosed wrote a row back"
             return
         with contextlib.suppress(Boom), self.sm.batch([self.s, other]) as bt:
             assert self.s.state is State.LENT
-            bt.step(picks)
+            self.rows_step(bt, picks)
             if how == "raise":
                 raise Boom("inside the batch")
         assert self.s.tokens == before + picks[:1]

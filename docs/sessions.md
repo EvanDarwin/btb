@@ -92,7 +92,11 @@ returned exactly one way, whatever returns it:
 
 The `Branches`/`Batch` keeps its own rows (a fork's copy, the MLX alias of the parent's buffer, the card's arena)
 and never writes the session's fields; a commit is the only way rows reach a session. Its own `step`/`generate` are
-transactions over its rows: a pass failing part way cuts every row back to where the step began.
+transactions over its rows: a pass failing part way cuts every row back to where the step began. The rows' point
+is each layer's own step count (a fork's tail, the card arena's steps - which its pass counts only once a replay is
+through - MLX's per-row lengths), a batch's padding mask, and a hybrid's recurrent states. Those are copied once a
+step until step 3: rows with recurrent layers run on the torch fork path only (the MLX and card rows passes take
+dense families), so the copy is that path's alone.
 
 ## What this settles
 
