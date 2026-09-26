@@ -457,16 +457,21 @@ DRAIN_S = 0.5  # how long a turned-away connection's remaining request is read a
 _DRAINS = threading.BoundedSemaphore(16)  # turned-away connections draining at once
 
 
-def _drain(request: socket.socket) -> None:
-    """read and discard what a turned-away peer is still sending, until it closes or DRAIN_S is up, then close"""
+def _discard(request: socket.socket) -> None:
+    """read and discard what a refused peer is still sending, until it closes or DRAIN_S is up: a socket closed
+    over unread request bytes resets the connection, and the peer loses the answer it has not read yet"""
     deadline = time.monotonic() + DRAIN_S
-    try:
+    with contextlib.suppress(OSError):
         while (left := deadline - time.monotonic()) > 0:
             request.settimeout(left)
             if not request.recv(1 << 16):
                 break
-    except OSError:
-        pass
+
+
+def _drain(request: socket.socket) -> None:
+    """a turned-away peer's rest discarded, then the socket closed"""
+    try:
+        _discard(request)
     finally:
         with contextlib.suppress(OSError):
             request.close()
@@ -901,8 +906,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self._send_body(body)
-            return
-        self._json(e.code, {"error": str(e)})
+        else:
+            self._json(e.code, {"error": str(e)})
+        # the answer out and our side closed, the unread body is let arrive before the socket closes: closed over
+        # it, the connection resets and the client can lose the answer (on Windows it reliably does)
+        with contextlib.suppress(OSError):
+            self.wfile.flush()
+            self.connection.shutdown(socket.SHUT_WR)
+        _discard(self.connection)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("[serve] " + (fmt % args) + "\n")
