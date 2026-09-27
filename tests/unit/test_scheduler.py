@@ -1567,6 +1567,52 @@ def test_a_store_below_a_calls_experts_serves_it_in_waves(monkeypatch: MonkeyPat
     assert served == ids, "every expert once, in ascending order"
 
 
+def test_a_cold_store_on_a_tight_machine_serves_a_call_in_waves(monkeypatch: MonkeyPatch) -> None:
+    """a store that has grown nothing yet, on a machine with room for a few slots, serves a long prompt's call in
+    waves of what it can seat. Its first wave was sized to what the room holds without the two slots' slack a
+    growth keeps, the growth for the whole wave failed, and the call was refused with the room for most of it
+    free: a 120B's cold 4096-token prefill died at its first layer"""
+    route = FakeRoute()
+    st, _sm = expert_store(monkeypatch, route, n_layers=2, n_experts=16)
+    per = st.per
+    assert per is not None
+    room = 5  # slots the machine holds above the margin, the store's own included
+    monkeypatch.setattr(st, "_host_free", lambda: st.margin + (room - st.live()) * per)
+    assert st.live() == 0
+    ids = list(range(14))
+    served: list[int] = []
+    rest, first = ids, True
+    while rest:
+        ready, pending, left = st.get_some(0, "layers.0.mlp.experts.", rest, rows=4096, first=first)
+        wave = sorted([*ready, *(e for e, _f, _s in pending)])
+        assert wave == rest[: len(wave)] and wave, f"a wave is a prefix of what is left: {wave} of {rest}"
+        assert st.live() <= room
+        for e in wave:
+            route.land((0, e))
+        served += wave
+        rest, first = left, False
+    assert served == ids, "every expert once, in ascending order"
+
+
+def test_closing_a_store_lets_every_block_go(monkeypatch: MonkeyPatch) -> None:
+    """`close` gives the store's blocks back whole - residents, free seats and the lookahead's ring alike - once
+    every read into them has landed; the store holds no slot afterwards"""
+    route = FakeRoute()
+    st, _sm = expert_store(monkeypatch, route, n_layers=2, n_experts=8)
+    assert st.per is not None
+    st.block_max = 3 * st.per
+    st._grow(3)
+    st._grow(3)
+    _ready, pending = st.get(0, "layers.0.mlp.experts.", [0, 1, 2], rows=1)
+    for e, _f, _s in pending:
+        route.land((0, e))
+    bufs = [weakref.ref(buf) for buf, _ids in st.blocks.values()]
+    assert len(bufs) == 2
+    st.close()
+    assert st.live() == 0 and not st.res and not st.slot_of and not st.free
+    assert all(b() is None for b in bufs), "a closed store's block is still held"
+
+
 def test_a_prediction_with_a_part_in_flight_is_never_withdrawn_in_part(monkeypatch: MonkeyPatch) -> None:
     """an expert is read as several parts: a prediction that lapses with one of them already in flight is left to
     land whole - no part withdrawn - and a later call that asks for it waits for every part. Withdrawn in part, the

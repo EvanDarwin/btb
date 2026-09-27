@@ -7,6 +7,7 @@ import os
 import sys
 import threading
 import time
+import weakref
 from collections import OrderedDict
 from collections.abc import Sequence
 from concurrent.futures import FIRST_COMPLETED
@@ -721,6 +722,12 @@ class VramSeats:
             self.free.append(j)
 
 
+def _line_size(store: _ExpertStore | None) -> int:
+    """the store's line as its residency policy sizes it: the live slots less the lookahead's ring (none once the
+    store is gone)"""
+    return 0 if store is None else store.live() - len(store.ring)
+
+
 class _ExpertStore:
     # a block of slots is at most this many bytes, so a shortfall under the reserve gives back a block's worth
     # and not the gigabytes of a first growth; and the store grows only `margin` above the reserve (a quarter
@@ -786,7 +793,10 @@ class _ExpertStore:
         # the model with no default of its own: a model built without a policy must fail, not run the wrong one
         bp = os.environ.get("BTB_BUS_PASS")
         bus_pass = bool(int(bp)) if bp not in (None, "") else bool(sm.bus_pass)
-        self.res = (BusPass if bus_pass else Riders)(lambda: self.live() - len(self.ring))
+        # the line's size read through a weak reference: a closure holding the store would make it a cycle, left
+        # with its gigabytes to the collector's next full pass once the engine lets it go
+        me = weakref.ref(self)
+        self.res = (BusPass if bus_pass else Riders)(lambda: _line_size(me()))
         self.res_tag = PassTag.EXPERT_BUS_PASS if bus_pass else PassTag.EXPERT_LINE
         self.lru = self.res.t1
         # the depot's pages held in RAM (`store_pin`, BTB_STORE_PIN over it: 0 pageable, 1 pinned, "auto" pinned
@@ -863,6 +873,25 @@ class _ExpertStore:
 
     def live(self) -> int:
         return sum(len(ids) for _, ids in self.blocks.values())
+
+    def close(self) -> None:
+        """The store given back whole: its readers stopped, every read still writing into a slot settled, then its
+        blocks, its card seats and every record of what sat where let go. The engine's `close` calls it after the
+        drive's readers are stopped; the store is unusable afterwards."""
+        self.pool.shutdown(wait=True)
+        for a in self.ahead.values():
+            a["parts"].settle()  # a prediction's part in flight still writes into its slot
+        self.ahead.clear()
+        self.blocks.clear()
+        self.shared.clear()
+        self.vram = None
+        self.res = (type(self.res))(lambda: 0)
+        self.lru = self.res.t1
+        self.ring, self.free, self.parked = [], [], []
+        self.slot_of.clear()
+        self.slot_delta.clear()
+        self.last_slots.clear()
+        self.n_slots = 0
 
     def _grow(self, need: int) -> Any:
         assert self.per is not None  # the store is sized before this runs
@@ -1638,7 +1667,8 @@ class _ExpertStore:
         if not misses:
             return len(ids)
         assert self.per is not None  # sized by the recipe before any call
-        growable = max(0, min(int(self.n_slots) - self.live(), (self._host_free() - self.margin) // int(self.per)))
+        # what a growth can make of the room above the margin: it keeps two slots' slack (`_grow`)
+        growable = max(0, min(int(self.n_slots) - self.live(), (self._host_free() - self.margin) // int(self.per) - 2))
         landed = 0
         for s in self.ring:
             a = next((x for x in self.ahead.values() if x["slot"] == s), None)
@@ -1745,8 +1775,12 @@ class _ExpertStore:
             self._grow(len(todo) - len(self.free))
         while self.live() < len(todo):
             if not self._grow(len(todo) - self.live()):
+                # short of the whole shortfall a wave takes one block of what the machine holds, and stops where
+                # the seats run out; a whole call raises
+                if wave and self._grow(1):
+                    continue
                 if wave:
-                    break  # the seats there are: the wave stops where they run out
+                    break
                 raise RuntimeError(
                     f"[experts] one call needs {len(todo)} experts and the machine has no room "
                     f"above the {self.reserve / 2**30:.1f} GB reserve ({self._host_line()})"

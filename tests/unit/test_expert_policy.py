@@ -6,7 +6,9 @@ which is the bug this pins: assigned after the load they never applied, and ever
 
 from __future__ import annotations
 
+import gc
 import types
+import weakref
 
 import pytest
 import torch
@@ -82,3 +84,33 @@ def test_a_model_with_no_policy_is_refused() -> None:
     for attrs in ({"store_pin": 0}, {"bus_pass": True}):
         with pytest.raises(AttributeError):
             _store(**attrs)
+
+
+@pytest.mark.parametrize("bus_pass", [True, False])
+def test_a_store_nothing_holds_is_freed_at_once(bus_pass: bool) -> None:
+    """a store is freed when its last reference goes, not at the collector's next full pass: its residency policy
+    reads the store's size through a weak reference. Held by a closure the store was a cycle, and an engine closed
+    but still bound (a caller's `with`) left its gigabytes to the collector"""
+    st = _store(bus_pass=bus_pass, store_pin=0)
+    gone = weakref.ref(st)
+    was = gc.isenabled()
+    gc.disable()
+    try:
+        del st
+        assert gone() is None, "the store outlived its last reference: something in it holds it in a cycle"
+    finally:
+        if was:
+            gc.enable()
+
+
+def test_closing_the_engine_lets_the_store_go() -> None:
+    """`close` gives the expert store's blocks back itself: after a `with` the engine is still bound in the
+    caller's code, and the store's gigabytes must not stay with it"""
+    with loaded_model(fixture(MOE), device="cpu") as sm:
+        sm.generate([1, 2, 3, 4], 4, speculate=False)
+        store = sm.expert_store
+        assert store is not None and store.blocks, "the store never grew a block"
+        bufs = [weakref.ref(buf) for buf, _ids in store.blocks.values()]
+        del store
+    assert sm.expert_store is None
+    assert all(b() is None for b in bufs), "the closed engine's store blocks are still held"

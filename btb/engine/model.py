@@ -602,6 +602,10 @@ class StreamedTextModel(
             self.cold_ring.slots, self.cold_ring.shared = [], None
             self.mlx_state.weights = {}
             self.mlx.close()
+        if store is not None:
+            # the store's blocks let go here (after MLX's arrays over them), not when its last reference goes: a
+            # caller's `with` leaves the engine bound, and the store's gigabytes with it
+            store.close()
         # the pool's blocks go back whole: the next model this process loads reads into touched memory
         for sh in self.mlx_state.pool_blocks:
             _pool.POOL.give(sh)
@@ -628,6 +632,9 @@ class StreamedTextModel(
         self.gguf = None
         if self.dev.type == DeviceKind.CUDA:
             torch.cuda.empty_cache()
+            # and the pinned host buffers torch caches after the engine's staging let them go: on Windows each
+            # pinned byte holds the machine's commit until it is given back
+            torch._C._host_emptyCache()
 
     def new_cache(self, max_len: int | None = None) -> Any:
         from transformers.cache_utils import DynamicCache, DynamicLayer
