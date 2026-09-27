@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import os
 import sys
 import threading
@@ -176,6 +175,15 @@ class Parts:
     def result(self) -> None:
         for f in self.futs:
             f.result()
+
+    def settle(self) -> None:
+        """every part finished, landed or withdrawn: a part in flight is waited for even after another was
+        cancelled (`result` stops at the first cancelled one, while the rest still write into the slot). A
+        withdrawn part never runs (only queued reads withdraw), and `concurrent.futures.wait` never counts a future
+        cancelled by hand as done: each part not withdrawn is waited on itself, its failure left to its reader"""
+        for f in self.futs:
+            if not f.cancelled():
+                f.exception()
 
     def done(self) -> bool:
         return all(f.done() for f in self.futs)
@@ -1444,7 +1452,7 @@ class _ExpertStore:
             if old is not None:
                 parts = self.ahead[old]["parts"]
                 if not parts.done() and sched is not None and hasattr(sched, "disk_drop"):
-                    sched.disk_drop(old)  # a queued read withdrawn; one in flight is left to land
+                    sched.disk_drop(old, whole=True)  # withdrawn whole, or left to land whole (`_lapsed`)
                 if not parts.done():
                     continue
                 del self.ahead[old]
@@ -1559,8 +1567,9 @@ class _ExpertStore:
                 parts = self.ahead.pop(old)["parts"]
                 if sched is not None and hasattr(sched, "disk_drop"):
                     sched.disk_drop(old)
-                with contextlib.suppress(Exception):  # a withdrawn read's future is cancelled: nothing lands
-                    parts.result()
+                # its reads withdrawn or landed before the slot is anyone else's: a part already in flight still
+                # writes into it
+                parts.settle()
                 self.stat["ahead_dropped"] += 1
             self.free.append(s)
 
@@ -1573,10 +1582,12 @@ class _ExpertStore:
             if a["parts"].done():
                 continue
             if sched is not None and hasattr(sched, "disk_drop"):
-                sched.disk_drop(key)
+                # withdrawn whole or not at all: an expert with a part in flight is left to land entire - its
+                # record stays, promoted whole if a later call asks for it, and `_ring_slot` passes its slot
+                # over until then; a part withdrawn beside one that lands would leave the slot a mix of two
+                # experts that reads as landed
+                sched.disk_drop(key, whole=True)
             if not a["parts"].done():
-                # a part is in flight (only queued reads withdraw): the record stays, so `_ring_slot` sees the
-                # slot is still being written and passes it over until the read lands
                 continue
             del self.ahead[key]
             self.stat["ahead_dropped"] += 1

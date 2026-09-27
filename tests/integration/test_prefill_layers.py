@@ -473,3 +473,88 @@ def test_a_depot_opened_up_front_grows_to_a_layers_seats_as_far_as_the_ledger_le
         assert depot.open_at(form, 128) == 2 * LayerDepot.BLOCK, "opened already: nothing more taken"
     finally:
         depot.close()
+
+
+def test_a_sweep_under_store_pressure_is_the_chunks_bits() -> None:
+    """the store held to a little past a layer's experts, the read-ahead free to take half of it: the sweep's
+    predictions, the evictions they make and the slots they recycle must never land in bytes a call is about to
+    multiply - the layer-by-layer prefill stays the chunked one's, bit for bit, at every store size (a read-ahead
+    that did once collapsed a 120B's routing to a handful of experts, and no roomy store here showed it)"""
+    L = layer_count(fixture("tiny_q4"))
+    kw: dict[str, Any] = {"device": "cpu", "cpu_layers": range(L), "prefill_chunk": 3}
+    ids = _prompt(24)
+    ref, ref_cache, _log = _prefill(False, ids, **kw)
+    StreamedTextModel.register_attention()
+    sm = StreamedTextModel(fixture("tiny_q4"), resident_head=True, log=NO_LOG, compute_dtype=torch.float32, **kw)
+    try:
+        sm.prefill_layers = True
+        with torch.inference_mode():
+            sm._prefill(torch.tensor([ids]), sm.new_cache())  # the store sized, its layout read
+            store = sm.expert_store
+            assert store is not None and store.per is not None
+            n_exp = int(sm.n_experts)
+            for n_slots in (n_exp + 2, n_exp + 4, 2 * n_exp):
+                for key, s in list(store.res.items()):
+                    store.res.pop(key)
+                    store.free.append(s)
+                store.n_slots = max(n_slots, store.live())
+                store.ring_n = n_slots // 2
+                cache = sm.new_cache()
+                got = sm._prefill(torch.tensor([ids]), cache)[0, -1].float().cpu()
+                assert torch.equal(got, ref), f"{n_slots} slots: logits part by {float((got - ref).abs().max()):.3e}"
+                for name, t in _tensors(cache):
+                    want = ref_cache[name]
+                    assert torch.equal(t.float().cpu(), want), f"{n_slots} slots: {name} parts"
+    finally:
+        sm.close()
+
+
+@pytest.mark.parametrize("layout", ["host layers on the card pass", "every layer resident"])
+def test_a_card_sweep_under_store_pressure_is_the_chunks_bits(monkeypatch: pytest.MonkeyPatch, layout: str) -> None:
+    """the store under the same pressure, the chunks' experts on the card's grouped path through the depot: the
+    read-ahead's reads, the depot's uploads out of the store's slots and the store's evictions never cross - the
+    sweep stays the chunked prefill's, bit for bit"""
+    dev = need_cuda()
+    from btb.engine.native import Native
+
+    L = layer_count(fixture("tiny_q4"))
+    StreamedTextModel.register_attention()
+    monkeypatch.setattr(Native, "gemm_rows", 2)
+    place: dict[str, Any] = (
+        {"cpu_layers": range(L - 2), "resident_layers": range(L - 2, L)}
+        if layout.startswith("host")
+        else {"resident_layers": range(L)}
+    )
+    kw: dict[str, Any] = {
+        "device": dev,
+        **place,
+        "prefill_card": True,
+        "prefill_card_min": 1,
+        "prefetch": True,
+        "compute_dtype": torch.bfloat16,
+        "prefill_chunk": 3,
+    }
+    ids = _prompt(24)
+    ref, ref_cache, _log = _prefill(False, ids, **kw)
+    sm = StreamedTextModel(fixture("tiny_q4"), resident_head=True, log=NO_LOG, **kw)
+    try:
+        sm.prefill_layers = True
+        with torch.inference_mode():
+            sm._prefill(torch.tensor([ids]), sm.new_cache())
+            store = sm.expert_store
+            if store is None or store.per is None:
+                pytest.skip("no expert went through the store in this layout")
+            n_exp = int(sm.n_experts)
+            for n_slots in (n_exp + 2, n_exp + 4, 2 * n_exp):
+                for key, s in list(store.res.items()):
+                    store.res.pop(key)
+                    store.free.append(s)
+                store.n_slots = max(n_slots, store.live())
+                store.ring_n = n_slots // 2
+                cache = sm.new_cache()
+                got = sm._prefill(torch.tensor([ids]), cache)[0, -1].float().cpu()
+                assert torch.equal(got, ref), f"{n_slots} slots: logits part by {float((got - ref).abs().max()):.3e}"
+                for name, t in _tensors(cache):
+                    assert torch.equal(t.float().cpu(), ref_cache[name]), f"{n_slots} slots: {name} parts"
+    finally:
+        sm.close()

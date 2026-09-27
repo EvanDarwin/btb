@@ -400,6 +400,7 @@ class FakeRoute:
         self.reads: list[Json] = []
         self.dropped: list[object] = []
         self.slow = False  # what `disk_slow` reports: a test turns it on and off
+        self.started: set[int] = set()  # the reads a reader has taken: in flight, past withdrawing
 
     def disk(self, path: str) -> Json:
         return {}
@@ -433,11 +434,19 @@ class FakeRoute:
         )
         return f
 
-    def disk_drop(self, key: object) -> int:
+    def start(self, key: object, parts: int = 1) -> None:
+        """the first `parts` reads of `key` taken by a reader: in flight, a withdrawal leaves them to land"""
+        mine = [i for i, r in enumerate(self.reads) if r["key"] == key and not r["future"].done()]
+        self.started.update(mine[:parts])
+
+    def disk_drop(self, key: object, whole: bool = False) -> int:
+        mine = [i for i, r in enumerate(self.reads) if r["key"] == key and not r["future"].done()]
+        if whole and any(i in self.started for i in mine):
+            return 0
         n = 0
-        for r in self.reads:
-            if r["key"] == key and not r["future"].done():
-                r["future"].cancel()
+        for i in mine:
+            if i not in self.started:
+                self.reads[i]["future"].cancel()
                 n += 1
         self.dropped.append(key)
         return n

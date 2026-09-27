@@ -1062,12 +1062,17 @@ class BatchScheduler:
             st["cv"].notify()
         return r["future"]
 
-    def disk_drop(self, key: Any) -> int:
+    def disk_drop(self, key: Any, whole: bool = False) -> int:
         """Withdraw every queued read of `key` (a prediction that lapsed): their futures are cancelled; a read
-        already in flight completes. Returns how many were withdrawn."""
+        already in flight completes. With `whole`, only where none of the key's reads has started - an expert
+        read as several parts is withdrawn entire or not at all, never left with parts that will never land
+        beside ones that do, which its slot's next reader would take for the expert. Returns how many were
+        withdrawn."""
         st = self._disk_state()
         n = 0
         with st["cv"]:
+            if whole and any(r["key"] == key and r["state"] == "inflight" for r in st["reqs"].values()):
+                return 0
             for r in list(st["reqs"].values()):
                 if r["key"] == key and r["state"] == "queued":
                     r["state"] = "dropped"

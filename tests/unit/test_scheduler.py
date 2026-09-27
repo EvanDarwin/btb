@@ -1541,6 +1541,52 @@ def test_ring_wraps_over_landed_predictions_and_holds_at_in_flight_ones(monkeypa
     assert len(st.ring) == 2
 
 
+def test_a_prediction_with_a_part_in_flight_is_never_withdrawn_in_part(monkeypatch: MonkeyPatch) -> None:
+    """an expert is read as several parts: a prediction that lapses with one of them already in flight is left to
+    land whole - no part withdrawn - and a later call that asks for it waits for every part. Withdrawn in part, the
+    slot was a mix of two experts that read as landed: a 120B's routing collapsed on it"""
+    st, route, _sm = _store_with_routers(monkeypatch, lookahead=(2, 0))
+    h = torch.ones(1, 4)
+    assert st.lookahead(0, h) == 2  # (1, 7) and (1, 6), two reads each
+    route.land((1, 7))
+    route.start((1, 6), parts=1)  # a reader has taken its first part; the second is still queued
+    st.get(1, "layers.1.mlp.experts.", [7, 3])  # layer 1 asks for 7 and 3: 6 lapses
+    six = [r["future"] for r in route.reads if r["key"] == (1, 6)]
+    assert not any(f.cancelled() for f in six), "a part of an expert in flight was withdrawn"
+    assert (1, 6) in st.ahead, "its record stays until it lands"
+    ready, pending = st.get(1, "layers.1.mlp.experts.", [6])
+    assert 6 not in ready and [e for e, _f, _s in pending] == [6], "asked for, it is waited for: every part"
+    route.land((1, 6))
+    assert all(f.done() and not f.cancelled() for f in six)
+
+
+def test_the_lookahead_gives_a_call_no_slot_still_being_written(monkeypatch: MonkeyPatch) -> None:
+    """a call with no seat left takes a prediction's slot back only whole: one with a part in flight keeps its
+    slot (and every part), and the call takes the next"""
+    st, route, _sm = _store_with_routers(monkeypatch, lookahead=(2, 0), ring_n=2)
+    assert st.lookahead(0, torch.ones(1, 4)) == 2  # (1, 7), (1, 6) in the ring
+    route.start((1, 7), parts=1)
+    s7 = st.ahead[(1, 7)]["slot"]
+    got = st._ring_take()
+    assert got is not None and got != s7, "the slot being written was given away"
+    assert (1, 7) in st.ahead and not any(
+        f.cancelled() for r in route.reads if r["key"] == (1, 7) for f in [r["future"]]
+    )
+
+
+def test_an_experts_reads_are_settled_before_its_slot_goes_back() -> None:
+    """withdrawing a prediction cancels its queued parts; a part in flight still writes into the slot, so the slot
+    is given back once that one has finished too - not at the first cancelled part"""
+    from btb.engine.experts import Parts
+
+    queued: Future[float] = Future()
+    flying: Future[float] = Future()
+    queued.cancel()
+    threading.Timer(0.05, lambda: flying.set_result(1.0)).start()
+    Parts([queued, flying]).settle()
+    assert flying.done()
+
+
 def test_a_call_with_no_seat_left_takes_one_back_from_the_lookahead(monkeypatch: MonkeyPatch) -> None:
     """a store that cannot grow (the host's commit ran out long before its ceiling) and whose every seat is the
     call's own: the call takes the lookahead's slots back, landed predictions and queued ones alike, instead of
@@ -1555,9 +1601,6 @@ def test_a_call_with_no_seat_left_takes_one_back_from_the_lookahead(monkeypatch:
     assert sorted(e for e, _f, _s in pending) == [0, 1], "both of the call's experts have a seat"
     assert st.ring == [] and st.ahead == {} and st.stat["ahead_dropped"] == 2
     assert (1, 6) in route.dropped, "the queued prediction's reads were withdrawn, not left to land in a used slot"
-
-
-# -- the Bus Pass: day riders, regulars and the ghosts that move the split --
 
 
 def test_riders_store_line_bumps_the_oldest_and_a_ride_renews() -> None:
