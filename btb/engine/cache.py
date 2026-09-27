@@ -637,13 +637,16 @@ class GrowLayer(_DynamicLayer):
         if self.grant is not None:
             # k and v; an int8 row carries a float32 scale a head beside its d bytes
             el = 1 if self.bits else torch.empty(0, dtype=dtype).element_size()
+            row = d * el + (4 if self.bits else 0)
             self.grant(
-                2 * Bc * Hk * cap * (d * el + (4 if self.bits else 0)),
+                2 * Bc * Hk * cap * row,
                 "kv",
                 requester=f"GrowLayer(layer cache) n={self._n} T={max(0, int(need) - self._n)} have={have}",
                 B=Bc,
                 cap=cap,
                 bound=self._grant_bound() or None,
+                # the buffer this one replaces, let go once its rows are copied over
+                held=2 * int(self._shape[0]) * Hk * have * row if same else 0,
             )
         kb = m.zeros((Bc, Hk, cap, d), dtype=mdt)
         vb = m.zeros((Bc, Hk, cap, d), dtype=mdt)
@@ -744,6 +747,26 @@ class GrowLayer(_DynamicLayer):
         if n:
             self._set_rows(kb[..., :n, :], vb[..., :n, :])
 
+    def hop(self, dev: torch.device, T: int, dtype: torch.dtype) -> None:
+        """The rows onto `dev` in a buffer of `dtype` with room for `T` more, the one they were in let go: a host
+        layer's prefill chunk on the card then writes its rows in place, the cache neither grown nor granted there
+        (the prefill's reservation holds the room, `_hop_bytes`). The rows are cast as a growth into `dtype` would
+        cast them."""
+        k, v = self.keys, self.values
+        B, Hk, n, d = k.shape
+        kb = torch.empty(B, Hk, n + int(T), d, dtype=dtype, device=dev)
+        vb = torch.empty_like(kb)
+        kb[..., :n, :].copy_(k)
+        vb[..., :n, :].copy_(v)
+        self._buf, self._an = (kb, vb), None
+        self._set_rows(kb[..., :n, :], vb[..., :n, :])
+
+    def detach_bytes(self) -> int:
+        """what `detach` copies"""
+        if self._buf is None or not (self.is_initialized and self.keys is not None and self._attached()):
+            return 0
+        return 2 * self.keys.numel() * self.keys.element_size()
+
     def detach(self) -> None:
         """The layer gives its buffer up (another cache takes the arena): its rows become its own copy."""
         if self._buf is None:
@@ -825,6 +848,8 @@ class GrowLayer(_DynamicLayer):
                     cap=cap,
                     bound=self._grant_bound() or None,
                     device=key_states.device,
+                    # the buffer this one replaces, let go once its rows are copied over
+                    held=2 * self._buf[0].numel() * self._buf[0].element_size() if self._buf is not None else 0,
                 )
             kb = torch.empty(B, Hk, cap, d, dtype=key_states.dtype, device=key_states.device)
             vb = torch.empty_like(kb)
@@ -873,31 +898,64 @@ def forked(cache: KvCache) -> bool:
 class ForkLayer(_DynamicLayer):
     """One attention layer of B rows going on from given rows: a prefix `[1, Hk, P, d]` every row shares (a fork's,
     another cache's rows, never written) or `[B, Hk, P, d]` one a row (a batch's, left-padded), then each row's
-    own rows in a buffer of their own. A pass reads the two joined, built once a step."""
+    own rows. The first step joins the two in one buffer `[B, Hk, P + cap, d]`, and every step after writes its
+    rows in place: a pass reads a slice of it, copying nothing. The buffer is granted as the main cache's growth
+    is (`grant`, the scheduler's gate), counting the one it replaces."""
 
-    def __init__(self, k: torch.Tensor, v: torch.Tensor, B: int) -> None:
+    def __init__(self, k: torch.Tensor, v: torch.Tensor, B: int, grant: Callable[..., None] | None = None) -> None:
         super().__init__()
-        self._pk, self._pv = k, v
+        # the prefix, until the first step joins it into the buffer (a batch's own padded copy is then let go)
+        self._pk: torch.Tensor | None = k
+        self._pv: torch.Tensor | None = v
+        self._P = int(k.shape[-2])
         self._B = int(B)
-        self._tk: torch.Tensor | None = None
-        self._tv: torch.Tensor | None = None
+        self._kv: tuple[torch.Tensor, torch.Tensor] | None = None
         self._t = 0
-        self._cat: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.grant = grant
         self.dtype, self.device = k.dtype, k.device
         self.is_initialized = True
+
+    @classmethod
+    def over(
+        cls, kb: torch.Tensor, vb: torch.Tensor, P: int, t: int, grant: Callable[..., None] | None = None
+    ) -> ForkLayer:
+        """a fork's layer over a buffer `[B, Hk, cap, d]` of its own, already granted and holding its rows: `P`
+        of prefix, then `t` of each row's"""
+        fl = cls(kb[:1, :, :0], vb[:1, :, :0], int(kb.shape[0]), grant)
+        fl._pk = fl._pv = None
+        fl._P, fl._t, fl._kv = int(P), int(t), (kb, vb)
+        return fl
 
     def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
         self.is_initialized = True
 
+    def _ask(
+        self, nbytes: int, held: int, what: str, dev: torch.device, B: int, cap: int, draws: str | None = None
+    ) -> None:
+        """the scheduler's grant for a buffer of the layer's: its growth draws on the epoch's KV, a copy or a move of
+        rows it holds already (`draws=""`) on nothing"""
+        if self.grant is not None:
+            self.grant(
+                nbytes,
+                "kv",
+                requester=f"{type(self).__name__}({what})",
+                B=B,
+                cap=cap,
+                device=dev,
+                held=held,
+                draws=draws,
+            )
+
+    def _prefix(self) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self._pk is not None and self._pv is not None  # held until the buffer takes them
+        return self._pk, self._pv
+
     def _joined(self) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._cat is None:
-            pk = self._pk.expand(self._B, -1, -1, -1)
-            pv = self._pv.expand(self._B, -1, -1, -1)
-            if self._t and self._tk is not None and self._tv is not None:
-                pk = torch.cat([pk, self._tk[..., : self._t, :]], dim=-2)
-                pv = torch.cat([pv, self._tv[..., : self._t, :]], dim=-2)
-            self._cat = (pk, pv)
-        return self._cat
+        if self._kv is None:
+            pk, pv = self._prefix()
+            return pk.expand(self._B, -1, -1, -1), pv.expand(self._B, -1, -1, -1)
+        n = self._P + self._t
+        return self._kv[0][..., :n, :], self._kv[1][..., :n, :]
 
     @property
     def keys(self) -> torch.Tensor:
@@ -918,91 +976,154 @@ class ForkLayer(_DynamicLayer):
             raise TypeError("a fork's rows are cut by its Branches, not through the cache")
 
     def get_seq_length(self) -> int:
-        return int(self._pk.shape[-2]) + self._t
+        return self._P + self._t
+
+    def _grow(self, need: int, like: torch.Tensor) -> None:
+        """a buffer of `need` rows or more, the rows so far copied in: the prefix, on the first step"""
+        B, Hk, _, d = like.shape
+        old = self._kv
+        have = int(old[0].shape[-2]) - self._P if old is not None else 0
+        cap = self._P + max(need - self._P, 2 * have, 64)
+        held = 2 * old[0].numel() * old[0].element_size() if old is not None else 0
+        self._ask(
+            2 * B * Hk * cap * d * like.element_size(), held, f"B={B} P={self._P} t={self._t}", like.device, B, cap
+        )
+        kb = like.new_empty(B, Hk, cap, d)
+        vb = like.new_empty(B, Hk, cap, d)
+        if old is None:
+            pk, pv = self._prefix()
+            kb[..., : self._P, :].copy_(pk.expand(B, -1, -1, -1))
+            vb[..., : self._P, :].copy_(pv.expand(B, -1, -1, -1))
+            self._pk = self._pv = None
+        else:
+            n = self._P + self._t
+            kb[..., :n, :].copy_(old[0][..., :n, :])
+            vb[..., :n, :].copy_(old[1][..., :n, :])
+        self._kv = (kb, vb)
 
     def update(
         self, key_states: torch.Tensor, value_states: torch.Tensor, *args: object, **kwargs: object
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        B, Hk, T, d = key_states.shape
-        need = self._t + T
-        if self._tk is None or self._tv is None or self._tk.shape[-2] < need:
-            cap = max(need, 2 * (self._tk.shape[-2] if self._tk is not None else 0), 64)
-            tk = key_states.new_empty(B, Hk, cap, d)
-            tv = value_states.new_empty(B, Hk, cap, d)
-            if self._t and self._tk is not None and self._tv is not None:
-                tk[..., : self._t, :].copy_(self._tk[..., : self._t, :])
-                tv[..., : self._t, :].copy_(self._tv[..., : self._t, :])
-            self._tk, self._tv = tk, tv
-        self._tk[..., self._t : need, :].copy_(key_states)
-        self._tv[..., self._t : need, :].copy_(value_states)
-        self._t = need
-        self._cat = None
+        T = int(key_states.shape[-2])
+        if key_states.device != self.device:
+            # the layer runs elsewhere now (given up to the host, or grown back onto the card): its rows follow it
+            self.to(key_states.device)
+        need = self._P + self._t + T
+        if self._kv is None or self._kv[0].shape[-2] < need:
+            self._grow(need, key_states)
+        assert self._kv is not None
+        self._kv[0][..., need - T : need, :].copy_(key_states)
+        self._kv[1][..., need - T : need, :].copy_(value_states)
+        self._t += T
         return self._joined()
+
+    def _pick(self, x: torch.Tensor, idx: torch.Tensor, what: str) -> torch.Tensor:
+        """`x`'s rows at `idx`, a buffer of their own granted before it is made (the old one let go after)"""
+        B = int(idx.numel())
+        per = x[0].numel() * x.element_size()
+        self._ask(B * per, x.numel() * x.element_size(), what, x.device, B, int(x.shape[-2]), draws="")
+        return x.index_select(0, idx.to(x.device))
 
     def select(self, idx: torch.Tensor) -> None:
         """the rows `idx` become the batch, in that order"""
-        if self._pk.shape[0] > 1:
-            self._pk = self._pk.index_select(0, idx.to(self._pk.device))
-            self._pv = self._pv.index_select(0, idx.to(self._pv.device))
-        if self._tk is not None and self._tv is not None:
-            self._tk = self._tk.index_select(0, idx.to(self._tk.device))
-            self._tv = self._tv.index_select(0, idx.to(self._tv.device))
+        if self._kv is not None:
+            self._kv = (self._pick(self._kv[0], idx, "select"), self._pick(self._kv[1], idx, "select"))
+        else:
+            pk, pv = self._prefix()
+            if pk.shape[0] > 1:
+                self._pk, self._pv = self._pick(pk, idx, "select prefix"), self._pick(pv, idx, "select prefix")
         self._B = int(idx.numel())
-        self._cat = None
 
     def row(self, b: int) -> tuple[torch.Tensor, ...] | None:
-        """row b's own rows [1, Hk, t, d], copied out"""
-        if not self._t or self._tk is None or self._tv is None:
+        """row b's own rows [1, Hk, t, d], a view the caller copies into its own cache before the next step"""
+        if not self._t or self._kv is None:
             return None
-        return self._tk[b : b + 1, :, : self._t].clone(), self._tv[b : b + 1, :, : self._t].clone()
+        s = slice(self._P, self._P + self._t)
+        return self._kv[0][b : b + 1, :, s], self._kv[1][b : b + 1, :, s]
 
     def to(self, dev: str | torch.device) -> None:
         """every row to `dev`, where the layer now runs: the prefix becomes a copy of its own there"""
-        self._pk, self._pv = self._pk.to(dev), self._pv.to(dev)
-        if self._tk is not None and self._tv is not None:
-            self._tk, self._tv = self._tk.to(dev), self._tv.to(dev)
-        self.device = torch.device(dev)
-        self._cat = None
+        dev = torch.device(dev)
+        if self._kv is not None:
+            k, v = self._kv
+            self._ask(2 * k.numel() * k.element_size(), 0, f"to {dev}", dev, int(k.shape[0]), int(k.shape[-2]), "")
+            self._kv = (k.to(dev), v.to(dev))
+        else:
+            pk, pv = self._prefix()
+            self._ask(2 * pk.numel() * pk.element_size(), 0, f"prefix to {dev}", dev, int(pk.shape[0]), self._P, "")
+            self._pk, self._pv = pk.to(dev), pv.to(dev)
+        self.device = dev
 
 
 class ForkIndexedLayer(ForkLayer):
     """a `ForkLayer` of a sparse-attention layer, which caches its indexer's keys `[B, n, d_index]` beside K and V:
-    the prefix's shared (or one a row) and each row's own after them, as the attention's rows are"""
+    the prefix's shared (or one a row) and each row's own after them in one buffer, as the attention's rows are"""
 
-    def __init__(self, k: torch.Tensor, v: torch.Tensor, ik: torch.Tensor, B: int) -> None:
-        super().__init__(k, v, B)
-        self._pi = ik
+    def __init__(
+        self, k: torch.Tensor, v: torch.Tensor, ik: torch.Tensor, B: int, grant: Callable[..., None] | None = None
+    ) -> None:
+        super().__init__(k, v, B, grant)
+        self._pi: torch.Tensor | None = ik
+        self._Pi = int(ik.shape[1])
         self._ti: torch.Tensor | None = None
+        # the indexer's own step count: its keys are written apart from K and V, in the attention's own pass
+        self._it = 0
         self.is_indexer_initialized = True
 
     @property
     def indexer_keys(self) -> torch.Tensor:
-        pi = self._pi.expand(self._B, -1, -1)
-        return pi if self._ti is None else torch.cat([pi, self._ti], dim=1)
+        if self._ti is None:
+            assert self._pi is not None
+            return self._pi.expand(self._B, -1, -1)
+        return self._ti[:, : self._Pi + self._it]
 
     def update_indexer(self, indexer_key_states: torch.Tensor) -> torch.Tensor:
         t = indexer_key_states
-        self._ti = t.clone() if self._ti is None else torch.cat([self._ti, t], dim=1)
+        if t.device != self.device:
+            self.to(t.device)
+        B, T, d = t.shape
+        need = self._Pi + self._it + T
+        if self._ti is None or self._ti.shape[1] < need:
+            old = self._ti
+            have = int(old.shape[1]) - self._Pi if old is not None else 0
+            cap = self._Pi + max(need - self._Pi, 2 * have, 64)
+            held = old.numel() * old.element_size() if old is not None else 0
+            self._ask(B * cap * d * t.element_size(), held, f"indexer B={B} P={self._Pi}", t.device, B, cap)
+            buf = t.new_empty(B, cap, d)
+            if old is None:
+                assert self._pi is not None
+                buf[:, : self._Pi].copy_(self._pi.expand(B, -1, -1))
+                self._pi = None
+            else:
+                n = self._Pi + self._it
+                buf[:, :n].copy_(old[:, :n])
+            self._ti = buf
+        self._ti[:, need - T : need].copy_(t)
+        self._it += T
         return self.indexer_keys
 
     def select(self, idx: torch.Tensor) -> None:
-        if self._pi.shape[0] > 1:
-            self._pi = self._pi.index_select(0, idx.to(self._pi.device))
         if self._ti is not None:
-            self._ti = self._ti.index_select(0, idx.to(self._ti.device))
+            self._ti = self._pick(self._ti, idx, "select indexer")
+        elif self._pi is not None and self._pi.shape[0] > 1:
+            self._pi = self._pick(self._pi, idx, "select indexer prefix")
         super().select(idx)
 
     def row(self, b: int) -> tuple[torch.Tensor, ...] | None:
         kv = super().row(b)
-        if kv is None or self._ti is None:
+        if kv is None or self._ti is None or not self._it:
             return kv
-        return (*kv, self._ti[b : b + 1].clone())
+        return (*kv, self._ti[b : b + 1, self._Pi : self._Pi + self._it])
 
     def to(self, dev: str | torch.device) -> None:
         super().to(dev)
-        self._pi = self._pi.to(dev)
+        x = self._ti if self._ti is not None else self._pi
+        assert x is not None
+        self._ask(x.numel() * x.element_size(), 0, f"indexer to {self.device}", self.device, int(x.shape[0]), 0, "")
         if self._ti is not None:
-            self._ti = self._ti.to(dev)
+            self._ti = self._ti.to(self.device)
+        else:
+            self._pi = x.to(self.device)
 
 
 class CardRowsLayer(_DynamicLayer):
@@ -1013,9 +1134,18 @@ class CardRowsLayer(_DynamicLayer):
     (`row`), or the lot as a fork's layer (`to_fork`) when the rows leave the card."""
 
     def __init__(
-        self, kb: torch.Tensor, vb: torch.Tensor, offs: Sequence[int], lens: Sequence[int], base: int, W: int
+        self,
+        kb: torch.Tensor,
+        vb: torch.Tensor,
+        offs: Sequence[int],
+        lens: Sequence[int],
+        base: int,
+        W: int,
+        grant: Callable[..., None] | None = None,
     ) -> None:
         super().__init__()
+        # the scheduler's gate, asked before the rows are copied out of the arena (`to_fork`)
+        self.grant = grant
         # this layer's [Hk, cap, d] slices of the arena; None while another cache holds it, the rows then in `_own`
         self._buf: tuple[torch.Tensor, torch.Tensor] | None = (kb, vb)
         self._own: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -1087,25 +1217,58 @@ class CardRowsLayer(_DynamicLayer):
         x = self._rows()[which]
         return x[:, self._steps(cols)].permute(1, 0, 2, 3).contiguous()
 
+    def _own_steps(self, which: int, c: int) -> torch.Tensor:
+        """the steps of the row at column `c`, [Hk, t, d]: a view of every W-th slot from its first, no copy"""
+        x = self._rows()[which]
+        return x[:, self.base + c : self.base + c + self._t * self.W : self.W]
+
     def _joined(self, which: int) -> torch.Tensor:
         p = self._prefix(which).expand(len(self.cols), -1, -1, -1)
         return torch.cat([p, self._tails(which, self.cols)], dim=-2) if self._t else p.clone()
 
     def row(self, b: int) -> tuple[torch.Tensor, ...] | None:
-        """row b's own rows [1, Hk, t, d], copied out"""
+        """row b's own rows [1, Hk, t, d], a view the caller copies into its own cache before the next step"""
         if not self._t:
             return None
-        return self._tails(0, [self.cols[b]]), self._tails(1, [self.cols[b]])
+        c = self.cols[b]
+        return self._own_steps(0, c)[None], self._own_steps(1, c)[None]
 
     def to_fork(self, dev: str | torch.device | None = None) -> ForkLayer:
-        """the rows as a fork's layer holds them (a shared prefix, or a batch's left-padded one, then each row's
-        own), for the torch pass once the card cannot take them; a batch's pass masks the padding"""
-        fl = ForkLayer(self._prefix(0), self._prefix(1), len(self.cols))
-        if self._t:
-            fl._tk, fl._tv, fl._t = self._tails(0, self.cols), self._tails(1, self.cols), self._t
-        if dev is not None:
-            fl.to(dev)
-        return fl
+        """the rows as a fork's layer holds them (each row's prefix, a batch's left-padded, then its own steps) in
+        one buffer of its own on `dev`, granted before it is made and filled from the arena directly, for the
+        torch pass once the card cannot take them; a batch's pass masks the padding"""
+        dev = self.device if dev is None else torch.device(dev)
+        k, v = self._rows()
+        B, P, t = len(self.cols), max(self.lens), self._t
+        Hk, d = int(k.shape[0]), int(k.shape[-1])
+        cap = P + max(t, 64)
+        if self.grant is not None:
+            self.grant(
+                2 * B * Hk * cap * d * k.element_size(),
+                "kv",
+                requester=f"CardRowsLayer(to a fork's layer) B={B} P={P} t={t}",
+                B=B,
+                cap=cap,
+                device=dev,
+                draws="",  # the rows the arena holds, copied out: the epoch counted them once already
+            )
+        bufs = []
+        for which, x in enumerate((k, v)):
+            buf = x.new_empty((B, Hk, cap, d), device=dev)
+            for b, (off, n) in enumerate(zip(self.offs, self.lens)):
+                if n < P:
+                    buf[b, :, : P - n].zero_()
+                buf[b, :, P - n : P].copy_(x[:, off : off + n])
+                if t:
+                    buf[b, :, P : P + t].copy_(self._own_steps(which, self.cols[b]))
+            bufs.append(buf)
+        return ForkLayer.over(bufs[0], bufs[1], P, t, self.grant)
+
+    def detach_bytes(self) -> int:
+        """what `detach` copies"""
+        if self._buf is None:
+            return 0
+        return 2 * self._buf[0][:, : self.used].numel() * self._buf[0].element_size()
 
     def select(self, slots: Sequence[int]) -> None:
         """the rows at `slots` become the rows, in that order (a row may repeat: a beam's survivor kept twice). A

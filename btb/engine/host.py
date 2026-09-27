@@ -149,6 +149,20 @@ def compute_fp32(module: torch.nn.Module) -> None:
     object.__setattr__(module, "forward", forward)
 
 
+def widen_scratch(store: Any, n: int, inter: int, hidden: int) -> int:
+    """the card memory a grouped call's widening holds at its peak, `n` experts at a time (`_card_grouped`), each
+    expert gate_up [2 * `inter`, `hidden`] and down [`hidden`, `inter`]: MXFP4's gathered bytes, their int32 lookup
+    index, the value pairs and the bf16 out - 4.5 bytes a weight - gate_up's, then down's beside gate_up's bf16;
+    FP8's bytes widened to float32, scaled and made bf16, 11 bytes a weight; 0 for bf16 experts, multiplied as they
+    sit"""
+    if store is None or getattr(store, "ggml", False) or not (store.mx or store.f8):
+        return 0
+    per = 4.5 if store.mx else 11.0
+    gu = dn = inter * hidden
+    gu *= 2
+    return int(n * max(per * gu, 2 * gu + per * dn))
+
+
 def stored_parts(gu: Any, dn: Any) -> tuple[torch.Tensor, ...] | None:
     """an expert's bytes as the store holds them, for the card: bf16 (gate_up, down), MXFP4 in the checkpoint's
     layout (gate_up's blocks and scales, down's blocks and scales), or FP8 (gate_up's e4m3 bytes and scale grid,
@@ -561,19 +575,26 @@ class _Experts(torch.nn.Module):
         def wave(items: list[tuple[int, Any, Any]]) -> None:
             while items:
                 slots = depot.place(self.layer, items)
-                placed = sorted((sl, e) for (e, _gu, _dn), sl in zip(items, slots, strict=True) if sl is not None)
-                if not placed:
+                if not any(sl is not None for sl in slots):
                     raise RuntimeError(f"[experts] layer {self.layer}: no expert of the wave has a place on the card")
-                if self.mx or self.f8:
-                    for a in range(0, len(placed), self.WIDEN_BATCH):
-                        multiply(placed[a : a + self.WIDEN_BATCH])
-                else:
-                    multiply(placed)
+                # one grouped matmul a block the wave touched, its experts in their rows' order there
+                by_block: dict[int, list[tuple[int, int]]] = {}
+                for (e, _gu, _dn), sl in zip(items, slots, strict=True):
+                    if sl is not None:
+                        b, row = depot.where[sl]
+                        by_block.setdefault(b, []).append((row, e))
+                for b, local in sorted(by_block.items()):
+                    local.sort()
+                    if self.mx or self.f8:
+                        for a in range(0, len(local), self.WIDEN_BATCH):
+                            multiply(depot.blocks[b], local[a : a + self.WIDEN_BATCH])
+                    else:
+                        multiply(depot.blocks[b], local)
                 items = [it for it, sl in zip(items, slots, strict=True) if sl is None]
 
-        def multiply(placed: list[tuple[int, int]]) -> None:
-            """the grouped products of `placed` (slot, expert), in slot order, into their rows' places"""
-            stacks = depot.stacks
+        def multiply(stacks: list[torch.Tensor], placed: list[tuple[int, int]]) -> None:
+            """the grouped products of `placed` (row, expert) of one block's `stacks`, in row order, into their
+            rows' places"""
             if self.mx or self.f8:
                 # the batch's bytes gathered and widened: one group an expert, in the batch's order
                 idx = torch.tensor([sl for sl, _e in placed], device=x.device)
@@ -705,6 +726,10 @@ class _Experts(torch.nn.Module):
             (depot := self._depot_for(x, on_host)) is not None
             and self._grouped_ok(x)
             and all(stored_parts(*v) is not None for v in views.values())
+            # the depot takes this form at all (its scratch slots, where the ledger has them): the loop where it
+            # cannot - the form read off an expert in RAM, or off the first one still coming from the drive
+            and (bool(views) or bool(pending))
+            and depot.takes(stored_parts(*(next(iter(views.values())) if views else store._views(pending[0][2]))))
         ):
             self._card_grouped(x, w_top, top_k_index, hit, views, pending, store, depot, final)
         else:

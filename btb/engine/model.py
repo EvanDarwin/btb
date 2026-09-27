@@ -7,7 +7,6 @@ from __future__ import annotations
 import contextlib
 import math
 import os
-import sys
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -24,7 +23,7 @@ from ..mlx.q6k import gather_q6k
 from ..options import Device as DeviceKind
 from ..options import DeviceName
 from ..pack12 import parent_dir
-from ..sysinfo import host_commit_bytes, host_free_bytes
+from ..sysinfo import host_free_bytes
 from .cache import GrowLayer
 from .cuda import _CudaMixin
 from .device import Device
@@ -124,6 +123,7 @@ class StreamedTextModel(
         self.mlx_state = MlxState()
         # the RAM this load started with (pool.py samples it before anything is allocated for the load; a
         # model built directly samples now): what the engine may use, against which it counts what it holds
+        # free-read: the MLX ledger's baseline, sampled before the ledger exists
         self.mem_start = _pool.MEM_START if _pool.MEM_START is not None else host_free_bytes() + _pool.POOL.free_bytes()
         self.mlx_layers = set()
         # the attention cache's rows as int8 with a scale each (the MLX device; `GrowLayer(bits=)`): half the
@@ -364,13 +364,10 @@ class StreamedTextModel(
                 if self.mlx is not None:
                     # the base re-read with the trunk and the pool bound and touched: the figure sampled at import was
                     # taken while the previous process was still releasing memory, and capped the store 5-10 GB low
+                    # free-read: the MLX ledger's own baseline, set here
                     self.mem_start = max(self.mem_start, host_free_bytes() + self.mlx.held_bytes())
-                    room = self.mem_start - self.ram_reserve - self.mlx.held_bytes()
-                else:
-                    room = host_free_bytes() - self.ram_reserve
-                if sys.platform == "win32":
-                    # the commit charge: the page file bounds what can be allocated at all, above the same floor
-                    room = min(room, host_commit_bytes() - self.ram_reserve)
+                # what the ledger has free on the host above the reserve (the commit left included on Windows)
+                room = int(self.device.free(torch.device("cpu"), unreserved=True) or 0)
                 budget = max(0, room)  # the store keeps its scratch slots whatever the room
             else:
                 budget = int(float(expert_cache_gb) * 2**30)
@@ -421,6 +418,7 @@ class StreamedTextModel(
                 for tmpl in self.resident.values():
                     for p in tmpl.parameters():
                         p.data = p.data.to(self.compute_dtype)
+        # free-read: the load's log line
         res = torch.cuda.memory_allocated(self.dev) / 2**30 if self.dev.type == DeviceKind.CUDA else 0.0
         n_templates = sum(len(v) for v in self.templates.values())
         self.log(

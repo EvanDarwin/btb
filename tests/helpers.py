@@ -362,6 +362,15 @@ class SchedulerModel:
         self.lines.append(" ".join(str(x) for x in a))
 
 
+def stub_ledger(free: Callable[[], int], reserve: int) -> types.SimpleNamespace:
+    """a stub engine's device ledger on the host: what `free()` reads, above `reserve`, nothing spoken for - the
+    figure the expert store grows and gives back against, as `Device.free` gives it"""
+    return types.SimpleNamespace(
+        free=lambda device=None, unreserved=False, own=None, pooled=False: max(0, int(free()) - int(reserve)),
+        reserved=lambda device=None, but=None: 0,
+    )
+
+
 def stub_engine(**attrs: object) -> types.SimpleNamespace:
     """the least an engine the scheduler or the expert store is built over: a quiet log, the CPU, and the store's
     residency policy at the model's own defaults (it reads `bus_pass`/`store_pin` directly - a stub without them
@@ -466,7 +475,6 @@ def expert_store(
     from btb.engine.families import Family
     from btb.kinds import FamilyKind
 
-    monkeypatch.setattr(experts_mod, "host_free_bytes", lambda: 64 * GB)
     per = 64 * KB
     resident: dict[int, types.SimpleNamespace] = {}
     if routers:
@@ -489,6 +497,7 @@ def expert_store(
         n_experts=n_experts,
         lookahead=lookahead,
         scheduler=scheduler,
+        device=stub_ledger(lambda: 64 * GB, GB),
         **attrs,
     )
     st = experts_mod._ExpertStore(sm, budget_bytes=4096 * per, reserve_bytes=GB)

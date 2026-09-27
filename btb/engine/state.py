@@ -148,6 +148,8 @@ class _State:
     _staging: dict[Any, Any]
     _streamed_any: bool
     _sweep_keep: bool
+    # the drive layer whose ring slot a layer-by-layer prefill holds across the layer's chunks (`_prefill_by_layer`)
+    _cold_held: int | None = None
     _depot: Any
     _sweep_ahead: bool
     _thread_mod: ModuleType
@@ -262,6 +264,9 @@ class _State:
         raise NotImplementedError
 
     def _caches_to(self, i: int, dev: str | torch.device, cache: KvCache | None = None) -> None:
+        raise NotImplementedError
+
+    def _rows_to(self, caches: Sequence[Any], layers: Sequence[int], dev: str | torch.device) -> None:
         raise NotImplementedError
 
     def _cold_release(self, i: int) -> None:
@@ -636,6 +641,12 @@ class _State:
         raise NotImplementedError
 
     def cache_room(self, cache: KvCache | None, B: int, T: int) -> None:
+        raise NotImplementedError
+
+    def cache_growth(self, cache: KvCache | None, B: int, T: int, peak: bool = False) -> dict[torch.device, int]:
+        raise NotImplementedError
+
+    def _make_room(self, dev: torch.device, nbytes: int, what: str, own: str | None = None) -> set[str]:
         raise NotImplementedError
 
     def room(self, nbytes: int, device: DeviceSpec | None = None, name: str = "room") -> Room:

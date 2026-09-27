@@ -465,6 +465,8 @@ class _CudaMixin(_State):
                 cap=cap,
                 bound=None,
                 device=self.dev,
+                # the arena this one replaces, let go once its rows are copied over
+                held=len(layers) * 2 * Hk * int(ar["cap"]) * D * 2 if ar is not None else 0,
             )
         A = torch.empty(len(layers), 2, Hk, cap, D, dtype=torch.bfloat16, device=self.dev)
         slot = {i: j for j, i in enumerate(layers)}
@@ -1329,9 +1331,17 @@ class _CudaMixin(_State):
         """the arena's holder lets it go: the rows it has become copies of their own"""
         owner = ar["owner"]() if ar["owner"] is not None else None
         if owner is not None:
-            for i in ar["slot"]:
-                if isinstance(owner.layers[i], (GrowLayer, CardRowsLayer)):
-                    owner.layers[i].detach()
+            held = [owner.layers[i] for i in ar["slot"] if isinstance(owner.layers[i], (GrowLayer, CardRowsLayer))]
+            # the copies granted before any is made: an eviction the card cannot take is refused whole, the arena
+            # still its holder's
+            nbytes = sum(cl.detach_bytes() for cl in held)
+            sched = getattr(self, "scheduler", None)
+            if nbytes and sched is not None:
+                sched.grant(
+                    nbytes, "kv", requester="card arena: the rows it lets go, copied out", device=self.dev, draws=""
+                )
+            for cl in held:
+                cl.detach()
         ar["owner"] = None
 
     def _card_rows_form(self, cache: Any, srcs: list[Any], rows: list[int]) -> list[int]:
@@ -1359,6 +1369,8 @@ class _CudaMixin(_State):
         self._card_evict(ar)
         ar["owner"] = weakref.ref(cache)
         A = ar["A"]
+        sched = getattr(self, "scheduler", None)
+        grant = sched.grant if sched is not None else None
         for i in layers:
             kb, vb = A[ar["slot"][i], 0], A[ar["slot"][i], 1]
             for j, c in enumerate(srcs):
@@ -1371,7 +1383,9 @@ class _CudaMixin(_State):
                     )
                 kb[:, offs[j] : offs[j] + lens[j]].copy_(k[0])
                 vb[:, offs[j] : offs[j] + lens[j]].copy_(v[0])
-            cache.layers[i] = CardRowsLayer(kb, vb, [offs[r] for r in rows], [lens[r] for r in rows], base, W)
+            cache.layers[i] = CardRowsLayer(
+                kb, vb, [offs[r] for r in rows], [lens[r] for r in rows], base, W, grant=grant
+            )
         return [lens[r] for r in rows]
 
     def _card_rows_bind(self, cache: Any, st: dict[str, Any], need: int = 0) -> dict[str, Any]:

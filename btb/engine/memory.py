@@ -255,9 +255,11 @@ class _MemoryMixin(_State):
     def vram_trim(self, tag: str = "") -> Any:
         if self.dev.type != Device.CUDA:
             return 0.0, 0.0
+        # free-read: the trim's own log line
         before = torch.cuda.memory_reserved() / 2**30
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
+        # free-read: the trim's own log line
         alloc, res = torch.cuda.memory_allocated() / 2**30, torch.cuda.memory_reserved() / 2**30
         if before - res > 0.05 or getattr(self, "vram_watch", False):
             self.log(
@@ -508,6 +510,12 @@ class _MemoryMixin(_State):
         while True:
             room = self.device.free(dev, unreserved=True, own=own)
             if room is None or room >= nbytes:
+                # room there only counting torch's cached blocks: they go back to the driver now, so what is made in
+                # it comes from free memory and not from the allocator failing and emptying its cache to retry
+                if dev.type == Device.CUDA and nbytes > int(
+                    self.device.free(dev, unreserved=True, own=own, pooled=True) or 0
+                ):
+                    self.vram_trim("room")
                 return tried
             if not self._give_up_one(dev, nbytes - room, tried):
                 self.device.refused()  # what was shed on the way grows back once there is room
@@ -520,25 +528,40 @@ class _MemoryMixin(_State):
         placement is pinned: nothing is given up, and the grant refuses what does not fit."""
         if cache is None or not getattr(self, "adapt", True):
             return
+        for dev, nbytes in self.cache_growth(cache, B, T).items():
+            if nbytes:
+                self._make_room(dev, nbytes, f"the cache's growth for {B}x{T} rows", own=EPOCH)
+
+    def cache_growth(self, cache: KvCache | None, B: int, T: int, peak: bool = False) -> dict[torch.device, int]:
+        """the bytes the cache's appends of `T` rows to `B` sequences will allocate, by the device each layer's
+        rows live on - priced as the grant prices them; empty where nothing grows. With `peak`, the most they hold
+        at once: a layer growing in steps keeps its old buffer until the new one is filled, so the largest layer's
+        growth once more"""
+        need: dict[torch.device, int] = {}
+        if cache is None:
+            return need
         first = next(((i, cl) for i, cl in enumerate(cache.layers) if isinstance(cl, GrowLayer)), None)
         if first is None:
-            return
+            return need
         c = self.cfg
         hq = int(c.num_attention_heads)
         Hk = int(getattr(c, "num_key_value_heads", None) or hq)
         d = int(getattr(c, "head_dim", None) or c.hidden_size // hq)
         dev0, dt0 = self._kv_home(*first)
         if not first[1].growth(B, T, Hk, d, dt0, dev0.type == Device.CPU):
-            return  # the layers grow together: the first one fitting is the pass needing nothing
-        need: dict[torch.device, int] = {}
+            return need  # the layers grow together: the first one fitting is the pass needing nothing
+        most: dict[torch.device, int] = {}
         for i, cl in enumerate(cache.layers):
             if not isinstance(cl, GrowLayer):
                 continue
             dev, dt = self._kv_home(i, cl)
-            need[dev] = need.get(dev, 0) + cl.growth(B, T, Hk, d, dt, dev.type == Device.CPU)
-        for dev, nbytes in need.items():
-            if nbytes:
-                self._make_room(dev, nbytes, f"the cache's growth for {B}x{T} rows", own=EPOCH)
+            g = cl.growth(B, T, Hk, d, dt, dev.type == Device.CPU)
+            need[dev] = need.get(dev, 0) + g
+            most[dev] = max(most.get(dev, 0), g)
+        if peak:
+            for dev, g in most.items():
+                need[dev] += g
+        return need
 
     def _kv_home(self, i: int, cl: GrowLayer) -> tuple[torch.device, torch.dtype]:
         """where layer i's cache rows live and in what dtype: its buffer's, or where the layer runs"""
@@ -568,13 +591,9 @@ class _MemoryMixin(_State):
             return True
         store = getattr(self, "expert_store", None)
         if store is not None and store.blocks and "store" not in tried:
-            # the store gives blocks back while the host is short of its reserve: short by what is missing, now
+            # the store gives blocks back until the ledger has what is missing on top of what it has now
             tried.add("store")
-            store.reserve += short
-            try:
-                store.release()
-            finally:
-                store.reserve -= short
+            store.release(want=int(self.device.free(dev, unreserved=True) or 0) + int(short))
             return True
         if self.device.request("lend", lambda: self.ram_shed("room asked for", log)) is None:
             return False

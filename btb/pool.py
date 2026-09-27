@@ -190,6 +190,7 @@ class Pool:
             cur += s
         if cur:
             cuts.append(cur)
+        # free-read: the MLX pool's own held bytes (`Pool.free_bytes`), not a free-memory figure
         held = self.free_bytes()
         while cuts and held >= cuts[0]:
             held -= cuts.pop(0)
@@ -267,6 +268,7 @@ def seed_for(model_dir: str, log: Log | None = None, gguf_packed: bool = True) -
                 "[pool] torch was imported before this load seeded the pool: the free-RAM baseline counts torch's "
                 "footprint as used (import btb before torch to keep it exact)"
             )
+        # free-read: the MLX pool seeded at import, before any model or ledger exists
         MEM_START = darwin_available_bytes() + POOL.free_bytes()
     if os.environ.get("BTB_POOL", "1") == "0" or not mlx_ok():
         return
@@ -276,13 +278,16 @@ def seed_for(model_dir: str, log: Log | None = None, gguf_packed: bool = True) -
         return
     if not sizes:
         return
+    # free-read: the MLX pool seeded at import, before any model or ledger exists
     need = sum(sizes) - POOL.free_bytes()
+    # free-read: the MLX pool seeded at import, before any model or ledger exists
     avail = darwin_available_bytes()
     if need <= 0 or need > avail - max(4 << 30, avail // 8):
         return
     if log:
         log(
             f"[pool] faulting {sum(sizes) / 2**30:.2f} GB of weight buffers under the imports "
+            # free-read: the MLX pool seeded at import, before any model or ledger exists
             f"({POOL.free_bytes() / 2**30:.2f} GB already held)"
         )
     POOL.seed(sizes)

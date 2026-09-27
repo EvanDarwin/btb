@@ -16,9 +16,14 @@ from .. import mlx as mlxdev
 from ..kinds import LayerKind, LayerTier, Parents, PassTag, TokenRows
 from ..options import Device
 from ..sampling import as_pick
-from ..sysinfo import host_free_bytes, host_total_bytes
+from .cache import GrowLayer
 from .native import Native
+from .scheduler import EPOCH
 from .state import _State
+
+# the ledger's tag for a layer-by-layer prefill's own working set, for the sweep: on the card, and on the host where
+# its host chunks run and its rows wait between layers
+PREFILL = "prefill"
 
 if TYPE_CHECKING:
     from transformers.cache_utils import DynamicCache
@@ -327,9 +332,8 @@ class _ForwardMixin(_State):
         if card_pass:
             self._tag(PassTag.PREFILL_CARD)  # the host layers prefill on the card for this pass
         if card_pass and cache is not None and past > 0:
-            for i in self.host:
-                if i < n_layers:
-                    self._cache_to(cache, i, self.dev)
+            # every host layer's rows onto the card for the pass, granted together before any moves
+            self._rows_to([cache], [i for i in self.host if i < n_layers], self.dev)
 
         pas = _Pass(
             cache=cache,
@@ -380,8 +384,7 @@ class _ForwardMixin(_State):
                     self._cache_to(cache, i, "cpu")
         if n_layers < self.L:
             return None
-        if h.device != self.dev:
-            h = h.to(self.dev)
+        h = self._norm_input(h)
         if last_only:
             h = h[:, -1:, :]
         h = self._final_norm(h)
@@ -435,7 +438,8 @@ class _ForwardMixin(_State):
             self._tag(PassTag.FP8_ASSTORED)
         tmpl = self.host[i]
         hc = pas.host_side()
-        if i in self.cold:
+        held = self._cold_held == i  # a layer-by-layer prefill holds the slot across the layer's chunks
+        if i in self.cold and not held:
             self._cold_wait(i)
         t0 = time.time()
         cache, T, past, am = pas.cache, pas.T, pas.past, pas.am
@@ -465,7 +469,7 @@ class _ForwardMixin(_State):
                 **kw,
             )
         self.compute_s += time.time() - t0
-        if i in self.cold:
+        if i in self.cold and not held:
             self._cold_release(i)
         if pas.on_layer is not None:
             pas.on_layer(i, h)
@@ -558,6 +562,14 @@ class _ForwardMixin(_State):
             causal = causal.get(lt)
         return {"attention_mask": linear_mask if lt == LayerKind.LINEAR else causal, "position_ids": pos}
 
+    def _norm_input(self, h: torch.Tensor) -> torch.Tensor:
+        """the last layer's rows crossing into the final norm, where the norm is and in its own dtype: a last layer
+        given up to the host hands its rows back in float32 on the host, and a card's norm takes its weights'"""
+        mod = self.norm if self.norm is not None else self.mixer
+        p = next((q for q in mod.parameters() if q.is_floating_point()), None) if mod is not None else None
+        dev, dt = (p.device, p.dtype) if p is not None else (self.dev, h.dtype)
+        return h if (h.device == dev and h.dtype == dt) else h.to(dev, dt)
+
     def _final_norm(self, h: torch.Tensor) -> torch.Tensor:
         if self.norm is not None:
             return self.norm(h)
@@ -631,29 +643,29 @@ class _ForwardMixin(_State):
     OS_FLOOR = 0.12
 
     def prefill_room(self) -> int:
-        """the memory a prefill's working set may take right now, on the tier it runs on: the card's free VRAM
-        above the margin; on unified memory the tightest of the engine's own ledger, Metal's working-set limit
-        less what MLX holds, and the machine's free RAM as it stands now (the other programs' share included)
-        above the OS's floor; the host's free RAM above a gigabyte elsewhere"""
+        """the memory a prefill's working set may take right now, on the tier it runs on: on the card what the
+        device's ledger has free there (`Device.free`: above the margin, less what is spoken for - the one figure
+        every grant and room is priced by); on unified memory the tightest of the engine's own ledger, Metal's
+        working-set limit less what MLX holds, and the machine's free RAM as it stands now (the other programs'
+        share included) above the OS's floor; the host's free RAM above a gigabyte elsewhere"""
         on_card = self.dev.type == Device.CUDA and (bool(self.resident) or bool(self.prefill_card))
         if on_card:
-            return int(torch.cuda.mem_get_info(self.dev)[0] - self.vram_margin)
+            return int(self.device.free(self.dev, unreserved=True) or 0)
         mlx = getattr(self, "mlx", None)
         if mlx is not None:
-            held = int(mlx.held_bytes())
+            # the ledger (the machine's live RAM above the OS's floor included), within Metal's working-set limit
             room = int(self.device.free(unreserved=True) or 0)
             limit = int((getattr(mlx, "info", None) or {}).get("max_recommended_working_set_size", 0) or 0)
             if limit:
-                room = min(room, limit - held)
-            live = int(host_free_bytes()) - int(self.OS_FLOOR * host_total_bytes())
-            return max(0, min(room, live))
-        return int(host_free_bytes() - (1 << 30))
+                room = min(room, limit - int(mlx.held_bytes()))
+            return max(0, room)
+        return int(self.device.free(torch.device("cpu"), unreserved=True) or 0)
 
-    def _auto_chunk(self, past: int = 0) -> int:
-        """The rows a prefill pass takes at once: the largest power of two, 64 to 4096, whose working set fits the
-        room - each row's activations through the widest layer, and, where the attention materializes its
-        scores, each row's scores against every key it sees (`past` and the chunk's own rows), which is what
-        grows with the context and once asked Metal for 33 GB in one buffer."""
+    def _chunk_cost(self, on_card: bool | None = None) -> tuple[int, int, int]:
+        """A prefill chunk's working set: per row, the bytes of its activations through the widest layer; per (row,
+        key) pair, the bytes of its scores where the attention materializes them and of its mask; and per key, the
+        bytes of the keys and values widened to every query head where the heads share them. `on_card`: priced for
+        the card's pass or the host's (the tier the engine's prefill runs on when None)"""
         c = self.cfg
         H = int(c.hidden_size) * int(self.fam.streams)
         I = int(getattr(c, "intermediate_size", None) or 4 * H)
@@ -665,7 +677,8 @@ class _ForwardMixin(_State):
         Hq = int(c.num_attention_heads)
         Hk = int(getattr(c, "num_key_value_heads", None) or Hq)
         d = int(getattr(c, "head_dim", None) or H // Hq)
-        on_card = self.dev.type == Device.CUDA and (bool(self.resident) or bool(self.prefill_card))
+        if on_card is None:
+            on_card = self.dev.type == Device.CUDA and (bool(self.resident) or bool(self.prefill_card))
         fp32 = self.compute_dtype is not None and self.compute_dtype != torch.bfloat16
         nb = 4 if (fp32 or not on_card) else 2
         per_token = 2 * nb * (3 * I + 8 * H + 2 * (Hq + 2 * Hk) * d)
@@ -674,13 +687,8 @@ class _ForwardMixin(_State):
             # on Qwen3.5-4B a 4096-row chunk at position 0 costs 4.9-6.2 GB against the 2.4 the
             # activations alone price
             per_token *= 2
-        free = self.prefill_room()
         scores = 0
-        buf_cap = free  # the single attention buffer must fit the reserve-aware room (--ram/--vram-reserve, via
-        if getattr(self, "mlx", None) is not None:  # prefill_room) and, on MLX, Metal's hard per-buffer ceiling
-            hard = int((getattr(self.mlx, "info", None) or {}).get("max_buffer_length", 0) or 0)
-            if hard:
-                buf_cap = min(buf_cap, hard)
+        if getattr(self, "mlx", None) is not None:
             if d not in self.MLX_FUSED_HEAD:
                 scores = 4 * Hq  # bytes per (row, key) pair of materialized scores, float32 through the softmax
             else:
@@ -690,12 +698,125 @@ class _ForwardMixin(_State):
                 from ..mlx.attn import ATTN_BLOCK
 
                 scores = -(-32 * Hq * (d + 2) // ATTN_BLOCK)
+        elif self.fam.eager:
+            # gpt-oss's sinks (`attention_sinks`) hold each row's scores against every key in the compute dtype
+            # about four times at once: the product, the sinks joined on, the shift and the softmax
+            scores = 4 * nb * Hq
+        per_key = 0
+        if getattr(self, "mlx", None) is None and not self.fam.eager:
+            # torch's sdpa over every key the chunk sees: the causal mask, a value a (row, key) pair at most, and the
+            # keys and values widened to every query head (`btb_sdpa`'s expand, transformers' `repeat_kv`)
+            scores += nb
+            if Hq > Hk:
+                per_key = 2 * Hq * d * nb
+        return per_token, scores, per_key
+
+    def _sweep_bytes(self, C: int, past: int, B: int, T: int, cache: Any) -> tuple[int, int]:
+        """What a layer-by-layer prefill of `T` rows at chunks of `C` asks of its device, as (its working set -
+        the last chunk's activations and scores (`_chunk_bytes`) and, on the card, a mixture's grouped call over
+        its rows (`_grouped_bytes`) - and what it holds beside that for the sweep: the rows kept on the card
+        between layers and the cache's growth past what an epoch has reserved for it). The chunk size is priced
+        by the two together, and the sweep asks the ledger for them"""
+        card = self.dev.type == Device.CUDA
+        work = self._chunk_bytes(C, past + max(0, T - C))
+        if card:
+            work += self._grouped_bytes(C, getattr(self, "expert_store", None))
+        row_b, park = self._sweep_rows(B, T)
+        rows = 0 if (park or not card) else T * row_b
+        growth = self.cache_growth(cache, B, T, peak=True).get(self.dev, 0)
+        epoch = int(self.device.reserved(self.dev)) - int(self.device.reserved(self.dev, but=EPOCH))
+        return work, rows + self._hop_bytes(C, past, B, T) + max(0, growth - epoch)
+
+    def _sweep_rows(self, B: int, T: int) -> tuple[int, bool]:
+        """a layer-by-layer prefill's rows between layers: the bytes one takes, and whether they wait in pinned RAM
+        (past a quarter of the card's room) rather than on the card"""
+        cd = self.compute_dtype
+        row_b = (
+            B
+            * int(self.cfg.hidden_size)
+            * int(self.fam.streams)
+            * (4 if (cd is not None and cd != torch.bfloat16) else 2)
+        )
+        return row_b, self.dev.type == Device.CUDA and T * row_b > self.prefill_room() // 4
+
+    def _card_chunks(self, C: int, T: int) -> list[bool]:
+        """which of a layer-by-layer prefill's chunks of `C` rows the card takes where the layer lives on the host:
+        every one of `prefill_card_min` rows or more, where the card passes host layers at all"""
+        on_card = bool(getattr(self, "prefill_card", False)) and bool(self.templates) and bool(self.host)
+        return [on_card and getattr(self, "prefill_card_min", 64) <= min(T, a + C) - a for a in range(0, T, C)]
+
+    def _hop_bytes(self, C: int, past: int, B: int, T: int) -> int:
+        """a host layer's rows on the card for a chunk of it there (`GrowLayer.hop`): its keys and values up to the
+        last such chunk's end, in the card's dtype, at most once at a time"""
+        card = self._card_chunks(C, T)
+        ends = [min(T, a + C) for a, on in zip(range(0, T, C), card) if on and past + a > 0]
+        if not ends or self.dev.type != Device.CUDA:
+            return 0
+        c = self.cfg
+        hq = int(c.num_attention_heads)
+        Hk = int(getattr(c, "num_key_value_heads", None) or hq)
+        d = int(getattr(c, "head_dim", None) or c.hidden_size // hq)
+        cd = self.compute_dtype
+        nb = 4 if (cd is not None and cd != torch.bfloat16) else 2
+        return 2 * B * Hk * d * nb * (past + max(ends))
+
+    def _host_bytes(self, C: int, past: int, B: int, T: int) -> int:
+        """what a layer-by-layer prefill on the card asks of the host: its host chunks' working set in float32 where
+        a layer lives there and the card does not take the chunk, and its rows parked between layers - each chunk's
+        a pinned buffer, which the pinned allocator rounds up to a power of two"""
+        if self.dev.type != Device.CUDA:
+            return 0
+        n = 0
+        if (self.host or self.cold) and not all(self._card_chunks(C, T)):
+            n += self._chunk_bytes(C, past + max(0, T - C), on_card=False)
+        row_b, park = self._sweep_rows(B, T)
+        if park:
+            n += sum(1 << max(0, (min(T, a + C) - a) * (row_b // B) * B - 1).bit_length() for a in range(0, T, C))
+        return n
+
+    def _grouped_bytes(self, rows: int, store: Any) -> int:
+        """a mixture's grouped expert call on the card over a chunk of `rows` (`_card_grouped`), at its widest: each
+        pick's place in the sum's buffer, and beside it the larger of its way in - the row gathered, gate_up's
+        product, its bias gathered and their sum, and the gate's temporaries over the halves (gpt-oss's clamped GLU,
+        the widest of the families') - and its way out - the gate's output, down's product, its bias and their sum,
+        the routing weight's float32 product and its cast; and the widening of the MXFP4 or FP8 experts it
+        multiplies (`widen_scratch`). 0 where the loop takes the calls"""
+        if not self.fam.moe or not bool(getattr(self, "grouped_experts", False)):
+            return 0
+        from .host import _Experts, widen_scratch
+
+        c = self.cfg
+        H = int(c.hidden_size)
+        I = int(getattr(c, "moe_intermediate_size", None) or c.intermediate_size)
+        k = int(getattr(c, "num_experts_per_tok", 1) or 1)
+        return 2 * rows * k * (H + max(H + 8 * I, I + 5 * H)) + widen_scratch(store, _Experts.WIDEN_BATCH, I, H)
+
+    def _chunk_bytes(self, rows: int, past: int = 0, on_card: bool | None = None) -> int:
+        """a prefill chunk of `rows` at position `past`: its activations, its scores and mask against every key it
+        sees, and those keys widened to every query head (`_chunk_cost`)"""
+        per_token, scores, per_key = self._chunk_cost(on_card)
+        keys = int(past) + int(rows)
+        return int(rows) * (per_token + scores * keys) + per_key * keys
+
+    def _auto_chunk(self, past: int = 0) -> int:
+        """The rows a prefill pass takes at once: the largest power of two, 64 to 4096, whose working set fits the
+        room - each row's activations through the widest layer, and, where the attention materializes its
+        scores, each row's scores against every key it sees (`past` and the chunk's own rows), which is what
+        grows with the context and once asked Metal for 33 GB in one buffer."""
+        _per_token, scores, _per_key = self._chunk_cost()
+        free = self.prefill_room()
+        buf_cap = free  # the single attention buffer must fit the reserve-aware room (--ram/--vram-reserve, via
+        mlx = getattr(self, "mlx", None)  # prefill_room) and, on MLX, Metal's hard per-buffer ceiling
+        if mlx is not None:
+            hard = int((getattr(mlx, "info", None) or {}).get("max_buffer_length", 0) or 0)
+            if hard:
+                buf_cap = min(buf_cap, hard)
         rows = 4096
         # shrink until the whole working set fits the room, and until the attention's own buffer at these rows
         # fits buf_cap - so a free reading that runs high never passes a single buffer the GPU cannot allocate,
         # the oversized ask that faults it
         while rows > PREFILL_MIN_ROWS and (
-            rows * (per_token + scores * (int(past) + rows)) > free or scores * rows * (int(past) + rows) > buf_cap
+            self._chunk_bytes(rows, past) > free or scores * rows * (int(past) + rows) > buf_cap
         ):
             rows //= 2
         return int(rows)
@@ -714,25 +835,31 @@ class _ForwardMixin(_State):
         if ids.dim() == 1:
             ids = ids.view(1, -1)
         T = ids.shape[1]
-        # the host path's DeltaNet takes a prompt whole; the MLX path continues a chunk from the stored states
-        whole_hybrid = LayerKind.LINEAR in self.layer_types and not self.fam.own and self.mlx is None
-        if cache is None or attention_mask is not None or getattr(self, "aq", False) or whole_hybrid:
+        if cache is None or attention_mask is not None or getattr(self, "aq", False):
             return self.forward(ids, cache=cache, on_layer=on_layer, attention_mask=attention_mask, last_only=last_only)
+        # a hybrid's DeltaNet continues a chunk from the cache's conv and recurrent states (the module takes them as
+        # the chunk's initial state), so it prefills layer by layer as any family does - the float32 sums inside
+        # the DeltaNet's blocks split at other rows than one pass's; outside that path the host's hybrid takes its
+        # prompt whole, as it always has (the MLX path continues its chunks from the stored states)
+        whole_hybrid = LayerKind.LINEAR in self.layer_types and not self.fam.own and self.mlx is None
         past = int(cache.get_seq_length())
         C = int(self.prefill_chunk or self._auto_chunk(past))
         if T <= C:
             return self.forward(ids, cache=cache, on_layer=on_layer, last_only=last_only)
-        # a mixture of experts prefills layer by layer, so a layer's experts are read once for the whole prompt
-        # instead of once per chunk (the chunks of a 16k prompt read the 180B's experts 3.35 times over)
-        if (
-            self.fam.moe
-            and on_layer is None
-            and last_only
-            and self.mlx is None
-            and not self.cold
-            and self.prefill_layers
-        ):
+        # a prompt past one chunk prefills layer by layer, so a layer the pass streams (a card pass's template, the
+        # drive's ring, a mixture's experts) is read once for the whole prompt instead of once per chunk (the
+        # chunks of a 16k prompt read the 180B's experts 3.35 times over)
+        if on_layer is None and last_only and self.mlx is None and self.prefill_layers:
+            if not self.prefill_chunk:
+                # every chunk is taken at one size, so it is priced where it costs the most - the last chunk's
+                # position, whose rows see every key before them (the chunks one at a time price each at its own)
+                # - with everything else the sweep asks of the device beside it (`_sweep_bytes`)
+                room = self.prefill_room()
+                while C > PREFILL_MIN_ROWS and sum(self._sweep_bytes(C, past, ids.shape[0], T, cache)) > room:
+                    C //= 2
             return self._prefill_by_layer(ids, cache, C)
+        if whole_hybrid:
+            return self.forward(ids, cache=cache, on_layer=on_layer, last_only=last_only)
         self.log(f"[prefill] {T} tokens in chunks of {C} from position {past}")
         # a layer hook sees the last layer's rows for the whole prompt once, joined at the end, as it would from
         # one forward (the drafter's prefill reads them); every other layer's rows are handed over per chunk as
@@ -807,8 +934,9 @@ class _ForwardMixin(_State):
 
     @torch.inference_mode()
     def _prefill_by_layer(self, ids: torch.Tensor, cache: Any, C: int) -> Any:
-        """The prompt through one layer at a time, every chunk of it before the next layer, so a mixture's layer
-        reads its experts once for the whole prompt instead of once per chunk. Each chunk meets each layer as the
+        """The prompt through one layer at a time, every chunk of it before the next layer, so a layer the pass
+        streams is read once for the whole prompt instead of once per chunk: a card pass's template, a drive layer's
+        ring slot (held across the layer's chunks), a mixture's experts. Each chunk meets each layer as the
         chunked prefill's pass would have it - the same cache rows before it, the same rope, mask, placement and
         module, crossing the tier's edge the same way - so the rows come out as the chunked path's: a layer runs
         on the card (resident, or the template a card pass streams in, taken once for all the chunks) or on the
@@ -826,8 +954,7 @@ class _ForwardMixin(_State):
         cd = self.compute_dtype
         spans = [(a, min(T, a + C)) for a in range(0, T, C)]
         # a chunk the chunked prefill would take on the card: every chunk past the first continues a batch there
-        on_card = bool(getattr(self, "prefill_card", False)) and bool(self.templates) and bool(self.host)
-        card = [on_card and getattr(self, "prefill_card_min", 64) <= b - a for a, b in spans]
+        card = self._card_chunks(C, T)
         if any(card):
             self._tag(PassTag.PREFILL_CARD)
         tier_owns_attention = (
@@ -836,41 +963,57 @@ class _ForwardMixin(_State):
             and self.fam.fast
             and all(i in self.resident for i, lt in enumerate(self.layer_types) if lt == LayerKind.FULL)
         )
-        self.log(f"[prefill] {T} tokens layer by layer in {len(spans)} chunks of {C} (each layer's experts read once)")
+        self.log(f"[prefill] {T} tokens layer by layer in {len(spans)} chunks of {C} (each layer read once)")
 
-        def frame(a: int, b: int) -> dict[str, Any]:
-            """a chunk's pass preamble, as `forward` builds it for these rows at this position"""
-            ids_c = ids[:, a:b]
-            h = self.embed(ids_c)
+        def embed(a: int, b: int) -> torch.Tensor:
+            """a chunk's rows into the first layer, as `forward` embeds them"""
+            h = self.embed(ids[:, a:b])
             if cd is not None:
                 h = h.to(cd)
             if self.fam.streams > 1:
                 h = h.repeat(1, 1, self.fam.streams)
+            return h
+
+        def frame(a: int, b: int, like: torch.Tensor) -> dict[str, Any]:
+            """a chunk's pass preamble, as `forward` builds it for these rows at this position: its positions, and
+            the dtype and device its rope is made in (`like`, the embedded rows'); the rope itself is made for each
+            layer's pass (`rope`), not held for the sweep"""
             past = past0 + a
             text_pos, rope_pos = self._positions(B, b - a, past, None)
-            if own:
-                pe: Any = self.rotary(h, self._positions(B, past + (b - a), 0, None)[1])
-            elif self.fam.dual_rope:
-                pe = {lt: self.rotary(h, text_pos, lt) for lt in set(self.layer_types)}
-            else:
-                pe = self.rotary(h, rope_pos if self.fam.mrope else text_pos)
-            return {"h": h, "past": past, "text_pos": text_pos, "pe": pe, "ple": ids_c if own else None}
+            return {
+                "past": past,
+                "text_pos": text_pos,
+                "rope_pos": rope_pos,
+                "like": like.new_empty((B, 0, like.shape[-1])),
+                "ple": ids[:, a:b] if own else None,
+            }
 
-        frames = [frame(a, b) for a, b in spans]
-        hs = [f.pop("h") for f in frames]
+        def rope(f: dict[str, Any], n: int) -> Any:
+            like = f["like"]
+            if own:
+                return self.rotary(like, self._positions(B, f["past"] + n, 0, None)[1])
+            if self.fam.dual_rope:
+                return {lt: self.rotary(like, f["text_pos"], lt) for lt in set(self.layer_types)}
+            return self.rotary(like, f["rope_pos"] if self.fam.mrope else f["text_pos"])
+
         # the rows between layers stay on the card while they take no more than a quarter of its room; past that
-        # they wait in pinned RAM, in the dtype they came out in (a copy, never a cast)
-        row_b = (
-            int(self.cfg.hidden_size) * int(self.fam.streams) * (4 if (cd is not None and cd != torch.bfloat16) else 2)
-        )
-        park = self.dev.type == Device.CUDA and T * row_b > self.prefill_room() // 4
+        # they wait in pinned RAM, in the dtype they came out in (a copy, never a cast), each chunk's buffer drawn
+        # from the host's share of the sweep's reservation as it is made
+        row_b, park = self._sweep_rows(B, T)
         parked: list[torch.Tensor | None] = [None] * len(spans)
+        host_dev = torch.device("cpu")
 
         def keep(c: int, h: torch.Tensor) -> torch.Tensor:
             if not park or h.device.type == "cpu":
                 return h
             buf = parked[c]
             if buf is None or buf.shape != h.shape or buf.dtype != h.dtype:
+                nbytes = 1 << max(0, h.numel() * h.element_size() - 1).bit_length()
+                sched = getattr(self, "scheduler", None)
+                if sched is not None:
+                    sched.grant(
+                        nbytes, "prefill", requester="a prefill chunk's rows, parked", device=host_dev, draws=PREFILL
+                    )
                 buf = parked[c] = torch.empty(h.shape, dtype=h.dtype, pin_memory=True)
             buf.copy_(h)
             return buf
@@ -883,7 +1026,7 @@ class _ForwardMixin(_State):
                 causal = self._causal(h, None, cache, f["text_pos"], True, layer_idx=i)
             return _Pass(
                 cache=cache,
-                pe=f["pe"],
+                pe=rope(f, b - a),
                 text_pos=f["text_pos"],
                 causal=causal,
                 linear_mask=None,
@@ -905,84 +1048,185 @@ class _ForwardMixin(_State):
         self._sweep_ahead = os.environ.get("BTB_PREFILL_AHEAD", "1") != "0"
         store = getattr(self, "expert_store", None)
         s0 = dict(store.stat) if store is not None else {}
-        if self.dev.type == Device.CUDA and os.environ.get("BTB_PREFILL_DEPOT", "1") != "0":
-            from .experts import LayerDepot
-
-            # half the card's free memory at the start holds a layer's experts for its sweep (a 180B layer's ~485
-            # asked: 4.6 GB); the rest stays the chunks' working room, which the chunk size was priced against
-            self._depot = LayerDepot(self.dev, int(self.device.free(self.dev, unreserved=True) or 0) // 2)
+        on_cuda = self.dev.type == Device.CUDA
+        # off the card the whole sweep runs on the host: its working set is the host's share
+        work_host = 0 if on_cuda else sum(self._sweep_bytes(C, past0, B, T, cache)[:1])
+        own_epoch = False
+        hs: list[torch.Tensor] = []
+        frames: list[dict[str, Any]] = []
         try:
-            with self.device.hold() as place:
-                proto = _Pass(card_pass=any(card), n_layers=self.L, place=None)
-                if self.prefetch:
-                    self._prefetch_next(0, proto)
-                for i in range(self.L):
-                    lt = self.layer_types[i]
-                    tl, es = time.perf_counter(), float(self.expert_stat.get("s", 0.0))
-                    host = place.tier(i) in (LayerTier.HOST, LayerTier.COLD)
-                    tmpl = self._card_layer(i, proto) if (not host or any(card)) else None
-                    for c in range(len(spans)):
-                        h = hs[c]
-                        if host and not card[c]:
-                            if h.device.type != "cpu" or h.dtype != torch.float32:
-                                h = h.detach().float().cpu()
-                            pas = chunk_pass(c, i, lt, False, h)
-                            pas.place = place
-                            hs[c] = keep(c, self._run_host_layer(i, h, pas))
-                            continue
-                        assert tmpl is not None  # a card chunk of a host layer took the template above
-                        wd = self._layer_dtype(tmpl)
-                        if h.device != self.dev or (wd is not None and h.dtype != wd):
-                            h = h.to(self.dev, wd) if wd is not None else h.to(self.dev)
-                        if host and frames[c]["past"] > 0:
-                            self._cache_to(cache, i, self.dev)
-                        pas = chunk_pass(c, i, lt, True, h)
-                        pas.place = place
-                        h = self._run_card_layer(i, tmpl, h, pas)
-                        if host:
-                            self._cache_to(cache, i, "cpu")
-                        hs[c] = keep(c, h)
-                    # the layer's time, its experts' share apart: where a sweep's time goes, by layer kind
-                    self._sync()
-                    kind = by_kind.setdefault(lt, [0, 0.0, 0.0])
-                    kind[0] += 1
-                    kind[1] += time.perf_counter() - tl
-                    kind[2] += float(self.expert_stat.get("s", 0.0)) - es
-                    if (i + 1) % 8 == 0 or i + 1 == self.L:
-                        self.log(f"[prefill] layer {i + 1}/{self.L} done, {time.time() - t0:.0f}s")
-        finally:
-            self._sweep_keep = False
-            self._sweep_ahead = False
-            store = getattr(self, "expert_store", None) or store
-            if store is not None:
-                store.sweep_end()
-                d = {k: store.stat.get(k, 0) - s0.get(k, 0) for k in ("miss", "wait_s", "s", "ahead", "ahead_used")}
-                self.log(
-                    f"[prefill] store: {int(d['miss'])} read, {d['wait_s']:.1f} s waited on the drive, "
-                    f"{d['s']:.1f} s in its own bookkeeping; {int(d['ahead'])} read ahead, "
-                    f"{int(d['ahead_used'])} of them used"
+            if on_cuda:
+                # the allocator's cached blocks given back first, so what the ledger reads as free is memory the card
+                # can hand out: a block cached for one size cannot be made into a buffer of another without emptying
+                # the cache, the sync and the flush the ledger was meant to spare
+                self.vram_trim("layer-by-layer prefill")
+                # the pass asks the ledger first, as a cache's growth does (`cache_room`): room on the card for its own
+                # working set - the last chunk's activations and scores (`_chunk_bytes`) and a mixture's grouped call
+                # over its rows (`_grouped_bytes`) - the rows kept between layers, and the cache's growth past what an
+                # epoch has reserved for it. btb gives up what it holds for that, or refuses the prefill, before anything
+                # is allocated
+                work, beside = self._sweep_bytes(C, past0, B, T, cache)
+                growth = self.cache_growth(cache, B, T, peak=True).get(self.dev, 0)
+                epoch = int(self.device.reserved(self.dev)) - int(self.device.reserved(self.dev, but=EPOCH))
+                kept = work + (0 if park else T * row_b) + self._hop_bytes(C, past0, B, T)
+                self._make_room(self.dev, work + beside, f"the layer-by-layer prefill's chunks of {C} rows")
+                # spoken for in the ledger for the sweep: the working set and the rows under the prefill's own tag, and
+                # the cache's growth as the epoch's KV where no epoch reserved it (a prefill outside a generate) - the
+                # cache's grants spend that one as their own, and nothing else reads either as free
+                self.device.reserve(PREFILL, kept, self.dev)
+                if growth > epoch:
+                    # the prompt's KV is the epoch's: its reservation raised to cover it (the cache's grants spend it as
+                    # the rows are allocated), and taken for the sweep where no epoch reserved any
+                    self.device.reserve(EPOCH, growth, self.dev)
+                    own_epoch = epoch == 0
+                if self.fam.moe and os.environ.get("BTB_PREFILL_DEPOT", "1") != "0":
+                    from .experts import LayerDepot
+
+                    # the depot grows its seats as the layers ask, out of what the ledger has free past all of that
+                    self._depot = LayerDepot(self.dev, self.device, getattr(self, "scheduler", None))
+                # the working set taken once and let go: the card's allocator keeps the block and splits every chunk's
+                # buffers from it, merging them back as they free. A chunk's scores grow with its position, and the
+                # buffers a smaller chunk freed would never fit the next: the card would fill with blocks the allocator
+                # must empty its cache to use again (the depot's blocks are of a pool of their own, and never split it)
+                del_work = torch.empty(work, dtype=torch.uint8, device=self.dev)
+                del del_work
+            host_share = self._host_bytes(C, past0, B, T) if on_cuda else work_host
+            if host_share:
+                # the host's share, asked of it as the card's is: the host chunks' working set and the parked rows,
+                # under the same tag there (the parked buffers draw on it as they are made)
+                self._make_room(host_dev, host_share, f"the layer-by-layer prefill's host share, chunks of {C} rows")
+                self.device.reserve(PREFILL, host_share, host_dev)
+            # the rows embedded now the room is made: on the card, or straight into their parked buffers
+            for c, (a, b) in enumerate(spans):
+                h = embed(a, b)
+                frames.append(frame(a, b, h))
+                hs.append(keep(c, h))
+                del h
+            # the card's allocator as the sweep goes: what it holds, what it keeps reserved, and how often it ran out and
+            # emptied its cache to retry (each retry a device-wide sync and fresh allocations after it)
+            retries0 = int(torch.cuda.memory_stats(self.dev).get("num_alloc_retries", 0)) if on_cuda else 0
+
+            def card_line() -> str:
+                if not on_cuda:
+                    return ""
+                ms = torch.cuda.memory_stats(self.dev)
+                return (
+                    f"; card {ms.get('allocated_bytes.all.current', 0) / 2**30:.1f} GB held, "
+                    f"{ms.get('reserved_bytes.all.current', 0) / 2**30:.1f} reserved, "
+                    f"{int(ms.get('num_alloc_retries', 0)) - retries0} allocator retries"
                 )
+
+            # a drive layer a host chunk runs is read into the ring's slot and held there for all its host chunks; a
+            # card chunk takes the layer as the card pass's template, read on its own
+            ring = bool(self.cold) and not all(card)
+            if ring:
+                self._cold_start(self.L)
+            try:
+                with self.device.hold() as place:
+                    proto = _Pass(card_pass=any(card), n_layers=self.L, place=None)
+                    if self.prefetch:
+                        self._prefetch_next(0, proto)
+                    for i in range(self.L):
+                        lt = self.layer_types[i]
+                        tl, es = time.perf_counter(), float(self.expert_stat.get("s", 0.0))
+                        host = place.tier(i) in (LayerTier.HOST, LayerTier.COLD)
+                        tmpl = self._card_layer(i, proto) if (not host or any(card)) else None
+                        if ring and i in self.cold:
+                            self._cold_wait(i)
+                            self._cold_held = i
+                        for c, (a_c, b_c) in enumerate(spans):
+                            h = hs[c]
+                            if host and not card[c]:
+                                if h.device.type != "cpu" or h.dtype != torch.float32:
+                                    # widened on the host, where the host chunk's share was asked for it
+                                    h = h.detach().cpu().float()
+                                pas = chunk_pass(c, i, lt, False, h)
+                                pas.place = place
+                                hs[c] = keep(c, self._run_host_layer(i, h, pas))
+                                continue
+                            assert tmpl is not None  # a card chunk of a host layer took the template above
+                            wd = self._layer_dtype(tmpl)
+                            if h.device != self.dev or (wd is not None and h.dtype != wd):
+                                h = h.to(self.dev, wd) if wd is not None else h.to(self.dev)
+                            if host and frames[c]["past"] > 0:
+                                cl = cache.layers[i]
+                                if isinstance(cl, GrowLayer) and not cl.shared and cl.keys.numel():
+                                    # the rows onto the card with room for this chunk's: written in place there, in
+                                    # the prefill's reservation (`_hop_bytes`), nothing grown or granted
+                                    cl.hop(self.dev, b_c - a_c, h.dtype)
+                                else:
+                                    self._cache_to(cache, i, self.dev)
+                            pas = chunk_pass(c, i, lt, True, h)
+                            pas.place = place
+                            h = self._run_card_layer(i, tmpl, h, pas)
+                            if host:
+                                self._cache_to(cache, i, "cpu")
+                            hs[c] = keep(c, h)
+                        if self._cold_held is not None:
+                            self._cold_held = None
+                            self._cold_release(i)
+                        # the layer's time, its experts' share apart: where a sweep's time goes, by layer kind
+                        self._sync()
+                        kind = by_kind.setdefault(lt, [0, 0.0, 0.0])
+                        kind[0] += 1
+                        kind[1] += time.perf_counter() - tl
+                        kind[2] += float(self.expert_stat.get("s", 0.0)) - es
+                        if (i + 1) % 8 == 0 or i + 1 == self.L:
+                            self.log(f"[prefill] layer {i + 1}/{self.L} done, {time.time() - t0:.0f}s{card_line()}")
+                    # the last row, its own: the parked buffers are let go as the sweep ends
+                    last = hs[-1][:, -1:].clone()
+            finally:
+                if self._cold_held is not None:
+                    held, self._cold_held = self._cold_held, None
+                    self._cold_release(held)
+                self._sweep_keep = False
+                self._sweep_ahead = False
+                store = getattr(self, "expert_store", None) or store
+                if store is not None:
+                    store.sweep_end()
+                    d = {k: store.stat.get(k, 0) - s0.get(k, 0) for k in ("miss", "wait_s", "s", "ahead", "ahead_used")}
+                    self.log(
+                        f"[prefill] store: {int(d['miss'])} read, {d['wait_s']:.1f} s waited on the drive, "
+                        f"{d['s']:.1f} s in its own bookkeeping; {int(d['ahead'])} read ahead, "
+                        f"{int(d['ahead_used'])} of them used"
+                    )
+                depot, self._depot = getattr(self, "_depot", None), None
+                if depot is not None:
+                    depot.close()
+                    st = depot.stat
+                    if st["seated"] or st["scratch"]:
+                        self.log(
+                            f"[prefill] depot: {st['seated']} experts seated in {int(st['blocks'])} blocks grown as asked "
+                            f"({st['held'] / 2**30:.1f} GB held; {st['bytes'] / 2**30:.1f} GB over the bus, "
+                            f"{st['upload_s']:.1f} s of it holding the host), {st['reused']} reused by a later chunk, "
+                            f"{st['scratch']} through scratch, {st['passed']} not seated"
+                        )
+                if by_kind:
+                    self.log(
+                        "[prefill] time by layer kind: "
+                        + "; ".join(
+                            f"{lt} {n} layers {wall:.1f} s (experts {ex:.1f} s)"
+                            for lt, (n, wall, ex) in by_kind.items()
+                        )
+                    )
+        finally:
+            # the sweep's reservations given back and its depot let go however it ended - a refusal, a fault, or the
+            # sweep's own cleanup raising: left standing, every later reading of the card's free memory would count
+            # them, and the next pass would find a depot with nothing behind it
+            self.device.release(PREFILL)
+            if own_epoch:
+                self.device.release(EPOCH)
+            if park:
+                # the parked rows' pinned buffers back to the OS, not kept in torch's pinned cache where the host's
+                # free reading would count them taken after the sweep let them go
+                parked.clear()
+                hs.clear()
+                torch._C._host_emptyCache()
             depot, self._depot = getattr(self, "_depot", None), None
             if depot is not None:
-                depot.settle()
-                st = depot.stat
-                if st["seated"]:
-                    self.log(
-                        f"[prefill] depot: {st['seated']} experts seated ({st['bytes'] / 2**30:.1f} GB over the bus, "
-                        f"{st['upload_s']:.1f} s of it holding the host), {st['reused']} reused by a later chunk, "
-                        f"{st['scratch']} through scratch, {st['passed']} not seated"
-                    )
-            if by_kind:
-                self.log(
-                    "[prefill] time by layer kind: "
-                    + "; ".join(
-                        f"{lt} {n} layers {wall:.1f} s (experts {ex:.1f} s)" for lt, (n, wall, ex) in by_kind.items()
-                    )
-                )
+                depot.close()
         self._flush_events()
-        h = hs[-1][:, -1:]
-        if h.device != self.dev:
-            h = h.to(self.dev)
+        h = self._norm_input(last)
         h = self._final_norm(h)
         return self._apply_head(h.to(cd if cd is not None else h.dtype))
 

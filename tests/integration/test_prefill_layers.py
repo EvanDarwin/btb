@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
-"""A mixture's prefill layer by layer against the same prompt's chunks taken through every layer in turn: the last
-row's logits and every layer's cache - attention rows, the DeltaNet and convolution states, the sparse indexer's
-keys - are the same bits, on the host tier, on a card pass that streams the host layers in as templates, and on a
+"""A prefill layer by layer against the same prompt's chunks taken through every layer in turn - a mixture's, a
+dense model's, a hybrid's: the last row's logits and every layer's cache - attention rows, the DeltaNet and
+convolution states, the sparse indexer's keys - are the same bits, on the host tier, on the drive's tier (each drive
+layer's ring slot held across its chunks), on a card pass that streams the host layers in as templates, and on a
 card pass whose short last chunk stays on the host."""
 
 from __future__ import annotations
@@ -32,7 +33,9 @@ def _tensors(cache: Any) -> Iterator[tuple[str, torch.Tensor]]:
 
 
 def _prefill(layers: bool, ids: list[int], **kw: Any) -> tuple[torch.Tensor, dict[str, torch.Tensor], list[str]]:
-    """the prompt's last-row logits and its cache's tensors, prefilled with `prefill_layers` as given"""
+    """the prompt's last-row logits and its cache's tensors, prefilled with `prefill_layers` as given. A hybrid's
+    chunks without it are the chunked loop's own passes, driven here: the engine takes a hybrid's prompt whole
+    outside the layer-by-layer path"""
     log: list[str] = []
     sm = StreamedTextModel(
         fixture(kw.pop("fx", "tiny_q4")),
@@ -47,7 +50,19 @@ def _prefill(layers: bool, ids: list[int], **kw: Any) -> tuple[torch.Tensor, dic
             sm.grouped_experts = bool(kw["grouped"])
         with torch.inference_mode():
             cache = sm.new_cache()
-            lg = sm._prefill(torch.tensor([ids]), cache)[0, -1].float().cpu()
+            t = torch.tensor([ids])
+            if not layers and sm.fam.hybrid and not sm.fam.own and sm.prefill_chunk:
+                # the chunked loop's passes (`_prefill`): each chunk one forward, continuing the one before
+                C, sm._batched_cont = int(sm.prefill_chunk), True
+                try:
+                    for a in range(0, t.shape[1], C):
+                        out = sm.forward(t[:, a : a + C], cache=cache, last_only=True)
+                finally:
+                    sm._batched_cont = False
+                assert out is not None  # a whole pass returns its logits
+                lg = out[0, -1].float().cpu()
+            else:
+                lg = sm._prefill(t, cache)[0, -1].float().cpu()
             got = {name: t.detach().float().cpu().clone() for name, t in _tensors(cache)}
     finally:
         sm.close()
@@ -60,9 +75,9 @@ def _prompt(n: int = 20) -> list[int]:
     return (base * (n // len(base) + 1))[:n]
 
 
-def _same(kw: dict[str, Any], chunk: int) -> list[str]:
+def _same(kw: dict[str, Any], chunk: int, ids: list[int] | None = None) -> list[str]:
     """the layer-by-layer prefill against the chunks, bit for bit; the layer-by-layer run's log"""
-    ids = _prompt()
+    ids = _prompt() if ids is None else ids
     assert len(ids) > 2 * chunk, "the prompt must span at least three chunks"
     ref, ref_cache, ref_log = _prefill(False, ids, prefill_chunk=chunk, **kw)
     got, got_cache, got_log = _prefill(True, ids, prefill_chunk=chunk, **kw)
@@ -91,6 +106,61 @@ def test_card_pass_by_layer_is_the_chunks_bits() -> None:
     _same({**kw, "prefill_card_min": 1, "prefetch": False}, chunk=3)
 
 
+# layer by layer is not a mixture's alone: a dense model's and a hybrid's streamed layers are read once a prompt too
+DENSE = ["tiny_qwen3", "tiny_q35"]
+
+
+def _ids(n: int = 20) -> list[int]:
+    """`n` tokens inside every fixture's vocabulary (256 the smallest): six chunks of three and a short one"""
+    return [(7 * i + 3) % 200 + 2 for i in range(n)]
+
+
+@pytest.mark.parametrize("fx", DENSE)
+def test_dense_host_layers_by_layer_are_the_chunks_bits(fx: str) -> None:
+    L = layer_count(fixture(fx))
+    StreamedTextModel.register_attention()
+    _same({"fx": fx, "device": "cpu", "cpu_layers": range(L)}, chunk=3, ids=_ids())
+
+
+@pytest.mark.parametrize("fx", DENSE)
+def test_drive_layers_by_layer_hold_their_ring_slot(fx: str) -> None:
+    """the drive's tier on the host: a drive layer waits for its ring slot once, holds it across all the layer's
+    chunks and frees it after the last, two slots for the layers between - the bits the chunks' own passes give"""
+    L = layer_count(fixture(fx))
+    StreamedTextModel.register_attention()
+    kw = {"fx": fx, "device": "cpu", "cpu_layers": range(L), "cold_layers": range(1, L - 1), "cold_slots": 2}
+    _same(kw, chunk=3, ids=_ids())
+
+
+@pytest.mark.parametrize("fx", DENSE)
+def test_dense_card_pass_by_layer_is_the_chunks_bits(fx: str) -> None:
+    dev = need_cuda()
+    L = layer_count(fixture(fx))
+    StreamedTextModel.register_attention()
+    kw = {"fx": fx, "device": dev, "cpu_layers": range(L - 2), "resident_layers": range(L - 2, L), "prefill_card": True}
+    _same({**kw, "prefill_card_min": 1, "prefetch": True}, chunk=3, ids=_ids())
+
+
+@pytest.mark.parametrize("fx", DENSE)
+def test_drive_layers_on_a_card_pass_by_layer(fx: str) -> None:
+    """drive layers on a card pass whose last chunk is short: the full chunks take each drive layer as the card's
+    template, the short one takes it from the ring on the host, which the prefill holds for it"""
+    dev = need_cuda()
+    L = layer_count(fixture(fx))
+    StreamedTextModel.register_attention()
+    kw = {
+        "fx": fx,
+        "device": dev,
+        "cpu_layers": range(L - 2),
+        "cold_layers": range(1, L - 2),
+        "resident_layers": range(L - 2, L),
+        "prefill_card": True,
+        "prefill_card_min": 3,
+        "prefetch": True,
+    }
+    _same(kw, chunk=3, ids=_ids())
+
+
 def test_the_depot_holds_a_layers_experts_on_the_card(monkeypatch: pytest.MonkeyPatch) -> None:
     """the experts multiplied on the card for every chunk (the rows past the host floor): a layer's experts are
     seated once in the depot and reused by the later chunks, and the bits stay the chunked path's"""
@@ -116,16 +186,10 @@ def test_experts_past_the_depot_ride_the_scratch_slots(monkeypatch: pytest.Monke
     from btb.engine.experts import LayerDepot
     from btb.engine.native import Native
 
-    def one_seat(self: LayerDepot, parts: tuple[torch.Tensor, ...]) -> bool:
-        n = self.SCRATCH + 1
-        self.stacks = [torch.empty((n, *p.shape), dtype=p.dtype, device=self.dev) for p in parts]
-        self.n_seats = 1
-        return True
-
     L = layer_count(fixture("tiny_q4"))
     StreamedTextModel.register_attention()
     monkeypatch.setattr(Native, "gemm_rows", 2)
-    monkeypatch.setattr(LayerDepot, "_open", one_seat)
+    monkeypatch.setattr(LayerDepot, "MAX_SEATS", 1)
     kw = {"device": dev, "cpu_layers": range(L - 2), "resident_layers": range(L - 2, L), "prefill_card": True}
     got_log = _same({**kw, "prefill_card_min": 1, "prefetch": True}, chunk=3)
     line = next((ln for ln in got_log if "depot:" in ln), None)
@@ -196,17 +260,11 @@ def test_grouped_waves_through_a_small_scratch_are_the_loops_bits(monkeypatch: p
     from btb.engine.experts import LayerDepot
     from btb.engine.native import Native
 
-    def one_seat(self: LayerDepot, parts: tuple[torch.Tensor, ...]) -> bool:
-        n = self.SCRATCH + 1
-        self.stacks = [torch.empty((n, *p.shape), dtype=p.dtype, device=self.dev) for p in parts]
-        self.n_seats = 1
-        return True
-
     L = layer_count(fixture("tiny_q4"))
     StreamedTextModel.register_attention()
     monkeypatch.setattr(Native, "gemm_rows", 2)
     monkeypatch.setattr(LayerDepot, "SCRATCH", 2)
-    monkeypatch.setattr(LayerDepot, "_open", one_seat)
+    monkeypatch.setattr(LayerDepot, "MAX_SEATS", 1)
     kw = {"device": dev, "cpu_layers": range(L - 2), "resident_layers": range(L - 2, L), "prefill_card": True}
     n = _grouped_vs_loop({**kw, "prefill_card_min": 1, "prefetch": True, "compute_dtype": torch.bfloat16})
     assert n > 0, "no call took the grouped path"

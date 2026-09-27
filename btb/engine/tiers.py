@@ -27,7 +27,7 @@ from ..mlx.legacyq import KINDS as LEGACY_KINDS
 from ..options import Device
 from ..pack12 import entries, unpack_bf16
 from ..sysinfo import process_working_set_bytes
-from .cache import CardRowsLayer, ForkLayer, GrowLayer
+from .cache import CardRowsLayer, ForkIndexedLayer, ForkLayer, GrowLayer
 from .host import _Experts, _HostLinear, bf16_in_place, copy_bytes
 from .native import Native
 from .state import DRAFT_VOCAB, _State
@@ -361,7 +361,9 @@ class _TiersMixin(_State):
             },
             "peak": {
                 "ram_gb": rss / 2**30,
+                # free-read: the run's report
                 "vram_reserved_gb": (torch.cuda.max_memory_reserved(dev) / 2**30) if cuda else 0.0,
+                # free-read: the run's report
                 "vram_allocated_gb": (torch.cuda.max_memory_allocated(dev) / 2**30) if cuda else 0.0,
                 "mlx_gb": (mlx.peak_bytes() / 2**30) if mlx is not None else 0.0,
             },
@@ -604,8 +606,21 @@ class _TiersMixin(_State):
     def _caches_to(self, i: int, dev: str | torch.device, cache: KvCache | None = None) -> None:
         """layer i's rows in every live cache (and `cache`) moved to `dev`, where the layer now runs"""
         live: list[KvCache] = list(self.__dict__.get("_live_caches", ()))
-        for c in {id(c): c for c in [*live, *([cache] if cache is not None else [])]}.values():
-            self._cache_to(c, i, dev)
+        caches = list({id(c): c for c in [*live, *([cache] if cache is not None else [])]}.values())
+        self._rows_to(caches, [i], dev)
+
+    def _rows_to(self, caches: Sequence[Any], layers: Sequence[int], dev: str | torch.device) -> None:
+        """the rows of `layers` in `caches` moved to `dev`, granted together first where they come onto the card:
+        a move the card cannot take is refused whole, before a row has moved"""
+        dev = torch.device(dev)
+        sched = getattr(self, "scheduler", None)
+        if dev.type == Device.CUDA and sched is not None:
+            nbytes = sum(_rows_bytes(c, i, dev) for c in caches for i in layers)
+            if nbytes:
+                sched.grant(nbytes, "kv", requester=f"layers {list(layers)}'s rows onto the card", device=dev, draws="")
+        for c in caches:
+            for i in layers:
+                self._cache_to(c, i, dev)
 
     @staticmethod
     def _cache_to(cache: Any, i: int, dev: str | torch.device) -> None:
@@ -661,7 +676,10 @@ class _TiersMixin(_State):
         if what == "drafter":
             return sum(self._get(k).numel() * 2 for k in self.weight_map if k.startswith("mtp."))
         fp32 = self.compute_dtype is not None and self.compute_dtype != torch.bfloat16
-        return self._layer_bytes(int(what.split()[1])) * (2 if (fp32 and self.resident_fp32) else 1)
+        i = int(what.split()[1])
+        # and its rows in every live cache, which follow it onto the card
+        rows = sum(_rows_bytes(c, i, self.dev) for c in list(self.__dict__.get("_live_caches", ())))
+        return self._layer_bytes(i) * (2 if (fp32 and self.resident_fp32) else 1) + rows
 
     def _realloc_bytes(self) -> int:
         n = 0
@@ -1278,3 +1296,26 @@ class _TiersMixin(_State):
             tmpl.to(self.dev)
         self._sync()
         self.load_s += time.time() - t0
+
+
+def _rows_bytes(cache: Any, i: int, dev: torch.device) -> int:
+    """the bytes layer i's rows in `cache` take once moved to `dev` (`_cache_to`): nothing for those there already"""
+    if cache is None or i >= len(cache.layers):
+        return 0
+    cl = cache.layers[i]
+    if isinstance(cl, CardRowsLayer):
+        return 0  # the arena's rows: a fork's layer made of them grants its own buffer (`to_fork`)
+    if isinstance(cl, ForkLayer):
+        held = [*(cl._kv or (cl._pk, cl._pv))]
+        if isinstance(cl, ForkIndexedLayer):
+            held.append(cl._ti if cl._ti is not None else cl._pi)
+    else:
+        held = [getattr(cl, a, None) for a in ("keys", "values", "indexer_keys")]
+        for a in ("conv_states", "recurrent_states"):
+            d = getattr(cl, a, None)
+            held += list(d.values()) if isinstance(d, dict) else [d]
+    return sum(
+        t.numel() * t.element_size()
+        for t in held
+        if isinstance(t, torch.Tensor) and t.device.type != dev.type and t.device.type != "meta"
+    )

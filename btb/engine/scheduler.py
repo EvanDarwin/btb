@@ -330,6 +330,7 @@ class BatchScheduler:
         else the larger of `RAM_FLOOR_SHARE` of the available RAM and the OS's figure plus the run's `growth`.
         The floor moves the plan's bottom line only; the run still gives memory back under pressure."""
         os_floor = int(os_memory_floor())
+        # free-read: the plan's host budget, measured before the model and its ledger exist
         available = int(host_free_bytes()) + int(pool.POOL.free_bytes())
         floor = (
             int(float(floor_gb) * 2**30)
@@ -339,6 +340,7 @@ class BatchScheduler:
         return HostBudget(
             total=int(host_total_bytes()),
             available=available,
+            # free-read: the plan's host budget, measured before the model and its ledger exist
             commit=int(host_commit_bytes()),
             footprint=int(process_working_set_bytes()),
             os_floor=os_floor,
@@ -460,27 +462,30 @@ class BatchScheduler:
             return None
         return self.free_for(None)
 
-    def free_for(self, device: Any = None) -> int | None:
+    def free_for(self, device: Any = None, draws: str | None = EPOCH) -> int | None:
         """What an allocation on `device` (the engine's own when None) may take: the card's free VRAM above
         the engine's margin, MLX's ledger on the unified device (the host and the GPU spend one pool), or the
         host's free RAM above the engine's RAM reserve. None when nothing here can price the device. The
         arithmetic is the device's (`Device.free`), the one ledger the plan and the memory policy read too:
-        less what rooms and loans are promised, all but the epoch's own KV, which its cache's growth spends. An
-        engine built without one (a stub under test) is priced the same way directly."""
+        less what rooms and loans are promised, all but the reservation `draws` (the epoch's KV by default, which
+        its cache's growth spends). An engine built without one (a stub under test) is priced the same way
+        directly."""
         dv = getattr(self.sm, "device", None)
         if dv is not None:
-            return dv.free(device, unreserved=True, own=EPOCH)
+            return dv.free(device, unreserved=True, own=draws or None)
         from .device import free_bytes, torch_device
 
         dev = self.sm.dev if device is None else torch_device(device)
         if dev.type == Device.CUDA:
             if self.sm.dev.type != Device.CUDA:
                 return None
+            # free-read: a scheduler over a model that is not btb's (`for_model`): it has no ledger to read
             return free_bytes(dev, int(getattr(self.sm, "vram_margin", 0) or 0))
         if getattr(self.sm, "mlx", None) is not None:
             # unified memory: the engine's own ledger - the RAM the load started with, less the reserve, less
             # everything MLX holds (exact whether or not the pages are touched; see the expert store)
             return max(0, int(self.sm.mem_start) - int(self.sm.ram_reserve) - int(self.sm.mlx.held_bytes()))
+        # free-read: a scheduler over a model that is not btb's (`for_model`): it has no ledger to read
         return max(0, host_free_bytes() - int(getattr(self.sm, "ram_reserve", 0) or 0))
 
     def grant(
@@ -493,19 +498,29 @@ class BatchScheduler:
         cap: int | None = None,
         bound: int | None = None,
         device: Any = None,
+        held: int = 0,
+        draws: str | None = None,
     ) -> None:
         """Ask before allocating: returns on a request the engine can afford, raises `MemoryGrantError` on one
         it cannot. One free-memory read: for an allocation path (a growth, a tier load), never a per-token one.
         A `kv` request whose per-row capacity `cap` is past `bound` (the length the sequence itself can reach)
-        is refused whatever its size: a growth bug, not a need. A large but affordable request is logged."""
+        is refused whatever its size: a growth bug, not a need. A large but affordable request is logged.
+
+        `draws` names the reservation the allocation is made out of: its room is the caller's own to take, and
+        what the allocation adds - `nbytes` less the `held` bytes of the buffer it replaces, freed once it is
+        filled - comes off it, so the memory is counted once. A `kv` request draws on the epoch's KV unless it names
+        another; `""` draws on none (a copy or a move of rows the epoch already counted). A request that fits only
+        by counting torch's cached blocks has them given back to the driver first: the allocation is then made from
+        free memory, not by torch's allocator failing and emptying its cache to retry."""
         nbytes = int(nbytes)
         who = requester or kind
+        tag = (EPOCH if kind == "kv" else None) if draws is None else (draws or None)
         if kind == "kv" and cap and bound and int(cap) > int(bound):
             raise MemoryGrantError(
                 f"[grant] REFUSED {who}: kv cap {int(cap)} rows past the sequence ceiling {int(bound)} "
                 f"(B={int(B)}, {_size(nbytes)}) - the buffer is growing past anything these rows reach"
             )
-        free = self.free_for(device)
+        free = self.free_for(device, tag)
         if free is None:
             return
         from .device import torch_device
@@ -515,12 +530,28 @@ class BatchScheduler:
         # names): a request past either is refused
         if nbytes > free:
             raise MemoryGrantError(
-                f"[grant] REFUSED {who}: {kind} {_size(nbytes)} on {dev}, only {_size(free)} free{self._ledger_line()}"
+                f"[grant] REFUSED {who}: {kind} {_size(nbytes)} on {dev}, only {_size(free)} free"
+                f"{self._held_line(dev, tag)}{self._ledger_line()}"
             )
-        tag = f"{kind}@{dev.type}"
-        self.granted[tag] = self.granted.get(tag, 0) + nbytes
+        seen = f"{kind}@{dev.type}"
+        self.granted[seen] = self.granted.get(seen, 0) + nbytes
         if free and nbytes >= self.warn_fraction * free:
             self.sm.log(f"[grant] LARGE {who}: {kind} {_size(nbytes)} of {_size(free)} free")
+        dv = getattr(self.sm, "device", None)
+        if dv is None:
+            return
+        if tag is not None:
+            dv.spend(tag, max(0, nbytes - int(held)), dev)
+        if dev.type == Device.CUDA and nbytes > int(dv.free(dev, unreserved=True, own=tag, pooled=True) or 0):
+            trim = getattr(self.sm, "vram_trim", None)
+            if trim is not None:
+                trim("grant")
+
+    def _held_line(self, dev: Any, draws: str | None) -> str:
+        """what the ledger holds spoken for on `dev` past the room the request draws on: who took the room"""
+        dv = getattr(self.sm, "device", None)
+        held = {k: n for k, n in dv.spoken_for(dev).items() if k != draws} if dv is not None else {}
+        return (" (spoken for there: " + ", ".join(f"{k} {_size(n)}" for k, n in held.items()) + ")") if held else ""
 
     def _ledger_line(self) -> str:
         """on MLX, the arithmetic behind the free figure, which the OS's own count does not show: the RAM at

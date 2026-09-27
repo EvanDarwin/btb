@@ -112,10 +112,15 @@ class _GenerateMixin(_State):
     def _lin_restore(cl: LinLayer, snap: LinSnap) -> None:
         conv, rec = snap
         if isinstance(conv, dict) and isinstance(rec, dict):
-            for k, v in conv.items():
-                cl.conv_states[k].copy_(v)
-            for k, v in rec.items():
-                cl.recurrent_states[k].copy_(v)
+            for have, snap_states in ((cl.conv_states, conv), (cl.recurrent_states, rec)):
+                assert isinstance(have, dict)  # a layer keeps its states as its snapshot does
+                for k, v in snap_states.items():
+                    if have.get(k) is None:
+                        # a slot the layer has not filled yet (a host prefill leaves some to the first step): the
+                        # state becomes a copy of its own, never a view of the rows it came from
+                        have[k] = v.clone()
+                    else:
+                        have[k].copy_(v)
             return
         assert isinstance(conv, torch.Tensor) and isinstance(rec, torch.Tensor)  # _lin_snap copies both alike
         c, r = _lin(cl)
@@ -781,21 +786,25 @@ class _GenerateMixin(_State):
         while i < len(prompts):
             longest = max(len(prompts[j]) for j in range(i, len(prompts)))
             B, _ = self.scheduler.plan(len(prompts) - i, longest + int(max_new))
-            rows = prompts[i : i + B]
-            part = hooks.child() if hooks is not None else None
-            if len(rows) == 1:
-                outs = [self.generate_greedy([rows[0]], max_new, eos_ids=eos_ids, sampling=sampling, hooks=part)]
-            else:
-                ids, mask = self.pad_left(rows, pad_id)
-                o = self.generate_greedy(
-                    ids, max_new, eos_ids=eos_ids, attention_mask=mask, sampling=sampling, hooks=part
-                )
-                outs = o if isinstance(o[0], (list, tuple)) else [o]
-            if hooks is not None and part is not None:
-                part.rows(len(rows))
-                hooks.extend(part)
-            for k in range(len(rows)):
-                results[i + k] = outs[k]
-            i += len(rows)
-            self.scheduler.release()
+            # the epoch's KV reservation is let go however the epoch ends, a refusal or an abort included: left
+            # standing, every reading of the device's free memory would count it until the next epoch's plan
+            try:
+                rows = prompts[i : i + B]
+                part = hooks.child() if hooks is not None else None
+                if len(rows) == 1:
+                    outs = [self.generate_greedy([rows[0]], max_new, eos_ids=eos_ids, sampling=sampling, hooks=part)]
+                else:
+                    ids, mask = self.pad_left(rows, pad_id)
+                    o = self.generate_greedy(
+                        ids, max_new, eos_ids=eos_ids, attention_mask=mask, sampling=sampling, hooks=part
+                    )
+                    outs = o if isinstance(o[0], (list, tuple)) else [o]
+                if hooks is not None and part is not None:
+                    part.rows(len(rows))
+                    hooks.extend(part)
+                for k in range(len(rows)):
+                    results[i + k] = outs[k]
+                i += len(rows)
+            finally:
+                self.scheduler.release()
         return results

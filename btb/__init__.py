@@ -148,6 +148,7 @@ def plan(
             p.open_packed()
         # the same arithmetic the scheduler and the memory policy read once the model is up (Device.free); on
         # MLX the GPU's memory is the RAM, so everything is planned as host layers and the card's figure is 0
+        # free-read: the load's plan, made before the model and its ledger exist
         vram_gb = (free_bytes(torch.device(str(dev))) or 0) / 2**30 if card else 0.0
         return BatchScheduler.plan_placement(
             p,
@@ -560,6 +561,7 @@ def peak_memory(sm: Any = None) -> tuple[int, int]:
     if sm is not None and getattr(sm, "mlx", None) is not None:
         vram = int(sm.mlx.peak_bytes())
     elif sm is not None and sm.dev.type == Device.CUDA:
+        # free-read: a report of what the card peaked at
         vram = int(torch.cuda.max_memory_reserved(sm.dev))
     return rss, vram
 

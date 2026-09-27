@@ -23,9 +23,9 @@ from ..fp8 import F8Weight
 from ..kinds import PassTag
 from ..mxfp4 import BLOCK, MxGateUp, MxWeight, stored_mxfp4
 from ..options import Device
-from ..sysinfo import host_free_bytes
 from .host import bf16_in_place, stored_parts
 from .native import Native
+from .scheduler import MemoryGrantError
 
 if TYPE_CHECKING:
     from concurrent.futures import ThreadPoolExecutor
@@ -335,40 +335,66 @@ class LayerDepot:
     """A layer's experts held on the card while a prefill sweeps its chunks through it (`_prefill_by_layer`): each
     expert crosses the bus once for the whole prompt, not once a chunk. An expert is seated the first time the
     layer asks for it, its copy queued on a stream of its own so the next expert's bytes move under this one's
-    matmuls; the compute waits on that expert's copy alone. A new layer takes the slots over once the card is
-    done with the last one's. The weights are the store's bytes as they are - bf16, or MXFP4 as stored, a quarter
-    of the bytes over the bus (`stored_parts`) - one stacked tensor per part; a product over a seated bf16 expert is
-    the one the call's own upload (`w.to(card).to(x.dtype)`) gives. Slots are bounded by `cap` bytes; past them an
-    expert rides one of the scratch slots, on the same copy stream: uploaded again by every chunk that asks, but
-    under the matmuls rather than as a pageable copy that waits for the card to drain.
+    matmuls; the compute waits on that expert's copy alone. A new layer takes the seats over once the card is
+    done with the last one's. The weights are the store's bytes as they are - bf16, or MXFP4 or FP8 as stored
+    (`stored_parts`) - a slot holding one expert's parts; a product over a seated bf16 expert is the one the call's
+    own upload (`w.to(card).to(x.dtype)`) gives.
 
-    A call's experts go to the card in waves (`place`) and each wave is one grouped matmul over the stack: a slot's
-    rows its expert's, an idle slot none.
+    The depot grows as the layers ask of it and no further. It opens with the scratch slots alone, and a layer
+    asking for an expert it has no seat for grows a block of `BLOCK` seats, out of what the device's ledger has
+    free that nothing has spoken for - the pass's own working set and the cache's growth are - counted there as it
+    is made and given back with the depot (`close`). Where the ledger has no block to give, an expert rides one of
+    the scratch slots, on the same copy stream: uploaded again by every chunk that asks, but under the matmuls
+    rather than as a pageable copy that waits for the card to drain; where it has not even the scratch, the call
+    takes the loop. The blocks come from a pool of their own in torch's allocator, so they never split, or are
+    split out of, the blocks the pass's own buffers are cut from.
+
+    A call's experts go to the card in waves (`place`), each wave multiplied as one grouped matmul a block it
+    touched: a slot's rows its expert's, an idle slot none.
 
     The store's pages are pageable (and on Windows a pinned store is refused), so a copy from them holds the host
     until it lands, at the driver's pageable rate. Each upload goes through a small ring of pinned buffers instead:
     the host copies the expert into one (a memcpy torch spreads over the cores), and the bus takes it from there at
-    the pinned rate while the host moves on; a buffer is filled again once its last copy out has landed.
-    `BTB_PREFILL_STAGE=0`, or a machine that will not pin the ring, uploads from the store's pages."""
+    the pinned rate while the host moves on; a buffer is filled again once its last copy out has landed. The
+    buffers are lent through the ledger too. `BTB_PREFILL_STAGE=0`, or a machine that will not pin the ring, uploads
+    from the store's pages."""
 
     SCRATCH = 32
+    BLOCK = 16
     STAGE = 4
+    # a ceiling on the seats, below the ledger's (the tests' small depots)
+    MAX_SEATS: int | None = None
 
-    def __init__(self, dev: torch.device, cap: int) -> None:
-        self.dev = dev
-        self.cap = int(cap)
+    def __init__(self, dev: torch.device, ledger: Any, sched: Any = None) -> None:
+        # the card by its index: a pool of torch's allocator is a device's own
+        self.dev = torch.device(dev.type, dev.index if dev.index is not None else torch.cuda.current_device())
+        self.ledger = ledger
+        self.sched = sched
+        self.pool: torch.cuda.MemPool | None = torch.cuda.MemPool()
         self.copy = torch.cuda.Stream(device=dev)
         self.layer = -1
         self.seat: dict[int, int] = {}
-        # one stack a stored part: bf16's gate_up and down, or MXFP4's four
-        self.stacks: list[torch.Tensor] | None = None
-        self.n_seats = 0
+        # the slots' blocks, each one stack a stored part: block 0 the scratch slots, the rest the seats as grown
+        self.blocks: list[list[torch.Tensor]] = []
+        self.where: list[tuple[int, int]] = []  # a slot's (block, row)
+        # the stored form the first expert showed, every expert after the same: each part's shape and dtype
+        self.form: tuple[tuple[torch.Size, torch.dtype], ...] | None = None
+        self.per = 0
         # scratch j is free once the matmuls handed it are done: the event recorded at the next `get`, after
         # the caller queued them
         self.turn = 0
         self.lent: int | None = None
         self.free: list[torch.cuda.Event | None] = [None] * self.SCRATCH
-        self.stat: dict[str, float] = {"seated": 0, "reused": 0, "scratch": 0, "passed": 0, "bytes": 0, "upload_s": 0.0}
+        self.stat: dict[str, float] = {
+            "seated": 0,
+            "reused": 0,
+            "scratch": 0,
+            "passed": 0,
+            "bytes": 0,
+            "upload_s": 0.0,
+            "blocks": 0,
+            "held": 0,
+        }
         # a wave took the scratch slots over: the next `get` to take one waits for the card to finish what came before
         self.fence_scratch = False
         self.stage: list[tuple[torch.Tensor, ...]] | None = None
@@ -377,39 +403,98 @@ class LayerDepot:
         self.staged = os.environ.get("BTB_PREFILL_STAGE", "1") != "0"
 
     @property
-    def gu(self) -> torch.Tensor | None:
-        """a bf16 depot's gate_up stack"""
-        return self.stacks[0] if self.stacks is not None else None
+    def n_seats(self) -> int:
+        """the seats grown so far"""
+        return max(0, len(self.where) - self.SCRATCH)
 
-    @property
-    def dn(self) -> torch.Tensor | None:
-        """a bf16 depot's down stack"""
-        return self.stacks[1] if self.stacks is not None else None
+    def _block(self, n: int) -> list[torch.Tensor] | None:
+        """`n` slots of the depot's form, out of what the ledger has free that nothing has spoken for, asked of the
+        scheduler as a large allocation is; None where there is not that much"""
+        assert self.form is not None
+        nbytes = n * self.per
+        # from the depot's own pool, which reuses none of torch's cached blocks: the card's free memory alone
+        if nbytes > int(self.ledger.free(self.dev, unreserved=True, pooled=True) or 0):
+            return None
+        if self.sched is not None:
+            try:
+                self.sched.grant(nbytes, "depot", requester="LayerDepot", device=self.dev)
+            except MemoryGrantError:
+                return None
+        if self.pool is None:  # closed
+            return None
+        try:
+            with torch.cuda.use_mem_pool(self.pool, device=self.dev):
+                block = [torch.empty((n, *shape), dtype=dt, device=self.dev) for shape, dt in self.form]
+        except torch.OutOfMemoryError:
+            return None
+        for t in block:
+            self.ledger.lend(lambda t=t: t, t.numel() * t.element_size(), self.dev, counted=False)
+        self.stat["blocks"] += 1
+        self.stat["held"] += nbytes
+        return block
 
     def _fits(self, parts: tuple[torch.Tensor, ...]) -> bool:
-        """whether `parts` has the stacks' form: opened by the first expert, every expert after the same"""
-        if self.stacks is None:
+        """whether `parts` has the depot's form, opened by the first expert: every expert after the same"""
+        if self.form is None:
             return self._open(parts)
-        return len(parts) == len(self.stacks) and all(
-            st.shape[1:] == p.shape and st.dtype == p.dtype for st, p in zip(self.stacks, parts, strict=True)
-        )
+        return bool(self.blocks) and tuple((p.shape, p.dtype) for p in parts) == self.form
 
     def _open(self, parts: tuple[torch.Tensor, ...]) -> bool:
-        per = sum(p.numel() * p.element_size() for p in parts)
-        n = self.cap // max(1, per)
-        if n <= self.SCRATCH:
+        """the depot opened at the form of `parts`: its scratch slots, where the ledger has them"""
+        self.form = tuple((p.shape, p.dtype) for p in parts)
+        self.per = sum(p.numel() * p.element_size() for p in parts)
+        scratch = self._block(self.SCRATCH)
+        if scratch is None:
             return False
-        self.stacks = [torch.empty((n, *p.shape), dtype=p.dtype, device=self.dev) for p in parts]
-        self.n_seats = n - self.SCRATCH
+        self.blocks = [scratch]
+        self.where = [(0, j) for j in range(self.SCRATCH)]
         if self.staged:
+            cpu = torch.device("cpu")
             try:
-                self.stage = [tuple(torch.empty_like(p).pin_memory() for p in parts) for _ in range(self.STAGE)]
+                self.stage = [
+                    tuple(
+                        self.ledger.lend(
+                            lambda p=p: torch.empty_like(p).pin_memory(),
+                            p.numel() * p.element_size(),
+                            cpu,
+                            counted=False,
+                        )
+                        for p in parts
+                    )
+                    for _ in range(self.STAGE)
+                ]
             except RuntimeError:  # the machine would not pin even these: the store's pages it is
                 self.stage = None
         return True
 
+    def takes(self, parts: tuple[torch.Tensor, ...] | None) -> bool:
+        """whether the depot takes experts stored as `parts`: open at that form (the first call opens it), with
+        its scratch slots at least"""
+        return parts is not None and self._fits(parts)
+
+    def _seat(self, e: int) -> int | None:
+        """a seat for expert `e` of this layer: the next of the seats grown, or one of a block grown for it now;
+        None where the ledger has no block to give"""
+        k = len(self.seat)
+        if self.MAX_SEATS is not None and k >= self.MAX_SEATS:
+            return None
+        if k >= self.n_seats:
+            block = self._block(self.BLOCK)
+            if block is None:
+                return None
+            b = len(self.blocks)
+            self.blocks.append(block)
+            self.where += [(b, j) for j in range(self.BLOCK)]
+        s = self.seat[e] = self.SCRATCH + k
+        return s
+
+    def at(self, s: int) -> tuple[list[torch.Tensor], int]:
+        """slot `s`'s block (one stack a part) and its row there"""
+        b, j = self.where[s]
+        return self.blocks[b], j
+
     def _upload(self, s: int, parts: tuple[torch.Tensor, ...], main: torch.cuda.Stream) -> None:
-        assert self.stacks is not None
+        stacks, row = self.at(s)
         t0 = time.perf_counter()
         ready = torch.cuda.Event()
         src: tuple[torch.Tensor, ...] = parts
@@ -425,8 +510,8 @@ class LayerDepot:
             for buf, p in zip(src, parts, strict=True):
                 buf.copy_(p)
         with torch.cuda.stream(self.copy):
-            for st, p in zip(self.stacks, src, strict=True):
-                st[s].copy_(p, non_blocking=True)
+            for st, p in zip(stacks, src, strict=True):
+                st[row].copy_(p, non_blocking=True)
             ready.record(self.copy)
         if j >= 0:
             self.stage_done[j] = ready
@@ -434,6 +519,10 @@ class LayerDepot:
         self.stat["bytes"] += sum(p.numel() * p.element_size() for p in parts)
         # the host's share of the upload: the pageable copy until it lands, or the copy into a pinned buffer
         self.stat["upload_s"] += time.perf_counter() - t0
+
+    def _slot(self, s: int) -> tuple[torch.Tensor, torch.Tensor]:
+        stacks, row = self.at(s)
+        return stacks[0][row], stacks[1][row]
 
     def get(self, layer: int, e: int, gu: Any, dn: Any) -> tuple[Any, Any]:
         """bf16 expert `e` of `layer` on the card, for the per-expert loop: its seat, seated now, or a scratch slot;
@@ -456,17 +545,15 @@ class LayerDepot:
         s = self.seat.get(e)
         if s is not None:
             self.stat["reused"] += 1
-            assert self.stacks is not None  # a seat exists only once the slots are open
-            return self.stacks[0][s], self.stacks[1][s]
+            return self._slot(s)
         if not self._fits(parts):
             self.stat["passed"] += 1
             return gu, dn
-        assert self.stacks is not None
-        if len(self.seat) < self.n_seats:
-            s = self.seat[e] = len(self.seat)
+        s = self._seat(e)
+        if s is not None:
             self._upload(s, parts, main)
             self.stat["seated"] += 1
-            return self.stacks[0][s], self.stacks[1][s]
+            return self._slot(s)
         j = self.turn
         self.turn = (j + 1) % self.SCRATCH
         ev = self.free[j]
@@ -477,14 +564,13 @@ class LayerDepot:
             done.record(main)
             self.copy.wait_event(done)
             self.fence_scratch = False
-        s = self.n_seats + j
-        self._upload(s, parts, main)
+        self._upload(j, parts, main)
         self.lent = j
         self.stat["scratch"] += 1
-        return self.stacks[0][s], self.stacks[1][s]
+        return self._slot(j)
 
     def place(self, layer: int, items: Sequence[tuple[int, Any, Any]]) -> list[int | None]:
-        """A wave of a call's experts on the card together, for one grouped matmul over the slots: each expert's slot
+        """A wave of a call's experts on the card together, for grouped matmuls over the slots: each expert's slot
         - its seat, seated now, or a scratch slot - in the order given, or None where it has no place this wave (the
         scratch is taken, or the stored form is not one the card path takes). The uploads are queued, the card's
         compute waits on each; the scratch is this wave's once the card is done with everything queued before it."""
@@ -513,8 +599,8 @@ class LayerDepot:
                 self.stat["passed"] += 1
                 out.append(None)
                 continue
-            if len(self.seat) < self.n_seats:
-                s = self.seat[e] = len(self.seat)
+            s = self._seat(e)
+            if s is not None:
                 self._upload(s, parts, main)
                 self.stat["seated"] += 1
                 out.append(s)
@@ -523,7 +609,7 @@ class LayerDepot:
                 if not fenced:
                     self.copy.wait_event(before)
                     fenced = True
-                s = self.n_seats + scratch
+                s = scratch
                 scratch += 1
                 self._upload(s, parts, main)
                 self.stat["scratch"] += 1
@@ -537,6 +623,12 @@ class LayerDepot:
     def settle(self) -> None:
         """every queued copy landed: the store may hand the host bytes behind them to another expert after this"""
         self.copy.synchronize()
+
+    def close(self) -> None:
+        """the depot given back: its copies landed, its blocks and their pool let go"""
+        self.settle()
+        self.blocks, self.where, self.seat, self.stage = [], [], {}, None
+        self.pool = None
 
 
 class VramSeats:
@@ -745,13 +837,9 @@ class _ExpertStore:
         room = self.n_slots - self.live()
         if room <= 0:
             return 0
-        if self.sm.mlx is not None:
-            # the engine's ledger: what the load started with, less the reserve, less everything MLX holds (exact
-            # whether or not the pages are touched)
-            headroom = self.sm.mem_start - self.reserve - self.sm.mlx.held_bytes()
-        else:
-            headroom = host_free_bytes() - self.reserve
-        usable = headroom - self.margin
+        # the device's ledger on the host: above the reserve, less what is spoken for (on MLX its own count of what
+        # the load started with less what MLX holds, exact whether or not the pages are touched)
+        usable = self._host_free() - self.margin
         # a whole block while the room above the margin holds one, then what is left of it (the fill is a few
         # blocks, never a trickle of ever smaller ones), at least what the call needs
         k = max(int(need), int(min(usable - 2 * self.per, self.block_max) // self.per))
@@ -789,13 +877,16 @@ class _ExpertStore:
                     )
             if raw is None:
                 raw = torch.empty(k * stride + 4096, dtype=torch.uint8)
+                # a byte a page written now: the OS counts a page only once it is touched, and a block it cannot see
+                # would read as free to the ledger until the reads fill it, spent again by the next growth
+                raw[::4096].zero_()
             skew = (-raw.data_ptr()) % 4096
             buf = raw[skew : skew + k * stride]
         self.blocks[b] = (buf, ids)
         for j, s in enumerate(ids):
             self.slot_of[s] = (b, j)
         self.free.extend(ids)
-        free_now = host_free_bytes()
+        free_now = self._host_free()
         self.sm.log(
             f"[experts] store +{k} slots ({k * self.per / 2**30:.2f} GB), {self.live()} of {self.n_slots} live, "
             f"{free_now / 2**30:.1f} GB free"
@@ -828,11 +919,17 @@ class _ExpertStore:
         self.stat["released"] += len(ids)
         del buf
         if prof is not None:
-            prof.add(prof.RELEASE, expert=len(ids), nbytes=len(ids) * self.per, aux=int(host_free_bytes()))
+            prof.add(prof.RELEASE, expert=len(ids), nbytes=len(ids) * self.per, aux=int(self._host_free()))
 
-    def release(self) -> Any:
+    def _host_free(self) -> int:
+        """what the device's ledger has free on the host: above the reserve, less what is spoken for"""
+        return int(self.sm.device.free(torch.device("cpu"), unreserved=True) or 0)
+
+    def release(self, want: int = 1) -> Any:
+        """blocks given back, oldest residents' first, until the ledger has `want` bytes free on the host above the
+        reserve (by default: while it has none), never below the largest call the store has served"""
         freed = 0
-        while self.blocks and host_free_bytes() < self.reserve:
+        while self.blocks and self._host_free() < want:
             victim = None
             s = self.res.oldest_slot()
             if s is not None:
@@ -846,8 +943,8 @@ class _ExpertStore:
                     self.stat["floor"] = 1
                     self.sm.log(
                         f"[experts] store holds {self.live()} slots for calls of {self.max_call}: "
-                        f"{host_free_bytes() / 2**30:.1f} GB free is under the "
-                        f"{self.reserve / 2**30:.1f} GB reserve"
+                        f"{self._host_free() / 2**30:.1f} GB free above the reserve, "
+                        f"{want / 2**30:.1f} GB asked"
                     )
                 break
             freed += len(self.blocks[victim][1])
@@ -855,7 +952,7 @@ class _ExpertStore:
         if freed:
             self.sm.log(
                 f"[experts] store -{freed} slots for the machine, {self.live()} live, "
-                f"{host_free_bytes() / 2**30:.1f} GB free"
+                f"{self._host_free() / 2**30:.1f} GB free above the reserve"
             )
         return freed
 
@@ -1232,8 +1329,8 @@ class _ExpertStore:
         mlp = getattr(mod, "mlp", None) if mod is not None else None
         gate = getattr(mlp, "gate", None) or getattr(mlp, "router", None)
         # the router's own linear: the module itself (Qwen's), or the one btb wraps it around (gpt-oss's `_Router`)
-        lin = None
-        if gate is not None:
+        lin = gate if isinstance(getattr(gate, "weight", None), torch.Tensor) else None
+        if lin is None and isinstance(gate, torch.nn.Module):
             lin = next((m for m in gate.modules() if isinstance(getattr(m, "weight", None), torch.Tensor)), None)
         w = getattr(lin, "weight", None)
         b = getattr(lin, "bias", None)

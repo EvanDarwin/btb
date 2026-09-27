@@ -23,21 +23,28 @@ import torch
 from ..kinds import LayerTier, Proposer, Tier
 from ..options import BadDevice, DeviceName, check_device
 from ..options import Device as DeviceKind
-from ..sysinfo import host_free_bytes
+from ..sysinfo import host_commit_bytes, host_free_bytes, host_total_bytes
 
-_PHYS_FREE: dict[int, tuple[float, int | None]] = {}
+# a card's nvidia-smi reading: when it was taken, the free it read, and what this process's allocator had reserved then
+_PHYS_FREE: dict[int, tuple[float, int | None, int]] = {}
 
 
 def _physical_free_bytes(dev: torch.device) -> int | None:
     """The card's free VRAM across every process, from nvidia-smi (NVML), or None when it cannot be read.
     `torch.cuda.mem_get_info` is a per-process figure on Windows - WDDM virtualizes VRAM, so it reads high while
     another process holds the card - and only NVML sees the true physical free. Cached for a second: this is an
-    allocation-path read, not a per-token one, so one subprocess a second is nothing."""
+    allocation-path read, not a per-token one, so one subprocess a second is nothing - and it can go stale the
+    moment it is read whatever the rate. What this process does meanwhile is its own to count, both ways: a cached
+    reading is less what its allocator has reserved since, so a pass's grants in the same second each see the ones
+    before them rather than all spending the one reading, and more what it has given back to the driver since, so
+    a buffer let go is free again at once rather than a second later."""
     idx = dev.index if dev.index is not None else torch.cuda.current_device()
     now = time.monotonic()
     hit = _PHYS_FREE.get(idx)
     if hit is not None and now - hit[0] < 1.0:
-        return hit[1]
+        if hit[1] is None:
+            return None
+        return max(0, hit[1] + hit[2] - int(torch.cuda.memory_reserved(idx)))
     free: int | None = None
     try:
         out = subprocess.run(
@@ -50,25 +57,27 @@ def _physical_free_bytes(dev: torch.device) -> int | None:
         free = int(out.strip().splitlines()[0]) * (1 << 20)  # MiB -> bytes
     except Exception:
         free = None
-    _PHYS_FREE[idx] = (now, free)
+    _PHYS_FREE[idx] = (now, free, int(torch.cuda.memory_reserved(idx)))
     return free
 
 
-def free_bytes(dev: torch.device, margin: int = 0) -> int | None:
+def free_bytes(dev: torch.device, margin: int = 0, pooled: bool = False) -> int | None:
     """Memory free on `dev` above `margin`. On a card: the physical free VRAM (nvidia-smi's, so a card shared with
     another process is priced by what is truly free, not the per-process figure WDDM hands `mem_get_info`) plus
     torch's own reserved-but-unallocated pool - blocks the next allocation reuses without reaching the driver, so
-    counting them keeps a later epoch from reading the previous epoch's retained pool as "used". On the host: the
-    available RAM. None where nothing here can price the device."""
+    counting them keeps a later epoch from reading the previous epoch's retained pool as "used". With `pooled`, for
+    an allocation from a pool of its own (`torch.cuda.MemPool`), which cannot reuse those blocks: the physical free
+    alone. On the host: the available RAM, and on Windows no more than the commit left (the page file bounds what
+    can be allocated at all, whatever is free). None where nothing here can price the device."""
     if dev.type == DeviceKind.CUDA:
         free, _ = torch.cuda.mem_get_info(dev)
         phys = _physical_free_bytes(dev)
         if phys is not None:
             free = min(int(free), phys)  # never trust the per-process view over the true physical free
-        reclaimable = torch.cuda.memory_reserved(dev) - torch.cuda.memory_allocated(dev)
+        reclaimable = 0 if pooled else torch.cuda.memory_reserved(dev) - torch.cuda.memory_allocated(dev)
         return max(0, int(free) + int(reclaimable) - int(margin))
     if dev.type == DeviceKind.CPU:
-        return max(0, int(host_free_bytes()) - int(margin))
+        return max(0, min(int(host_free_bytes()), int(host_commit_bytes())) - int(margin))
     return None
 
 
@@ -237,7 +246,8 @@ class Device:
         self.version = 0
         self._holds = 0
         self._pending: list[tuple[str, Callable[[], Any]]] = []
-        self._reserved: dict[str, tuple[str, int]] = {}
+        # what is spoken for, by (tag, device type): one tag may hold room on the card and on the host at once
+        self._reserved: dict[tuple[str, str], int] = {}
         self._loans: list[_Loan] = []
         self._rooms: dict[str, _Hold] = {}
         self._returns = 0
@@ -330,19 +340,26 @@ class Device:
 
     # -- memory --------------------------------------------------------------------------------------------
 
-    def free(self, device: Any = None, unreserved: bool = False, own: str | None = None) -> int | None:
+    def free(
+        self, device: Any = None, unreserved: bool = False, own: str | None = None, pooled: bool = False
+    ) -> int | None:
         """Memory free for an allocation on `device` (the engine's own when None), above the engine's margin
         there; with `unreserved`, less what `reserve()` has spoken for on it - all but the caller's `own` tag,
-        which is its to spend. On unified memory the ledger is the engine's own: the RAM the load started with,
-        less the reserve, less everything MLX holds."""
+        which is its to spend; with `pooled`, for an allocation from a pool of its own, which cannot reuse torch's
+        cached blocks (`free_bytes`). On unified memory the ledger is the engine's own: the RAM the load started
+        with, less the reserve, less everything MLX holds."""
         sm = self.sm
         dev = sm.dev if device is None else torch_device(device)
         if dev.type == DeviceKind.CUDA:
             if sm.dev.type != DeviceKind.CUDA:
                 return None
-            out = free_bytes(dev, int(getattr(sm, "vram_margin", 0) or 0))
+            out = free_bytes(dev, int(getattr(sm, "vram_margin", 0) or 0), pooled)
         elif getattr(sm, "mlx", None) is not None:
             out = max(0, int(sm.mem_start) - int(getattr(sm, "ram_reserve", 0) or 0) - int(sm.mlx.held_bytes()))
+            # and the machine's free RAM as it stands now above the OS's floor: MLX's own count cannot see what other
+            # programs took since the load
+            floor = float(getattr(sm, "OS_FLOOR", 0.0) or 0.0)
+            out = max(0, min(out, int(host_free_bytes()) - int(floor * host_total_bytes())))
         else:
             out = free_bytes(torch.device("cpu"), int(getattr(sm, "ram_reserve", 0) or 0))
         if out is None or not unreserved:
@@ -350,15 +367,42 @@ class Device:
         return max(0, out - self.reserved(dev, but=own))
 
     def reserve(self, tag: str, nbytes: int, device: Any = None) -> None:
-        """Memory spoken for under `tag` on `device` (the engine's own when None); a tag reserved again is
-        replaced, not added."""
+        """Memory spoken for under `tag` on `device` (the engine's own when None); a tag reserved again on a device
+        is replaced there, not added. A tag may hold room on several devices."""
         dev = self.sm.dev if device is None else torch_device(device)
         with self.lock:
-            self._reserved[tag] = (dev.type, max(0, int(nbytes)))
+            self._reserved[(tag, dev.type)] = max(0, int(nbytes))
 
-    def release(self, tag: str) -> None:
+    def release(self, tag: str, device: Any = None) -> None:
+        """`tag`'s room let go: on `device`, or on every device it holds room on when None"""
+        t = None if device is None else torch_device(device).type
         with self.lock:
-            self._reserved.pop(tag, None)
+            for key in [k for k in self._reserved if k[0] == tag and (t is None or k[1] == t)]:
+                del self._reserved[key]
+
+    def spend(self, tag: str, nbytes: int, device: Any = None) -> None:
+        """what a reservation on `device` was for, allocated now: `nbytes` off the reservation `tag` (never below
+        nothing), so the memory is counted once - as the allocation the device's free reading sees - and not also as
+        still spoken for; nothing where `tag` holds nothing there"""
+        t = (self.sm.dev if device is None else torch_device(device)).type
+        with self.lock:
+            hit = self._reserved.get((tag, t))
+            if hit is not None:
+                self._reserved[(tag, t)] = max(0, hit - int(nbytes))
+
+    def spoken_for(self, device: Any = None) -> dict[str, int]:
+        """what `reserved` counts on `device`, by what holds it: each reservation's tag, each room's, and the loans"""
+        t = (self.sm.dev if device is None else torch_device(device)).type
+        with self.lock:
+            self._settle()
+            out = {k: b for (k, d), b in self._reserved.items() if d == t and b}
+            lent = sum(ln.nbytes for ln in self._loans if ln.counted and ln.dev == t)
+            if lent:
+                out["loans"] = lent
+            for tag, h in self._rooms.items():
+                if h.dev == t and h.nbytes > self._used(tag):
+                    out[f"room {tag}"] = h.nbytes - self._used(tag)
+            return out
 
     def reserved(self, device: Any = None, but: str | None = None) -> int:
         """what is spoken for on `device` now: the reservations (all but `but`), the rooms held less what their
@@ -366,7 +410,7 @@ class Device:
         t = (self.sm.dev if device is None else torch_device(device)).type
         with self.lock:
             self._settle()
-            n = sum(b for k, (d, b) in self._reserved.items() if d == t and k != but)
+            n = sum(b for (k, d), b in self._reserved.items() if d == t and k != but)
             n += sum(ln.nbytes for ln in self._loans if ln.counted and ln.dev == t)
             return n + sum(max(0, h.nbytes - self._used(tag)) for tag, h in self._rooms.items() if h.dev == t)
 

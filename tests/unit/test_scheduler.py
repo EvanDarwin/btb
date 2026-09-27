@@ -45,6 +45,7 @@ from tests.helpers import (
     model_config,
     slot_size,
     stub_engine,
+    stub_ledger,
 )
 
 if TYPE_CHECKING:
@@ -996,8 +997,13 @@ def _store(
     from btb.engine import experts as experts_mod
 
     state = {"free": int(free)}
-    monkeypatch.setattr(experts_mod, "host_free_bytes", lambda: state["free"])
-    sm = stub_engine(mlx=None, fam=Family(kind=FamilyKind.QWEN3), cold_chunk=0, expert_profile=None)
+    sm = stub_engine(
+        mlx=None,
+        fam=Family(kind=FamilyKind.QWEN3),
+        cold_chunk=0,
+        expert_profile=None,
+        device=stub_ledger(lambda: state["free"], reserve),
+    )
     st = experts_mod._ExpertStore(sm, budget_bytes=(1 << 16) * per, reserve_bytes=reserve)
     st.per, st.n_slots = per, 1 << 16
     st.block_max = int(block_max)
@@ -1775,6 +1781,49 @@ def test_grant_keeps_a_ledger_of_what_it_gave() -> None:
         with pytest.raises(MemoryGrantError):
             e.scheduler.grant(9 * GB, "kv", device="cuda")
     assert e.scheduler.granted == {"kv@cuda": GB + GB // 2, "table@cuda": GB // 4}
+
+
+def test_a_cached_card_reading_moves_with_what_this_process_takes_and_gives_back(monkeypatch: MonkeyPatch) -> None:
+    """nvidia-smi is read at most once a second; within that second the reading moves by this process's own
+    allocator: less what it reserved since, more what it gave back - a buffer let go is free again at once, not a
+    second later (a pass right after one let go of a big buffer was refused the room it had)"""
+    monkeypatch.setattr(device_mod, "_PHYS_FREE", {})
+    monkeypatch.setattr(device_mod.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(device_mod.subprocess, "run", lambda *a, **k: types.SimpleNamespace(stdout="4096\n"))
+    held = [GB]
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *a, **k: held[0])
+    dev = torch.device("cuda", 0)
+    assert device_mod._physical_free_bytes(dev) == 4 * GB
+    held[0] = 2 * GB
+    assert device_mod._physical_free_bytes(dev) == 3 * GB, "what it took since is not free"
+    held[0] = 0
+    assert device_mod._physical_free_bytes(dev) == 5 * GB, "what it gave back since is"
+
+
+def test_a_grant_draws_on_the_reservation_it_names() -> None:
+    """a reservation is room nothing else may take, and the allocation it was made for draws on it: its room the
+    caller's own, and what the allocation adds spent from it, so the memory is counted once. A `kv` grant draws on
+    the epoch's KV unless it names another, `""` on none (a copy of rows the epoch counted already); one tag holds
+    room on the card and the host at once, and lets both go together"""
+    from btb.engine.scheduler import EPOCH, MemoryGrantError
+
+    e = _StubEngine()
+    e.device = Device(e)  # the stub's ledger, the one the grant reads
+    with cuda_stats(free=8 * GB):
+        e.device.reserve("sweep", 6 * GB, "cuda")
+        e.device.reserve("sweep", GB, "cpu")
+        assert e.device.reserved("cuda") == 6 * GB and e.device.reserved("cpu") == GB
+        with pytest.raises(MemoryGrantError, match=r"spoken for there: sweep 6.00 GiB"):
+            e.scheduler.grant(3 * GB, "table", device="cuda")  # 2 GB free past the sweep's room, named in the refusal
+        e.scheduler.grant(3 * GB, "work", device="cuda", draws="sweep")
+        assert e.device.reserved("cuda") == 3 * GB, "what it adds comes off the room it drew on"
+        e.device.reserve(EPOCH, 4 * GB, "cuda")
+        with pytest.raises(MemoryGrantError):
+            e.scheduler.grant(3 * GB, "kv", device="cuda", draws="")  # 8 less the sweep's 3 and the epoch's 4
+        e.scheduler.grant(3 * GB, "kv", device="cuda", held=GB)  # the epoch's own: 2 GB added, spent from it
+        assert e.device.reserved("cuda", but="sweep") == 2 * GB
+        e.device.release("sweep")
+        assert e.device.reserved("cpu") == 0 and e.device.reserved("cuda") == 2 * GB
 
 
 def test_the_cold_ring_survives_a_pass_of_the_same_order() -> None:
