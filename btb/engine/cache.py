@@ -36,6 +36,20 @@ def linear_layer(cl: CacheLayer) -> LinearAttentionCacheLayerMixin:
     return cl
 
 
+def conv_states_as(cl: Any, dtype: torch.dtype) -> None:
+    """a linear-attention layer's conv states in `dtype`, the one its layer computes in where it runs now. They
+    are kept in the dtype of the pass that made them, and a layer that moves between the host (float32) and the
+    card (bf16) - a host layer's prefill chunks, some on the card and some not; a layer shed and grown back - would
+    join its state onto the new rows promoted, and the card's bf16 conv refuses a float32 input. Nothing for any
+    other layer, or a state already so."""
+    states = getattr(cl, "conv_states", None)
+    if not isinstance(states, dict):
+        return
+    for k, v in states.items():
+        if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype != dtype:
+            states[k] = v.to(dtype)
+
+
 def attention_rows(cl: CacheLayer) -> tuple[torch.Tensor, torch.Tensor]:
     """an attention layer's keys and values; a TypeError for a layer that holds none"""
     from transformers.cache_utils import CacheLayerMixin

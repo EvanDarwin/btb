@@ -16,7 +16,7 @@ from .. import mlx as mlxdev
 from ..kinds import LayerKind, LayerTier, Parents, PassTag, TokenRows
 from ..options import Device
 from ..sampling import as_pick
-from .cache import GrowLayer
+from .cache import GrowLayer, conv_states_as
 from .native import Native
 from .scheduler import EPOCH
 from .state import _State
@@ -496,6 +496,8 @@ class _ForwardMixin(_State):
             self._tag(PassTag.CUDA_TORCH_FALLBACK)
         lt = self.layer_types[i]
         cache, T, past, am = pas.cache, pas.T, pas.past, pas.am
+        if cache is not None and i < len(cache.layers):
+            conv_states_as(cache.layers[i], h.dtype)  # a state left by the layer's run elsewhere, in its dtype here
         t0 = time.time()
         if self.dev.type == Device.CUDA:
             e0 = torch.cuda.Event(enable_timing=True)

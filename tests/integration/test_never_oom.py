@@ -175,3 +175,32 @@ def test_every_path_fits_or_is_refused_and_never_runs_the_card_out(fx: str, monk
     assert not ran_out, f"{fx}: torch's allocator ran out where btb should have fit or refused:\n" + "\n".join(ran_out)
     assert not idle, f"{fx}:\n" + "\n".join(idle)
     assert not untold, f"{fx}: memory on the card the ledger was never told of:\n" + "\n".join(untold)
+
+
+def test_a_conv_state_left_in_float32_by_the_host_takes_the_cards_dtype() -> None:
+    """a hybrid's linear-attention conv state is kept in the dtype of the pass that made it: a layer's chunk run on
+    the host leaves it float32, and the layer's next run on the card joined its bf16 rows onto it promoted - the
+    card's bf16 conv refused the float32 input (tiny_q4 under a squeezed card, whenever the squeeze moved a layer
+    between the two). A state left in float32 is taken in the card's dtype there, and the tokens are those of a
+    state never left so: bf16 to float32 and back is exact"""
+    dev = need_cuda()
+    kw: dict[str, Any] = {"device": dev, "cpu_layers": 1, "prefill_chunk": 8, "prefill_card_min": 4}
+    with loaded_model(fixture("tiny_q4"), **kw) as sm:
+
+        def run(widen: bool) -> list[int]:
+            s = sm.session(PROMPT[:24])
+            assert s.cache is not None
+            if widen:
+                n = 0
+                for cl in s.cache.layers:
+                    states = getattr(cl, "conv_states", None)
+                    if isinstance(states, dict):
+                        for k, v in states.items():
+                            if isinstance(v, torch.Tensor) and v.dtype == torch.bfloat16:
+                                states[k] = v.float()  # as a run on the host leaves it
+                                n += 1
+                assert n, "no conv state in the card's dtype to leave in float32"
+            s.feed(PROMPT[24:])
+            return list(s.generate(4, eos=(), speculate=False).tokens)
+
+        assert run(widen=True) == run(widen=False)
