@@ -747,6 +747,48 @@ class GrowLayer(_DynamicLayer):
         if n:
             self._set_rows(kb[..., :n, :], vb[..., :n, :])
 
+    def presize(self, rows: int, B: int, Hk: int, d: int, dtype: torch.dtype, dev: torch.device) -> None:
+        """The layer's buffer `rows` long at once, the rows it holds copied in: a prefill sweep's whole prompt, so
+        the cache does not grow while the sweep's working set is live around it - a buffer grown then would sit
+        inside the one block the pass's own buffers are cut from, and split it for good. Granted as a growth is,
+        the buffer it replaces counted; nothing where the buffer holds that many rows already, and nothing for rows
+        of another shape (left to their own growth)."""
+        if self.shared:
+            return
+        b = self._buf
+        if (
+            b is not None
+            and b[0].shape[-2] >= rows
+            and b[0].dtype == dtype
+            and b[0].device == dev
+            and tuple(b[0].shape[:2]) == (B, Hk)
+        ):
+            return
+        k = self.keys if self.is_initialized else None
+        n = int(k.shape[-2]) if (k is not None and k.numel()) else 0
+        if k is not None and n and (tuple(k.shape[:2]) != (B, Hk) or int(k.shape[-1]) != d):
+            return
+        el = torch.empty(0, dtype=dtype).element_size()
+        if self.grant is not None:
+            self.grant(
+                2 * B * Hk * int(rows) * d * el,
+                "kv",
+                requester=f"GrowLayer(the prompt's rows at once) n={n} rows={rows}",
+                B=B,
+                cap=int(rows),
+                bound=self._grant_bound() or None,
+                device=dev,
+                held=2 * b[0].numel() * b[0].element_size() if b is not None else 0,
+            )
+        kb = torch.empty(B, Hk, int(rows), d, dtype=dtype, device=dev)
+        vb = torch.empty_like(kb)
+        if n:
+            kb[..., :n, :].copy_(self.keys)
+            vb[..., :n, :].copy_(self.values)
+        self._buf, self._an = (kb, vb), None
+        if n:
+            self._set_rows(kb[..., :n, :], vb[..., :n, :])
+
     def hop(self, dev: torch.device, T: int, dtype: torch.dtype) -> None:
         """The rows onto `dev` in a buffer of `dtype` with room for `T` more, the one they were in let go: a host
         layer's prefill chunk on the card then writes its rows in place, the cache neither grown nor granted there
@@ -983,7 +1025,8 @@ class ForkLayer(_DynamicLayer):
         B, Hk, _, d = like.shape
         old = self._kv
         have = int(old[0].shape[-2]) - self._P if old is not None else 0
-        cap = self._P + max(need - self._P, 2 * have, 64)
+        # a cast alone keeps the room it had; a growth doubles it
+        cap = self._P + (have if have >= need - self._P else max(need - self._P, 2 * have, 64))
         held = 2 * old[0].numel() * old[0].element_size() if old is not None else 0
         self._ask(
             2 * B * Hk * cap * d * like.element_size(), held, f"B={B} P={self._P} t={self._t}", like.device, B, cap
@@ -1009,7 +1052,9 @@ class ForkLayer(_DynamicLayer):
             # the layer runs elsewhere now (given up to the host, or grown back onto the card): its rows follow it
             self.to(key_states.device)
         need = self._P + self._t + T
-        if self._kv is None or self._kv[0].shape[-2] < need:
+        if self._kv is None or self._kv[0].shape[-2] < need or self._kv[0].dtype != key_states.dtype:
+            # grown, or cast: the layer computes in another dtype where it runs now (float32 on the host, the card's
+            # bf16), and its rows are made that dtype as a growth into it makes them, as `GrowLayer`'s are
             self._grow(need, key_states)
         assert self._kv is not None
         self._kv[0][..., need - T : need, :].copy_(key_states)
@@ -1083,10 +1128,10 @@ class ForkIndexedLayer(ForkLayer):
             self.to(t.device)
         B, T, d = t.shape
         need = self._Pi + self._it + T
-        if self._ti is None or self._ti.shape[1] < need:
+        if self._ti is None or self._ti.shape[1] < need or self._ti.dtype != t.dtype:
             old = self._ti
             have = int(old.shape[1]) - self._Pi if old is not None else 0
-            cap = self._Pi + max(need - self._Pi, 2 * have, 64)
+            cap = self._Pi + (have if have >= need - self._Pi else max(need - self._Pi, 2 * have, 64))
             held = old.numel() * old.element_size() if old is not None else 0
             self._ask(B * cap * d * t.element_size(), held, f"indexer B={B} P={self._Pi}", t.device, B, cap)
             buf = t.new_empty(B, cap, d)

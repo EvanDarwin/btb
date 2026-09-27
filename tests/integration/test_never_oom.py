@@ -96,8 +96,8 @@ def told(sm: StreamedTextModel, mp: pytest.MonkeyPatch) -> Iterator[dict[str, in
         if torch.device(kw.get("device") or sm.dev).type == "cuda":
             t["granted"] += max(0, int(nbytes) - int(kw.get("held", 0)))
 
-    def r(tag: str, nbytes: int, device: Any = None) -> None:
-        reserve(tag, nbytes, device)
+    def r(tag: str, nbytes: int, device: Any = None, **kw: Any) -> None:
+        reserve(tag, nbytes, device, **kw)
         t["reserved"] = max(t["reserved"], int(dv.reserved(sm.dev)) - base)
 
     def m(dev: torch.device, nbytes: int, what: str, own: str | None = None) -> set[str]:

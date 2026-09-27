@@ -421,3 +421,55 @@ def test_stored_experts_on_the_card_match_the_hosts_kernel(monkeypatch: pytest.M
         g = got_cache[name]
         assert g.shape == t.shape, name
         assert float((g - t).abs().max()) <= 5e-2 * max(1.0, float(t.abs().max())), name
+
+
+def test_a_depot_with_no_room_yet_opens_once_there_is() -> None:
+    """the depot opens at the first call's form, with its scratch slots, where the ledger has them: a call that
+    finds no room leaves it closed, not stuck at a form with no slots - the next call asks again and opens it"""
+    import types
+
+    from btb.engine.experts import LayerDepot
+
+    dev = need_cuda()
+    room = [0]
+    ledger = types.SimpleNamespace(
+        free=lambda *a, **k: room[0],
+        lend=lambda make, nbytes, device, counted, **k: make(),
+    )
+    depot = LayerDepot(torch.device(dev), ledger)
+    try:
+        parts = (torch.zeros(4, 8, dtype=torch.bfloat16), torch.zeros(8, 4, dtype=torch.bfloat16))
+        assert not depot.takes(parts), "no room: the loop takes the call"
+        assert depot.form is None and depot.stat["refused"] == 1
+        room[0] = 1 << 30
+        assert depot.takes(parts), "room now: the depot opens"
+        assert depot.blocks and depot.form is not None
+    finally:
+        depot.close()
+
+
+def test_a_depot_opened_up_front_grows_to_a_layers_seats_as_far_as_the_ledger_lets_it() -> None:
+    """the sweep opens its depot before its working set is cut: its scratch and a layer's seats, a block at a time,
+    until the ledger has no block to give - the seats it holds, and none past the room"""
+    import types
+
+    from btb.engine.experts import LayerDepot
+
+    dev = need_cuda()
+    form = ((torch.Size([4, 8]), torch.bfloat16), (torch.Size([8, 4]), torch.bfloat16))
+    per = 2 * 4 * 8 * 2
+    room = [(LayerDepot.SCRATCH + 2 * LayerDepot.BLOCK) * per]
+
+    def lend(make: Any, nbytes: int, device: Any, counted: bool, **k: Any) -> Any:
+        if torch.device(device).type == "cuda":
+            room[0] -= int(nbytes)  # what the depot takes is gone from the card's room, as its free reading shows it
+        return make()
+
+    ledger = types.SimpleNamespace(free=lambda *a, **k: room[0], lend=lend)
+    depot = LayerDepot(torch.device(dev), ledger)
+    try:
+        assert depot.open_at(form, 128) == 2 * LayerDepot.BLOCK, "two blocks' room, two blocks of seats"
+        assert depot.form == form and len(depot.blocks) == 3
+        assert depot.open_at(form, 128) == 2 * LayerDepot.BLOCK, "opened already: nothing more taken"
+    finally:
+        depot.close()

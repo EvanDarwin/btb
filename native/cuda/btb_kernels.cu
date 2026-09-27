@@ -13,6 +13,7 @@
 //   btb_add_rmsnorm               h += y; x = rmsnorm(h) * w   (or * (1 + w), the zero-centred norm)
 //   btb_sandwich_add              h += rmsnorm(y) * w          (the sandwich block: the delta normed, then added)
 //   btb_{silu,gelu}_mul           m = act(g) * u  over a [T, 2I] gate/up block
+//   btb_mx4_widen                 MXFP4 experts at given seats of a depot's stacks to bf16, one pass
 //
 // The weights stream with evict-first loads (read once a step); the cache and the activations take the
 // default policy, so a persisting-L2 window over the cache's front keeps a short context's attention in L2.
@@ -645,6 +646,36 @@ extern "C" __global__ void __launch_bounds__(256) btb_silu_mul(const bf16* __res
 extern "C" __global__ void __launch_bounds__(256) btb_gelu_mul(const bf16* __restrict__ gu, bf16* __restrict__ m,
                                                                int T, int I) {
     act_mul<1>(gu, m, T, I);
+}
+
+// MXFP4 experts widened to bf16 for a grouped call, in one pass: a thread a 32-value block, its 16 bytes and its
+// scale read once and its 32 bf16 written once, for the experts at `seats` of a depot's stacks (`blocks` [seats,
+// groups, 16], `scales` [seats, groups], out [len(seats), groups, 32]). A value is its fp4 code (the low nibble
+// first) times 2^(scale - 127), made as ldexpf makes it and rounded to bf16 - exact wherever it is finite, as no fp4
+// code needs more than two of bf16's bits - the torch widening's values (`dequant_blocks`) bit for bit.
+__constant__ float BTB_FP4[16] = {0.f,  .5f,  1.f,  1.5f,  2.f,  3.f,  4.f,  6.f,
+                                  -0.f, -.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+
+extern "C" __global__ void __launch_bounds__(256) btb_mx4_widen(const unsigned char* __restrict__ blocks,
+                                                                const unsigned char* __restrict__ scales,
+                                                                const int* __restrict__ seats, long long groups,
+                                                                bf16* __restrict__ out) {
+    const long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= groups) return;
+    const long long at = (long long)seats[blockIdx.y] * groups + g;
+    const uint4 q = __ldcs(reinterpret_cast<const uint4*>(blocks) + at);
+    const int e = (int)scales[at] - 127;
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(&q);
+    __align__(16) bf16 v[32];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        v[2 * j] = f2bf(ldexpf(BTB_FP4[b[j] & 15], e));
+        v[2 * j + 1] = f2bf(ldexpf(BTB_FP4[b[j] >> 4], e));
+    }
+    uint4* o = reinterpret_cast<uint4*>(out) + ((long long)blockIdx.y * groups + g) * 4;
+    const uint4* s = reinterpret_cast<const uint4*>(v);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) o[j] = s[j];
 }
 
 // ---------------------------------------------------------------------------------------------------------

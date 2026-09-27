@@ -248,6 +248,9 @@ class Device:
         self._pending: list[tuple[str, Callable[[], Any]]] = []
         # what is spoken for, by (tag, device type): one tag may hold room on the card and on the host at once
         self._reserved: dict[tuple[str, str], int] = {}
+        # a reservation's measure of what is allocated out of it now, where its allocations are made one by one
+        # by code the ledger does not see (a pass's activations): it holds only the rest
+        self._uses: dict[tuple[str, str], Callable[[], int]] = {}
         self._loans: list[_Loan] = []
         self._rooms: dict[str, _Hold] = {}
         self._returns = 0
@@ -366,12 +369,25 @@ class Device:
             return out
         return max(0, out - self.reserved(dev, but=own))
 
-    def reserve(self, tag: str, nbytes: int, device: Any = None) -> None:
+    def reserve(self, tag: str, nbytes: int, device: Any = None, used: Callable[[], int] | None = None) -> None:
         """Memory spoken for under `tag` on `device` (the engine's own when None); a tag reserved again on a device
-        is replaced there, not added. A tag may hold room on several devices."""
+        is replaced there, not added. A tag may hold room on several devices. `used`, for room its owner allocates
+        out of piecemeal where the ledger cannot see each allocation (a pass's activations), measures what of it is
+        allocated now: the reservation then holds only the rest, as the device's free reading already counts the
+        part in use - never the same bytes twice. It is called under the ledger's lock, so it reads the device
+        and its owner's own state, never the ledger."""
         dev = self.sm.dev if device is None else torch_device(device)
         with self.lock:
             self._reserved[(tag, dev.type)] = max(0, int(nbytes))
+            if used is None:
+                self._uses.pop((tag, dev.type), None)
+            else:
+                self._uses[(tag, dev.type)] = used
+
+    def _holding(self, key: tuple[str, str], nbytes: int) -> int:
+        """what reservation `key` of `nbytes` holds now: all of it, or what its measure says is not yet in use"""
+        use = self._uses.get(key)
+        return nbytes if use is None else max(0, nbytes - max(0, int(use())))
 
     def release(self, tag: str, device: Any = None) -> None:
         """`tag`'s room let go: on `device`, or on every device it holds room on when None"""
@@ -379,6 +395,7 @@ class Device:
         with self.lock:
             for key in [k for k in self._reserved if k[0] == tag and (t is None or k[1] == t)]:
                 del self._reserved[key]
+                self._uses.pop(key, None)
 
     def spend(self, tag: str, nbytes: int, device: Any = None) -> None:
         """what a reservation on `device` was for, allocated now: `nbytes` off the reservation `tag` (never below
@@ -395,7 +412,7 @@ class Device:
         t = (self.sm.dev if device is None else torch_device(device)).type
         with self.lock:
             self._settle()
-            out = {k: b for (k, d), b in self._reserved.items() if d == t and b}
+            out = {k: n for (k, d), b in self._reserved.items() if d == t and (n := self._holding((k, d), b))}
             lent = sum(ln.nbytes for ln in self._loans if ln.counted and ln.dev == t)
             if lent:
                 out["loans"] = lent
@@ -410,7 +427,7 @@ class Device:
         t = (self.sm.dev if device is None else torch_device(device)).type
         with self.lock:
             self._settle()
-            n = sum(b for (k, d), b in self._reserved.items() if d == t and k != but)
+            n = sum(self._holding((k, d), b) for (k, d), b in self._reserved.items() if d == t and k != but)
             n += sum(ln.nbytes for ln in self._loans if ln.counted and ln.dev == t)
             return n + sum(max(0, h.nbytes - self._used(tag)) for tag, h in self._rooms.items() if h.dev == t)
 

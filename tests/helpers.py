@@ -368,6 +368,7 @@ def stub_ledger(free: Callable[[], int], reserve: int) -> types.SimpleNamespace:
     return types.SimpleNamespace(
         free=lambda device=None, unreserved=False, own=None, pooled=False: max(0, int(free()) - int(reserve)),
         reserved=lambda device=None, but=None: 0,
+        spoken_for=lambda device=None: {},
     )
 
 

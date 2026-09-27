@@ -1541,6 +1541,22 @@ def test_ring_wraps_over_landed_predictions_and_holds_at_in_flight_ones(monkeypa
     assert len(st.ring) == 2
 
 
+def test_a_call_with_no_seat_left_takes_one_back_from_the_lookahead(monkeypatch: MonkeyPatch) -> None:
+    """a store that cannot grow (the host's commit ran out long before its ceiling) and whose every seat is the
+    call's own: the call takes the lookahead's slots back, landed predictions and queued ones alike, instead of
+    failing - the call before a guess"""
+    st, route, _sm = _store_with_routers(monkeypatch, lookahead=(2, 0), ring_n=2)
+    h = torch.ones(1, 4)
+    assert st.lookahead(0, h) == 2  # layer 1's (1, 7) and (1, 6) in the ring
+    route.land((1, 7))  # one landed; (1, 6) still queued
+    st.free.clear()
+    st.n_slots = st.live()  # no growth past the seats it has: every one is the ring's
+    ready, pending = st.get(2, "layers.2.mlp.experts.", [0, 1])
+    assert sorted(e for e, _f, _s in pending) == [0, 1], "both of the call's experts have a seat"
+    assert st.ring == [] and st.ahead == {} and st.stat["ahead_dropped"] == 2
+    assert (1, 6) in route.dropped, "the queued prediction's reads were withdrawn, not left to land in a used slot"
+
+
 # -- the Bus Pass: day riders, regulars and the ghosts that move the split --
 
 
@@ -1798,6 +1814,30 @@ def test_a_cached_card_reading_moves_with_what_this_process_takes_and_gives_back
     assert device_mod._physical_free_bytes(dev) == 3 * GB, "what it took since is not free"
     held[0] = 0
     assert device_mod._physical_free_bytes(dev) == 5 * GB, "what it gave back since is"
+
+
+def test_a_reservation_allocated_out_of_piecemeal_holds_only_what_is_not_in_use() -> None:
+    """a pass's working set is allocated by its own ops, which the ledger never sees one by one: its reservation,
+    given a measure of what is live, holds only the rest - the device's free reading counts the live part already,
+    and counting it twice once refused a cache's growth mid-chunk the room the card had"""
+    e = _StubEngine()
+    e.device = Device(e)  # the stub's ledger
+    live = [0]
+    with cuda_stats(free=8 * GB):
+        e.device.reserve("pass", 4 * GB, "cuda", used=lambda: live[0])
+        assert e.device.reserved("cuda") == 4 * GB
+        live[0] = GB  # a GB of its activations allocated: the free reading has them, the reservation the other 3
+        assert e.device.reserved("cuda") == 3 * GB and e.device.spoken_for("cuda") == {"pass": 3 * GB}
+        live[0] = 5 * GB  # past what it reserved: it holds nothing, never less
+        assert e.device.reserved("cuda") == 0 and e.device.spoken_for("cuda") == {}
+        live[0] = -GB  # less than at its start: all of it, never more
+        assert e.device.reserved("cuda") == 4 * GB
+        e.device.reserve("pass", 4 * GB, "cuda")  # reserved again with no measure: whole, whatever is live
+        live[0] = GB
+        assert e.device.reserved("cuda") == 4 * GB
+        e.device.reserve("pass", 4 * GB, "cuda", used=lambda: live[0])
+        e.device.release("pass")
+        assert e.device.reserved("cuda") == 0 and not e.device._uses, "a released tag's measure goes with it"
 
 
 def test_a_grant_draws_on_the_reservation_it_names() -> None:
@@ -2424,3 +2464,17 @@ def test_a_foreign_model_on_a_device_btb_cannot_run_is_an_option_error() -> None
     if not torch.cuda.is_available():
         with pytest.raises(BadDevice, match="runs here"):
             BatchScheduler.for_model(cfg, device="cuda")
+
+
+def test_the_store_knows_an_experts_form_before_reading_one(monkeypatch: MonkeyPatch) -> None:
+    """a prefill's depot opens before the sweep's first call, at the form of the experts the store will read: the
+    store gives it off its layout alone, the same shapes and dtypes a read expert's views have"""
+    from btb.engine.host import stored_parts
+
+    st, _sm = expert_store(monkeypatch, object(), n_layers=2, n_experts=4)
+    form = st.form()
+    assert form is not None
+    st._grow(1)
+    s = st.free.pop()
+    read = stored_parts(*st._views(s))
+    assert read is not None and form == tuple((p.shape, p.dtype) for p in read)

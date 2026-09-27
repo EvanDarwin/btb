@@ -787,6 +787,7 @@ class _Cuda:
         "btb_sandwich_add",
         "btb_silu_mul",
         "btb_gelu_mul",
+        "btb_mx4_widen",
         "btb_publish",
         "btb_sample_max",
         "btb_sample_hist",
@@ -911,6 +912,41 @@ class _Cuda:
     @staticmethod
     def ptr(t: torch.Tensor | None) -> ctypes.c_void_p:
         return ctypes.c_void_p(0 if t is None else t.data_ptr())
+
+    def mx4_widen(
+        self, blocks: torch.Tensor, scales: torch.Tensor, seats: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """MXFP4 experts at `seats` of the stacks `blocks` [S, .., 16] and `scales` [S, ..] (a depot's: uint8,
+        contiguous, on the card) widened to bf16 [len(seats), groups * 32] in one pass (`btb_mx4_widen`), a
+        stack's row of 32-value blocks at a time: `dequant_blocks`'s values, bit for bit, with no gathered copy of
+        the bytes and no index into a table"""
+        groups = int(scales[0].numel())
+        if (
+            blocks.dtype != torch.uint8
+            or scales.dtype != torch.uint8
+            or not (blocks.is_contiguous() and scales.is_contiguous())
+            or int(blocks[0].numel()) != 16 * groups
+            or blocks.device != scales.device
+        ):
+            raise ValueError(
+                f"[cuda] mx4_widen: blocks {tuple(blocks.shape)} {blocks.dtype} and scales {tuple(scales.shape)} "
+                f"{scales.dtype} are not a contiguous uint8 stack of 16-byte blocks and their scales"
+            )
+        seats = seats.to(blocks.device, torch.int32)
+        n = int(seats.numel())
+        if out is None:
+            out = torch.empty(n, groups * 32, dtype=torch.bfloat16, device=blocks.device)
+        elif out.dtype != torch.bfloat16 or not out.is_contiguous() or out.numel() != n * groups * 32:
+            raise ValueError(f"[cuda] mx4_widen: out must be {n * groups * 32} contiguous bf16")
+        if n:
+            P = self.ptr
+            self.launch(
+                "btb_mx4_widen",
+                ((groups + 255) // 256, n, 1),
+                (256, 1, 1),
+                [P(blocks), P(scales), P(seats), ctypes.c_longlong(groups), P(out)],
+            )
+        return out
 
     def pick(self, x: torch.Tensor, keys: Sequence[int], temperature: float, top_k: int, top_p: float) -> torch.Tensor:
         """The fused card pick: `x` [R, V] cuda float32, one key a row; [R] int64 cuda. The multi-block pipeline -

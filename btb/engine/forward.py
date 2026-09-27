@@ -41,6 +41,19 @@ _GPU_PREFILL_RETRIES = 3
 PREFILL_MIN_ROWS = 64
 
 
+def _kv_on_card(cache: Any, host: Any) -> int:
+    """the bytes the resident layers' KV takes on the card in `cache` (each layer's whole buffer, as its growth was
+    granted), the host layers' passed over: their rows on the card are a prefill's hop, its own working set"""
+    n = 0
+    for i, cl in enumerate(cache.layers):
+        if i in host:
+            continue
+        buf = getattr(cl, "_buf", None)
+        held = buf if buf is not None else (getattr(cl, "keys", None), getattr(cl, "values", None))
+        n += sum(t.numel() * t.element_size() for t in held if isinstance(t, torch.Tensor) and t.device.type == "cuda")
+    return n
+
+
 def pe_for(pe: PassRope | None, lt: str) -> Rope | None:
     """the rope a layer of type `lt` reads: a dual-rope family carries one per type, the rest one for every layer"""
     return pe[lt] if isinstance(pe, dict) else pe
@@ -699,9 +712,11 @@ class _ForwardMixin(_State):
 
                 scores = -(-32 * Hq * (d + 2) // ATTN_BLOCK)
         elif self.fam.eager:
-            # gpt-oss's sinks (`attention_sinks`) hold each row's scores against every key in the compute dtype
-            # about four times at once: the product, the sinks joined on, the shift and the softmax
-            scores = 4 * nb * Hq
+            # gpt-oss's sinks (`attention_sinks`) hold each row's scores against every key twice at once in the dtype
+            # the reference's join promotes them to - the sinks' own (float32 in the checkpoint), or the pass's where
+            # that is wider - the product beside the buffer it is written into, then that buffer beside the softmax;
+            # and the mask once, in the pass's dtype
+            scores = 2 * max(nb, self._sinks_bytes()) * Hq + nb
         per_key = 0
         if getattr(self, "mlx", None) is None and not self.fam.eager:
             # torch's sdpa over every key the chunk sees: the causal mask, a value a (row, key) pair at most, and the
@@ -710,6 +725,42 @@ class _ForwardMixin(_State):
             if Hq > Hk:
                 per_key = 2 * Hq * d * nb
         return per_token, scores, per_key
+
+    def _presize_kv(self, cache: Any, rows: int, B: int) -> None:
+        """each resident attention layer's KV made `rows` long at once (`GrowLayer.presize`), granted from the epoch's
+        room, before a layer-by-layer prefill cuts its working set: a cache growing mid-sweep would split it. The
+        layers the card graph's arena holds keep their place there"""
+        st = getattr(self, "_cg", None)
+        ar = st["arena"] if st is not None else None
+        owner = ar["owner"]() if ar is not None and ar["owner"] is not None else None
+        in_arena = set(ar["slot"]) if ar is not None and owner is cache else set()
+        c = self.cfg
+        hq = int(c.num_attention_heads)
+        Hk = int(getattr(c, "num_key_value_heads", None) or hq)
+        d = int(getattr(c, "head_dim", None) or c.hidden_size // hq)
+        for i, cl in enumerate(cache.layers):
+            if i in self.host or i in in_arena or self.layer_types[i] == LayerKind.LINEAR:
+                continue
+            tmpl = self.resident.get(i)
+            dt = self._layer_dtype(tmpl) if tmpl is not None else None
+            if isinstance(cl, GrowLayer) and dt is not None:
+                cl.presize(int(rows), int(B), Hk, d, dt, self.dev)
+
+    def _scores_bytes(self, C: int, keys: int, B: int) -> int:
+        """one of a sweep's two score buffers (`ScoresWorkspace`): a chunk of `C` rows' scores against `keys` keys and
+        the sink column, every query head, in the dtype the sinks' join promotes them to"""
+        c = self.cfg
+        cd = self.compute_dtype
+        nb = 4 if (cd is not None and cd != torch.bfloat16) else 2
+        return int(B) * int(c.num_attention_heads) * int(C) * (int(keys) + 1) * max(nb, self._sinks_bytes())
+
+    def _sinks_bytes(self) -> int:
+        """the bytes of a sink logit as the resident layers hold them (float32 where none is resident to ask)"""
+        for tmpl in list(self.resident.values()):
+            sinks = getattr(getattr(tmpl, "self_attn", None), "sinks", None)
+            if isinstance(sinks, torch.Tensor):
+                return int(sinks.element_size())
+        return 4
 
     def _sweep_bytes(self, C: int, past: int, B: int, T: int, cache: Any) -> tuple[int, int]:
         """What a layer-by-layer prefill of `T` rows at chunks of `C` asks of its device, as (its working set -
@@ -1002,10 +1053,23 @@ class _ForwardMixin(_State):
         row_b, park = self._sweep_rows(B, T)
         parked: list[torch.Tensor | None] = [None] * len(spans)
         host_dev = torch.device("cpu")
+        # on the card, every chunk's rows in one buffer made before the working set, each layer's written back into
+        # its chunk's place: a layer's output kept past the chunk that made it would sit inside the working set's
+        # block for the next layers, and split it for good
+        on_card_rows: list[torch.Tensor | None] = [None]
 
         def keep(c: int, h: torch.Tensor) -> torch.Tensor:
-            if not park or h.device.type == "cpu":
+            if h.device.type == "cpu":
                 return h
+            if not park:
+                buf = on_card_rows[0]
+                if buf is None or buf.dtype != h.dtype or buf.shape[-1] != h.shape[-1] or buf.device != h.device:
+                    buf = on_card_rows[0] = torch.empty((B, T, h.shape[-1]), dtype=h.dtype, device=h.device)
+                a, b = spans[c]
+                view = buf[:, a:b]
+                if view.data_ptr() != h.data_ptr():
+                    view.copy_(h)
+                return view
             buf = parked[c]
             if buf is None or buf.shape != h.shape or buf.dtype != h.dtype:
                 nbytes = 1 << max(0, h.numel() * h.element_size() - 1).bit_length()
@@ -1054,6 +1118,7 @@ class _ForwardMixin(_State):
         own_epoch = False
         hs: list[torch.Tensor] = []
         frames: list[dict[str, Any]] = []
+        scores_open = False
         try:
             if on_cuda:
                 # the allocator's cached blocks given back first, so what the ledger reads as free is memory the card
@@ -1072,24 +1137,44 @@ class _ForwardMixin(_State):
                 self._make_room(self.dev, work + beside, f"the layer-by-layer prefill's chunks of {C} rows")
                 # spoken for in the ledger for the sweep: the working set and the rows under the prefill's own tag, and
                 # the cache's growth as the epoch's KV where no epoch reserved it (a prefill outside a generate) - the
-                # cache's grants spend that one as their own, and nothing else reads either as free
-                self.device.reserve(PREFILL, kept, self.dev)
+                # cache's grants spend that one as their own, and nothing else reads either as free. The working set
+                # is allocated piecemeal by the layers' own ops, which the ledger never sees one by one: what of it is
+                # live is what the card holds past the sweep's start, less what the ledger knows of already (the
+                # resident layers' KV, granted from the epoch's room, and the depot's blocks, granted and lent), and
+                # the reservation holds only the rest - the free reading counts the live part already
+                # free-read: the sweep's own segments measured against its reservation, the ledger's `used`
+                held0 = int(torch.cuda.memory_reserved(self.dev))
+                kv0 = _kv_on_card(cache, self.host)
+
+                def in_use() -> int:
+                    depot = getattr(self, "_depot", None)
+                    held = int(depot.stat["held"]) if depot is not None else 0
+                    grown = _kv_on_card(cache, self.host) - kv0
+                    # the card torch holds past the sweep's start - the working set's blocks whether in use or cached
+                    # between chunks (the card's own free reading has them taken either way) - less the KV and the
+                    # depot the ledger knows of already
+                    # free-read: the same measure, as the ledger asks for it
+                    return int(torch.cuda.memory_reserved(self.dev)) - held0 - grown - held
+
+                self.device.reserve(PREFILL, kept, self.dev, used=in_use)
                 if growth > epoch:
                     # the prompt's KV is the epoch's: its reservation raised to cover it (the cache's grants spend it as
                     # the rows are allocated), and taken for the sweep where no epoch reserved any
                     self.device.reserve(EPOCH, growth, self.dev)
                     own_epoch = epoch == 0
+                self._presize_kv(cache, past0 + T, B)
                 if self.fam.moe and os.environ.get("BTB_PREFILL_DEPOT", "1") != "0":
                     from .experts import LayerDepot
 
-                    # the depot grows its seats as the layers ask, out of what the ledger has free past all of that
+                    # the depot takes its blocks now, a layer's experts' worth as far as the ledger has room past
+                    # all of that, before the working set below is cut: once the pass's buffers split their one block,
+                    # the card's room sits inside it, where the depot's own pool cannot reach
                     self._depot = LayerDepot(self.dev, self.device, getattr(self, "scheduler", None))
-                # the working set taken once and let go: the card's allocator keeps the block and splits every chunk's
-                # buffers from it, merging them back as they free. A chunk's scores grow with its position, and the
-                # buffers a smaller chunk freed would never fit the next: the card would fill with blocks the allocator
-                # must empty its cache to use again (the depot's blocks are of a pool of their own, and never split it)
-                del_work = torch.empty(work, dtype=torch.uint8, device=self.dev)
-                del del_work
+                    store = getattr(self, "expert_store", None)
+                    form = store.form() if store is not None and self.grouped_experts else None
+                    if form is not None:
+                        n = self._depot.open_at(form, int(self.n_experts))
+                        self.log(f"[prefill] depot opened up front, {n} seats of {int(self.n_experts)} and its scratch")
             host_share = self._host_bytes(C, past0, B, T) if on_cuda else work_host
             if host_share:
                 # the host's share, asked of it as the card's is: the host chunks' working set and the parked rows,
@@ -1102,6 +1187,13 @@ class _ForwardMixin(_State):
                 frames.append(frame(a, b, h))
                 hs.append(keep(c, h))
                 del h
+            if on_cuda and self.fam.eager and self.dev.type == Device.CUDA:
+                # the sink attention's scores - the buffers that grow with every chunk's position - taken once, sized
+                # for the last chunk: every chunk's are views of them, never the allocator's cache (`ScoresWorkspace`)
+                from .families import ScoresWorkspace, open_scores
+
+                open_scores(self.dev, ScoresWorkspace(self._scores_bytes(C, past0 + T, B), self.dev))
+                scores_open = True
             # the card's allocator as the sweep goes: what it holds, what it keeps reserved, and how often it ran out and
             # emptied its cache to retry (each retry a device-wide sync and fresh allocations after it)
             retries0 = int(torch.cuda.memory_stats(self.dev).get("num_alloc_retries", 0)) if on_cuda else 0
@@ -1113,7 +1205,9 @@ class _ForwardMixin(_State):
                 return (
                     f"; card {ms.get('allocated_bytes.all.current', 0) / 2**30:.1f} GB held, "
                     f"{ms.get('reserved_bytes.all.current', 0) / 2**30:.1f} reserved, "
-                    f"{int(ms.get('num_alloc_retries', 0)) - retries0} allocator retries"
+                    f"{int(ms.get('num_alloc_retries', 0)) - retries0} allocator retries; the ledger holds "
+                    + ", ".join(f"{k} {n / 2**30:.2f}" for k, n in self.device.spoken_for(self.dev).items())
+                    + " GB spoken for"
                 )
 
             # a drive layer a host chunk runs is read into the ring's slot and held there for all its host chunks; a
@@ -1194,6 +1288,11 @@ class _ForwardMixin(_State):
                 if depot is not None:
                     depot.close()
                     st = depot.stat
+                    if st["refused"] and not (st["seated"] or st["scratch"]):
+                        self.log(
+                            f"[prefill] depot: never opened ({int(st['refused'])} calls found no room for its "
+                            f"scratch slots); the per-expert loop took every call"
+                        )
                     if st["seated"] or st["scratch"]:
                         self.log(
                             f"[prefill] depot: {st['seated']} experts seated in {int(st['blocks'])} blocks grown as asked "
@@ -1213,6 +1312,10 @@ class _ForwardMixin(_State):
             # the sweep's reservations given back and its depot let go however it ended - a refusal, a fault, or the
             # sweep's own cleanup raising: left standing, every later reading of the card's free memory would count
             # them, and the next pass would find a depot with nothing behind it
+            if scores_open:
+                from .families import close_scores
+
+                close_scores(self.dev)
             self.device.release(PREFILL)
             if own_epoch:
                 self.device.release(EPOCH)

@@ -53,6 +53,52 @@ def attention(
     return out.transpose(1, 2).contiguous(), None
 
 
+class ScoresWorkspace:
+    """Two buffers a layer-by-layer prefill makes once, each its last chunk's scores in the dtype the sinks' join
+    promotes them to, that `attention_sinks` takes its big tensors from as views, in turn: the scores (B), their
+    promoted copy (A), the softmax (B, over the scores), the probabilities in the values' dtype (A, over the copy).
+    Made per call, they grow with every chunk's position, and a buffer freed by one chunk is too small for the next:
+    the card fills with blocks the allocator must empty its cache to reuse, or cannot. As views of these the
+    largest of a pass's buffers never come from the cache at all."""
+
+    def __init__(self, nbytes: int, device: torch.device) -> None:
+        self.nbytes = int(nbytes)
+        self.bufs = {
+            "a": torch.empty(self.nbytes, dtype=torch.uint8, device=device),
+            "b": torch.empty(self.nbytes, dtype=torch.uint8, device=device),
+        }
+
+    def view(self, which: str, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor | None:
+        """buffer `which`'s front as a contiguous `shape` of `dtype`; None where it does not hold that much"""
+        n = 1
+        for s in shape:
+            n *= int(s)
+        n *= torch.empty(0, dtype=dtype).element_size()
+        buf = self.bufs[which]
+        return buf[:n].view(dtype).view(shape) if n <= buf.numel() else None
+
+
+# the open workspace a device's sink attention takes its scores from (`ScoresWorkspace`): a prefill sweep's, while
+# it runs; none otherwise, the tensors then made per call
+_SCORES: dict[torch.device, ScoresWorkspace] = {}
+
+
+def _card_key(device: Any) -> torch.device:
+    """a device as the tensors on it name it: a card by its index (`cuda` is the current one, `cuda:0` here)"""
+    d = torch.device(device)
+    if d.type == "cuda" and d.index is None:
+        d = torch.device("cuda", torch.cuda.current_device())
+    return d
+
+
+def open_scores(device: Any, ws: ScoresWorkspace) -> None:
+    _SCORES[_card_key(device)] = ws
+
+
+def close_scores(device: Any) -> None:
+    _SCORES.pop(_card_key(device), None)
+
+
 def attention_sinks(
     module: Any,
     query: torch.Tensor,
@@ -158,20 +204,59 @@ def attention_sinks(
     if start:
         key, value = key[..., start:, :], value[..., start:, :]
     nk = n - start
-    scores = torch.matmul(query.reshape(B, Hk, g * T, d), key.transpose(-1, -2)).reshape(B, Hq, T, nk) * scale
-    if attention_mask is not None:
-        scores = scores + attention_mask[:, :, :, start:n]
-    elif T > 1:
-        # no mask handed over (a tier that owns the attention elsewhere): the causal one, and the window
-        pos = torch.arange(n - T, n, device=scores.device)[:, None]
-        j = start + torch.arange(nk, device=scores.device)[None]
-        allow = (j <= pos) if win is None else ((j <= pos) & (j > pos - win))
-        scores = scores.masked_fill(~allow, torch.finfo(scores.dtype).min)
-    sinks = s_aux.reshape(1, -1, 1, 1).expand(B, -1, T, -1)
-    combined = torch.cat([scores, sinks], dim=-1)
-    combined = combined - combined.max(dim=-1, keepdim=True).values
-    probs = F.softmax(combined, dim=-1, dtype=combined.dtype)[..., :-1].to(value.dtype)
-    res = torch.matmul(probs.reshape(B, Hk, g * T, nk), value).reshape(B, Hq, T, d)
+    # the reference's steps - scaled, masked, the sinks joined on, shifted, softmaxed - each computed in the dtype it
+    # computes in there (the scores', or the float mask's the add promotes them to), written into one buffer of the
+    # dtype the join promotes to, in place: the same values, so the same bits, at the buffer beside the scores and
+    # then beside the softmax instead of a new tensor a step, several alive at once; views of a sweep's workspace
+    # where one is open here (`ScoresWorkspace`)
+    mask = attention_mask[:, :, :, start:n] if attention_mask is not None else None
+    raw_dt = torch.promote_types(query.dtype, key.dtype)
+    lhs = raw_dt if mask is None else torch.promote_types(raw_dt, mask.dtype)
+    cdt = torch.promote_types(lhs, s_aux.dtype)
+    ws = _SCORES.get(_card_key(query.device)) if _SCORES else None
+    shape = (B, Hq, T, nk + 1)
+    held: list[torch.Tensor] | None = None
+    if ws is not None:
+        views = [
+            ws.view("b", (B, Hk, g * T, nk), raw_dt),
+            ws.view("a", shape, cdt),
+            ws.view("b", shape, cdt),
+            ws.view("a", (B, Hq, T, nk), value.dtype),
+        ]
+        # past what the sweep sized it for: made per call
+        held = [t for t in views if t is not None] if all(t is not None for t in views) else None
+    if held is not None:
+        raw = torch.matmul(query.reshape(B, Hk, g * T, d), key.transpose(-1, -2), out=held[0]).reshape(B, Hq, T, nk)
+    else:
+        raw = torch.matmul(query.reshape(B, Hk, g * T, d), key.transpose(-1, -2)).reshape(B, Hq, T, nk)
+    raw.mul_(scale)
+    combined = held[1] if held is not None else raw.new_empty(shape, dtype=cdt)
+    scores = combined[..., :nk]
+    if mask is not None:
+        torch.add(raw, mask, out=scores)  # computed in the two's dtype, then made the buffer's, as the join makes it
+    else:
+        if T > 1:
+            # no mask handed over (a tier that owns the attention elsewhere): the causal one, and the window
+            pos = torch.arange(n - T, n, device=raw.device)[:, None]
+            j = start + torch.arange(nk, device=raw.device)[None]
+            allow = (j <= pos) if win is None else ((j <= pos) & (j > pos - win))
+            raw.masked_fill_(~allow, torch.finfo(raw.dtype).min)
+        scores.copy_(raw)
+    del raw
+    combined[..., nk:] = s_aux.reshape(1, -1, 1, 1)
+    combined.sub_(combined.max(dim=-1, keepdim=True).values)
+    if held is not None:
+        # the kernel `F.softmax` runs, into the buffer the scores were in; then the probabilities in the values' dtype
+        # into the one the promoted copy was in, each read before it is written over
+        probs = torch.ops.aten._softmax.out(combined, -1, False, out=held[2])
+        del combined, scores
+        p = held[3]
+        p.copy_(probs[..., :-1])
+    else:
+        probs = F.softmax(combined, dim=-1, dtype=combined.dtype)
+        del combined, scores
+        p = probs[..., :-1].to(value.dtype)
+    res = torch.matmul(p.reshape(B, Hk, g * T, nk), value).reshape(B, Hq, T, d)
     return res.transpose(1, 2).contiguous(), None
 
 

@@ -29,6 +29,7 @@ def main() -> None:
     ap.add_argument("--lens", default="64,256,1024,4096")
     ap.add_argument("--native")
     ap.add_argument("--sparse", type=int, choices=(0, 1), default=0, help="the engine's --sparse")
+    ap.add_argument("--prefill-chunk", type=int, default=0, help="the engine's prefill_chunk (0: priced by the room)")
     ap.add_argument(
         "--profile",
         metavar="A:B",
@@ -47,7 +48,8 @@ def main() -> None:
         for p in [os.path.join(ROOT, "README.md"), *sorted(glob.glob(os.path.join(ROOT, "docs", "*.md")))]
     )
     runs, layers, offs, picks, meta = [], [], [0], [], []
-    with btb.load(a.model, device="cuda", native=a.native, log=print, sparse=a.sparse) as m:
+    kw = {"prefill_chunk": a.prefill_chunk} if a.prefill_chunk else {}
+    with btb.load(a.model, device="cuda", native=a.native, log=print, sparse=a.sparse, **kw) as m:
         ids = m.tokenizer(text, add_special_tokens=False)["input_ids"]
         prof = _window(m, a.profile, a.out) if a.profile else None
         print(f"[trace] {len(ids)} tokens of text", flush=True)

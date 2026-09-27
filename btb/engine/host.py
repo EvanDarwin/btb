@@ -151,13 +151,13 @@ def compute_fp32(module: torch.nn.Module) -> None:
 
 def widen_scratch(store: Any, n: int, inter: int, hidden: int) -> int:
     """the card memory a grouped call's widening holds at its peak, `n` experts at a time (`_card_grouped`), each
-    expert gate_up [2 * `inter`, `hidden`] and down [`hidden`, `inter`]: MXFP4's gathered bytes, their int32 lookup
-    index, the value pairs and the bf16 out - 4.5 bytes a weight - gate_up's, then down's beside gate_up's bf16;
-    FP8's bytes widened to float32, scaled and made bf16, 11 bytes a weight; 0 for bf16 experts, multiplied as they
-    sit"""
+    expert gate_up [2 * `inter`, `hidden`] and down [`hidden`, `inter`], gate_up's, then down's beside gate_up's
+    bf16: MXFP4's bf16 alone where the card's kernel widens it from the depot's bytes (`mx4_widen`), 2 bytes a
+    weight, else torch's gathered bytes, their int32 lookup index, the value pairs and the bf16 out, 4.5; FP8's bytes
+    widened to float32, scaled and made bf16, 11 bytes a weight; 0 for bf16 experts, multiplied as they sit"""
     if store is None or getattr(store, "ggml", False) or not (store.mx or store.f8):
         return 0
-    per = 4.5 if store.mx else 11.0
+    per = (2.0 if Native.card_kernels() is not None else 4.5) if store.mx else 11.0
     gu = dn = inter * hidden
     gu *= 2
     return int(n * max(per * gu, 2 * gu + per * dn))
@@ -596,10 +596,17 @@ class _Experts(torch.nn.Module):
             """the grouped products of `placed` (row, expert) of one block's `stacks`, in row order, into their
             rows' places"""
             if self.mx or self.f8:
-                # the batch's bytes gathered and widened: one group an expert, in the batch's order
-                idx = torch.tensor([sl for sl, _e in placed], device=x.device)
+                # the batch's bytes widened: one group an expert, in the batch's order
+                idx = torch.tensor([sl for sl, _e in placed], dtype=torch.int32, device=x.device)
                 n = len(placed)
-                if self.mx:
+                kern = Native.card_kernels() if self.mx else None
+                if kern is not None:
+                    # straight from the depot's stacks in one pass, no gathered copy of the bytes
+                    gu_w, dn_w = (
+                        kern.mx4_widen(stacks[2 * i], stacks[2 * i + 1], idx).view(n, rows, cols)
+                        for i, (rows, cols) in enumerate(store.mx_shapes())
+                    )
+                elif self.mx:
                     gu_w, dn_w = (
                         dequant_blocks(
                             stacks[2 * i].index_select(0, idx).view(n, rows, cols // 32, 16),
