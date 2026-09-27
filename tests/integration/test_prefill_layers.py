@@ -493,12 +493,15 @@ def test_a_sweep_under_store_pressure_is_the_chunks_bits() -> None:
             store = sm.expert_store
             assert store is not None and store.per is not None
             n_exp = int(sm.n_experts)
-            for n_slots in (n_exp + 2, n_exp + 4, 2 * n_exp):
-                for key, s in list(store.res.items()):
-                    store.res.pop(key)
-                    store.free.append(s)
-                store.n_slots = max(n_slots, store.live())
-                store.ring_n = n_slots // 2
+            # below one call's experts (served in waves), then a little past a layer's
+            for n_slots in (3, 5, n_exp + 2, n_exp + 4, 2 * n_exp):
+                for b in list(store.blocks):
+                    store._release_block(b)
+                store.n_slots = n_slots
+                store.block_max = n_slots * int(store.per)  # a block of exactly these seats, no more
+                store._grow(n_slots)
+                assert store.live() == n_slots, (store.live(), n_slots)
+                store.ring_n = max(1, n_slots // 2)
                 cache = sm.new_cache()
                 got = sm._prefill(torch.tensor([ids]), cache)[0, -1].float().cpu()
                 assert torch.equal(got, ref), f"{n_slots} slots: logits part by {float((got - ref).abs().max()):.3e}"
@@ -545,12 +548,15 @@ def test_a_card_sweep_under_store_pressure_is_the_chunks_bits(monkeypatch: pytes
             if store is None or store.per is None:
                 pytest.skip("no expert went through the store in this layout")
             n_exp = int(sm.n_experts)
-            for n_slots in (n_exp + 2, n_exp + 4, 2 * n_exp):
-                for key, s in list(store.res.items()):
-                    store.res.pop(key)
-                    store.free.append(s)
-                store.n_slots = max(n_slots, store.live())
-                store.ring_n = n_slots // 2
+            # below one call's experts (served in waves), then a little past a layer's
+            for n_slots in (3, 5, n_exp + 2, n_exp + 4, 2 * n_exp):
+                for b in list(store.blocks):
+                    store._release_block(b)
+                store.n_slots = n_slots
+                store.block_max = n_slots * int(store.per)  # a block of exactly these seats, no more
+                store._grow(n_slots)
+                assert store.live() == n_slots, (store.live(), n_slots)
+                store.ring_n = max(1, n_slots // 2)
                 cache = sm.new_cache()
                 got = sm._prefill(torch.tensor([ids]), cache)[0, -1].float().cpu()
                 assert torch.equal(got, ref), f"{n_slots} slots: logits part by {float((got - ref).abs().max()):.3e}"

@@ -1541,6 +1541,32 @@ def test_ring_wraps_over_landed_predictions_and_holds_at_in_flight_ones(monkeypa
     assert len(st.ring) == 2
 
 
+def test_a_store_below_a_calls_experts_serves_it_in_waves(monkeypatch: MonkeyPatch) -> None:
+    """a store held below one call's experts (the machine's commit can hold it near a layer's, and a long prompt's
+    call asks for all of one) serves the call in turn - the longest prefix it can seat, then the rest once those
+    are done with - instead of refusing it; every expert once, in ascending order, never more seats than it has"""
+    route = FakeRoute()
+    st, _sm = expert_store(monkeypatch, route, n_layers=2, n_experts=8)
+    assert st.per is not None
+    st.block_max = 3 * st.per
+    st._grow(3)
+    st.n_slots = st.live()  # three seats, no growth
+    assert st.live() == 3
+    ids = list(range(8))
+    served: list[int] = []
+    rest, first = ids, True
+    while rest:
+        ready, pending, left = st.get_some(0, "layers.0.mlp.experts.", rest, rows=4, first=first)
+        wave = sorted([*ready, *(e for e, _f, _s in pending)])
+        assert wave == rest[: len(wave)] and wave, f"a wave is a prefix of what is left: {wave} of {rest}"
+        assert len({s for _e, _f, s in pending} | set(st.last_slots.values())) <= 3
+        for e in wave:
+            route.land((0, e))  # the wave's reads in; the call multiplies it and asks for the rest
+        served += wave
+        rest, first = left, False
+    assert served == ids, "every expert once, in ascending order"
+
+
 def test_a_prediction_with_a_part_in_flight_is_never_withdrawn_in_part(monkeypatch: MonkeyPatch) -> None:
     """an expert is read as several parts: a prediction that lapses with one of them already in flight is left to
     land whole - no part withdrawn - and a later call that asks for it waits for every part. Withdrawn in part, the

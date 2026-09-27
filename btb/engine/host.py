@@ -570,7 +570,8 @@ class _Experts(torch.nn.Module):
         T, k = int(top_k_index.shape[0]), int(top_k_index.shape[1])
         pos_s, row_s, offs, counts = group_picks(top_k_index, self.num_experts)
         ranks = torch.argsort(torch.argsort(top_k_index, dim=1), dim=1)
-        buf = torch.empty(T, k, x.shape[-1], dtype=final.dtype, device=x.device)
+        # zeros: a call served in waves (`get_some`) fills here only its wave's picks, the others' adding nothing
+        buf = torch.zeros(T, k, x.shape[-1], dtype=final.dtype, device=x.device)
 
         def wave(items: list[tuple[int, Any, Any]]) -> None:
             while items:
@@ -651,6 +652,116 @@ class _Experts(torch.nn.Module):
         for j in range(k):
             final.add_(buf[:, j])
 
+    def _waves(
+        self,
+        x: torch.Tensor,
+        w_top: torch.Tensor,
+        top_k_index: torch.Tensor,
+        expert_mask: torch.Tensor,
+        hidden_states: torch.Tensor,
+        now: list[int],
+        views: Any,
+        pending: Any,
+        rest: list[int],
+        store: Any,
+        final: torch.Tensor,
+        keep: bool,
+    ) -> None:
+        """A call of many rows over its experts, in the waves the store serves it (`get_some`): each wave's experts
+        multiplied - as grouped matmuls on the card through the depot, or the per-expert loop - and added into
+        `final`, the next wave asked for once these are done with. Each wave is a prefix of the call's ascending
+        experts, so a row's contributions are added in ascending expert order across the waves, as in one pass"""
+        on_host = x.device.type == "cpu" and hidden_states.device.type != "cpu"
+        grouped = None
+        while True:
+            depot = self._depot_for(x, on_host)
+            if grouped is None:
+                # the depot takes this form at all (its scratch slots, where the ledger has them): the loop where it
+                # cannot - the form read off an expert in RAM, or off the first one still coming from the drive
+                grouped = bool(
+                    depot is not None
+                    and self._grouped_ok(x)
+                    and all(stored_parts(*v) is not None for v in views.values())
+                    and (bool(views) or bool(pending))
+                    and depot.takes(
+                        stored_parts(*(next(iter(views.values())) if views else store._views(pending[0][2])))
+                    )
+                )
+            if grouped:
+                self._card_grouped(x, w_top, top_k_index, now, views, pending, store, depot, final)
+            else:
+                self._loop(x, w_top, top_k_index, expert_mask, hidden_states, now, views, pending, store, final)
+            if not rest:
+                return
+            # this wave's experts are done with (the depot's copies out of their slots landed): the store may seat
+            # the next wave in their slots
+            views, pending, left = store.get_some(
+                self.layer, self.base, rest, keep=keep, rows=int(hidden_states.shape[0]), first=False
+            )
+            now = [e for e in rest if e not in set(left)]
+            rest = left
+
+    def _loop(
+        self,
+        x: torch.Tensor,
+        w_top: torch.Tensor,
+        top_k_index: torch.Tensor,
+        expert_mask: torch.Tensor,
+        hidden_states: torch.Tensor,
+        hit: list[int],
+        views: Any,
+        pending: Any,
+        store: Any,
+        final: torch.Tensor,
+    ) -> None:
+        """the per-expert loop over `hit`: each expert's rows multiplied on its own and added into `final` in
+        ascending expert order"""
+        dev = hidden_states.device
+        on_host = x.device.type == "cpu" and dev.type != "cpu"
+        contrib = {}
+        # a prefill sweeping this layer's chunks on the card: the layer's experts cross the bus once for them all
+        depot = self._depot_for(x, on_host)
+        # rows on the card: every expert's rows found by one sort there, not a host lookup and a copy an expert,
+        # each of which waited for the card to finish what was queued before it
+        groups = group_picks(top_k_index, self.num_experts) if x.device.type != "cpu" else None
+
+        def run(e: int, w_gu: Any, w_dn: Any) -> None:
+            if groups is not None:
+                pos_s, row_s, offs, counts = groups
+                a, n = offs[e], counts[e]
+                top_k_pos, token_idx = pos_s[a : a + n], row_s[a : a + n]
+            else:
+                top_k_pos, token_idx = torch.where(expert_mask[e])
+                if not on_host:
+                    top_k_pos, token_idx = top_k_pos.to(dev), token_idx.to(dev)
+            if depot is not None:
+                w_gu, w_dn = depot.get(self.layer, e, w_gu, w_dn)
+            if isinstance(w_gu, torch.Tensor) and w_gu.device.type != "cpu" and x.device != w_gu.device:
+                # an expert seated on the card while the rows are on the host: its rows go to the card and
+                # are multiplied there in float32 over the stored bf16, as the one-row path does
+                cur = hidden_states[token_idx.to(hidden_states.device)].float()
+                h = self._act(torch.nn.functional.linear(cur, w_gu.float()), None)
+                h = torch.nn.functional.linear(h.float(), w_dn.float()).to(x.device).to(x.dtype)
+            else:
+                cur = x[token_idx]
+                h = self._act(self._linear(cur, w_gu), e)
+                h = self._linear(h, w_dn)
+            if self.biased:
+                h = h + self._bias(self.down_proj_bias, e, h)
+            contrib[e] = (token_idx, h * w_top[token_idx, top_k_pos, None])
+
+        for e in hit:
+            if e in views:
+                run(e, *views[e])
+        for batch in store.landed(pending) if pending else ():
+            for e, _f, s in batch:
+                run(e, *store._views(s))
+        if depot is not None:
+            depot.settle()
+        for e in hit:
+            token_idx, h = contrib[e]
+            final.index_add_(0, token_idx, h.to(final.dtype))
+
     def forward(
         self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
     ) -> torch.Tensor:
@@ -684,6 +795,7 @@ class _Experts(torch.nn.Module):
         store = self.sm.expert_store
         pending = []
         w0 = 0.0
+        keep = True
         if store is not None:
             self.sm._tag(PassTag.EXPERT_STORE, store.res_tag)  # the slots, under the policy the store was built on
             keep = hidden_states.shape[0] < Native.gemm_rows or bool(getattr(self.sm, "_sweep_keep", False))
@@ -691,7 +803,9 @@ class _Experts(torch.nn.Module):
                 # the Timetable: the next layers' picks from this layer's input (one row, or a verify pass's few),
                 # read ahead while this layer runs
                 store.lookahead(self.layer, hidden_states)
-            views, pending = store.get(self.layer, self.base, hit, keep=keep, rows=int(hidden_states.shape[0]))
+            views, pending, rest = store.get_some(
+                self.layer, self.base, hit, keep=keep, rows=int(hidden_states.shape[0])
+            )
             if getattr(self.sm, "_sweep_ahead", False) and store.sweep_layer != self.layer:
                 # a layer-by-layer prefill at this layer's first chunk: its reads are queued, and the next layer's
                 # experts are read ahead behind them while this layer's chunks compute
@@ -703,6 +817,7 @@ class _Experts(torch.nn.Module):
             self.sm._tag(PassTag.EXPERT_TABLES)  # no store: the checkpoint's expert tables, held whole
             gu, dn = self._tables()
             views = {e: (gu[e], dn[e]) for e in hit}
+            rest = []
             if self.mx or self.f8:
                 per_expert = gu[0].nbytes + dn[0].nbytes
             else:
@@ -725,64 +840,23 @@ class _Experts(torch.nn.Module):
             and hit
             and len(hit) == top_k_index.shape[1]
         )
+        if rest and (use_mlx or grouped):
+            # a one-row or MLX pass asks for a few experts, which the store's floor holds: never in waves
+            assert store is not None
+            more, late = store.get(self.layer, self.base, rest, keep=keep, rows=int(hidden_states.shape[0]))
+            views.update(more)
+            pending = pending + late
+            rest = []
+        # the experts of this wave (the call's whole, unless the store serves it in turn)
+        now = [e for e in hit if e not in set(rest)]
         if use_mlx:
             self._mlx_forward(x, w_top, expert_mask, hit, views, pending, store, final)
         elif grouped:
             self._one_row(x, w_top, top_k_index, hit, views, pending, store, final, hidden_states if on_host else None)
-        elif (
-            (depot := self._depot_for(x, on_host)) is not None
-            and self._grouped_ok(x)
-            and all(stored_parts(*v) is not None for v in views.values())
-            # the depot takes this form at all (its scratch slots, where the ledger has them): the loop where it
-            # cannot - the form read off an expert in RAM, or off the first one still coming from the drive
-            and (bool(views) or bool(pending))
-            and depot.takes(stored_parts(*(next(iter(views.values())) if views else store._views(pending[0][2]))))
-        ):
-            self._card_grouped(x, w_top, top_k_index, hit, views, pending, store, depot, final)
         else:
-            contrib = {}
-            # a prefill sweeping this layer's chunks on the card: the layer's experts cross the bus once for them all
-            depot = self._depot_for(x, on_host)
-            # rows on the card: every expert's rows found by one sort there, not a host lookup and a copy an expert,
-            # each of which waited for the card to finish what was queued before it
-            groups = group_picks(top_k_index, self.num_experts) if x.device.type != "cpu" else None
-
-            def run(e: int, w_gu: Any, w_dn: Any) -> None:
-                if groups is not None:
-                    pos_s, row_s, offs, counts = groups
-                    a, n = offs[e], counts[e]
-                    top_k_pos, token_idx = pos_s[a : a + n], row_s[a : a + n]
-                else:
-                    top_k_pos, token_idx = torch.where(expert_mask[e])
-                    if not on_host:
-                        top_k_pos, token_idx = top_k_pos.to(dev), token_idx.to(dev)
-                if depot is not None:
-                    w_gu, w_dn = depot.get(self.layer, e, w_gu, w_dn)
-                if isinstance(w_gu, torch.Tensor) and w_gu.device.type != "cpu" and x.device != w_gu.device:
-                    # an expert seated on the card while the rows are on the host: its rows go to the card and
-                    # are multiplied there in float32 over the stored bf16, as the one-row path does
-                    cur = hidden_states[token_idx.to(hidden_states.device)].float()
-                    h = self._act(torch.nn.functional.linear(cur, w_gu.float()), None)
-                    h = torch.nn.functional.linear(h.float(), w_dn.float()).to(x.device).to(x.dtype)
-                else:
-                    cur = x[token_idx]
-                    h = self._act(self._linear(cur, w_gu), e)
-                    h = self._linear(h, w_dn)
-                if self.biased:
-                    h = h + self._bias(self.down_proj_bias, e, h)
-                contrib[e] = (token_idx, h * w_top[token_idx, top_k_pos, None])
-
-            for e in hit:
-                if e in views:
-                    run(e, *views[e])
-            for batch in store.landed(pending) if pending else ():
-                for e, _f, s in batch:
-                    run(e, *store._views(s))
-            if depot is not None:
-                depot.settle()
-            for e in hit:
-                token_idx, h = contrib[e]
-                final.index_add_(0, token_idx, h.to(final.dtype))
+            self._waves(
+                x, w_top, top_k_index, expert_mask, hidden_states, now, views, pending, rest, store, final, keep
+            )
         st = self.sm.expert_stat
         st["experts"] += len(hit)
         st["bytes"] += len(hit) * per_expert

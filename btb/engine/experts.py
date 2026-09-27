@@ -1597,16 +1597,78 @@ class _ExpertStore:
                 self.ring.insert(0, s)
 
     def get(self, layer: int, base: str, ids: Sequence[int], keep: bool = True, rows: int = 1) -> Any:
+        """a call's experts `ids` of `layer`, every one seated: (ready, pending) - the views of those in hand, and
+        the (expert, reads, slot) of those still landing"""
+        ready, pending, _rest = self._get(layer, base, ids, keep, rows)
+        return ready, pending
+
+    def get_some(
+        self, layer: int, base: str, ids: Sequence[int], keep: bool = True, rows: int = 1, first: bool = True
+    ) -> Any:
+        """A call's experts in waves: the longest prefix of `ids` (ascending, as a call lists them) the store can
+        seat now, and the rest - (ready, pending, rest) - for the call to ask for again once it has multiplied these.
+        A store held below a call's experts (the machine's commit can hold it near one layer's, and a call of a long
+        prompt asks for all of a layer's) serves the call in turn instead of refusing it. The rest's residents keep
+        their seats while anything else can give one up, and the predictions the rest will want are not withdrawn;
+        each wave a prefix, a row's experts are still multiplied and summed in ascending order across the waves.
+        `first`: this call's first wave (the per-pass bookkeeping runs once a call)"""
+        ids = [int(e) for e in ids]
+        self._recipe(layer, base)  # the store sized, on its first call, before its seats are counted
+        # the blocks the machine asks back given back first, so the seats counted are the seats there are
+        self.release()
+        cut = self._wave_cut(layer, ids)
+        now, rest = ids[:cut], ids[cut:]
+        protect = {(layer, e) for e in rest}
+        ready, pending, cut = self._get(layer, base, now, keep, rows, asked=ids, protect=protect, first=first)
+        return ready, pending, [*cut, *rest]
+
+    def _wave_cut(self, layer: int, ids: Sequence[int]) -> int:
+        """how many of `ids` the store can seat now: all of them, or the prefix before the first miss it has no seat
+        for - a seat free, one the store can still grow (the host's ledger allowing), a resident's the call does not
+        ask for, or a slot of the lookahead's whose prediction has landed. At least one: where nothing else can give
+        a seat up, a later wave's resident does"""
+        want = {(layer, int(e)) for e in ids}
+        misses = [
+            i
+            for i, e in enumerate(ids)
+            if (layer, int(e)) not in self.res
+            and (layer, int(e)) not in self.ahead
+            and not (self.vram is not None and (layer, int(e)) in self.vram)
+        ]
+        if not misses:
+            return len(ids)
+        assert self.per is not None  # sized by the recipe before any call
+        growable = max(0, min(int(self.n_slots) - self.live(), (self._host_free() - self.margin) // int(self.per)))
+        landed = 0
+        for s in self.ring:
+            a = next((x for x in self.ahead.values() if x["slot"] == s), None)
+            landed += 1 if a is None or a["parts"].done() else 0
+        seats = len(self.free) + growable + sum(1 for k, _s in self.res.items() if k not in want) + landed
+        if len(misses) <= seats:
+            return len(ids)
+        return max(1, misses[seats])
+
+    def _get(
+        self,
+        layer: int,
+        base: str,
+        ids: Sequence[int],
+        keep: bool = True,
+        rows: int = 1,
+        asked: Sequence[int] | None = None,
+        protect: Any = frozenset(),
+        first: bool = True,
+    ) -> Any:
         t0 = time.perf_counter()
         parts = self._recipe(layer, base)
         assert self.per is not None  # _recipe sizes the store on the first call
         prof = getattr(self.sm, "expert_profile", None)
-        if prof is not None and layer == 0:
+        if prof is not None and layer == 0 and first:
             prof.step += 1
         sched = getattr(self.sm, "scheduler", None)
-        if layer == 0 and self.vram is not None:
+        if layer == 0 and self.vram is not None and first:
             self.vram.new_pass()
-        if layer == 0:
+        if layer == 0 and first:
             # the one-row passes, as each closes, say whether this drive has room for predictions, live
             ps = self._pass
             if ps is not None and ps["rows"] == 1:
@@ -1655,8 +1717,11 @@ class _ExpertStore:
             self.stat["miss"] += 1
             todo.append(e)
         if self.ahead:
-            self._lapsed(layer, {int(x) for x in ids}, sched)
-        if len(todo) > self.n_slots:
+            # the call's every expert, a later wave's too: a prediction one of them will want is not withdrawn
+            self._lapsed(layer, {int(x) for x in (ids if asked is None else asked)}, sched)
+        # a wave (`get_some`) stops where the store has no seat left, the rest its next wave's; a whole call raises
+        wave = asked is not None
+        if len(todo) > self.n_slots and not wave:
             raise RuntimeError(f"[experts] one call needs {len(todo)} experts, the store holds {self.n_slots} slots")
         self.stat["calls"] += 1
         if todo:
@@ -1680,16 +1745,21 @@ class _ExpertStore:
             self._grow(len(todo) - len(self.free))
         while self.live() < len(todo):
             if not self._grow(len(todo) - self.live()):
+                if wave:
+                    break  # the seats there are: the wave stops where they run out
                 raise RuntimeError(
                     f"[experts] one call needs {len(todo)} experts and the machine has no room "
                     f"above the {self.reserve / 2**30:.1f} GB reserve ({self._host_line()})"
                 )
         taken = set(out.values())
+        # a later wave's residents keep their seats while anything else can give one up
+        held = {s for k, s in self.res.items() if k in protect} if protect else set()
+        stop = None
         for e in todo:
             if self.free:
                 s = self.free.pop()
             else:
-                v = self.res.victim(taken)
+                v = self.res.victim(taken | held) or (self.res.victim(taken) if held else None)
                 if v is not None:
                     key, s = v
                     if prof is not None:
@@ -1697,6 +1767,9 @@ class _ExpertStore:
                 else:
                     # every seat is the call's own: a prediction's slot is taken back, the call before a guess
                     got = self._ring_take(taken)
+                    if got is None and wave and e != ids[0]:
+                        stop = e  # no seat for this one: the wave ends before it
+                        break
                     if got is None:
                         raise RuntimeError(
                             f"[experts] one call needs {len(todo)} experts and every seat is the call's own or a "
@@ -1707,6 +1780,23 @@ class _ExpertStore:
             taken.add(s)
             self.res.admit((layer, e), s)
             out[e] = s
+        cut: list[int] = []
+        if stop is not None:
+            # the wave is the prefix before `stop`: the experts from it on are the next wave's - a resident stays
+            # seated for it, and one whose promoted read is still landing lands first, so the next wave never takes
+            # a slot still being written for a resident
+            at = list(ids).index(stop)
+            later = {int(e) for e in list(ids)[at:]}
+            for w in [w for w in waiting if int(w[0]) in later]:
+                w[1].settle()
+            waiting = [w for w in waiting if int(w[0]) not in later]
+            for e in [e for e in out if int(e) in later]:
+                del out[e]
+                self.stat["hit"] -= 1  # counted again when the next wave asks for it
+            dropped = [e for e in todo if int(e) in later]
+            self.stat["miss"] -= len(dropped)  # the same: a miss of the next wave's
+            todo = [e for e in todo if int(e) not in later]
+            cut = [int(e) for e in list(ids)[at:]]
         if not keep:
             for e in todo:
                 self.res.demote((layer, e))
@@ -1737,7 +1827,7 @@ class _ExpertStore:
         ready = {e: self._views(s) for e, s in out.items() if e not in futs and e not in still}
         ready.update(on_card)
         pending = [(e, futs[e], out[e]) for e in todo] + waiting
-        return ready, pending
+        return ready, pending, cut
 
     def wait(self, pending: Any) -> Any:
         """every pending read landed, as `landed` would yield them, in one call: e -> views"""
