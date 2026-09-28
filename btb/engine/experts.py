@@ -894,6 +894,7 @@ class _ExpertStore:
         dev = getattr(sm, "dev", None)
         on_card = dev is not None and getattr(dev, "type", "") == Device.CUDA
         self.pin = on_card if str(sp).strip().lower() == "auto" else bool(int(sp or 0)) and on_card
+        self.cached_reads = self._read_mode()
         self.free = []
         self.parked = []
         self.blocks = {}
@@ -964,6 +965,23 @@ class _ExpertStore:
 
     def live(self) -> int:
         return sum(len(ids) for _, ids in self.blocks.values())
+
+    @staticmethod
+    def _read_mode() -> bool:
+        """Whether a miss is read through the system's file cache. Where the host's commit, not its RAM, is what
+        the store can grow into (Windows charges commit for every allocation and the page file bounds it, while
+        the file cache's pages are RAM that no commit is charged for), the cache is a second RAM tier the store
+        cannot otherwise have: a miss read through it fills it, and the same expert missed again while it holds
+        the bytes is a copy out of RAM - 2 ms against the drive's 25 for a 120B's expert on an SSD. Elsewhere the
+        cache and the store draw on the same RAM (on unified memory, the RAM the model runs in), so a miss reads
+        around it. `BTB_EXPERT_READS` (cached, direct) decides where it is set."""
+        env = (os.environ.get("BTB_EXPERT_READS") or "").strip().lower()
+        if env in ("cached", "direct"):
+            return env == "cached"
+        from ..sysinfo import host_commit_bytes, host_free_bytes
+
+        # free-read: which of the host's limits binds chooses how a miss is read, never what fits
+        return int(host_commit_bytes()) < int(host_free_bytes())
 
     def close(self) -> None:
         """The store given back whole: its readers stopped, every read still writing into a slot settled, then its
@@ -1306,7 +1324,12 @@ class _ExpertStore:
                     f"{self.n_slots * per / 2**30:.1f} GB in RAM, allocated as needed in blocks of at most "
                     f"{self.block_max / 2**30:.1f} GB, {self.margin / 2**30:.1f} GB above a "
                     f"{self.reserve / 2**30:.1f} GB reserve, {'pinned' if self.pin else 'pageable'}, "
-                    f"{self.pool._max_workers} readers"
+                    f"{self.pool._max_workers} readers, "
+                    + (
+                        "misses read through the file cache (RAM past the commit limit holds them for a re-read)"
+                        if self.cached_reads
+                        else "misses read around the file cache"
+                    )
                 )
                 if self.drive is not None:
                     self.sm.log(self.drive_report(self.drive, self.n_slots, total, per))
@@ -1621,6 +1644,7 @@ class _ExpertStore:
                     key=(layer, e),
                     on_done=landed,
                     chunk=self.sm.cold_chunk,
+                    cached=self.cached_reads,
                 )
             )
         self.slots[slot].delta = tuple(deltas)

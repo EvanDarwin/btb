@@ -469,6 +469,20 @@ pub unsafe extern "C" fn btb_open(path: *const u16) -> i64 {
     .unwrap_or(ERR_PANIC as i64)
 }
 
+/// [`btb_open`], the file read through the system's file cache instead of around it: a read fills the cache,
+/// and a read of bytes it still holds is a copy out of RAM (no commit is charged for the cache's pages). For
+/// reads that come back - an expert missed again - where the cache is RAM the process cannot otherwise hold.
+///
+/// # Safety
+/// `path` NUL-terminated UTF-16.
+#[no_mangle]
+pub unsafe extern "C" fn btb_open_cached(path: *const u16) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        direct::open_cached(path)
+    }))
+    .unwrap_or(ERR_PANIC as i64)
+}
+
 /// Release a handle from [`btb_open`]; `ERR_DOMAIN` if it is not open (a second close). Reads still running
 /// on it finish, and the file closes when the last of them returns.
 #[no_mangle]

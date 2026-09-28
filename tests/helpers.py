@@ -418,6 +418,7 @@ class FakeRoute:
         key: object = None,
         on_done: Any = None,
         chunk: int = 0,
+        cached: bool = False,
     ) -> Future[float]:
         f: Future[float] = Future()
         self.reads.append(

@@ -114,3 +114,22 @@ def test_closing_the_engine_lets_the_store_go() -> None:
         del store
     assert sm.expert_store is None
     assert all(b() is None for b in bufs), "the closed engine's store blocks are still held"
+
+
+def test_a_miss_is_read_through_the_file_cache_where_commit_binds_the_host(monkeypatch: MonkeyPatch) -> None:
+    """where the host's commit is what the store can grow into and not its RAM (Windows), the file cache is RAM the
+    store cannot otherwise hold, and a miss is read through it; where the two are one figure, around it.
+    `BTB_EXPERT_READS` decides where it is set"""
+    from btb import sysinfo
+
+    monkeypatch.delenv("BTB_EXPERT_READS", raising=False)
+    monkeypatch.setattr(sysinfo, "host_free_bytes", lambda: 30 * GB)
+    monkeypatch.setattr(sysinfo, "host_commit_bytes", lambda: 5 * GB)
+    assert _store(bus_pass=True, store_pin=0).cached_reads, "commit below the RAM: through the cache"
+    monkeypatch.setattr(sysinfo, "host_commit_bytes", lambda: 30 * GB)
+    assert not _store(bus_pass=True, store_pin=0).cached_reads, "one figure: around it"
+    monkeypatch.setenv("BTB_EXPERT_READS", "cached")
+    assert _store(bus_pass=True, store_pin=0).cached_reads
+    monkeypatch.setenv("BTB_EXPERT_READS", "direct")
+    monkeypatch.setattr(sysinfo, "host_commit_bytes", lambda: 5 * GB)
+    assert not _store(bus_pass=True, store_pin=0).cached_reads

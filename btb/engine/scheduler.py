@@ -1025,6 +1025,7 @@ class BatchScheduler:
         on_done: Any = None,
         chunk: int = 0,
         depth: int = 0,
+        cached: bool = False,
     ) -> Future[float]:
         """Queue one read of `n` bytes at `off` of `path` into `dst` and return its future (the read's seconds
         as the result). A read already queued or in flight for the same bytes is not queued twice: its
@@ -1032,7 +1033,8 @@ class BatchScheduler:
         `key` names the requester (a layer and expert) so `disk_drop` can withdraw its reads before they are
         issued; `on_done(dur_ns)` runs on the reader thread as the bytes land. `depth` is the reader's own
         parallelism inside the one read (1 for a request that is one of many, the default for a lone big
-        one)."""
+        one). `cached`: read through the system's file cache (`Native.open_cached`), for bytes that come back -
+        an expert missed again - where the cache is RAM the process cannot otherwise hold; else around it."""
         st = self._disk_state()
         # the same bytes into the same place: two experts whose padded spans share a sector are two reads
         k = (path, int(off), int(n), int(dst.data_ptr()))
@@ -1058,6 +1060,7 @@ class BatchScheduler:
                 "key": key,
                 "chunk": int(chunk),
                 "depth": int(depth),
+                "cached": bool(cached),
                 "on_done": [on_done] if on_done is not None else [],
                 "future": Future(),
                 "state": "queued",
@@ -1158,6 +1161,7 @@ class BatchScheduler:
                     or r2["state"] != "queued"
                     or r2["ver"] != ver2
                     or path2 != path
+                    or r2["cached"] != r["cached"]
                     or p2 != pri
                     or not (r["off"] < off2 <= end < off2 + r2["n"])
                     or off2 + r2["n"] - r["off"] > self.DISK_MERGE_MAX
@@ -1179,15 +1183,16 @@ class BatchScheduler:
 
         # this reader's own handle per file, share-read, held for the run: an open handle halves a read's cost,
         # and it is one handle a thread because a synchronous handle serializes the reads that share it
-        handles: dict[str, int] = {}
+        handles: dict[tuple[str, bool], int] = {}
 
-        def read(path: str, off: int, n: int, dst: torch.Tensor, chunk: int, depth: int) -> None:
+        def read(path: str, off: int, n: int, dst: torch.Tensor, chunk: int, depth: int, cached: bool) -> None:
             if Native.read_at is None or Native.open is None:
                 Native.read_direct(path, off, n, dst, chunk)
                 return
-            h = handles.get(path)
+            cached = cached and Native.open_cached is not None
+            h = handles.get((path, cached))
             if h is None:
-                h = handles[path] = Native.open(path)
+                h = handles[(path, cached)] = (Native.open_cached if cached else Native.open)(path)
             Native.read_at(h, off, n, dst, chunk, depth)
 
         try:
@@ -1217,11 +1222,11 @@ class BatchScheduler:
         t0 = time.perf_counter_ns()
         try:
             if not partners:
-                read(r["path"], r["off"], r["n"], r["dst"], r["chunk"], r["depth"])
+                read(r["path"], r["off"], r["n"], r["dst"], r["chunk"], r["depth"], r["cached"])
             else:
                 span = partners[-1]["off"] + partners[-1]["n"] - r["off"]
                 run = torch.empty(span, dtype=torch.uint8)
-                read(r["path"], r["off"], span, run, r["chunk"], r["depth"])
+                read(r["path"], r["off"], span, run, r["chunk"], r["depth"], r["cached"])
                 for q in reqs:
                     at = q["off"] - r["off"]
                     q["dst"].copy_(run[at : at + q["n"]])

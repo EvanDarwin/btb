@@ -201,6 +201,7 @@ class Native(metaclass=_Binding):
         "sample_pick",
         "read_direct",
         "open",
+        "open_cached",
         "read_at",
         "close",
     )
@@ -220,6 +221,7 @@ class Native(metaclass=_Binding):
     sample_pick: Any
     read_direct: Any
     open: Any
+    open_cached: Any
     read_at: Any
     close: Any
     # the MLX backend (`mlxdev.Backend`) of the engine on the MLX device
@@ -520,7 +522,7 @@ class Native(metaclass=_Binding):
                     raise NativeError("btb_read_direct", rc, f" for {path} @ {off}+{nb}", os_error=True)
 
             cls.read_direct = read_direct
-        cls.open = cls.read_at = cls.close = None
+        cls.open = cls.open_cached = cls.read_at = cls.close = None
         if hasattr(lib, "btb_open") and hasattr(lib, "btb_read_at") and hasattr(lib, "btb_close"):
             op, ra, cl = lib.btb_open, lib.btb_read_at, lib.btb_close
             op.restype = ctypes.c_int64
@@ -557,6 +559,20 @@ class Native(metaclass=_Binding):
                     raise NativeError("btb_close", rc, f" for handle {handle}")
 
             cls.open, cls.read_at, cls.close = open_file, read_at, close_file
+            if hasattr(lib, "btb_open_cached"):
+                oc = lib.btb_open_cached
+                oc.restype = ctypes.c_int64
+                oc.argtypes = [ctypes.c_char_p]
+
+                def open_cached(path: str | os.PathLike[str]) -> int:
+                    """`open`, the file read through the system's file cache: a read fills it, and a read of
+                    bytes it still holds is a copy out of RAM that no commit is charged for"""
+                    h = oc(str(path).encode("utf-16-le") + b"\0\0")
+                    if h < 0:
+                        raise NativeError("btb_open_cached", h, f" for {path}", os_error=True)
+                    return int(h)
+
+                cls.open_cached = open_cached
         cls.delta_step = None
         if hasattr(lib, "btb_delta_step"):
             ds = lib.btb_delta_step

@@ -1213,6 +1213,61 @@ def test_route_merges_adjacent_reads_only_where_the_drive_seeks(monkeypatch: Mon
     assert t is not None and t[0]["off"] == 528 and [q["off"] for q in t[1]] == [536]
 
 
+def test_route_never_merges_a_cached_read_with_a_direct_one(monkeypatch: MonkeyPatch) -> None:
+    """a merged run is read through one handle: reads through the file cache and reads around it (an expert and a
+    cold layer can share a shard) never go as one, while each kind still merges with its own"""
+    reads: list[tuple[str, int, int]] = []
+    s, st = _route(monkeypatch, reads)
+    st["workers"] = [None]
+    st["merge"] = True
+    dst = torch.empty(8, dtype=torch.uint8)
+    s.disk_read("a.st", 0, 8, dst, s.DISK_DEMAND, cached=True)
+    s.disk_read("a.st", 8, 8, dst, s.DISK_DEMAND)
+    t = s._disk_take(st)
+    assert t is not None and t[1] == [], "a cached read and a direct one went as one"
+    assert s._disk_take(st) is not None
+    s.disk_read("a.st", 16, 8, dst, s.DISK_DEMAND, cached=True)
+    s.disk_read("a.st", 24, 8, dst, s.DISK_DEMAND, cached=True)
+    t = s._disk_take(st)
+    assert t is not None and [q["off"] for q in t[1]] == [24], "two adjacent cached reads go as one"
+
+
+def test_route_reads_a_cached_request_through_a_cached_handle(monkeypatch: MonkeyPatch) -> None:
+    """a reader keeps a handle a file and a mode: a read through the file cache on one opened by `open_cached`, a
+    read around it on one opened by `open`, never the one for the other"""
+    from btb.engine import native as native_mod
+
+    reads: list[tuple[str, int, int]] = []
+    s, _st = _route(monkeypatch, reads)
+    opened: list[tuple[str, str]] = []
+    used: list[int] = []
+    ids = iter(range(1, 100))
+
+    def opener(kind: str) -> Callable[[str], int]:
+        def open_(path: str) -> int:
+            opened.append((kind, path))
+            return next(ids)
+
+        return open_
+
+    monkeypatch.setattr(native_mod.Native, "open", staticmethod(opener("direct")))
+    monkeypatch.setattr(native_mod.Native, "open_cached", staticmethod(opener("cached")))
+    monkeypatch.setattr(
+        native_mod.Native, "read_at", staticmethod(lambda h, off, n, dst, chunk, depth: used.append(int(h)))
+    )
+    monkeypatch.setattr(native_mod.Native, "close", staticmethod(lambda h: None))
+    dst = torch.empty(8, dtype=torch.uint8)
+    try:
+        s.disk_read("a.st", 0, 8, dst, s.DISK_DEMAND, cached=True).result(timeout=10)
+        s.disk_read("a.st", 4096, 8, dst, s.DISK_DEMAND).result(timeout=10)
+        s.disk_read("a.st", 8192, 8, dst, s.DISK_DEMAND, cached=True).result(timeout=10)
+    finally:
+        s.disk_close()
+    handle = {kind: i + 1 for i, (kind, _p) in enumerate(opened)}
+    assert sorted(opened) == [("cached", "a.st"), ("direct", "a.st")], opened
+    assert used == [handle["cached"], handle["direct"], handle["cached"]], (used, handle)
+
+
 def test_route_merged_read_lands_each_destination_from_the_union(monkeypatch: MonkeyPatch) -> None:
     reads: list[tuple[str, int, int]] = []
     s, st = _route(monkeypatch, reads)
@@ -1231,7 +1286,7 @@ def test_route_merged_read_lands_each_destination_from_the_union(monkeypatch: Mo
     f3 = s.disk_read("a.st", 76, 8, d3, s.DISK_DEMAND)
     t = s._disk_take(st)
     assert t is not None and len(t[1]) == 2
-    s._disk_serve(st, t, lambda path, off, n, dst, chunk, depth: fake_read(path, off, n, dst, chunk))
+    s._disk_serve(st, t, lambda path, off, n, dst, chunk, depth, cached: fake_read(path, off, n, dst, chunk))
     assert reads == [("a.st", 64, 20)], "one read of the union"
     assert d1.tolist() == list(range(64, 72)) and d2.tolist() == list(range(68, 76))
     assert d3.tolist() == list(range(76, 84))
