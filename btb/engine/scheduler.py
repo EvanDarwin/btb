@@ -60,6 +60,16 @@ class PlanError(MemoryGrantError):
     the staging a streamed layer crosses through. Raised before anything is loaded, naming the shortfall."""
 
 
+def drafts(probe: Any, mlx: bool, speculate: bool = True) -> bool:
+    """whether a load of `probe` runs the checkpoint's drafting head, the only case its bytes are placed anywhere:
+    speculation asked for with it as the proposer (`speculate`), `mtp.*` weights in the checkpoint, a drafter the
+    family builds over them, and a verify pass the family runs on this tier (`Family.speculates`)"""
+    if not speculate or not any(k.startswith("mtp.") for k in probe.weight_map):
+        return False
+    fam: Any = getattr(probe, "fam", None)
+    return callable(getattr(fam, "drafter_cls", None)) and fam.drafter_cls() is not None and bool(fam.speculates(mlx))
+
+
 @dataclass(frozen=True)
 class PlanBytes:
     """The sizes a plan priced, in bytes."""
@@ -176,7 +186,7 @@ class Plan:
     drafter_on_card: bool
     prefill_card: bool
     kv_host: bool
-    has_mtp: bool
+    has_mtp: bool  # the load runs the drafting head (`drafts`): only then is it priced, on the card or the host
     moe: bool
     predicted_ms_per_token: float
     bytes: PlanBytes
@@ -507,9 +517,13 @@ class BatchScheduler:
         device: Any = None,
         held: int = 0,
         draws: str | None = None,
+        reclaim: bool = False,
     ) -> None:
         """Ask before allocating: returns on a request the engine can afford, raises `MemoryGrantError` on one
         it cannot. One free-memory read: for an allocation path (a growth, a tier load), never a per-token one.
+        `reclaim`: a host request the room does not hold has the expert store give blocks back for it first (it
+        grows into whatever RAM is free, as a cache); only for a caller outside any store call, since a block given
+        back mid-call could take experts the call is still multiplying.
         A `kv` request whose per-row capacity `cap` is past `bound` (the length the sequence itself can reach)
         is refused whatever its size: a growth bug, not a need. A large but affordable request is logged.
 
@@ -533,6 +547,10 @@ class BatchScheduler:
         from .device import torch_device
 
         dev = self.sm.dev if device is None else torch_device(device)
+        store = getattr(self.sm, "expert_store", None)
+        if reclaim and nbytes > free and dev.type == Device.CPU and store is not None:
+            store.release(nbytes)
+            free = self.free_for(device, tag) or 0
         # the card's margin is its OOM guard and the host's floor is the OS's own (or the one --ram-reserve
         # names): a request past either is refused
         if nbytes > free:
@@ -616,6 +634,7 @@ class BatchScheduler:
         kv_host: bool | None = None,
         settle_s: float = 30.0,
         drive: DriveBenchmark | None = None,
+        speculate: bool = True,
     ) -> Plan:
         """The placement for `probe` (an engine opened on the CPU to price its layers) against the host budget
         (`budget`, else `measure_host` now, with `os_reserve_gb` as the floor where one is named) and
@@ -627,10 +646,12 @@ class BatchScheduler:
         and keeps RAM only where the layers the cache would evict stream at more a token than the host's
         attention reads at the full context; True or False is the placement asked for. `drive` is the drive's
         measurement to price the cold tier from; None measures it on the model's largest file when the
-        placement streams layers, once per volume for the process (the engine's Route reuses it)."""
+        placement streams layers, once per volume for the process (the engine's Route reuses it). `speculate`: the
+        load decodes speculatively with the drafting head as its proposer (a positive `v_max` and tree budget); off,
+        the drafter is priced nowhere (`drafts`)."""
         name = DeviceName.parse(device)
         card = name is not None and name.kind.card
-        has_mtp = any(k.startswith("mtp.") for k in probe.weight_map)
+        has_mtp = drafts(probe, mlx=name is not None and name.kind is Device.MLX, speculate=speculate)
         if budget is None:
             budget = BatchScheduler.measure_host(os_reserve_gb, BatchScheduler.growth_estimate(probe))
         hb = budget

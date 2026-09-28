@@ -1,8 +1,8 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
-"""Qwen4's sparse attention indexer through btb (btb/engine/qsa.py) against the reference's own forward: by default
-the selected-token mask is the reference's bit for bit - on the host and the card, float32 and bf16, a first chunk
-and one continuing a cache, a bool mask and an additive one - and a mask that is not plain causal takes the
-reference's forward. `sparse` (`--sparse`) is held to the reference indexer's choices: the share of the rows'
+"""Qwen4's sparse attention indexer through btb (btb/engine/families/qwen4/qsa.py) against the reference's own
+forward: by default the selected-token mask is the reference's bit for bit - on the host and the card, float32 and
+bf16, a first chunk and one continuing a cache, a bool mask and an additive one, a speculative pass's tree - and any
+other mask takes the reference's forward. `sparse` (`--sparse`) is held to the reference indexer's choices: the share of the rows'
 selected tokens it agrees on."""
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 import torch
 
-from btb.engine.qsa import install
+from btb.engine.families.qwen4.qsa import install
 from tests.helpers import fixture, layer_count
 
 DEVICES = ["cpu", *(["cuda"] if torch.cuda.is_available() else [])]
@@ -78,6 +78,39 @@ def test_the_selection_is_the_references_bit_for_bit(dev: str, dtype: torch.dtyp
         b = _call(ours, cfg, rot, S, past, dtype, dev, bool_mask, seed=S + past)
         assert a.dtype == b.dtype and a.shape == b.shape, (a.shape, b.shape)
         assert torch.equal(a, b), f"S={S} past={past} bool={bool_mask}: {int((a != b).sum())} entries part"
+
+
+@pytest.mark.parametrize("dev", DEVICES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_a_trees_selection_is_the_references_bit_for_bit(dev: str, dtype: torch.dtype) -> None:
+    """a verify pass's rows - the prefix, then a tree whose rows see themselves and their ancestors, roped at their
+    depth - select what the reference selects row for row: a prefix a whole number of blocks and one that is not
+    (its tail shares a block with the rows' own), short of the budget and past it"""
+    from btb.engine.forward import tree_mask
+
+    parents = [-1, 0, 1, 2, 1, 4, 0, 6, 7, 3, 9, 10]
+    depth = [0]
+    for p in parents[1:]:
+        depth.append(depth[p] + 1)
+    cfg, ref, ours, rot = _pair(8, dtype, dev)
+    S = len(parents)
+    for past, bool_mask in ((16, True), (37, True), (64, False), (130, True), (211, False)):
+        g = torch.Generator().manual_seed(past)
+        h = torch.randn(1, S, cfg.hidden_size, generator=g).to(dev, dtype)
+        prev = torch.randn(1, past, cfg.indexer_head_dim, generator=g).to(dev, dtype)
+        pos = torch.tensor(list(range(past)) + [past + d for d in depth], device=dev).view(1, 1, -1).expand(3, 1, -1)
+        cos, sin = rot(h, pos)
+        kv = past + S
+        causal = (torch.arange(kv, device=dev)[None, :] <= (torch.arange(S, device=dev) + past)[:, None]).view(
+            1, 1, S, kv
+        )
+        mask = tree_mask(causal, past, parents)
+        if not bool_mask:
+            mask = torch.where(mask, torch.zeros((), dtype=dtype, device=dev), torch.finfo(dtype).min)
+        with torch.no_grad():
+            a = ref(h, (cos.to(dtype), sin.to(dtype)), mask, _Keys(prev))
+            b = ours(h, (cos.to(dtype), sin.to(dtype)), mask, _Keys(prev))
+        assert torch.equal(a, b), f"past={past} bool={bool_mask}: {int((a != b).sum())} entries part"
 
 
 def test_a_padded_mask_takes_the_references_forward() -> None:

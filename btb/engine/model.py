@@ -31,7 +31,6 @@ from .drafter import MTPDrafter
 from .experts import _ExpertStore
 from .families import _FamiliesMixin, family, register_attention
 from .forward import _ForwardMixin
-from .fused import fast_causal_conv1d
 from .generate import _GenerateMixin
 from .holdings import Holdings, Stage, last_on_card, on_card
 from .host import _Experts, _HostLinear, _NGramRows, _Router
@@ -41,6 +40,7 @@ from .memory import RamPolicyState, VramPolicyState, _LendMixin
 from .mlx_forward import MlxState, _MlxMixin
 from .native import Native
 from .scheduler import BatchScheduler
+from .scratch import Scratch
 from .text import _TextMixin
 from .tiers import ColdRing, _TiersMixin
 
@@ -147,6 +147,7 @@ class StreamedTextModel(
         # everything the engine holds past a pass, each registered where it is made: `close` is this run
         self.holdings = Holdings()
         _leaks_track(self)
+        self.scratch = Scratch(self)
         self.gguf = GGUFModel(model_dir) if is_gguf(model_dir) else None
         self.gguf_packed = bool(gguf_packed)  # its Q4/Q8 tensors on the packed kernels as stored (MLX), else bf16
         self.dir = self.gguf.dir if self.gguf is not None else model_dir
@@ -213,14 +214,8 @@ class StreamedTextModel(
         # Gemma scales the input embedding by sqrt(hidden); the engine gathers rows itself, so it applies the
         # scale the module's scaled embedding would (the tied head's output projection stays unscaled)
         self.embed_scale = float(cfg.hidden_size) ** 0.5 if self.fam.embed_scale else None
-        if self.fam.eager:
-            # gpt-oss's sinks are not expressible through sdpa: `attention_sinks` runs the reference's arithmetic on
-            # the CPU, the engine's kernels over an MLX cache
-            register_attention()
-            cfg._attn_implementation = "btb_sinks"
+        self.fam.prepare(self)
         self.n_experts = int(getattr(cfg, "num_local_experts", 0) or getattr(cfg, "num_experts", 0) or 0)
-        if self.mlx is not None and self.fam.hybrid:
-            self.fam.mod.causal_conv1d_fn = fast_causal_conv1d
         self.L = int(cfg.num_hidden_layers)
         self.layer_types = [LayerKind.of(t) for t in (getattr(cfg, "layer_types", None) or [LayerKind.FULL] * self.L)]
         self.pack = None if self.gguf is not None else pack_format(model_dir)
@@ -264,20 +259,16 @@ class StreamedTextModel(
         self.expert_trace = None
         self.expert_profile = None
         self.expert_store = None
-        self.norm = self.mixer = None
         with self._meta:
-            if self.fam.norm is not None:
-                self.norm = self.fam.norm(cfg.hidden_size, eps=cfg.rms_norm_eps)
-            else:
-                self.mixer = self.fam.mod.Qwen4ExpTextGatedResidual(cfg, use_combine=False)
+            closing, last = self.fam.closing(cfg)
+        # a family's final norm is `norm`, which the fused paths fold into their graphs; a family without one closes
+        # with its own module (Qwen4's mixer of its streams), `mixer`, run as its module runs
+        self.norm, self.mixer = (last, None) if self.fam.norm is not None else (None, last)
         # the parameters are widened to a float32 compute dtype below: read at the checkpoint's own precision for it
         wide = self.compute_dtype is not None and self.compute_dtype != torch.bfloat16
-        if self.norm is not None:
-            self._adopt(self.norm, "weight", self._get(self.prefix + "norm.weight", stored=wide))
-        else:
-            for name, _, is_buf in self._named_tensors(self.mixer):
-                t = self._get(self.prefix + "hyper_connection_mixer." + name, stored=wide and not is_buf)
-                self._adopt(self.mixer, name, t, buffer=is_buf)
+        for name, _, is_buf in self._named_tensors(last):
+            t = self._get(f"{self.prefix}{closing}.{name}", stored=wide and not is_buf)
+            self._adopt(last, name, t, buffer=is_buf)
         self.resident_head = resident_head
         self.head = None
         self.head_host = None
@@ -581,9 +572,9 @@ class StreamedTextModel(
         layers differ in kind."""
         names = ["model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"]
         with torch.device("meta"):
-            if self.fam.norm is None:
-                mixer = self.fam.mod.Qwen4ExpTextGatedResidual(cfg, use_combine=False)
-                names += [f"model.hyper_connection_mixer.{n}" for n, _, _ in self._named_tensors(mixer)]
+            closing, last = self.fam.closing(cfg)
+            # a closing module other than the norm named above (Qwen4's mixer) adds its own
+            names += [n for t, _, _ in self._named_tensors(last) if (n := f"model.{closing}.{t}") not in names]
             for i in range(self.L):
                 names += [f"model.layers.{i}.{n}" for n, _, _ in self._named_tensors(self.fam.layer(cfg, i))]
         return names
@@ -685,7 +676,8 @@ class StreamedTextModel(
         self.embed_table = self.norm = self.head = self.head_host = None
         self.aj = None
         self._attn_ctx = None
-        self.cold_ring.slots, self.cold_ring.shared = [], None
+        # the recipe with the slots: its entries hold the cold layers' modules, whose weights are views of the slots
+        self.cold_ring.slots, self.cold_ring.shared, self.cold_ring.recipe = [], None, None
 
     def _close_files(self) -> None:
         """the checkpoint's maps and the drive handles the cold ring read through"""

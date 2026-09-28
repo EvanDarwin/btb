@@ -138,7 +138,15 @@
       "model.layers.7.attn_hyper_connection.block_inject_weight",
       "model.layers.7.mlp.gate",
       "model.layers.7.mlp.shared_expert_gate",
-      "model.layers.7.mlp_hyper_connection.block_inject_weight"
+      "model.layers.7.mlp_hyper_connection.block_inject_weight",
+      "mtp.fc_embedding",
+      "mtp.fc_hidden",
+      "mtp.hyper_connection_mixer.input_mix_weight_down",
+      "mtp.hyper_connection_mixer.input_mix_weight_up",
+      "mtp.layers.0.attn_hyper_connection.block_inject_weight",
+      "mtp.layers.0.mlp.gate",
+      "mtp.layers.0.mlp.shared_expert_gate",
+      "mtp.layers.0.mlp_hyper_connection.block_inject_weight"
     ]
   }
 }

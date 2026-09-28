@@ -904,6 +904,7 @@ class _ExpertStore:
         self.next_slot = 0
         self.max_call = 0
         self.pool = ThreadPoolExecutor(max_workers=int(readers))
+        self.readers = int(readers)
         # hit/miss per expert asked; bytes the misses' bytes; s the store's own time in get/wait; wait_s the
         # time a layer's forward blocked on its reads; read_s/read_n/read_max_s each expert read as the reader
         # saw it; calls and miss_calls per layer call; adjacent the misses next to another miss of the same
@@ -1314,7 +1315,13 @@ class _ExpertStore:
                     and os.environ.get("BTB_STORE_PADDED", "1") != "0"
                 )
                 self.stride, self.part_at = self._layout(self.sizes, self.padded)
-                total = int(self.sm.L) * int(self.sm.n_experts)
+                # every layer's experts: the trunk's, and a drafting layer's (Qwen4's MTP layer is the store's layer L)
+                drafting = {
+                    k.split(".mlp.experts.")[0]
+                    for k in self.sm.weight_map
+                    if k.startswith("mtp.") and ".mlp.experts." in k
+                }
+                total = (int(self.sm.L) + len(drafting)) * int(self.sm.n_experts)
                 self.n_slots = min(total, max(self.scratch_n + 1, int(self.budget // self.stride)))
                 # the ring is carved out of the store: an eighth of it at most, none of a store too small to spare
                 self.ring_n = min(self.ring_n, self.n_slots // 8)
@@ -1380,6 +1387,26 @@ class _ExpertStore:
             f"[experts] this drive: a missed expert costs {cost * 1e3:.1f} ms; the store seats {n_slots} of {total} "
             f"experts ({100.0 * n_slots / max(1, total):.0f}%), and a token waits about its misses times that"
         )
+
+    def reads(self) -> int:
+        """the expert reads the store has put to the drive so far: its misses and the lookahead's predictions not
+        withdrawn - a pass's count, taken before and after it, is what the speculative pricing charges its rows"""
+        st = self.stat
+        return int(st["miss"] + st["ahead"] - st["ahead_dropped"])
+
+    def waited(self) -> float:
+        """the seconds the forwards have waited on the store's reads so far (`wait_s`): a pass's, taken before and
+        after it, is what the speculative pricing takes out of its seconds to leave the rows' compute"""
+        return float(self.stat["wait_s"])
+
+    def miss_s(self) -> float:
+        """a missed expert's seconds: the drive's probe (`expert_s`); without one, the reads timed so far spread
+        over the readers that ran them side by side; 0 before either"""
+        cost = self.expert_s(self.drive or {}, int(self.per or 0))
+        if cost > 0:
+            return cost
+        n = int(self.stat["read_n"])
+        return float(self.stat["read_s"]) / n / max(1, self.readers) if n else 0.0
 
     PASS_SAMPLES = 16
 

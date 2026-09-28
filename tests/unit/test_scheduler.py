@@ -996,6 +996,41 @@ def test_grant_warns_past_the_warn_fraction_of_free() -> None:
         assert len(sm.lines) == n, "a small request is granted quietly"
 
 
+def test_a_host_grant_takes_room_back_from_the_expert_store_only_when_the_caller_lets_it(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The expert store grows into whatever RAM the ledger shows free, so a host request made after it has is short.
+    Without `reclaim` the request is refused and the store left alone (a caller mid-call could lose experts it is
+    multiplying); with it the store gives blocks back for the request - asked once, for what the request needs -
+    and the grant goes through. A request that fits never asks."""
+    from btb.engine import scheduler as S
+
+    _sched, err = _grant_api()
+    free = {"now": 64 * MB}
+    monkeypatch.setattr(S, "host_free_bytes", lambda: free["now"])
+
+    class Store:
+        def __init__(self) -> None:
+            self.asked: list[int] = []
+
+        def release(self, want: int = 1) -> int:
+            self.asked.append(int(want))
+            free["now"] += 256 * MB
+            return 1
+
+    sm = SchedulerModel(dev="cpu")
+    store = Store()
+    monkeypatch.setattr(sm, "expert_store", store, raising=False)
+    s = BatchScheduler(sm)
+    with pytest.raises(err):
+        s.grant(128 * MB, "scratch", requester="test", device="cpu")
+    assert store.asked == [], "a grant that may not reclaim leaves the store alone"
+    s.grant(128 * MB, "scratch", requester="test", device="cpu", reclaim=True)
+    assert store.asked == [128 * MB]
+    s.grant(MB, "scratch", requester="test", device="cpu", reclaim=True)
+    assert store.asked == [128 * MB], "a request the room holds asks nothing back"
+
+
 def test_grant_allows_a_plausible_request() -> None:
     _sched, _err = _grant_api()
     s, free = _grant_scheduler()
@@ -1948,13 +1983,7 @@ def test_vram_seats_hold_the_most_ridden_experts_and_serve_them_from_the_card(mo
     assert ready[5][0].device.type == "cpu", "the ride that earned it is still served from RAM"
     # a second rider, a third, at layer 1: one promotion a pass (a pass turns at layer 0), the seats by last ride
     for e in (6, 7):
-        if st.free:
-            s2 = st.free.pop()
-        else:
-            victim = st.res.victim()
-            assert victim is not None
-            s2 = victim[1]
-        st.res.admit((1, e), s2)
+        seat(st, (1, e))  # through the store's own transitions: its slot table checks after every wave
         st.rides[(1, e)] = 5
     st.get(1, "layers.1.mlp.experts.", [6])
     assert (1, 6) not in st.vram, "the pass's one promotion was spent on 5"
@@ -1972,7 +2001,8 @@ def test_vram_seats_hold_the_most_ridden_experts_and_serve_them_from_the_card(mo
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 def test_a_seated_expert_serves_a_multi_row_call_from_the_card(monkeypatch: MonkeyPatch) -> None:
     """the prefill's path (several rows, the host kernel) met a seated expert's card views and handed the host
-    kernel a card pointer; the rows of a seated expert go to the card and come back with the same answer"""
+    kernel a card pointer; the rows of a seated expert go to the card and come back with the same answer - the same
+    bits, where the card has btb's kernels: the host's gemv on the card (`gemv_lane16`), the activation on the host"""
     from btb.engine.experts import VramSeats
     from btb.engine.host import _Experts
 
@@ -1998,6 +2028,10 @@ def test_a_seated_expert_serves_a_multi_row_call_from_the_card(monkeypatch: Monk
     assert (0, 5) in st.vram and (0, 6) in st.vram, "the first ride earned the seats"
     y1 = mod(x, top, w)
     assert y1.shape == x.shape
+    from btb.engine.native import Native
+
+    if Native.card_kernels() is not None:
+        assert torch.equal(y1, y0), "a seated expert's rows part from its rows off the card"
     torch.testing.assert_close(y1.float().cpu(), y0.float().cpu(), rtol=2e-2, atol=2e-2)
 
 

@@ -60,7 +60,7 @@ class _HostLinear(torch.nn.Module):
         self.key = key
         self.packed = None
         self.mx = None
-        # an FP8 checkpoint's matrix as stored (families.py binds it); `weight` is then its shape and no bytes
+        # an FP8 checkpoint's matrix as stored (families/__init__.py binds it); `weight` is then its shape and no bytes
         self.f8 = None
         # on a Mac's CPU tier: the same bytes as an MLX bf16 array, for the prefill's GEMM on MLX's CPU
         # stream (`bind_cpu_gemm`); the one-row step keeps the native kernel
@@ -342,6 +342,43 @@ class _Experts(torch.nn.Module):
         for j, i in enumerate(pos):
             gu_buf[i] = self._join(tg[j], tu[j])
 
+    def _seated(
+        self, xs: list[torch.Tensor], pairs: list[tuple[torch.Tensor, torch.Tensor]], dt: torch.dtype
+    ) -> list[torch.Tensor]:
+        """Experts seated on the card (bf16 `pairs` of gate_up and down there), each over its own rows `xs[j]` [n,
+        H], computed as the host computes them: gate_up and down through the host's gemv on the card (`gemv_lane16`,
+        the host kernel's bits), the activation between them on the host in `dt` as `_act` takes it there - so an
+        expert's rows do not depend on which side of the bus it is seated. Returns each expert's rows [n, H] float32
+        on the host, before the routing weight. Without the card's kernels the float32 matmuls on the card."""
+        kern = Native.card_kernels()
+        dev = pairs[0][0].device
+        with torch.no_grad():
+            if kern is None:
+                outs = []
+                for x, (w_gu, w_dn) in zip(xs, pairs, strict=True):
+                    xc = x.to(dev).float()
+                    hmid = self._act(torch.nn.functional.linear(xc, w_gu.float()).to(dt), None)
+                    outs.append(torch.nn.functional.linear(hmid.float(), w_dn.float()).cpu())
+                return outs
+
+            def lane16(w: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+                # the gemv's widths are 1..32 rows: a longer call goes 32 rows at a time, the rows independent
+                n = int(x.shape[0])
+                y = torch.empty(n, int(w.shape[0]), dtype=torch.float32, device=dev)
+                for a in range(0, n, 32):
+                    m = min(32, n - a)
+                    M = next(r for r in kern.GEMV_ROWS if r >= m)
+                    xin = torch.zeros(M, int(x.shape[1]), dtype=torch.float32, device=dev)
+                    xin[:m].copy_(x[a : a + m])
+                    yo = torch.empty(M, int(w.shape[0]), dtype=torch.float32, device=dev)
+                    kern.gemv_lane16(w, xin, yo)
+                    y[a : a + m].copy_(yo[:m])
+                return y
+
+            gus = [lane16(w_gu, x.to(dev).float()) for x, (w_gu, _dn) in zip(xs, pairs, strict=True)]
+            mids = [self._act(g.cpu().to(dt), None).float() for g in gus]
+            return [lane16(w_dn, h.to(dev)).cpu() for h, (_gu, w_dn) in zip(mids, pairs, strict=True)]
+
     def _one_row(
         self,
         x: torch.Tensor,
@@ -368,23 +405,17 @@ class _Experts(torch.nn.Module):
         gu_buf = torch.empty(k, first[0].shape[0], dtype=torch.float32)
         dn_buf = torch.empty(k, first[1].shape[0], dtype=torch.float32)
         out = torch.empty(k, first[1].shape[0], dtype=dt)
-        # the experts seated on the card: multiplied there in float32 over the stored bf16, the row brought back
+        # the experts seated on the card: multiplied there as the host multiplies them (`_seated`), the row back
         card = [
             i
             for i, e in enumerate(hit)
             if e in views and isinstance(views[e][0], torch.Tensor) and views[e][0].device.type != "cpu"
         ]
-        if card and x_card is not None:
-            with torch.no_grad():
-                xc = x_card.reshape(1, -1).float()
-                rows = []
-                for i in card:
-                    w_gu, w_dn = views[hit[i]]
-                    hmid = self._act(torch.nn.functional.linear(xc, w_gu.float()), None)
-                    rows.append(torch.nn.functional.linear(hmid.float(), w_dn.float()))
-                back = torch.cat(rows, 0).cpu()
+        if card:
+            xc = (x if x_card is None else x_card).reshape(1, -1)
+            back = self._seated([xc] * len(card), [views[hit[i]] for i in card], dt)
             for r, i in enumerate(card):
-                out[i] = back[r].to(dt) * weights[slot[hit[i]]]
+                out[i] = back[r][0].to(dt) * weights[slot[hit[i]]]
 
         def stage(pos: Any, ws: Any) -> None:
             if not pos:
@@ -669,6 +700,7 @@ class _Experts(torch.nn.Module):
         store: Any,
         final: torch.Tensor,
         seated: set[int] | None = None,
+        x_card: torch.Tensor | None = None,
     ) -> None:
         """A call of many rows over its experts, in the waves the store serves it (`StoreCall.wave`): each wave's experts
         multiplied - as grouped matmuls on the card through the depot, or the per-expert loop - and added into
@@ -697,7 +729,7 @@ class _Experts(torch.nn.Module):
                 self._card_grouped(x, w_top, top_k_index, now, views, pending, store, depot, final, seated)
                 seated = None  # placed with the first wave
             else:
-                self._loop(x, w_top, top_k_index, expert_mask, hidden_states, now, views, pending, store, final)
+                self._loop(x, w_top, top_k_index, expert_mask, hidden_states, now, views, pending, store, final, x_card)
             if call is None or call.done:
                 return
             # this wave's experts are done with (the depot's copies out of their slots landed): the store may seat
@@ -719,9 +751,10 @@ class _Experts(torch.nn.Module):
         pending: Any,
         store: Any,
         final: torch.Tensor,
+        x_card: torch.Tensor | None = None,
     ) -> None:
         """the per-expert loop over `hit`: each expert's rows multiplied on its own and added into `final` in
-        ascending expert order"""
+        ascending expert order; `x_card` the rows where they are on the card too (a seated expert reads them there)"""
         dev = hidden_states.device
         on_host = x.device.type == "cpu" and dev.type != "cpu"
         contrib = {}
@@ -743,11 +776,11 @@ class _Experts(torch.nn.Module):
             if depot is not None:
                 w_gu, w_dn = depot.get(self.layer, e, w_gu, w_dn)
             if isinstance(w_gu, torch.Tensor) and w_gu.device.type != "cpu" and x.device != w_gu.device:
-                # an expert seated on the card while the rows are on the host: its rows go to the card and
-                # are multiplied there in float32 over the stored bf16, as the one-row path does
-                cur = hidden_states[token_idx.to(hidden_states.device)].float()
-                h = self._act(torch.nn.functional.linear(cur, w_gu.float()), None)
-                h = torch.nn.functional.linear(h.float(), w_dn.float()).to(x.device).to(x.dtype)
+                # an expert seated on the card while the rows are on the host: its rows multiplied there as the host
+                # multiplies them (`_seated`), as the one-row path does
+                src = x_card if x_card is not None else hidden_states
+                cur = src[token_idx.to(src.device)]
+                h = self._seated([cur], [(w_gu, w_dn)], x.dtype)[0].to(x.device).to(x.dtype)
             else:
                 cur = x[token_idx]
                 h = self._act(self._linear(cur, w_gu), e)
@@ -769,8 +802,15 @@ class _Experts(torch.nn.Module):
             final.index_add_(0, token_idx, h.to(final.dtype))
 
     def forward(
-        self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+        x_card: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """the call's routed experts over its rows: [T, H] in the rows' dtype, summed in ascending expert order.
+        `x_card`: the rows on the card too, where the caller holds them there (a card program's) - an expert seated
+        on the card reads them there"""
         t0 = time.perf_counter()
         dev = hidden_states.device
         probe = getattr(self.sm, "expert_probe", None)
@@ -861,11 +901,13 @@ class _Experts(torch.nn.Module):
         if use_mlx:
             self._mlx_forward(x, w_top, expert_mask, hit, views, pending, store, final)
         elif grouped:
-            self._one_row(x, w_top, top_k_index, hit, views, pending, store, final, hidden_states if on_host else None)
+            card_rows = x_card if x_card is not None else (hidden_states if on_host else None)
+            self._one_row(x, w_top, top_k_index, hit, views, pending, store, final, card_rows)
         else:
             self._waves(
-                x, w_top, top_k_index, expert_mask, hidden_states, now, views, pending, call, store, final, seated
-            )
+                x, w_top, top_k_index, expert_mask, hidden_states, now, views, pending, call, store, final, seated,
+                x_card,
+            )  # fmt: skip
         st = self.sm.expert_stat
         st["experts"] += len(hit)
         st["bytes"] += len(hit) * per_expert

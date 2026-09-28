@@ -207,9 +207,11 @@ def speculation(
     ngram_p: float | None = None,
     tree_read: str | None = None,
     v_max: int | None = None,
+    price: bool | None = None,
 ) -> None:
     """the speculative loop's knobs a test pins, each left alone when not given; the drafter never read from
-    beside the model"""
+    beside the model. `price` False sizes the passes as with no store (`spec_price`): a test of the verify pass
+    drafts what it asks for, whatever earlier calls taught the pricer"""
     if tree_budget is not None:
         sm.tree_budget = tree_budget
     if tree_min_prob is not None:
@@ -220,6 +222,8 @@ def speculation(
         sm.tree_read = tree_read
     if v_max is not None:
         sm.v_max = v_max
+    if price is not None:
+        sm.spec_price = price
     sm.drafter_weights = None
 
 

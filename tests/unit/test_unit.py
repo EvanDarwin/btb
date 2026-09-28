@@ -188,6 +188,106 @@ def test_native_refuses_misaligned_buffers() -> None:
     assert f(w.data_ptr(), 0, 8, raw.data_ptr(), 1, y.data_ptr(), 1) == -6, "a zero dimension"
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_native_attn_nodes_rows_are_the_one_row_steps(dtype: torch.dtype) -> None:
+    """a verify pass's tree nodes through `Native.attn_nodes`: each node over its list of cache rows (the prefix,
+    its ancestors, itself) is `Native.attn_decode` over those rows copied out, bit for bit, on a cache sliced out
+    of a longer one as the engine slices it; a list of the first n rows is the decode step itself; and a list
+    naming a row past the cache is refused with ERR_DOMAIN before anything is written"""
+    from btb.engine.native import Native, NativeError
+
+    native_library()
+    hq, hk, d, cap, prefix = 24, 2, 256, 96, 70
+    g = torch.Generator().manual_seed(7)
+    parents = [-1, 0, 1, -1, 3, 1]  # two branches off the prefix, one of them forked
+    n_rows = prefix + len(parents)
+    kc = torch.randn(hk, cap, d, generator=g).to(dtype)
+    vc = torch.randn(hk, cap, d, generator=g).to(dtype)
+    k, v = kc[:, :n_rows], vc[:, :n_rows]
+    lists = []
+    for j in range(len(parents)):
+        path, at = [], j
+        while at >= 0:
+            path.append(prefix + at)
+            at = parents[at]
+        lists.append(list(range(prefix)) + path[::-1])
+    lists.append(list(range(n_rows)))  # the identity list
+    T = len(lists)
+    q = torch.randn(T, hq, d, generator=g)
+    offs = torch.tensor([0] + [sum(len(li) for li in lists[: i + 1]) for i in range(T)], dtype=torch.int32)
+    idx = torch.tensor([r for li in lists for r in li], dtype=torch.int32)
+    out = torch.full((T, hq, d), float("nan"))
+    Native.attn_nodes(q, k, v, offs, idx, 0.0625, out)
+    for t, li in enumerate(lists):
+        rows = torch.tensor(li)
+        step = torch.empty(hq, d)
+        Native.attn_decode(q[t], k[:, rows].contiguous(), v[:, rows].contiguous(), 0.0625, step)
+        assert torch.equal(out[t], step), f"node {t} is not its one-row step"
+    whole = torch.empty(hq, d)
+    Native.attn_decode(q[T - 1], k, v, 0.0625, whole)
+    assert torch.equal(out[T - 1], whole), "a list of the first n rows is not the decode step over n rows"
+
+    bad = idx.clone()
+    bad[-1] = n_rows
+    kept = torch.full((T, hq, d), 7.0)
+    with pytest.raises(NativeError) as e:
+        Native.attn_nodes(q, k, v, offs, bad, 0.0625, kept)
+    assert e.value.rc == -6, "a row past the cache is ERR_DOMAIN"
+    assert bool((kept == 7.0).all()), "a refused call wrote its output"
+
+
+@pytest.mark.parametrize("norm_topk_prob", [True, False])
+def test_qwen4_router_rows_are_the_one_row_calls(norm_topk_prob: bool) -> None:
+    """Qwen4's host router (families/qwen4/router.py): a row's logits, weights and experts from a call of many rows
+    are the one-row call's bit for bit - the verify pass's rows route as their one-token steps do - and they are
+    the reference router's over the widened matrix, its routing to the expert and its numbers to float32's
+    rounding"""
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextTopKRouter
+
+    from btb.engine.families.qwen4.router import Qwen4Router, install
+
+    native_library()
+    E, H, k, T = 24, 192, 4, 17
+    g = torch.Generator().manual_seed(11)
+    cfg = types.SimpleNamespace(num_experts_per_tok=k, num_experts=E, norm_topk_prob=norm_topk_prob, hidden_size=H)
+    ref = Qwen4ExpTextTopKRouter(cfg)
+    ref.weight.data = torch.randn(E, H, generator=g).bfloat16()
+    mlp = types.SimpleNamespace(gate=ref)
+    install(mlp, "model.layers.0.mlp.gate.weight")
+    ours = mlp.gate
+    assert isinstance(ours, Qwen4Router) and ours.lin.weight.dtype == torch.bfloat16, "the matrix is kept as stored"
+    x = torch.randn(T, H, generator=g)
+    logits, weights, experts = ours(x)
+    for t in range(T):
+        lg1, w1, e1 = ours(x[t : t + 1])
+        assert torch.equal(logits[t], lg1[0]) and torch.equal(weights[t], w1[0]) and torch.equal(experts[t], e1[0]), (
+            f"row {t} of a {T}-row call is not its one-row call"
+        )
+    ref.weight.data = ref.weight.data.float()
+    r_logits, r_weights, r_experts = ref(x)
+    assert torch.equal(experts, r_experts), "the reference router picks other experts"
+    torch.testing.assert_close(logits, r_logits, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(weights, r_weights, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("width", [1, 4, 8, 20, 64])
+def test_qwen4_activations_row_by_row_are_the_one_row_calls(width: int) -> None:
+    """families/qwen4/rows.py `each`: a verify pass's activations a token row at a time, every row the one-row call
+    bit for bit - torch's sigmoid and silu take a vector body or a scalar tail by how many elements travel
+    together, which a row among many and a row alone need not share"""
+    import torch.nn.functional as F
+
+    from btb.engine.families.qwen4.rows import each
+
+    T = 16
+    x = torch.randn(1, T, width, generator=torch.Generator().manual_seed(width)) * 3
+    for fn in (torch.sigmoid, F.silu):
+        rows = each(fn, x, T)
+        assert rows.shape == x.shape
+        for t in range(T):
+            assert torch.equal(rows[0, t], fn(x[:, t : t + 1].clone())[0, 0]), f"{fn.__name__} row {t} of {width}"
+
+
 # --- the wheel's package list (pyproject.toml) --------------------------------------------------------------
 
 
@@ -402,6 +502,95 @@ def test_an_mlx_plan_prices_the_gpu_and_says_so(monkeypatch: pytest.MonkeyPatch)
     assert "8 on the GPU" in s and "head on the GPU" in s and "the GPU reads 100 GB/s" in s and "host" not in s
     cpu = BatchScheduler.plan_placement(p, "cpu", 0.0, packed=False, fp32=False, vram_reserve_gb=0.0, budget=hb)
     assert cpu.gpu_bps is None and "8 host" in str(cpu) and "head host" in str(cpu)
+
+
+# Qwen3.8-Flash-Next's drafting head as its headers give it (H 2560, four streams, 512 experts): the experts are
+# 4.69 GiB of its 4.86, the dense rest 0.17
+_Q4_MTP = {
+    "mtp.fc_embedding.weight": [2560, 2560],
+    "mtp.fc_hidden.weight": [2560, 2560],
+    "mtp.hyper_connection_mixer.hc_norm.weight": [10240],
+    "mtp.hyper_connection_mixer.input_mix_weight_down.weight": [320, 10240],
+    "mtp.hyper_connection_mixer.input_mix_weight_up.weight": [10240, 320],
+    "mtp.layers.0.attn_hyper_connection.block_inject_weight.weight": [4, 10240],
+    "mtp.layers.0.attn_hyper_connection.hc_norm.weight": [10240],
+    "mtp.layers.0.attn_hyper_connection.input_mix_weight_down.weight": [320, 10240],
+    "mtp.layers.0.attn_hyper_connection.input_mix_weight_up.weight": [10240, 320],
+    "mtp.layers.0.mlp.experts.down_proj": [512, 2560, 640],
+    "mtp.layers.0.mlp.experts.gate_up_proj": [512, 1280, 2560],
+    "mtp.layers.0.mlp.gate.weight": [512, 2560],
+    "mtp.layers.0.mlp.shared_expert.down_proj.weight": [2560, 640],
+    "mtp.layers.0.mlp.shared_expert.gate_proj.weight": [640, 2560],
+    "mtp.layers.0.mlp.shared_expert.up_proj.weight": [640, 2560],
+    "mtp.layers.0.mlp.shared_expert_gate.weight": [1, 2560],
+    "mtp.layers.0.mlp_hyper_connection.block_inject_weight.weight": [4, 10240],
+    "mtp.layers.0.mlp_hyper_connection.hc_norm.weight": [10240],
+    "mtp.layers.0.mlp_hyper_connection.input_mix_weight_down.weight": [320, 10240],
+    "mtp.layers.0.mlp_hyper_connection.input_mix_weight_up.weight": [10240, 320],
+    "mtp.layers.0.self_attn.indexer.index_qk_proj.weight": [640, 2560],
+    "mtp.layers.0.self_attn.indexer.k_layernorm.weight": [128],
+    "mtp.layers.0.self_attn.indexer.q_layernorm.weight": [128],
+    "mtp.layers.0.self_attn.k_norm.weight": [256],
+    "mtp.layers.0.self_attn.k_proj.weight": [512, 2560],
+    "mtp.layers.0.self_attn.o_proj.weight": [2560, 6144],
+    "mtp.layers.0.self_attn.q_norm.weight": [256],
+    "mtp.layers.0.self_attn.q_proj.weight": [12288, 2560],
+    "mtp.layers.0.self_attn.v_proj.weight": [512, 2560],
+    "mtp.pre_fc_norm_embedding.weight": [2560],
+    "mtp.pre_fc_norm_hidden.weight": [10240],
+}
+
+
+def test_the_plan_prices_only_the_drafter_it_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """a drafting head whose layer is a mixture is priced at its dense tensors alone (the experts are the expert
+    store's, as every MoE layer's are): the 180B's 0.17 GB, not its 4.86; and it is priced only where the load runs
+    it - speculation on, with a family that drafts and verifies on the tier - else nowhere, and the plan says none"""
+    import btb.mlx
+    from btb.engine.families.base import _flags
+    from btb.engine.families.qwen4.family import Qwen4Family
+    from btb.engine.scheduler import BatchScheduler, HostBudget
+    from btb.engine.state import DRAFT_VOCAB
+    from btb.engine.tiers import _TiersMixin
+    from btb.kinds import FamilyKind
+
+    GB = 2**30
+    monkeypatch.setattr(btb.mlx, "read_bps", lambda: 100e9)
+    p = _probe()
+    p.cfg.hidden_size = 2560
+    p.fam = Qwen4Family(kind=FamilyKind.QWEN4, streams=4, **_flags(FamilyKind.QWEN4))
+    hdr = {k: {"shape": shp, "dtype": "BF16"} for k, shp in _Q4_MTP.items()}
+    p.weight_map = dict.fromkeys(hdr, "mtp.safetensors")
+    p._shard = lambda _f: (None, hdr, 0)
+    p._drafter_bytes = lambda: _TiersMixin._drafter_bytes(cast("_TiersMixin", p))
+    p.plan_budget = lambda *a, **kw: _TiersMixin.plan_budget(cast("_TiersMixin", p), *a, **kw)
+    whole = sum(2 * int(torch.Size(s).numel()) for s in _Q4_MTP.values())
+    dense = sum(2 * int(torch.Size(s).numel()) for k, s in _Q4_MTP.items() if ".mlp.experts." not in k)
+    assert (round(whole / GB, 2), round(dense / GB, 2)) == (4.86, 0.17)
+    assert p._drafter_bytes() == dense == 181_136_896
+    slice_b = min(DRAFT_VOCAB, int(p.cfg.vocab_size)) * 2560 * 2
+    hb = HostBudget(total=64 * GB, available=48 * GB, commit=64 * GB, footprint=0, os_floor=0, growth=0, floor=4 * GB)
+    plan = lambda dev, **kw: BatchScheduler.plan_placement(
+        p,
+        dev,
+        11.0 if dev == "cuda" else 0.0,
+        packed=False,
+        fp32=False,
+        vram_reserve_gb=0.5,
+        budget=hb,
+        settle_s=0.0,
+        **kw,
+    )
+    on = plan("cuda")
+    assert on.has_mtp and on.drafter_on_card and on.bytes.drafter == dense + slice_b
+    assert "drafter card" in str(on)
+    # the room it leaves is the room the card's layers get: a head priced at its whole 4.86 GB would take it
+    assert on.bytes.drafter < 0.2 * GB
+    for off in (plan("cuda", speculate=False), plan("mlx"), plan("cpu", speculate=False)):
+        assert not off.has_mtp and not off.drafter_on_card and off.bytes.drafter == 0
+        assert "drafter none" in str(off)
+    host = plan("cpu")
+    assert host.has_mtp and not host.drafter_on_card and host.bytes.drafter == dense + slice_b
+    assert "drafter host" in str(host)
 
 
 def test_the_report_line_puts_mlx_layers_the_head_and_the_cache_on_the_gpu() -> None:

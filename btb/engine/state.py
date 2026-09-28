@@ -71,6 +71,8 @@ if TYPE_CHECKING:
     from .mlx_forward import MlxState
     from .model import StreamedTextModel
     from .scheduler import BatchScheduler, Plan
+    from .scratch import Scratch
+    from .spec_cost import SpecCost
     from .tiers import ColdRing
 
 
@@ -198,7 +200,10 @@ class _State:
     an: dict[int, Any]
     ap: Parents | None
     aq: bool
-    ay: dict[int, tuple[torch.Tensor, torch.Tensor]]
+    # what a family's own layers hold back from a speculative pass until its path is known: each run with the
+    # accepted path at the commit (`ad`), and dropped at the next pass's start (`aa`)
+    spec_commits: list[Callable[[NodePath], None]]
+    scratch: Scratch
     _fmlp: bool
     _frope: bool
     _g: dict[str, Any]
@@ -228,6 +233,8 @@ class _State:
     ngram_p: float
     ngram_tree: bool
     proposer: Proposer
+    _spec_cost: SpecCost | None  # the passes' pricing (`_spec_pricer`), kept across calls
+    spec_price: bool  # the passes sized by their rows' expert reads (on by default; off: as with no store)
     sampling: Sampling  # the engine's default: greedy unless loaded with temperature/top_p/top_k/seed
     tree_budget: int
     tree_min_prob: float
@@ -376,6 +383,40 @@ class _State:
     def _card_segment_at(self, i: int, n_layers: int) -> tuple[int, int] | None:
         raise NotImplementedError
 
+    def _card_program(
+        self, cache: Any, B: int, T: int, past: int, am: Any, stop_after: int | None, positions: Any
+    ) -> Any:  # an engine built without the card mixin runs no card program
+        return None
+
+    def _card_graph_run(self, holder: Any, key: Any, body: Callable[[], None], eager: bool | None = None) -> None:
+        raise NotImplementedError
+
+    def _forward_card_program(
+        self,
+        prog: Any,
+        ids: Any,
+        h: torch.Tensor,
+        cache: Any,
+        past: int,
+        positions: Any,
+        last_only: bool,
+        head: bool,
+        on_layer: Callable[[int, torch.Tensor], Any] | None,
+        place: Any = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+    def _host_frame(
+        self,
+        h: torch.Tensor,
+        ids: list[int],
+        cache: Any,
+        past: int,
+        positions: Any,
+        on_layer: Callable[[int, torch.Tensor], Any] | None,
+    ) -> Any:
+        raise NotImplementedError
+
     def _delta_nodes(
         self,
         layer: Any,
@@ -408,6 +449,9 @@ class _State:
         raise NotImplementedError
 
     def _spec_full(self, v_max: int | None = None) -> int:
+        raise NotImplementedError
+
+    def _spec_pricer(self, v_max: int | None = None) -> SpecCost:
         raise NotImplementedError
 
     def _rope_fn(self) -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
@@ -517,6 +561,9 @@ class _State:
     def _apply_head(self, hf: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
+    def _sinks_bytes(self) -> int:
+        raise NotImplementedError
+
     def _prefill(
         self,
         ids: torch.Tensor,
@@ -611,19 +658,12 @@ class _State:
     ) -> tuple[Any, Any]:
         raise NotImplementedError
 
-    # -- families.py --
-    @staticmethod
-    def _dense_key(key: str) -> bool:
-        raise NotImplementedError
-
+    # -- families/__init__.py --
     def _make_host_layer(self, i: int) -> Any:
         raise NotImplementedError
 
     @staticmethod
     def _named_tensors(module: Any) -> Iterable[tuple[str, torch.Tensor, bool]]:
-        raise NotImplementedError
-
-    def _shape_layer(self, layer: Any, i: int) -> Any:
         raise NotImplementedError
 
     # -- model.py --

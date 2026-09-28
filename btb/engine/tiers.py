@@ -84,7 +84,7 @@ class _TiersMixin(_State):
         base = f"{self.prefix}layers.{i}."
         n = 0
         for k in self.weight_map:
-            if k.startswith(base) and self._dense_key(k):
+            if k.startswith(base) and self.fam.dense_key(k):
                 e = self._packed.get(k)
                 if e is not None and not e["raw"]:
                     n += e["lo"] + e["hi4"] + e["pad"] + 5 * e["esc"]
@@ -129,12 +129,10 @@ class _TiersMixin(_State):
             i: 0 if self.layer_types[i] == LayerKind.LINEAR else 2 * hk * hd * (4 if fp32 else 2) * kv_rows
             for i in range(L)
         }
-        # the drafter plus its head slice, both at bf16
+        # the drafter the load runs (`drafter`: speculation on, with the drafting head as its proposer), its dense
+        # tensors and its head slice at bf16; a mixture in its layer is the expert store's, never placed with it
         drafter_b = (
-            sum(self._get(k).numel() * 2 for k in self.weight_map if k.startswith("mtp."))
-            + min(DRAFT_VOCAB, int(cfg.vocab_size)) * int(cfg.hidden_size) * 2
-            if drafter
-            else 0
+            self._drafter_bytes() + min(DRAFT_VOCAB, int(cfg.vocab_size)) * int(cfg.hidden_size) * 2 if drafter else 0
         )
         bf16 = {i: self._layer_bytes(i) for i in range(L)}
         stored = {i: self._layer_bytes_stored(i, packed) for i in range(L)}
@@ -280,13 +278,7 @@ class _TiersMixin(_State):
         head_b = int(cfg.vocab_size) * int(cfg.hidden_size) * 2 if cfg is not None else 0
         # off the headers, never through `_get`: a report may not move the engine's counters
         mtp = [k for k in getattr(self, "weight_map", {}) if k.startswith("mtp.")]
-        drafter_b = 0
-        for k in mtp:
-            _mm, hdr, _ = self._shard(self.weight_map[k])
-            n = 1
-            for d in hdr[k]["shape"]:
-                n *= int(d)
-            drafter_b += n * 2
+        drafter_b = self._drafter_bytes() if mtp else 0
         tmpl_b = 0
         for lt, mods in (getattr(self, "templates", {}) or {}).items():
             tmpl_b += len(mods) * max((bf16.get(i, 0) for i in range(L) if types[i] == lt), default=0)
@@ -509,7 +501,7 @@ class _TiersMixin(_State):
         base = f"{self.prefix}layers.{i}."
         n = 0
         for k in self.weight_map:
-            if k.startswith(base) and self._dense_key(k):
+            if k.startswith(base) and self.fam.dense_key(k):
                 _mm, hdr, _ = self._shard(self.weight_map[k])
                 a, b = hdr[k]["data_offsets"]
                 n += int(b - a) - self._held_nbytes(hdr[k])
@@ -662,9 +654,23 @@ class _TiersMixin(_State):
         base = f"{self.prefix}layers.{i}."
         n = 0
         for k in self.weight_map:
-            if k.startswith(base) and self._dense_key(k):
+            if k.startswith(base) and self.fam.dense_key(k):
                 _mm, hdr, _ = self._shard(self.weight_map[k])
                 n += self._held_nbytes(hdr[k])
+        return n
+
+    def _drafter_bytes(self) -> int:
+        """the drafting head's bytes where it is placed, at bf16 off the headers: its `mtp.*` tensors the family
+        reads with a layer (`dense_key`) - a mixture's experts in its drafting layer stream through the expert
+        store as every MoE layer's do, and an FP8 scale is read with the tensor it scales"""
+        n = 0
+        for k in self.weight_map:
+            if k.startswith("mtp.") and self.fam.dense_key(k):
+                _mm, hdr, _ = self._shard(self.weight_map[k])
+                c = 2
+                for d in hdr[k]["shape"]:
+                    c *= int(d)
+                n += c
         return n
 
     def _regrow_bytes(self) -> int:
@@ -674,7 +680,7 @@ class _TiersMixin(_State):
         if what == "head":
             return self.cfg.vocab_size * self.cfg.hidden_size * 2
         if what == "drafter":
-            return sum(self._get(k).numel() * 2 for k in self.weight_map if k.startswith("mtp."))
+            return self._drafter_bytes()
         fp32 = self.compute_dtype is not None and self.compute_dtype != torch.bfloat16
         i = int(what.split()[1])
         # and its rows in every live cache, which follow it onto the card
@@ -687,7 +693,7 @@ class _TiersMixin(_State):
             n += self.head.weight.numel() * self.head.weight.element_size()
         aj = getattr(self, "aj", None)
         if aj is not None and aj.dev.type == Device.CUDA:
-            n += sum(self._get(k).numel() * 2 for k in self.weight_map if k.startswith("mtp."))
+            n += self._drafter_bytes()
         return n
 
     def _bind_cold(self) -> None:
@@ -1112,7 +1118,7 @@ class _TiersMixin(_State):
     def _new_layer(self, idx: int) -> Any:
         with self._meta:
             layer = self.fam.layer(self.cfg, idx).eval()
-        layer = self._shape_layer(layer, idx)
+        layer = self.fam.shape_layer(self, layer, idx)
         base = f"{self.prefix}layers.{idx}."
         for name, _b in layer.named_buffers():
             if base + name not in self.weight_map:
@@ -1231,7 +1237,7 @@ class _TiersMixin(_State):
             name = self._gguf_names[key]
             i = self._gguf_layer_index(key)
             # a layer bound to MLX always runs its linears through `_bind_mlx_resident` right after loading
-            # (`families.py`'s `i in self.mlx_layers and i not in self.cold`); `gguf_shortcut` lets a caller that
+            # (`_make_host_layer`'s `i in self.mlx_layers and i not in self.cold`); `gguf_shortcut` lets a caller that
             # knows its own tensor rebinds immediately (the resident head) claim the same skip
             resolved = gguf_shortcut or (i is not None and i in self.mlx_layers and i not in getattr(self, "cold", ()))
             if resolved and self._gguf_binds_packed(name):
@@ -1292,7 +1298,7 @@ class _TiersMixin(_State):
                     )
                 p.data.copy_(t)
             seen += 1
-        extra = [k for k in self.weight_map if k.startswith(base) and self._dense_key(k)]
+        extra = [k for k in self.weight_map if k.startswith(base) and self.fam.dense_key(k)]
         if len(extra) != seen:
             raise RuntimeError(f"[stream] layer {i}: template consumed {seen} tensors, the index holds {len(extra)}")
         self._retarget(tmpl, i)

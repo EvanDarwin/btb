@@ -5,6 +5,7 @@ pass over the host-side attention cache."""
 from __future__ import annotations
 
 import ctypes
+import functools
 import itertools
 import os
 import sys
@@ -19,11 +20,12 @@ from .. import mlx as mlxdev
 from ..kinds import LayerKind, NodePath, Parents, PassTag, Tokens
 from ..options import Device
 from ..sampling import GREEDY
-from .cache import CardRowsLayer, GrowLayer, attention_rows, forked, set_rows
+from .cache import CardRowsLayer, GrowLayer, attention_rows, forked, indexer_keys, set_rows
 from .families import act_name
-from .forward import layer_window, node_mask, pe_for
+from .forward import chain_of, layer_window, node_mask, pe_for
 from .fused import _fused_rope
 from .native import Native, kernels_path
+from .spec_cost import SpecCost
 from .state import _State
 
 if TYPE_CHECKING:
@@ -82,6 +84,7 @@ class _CudaMixin(_State):
         self.al = {}
         self.am = {}
         self.an = {}
+        self.spec_commits = []
         self.ap = parents
         self.aq = True
 
@@ -312,9 +315,8 @@ class _CudaMixin(_State):
             # the family first: another family's config need not carry the fields the shapes are read from
             # (a mixture of experts names its width moe_intermediate_size)
             ok = (
-                (self.fam.kernel_layout or self.fam.sandwich)
+                self.fam.card_graph
                 and act_name(self.cfg) in ("silu", "swish", "gelu_pytorch_tanh")  # the kernels' activations
-                and not self.fam.own
                 and self.mlx is None
                 and not getattr(self, "resident_fp32", False)
                 and self.compute_dtype in (None, torch.bfloat16)
@@ -370,10 +372,14 @@ class _CudaMixin(_State):
         return segs
 
     def _graphs_close(self) -> None:
-        """The captured graphs let go, and every buffer they replay into: the single-token decode's (`_g`) and the
-        card path's (`_cg`: its graphs, arena and tables). A graph keeps its pool's memory until it is reset, so
-        each is reset before the state goes; and the arena's persisting L2 window is cleared on the streams it was
-        set on - left, it names freed memory and keeps the card's L2 set aside for it."""
+        """The captured graphs let go, and every buffer they replay into: the single-token decode's (`_g`), the
+        card path's (`_cg`: its graphs, arena and tables) and a family's card program's (`_cp`). A graph keeps its
+        pool's memory until it is reset, so each is reset before the state goes; and the arena's persisting L2
+        window is cleared on the streams it was set on - left, it names freed memory and keeps the card's L2 set
+        aside for it."""
+        cp = vars(self).pop("_cp", None)
+        if cp is not None:
+            cp.close()
         g, cg = getattr(self, "_g", None), getattr(self, "_cg", None)
         if g is None and cg is None:
             return
@@ -1181,6 +1187,9 @@ class _CudaMixin(_State):
         timed answer pays a capture. Returns the number of graphs captured; 0 where the card graph does not
         apply."""
         ids_t = torch.as_tensor(list(ids), dtype=torch.long).view(1, -1)
+        if self.dev.type == Device.CUDA and self.fam.card_program() is not None:
+            t_max = int(t_max or (int(getattr(self, "tree_budget", 0) or 0) + 1))
+            return self._card_program_warm(ids_t, max(1, min(t_max, self.CARD_T_MAX)))
         if self.dev.type != Device.CUDA or self._card_kernels() is None or not self._card_ready():
             return 0
         t_max = int(t_max or (int(getattr(self, "tree_budget", 0) or 0) + 1))
@@ -1271,6 +1280,69 @@ class _CudaMixin(_State):
                 )
         return n
 
+    def _card_program_warm(self, ids_t: torch.Tensor, t_max: int) -> int:
+        """a family's card program's cost curve, measured up front with no cache and no expert read: for each graph
+        width M the passes of 1 .. `t_max` rows take, the program's verify graphs replayed (captured on the first
+        one, the fastest of the two after it counted) at the context of `ids_t`'s length, the host's part between
+        the layers only the wait for each router's publish (`_card_program_time`). The curve (`_card_cost`) is the
+        card's compute a pass of T rows costs - the rows' expert reads, which the speculative pricer counts on its
+        own, and the host layers are not in it. Every other graph (the step's, a tap's, a commit's) is captured on
+        its first use. Returns the graphs captured; 0 where the program does not run the model."""
+        cls = self.fam.card_program()
+        if cls is None or self._card_kernels() is None:
+            return 0
+        if getattr(self, "_cp", None) is None:
+            self._cp = cls(self)
+        prog = self._cp
+        if not prog.ok():
+            return 0
+        n0 = max(1, int(ids_t.shape[-1]))
+        before = len(prog.graphs)
+        by_m: dict[int, float] = {}
+        cost: dict[int, float] = {}
+        with torch.inference_mode(), self.device.hold() as place:
+            if place.version != prog.version:
+                return 0
+            for T in range(1, t_max + 1):
+                M = self._card_m(T)
+                if M not in by_m:
+                    times = [self._card_program_time(prog, M, n0) for _rep in range(3)]
+                    by_m[M] = min(times[1:])  # the first one captures
+                cost[T] = by_m[M]
+        self._card_cost = cost
+        c1 = cost[1]
+        self.log(
+            f"[card] {self.fam.name}'s card program: {len(prog.graphs) - before} graphs captured; its compute by "
+            "rows (no expert reads, no host layers): "
+            + ", ".join(f"{T}:{c / c1:.2f}x" for T, c in cost.items() if T in (1, 2, 4, 8, 16, t_max))
+            + f" (one row {c1 * 1e3:.2f} ms)"
+        )
+        return len(prog.graphs) - before
+
+    def _card_program_time(self, prog: Any, T: int, n0: int) -> float:
+        """seconds one T-row verify pass of the program's resident layers takes on the card at `n0` rows of
+        context: its segments' graphs, closes and tail replayed in turn with the host's part rehearsed
+        (`between(i, dry=True)`: the publish waited for, no expert read) and the host layers left out - the card's
+        compute a pass of T rows costs, over the program's own buffers and no cache (`rehearse`)"""
+        M = prog.rehearse(T, n0)
+        L = int(prog.L)
+        run = self._card_graph_run
+        mode, tap = "tree", False
+        try:
+            torch.cuda.synchronize(self.dev)
+            t0 = time.perf_counter()
+            for a, b in prog.segs:
+                for j in range(a, b):
+                    run(prog, (j, M, mode, tap), functools.partial(prog.layer_body, j, M, mode, tap))
+                    prog.between(j, dry=True)
+                if b < L:
+                    run(prog, ("close", b - 1, M, mode, tap), functools.partial(prog.close_body, b - 1, M, mode, tap))
+            run(prog, (L, M, mode, tap), functools.partial(prog.tail_body, M, mode, tap))
+            torch.cuda.synchronize(self.dev)
+            return time.perf_counter() - t0
+        finally:
+            prog.rehearsed()
+
     def _spec_full(self, v_max: int | None = None) -> int:
         """The widest speculative pass, the root included: the tree's rows, or a chain's `v_max` drafts (the
         call's, else the model's) and the root, whichever is wider."""
@@ -1309,6 +1381,26 @@ class _CudaMixin(_State):
             cap = max(cap, max(probe) if probe else 1)
         return max(1, cap)
 
+    def _spec_pricer(self, v_max: int | None = None) -> SpecCost:
+        """The engine's pricing of its speculative passes (`SpecCost`): made on first use and kept across calls,
+        so what a call learned of the drafter's acceptance and the rows' expert reads sizes the next call's first
+        passes; handed the widest pass, the base cost curve `_spec_budget` reads and a missed expert's seconds."""
+        pc: SpecCost | None = getattr(self, "_spec_cost", None)
+        if pc is None:
+            top_k = int(getattr(getattr(self, "cfg", None), "num_experts_per_tok", 0) or 0)
+            pc = SpecCost(SpecCost.gamma_of(int(getattr(self, "n_experts", 0) or 0), top_k))
+            self._spec_cost = pc
+        cost = (
+            getattr(self, "_card_cost", None) or getattr(self, "_mlx_cost", None) or getattr(self, "_host_cost", None)
+        )
+        store = getattr(self, "expert_store", None)
+        miss = getattr(store, "miss_s", None)
+        # `spec_price` off prices no read (the pricer inactive): the passes sized as with no store to read from - what a
+        # test of the verify pass pins, so what earlier calls taught the pricer cannot choose to draft nothing
+        miss_s = miss() if callable(miss) and bool(getattr(self, "spec_price", True)) else 0.0
+        pc.price(self._spec_full(v_max), cost, miss_s)
+        return pc
+
     def _forward_card_segment(
         self, a: int, b: int, h: torch.Tensor, pas: Any, tail: bool
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
@@ -1346,6 +1438,132 @@ class _CudaMixin(_State):
             # 17 rows of the vocabulary to fp32 a pass cost more than the argmax that followed
             return None, g["logits"][:T].view(1, T, -1)
         return g["h"][:T].view(1, T, -1), None
+
+    # -- a family's card program: its layers as graphs replayed in turn, the host between them ------------------
+
+    def _card_program(
+        self, cache: Any, B: int, T: int, past: int, am: Any, stop_after: int | None, positions: Any
+    ) -> Any:
+        """the family's card program for this pass, or None where it takes the torch path: a family with one
+        (`Family.card_program`), a one-row step or a speculative pass of up to CARD_T_MAX rows over one sequence's
+        cache, on the card with its kernels, and a model the program runs as placed (`ok`)"""
+        cls = self.fam.card_program()
+        if cls is None:
+            return None
+        spec = bool(getattr(self, "aq", False))
+        if not (
+            B == 1
+            and 1 <= T <= self.CARD_T_MAX
+            and (T == 1 or spec)
+            and (positions is None or spec)
+            and past > 0
+            and am is None
+            and stop_after is None
+            and cache is not None
+            and not forked(cache)
+            and self.dev.type == Device.CUDA
+            and getattr(self, "card_programs", True)
+            and os.environ.get("BTB_CARD_PROGRAM", "1") != "0"
+            and getattr(self, "_probe", None) is None
+        ):
+            return None
+        prog = getattr(self, "_cp", None)
+        if prog is None:
+            if self._card_kernels() is None:
+                return None
+            prog = self._cp = cls(self)
+        return prog if prog.ok() else None
+
+    def _card_graph_run(self, holder: Any, key: Any, body: Callable[[], None], eager: bool | None = None) -> None:
+        """`body`'s kernels as the graph `holder.graphs[key]`, captured on first use on the holder's stream and
+        replayed on the current one; `eager` (the engine's `card_program_eager` by default, a test's check) runs
+        the body itself. The capture only records: nothing a body writes (a step's states) runs twice."""
+        if eager is None:
+            eager = bool(getattr(self, "card_program_eager", False))
+        if eager:
+            body()
+            return
+        g = holder.graphs.get(key)
+        if g is None:
+            s = holder.stream
+            s.wait_stream(torch.cuda.current_stream())
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, pool=holder.pool, stream=s, capture_error_mode="thread_local"):
+                body()
+            torch.cuda.current_stream().wait_stream(s)
+            holder.graphs[key] = g
+        g.replay()
+
+    def _forward_card_program(
+        self,
+        prog: Any,
+        ids: Any,
+        h: torch.Tensor,
+        cache: Any,
+        past: int,
+        positions: Any,
+        last_only: bool,
+        head: bool,
+        on_layer: Callable[[int, torch.Tensor], Any] | None,
+        place: Any = None,
+    ) -> torch.Tensor:
+        """One pass through a family's card program over the model as placed (`place`, the pass's held
+        placement): each segment of resident layers its graphs in turn - after each layer i the host's part
+        (`between(i)`: a mixture's routed experts through the store) - closed into the streams where a host layer
+        follows; a host layer between segments through the host path (`run_layer`, the streams crossing the edge
+        through the program's pinned rows); the tail last. A one-row pass outside speculation is a step (it commits
+        as it goes); a speculative one verifies its chain or tree (`ap`) at its rows' positions, its commit handed
+        to `ad`, a host layer's with its own. Returns the logits [1, T, V] bf16 (the final rows without `head`), a
+        view of the program's buffer read before the next pass."""
+        self._tag(PassTag.CUDA_GRAPH)
+        T = int(h.shape[1])
+        spec = bool(getattr(self, "aq", False))
+        mode = "tree" if spec else "step"
+        parents = chain_of(getattr(self, "ap", None) if spec else None, T)
+        ids_l = [int(t) for t in torch.as_tensor(ids).reshape(-1).tolist()]
+        if positions is not None:
+            depth = [int(p) - past for p in torch.as_tensor(positions).reshape(-1).tolist()]
+        else:
+            depth = list(range(T))
+        tap = on_layer is not None
+        taps: dict[int, torch.Tensor] = {}
+        pas = None
+        if prog.host_layers:
+            # the host layers' frame, as the torch path's pass makes it: the rope, the mask (the tree through it),
+            # the ids; made before any layer writes the cache
+            pas = self._host_frame(h, ids_l, cache, past, positions, taps.__setitem__ if tap else None)
+            pas.place = place if place is not None else self.device.snapshot()
+            if self.cold:
+                self._cold_start(self.L)
+        M = prog.begin(cache, h, ids_l, past, parents, depth, mode, tap)
+        L = int(prog.L)
+        run = self._card_graph_run
+        hf: torch.Tensor | None = None  # the streams on the host, between host layers
+        i = 0
+        while i < L:
+            if i not in prog.at:
+                if hf is None:
+                    hf = prog.leave()
+                hf = self.device.run_layer(i, hf, pas)
+                i += 1
+                continue
+            b = prog.seg_end(i)
+            prog.enter(i, hf)
+            hf = None
+            for j in range(i, b):
+                run(prog, (j, M, mode, tap), functools.partial(prog.layer_body, j, M, mode, tap))
+                prog.between(j)
+            if b < L:
+                run(prog, ("close", b - 1, M, mode, tap), functools.partial(prog.close_body, b - 1, M, mode, tap))
+            i = b
+        prog.enter(L, hf)
+        run(prog, (L, M, mode, tap), functools.partial(prog.tail_body, M, mode, tap))
+        prog.end()
+        if on_layer is not None:
+            for i in range(L):
+                on_layer(i, taps[i] if i in taps else prog.tap_rows(i, T))
+        out = prog.logits(T) if head else prog.hidden(T)
+        return out[:, -1:] if last_only else out
 
     # -- rows: a fork's or a batch's rows stepped together, a token each at its own position -------------------
 
@@ -1553,8 +1771,21 @@ class _CudaMixin(_State):
         flags: list[Any] = []
         for i, layer in enumerate(cache.layers):
             # every attention layer's keys and values are cropped to the accepted path; a sliding layer
-            # keeps the whole cache (its window is a mask, not a shorter cache), so it is cropped too
-            if self.layer_types[i] in (LayerKind.FULL, LayerKind.SLIDING):
+            # keeps the whole cache (its window is a mask, not a shorter cache), so it is cropped too, and a
+            # sparse layer's indexer keys with its rows
+            if self.layer_types[i] in (LayerKind.FULL, LayerKind.SLIDING, LayerKind.QWEN_SPARSE):
+                keep_path = getattr(layer, "keep_path", None)
+                if keep_path is not None:
+                    # a layer keeping its rows where a card program's kernels read them moves the path into place
+                    # itself (`ArenaIndexedLayer`)
+                    keep_path(base_len, path)
+                    continue
+                ik = indexer_keys(layer)
+                if ik is not None and ik.numel():
+                    if path == list(range(len(path))):
+                        layer.indexer_keys = ik[:, : len(keep)]
+                    else:
+                        layer.indexer_keys = ik.index_select(1, torch.tensor(keep, device=ik.device))
                 if isinstance(layer, GrowLayer) and not layer.shared and layer._buf is not None and layer._attached():
                     # a layer living in its buffer (the card's arena): the accepted path's rows move into
                     # place inside the buffer and the views are re-cut - nothing leaves the buffer
@@ -1592,8 +1823,11 @@ class _CudaMixin(_State):
                         self.ah(layer, i, inp, path)
                     continue
                 if path and hasattr(st, "restore"):
-                    conv, rec = st.restore(path)
-                    lazy.append((layer, conv, rec))
+                    # MLX's checkpoints hand back lazy states, evaluated together below; a restore that wrote the
+                    # accepted path's states into the layer itself hands back nothing
+                    got = st.restore(path)
+                    if got is not None:
+                        lazy.append((layer, *got))
                     continue
                 conv, rec = st[path[-1]] if path else self.am[i]
                 c, r = self._lin(layer)
@@ -1610,20 +1844,19 @@ class _CudaMixin(_State):
             for layer, conv, _rec in lazy:
                 c, _r = self._lin(layer)
                 c.copy_(conv)
+        # a family's own states (Qwen4's n-gram embedding) put where the accepted path left them
+        for commit in getattr(self, "spec_commits", ()):
+            commit(path)
 
     def af(self, i: int, T: int, cl: Any) -> Any:
-        slots = getattr(self, "ay", None)
-        if slots is None:
-            slots = self.ay = {}
-        s = slots.get(i)
-        if s is None or s[0].shape[0] < T:
-            c, r = self._lin(cl)
-            s = (
-                torch.empty((T, *tuple(c.shape)), dtype=c.dtype, device=c.device),
-                torch.empty((T, *tuple(r.shape)), dtype=r.dtype, device=r.device),
-            )
-            slots[i] = s
-        return s
+        """layer i's per-node (conv, recurrent) states for a speculative pass of T nodes: its own, since the pass's
+        commit reads them after every later layer has run; granted and held as the engine's scratch"""
+        c, r = self._lin(cl)
+        who = f"the speculative pass's per-node DeltaNet states, layer {i}"
+        return (
+            self.scratch.take(f"delta nodes {i} conv", (T, *tuple(c.shape)), c.dtype, c.device, who),
+            self.scratch.take(f"delta nodes {i} state", (T, *tuple(r.shape)), r.dtype, r.device, who),
+        )
 
     def ag(
         self,
@@ -1730,6 +1963,7 @@ class _CudaMixin(_State):
                     la._k_norm_w,
                     la._k_eps,
                     out,
+                    la._k_gate,
                 )
             return
         mod = self.fam.mod
@@ -1815,6 +2049,8 @@ class _CudaMixin(_State):
             la._k_dt_bias = la.dt_bias.detach().float().contiguous()
             la._k_norm_w = la.norm.weight.detach().float().contiguous()
             la._k_eps = float(getattr(la.norm, "variance_epsilon", getattr(la.norm, "eps", 1e-6)))
+            # the gated norm's activation: Qwen3.5's silu, Qwen4's sigmoid (its norm carries the name)
+            la._k_gate = 1 if getattr(la.norm, "activation", "silu") == "sigmoid" else 0
         pre: Any = self._lin(cl)
         if step_fn is not None and not (pre[0].is_contiguous() and pre[1].is_contiguous()):
             pre = (pre[0].contiguous(), pre[1].contiguous())
@@ -1856,6 +2092,7 @@ class _CudaMixin(_State):
                     la._k_norm_w,
                     la._k_eps,
                     out,
+                    la._k_gate,
                 )
                 outs.append(out.view(1, 1, -1))
                 if spec_on:

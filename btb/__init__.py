@@ -122,12 +122,14 @@ def plan(
     vram_reserve_gb: float | None = None,
     context: int = 0,
     kv_host: bool | None = None,
+    speculate: bool = True,
 ) -> Plan:
     """The placement the engine would take for the model at `path` on `device`, priced against the memory free
     right now. Opens the model on the CPU to size its layers, measures the card, and hands the budgeting to the
     scheduler (`BatchScheduler.plan_placement`), which owns the arithmetic - the host budget it measures, the
     floor it keeps (`os_reserve_gb` names another) - and the wait for a machine that is still giving memory
-    back."""
+    back. `speculate`: the load decodes with the drafting head as its proposer, so the drafter is placed; off, it
+    is priced nowhere."""
     import torch
 
     from .engine import StreamedTextModel
@@ -161,6 +163,7 @@ def plan(
             vram_reserve_gb=vram_reserve_gb,
             context=context,
             kv_host=kv_host,
+            speculate=speculate,
         )
     finally:
         p.close()
@@ -249,6 +252,9 @@ def load(
         "fp32": fp32,
         "context": int(c.get("context", 0) or 0),
         "kv_host": (None if c.get("kv_host") is None else bool(int(c["kv_host"]))) if dev.kind.card else False,
+        # the drafting head is placed only where it will propose: speculation on (`v_max`) and a tree budget, which
+        # the plan defaults for a head (the proposer is the n-gram one at a budget of 0)
+        "speculate": int(c.get("v_max", 4) or 0) > 0 and (c.get("tree_budget") is None or int(c["tree_budget"]) > 0),
         **reserves,
     }
     mlx_layers = None
@@ -322,7 +328,9 @@ def load(
                 f"[plan] free VRAM {pl.free.vram_gb:.1f} GB, RAM {pl.free.ram_gb:.1f} GB -> "
                 f"resident {len(res)} layers ({b.vram_layers / 2**30:.2f} GB), host {len(cpu)} "
                 f"(cold {len(cold)}), head {'card' if pl.head_on_card else 'host'}, "
-                f"drafter {'card' if pl.drafter_on_card else ('host' if pl.has_mtp else 'none')}, "
+                f"drafter {'card' if pl.drafter_on_card else ('host' if pl.has_mtp else 'none')}"
+                + (f" ({b.drafter / 2**30:.2f} GB)" if pl.has_mtp else "")
+                + ", "
                 f"prefill via card {pl.prefill_card}; shadows {b.shadow / 2**30:.2f} GB, templates {b.templates / 2**30:.2f} GB, "
                 f"cache {(b.kv_card + b.kv_host) / 2**30:.2f} GB for {max(4096, int(plan_kw['context'] or 0))} positions"
                 f"{' in RAM' if pl.kv_host else ''}, "
@@ -344,11 +352,10 @@ def load(
     if pl is not None:
         # every planned placement: the cold reader's depth; the drafter's head over the frequent 32K ids (a draft
         # outside them is a missed proposal, never a wrong token); speculation on by default (the tree with a
-        # drafting head, the n-gram drafter without; --v-max 0 turns it off), off for a mixture of experts, where a
-        # verify pass routes rows to more experts and the node kernel on every decode row costs gpt-oss 30%
+        # drafting head, the n-gram drafter without; --v-max 0 turns it off), a mixture of experts' included
         c.setdefault("cold_slots", pl.cold_slots())
         c.setdefault("draft_vocab", DRAFT_VOCAB if pl.has_mtp else 0)
-        c.setdefault("v_max", 0 if pl.moe else 4)
+        c.setdefault("v_max", 4)
     sm = StreamedTextModel(
         path,
         device=dev,
@@ -421,7 +428,7 @@ def load(
         # The plan-driven placements default the budget above; an explicit placement (--cpu-layers with --resident-last)
         # reaches here without a plan, so the default comes from the weights and the device: a head, or a card
         # holding every layer, where a tree's rows verify at about the cost of one
-        has_drafter = any(k.startswith("mtp.") for k in sm.weight_map)
+        has_drafter = any(k.startswith("mtp.") for k in sm.weight_map) and sm.fam.drafter_cls() is not None
         # the card's widest pass at its 16-row cost is 15 drafted rows and the root; the host has no such edge
         default_budget = (
             (15 if sm.dev.type == Device.CUDA else 16)
@@ -438,11 +445,16 @@ def load(
         sm.draft_vocab = int(c.get("draft_vocab", DRAFT_VOCAB if has_drafter else 0) or 0)
         sm.draft_temp_ratio = float(c.get("draft_temp_ratio", 1.0) or 1.0)
         sm.ngram_p = float(c.get("ngram_p", 0.9))
-        sm.v_max = int(c.get("v_max", 0 if sm.fam.moe else 4))  # an explicit placement: the planned default's rule
-        if sm.fam.own:
+        sm.v_max = int(c.get("v_max", 4))  # an explicit placement: the planned default's rule
+        if not sm.fam.speculates(mlx=sm.mlx is not None):
+            # a tier the family's verify pass does not run on (Qwen4's node steps on MLX): the plain loop
             sm.tree_budget = 0
             sm.v_max = 0
         sm.proposer = Proposer.MTP_DYN if (sm.tree_budget > 0 and has_drafter) else Proposer.NGRAM
+        if pl is not None and dev.kind.card and not pl.drafter_on_card:
+            # the plan put no drafter on the card (it did not fit, or none was priced): one a caller asks for anyway
+            # is built on the host, where the plan's log said it would be
+            sm.drafter_dev = torch.device("cpu")
         # how every token is picked unless a call says otherwise: greedy, or the loaded temperature / top_p / top_k / seed
         from .sampling import Sampling
 
@@ -484,7 +496,7 @@ def load(
                 sm.eos_ids = tuple(int(x) for x in (e if isinstance(e, (list, tuple)) else [e]))
         # ready is part of the load, not of one command: the card's graphs and the pass-cost curve (the card graph),
         # the MLX pass-cost curve (the fused tree), over a throwaway prompt - what every entry point is timed at
-        if dev.kind is Device.MLX and int(c.get("mlx_mega", 1)) and sm.fam.kernel_layout and not sm.cold:
+        if dev.kind is Device.MLX and int(c.get("mlx_mega", 1)) and sm.fam.mega and not sm.cold:
             from .mlx.mega import MegaPass
 
             try:

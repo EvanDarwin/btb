@@ -212,11 +212,15 @@ class _GenerateMixin(_State):
             cl.recurrent_states = rec
 
     def mtp_drafter(self) -> MTPDrafter:
+        """the family's drafter over the checkpoint's drafting head, built on first use and kept"""
         if getattr(self, "aj", None) is None:
+            cls = self.fam.drafter_cls()
+            if cls is None:
+                raise NotImplementedError(
+                    f"btb has no MTP drafter for {self.fam.name}: speculate with the n-gram proposer"
+                )
             t0 = time.time()
-            self.aj = MTPDrafter(
-                self, weights=getattr(self, "drafter_weights", None), dev=getattr(self, "drafter_dev", None)
-            )
+            self.aj = cls(self, weights=getattr(self, "drafter_weights", None), dev=getattr(self, "drafter_dev", None))
             self.aj.build_s = time.time() - t0
         assert self.aj is not None  # set above whenever it was unset or None
         return self.aj
@@ -384,11 +388,24 @@ class _GenerateMixin(_State):
         # the drafter's steps and time of this call's passes (its prefill excluded)
         dr_steps0 = int(getattr(getattr(self, "aj", None), "steps", 0) or 0)
         dr_step_s0 = float(getattr(getattr(self, "aj", None), "step_s", 0.0) or 0.0)
+        # the passes priced by what their rows cost (`SpecCost`): the base curve's width narrowed where the rows'
+        # expert reads outweigh what their drafts return, a plain step where no width pays
+        pricer = self._spec_pricer(v_max)
+        pricer.begin()
+        store = getattr(self, "expert_store", None)
+        store_reads = getattr(store, "reads", None)
+        store_waited = getattr(store, "waited", None)
+        if not (callable(store_reads) and callable(store_waited)):
+            store_reads = store_waited = None
         while len(committed) < max_new and not self._stop_asked():
             tp = time.perf_counter()
             v = min(v_max, max_new - len(committed) - 1)
             budget = self._spec_budget(ema_tokens, census["forwards"], v_max, cache.get_seq_length())
-            v = max(0, min(v, budget - 1))
+            rows, probe = pricer.plan(budget, census["forwards"])
+            v = max(0, min(v, rows - 1))
+            # each draft's path probability (1 for a chain's) and the drafts made before the pricing kept a prefix
+            node_p: list[float] = []
+            drafted = 0
             base_len = cache.get_seq_length()
             last_base = base_len
             src = "mtp"
@@ -411,11 +428,16 @@ class _GenerateMixin(_State):
                         extra.append((ng, ng_p, "ngram"))
                 for sp_toks, sp_p, sp_tag in getattr(self, "extra_chains", ()):
                     extra.append((sp_toks, sp_p, sp_tag))
+                n_draft = int(getattr(self, "tree_budget", 0) or v)
+                if pricer.active() and rows < pricer.full:
+                    # the pricing sized the pass short of the whole tree: one node past its plan, so the prune
+                    # below has a choice
+                    n_draft = min(n_draft, rows)
                 drawn = dr.au(
                     [*pend_toks, cur],
                     pend_h,
                     base_len - 1 - len(pend_toks),
-                    int(getattr(self, "tree_budget", 0) or v),
+                    n_draft,
                     min_prob=float(getattr(self, "tree_min_prob", 0.0)),
                     extra_chains=extra,
                     with_tags=True,
@@ -425,6 +447,18 @@ class _GenerateMixin(_State):
                 # nodes' distributions: the verify pass accepts against them
                 tk, par, dep, tg = drawn[:4]
                 qrows, draws = (drawn[4], drawn[5]) if len(drawn) > 4 else (None, None)
+                drafted = len(tk)
+                node_p = [float(x) for x in getattr(dr, "last_p", ())]
+                if len(node_p) != drafted:
+                    node_p = [1.0] * drafted
+                # the tree priced node by node in the drafter's order: the prefix whose expected tokens a second
+                # are the most is verified (a prefix keeps each node's parent; a row's draws under a temperature
+                # stay whole, so a pruned child ends the walk as one the tree never held). Size only, never a token
+                gains = [pricer.gain(str(tg[j]), int(dep[j]), node_p[j]) for j in range(drafted)]
+                pricer.record_tree(gains, capped=drafted >= n_draft)
+                keep = pricer.prune(gains, probe)
+                if keep < drafted:
+                    tk, par, dep, tg, node_p = tk[:keep], par[:keep], dep[:keep], tg[:keep], node_p[:keep]
                 guesses = [int(t) for t in tk]
                 parents = [-1] + [0 if p < 0 else p + 1 for p in par]
                 depth = [0] + [int(d) for d in dep]
@@ -440,7 +474,14 @@ class _GenerateMixin(_State):
                     dr.crop(base_len)
                     g1, ca, cb = dr.at([*pend_toks, cur], pend_h, base_len - 1 - len(pend_toks), v)
                 guesses = [g1, *ca, *cb]
-                parents = [-1, 0, 1, *list(range(2, 1 + len(ca))), 1, *list(range(2 + len(ca), 1 + len(ca) + len(cb)))]
+                # each chain hangs off the first guess (row 1), its rows one after another; a pass with room for one
+                # guess (v 1, near the end of a decode) has no chains, so no row hangs off it
+                parents = [
+                    -1,
+                    0,
+                    *([1, *range(2, 1 + len(ca))] if ca else []),
+                    *([1, *range(2 + len(ca), 1 + len(ca) + len(cb))] if cb else []),
+                ]
                 depth = [0, 1, *list(range(2, 2 + len(ca))), *list(range(2, 2 + len(cb)))]
                 children = {}
                 for j in range(1, len(guesses) + 1):
@@ -455,13 +496,23 @@ class _GenerateMixin(_State):
                     # matvec kernel's tile: up to 15 drafted rows verify at the cost of one); on the card the
                     # tree's budget
                     cap = 14 if getattr(self, "mlx", None) is not None else int(getattr(self, "tree_budget", 0) or 14)
-                    cap = max(1, min(cap, budget - 1))
+                    cap = max(1, min(cap, rows - 1))
                     guesses, parents, depth, children, node_tags = _chains_tree(chains, cap)
                     src, tree_now = "ngram_tree", True
                 else:
                     guesses, where = prop.propose_with_source(v)
                     guesses = [int(g) for g in guesses]
                     src = where[0] if isinstance(where, tuple) else "self"
+            if not node_p and guesses:
+                drafted = len(guesses)
+                node_p = [1.0] * drafted
+                if pricer.active():
+                    # a chain or an unweighted tree: its nodes' gains are their source's acceptance by depth
+                    tags_ = node_tags[1:] if node_tags else [src] * drafted
+                    deps_ = depth[1:] if tree_now else list(range(1, drafted + 1))
+                    pricer.record_tree(
+                        [pricer.gain(str(t_), int(d_), 1.0) for t_, d_ in zip(tags_, deps_)], capped=drafted >= v
+                    )
             self.aa(parents if tree_now else None)
             pick: Any = smp
             if tree_now and qrows is not None:
@@ -469,6 +520,8 @@ class _GenerateMixin(_State):
             tf = time.perf_counter()
             phase["propose"] += tf - tp
             taps.clear()
+            reads0 = store_reads() if store_reads is not None else 0
+            wait0 = store_waited() if store_waited is not None else 0.0
             try:
                 out = self.forward(
                     [[cur, *guesses]],
@@ -558,6 +611,18 @@ class _GenerateMixin(_State):
                         census["accepted_by_pos"][j] += 1
             census["accepted"] += a
             self._tag_spec(len(guesses), a)
+            n_rows = len(guesses) + 1
+            tags_all = node_tags if node_tags else ["root", *([src] * len(guesses))]
+            deps_all = depth if tree_now else list(range(n_rows))
+            pricer.record_pass(
+                n_rows,
+                tc - tf,
+                (store_reads() - reads0) if store_reads is not None else 0,
+                (tf - tp) if drafted else None,
+                [(str(tags_all[j]), int(deps_all[j]), node_p[j - 1]) for j in range(1, n_rows)],
+                [str(tags_all[path[d]]) for d in range(1, len(path))],
+                (store_waited() - wait0) if store_waited is not None else 0.0,
+            )
             ema_tokens = 0.85 * ema_tokens + 0.15 * (1 + a)
             if guesses:
                 by_src["drafted"][src] = by_src["drafted"].get(src, 0) + len(guesses)
@@ -584,6 +649,7 @@ class _GenerateMixin(_State):
         census["tokens_per_pass"] = round(len(committed) / max(1, census["forwards"]), 3)
         census["by_source"] = by_src
         census["phase_s"] = {k: round(x, 3) for k, x in phase.items()}
+        census["priced"] = pricer.report()
         if use_mtp:
             census["mtp_build_s"] = round(dr.build_s, 2)
             census["mtp_steps"] = dr.steps - dr_steps0
@@ -604,6 +670,7 @@ class _GenerateMixin(_State):
             )
             + "; accepted by depth "
             + " ".join(f"{a_}/{d_}" for a_, d_ in zip(census["accepted_by_pos"], census["drafted_by_pos"]) if d_)
+            + pricer.line()
         )
         return committed, census
 

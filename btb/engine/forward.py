@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -84,6 +84,36 @@ def node_mask(base: int, p: int, parents: Parents, win: int) -> torch.Tensor | N
         if base + depth - 1 - k >= first:
             allow[base + q] = True
     return allow
+
+
+def chain_of(parents: Parents | None, T: int) -> list[int]:
+    """a pass's parents as a list: a tree's, or a chain's own when none were given"""
+    return [int(p) for p in parents] if parents is not None else list(range(-1, T - 1))
+
+
+def path_of(parents: Sequence[int], j: int) -> list[int]:
+    """node j and its ancestors among a pass's rows, j first"""
+    out = [j]
+    while parents[out[-1]] >= 0:
+        out.append(parents[out[-1]])
+    return out
+
+
+def tree_mask(causal: torch.Tensor, past: int, parents: Parents) -> torch.Tensor:
+    """`causal` [B, 1, T, past + T] (bool, or additive float) with its last T columns a tree's: row j sees the
+    prefix, itself and its ancestors - the mask a family running its own layers verifies a tree through"""
+    par = [int(p) for p in parents]
+    T = len(par)
+    anc = torch.zeros(T, T, dtype=torch.bool)
+    for j in range(T):
+        anc[j, path_of(par, j)] = True
+    anc = anc.to(causal.device)
+    out = causal.clone()
+    if out.dtype == torch.bool:
+        out[..., past : past + T] = anc
+    else:
+        out[..., past : past + T] = torch.where(anc, out.new_zeros(()), torch.finfo(out.dtype).min)
+    return out
 
 
 def _is_gpu_recovery(e: BaseException) -> bool:
@@ -212,6 +242,7 @@ class _ForwardMixin(_State):
         returns [B, T] int32 token ids picked in the graph instead of logits; the other paths ignore it and
         return logits, so a caller checks the dtype."""
         pick = as_pick(pick)
+        ids_arg = ids  # as given: a card program reads the pass's ids on the host
         ids = torch.as_tensor(ids, dtype=torch.long, device=self.dev)
         if ids.dim() == 1:
             ids = ids.view(1, -1)
@@ -251,6 +282,19 @@ class _ForwardMixin(_State):
             h = h.to(self.compute_dtype)
         if self.fam.streams > 1:
             h = h.repeat(1, 1, self.fam.streams)
+        # a family's card program (Qwen4's) takes a one-row step or a verify pass whole on the card
+        prog = self._card_program(cache, B, T, past, attention_mask, stop_after, positions)
+        if prog is not None:
+            self._attn_ctx = cache
+            with self.device.hold() as place:
+                # the program was checked against the placement as it stood; one moved since takes the torch path
+                if place.version == prog.version:
+                    return self._forward_card_program(
+                        prog, ids_arg, h, cache, past, positions, last_only, head, on_layer, place
+                    )
+        cp = getattr(self, "_cp", None)
+        if cp is not None and cache is not None:
+            cp.touched(cache)  # a pass off the program: what it mirrors of this cache is read again
         am = None
         if attention_mask is not None:
             am = torch.as_tensor(attention_mask, dtype=torch.long, device=self.dev).view(B, -1)
@@ -296,18 +340,7 @@ class _ForwardMixin(_State):
             cd = self.compute_dtype if self.compute_dtype is not None else h.dtype
             hf = h.to(cd)
             return hf if not head else self._apply_head(hf)
-        if own:
-            if positions is not None:
-                prev = torch.arange(past, device=self.dev).view(1, 1, -1).expand(3, B, -1)
-                rope_all = torch.cat([prev, rope_pos], dim=-1)
-            else:
-                rope_all = self._positions(B, past + T, 0, am)[1]
-            pe = self.rotary(h, rope_all)
-        elif self.fam.dual_rope:
-            # one rope per layer type (Gemma 3's local/global split); each layer reads its own from the pass
-            pe = {lt: self.rotary(h, text_pos, lt) for lt in set(self.layer_types)}
-        else:
-            pe = self.rotary(h, rope_pos if self.fam.mrope else text_pos)
+        pe = self._pass_rope(h, past, am, positions, text_pos, rope_pos)
         n_layers = self.L if stop_after is None else min(self.L, int(stop_after))
         if self._mlx_ok(cache, B, T, am, positions, n_layers):
             return self._forward_mlx(h, pe, cache, on_layer, last_only, head, n_layers, pick=pick)
@@ -322,14 +355,12 @@ class _ForwardMixin(_State):
             and all(i in self.resident for i, lt in enumerate(self.layer_types) if lt == LayerKind.FULL)
         )
         causal = None if tier_owns_attention else self._causal(h, am, cache, text_pos, own)
+        tree = getattr(self, "ap", None) if getattr(self, "aq", False) else None
+        if own and causal is not None and tree is not None:
+            # a family running its own layers verifies a tree through their mask: each row sees its ancestors
+            causal = tree_mask(causal, past, tree)
         linear_mask = None if (am is None or bool(torch.all(am == 1))) else am[:, -T:]
-        ple_ids = None
-        if own:
-            eos = self.cfg.eos_token_id
-            eos = eos[0] if isinstance(eos, (list, tuple)) else eos
-            ple_ids = (
-                ids if linear_mask is None else torch.where(linear_mask.bool(), ids, torch.full_like(ids, int(eos)))
-            )
+        ple_ids = self.fam.ple_ids(self.cfg, ids, linear_mask)
         n_layers = self.L if stop_after is None else min(self.L, int(stop_after))
         if self._fast_ok(cache, B, T, past, am, on_layer, stop_after):
             return self._forward_fast(h, pe, cache, last_only, head)
@@ -407,6 +438,72 @@ class _ForwardMixin(_State):
             return hf
         return self._apply_head(hf)
 
+    def _pass_rope(
+        self,
+        h: torch.Tensor,
+        past: int,
+        am: torch.Tensor | None,
+        positions: Any,
+        text_pos: torch.Tensor,
+        rope_pos: torch.Tensor,
+    ) -> PassRope:
+        """a pass's rope: over the prefix and the pass for a family running its own layers, one per layer type for
+        a dual-rope family, else over the pass's positions"""
+        B, T = int(h.shape[0]), int(h.shape[1])
+        if self.fam.own:
+            if positions is not None:
+                prev = torch.arange(past, device=self.dev).view(1, 1, -1).expand(3, B, -1)
+                rope_all = torch.cat([prev, rope_pos], dim=-1)
+            else:
+                rope_all = self._positions(B, past + T, 0, am)[1]
+            return self.rotary(h, rope_all)
+        if self.fam.dual_rope:
+            # one rope per layer type (Gemma 3's local/global split); each layer reads its own from the pass
+            return {lt: self.rotary(h, text_pos, lt) for lt in set(self.layer_types)}
+        return self.rotary(h, rope_pos if self.fam.mrope else text_pos)
+
+    def _host_frame(
+        self,
+        h: torch.Tensor,
+        ids: list[int],
+        cache: Any,
+        past: int,
+        positions: Any,
+        on_layer: Callable[[int, torch.Tensor], Any] | None,
+    ) -> _Pass:
+        """the frame a card program's host layers run in (cuda.py `_forward_card_program`): one sequence's
+        positions, rope, mask - a verify pass's tree through it - and ids, as this pass makes them for its host
+        layers, so a host layer between the program's segments runs as it runs on the torch path"""
+        B, T = int(h.shape[0]), int(h.shape[1])
+        own = bool(self.fam.own)
+        if positions is not None:
+            pos = torch.as_tensor(positions, dtype=torch.long, device=self.dev).view(1, B, T).expand(4, B, -1)
+            text_pos, rope_pos = pos[0], pos[1:]
+        else:
+            text_pos, rope_pos = self._positions(B, T, past)
+        pe = self._pass_rope(h, past, None, positions, text_pos, rope_pos)
+        causal = self._causal(h, None, cache, text_pos, own)
+        tree = getattr(self, "ap", None) if getattr(self, "aq", False) else None
+        if own and causal is not None and tree is not None:
+            causal = tree_mask(causal, past, tree)
+        ids_t = torch.as_tensor(ids, dtype=torch.long, device=self.dev).view(B, T)
+        return _Pass(
+            cache=cache,
+            pe=pe,
+            text_pos=text_pos,
+            causal=causal,
+            linear_mask=None,
+            ple_ids=self.fam.ple_ids(self.cfg, ids_t, None),
+            T=T,
+            past=past,
+            am=None,
+            batched=False,
+            own=own,
+            card_pass=False,
+            n_layers=self.L,
+            on_layer=on_layer,
+        )
+
     def _prefetch_next(self, j: int, pas: Any) -> None:
         """start the read of the next layer that is neither resident nor a host layer (the templates' path)"""
         while j < pas.n_layers and (j in self.resident or (j in self.host and not pas.card_pass)):
@@ -467,7 +564,7 @@ class _ForwardMixin(_State):
         if (spec or step1 or cont) and not pas.own and self.fam.fast and h.shape[0] == 1:
             h = self.ai(tmpl, i, h, pe_for(hc["pe"], lt), hc["pos"], cache)
         else:
-            kw = self._layer_kw(
+            kw = self.fam.layer_kw(
                 lt,
                 pas.host_causal() if (pas.own or lt != LayerKind.LINEAR) else None,
                 hc["lin"],
@@ -528,7 +625,7 @@ class _ForwardMixin(_State):
                 position_embeddings=pe_for(pas.pe, lt),
                 past_key_values=cache,
                 use_cache=cache is not None,
-                **self._layer_kw(lt, pas.causal, pas.linear_mask, pas.text_pos, pas.ple_ids),
+                **self.fam.layer_kw(lt, pas.causal, pas.linear_mask, pas.text_pos, pas.ple_ids),
             )
         if self.dev.type == Device.CUDA:
             e1 = torch.cuda.Event(enable_timing=True)
@@ -550,7 +647,7 @@ class _ForwardMixin(_State):
         layer_idx: int | None = None,
     ) -> Any:
         """The attention mask for this pass: one tensor, or - for a family whose layers alternate a window
-        with the whole prefix, as gpt-oss's do - one per layer type, which `_layer_kw` picks from."""
+        with the whole prefix, as gpt-oss's do - one per layer type, which the family's `layer_kw` picks from."""
         from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
         kw = {
@@ -569,13 +666,6 @@ class _ForwardMixin(_State):
             LayerKind.FULL: create_causal_mask(**kw),
             LayerKind.SLIDING: create_sliding_window_causal_mask(**kw),
         }
-
-    def _layer_kw(self, lt: str, causal: Any, linear_mask: Any, pos: torch.Tensor, ple_ids: Any) -> dict[str, Any]:
-        if self.fam.own:
-            return {"attention_mask": causal, "conv_mask": linear_mask, "ple_input_ids": ple_ids}
-        if isinstance(causal, dict):
-            causal = causal.get(lt)
-        return {"attention_mask": linear_mask if lt == LayerKind.LINEAR else causal, "position_ids": pos}
 
     def _norm_input(self, h: torch.Tensor) -> torch.Tensor:
         """the last layer's rows crossing into the final norm, where the norm is and in its own dtype: a last layer
@@ -747,14 +837,6 @@ class _ForwardMixin(_State):
             dt = self._layer_dtype(tmpl) if tmpl is not None else None
             if isinstance(cl, GrowLayer) and dt is not None:
                 cl.presize(int(rows), int(B), Hk, d, dt, self.dev)
-
-    def _scores_bytes(self, C: int, keys: int, B: int) -> int:
-        """one of a sweep's two score buffers (`ScoresWorkspace`): a chunk of `C` rows' scores against `keys` keys and
-        the sink column, every query head, in the dtype the sinks' join promotes them to"""
-        c = self.cfg
-        cd = self.compute_dtype
-        nb = 4 if (cd is not None and cd != torch.bfloat16) else 2
-        return int(B) * int(c.num_attention_heads) * int(C) * (int(keys) + 1) * max(nb, self._sinks_bytes())
 
     def _sinks_bytes(self) -> int:
         """the bytes of a sink logit as the resident layers hold them (float32 where none is resident to ask)"""
@@ -1038,7 +1120,7 @@ class _ForwardMixin(_State):
                 "text_pos": text_pos,
                 "rope_pos": rope_pos,
                 "like": like.new_empty((B, 0, like.shape[-1])),
-                "ple": ids[:, a:b] if own else None,
+                "ple": self.fam.ple_ids(self.cfg, ids[:, a:b], None),
             }
 
         def rope(f: dict[str, Any], n: int) -> Any:
@@ -1189,13 +1271,9 @@ class _ForwardMixin(_State):
                 frames.append(frame(a, b, h))
                 hs.append(keep(c, h))
                 del h
-            if on_cuda and self.fam.eager and self.dev.type == Device.CUDA:
-                # the sink attention's scores - the buffers that grow with every chunk's position - taken once, sized
-                # for the last chunk: every chunk's are views of them, never the allocator's cache (`ScoresWorkspace`)
-                from .families import ScoresWorkspace, open_scores
-
-                open_scores(self.dev, ScoresWorkspace(self._scores_bytes(C, past0 + T, B), self.dev))
-                scores_open = True
+            if on_cuda and self.dev.type == Device.CUDA:
+                # what the family's attention holds across the chunks, sized for the last (gpt-oss's scores)
+                scores_open = self.fam.open_sweep(self, C, past0 + T, B)
             # the card's allocator as the sweep goes: what it holds, what it keeps reserved, and how often it ran out and
             # emptied its cache to retry (each retry a device-wide sync and fresh allocations after it)
             retries0 = int(torch.cuda.memory_stats(self.dev).get("num_alloc_retries", 0)) if on_cuda else 0
@@ -1315,9 +1393,7 @@ class _ForwardMixin(_State):
             # sweep's own cleanup raising: left standing, every later reading of the card's free memory would count
             # them, and the next pass would find a depot with nothing behind it
             if scores_open:
-                from .families import close_scores
-
-                close_scores(self.dev)
+                self.fam.close_sweep(self)
             self.device.release(PREFILL)
             if own_epoch:
                 self.device.release(EPOCH)

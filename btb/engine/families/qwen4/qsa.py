@@ -9,8 +9,10 @@ Under a plain causal mask (no padding, no window) the pooled key of a block is t
 it, so it is pooled once; a query's visible tokens are its prefix; a query whose complete blocks all fit the
 budget keeps its whole prefix (the reference's top-k over all of them selects all of them), so only the rows past
 the budget are scored. The default scores each of those rows as the reference does - its index heads against its
-own complete blocks, one matmul of the reference's shape - so the mask is the reference's bit for bit; any other
-mask takes the reference's own forward. `sparse` (the `--sparse` option) scores every such row in one matmul
+own complete blocks, one matmul of the reference's shape - so the mask is the reference's bit for bit. A speculative
+pass's tree (every row the whole prefix, and of the pass's rows itself and its ancestors) pools the prefix's complete
+blocks once and each row's blocks past them - the prefix's tail and its ancestors - for that row alone
+(`_select_tree`), the reference's selection row for row; any other mask takes the reference's own forward. `sparse` (the `--sparse` option) scores every such row in one matmul
 over all the blocks, the invalid ones masked: far fewer launches, and a sum in another order, so a near-tie at the
 budget's edge may choose the other block. It is held against the reference indexer's choices, not the receipts.
 """
@@ -53,7 +55,9 @@ def select(
     """the indexer's selected-token mask, [B, 1, S, kv]: bool, or additive float where the mask it is given is"""
     visible = attention_mask if attention_mask.dtype == torch.bool else attention_mask == 0
     B, S, _ = hidden_states.shape
-    if not _plain_causal(visible, S):
+    plain = _plain_causal(visible, S)
+    tree = None if plain else _prefix_tree(visible, S)
+    if not plain and tree is None:
         return type(self).forward(self, hidden_states, position_embeddings, attention_mask, past_key_values)
     from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_emb
 
@@ -73,6 +77,11 @@ def select(
     r, k_top = int(self.compress_ratio), int(self.block_topk)
     kv = int(visible.shape[-1])
     off = kv - S
+    if tree is not None:
+        mask = _select_tree(self, q, raw_keys, full_cos, full_sin, visible, tree, off, r, k_top, d)
+        if attention_mask.is_floating_point():
+            return torch.where(mask, attention_mask.new_zeros(()), torch.finfo(attention_mask.dtype).min)
+        return mask
     NB = (off + S) // r  # the complete blocks the last row sees
     # every row whose complete blocks fit the budget keeps its whole prefix; the first row past it is p0
     p0 = max(0, (k_top + 1) * r - 1 - off)
@@ -112,6 +121,87 @@ def select(
     if attention_mask.is_floating_point():
         min_dtype = torch.finfo(attention_mask.dtype).min
         return torch.where(mask, attention_mask.new_zeros(()), min_dtype)
+    return mask
+
+
+def _prefix_tree(visible: torch.Tensor, S: int) -> list[list[torch.Tensor]] | None:
+    """A speculative pass's mask - every row sees the whole prefix, and of the pass's own rows itself and some of
+    those before it (a tree's ancestors, parents ahead of their children) - as each row's pass rows it sees, by
+    batch row; None for any other mask. [B, 1, S, kv]"""
+    if visible.dim() != 4 or visible.shape[-2] != S:
+        return None
+    kv = int(visible.shape[-1])
+    off = kv - S
+    if off < 0 or not bool(visible[..., :off].all()):
+        return None
+    block = visible[..., off:]
+    upper = torch.ones(S, S, dtype=torch.bool, device=visible.device).triu(1)
+    diag = torch.eye(S, dtype=torch.bool, device=visible.device)
+    if bool((block & upper).any()) or not bool((block | ~diag).all()):
+        return None
+    return [[block[b, 0, p].nonzero().flatten() for p in range(S)] for b in range(int(visible.shape[0]))]
+
+
+def _pooled(self: Any, raw: torch.Tensor, blocks: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """blocks' keys [n, d] by the reference's arithmetic: the mean of each block's `r` raw keys, normed, roped at the
+    block's first position. `raw` [kv, d]; `blocks` [n, r] cache rows; `cos`/`sin` [kv, rd] a row's position each"""
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_emb
+
+    n, r = int(blocks.shape[0]), int(blocks.shape[1])
+    groups = raw.index_select(0, blocks.flatten()).view(n, r, -1)
+    pooled = self.k_layernorm(groups.float().mean(dim=1).to(raw.dtype))
+    starts = blocks[:, 0]
+    return apply_rotary_pos_emb(
+        pooled.unsqueeze(1), cos=cos.index_select(0, starts), sin=sin.index_select(0, starts)
+    ).squeeze(1)
+
+
+def _select_tree(
+    self: Any,
+    q: torch.Tensor,
+    raw_keys: torch.Tensor,
+    full_cos: torch.Tensor,
+    full_sin: torch.Tensor,
+    visible: torch.Tensor,
+    tree: list[list[torch.Tensor]],
+    off: int,
+    r: int,
+    k_top: int,
+    d: int,
+) -> torch.Tensor:
+    """The indexer's selection for a speculative pass's rows ([B, 1, S, kv] bool). Row p sees the prefix and its own
+    pass rows, so its complete blocks are the prefix's first `off // r` - pooled once, the same for every row -
+    then the blocks of what follows them in its sequence: the prefix's partial tail and its ancestors, pooled for
+    the row alone. A row whose blocks fit the budget keeps everything it sees (the reference's top-k over all of
+    them selects all of them); the others score their blocks as the reference does, one matmul of its shape."""
+    dev = q.device
+    mask = visible.clone()
+    kv = int(visible.shape[-1])
+    n_pre = off // r
+    pre_blocks = torch.arange(n_pre * r, device=dev).view(n_pre, r)
+    lead = torch.arange(n_pre * r, off, device=dev)  # the prefix's rows past its last complete block
+    for b, rows in enumerate(tree):
+        shared: torch.Tensor | None = None
+        for p, own in enumerate(rows):
+            n_vis = off + int(own.numel())
+            if n_vis // r <= k_top:
+                continue
+            if shared is None:
+                shared = _pooled(self, raw_keys[b], pre_blocks, full_cos[b], full_sin[b])
+            rest = torch.cat([lead, off + own.to(dev)])
+            n_own = int(rest.numel()) // r
+            own_blocks = rest[: n_own * r].view(n_own, r)
+            keys = shared
+            if n_own:
+                keys = torch.cat([shared, _pooled(self, raw_keys[b], own_blocks, full_cos[b], full_sin[b])])
+            scores = torch.matmul(q[b, p].float(), keys.float().transpose(-1, -2)).transpose(-1, -2)
+            scores = torch.relu(scores).sum(dim=-1) / math.sqrt(d)
+            sel = scores.topk(k_top, dim=0).indices
+            tokens = torch.cat([pre_blocks, own_blocks]).index_select(0, sel).flatten()
+            row = torch.zeros(kv, dtype=torch.bool, device=dev)
+            row[tokens] = True
+            row[rest[n_own * r :]] = True  # the partial block kept whole
+            mask[b, 0, p] = row
     return mask
 
 

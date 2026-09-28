@@ -15,6 +15,7 @@ from .. import mlx as mlxdev
 if TYPE_CHECKING:
     import mlx.core as mx_
     from transformers.cache_utils import CacheLayerMixin, DynamicCache, LinearAttentionCacheLayerMixin
+    from transformers.cache_utils import DynamicIndexedLayer as _DynamicIndexedLayer
     from transformers.cache_utils import DynamicLayer as _DynamicLayer
 
     # a sequence's cache: transformers' DynamicCache over the engine's layers (GrowLayer, a fork's, a hybrid's)
@@ -25,6 +26,7 @@ else:
     # transformers is imported by name here and not at the top: the engine package is imported for its
     # discovery and planning too, where transformers' import time is not wanted
     _DynamicLayer = __import__("transformers").cache_utils.DynamicLayer
+    _DynamicIndexedLayer = __import__("transformers").cache_utils.DynamicIndexedLayer
 
 
 def linear_layer(cl: CacheLayer) -> LinearAttentionCacheLayerMixin:
@@ -1390,3 +1392,231 @@ class CardRowsLayer(_DynamicLayer):
             self._own = None
         self._buf = (kb, vb)
         self.device = kb.device
+
+
+class ArenaIndexedLayer(_DynamicIndexedLayer):
+    """A sparse-attention layer's cache - its keys and values, and the indexer's raw keys - held in an arena a card
+    program owns, not grown by concatenation: rows are written in place at the front (`update`, `update_indexer`)
+    and the views handed out are the front, so the program's captured kernels and the torch modules read and write
+    the same rows. The program binds a sequence's cache to its arena (`attach`, rows held apart copied in) and lets
+    it go (`detach`: the rows become a copy of their own, grown after as transformers' layer grows them);
+    `grow(need)` asks the program for room past the arena's capacity (it reallocates, copies and attaches every
+    layer again, this one included). `keep_path` keeps a speculative pass's accepted path. Rows assigned from
+    elsewhere are copied to the front; rows on another device (the layer given up to the host) detach the layer.
+    `low` is the lowest indexer row written since the program last read it: its pooled keys of the blocks from
+    there on are stale."""
+
+    def __init__(self, grow: Callable[[int], None], grant: Callable[..., None] | None = None) -> None:
+        # set before transformers' init, which assigns `keys`, `values` and `indexer_keys` through the setters below
+        self._arena: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None  # K, V [Hk, cap, d]; raw [cap, di]
+        self._own: list[torch.Tensor | None] = [None, None, None]  # detached: keys, values, indexer keys
+        self._n = [0, 0, 0]  # the rows at the arena's front: keys, values, raw keys (set one at a time)
+        self.low = 0
+        super().__init__()
+        self._grow = grow
+        self.grant = grant
+
+    # -- the rows ----------------------------------------------------------------------------------------------
+
+    def _view(self, which: int) -> torch.Tensor | None:
+        a = self._arena
+        if a is None:
+            return self._own[which]
+        if which == 2:
+            return a[2][None, : self._n[2]]
+        return a[which][None, :, : self._n[which]]
+
+    @property
+    def keys(self) -> torch.Tensor | None:
+        return self._view(0)
+
+    @keys.setter
+    def keys(self, t: torch.Tensor | None) -> None:
+        self._put(0, t)
+
+    @property
+    def values(self) -> torch.Tensor | None:
+        return self._view(1)
+
+    @values.setter
+    def values(self, t: torch.Tensor | None) -> None:
+        self._put(1, t)
+
+    @property
+    def indexer_keys(self) -> torch.Tensor | None:
+        return self._view(2)
+
+    @indexer_keys.setter
+    def indexer_keys(self, t: torch.Tensor | None) -> None:
+        self._put(2, t)
+
+    def _front(self, which: int, t: torch.Tensor) -> bool:
+        """whether `t` is the arena's own front (a view the layer handed out, cut shorter or not)"""
+        a = self._arena
+        assert a is not None
+        b = a[which]
+        return (
+            t.device == b.device
+            and t.dtype == b.dtype
+            and t.data_ptr() == b.data_ptr()
+            and t.dim() == b.dim() + 1
+            and int(t.shape[0]) == 1
+            and tuple(t.shape[1:-2]) == tuple(b.shape[:-2])
+            and int(t.shape[-1]) == int(b.shape[-1])
+            and tuple(t.stride()[1:]) == tuple(b.stride())
+        )
+
+    def _put(self, which: int, t: torch.Tensor | None) -> None:
+        a = self._arena
+        if a is None:
+            self._own[which] = t
+            return
+        if t is None:
+            return  # transformers' init: the arena's front stands
+        n = int(t.shape[-2])
+        if self._front(which, t):
+            self._set_len(which, n)
+            return
+        if t.device != a[which].device or int(t.shape[0]) != 1:
+            # rows moved to another device (the layer given up to the host) or a batch's: the layer leaves the arena
+            self.detach()
+            self._own[which] = t
+            return
+        if n > int(a[which].shape[-2]):
+            self._grow(n)
+            a = self._arena
+            assert a is not None
+        a[which][..., :n, :].copy_(t[0])
+        self._set_len(which, n)
+        if which == 2:
+            self.low = 0
+
+    def _set_len(self, which: int, n: int) -> None:
+        self._n[which] = n
+        if which == 2:
+            self.low = min(self.low, n)
+
+    def get_seq_length(self) -> int:
+        if self._arena is None:
+            return int(super().get_seq_length())
+        return self._n[0]
+
+    def update(
+        self, key_states: torch.Tensor, value_states: torch.Tensor, *args: object, **kwargs: object
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._arena is None:
+            return super().update(key_states, value_states, *args, **kwargs)
+        T = int(key_states.shape[-2])
+        n = self._n[0]
+        need = n + T
+        if need > int(self._arena[0].shape[-2]):
+            self._grow(need)
+        a = self._arena
+        a[0][:, n:need].copy_(key_states[0])
+        a[1][:, n:need].copy_(value_states[0])
+        self._n[0] = self._n[1] = need
+        k, v = self.keys, self.values
+        assert k is not None and v is not None
+        return k, v
+
+    def update_indexer(self, indexer_key_states: torch.Tensor) -> torch.Tensor:
+        if self._arena is None:
+            return super().update_indexer(indexer_key_states)
+        T = int(indexer_key_states.shape[1])
+        n = self._n[2]
+        need = n + T
+        if need > int(self._arena[2].shape[0]):
+            self._grow(need)
+        a = self._arena
+        a[2][n:need].copy_(indexer_key_states[0])
+        self.low = min(self.low, n)
+        self._n[2] = need
+        ik = self.indexer_keys
+        assert ik is not None
+        return ik
+
+    def keep_path(self, base: int, path: Sequence[int]) -> None:
+        """a speculative pass's rows past `base` cut to its accepted `path` (node indices, root first), moved into
+        place: what the engine's commit (`ad`) asks of each attention layer that keeps its own rows"""
+        path = [int(p) for p in path]
+        n = len(path)
+        base = int(base)
+        a = self._arena
+        prefix = path == list(range(n))
+        if a is not None:
+            if not prefix:
+                idx = torch.tensor(path, device=a[0].device) + base
+                for b in a[:2]:
+                    b[:, base : base + n] = b.index_select(1, idx)
+                a[2][base : base + n] = a[2].index_select(0, idx)
+                self.low = min(self.low, base)
+            self._n = [base + n] * 3
+            return
+        keep = list(range(base)) + [base + p for p in path]
+        for which in range(3):
+            t = self._own[which]
+            if t is None or not t.numel():
+                continue
+            dim = 1 if which == 2 else -2
+            if prefix:
+                t = t.narrow(dim, 0, len(keep))
+            else:
+                t = t.index_select(dim, torch.tensor(keep, device=t.device))
+            self._own[which] = t
+
+    def set_front(self, n: int) -> None:
+        """the rows at the arena's front after the program's kernels wrote them: its keys, values and raw keys"""
+        self._n = [int(n)] * 3
+
+    # -- binding -----------------------------------------------------------------------------------------------
+
+    def attached_to(self, k: torch.Tensor) -> bool:
+        """whether the layer's keys are the arena slice `k`"""
+        a = self._arena
+        return a is not None and a[0].data_ptr() == k.data_ptr() and a[0].shape == k.shape
+
+    def attach(self, k: torch.Tensor, v: torch.Tensor, raw: torch.Tensor) -> None:
+        """the arena's slices (K and V [Hk, cap, d], raw [cap, di]) as the layer's: rows it held apart copied to the
+        front, rows already in an arena left where the caller put them (a regrowth copies the arena whole)"""
+        own = self._own if self._arena is None else [None, None, None]
+        self._arena = (k, v, raw)
+        self._own = [None, None, None]
+        self.dtype, self.device = k.dtype, k.device
+        self.is_initialized = True
+        self.is_indexer_initialized = True
+        self.indexer_dtype, self.indexer_device = raw.dtype, raw.device
+        if own[0] is not None or own[2] is not None:
+            self.load(own[0], own[1], own[2])
+
+    def load(self, keys: torch.Tensor | None, values: torch.Tensor | None, ik: torch.Tensor | None) -> None:
+        """rows [1, Hk, n, d] (and the indexer's [1, n, di]) copied to the attached arena's front"""
+        a = self._arena
+        assert a is not None
+        n = int(keys.shape[-2]) if keys is not None and keys.numel() else 0
+        ni = int(ik.shape[1]) if ik is not None and ik.numel() else 0
+        if max(n, ni) > int(a[0].shape[-2]):
+            self._grow(max(n, ni))
+            a = self._arena
+            assert a is not None
+        if n:
+            assert keys is not None and values is not None
+            a[0][:, :n].copy_(keys[0])
+            a[1][:, :n].copy_(values[0])
+        if ni:
+            assert ik is not None
+            a[2][:ni].copy_(ik[0])
+        self._n, self.low = [n, n, ni], 0
+
+    def detach(self) -> None:
+        """the program lets the arena go (another sequence takes it, or the layer leaves the card): the rows held so
+        far become a copy of their own, asked of the scheduler first"""
+        a = self._arena
+        if a is None:
+            return
+        k, v, raw = a
+        nk, nv, ni = self._n
+        nbytes = (int(k[:, :nk].numel()) + int(v[:, :nv].numel()) + int(raw[:ni].numel())) * k.element_size()
+        if self.grant is not None and nbytes:
+            self.grant(nbytes, "kv", requester="a card program's arena rows, copied out", device=k.device, draws="")
+        self._own = [k[None, :, :nk].clone(), v[None, :, :nv].clone(), raw[None, :ni].clone()]
+        self._arena = None
