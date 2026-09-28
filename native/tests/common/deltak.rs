@@ -94,6 +94,7 @@ unsafe fn step(
         s.dv,
         r.norm_w.ptr(),
         EPS,
+        0, // silu
         out,
         threads,
     )

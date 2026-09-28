@@ -44,6 +44,19 @@ fn silu(x: f32) -> f32 {
 }
 
 #[inline(always)]
+fn sigmoid(x: f32) -> f32 {
+    if x < -88.0 {
+        0.0
+    } else {
+        1.0 / (1.0 + exp_fast(-x))
+    }
+}
+
+/// the gated norm's activation on `z`: Qwen3.5's silu, Qwen4's sigmoid (its `output_gate_type`)
+pub(crate) const GATE_SILU: u32 = 0;
+pub(crate) const GATE_SIGMOID: u32 = 1;
+
+#[inline(always)]
 fn softplus(x: f32) -> f32 {
     if x > 20.0 {
         x
@@ -279,6 +292,7 @@ struct Tensors {
     out: *mut f32,
 
     eps: f32,
+    gate: u32,
 }
 unsafe impl Send for Tensors {}
 unsafe impl Sync for Tensors {}
@@ -345,9 +359,15 @@ macro_rules! def_head_step {
             let zh = std::slice::from_raw_parts(p.z.add((node * s.hv + h) * dv), dv);
             let nw = std::slice::from_raw_parts(p.norm_w, dv);
             let o = std::slice::from_raw_parts_mut(p.out.add((node * s.hv + h) * dv), dv);
-            for (((ov, cv), wv), zv) in o.iter_mut().zip(core.iter()).zip(nw.iter()).zip(zh.iter())
-            {
-                *ov = (*wv * (*cv * rms)) * silu(*zv);
+            let rows = o.iter_mut().zip(core.iter()).zip(nw.iter()).zip(zh.iter());
+            if p.gate == GATE_SIGMOID {
+                for (((ov, cv), wv), zv) in rows {
+                    *ov = (*wv * (*cv * rms)) * sigmoid(*zv);
+                }
+            } else {
+                for (((ov, cv), wv), zv) in rows {
+                    *ov = (*wv * (*cv * rms)) * silu(*zv);
+                }
             }
         }
     };
@@ -439,6 +459,7 @@ pub(crate) unsafe fn delta_step(
     dv: usize,
     norm_w: *const f32,
     eps: f32,
+    gate: u32,
     out: *mut f32,
     nodes: usize,
     threads: usize,
@@ -502,6 +523,9 @@ pub(crate) unsafe fn delta_step(
     if eps.is_nan() || eps < 0.0 {
         return ERR_DOMAIN;
     }
+    if gate != GATE_SILU && gate != GATE_SIGMOID {
+        return ERR_DOMAIN;
+    }
     // the element counts fit usize and their byte sizes a pointer offset
     let conv_elems = match c_dim.checked_mul(k_size) {
         Some(v) if v <= MAX_ELEMS => v,
@@ -540,6 +564,7 @@ pub(crate) unsafe fn delta_step(
         norm_w,
         out,
         eps,
+        gate,
     };
 
     let global = rayon::current_num_threads().max(1);
@@ -623,6 +648,20 @@ mod tests {
             hi.is_finite() && hi > 3.0e38,
             "right tail saturates near f32::MAX, got {hi}"
         );
+    }
+
+    #[test]
+    fn sigmoid_matches_its_definition() {
+        for &x in &[-100.0f32, -40.0, -8.0, -1.0, -0.1, 0.0, 0.1, 1.0, 8.0, 40.0] {
+            let want = 1.0 / (1.0 + (-(x as f64)).exp());
+            let got = sigmoid(x) as f64;
+            assert!(
+                (got - want).abs() <= 1e-6,
+                "sigmoid({x}) = {got}, want {want}"
+            );
+        }
+        assert_eq!(sigmoid(f32::NEG_INFINITY), 0.0);
+        assert_eq!(sigmoid(f32::INFINITY), 1.0);
     }
 
     #[test]

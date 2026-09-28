@@ -22,8 +22,17 @@ const REAL: DeltaShape = DeltaShape {
 const EPS: f32 = 1e-6;
 const TOL: f64 = 1e-5;
 
+type Step = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
 /// One step in place: the conv output, the conv state, the recurrent state and the output.
-fn run(s: &DeltaShape, n: &DeltaIn, threads: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+fn run(s: &DeltaShape, n: &DeltaIn, threads: usize) -> Step {
+    let (code, step) = gated(s, n, threads, 0);
+    assert_eq!(code, OK, "btb_delta_step returned {code}");
+    step
+}
+
+/// `run` with the gated norm's activation named (0 silu, 1 sigmoid), and the kernel's return code.
+fn gated(s: &DeltaShape, n: &DeltaIn, threads: usize, gate: u32) -> (i32, Step) {
     let mut mixed = n.mixed.clone();
     let mut cs = n.conv_state.clone();
     let mut st = n.state.clone();
@@ -48,12 +57,38 @@ fn run(s: &DeltaShape, n: &DeltaIn, threads: usize) -> (Vec<f32>, Vec<f32>, Vec<
             s.dv,
             n.norm_w.as_ptr(),
             EPS,
+            gate,
             out.as_mut_ptr(),
             threads,
         )
     };
-    assert_eq!(code, OK, "btb_delta_step returned {code}");
-    (mixed, cs, st, out)
+    (code, (mixed, cs, st, out))
+}
+
+/// Qwen4's sigmoid gate changes the output's last factor and nothing else: the conv and both states are
+/// bit for bit the silu step's, and since silu(z) = z * sigmoid(z) the silu output is the sigmoid one times z.
+#[test]
+fn the_sigmoid_gate_changes_only_the_gate_factor() {
+    let n = gen_delta(&REAL, 4242, true);
+    let silu = run(&REAL, &n, 0);
+    let (code, sig) = gated(&REAL, &n, 0, 1);
+    assert_eq!(code, OK);
+    assert_eq!(bits(&sig.0), bits(&silu.0), "mixed_qkv");
+    assert_eq!(bits(&sig.1), bits(&silu.1), "conv_state");
+    assert_eq!(bits(&sig.2), bits(&silu.2), "state");
+    let mut worst = 0.0f64;
+    for ((&o_sig, &o_silu), &z) in sig.3.iter().zip(silu.3.iter()).zip(n.z.iter()) {
+        let want = o_sig as f64 * z as f64;
+        worst = worst.max((o_silu as f64 - want).abs() / want.abs().max(1e-3));
+    }
+    assert!(worst < 1e-5, "silu out vs sigmoid out * z: {worst:.3e}");
+}
+
+/// A gate the kernel does not know is refused rather than read as one it does.
+#[test]
+fn an_unknown_gate_is_an_error_code() {
+    let n = gen_delta(&REAL, 3, false);
+    assert_eq!(gated(&REAL, &n, 0, 2).0, ERR_DOMAIN);
 }
 
 /// The thread count is a scheduling choice only: every output of the step is bit-identical at one,
@@ -183,6 +218,7 @@ fn bad_pointers_and_shapes_are_error_codes() {
             dv,
             n.norm_w.as_ptr(),
             eps,
+            0, // silu
             out.as_mut_ptr(),
             0,
         )

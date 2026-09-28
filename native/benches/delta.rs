@@ -100,6 +100,7 @@ fn step(
             S.dv,
             n.norm_w.as_ptr(),
             EPS,
+            0, // silu
             out.as_mut_ptr(),
             1,
         )

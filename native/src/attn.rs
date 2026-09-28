@@ -1,5 +1,7 @@
 // Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
-//! Single-token grouped-query attention over a key/value cache, streamed with an online softmax.
+//! Single-token grouped-query attention over a key/value cache, streamed with an online softmax: one query
+//! over the cache's first `n` rows (a decode step), or a batch of queries each over its own list of cache
+//! rows (a verify pass's tree nodes, each attending the rows its committed step would).
 
 use crate::codes::{ERR_DOMAIN, ERR_NULL, OK};
 use crate::gemv::{
@@ -49,6 +51,10 @@ struct Job<E> {
     query: *const f32,
     key: *const E,
     value: *const E,
+    /// The cache rows the query attends, in the order it attends them; null for rows `0..n` in order, a
+    /// decode step's cache. A range reads row `index[r]` where the step reads row `r`, and nothing else
+    /// about the arithmetic changes, so a list of the rows `0..n` is the step bit for bit.
+    index: *const u32,
     d: usize,
     group: usize,
     key_stride: usize,
@@ -388,11 +394,16 @@ macro_rules! def_range {
             let prob = work.add(group);
 
             let query = job.query.add(head * group * d);
-            let key = job.key.add(head * job.key_stride + r0 * d);
-            let value = job.value.add(head * job.value_stride + r0 * d);
+            let key = job.key.add(head * job.key_stride);
+            let value = job.value.add(head * job.value_stride);
 
-            for r in 0..(r1 - r0) {
-                let key_row = key.add(r * d);
+            for r in r0..r1 {
+                let row = if job.index.is_null() {
+                    r
+                } else {
+                    *job.index.add(r) as usize
+                };
+                let key_row = key.add(row * d);
                 let mut u = 0;
                 while u + QUERY_UNROLL <= group {
                     $scores::<E, QUERY_UNROLL>(query.add(u * d), key_row, d, score.add(u));
@@ -423,7 +434,7 @@ macro_rules! def_range {
                     }
                 }
 
-                $accumulate::<E>(value.add(r * d), prob, acc, d, group);
+                $accumulate::<E>(value.add(row * d), prob, acc, d, group);
             }
         }
     };
@@ -463,19 +474,58 @@ unsafe fn run_range<E: Element>(
     }
 }
 
+/// One query row's share of a call: the list it attends (`len` entries of the call's index from `start`, or
+/// the rows `0..len` when the call has none), the rows of that list per slot, and the slots it takes per kv
+/// head, the first of them at `first` among the call's.
+#[derive(Clone, Copy)]
+struct Span {
+    start: usize,
+    len: usize,
+    chunk: usize,
+    parts: usize,
+    first: usize,
+}
+
+/// The rows per slot and the slots per kv head of a list of `n` rows, from its own length alone: a list
+/// splits into the same pieces as a decode step over `n` rows, whatever else shares its call, so it sums
+/// in the same order and comes out the step's bits.
+fn split(n: usize, nt: usize, hk: usize) -> (usize, usize) {
+    let chunk = if nt <= 1 {
+        n
+    } else {
+        n.div_ceil(nt.saturating_mul(2).div_ceil(hk).max(1))
+            .max(MIN_ROWS)
+    };
+    (chunk, n.div_ceil(chunk))
+}
+
+/// The slot `slot` of a call: `job` is the call's (its query row 0, its whole index), `row` the elements
+/// of one query row (`hq * d`).
 #[inline]
 unsafe fn run_slot<E: Element>(
     job: Job<E>,
     selected: Isa,
+    spans: &[Span],
+    row: usize,
     slot: usize,
-    parts: usize,
-    chunk: usize,
-    n: usize,
     state: &mut [f32],
 ) {
-    let head = slot / parts;
-    let start = (slot % parts) * chunk;
-    let stop = (start + chunk).min(n);
+    // the query row owning this slot: the last span starting at or before it
+    let t = spans.partition_point(|s| s.first <= slot) - 1;
+    let span = spans[t];
+    let local = slot - span.first;
+    let head = local / span.parts;
+    let start = (local % span.parts) * span.chunk;
+    let stop = (start + span.chunk).min(span.len);
+    let job = Job {
+        query: job.query.add(t * row),
+        index: if job.index.is_null() {
+            job.index
+        } else {
+            job.index.add(span.start)
+        },
+        ..job
+    };
     // two f32 per query head of the group: on the stack for any group up to 32
     let mut stack = [0.0f32; 64];
     let mut heap: Vec<f32> = Vec::new();
@@ -539,6 +589,69 @@ unsafe fn merge(
     }
 }
 
+/// The slots of every span over the pool (or in turn), then each query row's slots merged into its output
+/// row. `job` is the call's: query row 0 and the whole index. Which thread runs a slot never reaches its
+/// sums, and each row merges its own slots in their order, so the rows are independent of each other.
+unsafe fn attend<E: Element>(
+    job: Job<E>,
+    spans: &[Span],
+    hk: usize,
+    width: usize,
+    out: *mut f32,
+    nt: usize,
+) -> i32 {
+    let (d, group) = (job.d, job.group);
+    let row = hk * group * d;
+    let last = spans[spans.len() - 1];
+    let slots = match last
+        .parts
+        .checked_mul(hk)
+        .and_then(|s| s.checked_add(last.first))
+    {
+        Some(v) => v,
+        None => return ERR_DOMAIN,
+    };
+    let total = match slots.checked_mul(width) {
+        Some(v) => v,
+        None => return ERR_DOMAIN,
+    };
+
+    let mut partials = vec![0.0f32; total];
+    for slot in partials.chunks_mut(width) {
+        slot[group * d..group * d + group].fill(f32::NEG_INFINITY);
+    }
+
+    let selected = isa();
+
+    if nt <= 1 || slots == 1 {
+        for (slot, state) in partials.chunks_mut(width).enumerate() {
+            run_slot(job, selected, spans, row, slot, state);
+        }
+    } else {
+        let mut body = || {
+            partials
+                .par_chunks_mut(width)
+                .enumerate()
+                .for_each(|(slot, state)| unsafe {
+                    run_slot(job, selected, spans, row, slot, state)
+                });
+        };
+        if nt == default_threads() {
+            body();
+        } else if let Some(pool) = pool_for(nt) {
+            pool.install(body);
+        } else {
+            body();
+        }
+    }
+
+    for (t, span) in spans.iter().enumerate() {
+        let mine = &partials[span.first * width..(span.first + hk * span.parts) * width];
+        merge(mine, out.add(t * row), hk, group, d, span.parts, width);
+    }
+    OK
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn decode<E: Element>(
     query: *const f32,
@@ -591,62 +704,143 @@ unsafe fn decode<E: Element>(
         Some(v) => v,
         None => return ERR_DOMAIN,
     };
-    let chunk = if nt <= 1 {
-        n
-    } else {
-        n.div_ceil(nt.saturating_mul(2).div_ceil(hk).max(1))
-            .max(MIN_ROWS)
-    };
-    let parts = n.div_ceil(chunk);
-    let total = match hk
-        .checked_mul(parts)
-        .and_then(|slots| slots.checked_mul(width))
-    {
-        Some(v) => v,
-        None => return ERR_DOMAIN,
-    };
-
-    let mut partials = vec![0.0f32; total];
-    for slot in partials.chunks_mut(width) {
-        slot[group * d..group * d + group].fill(f32::NEG_INFINITY);
-    }
+    let (chunk, parts) = split(n, nt, hk);
+    let spans = [Span {
+        start: 0,
+        len: n,
+        chunk,
+        parts,
+        first: 0,
+    }];
 
     let job = Job {
         query,
         key,
         value,
+        index: std::ptr::null(),
         d,
         group,
         key_stride,
         value_stride,
         scale,
     };
-    let selected = isa();
+    attend(job, &spans, hk, width, out, nt)
+}
 
-    if nt <= 1 || hk * parts == 1 {
-        for (slot, state) in partials.chunks_mut(width).enumerate() {
-            run_slot(job, selected, slot, parts, chunk, n, state);
-        }
-    } else {
-        let mut body = || {
-            partials
-                .par_chunks_mut(width)
-                .enumerate()
-                .for_each(|(slot, state)| unsafe {
-                    run_slot(job, selected, slot, parts, chunk, n, state)
-                });
-        };
-        if nt == default_threads() {
-            body();
-        } else if let Some(pool) = pool_for(nt) {
-            pool.install(body);
-        } else {
-            body();
-        }
+#[allow(clippy::too_many_arguments)]
+unsafe fn nodes<E: Element>(
+    query: *const f32,
+    key: *const E,
+    value: *const E,
+    offsets: *const u32,
+    index: *const u32,
+    t: usize,
+    n_rows: usize,
+    hq: usize,
+    hk: usize,
+    d: usize,
+    key_stride: usize,
+    value_stride: usize,
+    scale: f32,
+    out: *mut f32,
+    threads: usize,
+) -> i32 {
+    if query.is_null()
+        || key.is_null()
+        || value.is_null()
+        || offsets.is_null()
+        || index.is_null()
+        || out.is_null()
+    {
+        return ERR_NULL;
+    }
+    if t == 0 || n_rows == 0 || hq == 0 || hk == 0 || d == 0 || !hq.is_multiple_of(hk) {
+        return ERR_DOMAIN;
+    }
+    // as decode's: a finite scale, and every buffer naturally aligned (the lists are read as u32 directly)
+    if !scale.is_finite()
+        || !aligned(query)
+        || !aligned(key)
+        || !aligned(value)
+        || !aligned(offsets)
+        || !aligned(index)
+        || !aligned(out)
+    {
+        return ERR_DOMAIN;
     }
 
-    merge(&partials, out, hk, group, d, parts, width);
-    OK
+    let rows = match n_rows.checked_mul(d) {
+        Some(v) => v,
+        None => return ERR_DOMAIN,
+    };
+    if key_stride < rows || value_stride < rows {
+        return ERR_DOMAIN;
+    }
+    // the element counts fit usize and their byte sizes a pointer offset: `t` query and output rows of
+    // `hq * d` f32, and `t + 1` offsets
+    if hq
+        .checked_mul(d)
+        .and_then(|v| v.checked_mul(t))
+        .is_none_or(|v| v > MAX_ELEMS)
+        || t >= MAX_ELEMS
+        || hk.checked_mul(key_stride).is_none_or(|v| v > MAX_ELEMS)
+        || hk.checked_mul(value_stride).is_none_or(|v| v > MAX_ELEMS)
+    {
+        return ERR_DOMAIN;
+    }
+
+    // every list holds at least one row (a softmax over none has no value), and every entry is a row the
+    // caller vouched for: one past `n_rows` would read keys outside the cache
+    let offs = std::slice::from_raw_parts(offsets, t + 1);
+    if offs.windows(2).any(|w| w[1] <= w[0]) {
+        return ERR_DOMAIN;
+    }
+    let (lo, hi) = (offs[0] as usize, offs[t] as usize);
+    let list = std::slice::from_raw_parts(index.add(lo), hi - lo);
+    if list.iter().any(|&r| r as usize >= n_rows) {
+        return ERR_DOMAIN;
+    }
+
+    let group = hq / hk;
+    let width = match d.checked_add(2).and_then(|w| group.checked_mul(w)) {
+        Some(v) => v,
+        None => return ERR_DOMAIN,
+    };
+
+    let nt = match resolve_threads(threads) {
+        Some(v) => v,
+        None => return ERR_DOMAIN,
+    };
+    let mut spans = Vec::with_capacity(t);
+    let mut first = 0usize;
+    for w in offs.windows(2) {
+        let len = (w[1] - w[0]) as usize;
+        let (chunk, parts) = split(len, nt, hk);
+        spans.push(Span {
+            start: w[0] as usize,
+            len,
+            chunk,
+            parts,
+            first,
+        });
+        first = match parts.checked_mul(hk).and_then(|s| s.checked_add(first)) {
+            Some(v) => v,
+            None => return ERR_DOMAIN,
+        };
+    }
+
+    let job = Job {
+        query,
+        key,
+        value,
+        index,
+        d,
+        group,
+        key_stride,
+        value_stride,
+        scale,
+    };
+    attend(job, &spans, hk, width, out, nt)
 }
 
 /// One decode step of grouped-query attention over a bf16 key/value cache.
@@ -702,6 +896,84 @@ pub(crate) unsafe fn decode_core_f32(
         k,
         v,
         n,
+        hq,
+        hk,
+        d,
+        k_head_stride,
+        v_head_stride,
+        scale,
+        out,
+        threads,
+    )
+}
+
+/// `t` single-token queries of grouped-query attention over a bf16 key/value cache, each over its own list
+/// of cache rows.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn nodes_core_bf16(
+    q: *const f32,
+    k: *const u16,
+    v: *const u16,
+    offs: *const u32,
+    idx: *const u32,
+    t: usize,
+    n_rows: usize,
+    hq: usize,
+    hk: usize,
+    d: usize,
+    k_head_stride: usize,
+    v_head_stride: usize,
+    scale: f32,
+    out: *mut f32,
+    threads: usize,
+) -> i32 {
+    nodes::<u16>(
+        q,
+        k,
+        v,
+        offs,
+        idx,
+        t,
+        n_rows,
+        hq,
+        hk,
+        d,
+        k_head_stride,
+        v_head_stride,
+        scale,
+        out,
+        threads,
+    )
+}
+
+/// `t` single-token queries of grouped-query attention over an f32 key/value cache, each over its own list
+/// of cache rows.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn nodes_core_f32(
+    q: *const f32,
+    k: *const f32,
+    v: *const f32,
+    offs: *const u32,
+    idx: *const u32,
+    t: usize,
+    n_rows: usize,
+    hq: usize,
+    hk: usize,
+    d: usize,
+    k_head_stride: usize,
+    v_head_stride: usize,
+    scale: f32,
+    out: *mut f32,
+    threads: usize,
+) -> i32 {
+    nodes::<f32>(
+        q,
+        k,
+        v,
+        offs,
+        idx,
+        t,
+        n_rows,
         hq,
         hk,
         d,
