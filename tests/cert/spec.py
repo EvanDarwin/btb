@@ -337,7 +337,7 @@ def residency_tag(kind: FamilyKind, knobs: dict[str, object]) -> PassTag | None:
 
 def storage_tag(storage: Storage, hw: Hardware) -> PassTag | None:
     """the tag a storage's own read leaves, or None where it has none: FP8 multiplied as stored on the host's
-    kernels, widened into the bf16 slots MLX and a card read (families.py `f8_host`)"""
+    kernels, widened into the bf16 slots MLX and a card read (families/__init__.py `f8_host`)"""
     if storage is not Storage.SAFE_FP8:
         return None
     return PassTag.FP8_ASSTORED if hw is Hardware.CPU else PassTag.FP8_WIDENED

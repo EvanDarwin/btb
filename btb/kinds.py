@@ -63,7 +63,7 @@ class LayerKind(StrEnum):
 
 
 class FamilyKind(StrEnum):
-    """the model families btb drives, keyed from the config's model_type (btb/engine/families.py)"""
+    """the model families btb drives, keyed from the config's model_type (a class each in btb/engine/families/)"""
 
     QWEN3 = "qwen3"
     QWEN3_5 = "qwen3_5"
@@ -102,7 +102,7 @@ class ModelType(StrEnum):
 
 class Cap(StrEnum):
     """a family capability - a boolean on `Family` that selects a code path. Spelled once here (the value is the
-    field name); `families.family()` builds a Family's flags from `CAPS`, so this table is the single truth for
+    field name); each family's `build` takes its Family's flags from `CAPS`, so this table is the single truth for
     what a family does, torch-free, readable without the engine."""
 
     DENSE = "dense"

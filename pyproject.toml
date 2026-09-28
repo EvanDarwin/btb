@@ -48,7 +48,18 @@ mlx = ["mlx>=0.32.2"]
 btb = "btb.cli:main"
 
 [tool.setuptools]
-packages = ["btb", "btb.engine", "btb.mlx"]
+packages = [
+  "btb",
+  "btb.engine",
+  "btb.engine.families",
+  "btb.engine.families.gemma3",
+  "btb.engine.families.gpt_oss",
+  "btb.engine.families.phi3",
+  "btb.engine.families.qwen3",
+  "btb.engine.families.qwen35",
+  "btb.engine.families.qwen4",
+  "btb.mlx",
+]
 
 [tool.setuptools.package-data]
 "btb" = ["native/*/*.dll", "native/*/*.so", "native/*/*.dylib", "native/*/*.fatbin"]

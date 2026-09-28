@@ -99,13 +99,13 @@ def test_what_only_a_cycle_holds_is_kept_and_named() -> None:
 
 
 def test_what_a_btb_modules_globals_keep_is_kept(monkeypatch: MonkeyPatch) -> None:
-    from btb.engine import families
+    from btb.engine.families.gpt_oss import sinks
 
     e = Engine()
     leaks.track(e)
-    monkeypatch.setattr(families, "_SCORES", {"cuda:0": _buf()})
+    monkeypatch.setattr(sinks, "_SCORES", {"cuda:0": _buf()})
     found = "\n".join(_life(e))
-    assert "btb.engine.families._SCORES['cuda:0']" in found, found
+    assert "btb.engine.families.gpt_oss.sinks._SCORES['cuda:0']" in found, found
 
 
 def test_what_a_btb_thread_still_holds_is_kept() -> None:

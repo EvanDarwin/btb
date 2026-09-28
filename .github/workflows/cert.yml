@@ -16,7 +16,7 @@ on:
       [
         "tests/cert/**",
         "btb/kinds.py",
-        "btb/engine/families.py",
+        "btb/engine/families/**",
         "btb/engine/native.py",
         "btb/hf.py",
         "btb/serve.py",
@@ -30,7 +30,7 @@ on:
       [
         "tests/cert/**",
         "btb/kinds.py",
-        "btb/engine/families.py",
+        "btb/engine/families/**",
         "btb/engine/native.py",
         "btb/hf.py",
         "btb/serve.py",

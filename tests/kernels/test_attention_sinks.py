@@ -12,7 +12,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from btb.engine.families import ScoresWorkspace, attention_sinks, close_scores, open_scores
+from btb.engine.families.gpt_oss.sinks import ScoresWorkspace, attention_sinks, close_scores, open_scores
 
 B, HQ, HK, T, PAST, D = 1, 8, 2, 12, 20, 16
 

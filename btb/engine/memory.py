@@ -434,7 +434,7 @@ class _MemoryMixin(_State):
         for sh, keys in by_shard.items():
             _, hdr, _ = self._shard(sh)
             for k in keys:
-                if not k.startswith(self.prefix + "layers.") or not self._dense_key(k):
+                if not k.startswith(self.prefix + "layers.") or not self.fam.dense_key(k):
                     continue
                 i = int(k[len(self.prefix) + len("layers.") :].split(".")[0])
                 info = hdr[k]
