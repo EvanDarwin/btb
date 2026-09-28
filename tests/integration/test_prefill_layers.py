@@ -516,7 +516,9 @@ def test_a_sweep_under_store_pressure_is_the_chunks_bits() -> None:
 def test_a_card_sweep_under_store_pressure_is_the_chunks_bits(monkeypatch: pytest.MonkeyPatch, layout: str) -> None:
     """the store under the same pressure, the chunks' experts on the card's grouped path through the depot: the
     read-ahead's reads, the depot's uploads out of the store's slots and the store's evictions never cross - the
-    sweep stays the chunked prefill's, bit for bit"""
+    sweep stays the chunked prefill's, bit for bit. And the depot is the tier a chunk asks first: an expert seated
+    on the card by an earlier chunk of its layer is not asked of the store again, so however small the store, a
+    layer's experts are read from the drive once for the prompt, not once a chunk"""
     dev = need_cuda()
     from btb.engine.native import Native
 
@@ -558,7 +560,12 @@ def test_a_card_sweep_under_store_pressure_is_the_chunks_bits(monkeypatch: pytes
                 assert store.live() == n_slots, (store.live(), n_slots)
                 store.ring_n = max(1, n_slots // 2)
                 cache = sm.new_cache()
+                m0 = store.stat["miss"]
                 got = sm._prefill(torch.tensor([ids]), cache)[0, -1].float().cpu()
+                reads = store.stat["miss"] - m0
+                assert reads <= L * n_exp, (
+                    f"{n_slots} slots: {reads} reads, past every layer's experts once ({L * n_exp})"
+                )
                 assert torch.equal(got, ref), f"{n_slots} slots: logits part by {float((got - ref).abs().max()):.3e}"
                 for name, t in _tensors(cache):
                     assert torch.equal(t.float().cpu(), ref_cache[name]), f"{n_slots} slots: {name} parts"

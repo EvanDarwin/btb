@@ -546,6 +546,7 @@ class _Experts(torch.nn.Module):
         store: Any,
         depot: Any,
         final: torch.Tensor,
+        seated: set[int] | None = None,
     ) -> None:
         """A call's experts on the card as grouped matmuls over the depot's stacked slots, a wave at a time: the
         experts already in RAM, then each batch as it lands from the drive, each wave placed on the card
@@ -645,7 +646,9 @@ class _Experts(torch.nn.Module):
                 y = y + self._bias(self.down_proj_bias, who, y)
             buf[rows, ranks[rows, poss]] = (y * w_top[rows, poss, None]).to(buf.dtype)
 
-        wave([(e, *views[e]) for e in hit if e in views])
+        # the experts seated on the card by an earlier chunk (no bytes in RAM: `place` finds their seats) and
+        # those in RAM, then each batch as it lands
+        wave([(e, *views[e]) if e in views else (e, None, None) for e in hit if e in views or e in (seated or ())])
         for batch in store.landed(pending) if pending else ():
             wave([(e, *store._views(s)) for e, _f, s in batch])
         depot.settle()
@@ -665,13 +668,17 @@ class _Experts(torch.nn.Module):
         call: StoreCall | None,
         store: Any,
         final: torch.Tensor,
+        seated: set[int] | None = None,
     ) -> None:
         """A call of many rows over its experts, in the waves the store serves it (`StoreCall.wave`): each wave's experts
         multiplied - as grouped matmuls on the card through the depot, or the per-expert loop - and added into
         `final`, the next wave asked for once these are done with. Each wave is a prefix of the call's ascending
-        experts, so a row's contributions are added in ascending expert order across the waves, as in one pass"""
+        experts, so a row's contributions are added in ascending expert order across the waves, as in one pass.
+        `seated`: the experts the depot holds on the card for this layer already, not asked of the store - the
+        grouped path's, placed from their seats with the first wave"""
         on_host = x.device.type == "cpu" and hidden_states.device.type != "cpu"
-        grouped = None
+        # experts seated on the card: the depot took this layer's form in an earlier chunk, so the path is grouped
+        grouped: bool | None = True if seated else None
         while True:
             depot = self._depot_for(x, on_host)
             if grouped is None:
@@ -687,7 +694,8 @@ class _Experts(torch.nn.Module):
                     )
                 )
             if grouped:
-                self._card_grouped(x, w_top, top_k_index, now, views, pending, store, depot, final)
+                self._card_grouped(x, w_top, top_k_index, now, views, pending, store, depot, final, seated)
+                seated = None  # placed with the first wave
             else:
                 self._loop(x, w_top, top_k_index, expert_mask, hidden_states, now, views, pending, store, final)
             if call is None or call.done:
@@ -819,7 +827,14 @@ class _Experts(torch.nn.Module):
                 # the Timetable: the next layers' picks from this layer's input (one row, or a verify pass's few),
                 # read ahead while this layer runs
                 store.lookahead(self.layer, hidden_states)
-            call = store.call(self.layer, self.base, hit, keep=keep, rows=int(hidden_states.shape[0]))
+            # the depot as the tier the call asks first: a chunk of a layer-by-layer prefill after the layer's first
+            # multiplies the experts an earlier chunk seated on the card from their seats, so the store is asked only
+            # for the rest - held in RAM chunk after chunk too, a store below the layer's experts read the whole layer
+            # from the drive again every chunk. Only where the grouped path is certain (the loop needs every view)
+            depot = self._depot_for(x, on_host) if not (use_mlx or grouped) and self._grouped_ok(x) else None
+            seated = depot.seated(self.layer) & set(hit) if depot is not None else set()
+            ask = [e for e in hit if e not in seated] if seated else hit
+            call = store.call(self.layer, self.base, ask, keep=keep, rows=int(hidden_states.shape[0]))
             # the MLX and one-row paths multiply the call's experts together: all of them seated at once, or the call
             # refused; the rest in the waves the store can seat
             views, pending = call.whole() if (use_mlx or grouped) else call.wave()
@@ -835,6 +850,7 @@ class _Experts(torch.nn.Module):
             gu, dn = self._tables()
             views = {e: (gu[e], dn[e]) for e in hit}
             call = None
+            seated = set()
             if self.mx or self.f8:
                 per_expert = gu[0].nbytes + dn[0].nbytes
             else:
@@ -847,7 +863,9 @@ class _Experts(torch.nn.Module):
         elif grouped:
             self._one_row(x, w_top, top_k_index, hit, views, pending, store, final, hidden_states if on_host else None)
         else:
-            self._waves(x, w_top, top_k_index, expert_mask, hidden_states, now, views, pending, call, store, final)
+            self._waves(
+                x, w_top, top_k_index, expert_mask, hidden_states, now, views, pending, call, store, final, seated
+            )
         st = self.sm.expert_stat
         st["experts"] += len(hit)
         st["bytes"] += len(hit) * per_expert

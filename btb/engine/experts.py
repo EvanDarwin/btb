@@ -628,15 +628,16 @@ class LayerDepot:
         scratch = 0
         fenced = False
         for e, gu, dn in items:
-            parts = stored_parts(gu, dn)
-            if parts is None:
-                self.stat["passed"] += 1
-                out.append(None)
-                continue
+            # a seat of this layer's first: an expert seated by an earlier chunk comes without its bytes in RAM
             s = self.seat.get(e)
             if s is not None:
                 self.stat["reused"] += 1
                 out.append(s)
+                continue
+            parts = stored_parts(gu, dn)
+            if parts is None:
+                self.stat["passed"] += 1
+                out.append(None)
                 continue
             if not self._fits(parts):
                 self.stat["passed"] += 1
@@ -662,6 +663,11 @@ class LayerDepot:
         if scratch:
             self.fence_scratch = True
         return out
+
+    def seated(self, layer: int) -> set[int]:
+        """the experts of `layer` with a seat on the card, copied by an earlier chunk of the layer: a chunk after
+        it multiplies them from their seats, and needs nothing of them in RAM"""
+        return set(self.seat) if layer == self.layer else set()
 
     def settle(self) -> None:
         """every queued copy landed: the store may hand the host bytes behind them to another expert after this"""
