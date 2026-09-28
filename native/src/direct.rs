@@ -707,7 +707,11 @@ mod tests {
         close(h);
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(got, Some(4095), "a misaligned read through the cache was refused");
+        assert_eq!(
+            got,
+            Some(4095),
+            "a misaligned read through the cache was refused"
+        );
         assert_eq!(bytes, data[1..4096], "the misaligned read's bytes");
         assert_eq!(rc, OK, "a whole read on the cached handle");
         assert_eq!(all, data, "the whole file back through the cached handle");

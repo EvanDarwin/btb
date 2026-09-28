@@ -179,6 +179,8 @@ class SeekingDrive:
             drive.read(str(path), off, n, dst)
 
         monkeypatch.setattr(native_mod.Native, "open", staticmethod(open_), raising=False)
+        # a read through the file cache is this drive's too: the simulation models no cache, only the drive
+        monkeypatch.setattr(native_mod.Native, "open_cached", staticmethod(open_), raising=False)
         monkeypatch.setattr(native_mod.Native, "read_at", staticmethod(read_at), raising=False)
         monkeypatch.setattr(native_mod.Native, "close", staticmethod(close_), raising=False)
         monkeypatch.setattr(native_mod.Native, "read_direct", staticmethod(read_direct), raising=False)
