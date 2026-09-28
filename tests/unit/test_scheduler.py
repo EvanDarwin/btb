@@ -216,6 +216,23 @@ class _StubEngine(_GenerateMixin):
         return self._logits(cache.rows, cache.step)
 
 
+def test_the_epochs_kv_on_a_card_is_only_the_resident_layers() -> None:
+    """the epoch's KV is reserved on the card, so it is priced for the layers whose rows live there: a host layer's
+    rows are on the host, and `kv_host` keeps even a resident layer's there. Priced for every layer it was a
+    phantom reservation that shrank the depot and the chunk on a card holding a few layers"""
+    m = SchedulerModel(
+        dev="cuda", layer_types=("full_attention", "linear_attention", "full_attention", "full_attention")
+    )
+    every = BatchScheduler(m)._kv_bytes_per_row_token()
+    m.resident = {2: None}  # type: ignore[attr-defined]
+    assert BatchScheduler(m)._kv_bytes_per_row_token() * 3 == every, "one of the three attention layers on the card"
+    m.kv_host = True  # type: ignore[attr-defined]
+    assert BatchScheduler(m)._kv_bytes_per_row_token() == 0, "every layer's rows on the host"
+    host = SchedulerModel(dev="cpu", layer_types=m.layer_types)
+    host.resident = {2: None}  # type: ignore[attr-defined]
+    assert BatchScheduler(host)._kv_bytes_per_row_token() == every, "one device: every layer's rows are its own"
+
+
 def _counting_max_batch(engine: _StubEngine, values: Sequence[int]) -> dict[str, int]:
     """replace the scheduler's max_batch with one that returns `values` in order (the last repeating) and
     counts how often it was consulted - the `_in_epoch` guard says: once per split"""
@@ -1589,6 +1606,51 @@ def test_a_cold_store_on_a_tight_machine_serves_a_call_in_waves(monkeypatch: Mon
         assert st.live() <= room
         for e in wave:
             route.land((0, e))
+        served += wave
+        rest, first = left, False
+    assert served == ids, "every expert once, in ascending order"
+
+
+def test_a_hit_whose_block_goes_back_mid_call_is_seated_in_the_calls_order(monkeypatch: MonkeyPatch) -> None:
+    """a call's hits are collected, then a release inside the call gives their block back: they are read again,
+    seated among the misses where they fall in the call's order. Appended after the misses they were seated last
+    - left without a seat before the wave's cut, or seated after misses the cut then dropped, which stayed in the
+    line with no read behind them - so a wave is the prefix before the first expert without a seat"""
+    route = FakeRoute()
+    st, _sm = expert_store(monkeypatch, route, n_layers=2, n_experts=8)
+    base = "layers.0.mlp.experts."
+    assert st.per is not None
+    st.block_max = 2 * st.per
+    for _ in range(3):
+        st._grow(2)
+    st.n_slots = st.live()  # six seats
+    _ready, pending = st.get(0, base, [0, 1], rows=1)  # 0 and 1 resident, together in one block
+    for e, _f, _s in pending:
+        route.land((0, e))
+    route.reads.clear()
+    monkeypatch.setattr(st, "_grow", lambda need: 0)  # nothing grows back: the call has the seats left
+    real, calls = st.release, [0]
+
+    def release(want: int = 1) -> Any:
+        calls[0] += 1
+        if calls[0] == 2:  # inside the first wave's call, its hits collected: their block goes back
+            st._release_block(st.slot_of[dict(st.res.items())[(0, 0)]][0])
+            return 0
+        return real(want)
+
+    monkeypatch.setattr(st, "release", release)
+    ids = list(range(8))
+    served: list[int] = []
+    rest, first = ids, True
+    while rest:
+        ready, pending, left = st.get_some(0, base, rest, rows=64, first=first)
+        wave = sorted([*ready, *(e for e, _f, _s in pending)])
+        assert wave == rest[: len(wave)] and wave, f"a wave is a prefix of what is left: {wave} of {rest}"
+        read = {r["key"][1] for r in route.reads if r["key"][0] == 0}
+        assert all(e in read for e in wave), f"every expert of the wave read, none taken for resident: {wave}"
+        for e in wave:
+            route.land((0, e))
+        route.reads.clear()
         served += wave
         rest, first = left, False
     assert served == ids, "every expert once, in ascending order"

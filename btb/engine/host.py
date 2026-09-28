@@ -796,32 +796,6 @@ class _Experts(torch.nn.Module):
         pending = []
         w0 = 0.0
         keep = True
-        if store is not None:
-            self.sm._tag(PassTag.EXPERT_STORE, store.res_tag)  # the slots, under the policy the store was built on
-            keep = hidden_states.shape[0] < Native.gemm_rows or bool(getattr(self.sm, "_sweep_keep", False))
-            if hidden_states.shape[0] < Native.gemm_rows:
-                # the Timetable: the next layers' picks from this layer's input (one row, or a verify pass's few),
-                # read ahead while this layer runs
-                store.lookahead(self.layer, hidden_states)
-            views, pending, rest = store.get_some(
-                self.layer, self.base, hit, keep=keep, rows=int(hidden_states.shape[0])
-            )
-            if getattr(self.sm, "_sweep_ahead", False) and store.sweep_layer != self.layer:
-                # a layer-by-layer prefill at this layer's first chunk: its reads are queued, and the next layer's
-                # experts are read ahead behind them while this layer's chunks compute
-                store.sweep_layer = self.layer
-                store.lookahead(self.layer, hidden_states, sweep=len(hit))
-            per_expert = store.per
-            w0 = store.stat["wait_s"]
-        else:
-            self.sm._tag(PassTag.EXPERT_TABLES)  # no store: the checkpoint's expert tables, held whole
-            gu, dn = self._tables()
-            views = {e: (gu[e], dn[e]) for e in hit}
-            rest = []
-            if self.mx or self.f8:
-                per_expert = gu[0].nbytes + dn[0].nbytes
-            else:
-                per_expert = (gu.shape[1] * gu.shape[2] + dn.shape[1] * dn.shape[2]) * gu.element_size()
         # FP8 experts have no MLX matvec: they stay on the host's FP8 kernels
         use_mlx = (
             self.sm.mlx is not None
@@ -840,13 +814,38 @@ class _Experts(torch.nn.Module):
             and hit
             and len(hit) == top_k_index.shape[1]
         )
-        if rest and (use_mlx or grouped):
-            # a one-row or MLX pass asks for a few experts, which the store's floor holds: never in waves
-            assert store is not None
-            more, late = store.get(self.layer, self.base, rest, keep=keep, rows=int(hidden_states.shape[0]))
-            views.update(more)
-            pending = pending + late
+        if store is not None:
+            self.sm._tag(PassTag.EXPERT_STORE, store.res_tag)  # the slots, under the policy the store was built on
+            keep = hidden_states.shape[0] < Native.gemm_rows or bool(getattr(self.sm, "_sweep_keep", False))
+            if hidden_states.shape[0] < Native.gemm_rows:
+                # the Timetable: the next layers' picks from this layer's input (one row, or a verify pass's few),
+                # read ahead while this layer runs
+                store.lookahead(self.layer, hidden_states)
+            if use_mlx or grouped:
+                # the MLX and one-row paths multiply the call's experts together: all of them seated at once, or
+                # the call refused - never in waves, where a later fetch could hand on a slot already given out
+                views, pending = store.get(self.layer, self.base, hit, keep=keep, rows=int(hidden_states.shape[0]))
+                rest = []
+            else:
+                views, pending, rest = store.get_some(
+                    self.layer, self.base, hit, keep=keep, rows=int(hidden_states.shape[0])
+                )
+            if getattr(self.sm, "_sweep_ahead", False) and store.sweep_layer != self.layer:
+                # a layer-by-layer prefill at this layer's first chunk: its reads are queued, and the next layer's
+                # experts are read ahead behind them while this layer's chunks compute
+                store.sweep_layer = self.layer
+                store.lookahead(self.layer, hidden_states, sweep=len(hit))
+            per_expert = store.per
+            w0 = store.stat["wait_s"]
+        else:
+            self.sm._tag(PassTag.EXPERT_TABLES)  # no store: the checkpoint's expert tables, held whole
+            gu, dn = self._tables()
+            views = {e: (gu[e], dn[e]) for e in hit}
             rest = []
+            if self.mx or self.f8:
+                per_expert = gu[0].nbytes + dn[0].nbytes
+            else:
+                per_expert = (gu.shape[1] * gu.shape[2] + dn.shape[1] * dn.shape[2]) * gu.element_size()
         # the experts of this wave (the call's whole, unless the store serves it in turn)
         now = [e for e in hit if e not in set(rest)]
         if use_mlx:

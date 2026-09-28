@@ -1143,20 +1143,20 @@ class _ForwardMixin(_State):
                 # is allocated piecemeal by the layers' own ops, which the ledger never sees one by one: what of it is
                 # live is what the card holds past the sweep's start, less what the ledger knows of already (the
                 # resident layers' KV, granted from the epoch's room, and the depot's blocks, granted and lent), and
-                # the reservation holds only the rest - the free reading counts the live part already
+                # the reservation holds only the rest - the free reading counts the live part already. Live means
+                # allocated: the working set's blocks torch caches between chunks stay under the reservation, since
+                # the free reading counts torch's cache as reclaimable and would otherwise hand them to anyone
                 # free-read: the sweep's own segments measured against its reservation, the ledger's `used`
-                held0 = int(torch.cuda.memory_reserved(self.dev))
+                held0 = int(torch.cuda.memory_allocated(self.dev))
                 kv0 = _kv_on_card(cache, self.host)
 
                 def in_use() -> int:
                     depot = getattr(self, "_depot", None)
                     held = int(depot.stat["held"]) if depot is not None else 0
                     grown = _kv_on_card(cache, self.host) - kv0
-                    # the card torch holds past the sweep's start - the working set's blocks whether in use or cached
-                    # between chunks (the card's own free reading has them taken either way) - less the KV and the
-                    # depot the ledger knows of already
+                    # the card allocated past the sweep's start, less the KV and the depot the ledger knows of already
                     # free-read: the same measure, as the ledger asks for it
-                    return int(torch.cuda.memory_reserved(self.dev)) - held0 - grown - held
+                    return int(torch.cuda.memory_allocated(self.dev)) - held0 - grown - held
 
                 self.device.reserve(PREFILL, kept, self.dev, used=in_use)
                 if growth > epoch:

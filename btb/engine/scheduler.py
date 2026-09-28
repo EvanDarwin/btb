@@ -444,7 +444,14 @@ class BatchScheduler:
         hq = int(c.num_attention_heads)
         hk = int(getattr(c, "num_key_value_heads", None) or hq)
         d = int(getattr(c, "head_dim", None) or c.hidden_size // hq)
-        n_attn = sum(1 for lt in self.sm.layer_types if lt != LayerKind.LINEAR)
+        attn = [i for i, lt in enumerate(self.sm.layer_types) if lt != LayerKind.LINEAR]
+        resident = getattr(self.sm, "resident", None)
+        if self.sm.dev.type == Device.CUDA and resident is not None:
+            # the epoch's KV is reserved on the card: only the layers whose rows live there - the resident ones,
+            # unless `kv_host` keeps even theirs on the host. A host layer's rows live on the host in float32
+            # (`_kv_home`); priced on the card they were a phantom reservation (about 1.2 GB for a 120B at 16k)
+            attn = [] if getattr(self.sm, "kv_host", False) else [i for i in attn if i in resident]
+        n_attn = len(attn)
         dt = self.sm.compute_dtype if self.sm.compute_dtype is not None else torch.bfloat16
         el = torch.empty(0, dtype=dt).element_size()
         if getattr(self.sm, "kv_bits", None) == 8:

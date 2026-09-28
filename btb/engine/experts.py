@@ -1771,6 +1771,12 @@ class _ExpertStore:
             if prof is not None:
                 prof.add(prof.REREAD, layer, e, self.per)
         waiting = [w for w in waiting if w[0] in out]  # a promoted read whose slot went is re-read like a hit
+        # seated in the call's order, a re-read among the misses where it falls: a wave's cut is then the first
+        # expert without a seat, and everything seated is before it. Re-reads appended last were seated after
+        # misses the cut then dropped - admitted to the line with no read behind them, taken as resident by the
+        # next wave - or left unseated before the cut
+        at_ = {int(e): n for n, e in enumerate(ids)}
+        todo.sort(key=lambda e: at_[int(e)])
         if len(self.free) < len(todo):
             self._grow(len(todo) - len(self.free))
         while self.live() < len(todo):
