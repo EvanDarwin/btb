@@ -21,7 +21,7 @@ from .native import Native
 from .pack import unpack_bf16
 
 if TYPE_CHECKING:
-    pass
+    from .experts import StoreCall
 
 
 def copy_bytes(dst: torch.Tensor, t: torch.Tensor) -> None:
@@ -570,7 +570,7 @@ class _Experts(torch.nn.Module):
         T, k = int(top_k_index.shape[0]), int(top_k_index.shape[1])
         pos_s, row_s, offs, counts = group_picks(top_k_index, self.num_experts)
         ranks = torch.argsort(torch.argsort(top_k_index, dim=1), dim=1)
-        # zeros: a call served in waves (`get_some`) fills here only its wave's picks, the others' adding nothing
+        # zeros: a call served in waves (`StoreCall.wave`) fills here only its wave's picks, the others' adding nothing
         buf = torch.zeros(T, k, x.shape[-1], dtype=final.dtype, device=x.device)
 
         def wave(items: list[tuple[int, Any, Any]]) -> None:
@@ -662,12 +662,11 @@ class _Experts(torch.nn.Module):
         now: list[int],
         views: Any,
         pending: Any,
-        rest: list[int],
+        call: StoreCall | None,
         store: Any,
         final: torch.Tensor,
-        keep: bool,
     ) -> None:
-        """A call of many rows over its experts, in the waves the store serves it (`get_some`): each wave's experts
+        """A call of many rows over its experts, in the waves the store serves it (`StoreCall.wave`): each wave's experts
         multiplied - as grouped matmuls on the card through the depot, or the per-expert loop - and added into
         `final`, the next wave asked for once these are done with. Each wave is a prefix of the call's ascending
         experts, so a row's contributions are added in ascending expert order across the waves, as in one pass"""
@@ -691,15 +690,14 @@ class _Experts(torch.nn.Module):
                 self._card_grouped(x, w_top, top_k_index, now, views, pending, store, depot, final)
             else:
                 self._loop(x, w_top, top_k_index, expert_mask, hidden_states, now, views, pending, store, final)
-            if not rest:
+            if call is None or call.done:
                 return
             # this wave's experts are done with (the depot's copies out of their slots landed): the store may seat
             # the next wave in their slots
-            views, pending, left = store.get_some(
-                self.layer, self.base, rest, keep=keep, rows=int(hidden_states.shape[0]), first=False
-            )
-            now = [e for e in rest if e not in set(left)]
-            rest = left
+            asked = list(call.rest)
+            views, pending = call.wave()
+            left = set(call.rest)
+            now = [e for e in asked if e not in left]
 
     def _loop(
         self,
@@ -821,15 +819,10 @@ class _Experts(torch.nn.Module):
                 # the Timetable: the next layers' picks from this layer's input (one row, or a verify pass's few),
                 # read ahead while this layer runs
                 store.lookahead(self.layer, hidden_states)
-            if use_mlx or grouped:
-                # the MLX and one-row paths multiply the call's experts together: all of them seated at once, or
-                # the call refused - never in waves, where a later fetch could hand on a slot already given out
-                views, pending = store.get(self.layer, self.base, hit, keep=keep, rows=int(hidden_states.shape[0]))
-                rest = []
-            else:
-                views, pending, rest = store.get_some(
-                    self.layer, self.base, hit, keep=keep, rows=int(hidden_states.shape[0])
-                )
+            call = store.call(self.layer, self.base, hit, keep=keep, rows=int(hidden_states.shape[0]))
+            # the MLX and one-row paths multiply the call's experts together: all of them seated at once, or the call
+            # refused; the rest in the waves the store can seat
+            views, pending = call.whole() if (use_mlx or grouped) else call.wave()
             if getattr(self.sm, "_sweep_ahead", False) and store.sweep_layer != self.layer:
                 # a layer-by-layer prefill at this layer's first chunk: its reads are queued, and the next layer's
                 # experts are read ahead behind them while this layer's chunks compute
@@ -841,21 +834,20 @@ class _Experts(torch.nn.Module):
             self.sm._tag(PassTag.EXPERT_TABLES)  # no store: the checkpoint's expert tables, held whole
             gu, dn = self._tables()
             views = {e: (gu[e], dn[e]) for e in hit}
-            rest = []
+            call = None
             if self.mx or self.f8:
                 per_expert = gu[0].nbytes + dn[0].nbytes
             else:
                 per_expert = (gu.shape[1] * gu.shape[2] + dn.shape[1] * dn.shape[2]) * gu.element_size()
         # the experts of this wave (the call's whole, unless the store serves it in turn)
-        now = [e for e in hit if e not in set(rest)]
+        left = set(call.rest) if call is not None else set()
+        now = [e for e in hit if e not in left]
         if use_mlx:
             self._mlx_forward(x, w_top, expert_mask, hit, views, pending, store, final)
         elif grouped:
             self._one_row(x, w_top, top_k_index, hit, views, pending, store, final, hidden_states if on_host else None)
         else:
-            self._waves(
-                x, w_top, top_k_index, expert_mask, hidden_states, now, views, pending, rest, store, final, keep
-            )
+            self._waves(x, w_top, top_k_index, expert_mask, hidden_states, now, views, pending, call, store, final)
         st = self.sm.expert_stat
         st["experts"] += len(hit)
         st["bytes"] += len(hit) * per_expert
@@ -867,8 +859,8 @@ class _Experts(torch.nn.Module):
                 prof.CALL,
                 self.layer,
                 expert=int(hidden_states.shape[0]),
-                nbytes=len(hit) - len(pending),
-                shard=len(pending),
+                nbytes=len(hit) - (call.read if call is not None else len(pending)),
+                shard=call.read if call is not None else len(pending),
                 dur_ns=int((store.stat["wait_s"] - w0) * 1e9),
             )
         if self.sm.expert_trace is not None:

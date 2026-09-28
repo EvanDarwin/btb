@@ -527,7 +527,31 @@ def expert_store(
         return r
 
     monkeypatch.setattr(st, "_recipe", recipe)
+    # the slot table's invariants after every wave and lookahead the test drives
+    wave, look = st._wave, st.lookahead
+
+    def checked_wave(*a: Any, **k: Any) -> Any:
+        out = wave(*a, **k)
+        st.check()
+        return out
+
+    def checked_look(*a: Any, **k: Any) -> Any:
+        out = look(*a, **k)
+        st.check()
+        return out
+
+    monkeypatch.setattr(st, "_wave", checked_wave)
+    monkeypatch.setattr(st, "lookahead", checked_look)
     return st, sm
+
+
+def seat(st: Any, key: tuple[int, int]) -> int:
+    """a slot of the store's made `key`'s seat on the line through the store's own transitions (`_seat_for`,
+    `_resident`): a test's stand-in for an expert read and landed, its slot's record kept true"""
+    s = st._seat_for(set())
+    assert s is not None, "the store has no seat to give"
+    st._resident(s, key)
+    return int(s)
 
 
 def bare_registry(device: str = "cuda:0", budget: int = 1 << 60) -> ModelRegistry:

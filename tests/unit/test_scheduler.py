@@ -43,6 +43,7 @@ from tests.helpers import (
     bare_registry,
     expert_store,
     model_config,
+    seat,
     slot_size,
     stub_engine,
     stub_ledger,
@@ -1061,9 +1062,8 @@ def test_store_does_not_thrash_at_the_reserve(monkeypatch: MonkeyPatch) -> None:
         assert st._grow(1) > 0
     grown = st.live()
     # every slot in use, the oldest first
-    for i, s in enumerate(range(grown)):
-        st.lru[(0, i)] = s
-    st.free = []
+    for i in range(grown):
+        seat(st, (0, i))
     st.max_call = 1
     # the machine takes memory: free RAM dips under the reserve
     state["free"] = st.reserve - slot_size(st)
@@ -1089,8 +1089,7 @@ def test_store_release_holds_the_floor_for_the_largest_call(monkeypatch: MonkeyP
         assert st._grow(1) > 0
     n = st.live()
     for i in range(n):
-        st.lru[(0, i)] = i
-    st.free = []
+        seat(st, (0, i))
     st.max_call = n - 1  # freeing any block would leave fewer slots than the largest call served
     state["free"] = st.reserve - slot_size(st)
     assert st.release() == 0, "the store holds rather than fall below what a call needs"
@@ -1503,8 +1502,7 @@ def test_lookahead_reads_the_next_layers_top_picks_that_are_not_resident(monkeyp
     h = torch.ones(1, 4)
     # expert 7 of layer 1 is resident already: it is not read again
     st._grow(1)
-    s = st.free.pop()
-    st.lru[(1, 7)] = s
+    seat(st, (1, 7))
     n = st.lookahead(0, h)
     assert n == 2, "layer 1's top-2 less the resident one, and layer 2's top-1"
     keys = [r["key"] for r in route.reads]
@@ -1571,16 +1569,16 @@ def test_a_store_below_a_calls_experts_serves_it_in_waves(monkeypatch: MonkeyPat
     assert st.live() == 3
     ids = list(range(8))
     served: list[int] = []
-    rest, first = ids, True
-    while rest:
-        ready, pending, left = st.get_some(0, "layers.0.mlp.experts.", rest, rows=4, first=first)
+    call = st.call(0, "layers.0.mlp.experts.", ids, rows=4)
+    while not call.done:
+        rest = list(call.rest)
+        ready, pending = call.wave()
         wave = sorted([*ready, *(e for e, _f, _s in pending)])
         assert wave == rest[: len(wave)] and wave, f"a wave is a prefix of what is left: {wave} of {rest}"
         assert len({s for _e, _f, s in pending} | set(st.last_slots.values())) <= 3
         for e in wave:
             route.land((0, e))  # the wave's reads in; the call multiplies it and asks for the rest
         served += wave
-        rest, first = left, False
     assert served == ids, "every expert once, in ascending order"
 
 
@@ -1598,24 +1596,25 @@ def test_a_cold_store_on_a_tight_machine_serves_a_call_in_waves(monkeypatch: Mon
     assert st.live() == 0
     ids = list(range(14))
     served: list[int] = []
-    rest, first = ids, True
-    while rest:
-        ready, pending, left = st.get_some(0, "layers.0.mlp.experts.", rest, rows=4096, first=first)
+    call = st.call(0, "layers.0.mlp.experts.", ids, rows=4096)
+    while not call.done:
+        rest = list(call.rest)
+        ready, pending = call.wave()
         wave = sorted([*ready, *(e for e, _f, _s in pending)])
         assert wave == rest[: len(wave)] and wave, f"a wave is a prefix of what is left: {wave} of {rest}"
         assert st.live() <= room
         for e in wave:
             route.land((0, e))
         served += wave
-        rest, first = left, False
     assert served == ids, "every expert once, in ascending order"
 
 
-def test_a_hit_whose_block_goes_back_mid_call_is_seated_in_the_calls_order(monkeypatch: MonkeyPatch) -> None:
-    """a call's hits are collected, then a release inside the call gives their block back: they are read again,
-    seated among the misses where they fall in the call's order. Appended after the misses they were seated last
-    - left without a seat before the wave's cut, or seated after misses the cut then dropped, which stayed in the
-    line with no read behind them - so a wave is the prefix before the first expert without a seat"""
+def test_residents_whose_block_goes_back_are_read_again_in_the_calls_order(monkeypatch: MonkeyPatch) -> None:
+    """a release at a wave's start takes back the block the call's residents sit in: they are misses of that wave,
+    read again where they fall in the call's order, and the wave is the prefix before the first expert without a
+    seat. (A release once ran inside the call, after its hits were handed out: re-read and appended after the
+    misses, they were left unseated before the cut, or seated after misses the cut dropped, which stayed in the
+    line with no read behind them.) Every expert of every wave is read, none taken for resident"""
     route = FakeRoute()
     st, _sm = expert_store(monkeypatch, route, n_layers=2, n_experts=8)
     base = "layers.0.mlp.experts."
@@ -1633,17 +1632,18 @@ def test_a_hit_whose_block_goes_back_mid_call_is_seated_in_the_calls_order(monke
 
     def release(want: int = 1) -> Any:
         calls[0] += 1
-        if calls[0] == 2:  # inside the first wave's call, its hits collected: their block goes back
-            st._release_block(st.slot_of[dict(st.res.items())[(0, 0)]][0])
+        if calls[0] == 1:  # the first wave's start: the block 0 and 1 sit in goes back
+            st._release_block(st.slots[dict(st.res.items())[(0, 0)]].block)
             return 0
         return real(want)
 
     monkeypatch.setattr(st, "release", release)
     ids = list(range(8))
     served: list[int] = []
-    rest, first = ids, True
-    while rest:
-        ready, pending, left = st.get_some(0, base, rest, rows=64, first=first)
+    call = st.call(0, base, ids, rows=64)
+    while not call.done:
+        rest = list(call.rest)
+        ready, pending = call.wave()
         wave = sorted([*ready, *(e for e, _f, _s in pending)])
         assert wave == rest[: len(wave)] and wave, f"a wave is a prefix of what is left: {wave} of {rest}"
         read = {r["key"][1] for r in route.reads if r["key"][0] == 0}
@@ -1652,7 +1652,6 @@ def test_a_hit_whose_block_goes_back_mid_call_is_seated_in_the_calls_order(monke
             route.land((0, e))
         route.reads.clear()
         served += wave
-        rest, first = left, False
     assert served == ids, "every expert once, in ascending order"
 
 
@@ -1671,7 +1670,7 @@ def test_closing_a_store_lets_every_block_go(monkeypatch: MonkeyPatch) -> None:
     bufs = [weakref.ref(buf) for buf, _ids in st.blocks.values()]
     assert len(bufs) == 2
     st.close()
-    assert st.live() == 0 and not st.res and not st.slot_of and not st.free
+    assert st.live() == 0 and not st.res and not st.slots and not st.free
     assert all(b() is None for b in bufs), "a closed store's block is still held"
 
 
@@ -1700,7 +1699,7 @@ def test_the_lookahead_gives_a_call_no_slot_still_being_written(monkeypatch: Mon
     st, route, _sm = _store_with_routers(monkeypatch, lookahead=(2, 0), ring_n=2)
     assert st.lookahead(0, torch.ones(1, 4)) == 2  # (1, 7), (1, 6) in the ring
     route.start((1, 7), parts=1)
-    s7 = st.ahead[(1, 7)]["slot"]
+    s7 = st.ahead[(1, 7)]
     got = st._ring_take()
     assert got is not None and got != s7, "the slot being written was given away"
     assert (1, 7) in st.ahead and not any(
@@ -1726,14 +1725,16 @@ def test_a_call_with_no_seat_left_takes_one_back_from_the_lookahead(monkeypatch:
     call's own: the call takes the lookahead's slots back, landed predictions and queued ones alike, instead of
     failing - the call before a guess"""
     st, route, _sm = _store_with_routers(monkeypatch, lookahead=(2, 0), ring_n=2)
+    assert st.per is not None
+    st.block_max = 2 * st.per  # a store of two seats, grown by the lookahead: every one the ring's
     h = torch.ones(1, 4)
     assert st.lookahead(0, h) == 2  # layer 1's (1, 7) and (1, 6) in the ring
     route.land((1, 7))  # one landed; (1, 6) still queued
-    st.free.clear()
-    st.n_slots = st.live()  # no growth past the seats it has: every one is the ring's
+    st.n_slots = st.live()  # no growth past the seats it has
+    assert not st.free and len(st.ring) == st.live() == 2
     ready, pending = st.get(2, "layers.2.mlp.experts.", [0, 1])
     assert sorted(e for e, _f, _s in pending) == [0, 1], "both of the call's experts have a seat"
-    assert st.ring == [] and st.ahead == {} and st.stat["ahead_dropped"] == 2
+    assert not st.ring and st.ahead == {} and st.stat["ahead_dropped"] == 2
     assert (1, 6) in route.dropped, "the queued prediction's reads were withdrawn, not left to land in a used slot"
 
 
@@ -1850,7 +1851,7 @@ def test_padded_slots_read_the_aligned_span_straight_in_and_the_views_find_the_b
     st._sizes_of = {"gu.st": GB, "dn.st": GB}
     monkeypatch.setattr(st, "_recipe", lambda layer, base: parts)
     assert st._grow(1) > 0
-    s = st.free.pop()
+    s = seat(st, (0, 1))
     st._submit(route, parts, 1, s, 0, route.DISK_DEMAND)
     r0, r1 = route.reads[-2], route.reads[-1]
     for r in (r0, r1):
@@ -1858,7 +1859,7 @@ def test_padded_slots_read_the_aligned_span_straight_in_and_the_views_find_the_b
         assert r["dst"].data_ptr() % 4096 == 0, "and lands on a sector of the slot"
     # the file offset of expert 1's gate_up is 1000 + per // 2: its delta is that modulo 4096
     delta0 = (1000 + per // 2) % 4096
-    assert r0["off"] == 1000 + per // 2 - delta0 and st.slot_delta[s][0] == delta0
+    assert r0["off"] == 1000 + per // 2 - delta0 and st.slots[s].delta[0] == delta0
     assert r0["n"] >= per // 2 and r0["n"] - per // 2 < 8192
     # the bytes the drive would write: a pattern at the expert's place inside the span
     r0["dst"].fill_(0)
@@ -1882,8 +1883,7 @@ def test_vram_seats_hold_the_most_ridden_experts_and_serve_them_from_the_card(mo
     per = slot_size(st)
     st.vram = VramSeats(2, per, st.shapes, torch.device("cuda"), min_rides=3, per_pass=1)
     assert st._grow(1) > 0
-    s = st.free.pop()
-    st.res.admit((0, 5), s)
+    s = seat(st, (0, 5))
     st._region(s).fill_(7)
     for _ in range(2):
         ready, _pending = st.get(0, "layers.0.mlp.experts.", [5])
@@ -1929,8 +1929,7 @@ def test_a_seated_expert_serves_a_multi_row_call_from_the_card(monkeypatch: Monk
     assert st._grow(2) > 0
     torch.manual_seed(3)
     for e in (5, 6):
-        s = st.free.pop()
-        st.res.admit((0, e), s)
+        s = seat(st, (0, e))
         st._region(s).view(torch.bfloat16).copy_((torch.randn(st.per // 2) * 0.2).bfloat16())
     st.vram = VramSeats(2, st.per, st.shapes, torch.device("cuda"), min_rides=1, per_pass=4)
     sm.expert_store = st
