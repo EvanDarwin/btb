@@ -10,7 +10,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Iterable
-from typing import Any
+from typing import Any, Concatenate, ParamSpec, Protocol, TypeVar
 
 import torch
 
@@ -33,13 +33,40 @@ from .families import _FamiliesMixin, family, register_attention
 from .forward import _ForwardMixin
 from .fused import fast_causal_conv1d
 from .generate import _GenerateMixin
+from .holdings import Holdings, Stage, last_on_card, on_card
 from .host import _Experts, _HostLinear, _NGramRows, _Router
+from .leaks import closed as _leaks_closed
+from .leaks import track as _leaks_track
 from .memory import RamPolicyState, VramPolicyState, _LendMixin
 from .mlx_forward import MlxState, _MlxMixin
 from .native import Native
 from .scheduler import BatchScheduler
 from .text import _TextMixin
 from .tiers import ColdRing, _TiersMixin
+
+
+class _Closes(Protocol):
+    def close(self) -> None: ...
+
+
+_P = ParamSpec("_P")
+_E = TypeVar("_E", bound=_Closes)
+
+
+def _closes_on_failure(init: Callable[Concatenate[_E, _P], None]) -> Callable[Concatenate[_E, _P], None]:
+    """an engine's construction made whole or nothing: a failure part way closes what it had taken (its holdings
+    so far) before the error goes on, rather than leaving it to the collector"""
+
+    def build(self: _E, /, *args: _P.args, **kwargs: _P.kwargs) -> None:
+        try:
+            init(self, *args, **kwargs)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                self.close()
+            raise
+
+    build.__doc__, build.__qualname__ = init.__doc__, init.__qualname__
+    return build
 
 
 class StreamedTextModel(
@@ -79,6 +106,7 @@ class StreamedTextModel(
         """bind the native library's kernels (once per process); see `Native.load_gemv`"""
         return Native.load_gemv(dll_path, threads)
 
+    @_closes_on_failure
     def __init__(
         self,
         model_dir: str,
@@ -116,6 +144,9 @@ class StreamedTextModel(
         from transformers import AutoConfig
 
         t0 = time.time()
+        # everything the engine holds past a pass, each registered where it is made: `close` is this run
+        self.holdings = Holdings()
+        _leaks_track(self)
         self.gguf = GGUFModel(model_dir) if is_gguf(model_dir) else None
         self.gguf_packed = bool(gguf_packed)  # its Q4/Q8 tensors on the packed kernels as stored (MLX), else bf16
         self.dir = self.gguf.dir if self.gguf is not None else model_dir
@@ -141,6 +172,7 @@ class StreamedTextModel(
             if not mlxdev.available():
                 raise RuntimeError("[mlx] MLX is not available in this Python (pip install mlx; Apple silicon only)")
             self.mlx = Native.mlx = mlxdev.Backend(self, gemm_rows=Native.gemm_rows, log=log)
+            self.holdings.own(Stage.VIEWS, "the MLX tier", self._mlx_teardown)
             self.mlx_layers = (
                 {int(x) for x in mlx_layers}
                 if mlx_layers is not None
@@ -214,6 +246,8 @@ class StreamedTextModel(
         self.prefix = emb_keys[0][: -len("embed_tokens.weight")]
         self.head_key = "lm_head.weight" if "lm_head.weight" in self.weight_map else emb_keys[0]
         self._maps = {}
+        self.holdings.own(Stage.FILES, "the checkpoint's maps and handles", self._close_files)
+        self.holdings.own(Stage.MEMORY, "the weights", self._drop_weights)
         # the embedding carries the checkpoint's own weight precision: an fp16 or fp32 one is held as bf16
         self.held_cast = False
         if self.gguf is None:
@@ -352,6 +386,9 @@ class StreamedTextModel(
         self.scheduler = BatchScheduler(self)
         self.plan = None
         self.device = Device(self)
+        if self.dev.type == DeviceKind.CUDA:
+            on_card(self)
+            self.holdings.own(Stage.MEMORY, "the card graphs and their arena", self._graphs_close)
         # the expert store reads both at construction, so they are set here and never afterwards: the Bus Pass by
         # default (1-8% on the token over two pairs on NVMe, 11% fewer misses on the replay's warm passes,
         # bookkeeping its only cost), and the store's pages pageable unless `store_pin` asks for pinned ones
@@ -372,6 +409,7 @@ class StreamedTextModel(
             else:
                 budget = int(float(expert_cache_gb) * 2**30)
             self.expert_store = _ExpertStore(self, budget, self.ram_reserve)
+            self.holdings.own(Stage.MEMORY, "the expert store", self._close_store)
         # the memory policies give layers up when another program needs the memory and take them back after;
         # `adapt` off pins the placement taken at load
         self.adapt = bool(adapt)
@@ -418,6 +456,13 @@ class StreamedTextModel(
                 for tmpl in self.resident.values():
                     for p in tmpl.parameters():
                         p.data = p.data.to(self.compute_dtype)
+        # the threads writing into the engine's buffers, stopped before any of them is let go (the last registered
+        # first: the cold ring's reader, which waits on the drive's, before them), and the record they complete,
+        # written once they have stopped
+        self.holdings.own(Stage.STOP, "the expert store's and the MLX tier's workers", self._stop_workers)
+        self.holdings.own(Stage.STOP, "the drive's readers", self.scheduler.disk_close)
+        self.holdings.own(Stage.STOP, "the cold ring's reader", self._cold_stop)
+        self.holdings.own(Stage.RECORD, "the expert profile", self._save_profile)
         # free-read: the load's log line
         res = torch.cuda.memory_allocated(self.dev) / 2**30 if self.dev.type == DeviceKind.CUDA else 0.0
         n_templates = sum(len(v) for v in self.templates.values())
@@ -544,17 +589,22 @@ class StreamedTextModel(
         return names
 
     def close(self) -> None:
-        """Stop any decode in flight and release the model's memory on every tier; safe to call twice. The engine
-        is unusable afterwards. `with btb.load(...) as model:` calls it on exit."""
+        """Stop any decode in flight and let go of everything the engine holds (`holdings`): the threads writing
+        into its buffers first, then the records they complete, the arrays over other buffers, the buffers, the
+        files. Each release runs on its own; one that raises stays held for the next call to try again, and the
+        errors are raised together once every other release has run. Safe to call twice; the engine is unusable
+        afterwards. `with btb.load(...) as model:` calls it on exit. What is still held after is logged
+        (`leaks.closed`)."""
         if getattr(self, "_closed", False):
             return
         draft = getattr(self, "draft_engine", None)
         if draft is not None:
-            self.draft_engine = None
+            self.draft_engine = None  # the draft model is its own engine (a --draft-model load): released first
             draft.close()
-        self.abort.set()
+        if getattr(self, "abort", None) is not None:
+            self.abort.set()
         # the MLX tier's teardown runs on the model's worker thread, where its arrays were built (see `_on_worker`),
-        # then the worker itself is retired
+        # then the worker itself is retired, whether or not the teardown raised
         w = getattr(self, "_worker", None)
         if w is not None and threading.current_thread() is not getattr(self, "_worker_thread", None):
             try:
@@ -563,57 +613,82 @@ class StreamedTextModel(
                 # the interpreter is exiting and shut the executor first: the teardown runs here, off the worker
                 self._worker = None
                 return self.close()
-            fut.result()
-            w.shutdown(wait=True)
-            self._worker = None
+            try:
+                fut.result()
+            finally:
+                w.shutdown(wait=True)
+                self._worker = None
             return
-        self._closed = True
-        draft = getattr(self, "draft_engine", None)
-        if draft is not None:
-            self.draft_engine = None  # the draft model is its own engine (a --draft-model load): release it too
-            draft.close()
         if getattr(self, "_pending", None) is not None:
             self._pending[3].join()
             self._pending = None
-        # no thread may still be writing into a buffer this is about to free: the cold reader is told to stop
-        # and joined, the expert store's and the loader's pools are drained
-        self._cold_stop()
+        holdings = getattr(self, "holdings", None)
+        errors = holdings.release_all() if holdings is not None else []
+        self._closed = not holdings
+        if getattr(self, "dev", None) is not None and self.dev.type == DeviceKind.CUDA:
+            torch.cuda.empty_cache()
+            if last_on_card(self):
+                # what torch keeps for the process: a cuBLAS workspace for every stream it multiplied on (a closed
+                # engine's streams are never used again) and the pinned host buffers it caches, each pinned byte
+                # the machine's commit on Windows. Let go by the last engine on a card only: another may be mid-GEMM
+                torch._C._cuda_clearCublasWorkspaces()
+                torch._C._host_emptyCache()
+        _leaks_closed(self)
+        if errors:
+            raise ExceptionGroup(f"[close] {len(errors)} of the engine's holdings would not let go", errors)
+
+    def _stop_workers(self) -> None:
+        """the expert store's readers and the MLX tier's pool, drained: nothing of theirs still writes"""
         store = getattr(self, "expert_store", None)
         if store is not None:
             store.pool.shutdown(wait=True)
-        sched = getattr(self, "scheduler", None)
-        if sched is not None:
-            sched.disk_close()
-        prof = getattr(self, "expert_profile", None)
-        if prof is not None:
-            # every reader has finished: the record is complete
-            self.expert_profile = None
-            prof.save()
         pool = getattr(self, "_mlx_pool", None)
         if pool is not None:
             pool.shutdown(wait=True)
+
+    def _save_profile(self) -> None:
+        """every reader has finished: the expert profile's record is complete"""
+        prof = getattr(self, "expert_profile", None)
+        if prof is not None:
+            self.expert_profile = None
+            prof.save()
+
+    def _mlx_teardown(self) -> None:
+        """MLX's arrays let go - the host layers' packed weights, the head's, the cold ring's shared slots - before
+        the store's blocks they sit over, then the tier itself; the pool's blocks go back whole, so the next model
+        this process loads reads into touched memory"""
+        for layer in self.host.values():
+            for m in layer.modules():
+                if isinstance(m, _HostLinear):
+                    m.mx = None
+        self.head_host = None
+        self.cold_ring.slots, self.cold_ring.shared = [], None
+        self.mlx_state.weights = {}
         if self.mlx is not None:
-            for layer in self.host.values():
-                for m in layer.modules():
-                    if isinstance(m, _HostLinear):
-                        m.mx = None
-            self.head_host = None
-            self.expert_store = None
-            self.cold_ring.slots, self.cold_ring.shared = [], None
-            self.mlx_state.weights = {}
             self.mlx.close()
-        if store is not None:
-            # the store's blocks let go here (after MLX's arrays over them), not when its last reference goes: a
-            # caller's `with` leaves the engine bound, and the store's gigabytes with it
-            store.close()
-        # the pool's blocks go back whole: the next model this process loads reads into touched memory
         for sh in self.mlx_state.pool_blocks:
             _pool.POOL.give(sh)
         self.mlx_state.pool_blocks = set()
+
+    def _close_store(self) -> None:
+        """the expert store's blocks let go now, not when its last reference goes: a caller's `with` leaves the
+        engine bound, and the store's gigabytes with it"""
+        store, self.expert_store = self.expert_store, None
+        if store is not None:
+            store.close()
+
+    def _drop_weights(self) -> None:
+        """the weights on every tier, the drafter's state and the last pass's cache (the caller's to keep, not the
+        closed engine's)"""
         for attr in ("templates", "shadow", "resident", "pinned", "_staging", "host", "_spec_slot_bufs"):
             setattr(self, attr, {})
-        self.embed_table = self.norm = self.head = None
+        self.embed_table = self.norm = self.head = self.head_host = None
         self.aj = None
+        self._attn_ctx = None
+        self.cold_ring.slots, self.cold_ring.shared = [], None
+
+    def _close_files(self) -> None:
+        """the checkpoint's maps and the drive handles the cold ring read through"""
         for mm, _, _ in self._maps.values():
             if mm is not None:  # the GGUF file's map is the gguf package's own
                 with contextlib.suppress(BufferError):
@@ -627,14 +702,7 @@ class StreamedTextModel(
             with contextlib.suppress(OSError):
                 fh.close()
         self.cold_ring.fh = {}
-        self.cold_ring.slots, self.cold_ring.shared = [], None
-        self.expert_store = None
         self.gguf = None
-        if self.dev.type == DeviceKind.CUDA:
-            torch.cuda.empty_cache()
-            # and the pinned host buffers torch caches after the engine's staging let them go: on Windows each
-            # pinned byte holds the machine's commit until it is given back
-            torch._C._host_emptyCache()
 
     def new_cache(self, max_len: int | None = None) -> Any:
         from transformers.cache_utils import DynamicCache, DynamicLayer

@@ -9,7 +9,7 @@ import itertools
 import os
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -54,6 +54,27 @@ def _card_warning(reason: str) -> None:
         f"{amd}{rule}\n\n"
     )
     sys.stderr.flush()
+
+
+def _graphs_in(o: Any, seen: set[int] | None = None) -> Iterator[Any]:
+    """every CUDA graph in a graph state's dicts, lists and tuples, once each"""
+    seen = set() if seen is None else seen
+    if id(o) in seen:
+        return
+    seen.add(id(o))
+    if isinstance(o, torch.cuda.CUDAGraph):
+        yield o
+    elif isinstance(o, dict):
+        for v in o.values():
+            yield from _graphs_in(v, seen)
+    elif isinstance(o, (list, tuple)):
+        for v in o:
+            yield from _graphs_in(v, seen)
+
+
+def _captured(exec_id: int) -> None:
+    """the body of a step graph already captured: never run, the graph is replayed instead"""
+    raise RuntimeError(f"[card] the step graph is captured; its body ({exec_id}) does not run again")
 
 
 class _CudaMixin(_State):
@@ -347,6 +368,25 @@ class _CudaMixin(_State):
         if a is not None:
             segs.append((a, self.L))
         return segs
+
+    def _graphs_close(self) -> None:
+        """The captured graphs let go, and every buffer they replay into: the single-token decode's (`_g`) and the
+        card path's (`_cg`: its graphs, arena and tables). A graph keeps its pool's memory until it is reset, so
+        each is reset before the state goes; and the arena's persisting L2 window is cleared on the streams it was
+        set on - left, it names freed memory and keeps the card's L2 set aside for it."""
+        g, cg = getattr(self, "_g", None), getattr(self, "_cg", None)
+        if g is None and cg is None:
+            return
+        torch.cuda.synchronize(self.dev)  # nothing still replaying into what goes
+        for st in (g, cg):
+            if st is not None:
+                for graph in _graphs_in(st):
+                    graph.reset()
+        if cg is not None and cg.get("arena") is not None and cg.get("k") is not None:
+            cg["k"].persist(0, 0, stream=cg["stream"])
+            cg["k"].persist(0, 0)
+        vars(self).pop("_g", None)
+        vars(self).pop("_cg", None)
 
     def _card_state(self) -> dict[str, Any]:
         ver = self.device.snapshot().version
@@ -897,7 +937,9 @@ class _CudaMixin(_State):
             return 2
         return 4
 
-    def _card_step_graph(self, st: dict[str, Any], table: torch.Tensor, U: int, sampling: Any = None) -> dict[str, Any]:
+    def _card_step_graph(
+        self, st: dict[str, Any], table: torch.Tensor, U: int, sampling: Any = None
+    ) -> tuple[dict[str, Any], Callable[[int], None]]:
         """U one-row steps as one graph: each step's token embedding, every layer, the head, the pick (the argmax,
         or the sample drawn inside the replay from the card's generator, its temperature and top-p read off
         device buffers, its top-k part of the key) written back as the next token, the cache's length advanced
@@ -910,8 +952,8 @@ class _CudaMixin(_State):
         top_p_on = bool(sampled and sampling.top_p < 1.0)
         key = (0, self.L, 1, True, mma, "step", U, sampled, top_k, top_p_on)
         g = st["graphs"].get(key)
-        if g is not None:
-            return g
+        if g is not None and g["graph"] is not None:
+            return g, _captured  # replayed as captured: the body is never run again
         g = dict(self._card_buffers(st, 0, self.L, 1, True, mma))
         g["key"] = key
         g["graph"] = None
@@ -1001,8 +1043,9 @@ class _CudaMixin(_State):
                     [P(g["n0"]), P(g["ids"]), P(g["pin_tok"][slot : slot + 1]), P(g["pin_n0"])],
                 )
 
-        g["body"] = body
-        return g
+        # handed back beside the graph, never kept in it: the capture is its only caller, and a closure over `g`
+        # kept in `g` is a cycle that holds the graph, its buffers and the table past the graph's drop
+        return g, body
 
     def _card_generate_greedy(
         self,
@@ -1044,7 +1087,7 @@ class _CudaMixin(_State):
             from .scheduler import MemoryGrantError
 
             raise MemoryGrantError("[card] the embedding table for the step graph was refused after the gate passed")
-        g = self._card_step_graph(st, table, U, smp)
+        g, body = self._card_step_graph(st, table, U, smp)
         past = cache.get_seq_length()
         g["n0"].fill_(past)
         g["ids"].fill_(first)
@@ -1055,12 +1098,12 @@ class _CudaMixin(_State):
             self._card_record(
                 st,
                 g,
-                lambda: g["body"](0),
+                lambda: body(0),
                 f"{U} one-row step{'s' if U > 1 else ''} captured as a self-advancing graph",
             )
             cg2 = torch.cuda.CUDAGraph()
             with torch.cuda.graph(cg2, pool=st["pool"], stream=st["stream"]):
-                g["body"](1)
+                body(1)
             g["graph2"] = cg2
             g["n0"].fill_(past)
             g["ids"].fill_(first)

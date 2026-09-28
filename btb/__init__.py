@@ -9,6 +9,7 @@ on first touch.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import json
 import os
 import sys
@@ -380,166 +381,175 @@ def load(
         sparse=bool(int(c.get("sparse", 0))),
         log=log or (lambda *_a: None),
     )
-    sm.plan = pl
-    if sm.pack is not None and sm.pack["format"] == PACK12_FORMAT:
-        sm.open_packed()
-        if sm.host:
-            sm.bind_host_packed()
-        if log:
-            log(f"[store] 12-bit model: the layers from {path}, the rest from {sm.pack['source']}")
-    if (
-        dev.kind is Device.CPU
-        and sys.platform == "darwin"
-        and sm.host
-        and c.get("fp32") != 1
-        and os.environ.get("BTB_CPU_GEMM", "1") != "0"
-        and mlx_available()
-    ):
-        # a Mac's CPU tier: the prefill's matmuls on MLX's CPU stream in bf16 (half the f32 path's time); one-row
-        # steps and verify passes keep the native kernels. --fp32 1 or BTB_CPU_GEMM=0 keeps float32
-        n = sm.bind_cpu_gemm()
-        if log and n:
-            log(f"[stream] host linears in shared memory ({n / 2**30:.2f} GB): the prefill's GEMM on the CPU stream")
-    # closed before the interpreter tears down, so reader threads and GPU work end while their buffers exist
-    ref = weakref.ref(sm)
+    # the engine is built: from here a failure (a draft that does not match, a declined download, a warm-up
+    # that raises) closes it before the error goes on, so nothing it took is left to the collector
+    try:
+        sm.plan = pl
+        if sm.pack is not None and sm.pack["format"] == PACK12_FORMAT:
+            sm.open_packed()
+            if sm.host:
+                sm.bind_host_packed()
+            if log:
+                log(f"[store] 12-bit model: the layers from {path}, the rest from {sm.pack['source']}")
+        if (
+            dev.kind is Device.CPU
+            and sys.platform == "darwin"
+            and sm.host
+            and c.get("fp32") != 1
+            and os.environ.get("BTB_CPU_GEMM", "1") != "0"
+            and mlx_available()
+        ):
+            # a Mac's CPU tier: the prefill's matmuls on MLX's CPU stream in bf16 (half the f32 path's time); one-row
+            # steps and verify passes keep the native kernels. --fp32 1 or BTB_CPU_GEMM=0 keeps float32
+            n = sm.bind_cpu_gemm()
+            if log and n:
+                log(
+                    f"[stream] host linears in shared memory ({n / 2**30:.2f} GB): the prefill's GEMM on the CPU stream"
+                )
+        # closed before the interpreter tears down, so reader threads and GPU work end while their buffers exist
+        ref = weakref.ref(sm)
 
-    def _close_at_exit() -> None:
-        live = ref()
-        if live is not None:
-            live.close()
+        def _close_at_exit() -> None:
+            live = ref()
+            if live is not None:
+                live.close()
 
-    atexit.register(_close_at_exit)
-    sm.drafter_weights = None
-    # the tree's budget applies to either proposer: a drafting head (the checkpoint's `mtp.*` weights) draws the
-    # tree, and without one the n-gram proposer's continuations at every order merge into one (generate.py).
-    # The plan-driven placements default the budget above; an explicit placement (--cpu-layers with --resident-last)
-    # reaches here without a plan, so the default comes from the weights and the device: a head, or a card
-    # holding every layer, where a tree's rows verify at about the cost of one
-    has_drafter = any(k.startswith("mtp.") for k in sm.weight_map)
-    # the card's widest pass at its 16-row cost is 15 drafted rows and the root; the host has no such edge
-    default_budget = (
-        (15 if sm.dev.type == Device.CUDA else 16)
-        if (has_drafter or (sm.dev.type == Device.CUDA and not sm.host))
-        else 0
-    )
-    sm.tree_budget = int(c.get("tree_budget", default_budget))
-    # the drafter's path probability under-reports a walk's reach (greedy or sampled), so the floor sits low
-    sm.tree_min_prob = float(c.get("tree_min_prob", 0.15))
-    sm.tree_step_mass = float(c.get("tree_step_mass", 0.5))
-    # int8 only pays on MLX
-    sm.draft_bits = int(c.get("draft_bits", 8 if sm.mlx is not None else 16))
-    sm.tree_read = "step"
-    sm.draft_vocab = int(c.get("draft_vocab", DRAFT_VOCAB if has_drafter else 0) or 0)
-    sm.draft_temp_ratio = float(c.get("draft_temp_ratio", 1.0) or 1.0)
-    sm.ngram_p = float(c.get("ngram_p", 0.9))
-    sm.v_max = int(c.get("v_max", 0 if sm.fam.moe else 4))  # an explicit placement: the planned default's rule
-    if sm.fam.own:
-        sm.tree_budget = 0
-        sm.v_max = 0
-    sm.proposer = Proposer.MTP_DYN if (sm.tree_budget > 0 and has_drafter) else Proposer.NGRAM
-    # how every token is picked unless a call says otherwise: greedy, or the loaded temperature / top_p / top_k / seed
-    from .sampling import Sampling
-
-    sm.sampling = Sampling(
-        temperature=float(c.get("temperature", 0.0) or 0.0),
-        top_p=float(c.get("top_p", 1.0) if c.get("top_p") is not None else 1.0),
-        top_k=int(c.get("top_k", 0) or 0),
-        seed=(int(c["seed"]) if c.get("seed") is not None else None),
-    )
-    # the expert store's lookahead: the next layers' router picks read ahead of their layers, per depth (the
-    # configuration's `lookahead`, BTB_LOOKAHEAD="10,6" or "0" over it). Off for one-row passes: their
-    # predictions' reads take the drive from the layer's own; a pass of several rows keeps its picks
-    la = os.environ.get("BTB_LOOKAHEAD")
-    sm.lookahead = tuple(
-        int(x) for x in (la.split(",") if la is not None else c.get("lookahead", ())) if str(x).strip()
-    )
-    if sm.lookahead == (0,):
-        sm.lookahead = ()
-    lr = os.environ.get("BTB_LOOKAHEAD_ROWS")
-    sm.lookahead_rows = tuple(
-        int(x) for x in (lr.split(",") if lr is not None else c.get("lookahead_rows", (10, 6))) if str(x).strip()
-    )
-    if sm.lookahead_rows == (0,):
-        sm.lookahead_rows = ()
-    # the experts seated on the card: 0 none, "auto" what the card has to spare, or a figure in GB
-    ve = os.environ.get("BTB_VRAM_EXPERTS_GB", c.get("vram_experts_gb", 0))
-    sm.vram_experts_gb = "auto" if str(ve).strip().lower() == "auto" else float(ve or 0)
-    if getattr(sm, "mlx", None) is not None and sm.v_max > 0:
-        # every decode row through the engine's attention kernel, so a verify pass and the one-row step
-        # compute alike (see `_mlx_attend`)
-        sm.mlx_attn_rows = 0
-    sm.eos_ids = ()
-    if sm.gguf is not None:
-        sm.eos_ids = sm.gguf.eos_ids()  # a GGUF carries them in its tokenizer keys, not a generation config
-    gp = os.path.join(path, "generation_config.json")
-    if os.path.exists(gp):
-        e = json.load(open(gp, encoding="utf-8")).get("eos_token_id")
-        if e is not None:
-            sm.eos_ids = tuple(int(x) for x in (e if isinstance(e, (list, tuple)) else [e]))
-    # ready is part of the load, not of one command: the card's graphs and the pass-cost curve (the card graph),
-    # the MLX pass-cost curve (the fused tree), over a throwaway prompt - what every entry point is timed at
-    if dev.kind is Device.MLX and int(c.get("mlx_mega", 1)) and sm.fam.kernel_layout and not sm.cold:
-        from .mlx.mega import MegaPass
-
-        try:
-            sm._mega = MegaPass(sm)
-            sm.log(
-                f"[mega] the pass as one dispatch: {sm._mega.nb} weight buffers, scratch {sm._mega.scr.size >> 20} MB"
-            )
-        except ValueError as e:
-            sm.log(f"[mega] off: {e}")
-    sm.draft_engine = None
-    sm.draft_ks = (4, 3, 2)
-    sm.warm()
-    # a sibling model drafts the speculative tree, verified exactly by this model's tree pass: far better than the
-    # n-gram proposer on fresh prose, and the memory-bound single-stream lever. Same tokenizer required.
-    from .hf import confirm_download, is_gguf
-
-    dm = c.get("draft_model")
-    if dm == "auto":
-        # the curated draft for this model (hf.DRAFT_MODELS); refused by name when this one has no known pair
-        dm = draft_for(path)
-        if dm is None:
-            raise options.OptionError(
-                "--draft-model auto: no curated draft model for this one - pass an explicit --draft-model PATH"
-            )
-    if dm and os.path.isfile(str(dm)) and not is_gguf(str(dm)):
-        # a custom MTP drafting-head file (experimental): drafter.py reads its mtp.* keys, this model's own
-        # weights for the rest. Unchecked - a head that is not this model's blows up at first use.
-        sys.stderr.write(
-            "[btb] custom drafting-head file for speculative decoding - unsupported, I hope you know what "
-            "you're doing!\n"
+        atexit.register(_close_at_exit)
+        sm.drafter_weights = None
+        # the tree's budget applies to either proposer: a drafting head (the checkpoint's `mtp.*` weights) draws the
+        # tree, and without one the n-gram proposer's continuations at every order merge into one (generate.py).
+        # The plan-driven placements default the budget above; an explicit placement (--cpu-layers with --resident-last)
+        # reaches here without a plan, so the default comes from the weights and the device: a head, or a card
+        # holding every layer, where a tree's rows verify at about the cost of one
+        has_drafter = any(k.startswith("mtp.") for k in sm.weight_map)
+        # the card's widest pass at its 16-row cost is 15 drafted rows and the root; the host has no such edge
+        default_budget = (
+            (15 if sm.dev.type == Device.CUDA else 16)
+            if (has_drafter or (sm.dev.type == Device.CUDA and not sm.host))
+            else 0
         )
-        sm.drafter_weights = str(dm)
-        sm.proposer = Proposer.MTP_DYN
-        if not sm.tree_budget:
-            sm.tree_budget = 14 if sm.mlx is not None else 16
-    elif dm:
-        # a small model of the family (a directory, repo id, or GGUF) drafts for this one, loaded as its own
-        # engine on the same device with its speculation off (v_max=0) - it proposes, never verified against.
-        # An uncached repo is gated like any download; the vocabularies must match for its tokens to verify.
-        if not confirm_download(str(dm)):
-            raise options.OptionError(f"draft_model {dm!r}: download declined")
-        ks = c.get("draft_ks")
-        if ks is not None:
-            sm.draft_ks = tuple(int(x) for x in (ks.split(",") if isinstance(ks, str) else ks) if str(x).strip())
-        draft_sm = load(
-            resolve(str(dm)),
-            device=device,
-            native=native,
-            log=None,
-            v_max=0,
-            tree_budget=0,
-            gguf_packed=int(c.get("gguf_packed", 1)),
+        sm.tree_budget = int(c.get("tree_budget", default_budget))
+        # the drafter's path probability under-reports a walk's reach (greedy or sampled), so the floor sits low
+        sm.tree_min_prob = float(c.get("tree_min_prob", 0.15))
+        sm.tree_step_mass = float(c.get("tree_step_mass", 0.5))
+        # int8 only pays on MLX
+        sm.draft_bits = int(c.get("draft_bits", 8 if sm.mlx is not None else 16))
+        sm.tree_read = "step"
+        sm.draft_vocab = int(c.get("draft_vocab", DRAFT_VOCAB if has_drafter else 0) or 0)
+        sm.draft_temp_ratio = float(c.get("draft_temp_ratio", 1.0) or 1.0)
+        sm.ngram_p = float(c.get("ngram_p", 0.9))
+        sm.v_max = int(c.get("v_max", 0 if sm.fam.moe else 4))  # an explicit placement: the planned default's rule
+        if sm.fam.own:
+            sm.tree_budget = 0
+            sm.v_max = 0
+        sm.proposer = Proposer.MTP_DYN if (sm.tree_budget > 0 and has_drafter) else Proposer.NGRAM
+        # how every token is picked unless a call says otherwise: greedy, or the loaded temperature / top_p / top_k / seed
+        from .sampling import Sampling
+
+        sm.sampling = Sampling(
+            temperature=float(c.get("temperature", 0.0) or 0.0),
+            top_p=float(c.get("top_p", 1.0) if c.get("top_p") is not None else 1.0),
+            top_k=int(c.get("top_k", 0) or 0),
+            seed=(int(c["seed"]) if c.get("seed") is not None else None),
         )
-        if int(draft_sm.cfg.vocab_size) != int(sm.cfg.vocab_size):
-            draft_sm.close()
-            raise options.OptionError(
-                f"draft_model {dm!r} has vocab {draft_sm.cfg.vocab_size}, the model's is {sm.cfg.vocab_size}: "
-                "a draft must share the model's tokenizer for its tokens to verify"
+        # the expert store's lookahead: the next layers' router picks read ahead of their layers, per depth (the
+        # configuration's `lookahead`, BTB_LOOKAHEAD="10,6" or "0" over it). Off for one-row passes: their
+        # predictions' reads take the drive from the layer's own; a pass of several rows keeps its picks
+        la = os.environ.get("BTB_LOOKAHEAD")
+        sm.lookahead = tuple(
+            int(x) for x in (la.split(",") if la is not None else c.get("lookahead", ())) if str(x).strip()
+        )
+        if sm.lookahead == (0,):
+            sm.lookahead = ()
+        lr = os.environ.get("BTB_LOOKAHEAD_ROWS")
+        sm.lookahead_rows = tuple(
+            int(x) for x in (lr.split(",") if lr is not None else c.get("lookahead_rows", (10, 6))) if str(x).strip()
+        )
+        if sm.lookahead_rows == (0,):
+            sm.lookahead_rows = ()
+        # the experts seated on the card: 0 none, "auto" what the card has to spare, or a figure in GB
+        ve = os.environ.get("BTB_VRAM_EXPERTS_GB", c.get("vram_experts_gb", 0))
+        sm.vram_experts_gb = "auto" if str(ve).strip().lower() == "auto" else float(ve or 0)
+        if getattr(sm, "mlx", None) is not None and sm.v_max > 0:
+            # every decode row through the engine's attention kernel, so a verify pass and the one-row step
+            # compute alike (see `_mlx_attend`)
+            sm.mlx_attn_rows = 0
+        sm.eos_ids = ()
+        if sm.gguf is not None:
+            sm.eos_ids = sm.gguf.eos_ids()  # a GGUF carries them in its tokenizer keys, not a generation config
+        gp = os.path.join(path, "generation_config.json")
+        if os.path.exists(gp):
+            e = json.load(open(gp, encoding="utf-8")).get("eos_token_id")
+            if e is not None:
+                sm.eos_ids = tuple(int(x) for x in (e if isinstance(e, (list, tuple)) else [e]))
+        # ready is part of the load, not of one command: the card's graphs and the pass-cost curve (the card graph),
+        # the MLX pass-cost curve (the fused tree), over a throwaway prompt - what every entry point is timed at
+        if dev.kind is Device.MLX and int(c.get("mlx_mega", 1)) and sm.fam.kernel_layout and not sm.cold:
+            from .mlx.mega import MegaPass
+
+            try:
+                sm._mega = MegaPass(sm)
+                sm.log(
+                    f"[mega] the pass as one dispatch: {sm._mega.nb} weight buffers, scratch {sm._mega.scr.size >> 20} MB"
+                )
+            except ValueError as e:
+                sm.log(f"[mega] off: {e}")
+        sm.draft_engine = None
+        sm.draft_ks = (4, 3, 2)
+        sm.warm()
+        # a sibling model drafts the speculative tree, verified exactly by this model's tree pass: far better than the
+        # n-gram proposer on fresh prose, and the memory-bound single-stream lever. Same tokenizer required.
+        from .hf import confirm_download, is_gguf
+
+        dm = c.get("draft_model")
+        if dm == "auto":
+            # the curated draft for this model (hf.DRAFT_MODELS); refused by name when this one has no known pair
+            dm = draft_for(path)
+            if dm is None:
+                raise options.OptionError(
+                    "--draft-model auto: no curated draft model for this one - pass an explicit --draft-model PATH"
+                )
+        if dm and os.path.isfile(str(dm)) and not is_gguf(str(dm)):
+            # a custom MTP drafting-head file (experimental): drafter.py reads its mtp.* keys, this model's own
+            # weights for the rest. Unchecked - a head that is not this model's blows up at first use.
+            sys.stderr.write(
+                "[btb] custom drafting-head file for speculative decoding - unsupported, I hope you know what "
+                "you're doing!\n"
             )
-        sm.draft_engine = draft_sm
-        sm.log(f"[draft] {os.path.basename(str(dm))} proposing, tree {sm.draft_ks}")
+            sm.drafter_weights = str(dm)
+            sm.proposer = Proposer.MTP_DYN
+            if not sm.tree_budget:
+                sm.tree_budget = 14 if sm.mlx is not None else 16
+        elif dm:
+            # a small model of the family (a directory, repo id, or GGUF) drafts for this one, loaded as its own
+            # engine on the same device with its speculation off (v_max=0) - it proposes, never verified against.
+            # An uncached repo is gated like any download; the vocabularies must match for its tokens to verify.
+            if not confirm_download(str(dm)):
+                raise options.OptionError(f"draft_model {dm!r}: download declined")
+            ks = c.get("draft_ks")
+            if ks is not None:
+                sm.draft_ks = tuple(int(x) for x in (ks.split(",") if isinstance(ks, str) else ks) if str(x).strip())
+            draft_sm = load(
+                resolve(str(dm)),
+                device=device,
+                native=native,
+                log=None,
+                v_max=0,
+                tree_budget=0,
+                gguf_packed=int(c.get("gguf_packed", 1)),
+            )
+            if int(draft_sm.cfg.vocab_size) != int(sm.cfg.vocab_size):
+                draft_sm.close()
+                raise options.OptionError(
+                    f"draft_model {dm!r} has vocab {draft_sm.cfg.vocab_size}, the model's is {sm.cfg.vocab_size}: "
+                    "a draft must share the model's tokenizer for its tokens to verify"
+                )
+            sm.draft_engine = draft_sm
+            sm.log(f"[draft] {os.path.basename(str(dm))} proposing, tree {sm.draft_ks}")
+    except BaseException:
+        with contextlib.suppress(Exception):
+            sm.close()
+        raise
     return sm
 
 

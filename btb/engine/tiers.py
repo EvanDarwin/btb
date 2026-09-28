@@ -927,6 +927,10 @@ class _TiersMixin(_State):
         for ev in self.cold_ring.free:
             ev.set()
         th.join(timeout=60)
+        if th.is_alive():
+            # still in a read into a ring slot after a minute: the ring is not reused or let go while it writes -
+            # the thread stays the ring's, and the pass (or the close, which tries again) is told
+            raise RuntimeError("[stream] the cold ring's reader is still in a read after 60 s; its slots stay held")
         self.cold_ring.thread = None
 
     def _cold_wait(self, i: int) -> None:

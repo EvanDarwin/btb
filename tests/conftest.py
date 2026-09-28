@@ -20,6 +20,9 @@ if TYPE_CHECKING:
 # every skip of a session, collected across phases and written at the end; a full `tests` run banks the ledger
 _SKIPS: dict[str, str] = {}
 
+# every engine a test builds is checked for what it keeps once closed (btb/engine/leaks.py): armed before any is built
+os.environ["BTB_LEAK_HARNESS"] = "1"
+
 
 def _release_cuda_cache() -> None:
     """the engine's own vram_trim idiom (synchronize, then empty_cache), when a test has loaded torch at all - the
@@ -35,13 +38,19 @@ def _release_allocator_caches() -> Iterator[None]:
     """Every allocator keeps freed buffers cached, and the scheduler's ledger counts them as held, so a long session
     starves later loads whatever the backend - the draft-model test refused a 16 MB KV grow at the end of the cert
     runner with "0 KiB free, 7.49 GiB held by MLX". After each test: drop the cyclic garbage that pins tensors, then
-    return the CUDA and MLX caches, so memory reads the same in any order."""
+    return the CUDA and MLX caches, so memory reads the same in any order. First, before the collection that would
+    free it, what a closed engine kept - still reached from it or btb, or held only by a cycle - fails the test at
+    its teardown, apart from the test's own outcome."""
     yield
+    leaks = sys.modules.get("btb.engine.leaks")  # only a test that built an engine has one to check
+    found = leaks.verify() if leaks is not None else []
     gc.collect()
     _release_cuda_cache()
     mx = sys.modules.get("mlx.core")  # only a test that loaded MLX has an MLX cache to return
     if mx is not None:
         mx.clear_cache()
+    if found:
+        pytest.fail("a closed engine kept memory:\n" + "\n".join(found), pytrace=False)
 
 
 def pytest_configure(config: Config) -> None:

@@ -12,6 +12,7 @@ decoded, a fork stepped and kept, a batch of sessions, and a tensor lent to the 
 from __future__ import annotations
 
 import contextlib
+import sys
 from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any
 
@@ -29,6 +30,8 @@ MiB = 2**20
 PROMPT = [(7 * i + 3) % 200 + 2 for i in range(40)]
 # what btb has free as it counts it, past its margin: nothing, a little, and plenty
 LEFT = (0, 8 * MiB, 64 * MiB, 1024 * MiB)
+# what the host keeps while the card is squeezed (`squeezed`): the paths' host growth and staging, with room
+HOST_ROOM = 512 * MiB
 FAMILIES = ["tiny_q4", "tiny_gpt_oss", "tiny_qwen3", "tiny_q35"]
 
 
@@ -40,10 +43,17 @@ def _allocator(dev: torch.device) -> tuple[int, int]:
 @contextlib.contextmanager
 def squeezed(sm: StreamedTextModel, left: int) -> Iterator[None]:
     """the card with only `left` bytes free past btb's margin, as its ledger reads it: the rest taken by a tensor
-    of the test's own, which btb sees as any other program's use of the card"""
+    of the test's own, which btb sees as any other program's use of the card. On Windows a card allocation is
+    charged to the host's commit as well (WDDM), so a filler taken whole would starve the host too - the paths'
+    host growth then refused, rightly, and "plenty left" not what the test meant (8.6 GB of filler took the
+    machine from 11.6 to 3.0 GB of commit left, btb's host figure to 0.08 GB). There the filler leaves the host
+    `HOST_ROOM` of what it had, and the card a little more than `left`"""
     torch.cuda.synchronize(sm.dev)
     torch.cuda.empty_cache()
     take = max(0, int(sm.device.free(sm.dev, unreserved=True) or 0) - int(left))
+    if sys.platform == "win32":
+        host = int(sm.device.free(torch.device("cpu"), unreserved=True) or 0)
+        take = min(take, max(0, host - HOST_ROOM))
     filler = torch.empty(take, dtype=torch.uint8, device=sm.dev) if take else None
     try:
         yield
