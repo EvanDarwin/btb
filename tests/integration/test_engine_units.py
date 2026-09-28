@@ -1009,6 +1009,7 @@ def test_every_native_kernel_refuses_a_dtype_it_was_not_built_for(monkeypatch: p
     p12 = (torch.zeros(r * c, dtype=u8), torch.zeros(r * c // 2, dtype=u8), torch.zeros(16, dtype=u8))
     no_esc = (torch.zeros(0, dtype=torch.int32), torch.zeros(0, dtype=u8), 0)
     q, kv = torch.zeros(2, 16, dtype=f32), torch.zeros(1, 3, 16, dtype=bf)
+    offs, rows = torch.tensor([0, 3], dtype=torch.int32), torch.arange(3, dtype=torch.int32)
     hk, hv, dk, dv, cd, ks = 1, 1, 4, 4, 12, 4
 
     def delta(**bad: torch.Tensor) -> Callable[[torch.Tensor], None]:
@@ -1076,13 +1077,34 @@ def test_every_native_kernel_refuses_a_dtype_it_was_not_built_for(monkeypatch: p
         ("attn_decode", "btb_attn_decode", "k", lambda y: Native.attn_decode(q, kv.half(), kv, 1.0, y), f32),
         ("attn_decode", "btb_attn_decode", "v", lambda y: Native.attn_decode(q, kv, kv.float(), 1.0, y), f32),
         ("attn_decode", "btb_attn_decode", "q", lambda y: Native.attn_decode(q.bfloat16(), kv, kv, 1.0, y), f32),
+        (
+            "attn_nodes",
+            "btb_attn_nodes",
+            "k",
+            lambda y: Native.attn_nodes(q[None], kv.half(), kv, offs, rows, 1.0, y),
+            f32,
+        ),
+        (
+            "attn_nodes",
+            "btb_attn_nodes",
+            "idx",
+            lambda y: Native.attn_nodes(q[None], kv, kv, offs, rows.long(), 1.0, y),
+            f32,
+        ),
+        (
+            "attn_nodes",
+            "btb_attn_nodes",
+            "offs",
+            lambda y: Native.attn_nodes(q[None], kv, kv, offs.long(), rows, 1.0, y),
+            f32,
+        ),
         ("delta_step", "btb_delta_step", "norm_w", delta(norm_w=torch.zeros(dv, dtype=bf)), f32),
         ("delta_step", "btb_delta_step", "conv_b", delta(conv_b=torch.zeros(cd, dtype=bf)), f32),
     ]
     missing = sorted({b for b, *_ in cases if getattr(Native, b) is None})
     assert not missing, f"the library built in this tree binds every kernel; unbound: {missing}"
     for binding, call, arg, run, ydt in cases:
-        y = torch.full((2, 16) if binding == "attn_decode" else (1, r), 7.0, dtype=ydt)
+        y = torch.full((2, 16) if binding in ("attn_decode", "attn_nodes") else (1, r), 7.0, dtype=ydt)
         if binding == "delta_step":
             y = torch.full((hv * dv,), 7.0, dtype=f32)
         with pytest.raises(NativeDtypeError) as e:

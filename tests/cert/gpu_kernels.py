@@ -36,14 +36,18 @@ _CUDA_NAME = re.compile(r"__global__\s+void\s+(?:__launch_bounds__\s*\([^)]*\)\s
 
 # op category -> the stem pattern that claims it, first match wins
 CATEGORIES: tuple[tuple[str, str], ...] = (
-    ("Matrix-vector: bf16", r"gemv_(bf16|silu|gelu|mma)|gemm16"),
+    ("Matrix-vector: bf16", r"gemv_(bf16|silu|gelu|mma|sgate|lane16)|gemm16"),
     ("Matrix-vector: 12-bit", r"p12"),
-    ("Matrix-vector: MXFP4", r"mxfp4"),
+    ("Matrix-vector: MXFP4", r"mxfp4|mx4_widen"),
     ("Matrix-vector: GGUF quants", r"<kind>|q\dk|iq4nl"),
     ("Attention", r"attn"),
+    ("Sparse attention indexer", r"qsa_"),
     ("Norm and RoPE", r"norm|rope|sandwich"),
-    ("Activation", r"silu_mul|gelu_mul"),
-    ("DeltaNet", r"delta"),
+    ("Hyper-connections", r"hc_"),
+    ("Mixture routing", r"moe_"),
+    ("Per-layer embedding", r"ple_"),
+    ("Activation", r"silu_mul|gelu_mul|sigmoid_mul"),
+    ("DeltaNet", r"delta|conv_window"),
     ("Sampling", r"sample"),
     ("KV cache", r"kv_store"),
     ("Whole-pass kernels", r"mega|publish"),
