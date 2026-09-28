@@ -160,6 +160,9 @@ fallback_version = "0.0.0"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-q"
+# no test runs past this (pytest-timeout, requirements-dev.txt): past it every thread's stack is dumped and the run
+# ends, where a hung test once held the shared GPU queue for five hours. Generous for the real-model cert tests
+timeout = 1800
 markers = [
     "timing: asserts on wall-clock rates or a process-wide limit; not run on shared CI runners",
     "cert_gap: fails while a certification gap is open (cert.yml gates on it); not a code failure, so a wheel build does not stop on it",
