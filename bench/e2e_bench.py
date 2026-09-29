@@ -387,7 +387,9 @@ def test_cuda_attn_gqa(benchmark: object, n: int, T: int, how: str) -> None:
     P, I, F = k.ptr, ctypes.c_int, ctypes.c_float
     name = "btb_attn_split_d128" if how == "split" else "btb_attn_split_gqa2_d128"
     tail = [I(T), I(Hq), I(Hk), I(cap), F(D**-0.5), P(pm), P(pl), P(pa), P(cnt), I(S), I(0)]
-    tail += [] if how == "split" else [I(0 if how == "gqa" else 1 << 30)]
+    # the grouped form's threshold, read on the card as the passes' switch holds it
+    shared = torch.tensor([0 if how == "gqa" else 1 << 30], dtype=torch.int32, device="cuda")
+    tail += [] if how == "split" else [P(shared)]
     args = [[P(q), P(kv[0]), P(kv[1]), P(out), P(n0), P(par), *tail] for kv in KV]
 
     def body() -> None:

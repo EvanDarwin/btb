@@ -684,18 +684,19 @@ __device__ __forceinline__ void attn_split_gqa(const bf16* __restrict__ q, const
     if (lane == 0) cnt[row] = 0;
 }
 
-// btb_attn_split_d{D}'s launch - grid (Hq, T, S) - plus `shared`: from a prefix of that many keys on (n0, on
-// the card, so one captured graph serves every context), block (g G, t, s) runs its group's G heads and the
-// group's other blocks leave; below it every block runs its own head. Both give every head the same bits.
+// btb_attn_split_d{D}'s launch - grid (Hq, T, S) - plus `sharedp`: from a prefix of *sharedp keys on (n0 and
+// the threshold both read on the card, so one captured graph serves every context and the host can move the
+// threshold between replays), block (g G, t, s) runs its group's G heads and the group's other blocks leave;
+// below it every block runs its own head. Both give every head the same bits.
 #define ATTN_SPLIT_GQA_K(G, D)                                                                               \
     extern "C" __global__ void __launch_bounds__(256) btb_attn_split_gqa##G##_d##D(                          \
         const bf16* __restrict__ q, const bf16* __restrict__ K, const bf16* __restrict__ V,                  \
         bf16* __restrict__ out, const int* __restrict__ n0p, const int* __restrict__ par, int T, int Hq,     \
         int Hk, int cap, float scale, float* __restrict__ part_m, float* __restrict__ part_l,                \
-        float* __restrict__ part_acc, int* __restrict__ cnt, int S, int win, int shared) {                   \
+        float* __restrict__ part_acc, int* __restrict__ cnt, int S, int win, const int* __restrict__ sharedp) { \
         const int n0 = *n0p;                                                                                 \
         if (blockIdx.z * ATTN_SPLIT >= n0 + T) return;                                                       \
-        if (n0 >= shared) {                                                                                  \
+        if (n0 >= *sharedp) {                                                                                \
             if (blockIdx.x % G) return;                                                                      \
             attn_split_gqa<D, G>(q, K, V, out, n0, par, blockIdx.x / G, T, Hq, cap, scale, part_m, part_l,   \
                                  part_acc, cnt, win);                                                        \
@@ -882,13 +883,17 @@ extern "C" __global__ void __launch_bounds__(256) btb_sandwich_add(bf16* __restr
 // ---------------------------------------------------------------------------------------------------------
 // the step's handoff to the host: the token and the cache's length written straight into pinned host memory
 // (device-addressable under unified addressing) by one thread of one block - a kernel node at the graph's
-// end, where a memcpy node was its own submission. The token lands first and a system fence orders it before
-// the length, so a host that has seen the length also sees the token.
+// end, where a memcpy node was its own submission. The token lands first, with the card's clock at the step's end
+// (ns, `out_ts`: when the steps ran, whatever the host was doing when it looked), and a system fence orders them
+// before the length, so a host that has seen the length also sees the token and the time.
 // ---------------------------------------------------------------------------------------------------------
 extern "C" __global__ void btb_publish(const int* __restrict__ n0, const long long* __restrict__ ids,
-                                       long long* out_tok, int* out_n0) {
+                                       long long* out_tok, int* out_n0, long long* out_ts) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         *out_tok = *ids;
+        unsigned long long t;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        *out_ts = (long long)t;
         __threadfence_system();
         *out_n0 = *n0;
     }

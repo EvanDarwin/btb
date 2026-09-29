@@ -235,6 +235,58 @@ def test_the_experts_linear_widens_what_no_kernel_multiplies(monkeypatch: Monkey
 # --- the scheduler (btb/engine/scheduler.py) ---------------------------------------------------------------
 
 
+def test_the_step_tuner_engages_the_deep_queue_releases_it_and_engages_it_again() -> None:
+    """the step loop's tuner (`_Tuner`) over synthetic replay times on its two lanes: alone on the card the usual
+    replays are faster and it stays there, saying nothing; when another program's load makes the deep queue faster
+    by more than its margin it moves there and says the card is shared, holds while the deep queue stays faster by
+    less than the margin, moves back and says the card is free as soon as the usual lane is as fast, and engages
+    again after; each lane still tried a window in every `explore`; the switches written only when the arm
+    changes"""
+    from btb.engine.cuda import _Tuner
+
+    arms = [("usual", [1, 0, 0], "usual"), ("queued deep", [2, 0, 0], "deep")]
+    tu = _Tuner(arms, torch.device("cpu"), window=2, rounds=2, explore=4, keep=5, margin=0.05, least=3, dwell=6)
+    switch = torch.zeros(3, dtype=torch.int32)
+    speed = {0: 4.2, 1: 4.4}  # ms a token: alone, the usual lane a little faster
+    said: list[str] = []
+    writes, runs = 0, [0, 0]
+
+    def run(n: int) -> None:
+        nonlocal writes
+        for _ in range(n):
+            before = tu.cur
+            arm = tu.before_replay(switch)
+            writes += before != arm
+            assert int(switch[0]) == arms[arm][1][0]  # the arm's switches stand on the card
+            runs[arm] += 1
+            s = tu.after_replay(arm, speed[arm] * 1e-3)
+            if s:
+                said.append(s)
+
+    run(80)
+    assert tu.chosen == 0 and not said and runs[1] >= 8  # alone: usual, the deep lane still tried
+    assert writes < 40  # a switch write at a change of arm, not at every replay
+    # a deep lane that loses clearly is explored less and less, and as often as at first when it comes close
+    before = runs[1]
+    speed.update({1: 6.0})
+    run(400)
+    assert tu.chosen == 0 and tu.every == 64 and runs[1] - before < 400 // 8
+    speed.update({1: 4.4})
+    speed.update({0: 9.0, 1: 7.8})  # a game on the card: the deep queue runs in its gaps
+    run(80)
+    assert tu.chosen == 1 and len(said) == 1 and "shared" in said[0]
+    speed.update({0: 8.0})  # the deep lane still faster, by less than the margin: the choice holds
+    run(80)
+    assert tu.chosen == 1 and len(said) == 1
+    speed.update({0: 4.2, 1: 4.4})  # the game gone
+    run(120)
+    assert tu.chosen == 0 and len(said) == 2 and "no longer pays" in said[1]
+    speed.update({0: 9.0, 1: 7.8})  # and back
+    run(120)
+    assert tu.chosen == 1 and len(said) == 3 and "shared" in said[2]
+    assert "*queued deep 7.80" in tu.report()
+
+
 def test_scheduler_kv_bytes_count_the_attention_layers_only() -> None:
     s = BatchScheduler(
         SchedulerModel(layer_types=("full_attention", "linear_attention", "full_attention", "linear_attention"))

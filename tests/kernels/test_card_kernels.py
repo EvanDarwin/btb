@@ -143,6 +143,8 @@ def _attn_split(
     pl = torch.zeros(S * T * Hq, device=dev)
     pa = torch.zeros(S * T * Hq * D, device=dev)
     cnt = torch.zeros(T * Hq, dtype=torch.int32, device=dev)
+    # the grouped form reads its threshold on the card, as the passes' switch holds it
+    sh = torch.tensor([shared if shared is not None else 0], dtype=torch.int32, device=dev)
     cu.launch(
         f"btb_attn_split_d{D}" if shared is None else f"btb_attn_split_gqa{G}_d{D}",
         (Hq, T, S),
@@ -167,7 +169,7 @@ def _attn_split(
             # the kernel's last parameter (0: the whole prefix, no sliding window); left off, the driver read the
             # argument array past its end - an access violation on Windows
             I(win),
-            *([] if shared is None else [I(shared)]),
+            *([] if shared is None else [P(sh)]),
         ],
     )
     assert int(cnt.abs().sum()) == 0, "every (head, row) count is reset by its last block"

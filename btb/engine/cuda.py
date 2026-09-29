@@ -80,6 +80,142 @@ def _captured(exec_id: int) -> None:
     raise RuntimeError(f"[card] the step graph is captured; its body ({exec_id}) does not run again")
 
 
+class _Tuner:
+    """the step loop's choice among ways to run the step that give the same bits and differ only in speed, by their
+    speed as measured, interleaved with each other so every way meets the same load on the card. An arm is a
+    setting of the card state's switches (`SW_*`, written on the card between replays, in stream order) and a lane:
+    the step graph at the platform's unroll with one replay queued ahead ("usual"), or at one step a replay queued
+    as deep as its execs allow ("deep"). Alone on the card the usual lane is the faster (fewer submissions); beside
+    a program the driver time-slices the card with, the deep lane's short replays, waiting when a gap opens, run in
+    the gaps it leaves where a longer replay spans them - so choosing the deep lane is noticing the card is shared.
+    Replays are timed in windows of `window` (each replay's time a token on the card's clock), a window's median kept
+    for its arm (the last `keep`); every arm is tried `rounds` times first, then the chosen arm runs, a window in
+    every `explore` spent on the others in turn. The choice moves only on `least` windows of each arm and holds for
+    `dwell` windows after it moves - beside a game a few lucky windows of the deep lane once moved it there and the
+    next few moved it back, five times in three answers - and away from the usual lane only to one `margin` faster;
+    a move between lanes is said"""
+
+    def __init__(
+        self,
+        arms: list[tuple[str, list[int], str]],
+        dev: torch.device,
+        window: int = 4,
+        rounds: int = 2,
+        explore: int = 8,
+        keep: int = 9,
+        margin: float = 0.05,
+        least: int = 5,
+        dwell: int = 12,
+    ) -> None:
+        self.labels = [a for a, _, _ in arms]
+        self.lanes = [ln for _, _, ln in arms]
+        self.table = torch.tensor([v for _, v, _ in arms], dtype=torch.int32, device=dev)
+        self.window, self.rounds, self.explore, self.keep, self.margin = window, rounds, explore, keep, margin
+        self.least, self.dwell = least, dwell
+        self.moved = 0  # the window the choice last moved at
+        # the windows between two exploring ones: doubled (to 64) each time the arm explored loses by more than twice
+        # the margin, back to `explore` when one comes close - beside a game the deep lane ran 20-40% slower for a
+        # whole run, and a window in eight spent on it cost the answer 5% - or when the chosen arm's own time moves
+        # as far from where it stood then (`ref`): a change of load shows there first, and a stale median of an arm
+        # explored once in 64 windows would hold the choice long after the load that made it
+        self.every = explore
+        self.ref: float | None = None
+        self.meds: list[list[float]] = [[] for _ in arms]
+        self.windows = 0  # windows completed, over every generate call
+        self.other = 0  # the next arm an exploring window tries
+        self.chosen = 0  # the arm run outside the exploring windows
+        self.arm = 0  # the arm the current window runs
+        self.cur: int | None = None  # the arm the switches hold on the card
+        self.acc: list[float] = []  # the current window's per-token seconds
+
+    def median(self, i: int) -> float | None:
+        m = self.meds[i]
+        return sorted(m)[len(m) // 2] if m else None
+
+    def best(self) -> int:
+        return self.chosen
+
+    def _choose(self) -> str | None:
+        """the chosen arm moved to the fastest: away from the first arm (the usual way, the one alone on the card
+        takes) only where another is `margin` faster, back to it as soon as it is as fast - alone, the lanes differ by
+        the deep one's submissions, less than the margin, so a margin both ways would keep the deep queue after the
+        other program left; the line to say where the lane changes"""
+        if any(len(m) < self.least for m in self.meds) or self.windows - self.moved < self.dwell:
+            return None
+        meds = [self.median(i) or 0.0 for i in range(len(self.meds))]
+        if self.chosen != 0 and meds[0] <= meds[self.chosen]:
+            b = 0
+        else:
+            b = min(range(len(meds)), key=lambda i: meds[i])
+            if b == self.chosen or meds[b] >= meds[self.chosen] * (1.0 - self.margin):
+                return None
+        was, self.chosen, self.moved = self.chosen, b, self.windows
+        if self.lanes[b] == self.lanes[was]:
+            return None
+        if self.lanes[b] == "deep":
+            return (
+                f"the card is shared: one-step replays queued deep run at {1e3 * meds[b]:.2f} ms a token against "
+                f"{1e3 * meds[was]:.2f} - queuing deep, so btb runs in the gaps the other program leaves"
+            )
+        return (
+            f"queuing deep no longer pays: the usual replays run at {1e3 * meds[b]:.2f} ms a token against "
+            f"{1e3 * meds[was]:.2f} queued deep - back to one replay queued ahead"
+        )
+
+    def _next_arm(self) -> int:
+        n = len(self.labels)
+        if self.windows < n * self.rounds:
+            return self.windows % n
+        if n > 1 and self.windows % self.every == 0:
+            self.other = (self.other + 1) % n
+            if self.other == self.chosen:
+                self.other = (self.other + 1) % n
+            return self.other
+        return self.chosen
+
+    def before_replay(self, switch: torch.Tensor) -> int:
+        """the arm the next replay runs, its switches written on the card where they change"""
+        if self.cur != self.arm:
+            switch.copy_(self.table[self.arm], non_blocking=True)
+            self.cur = self.arm
+        return self.arm
+
+    def after_replay(self, arm: int, seconds_per_token: float) -> str | None:
+        """a replay run by `arm` took `seconds_per_token` a token: kept, the window closed when full, and the choice
+        made again; the line to say where the chosen lane changed"""
+        if arm != self.arm:
+            return None
+        self.acc.append(seconds_per_token)
+        if len(self.acc) < self.window:
+            return None
+        m = self.meds[self.arm]
+        m.append(sorted(self.acc)[len(self.acc) // 2])
+        del m[: -self.keep]
+        self.acc = []
+        self.windows += 1
+        if self.arm != self.chosen and self.windows > len(self.labels) * self.rounds:
+            # an exploring window closed: explore less while the other arms lose clearly, as often as at first when
+            # one comes close
+            mine, theirs = self.median(self.arm), self.median(self.chosen)
+            if mine is not None and theirs is not None and mine > theirs * (1.0 + 2.0 * self.margin):
+                self.every, self.ref = min(64, self.every * 2), theirs
+            else:
+                self.every, self.ref = self.explore, None
+        elif self.arm == self.chosen and self.ref is not None and abs(m[-1] - self.ref) > 2.0 * self.margin * self.ref:
+            # the chosen arm's own time moved: the load changed, and the others are worth a look again
+            self.every, self.ref = self.explore, None
+        said = self._choose()
+        self.arm = self._next_arm()
+        return said
+
+    def report(self) -> str:
+        parts = []
+        for i, lab in enumerate(self.labels):
+            md = self.median(i)
+            parts.append(f"{'*' if i == self.chosen else ''}{lab} " + (f"{1e3 * md:.2f}" if md is not None else "-"))
+        return f"ms a token by setting, {self.windows} windows: " + ", ".join(parts)
+
+
 class _CudaMixin(_State):
     def aa(self, parents: Parents | None = None) -> None:
         self.al = {}
@@ -411,6 +547,10 @@ class _CudaMixin(_State):
             "stream": torch.cuda.Stream(device=self.dev) if st is None else st["stream"],
             "arena": None if st is None else st["arena"],
             "tables": None if st is None else st["tables"],
+            # the passes' switches, read on the card by the kernels they steer, so the host moves them between
+            # replays without a capture (`SW_*`, `_Tuner`): every setting gives the same bits
+            "switch": self._card_switch_init() if st is None else st["switch"],
+            "tuner": None if st is None else st.get("tuner"),
         }
         self._cg = st
         return st
@@ -696,6 +836,22 @@ class _CudaMixin(_State):
         Read on the card from the live prefix, so one graph serves every length; both give the same bits"""
         return cls.ATTN_SHARED_FROM if T > 1 else 1 << 30
 
+    # the card state's switches (`st["switch"]`, int32 on the card): the prefix from which a one-row step's
+    # attention reads each KV group's keys once, and a tree pass's (`_card_attn_shared`)
+    SW_ATTN_ONE, SW_ATTN_TREE = 0, 1
+
+    def _card_switch_init(self) -> torch.Tensor:
+        return torch.tensor(
+            [self._card_attn_shared(1), self._card_attn_shared(2)],
+            dtype=torch.int32,
+            device=self.dev,
+        )
+
+    @staticmethod
+    def _card_switch_ptr(st: dict[str, Any], i: int) -> ctypes.c_void_p:
+        """a kernel's pointer to switch `i` of the card state"""
+        return ctypes.c_void_p(int(st["switch"].data_ptr()) + 4 * i)
+
     def _card_buffers(
         self, st: dict[str, Any], a: int, b: int, T: int, tail: bool, mma: bool | None = None, rows: bool = False
     ) -> dict[str, Any]:
@@ -772,11 +928,12 @@ class _CudaMixin(_State):
         nrk = f"btb_norm_rope_kv_rows_d{D}" if rows else f"btb_norm_rope_kv_d{D}"
         if attn not in k.fn or nrk not in k.fn:
             raise RuntimeError(f"[card] no kernel for head_dim {D}")
-        # a tree's attention in its grouped-query form where the build has one for the model's group width
+        # the attention in its grouped-query form where the build has one for the model's group width, from the
+        # prefix the card state's switch names for this pass's width (a one-row step's, or a tree's)
         shared: list[Any] = []
         gqa = f"btb_attn_split_gqa{Hq // Hk}_d{D}"
         if not rows and Hq // Hk > 1 and gqa in k.fn:
-            attn, shared = gqa, [ci(self._card_attn_shared(T))]
+            attn, shared = gqa, [self._card_switch_ptr(st, self.SW_ATTN_ONE if T == 1 else self.SW_ATTN_TREE)]
         S = int(g["S"])
         # where each row's keys lie: the tree's (its prefix length, the rows' depths and parents), or the rows'
         # layout, one array for every rows graph
@@ -919,6 +1076,23 @@ class _CudaMixin(_State):
         elif y_prev is not None:
             g["h"][:T].add_(y_prev[:T])
 
+    # the step loop picks among its ways to run the step as it runs, by their measured speed (`_Tuner`)
+    CARD_TUNE = True
+
+    def _card_tuner(self, st: dict[str, Any]) -> _Tuner | None:
+        """the card state's tuner, made on the first step loop that may use it: its arms the usual lane and the
+        deep one (`_Tuner`), at the switches' settings as they stand - the attention's walk measured within the
+        noise of itself beside a game, and a shorter list is found sooner. Kept with the card state, so an answer
+        starts from what the last one found"""
+        if not (self.CARD_TUNE and self.CARD_CONTEND):
+            return None
+        tu: _Tuner | None = st.get("tuner")
+        if tu is not None:
+            return tu
+        base = [int(v) for v in st["switch"].tolist()]
+        tu = st["tuner"] = _Tuner([("usual", base, "usual"), ("queued deep", base, "deep")], self.dev)
+        return tu
+
     def _card_record(self, st: dict[str, Any], g: dict[str, Any], body: Any, what: str) -> None:
         """`body` once eagerly on the arena's stream (the warm-up), then captured there, so the captured
         kernel nodes inherit the stream's persisting window"""
@@ -1010,6 +1184,74 @@ class _CudaMixin(_State):
             return 2
         return 4
 
+    # the step graph's execs: the most replays the card can hold ahead of the host (`_card_depth`); how many it
+    # holds is the lane's (`_Tuner`)
+    CARD_DEPTH = 6
+
+    # the step loop moves to one-step replays queued deep where they measure faster: while another program shares
+    # the card (`_Tuner`)
+    CARD_CONTEND = True
+
+    def _card_step_lane(
+        self, st: dict[str, Any], table: torch.Tensor, U: int, smp: Any, past: int, first: int
+    ) -> dict[str, Any]:
+        """the step graph at `U` steps a replay as a lane of the step loop: captured on first use - `_card_depth()`
+        execs of the same steps, launched in turn (an exec launched again while its last launch still runs waits
+        for it), each writing its own pinned token slots - its length and token set to the answer's start, its
+        sampling configured, and its execs' bookkeeping for this answer fresh"""
+        g, body = self._card_step_graph(st, table, U, smp)
+        g["n0"].fill_(past)
+        g["ids"].fill_(first)
+        if g["graph"] is None:
+            # the warm-up run consumes tokens and advances the length: both are reset after it
+            self._card_record(
+                st,
+                g,
+                lambda: body(0),
+                f"{U} one-row step{'s' if U > 1 else ''} captured as a self-advancing graph",
+            )
+            g["execs"] = [g["graph"]]
+            for e in range(1, len(g["pin_tok"]) // U):
+                cg = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(cg, pool=st["pool"], stream=st["stream"]):
+                    body(e)
+                g["execs"].append(cg)
+            g["n0"].fill_(past)
+            g["ids"].fill_(first)
+        if not smp.greedy:
+            # the pipeline's config, filled before the replays: the temperature and top-p, and the seed as two
+            # int32 halves (the pick derives each step's key from it and the length, so a run repeats on a seed)
+            g["fp"][0] = 1.0 / smp.temperature
+            g["fp"][1] = float(smp.top_p)
+            sd = int(smp.seed or 0)
+            u32 = lambda v: v - (1 << 32) if v >= (1 << 31) else v
+            g["seed"].copy_(torch.tensor([u32(sd & 0xFFFFFFFF), u32((sd >> 32) & 0xFFFFFFFF)], dtype=torch.int32))
+        g["pin_n0"].fill_(past)
+        E = len(g["execs"])
+        return {
+            "U": U,
+            "g": g,
+            "execs": g["execs"],
+            "E": E,
+            "pin_tok": g["pin_tok"],
+            "pin_n0": g["pin_n0"],
+            "pin_ts": g["pin_ts"],
+            "uses": [None] * E,  # the replay each exec last ran, this answer
+            "next": 0,
+        }
+
+    def _card_say(self, line: str) -> None:
+        """a change in how btb runs the card that the person at the console should see (the contention's queue):
+        on the console whatever the log's verbosity, and in the log"""
+        sys.stderr.write(f"  btb: {line}\n")
+        sys.stderr.flush()
+        self.log(f"[card] {line}")
+
+    def _card_depth(self) -> int:
+        """the step graph's execs, each writing its own pinned token slots: the replays the card can hold queued
+        while the host reads the oldest's tokens (2 to 8)"""
+        return max(2, min(8, int(self.CARD_DEPTH)))
+
     def _card_step_graph(
         self, st: dict[str, Any], table: torch.Tensor, U: int, sampling: Any = None
     ) -> tuple[dict[str, Any], Callable[[int], None]]:
@@ -1050,8 +1292,10 @@ class _CudaMixin(_State):
         # 0.3-0.45 ms a step on this platform, where the host polling a pinned counter costs nothing the card
         # sees. Each exec writes its own U token slots; the host reads a replay's slots one replay behind,
         # before the exec that owns them is launched again
-        g["pin_tok"] = torch.zeros(2 * U, dtype=torch.long, pin_memory=True)
+        g["pin_tok"] = torch.zeros(self._card_depth() * U, dtype=torch.long, pin_memory=True)
         g["pin_n0"] = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+        # each step's end on the card's clock (ns), beside its token: a replay's time as the card ran it
+        g["pin_ts"] = torch.zeros(self._card_depth() * U, dtype=torch.long, pin_memory=True)
         st["graphs"][key] = g
 
         k = st["k"]
@@ -1113,7 +1357,13 @@ class _CudaMixin(_State):
                     "btb_publish",
                     (1, 1, 1),
                     (32, 1, 1),
-                    [P(g["n0"]), P(g["ids"]), P(g["pin_tok"][slot : slot + 1]), P(g["pin_n0"])],
+                    [
+                        P(g["n0"]),
+                        P(g["ids"]),
+                        P(g["pin_tok"][slot : slot + 1]),
+                        P(g["pin_n0"]),
+                        P(g["pin_ts"][slot : slot + 1]),
+                    ],
                 )
 
         # handed back beside the graph, never kept in it: the capture is its only caller, and a closure over `g`
@@ -1174,81 +1424,100 @@ class _CudaMixin(_State):
             from .scheduler import MemoryGrantError
 
             raise MemoryGrantError("[card] the embedding table for the step graph was refused after the gate passed")
-        g, body = self._card_step_graph(st, table, U, smp)
         past = cache.get_seq_length()
-        g["n0"].fill_(past)
-        g["ids"].fill_(first)
-        if g["graph"] is None:
-            # the warm-up run consumes tokens and advances the length: both are reset after it. Two execs of
-            # the same steps, launched in turn (a graph exec launched again while its last launch still runs
-            # waits for it), each writing its own pinned token slots
-            self._card_record(
-                st,
-                g,
-                lambda: body(0),
-                f"{U} one-row step{'s' if U > 1 else ''} captured as a self-advancing graph",
-            )
-            cg2 = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(cg2, pool=st["pool"], stream=st["stream"]):
-                body(1)
-            g["graph2"] = cg2
-            g["n0"].fill_(past)
-            g["ids"].fill_(first)
-        if not smp.greedy:
-            # the pipeline's config, filled before the replays: the temperature and top-p, and the seed as two
-            # int32 halves (the pick derives each step's key from it and the length, so a run repeats on a seed)
-            g["fp"][0] = 1.0 / smp.temperature
-            g["fp"][1] = float(smp.top_p)
-            sd = int(smp.seed or 0)
-            u32 = lambda v: v - (1 << 32) if v >= (1 << 31) else v
-            g["seed"].copy_(torch.tensor([u32(sd & 0xFFFFFFFF), u32((sd >> 32) & 0xFFFFFFFF)], dtype=torch.int32))
-        graphs = (g["graph"], g["graph2"])
-        pin_tok, pin_n0 = g["pin_tok"], g["pin_n0"]
-        pin_n0.fill_(past)
+        # the step graph at the unroll the platform's submissions call for, and - where contention may engage
+        # (`CARD_CONTEND`) - at one step a replay: beside another program on the card, short replays queued deep
+        # run in the gaps it leaves, where a longer replay spans them (Qwen3-0.6B at 4k beside a game: 7.7-8.1 ms a
+        # token at one step queued five deep, 9-12 at one queued one deep, 8.2-8.8 at four steps either way). The
+        # lanes share the model's buffers and the length; the answer moves between them at a replay's edge
+        lanes = {U: self._card_step_lane(st, table, U, smp, past, first)}
+        if self.CARD_CONTEND and U > 1:
+            lanes[1] = self._card_step_lane(st, table, 1, smp, past, first)
         done = 0  # tokens the host has read off the replays
         stop = False
+        # each replay's arm (`_Tuner`): its switches and its lane - the usual, one replay queued ahead of the one
+        # the host reads; the deep, one step a replay and the lane's execs less one queued. A replay's time is its
+        # last step's stamp on the card's clock less the replay before it's, a token's share of that what the tuner
+        # compares
+        tu = self._card_tuner(st) if len(lanes) > 1 else None
+        arms: list[int] = []
+        recs: list[tuple[dict[str, Any], int, int, bool]] = []  # each replay: its lane, exec, first step, timed
+        nxt = 0  # the next replay whose tokens the host reads
+        prev_ts: int | None = None
 
-        def token_of(k: int) -> int:
-            # step k has finished when the graph's own copy of the length reads past + k + 1; its token sits
-            # in the slot of its exec and its place within the replay
-            target = past + k + 1
-            waited = time.perf_counter()
-            while int(pin_n0[0]) < target:
-                if time.perf_counter() - waited > 30.0:
-                    raise RuntimeError(f"[card] the step graph did not advance past {target} within 30 s")
-            j, i = divmod(k, U)
-            return int(pin_tok[(j & 1) * U + i])
-
-        n_replays = (steps + U - 1) // U
-        for j in range(n_replays):
-            if self._stop_asked():
-                stop = True
-                break
-            graphs[j & 1].replay()
-            if j >= 1:
-                # the previous replay's tokens, streamed as each step lands
-                for i in range(U):
-                    k = (j - 1) * U + i
-                    if k >= steps:
-                        break
-                    tok = token_of(k)
-                    out.append(tok)
-                    done = k + 1
-                    if on_token:
-                        on_token(tok)
-                    if tok in eos:
-                        stop = True
-                        break
-                if stop:
-                    break
-        if not stop:
-            for k in range((n_replays - 1) * U, steps):
-                tok = token_of(k)
+        def read(r: int) -> bool:
+            """replay r's tokens, streamed as each step lands, and its time; True at an end token"""
+            nonlocal done, prev_ts
+            ln, e, k0, timed = recs[r]
+            Ul = int(ln["U"])
+            for i in range(Ul):
+                k = k0 + i
+                if k >= steps:
+                    return False  # a replay cut short by the answer's end: its last stamp is not waited for
+                # step k has finished when the lane's own copy of the length reads past + k + 1; its token sits in
+                # the slot of its exec and its place within the replay
+                target = past + k + 1
+                waited = time.perf_counter()
+                while int(ln["pin_n0"][0]) < target:
+                    if time.perf_counter() - waited > 30.0:
+                        raise RuntimeError(f"[card] the step graph did not advance past {target} within 30 s")
+                tok = int(ln["pin_tok"][e * Ul + i])
                 out.append(tok)
                 done = k + 1
                 if on_token:
                     on_token(tok)
                 if tok in eos:
+                    return True
+            ts = int(ln["pin_ts"][e * Ul + Ul - 1])
+            if prev_ts is not None and timed and tu is not None:
+                said = tu.after_replay(arms[r], (ts - prev_ts) / Ul / 1e9)
+                if said:
+                    self._card_say(said)
+            prev_ts = ts
+            return False
+
+        cur = lanes[U]
+        k_next = 0  # the next step a replay takes
+        while k_next < steps:
+            if self._stop_asked():
+                stop = True
+                break
+            arm = tu.before_replay(st["switch"]) if tu is not None else 0
+            want = lanes[1] if (tu is not None and tu.lanes[arm] == "deep") else lanes[U]
+            switched = want is not cur
+            if switched:
+                # every replay read before the answer moves lanes, so the lane taken up starts from a length the
+                # host knows; it takes the last replay's token from the card, in stream order
+                while nxt < len(recs) and not stop:
+                    stop, nxt = read(nxt), nxt + 1
+                if stop:
+                    break
+                want["g"]["ids"].copy_(cur["g"]["ids"])
+                want["pin_n0"].fill_(past + k_next)
+                cur = want
+            e = cur["next"]
+            cur["next"] = (e + 1) % cur["E"]
+            # the exec's last replay read before it runs again: its token slots are the ones this replay writes
+            last = cur["uses"][e]
+            while last is not None and nxt <= last and not stop:
+                stop, nxt = read(nxt), nxt + 1
+            if stop:
+                break
+            arms.append(arm)
+            cur["execs"][e].replay()
+            recs.append((cur, e, k_next, not switched))
+            cur["uses"][e] = len(recs) - 1
+            k_next += int(cur["U"])
+            # the replays past the lookahead are read now: one ahead on the usual lane, the execs less one deep
+            ahead = cur["E"] - 1 if (cur is not lanes[U]) else 1
+            while nxt <= len(recs) - 1 - ahead and not stop:
+                stop, nxt = read(nxt), nxt + 1
+            if stop:
+                break
+        if not stop:
+            while nxt < len(recs):
+                end, nxt = read(nxt), nxt + 1
+                if end:
                     break
         torch.cuda.current_stream().synchronize()
         # the rows the sequence's processed tokens occupy: the prompt and every token fed to a replay whose
@@ -1260,6 +1529,8 @@ class _CudaMixin(_State):
             f"[stream] generated {len(out)} tokens over 1 rows in {time.time() - t0:.1f}s "
             f"({(time.time() - t0) / max(1, len(out)):.3f} s/step incl. prefill; the step graph, host {done} behind by one)"
         )
+        if tu is not None:
+            self.log(f"[card] step settings: {tu.report()}")
         return out
 
     def card_warm(self, ids: Tokens, t_max: int | None = None) -> int:
