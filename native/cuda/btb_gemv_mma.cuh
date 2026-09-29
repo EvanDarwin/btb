@@ -3,8 +3,9 @@
 // fp32 accumulation, one kernel for every M (the caller pads x to 32 rows), so a one-row step and a 32-row
 // verify pass compute row r from the same instruction sequence and agree bit for bit.
 //
-//   btb_gemv_mma_bf16(w [R, C], x [32, C], y [32, R], R, C, M)  grid ceil(R / 16) x 1 x 1, block 64 x 1 x 1
-//   (M: the live rows of x, 1..32; the rest are zeros and are not read)
+//   btb_gemv_mma_bf16(w [R, C], x [32, C], y [32, R], R, C, M)  grid ceil(R / 16) x 1 x 1, block 32 W x 1 x 1
+//   (M: the live rows of x, 1..32; the rest are zeros and are not read; W the warps over a row group, 2..8,
+//   the caller's choice by R and C alone - `_card_mma_warps`)
 //
 // The pass is y^T[R, 32] = W[R, C] x^T[C, 32] read as a GEMM with M = 32 (the x rows), N = R (the weight
 // rows), K = C, run on mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32. A warp owns 16 weight rows (two
@@ -39,8 +40,14 @@
 // 258. The layout is a function of R and C alone, never of M and never of the grid, so a shape's launches
 // all give the same bits; blockIdx.x only strides the row groups (lb += gridDim.x), which makes a short
 // grid slow, never wrong.
+//
+// Those splits were measured where the row groups fill the card. A short weight does not: a 1024-row
+// projection is 64 groups, 128 warps over 60 SMs, too few loads standing to stream it (Qwen3-0.6B's o and
+// down ran at 350 GB/s where its 4096-row qkv ran at 415 and the head at 441). There the caller gives a
+// group more warps, k split into that many parts; the partials meet in warp 0 in warp order, one warp's
+// at a time, so a layout's sum is fixed - and at two warps it is the sum it always was.
 
-#define BTB_MMA_WARPS 2
+#define BTB_MMA_WARPS_MAX 8
 #define BTB_MMA_ROWS 16
 #define BTB_MMA_U 4
 
@@ -96,17 +103,18 @@ __device__ __forceinline__ void btb_mma_st2(bf16* p, int c, int R, float a, floa
     }
 }
 
-extern "C" __global__ void __launch_bounds__(32 * BTB_MMA_WARPS)
+extern "C" __global__ void __launch_bounds__(32 * BTB_MMA_WARPS_MAX)
     btb_gemv_mma_bf16(const bf16* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ y, int R,
                       int C, int M) {
     const int lane = threadIdx.x & 31;
     const int slice = threadIdx.x >> 5;
+    const int nw = blockDim.x >> 5;
     const int tig = lane & 3;
     const int gid = lane >> 2;
 
     const int nst = (C + 31) >> 5;
     const int nrg = (R + BTB_MMA_ROWS - 1) / BTB_MMA_ROWS;
-    const int per = (nst + BTB_MMA_WARPS - 1) / BTB_MMA_WARPS;
+    const int per = (nst + nw - 1) / nw;
     const int s0 = min(slice * per, nst), s1 = min(s0 + per, nst);
 
     __shared__ float red[256];
@@ -144,19 +152,21 @@ extern "C" __global__ void __launch_bounds__(32 * BTB_MMA_WARPS)
                          btb_mma_ldw(wb + (st << 5), okb && okk), M);
         }
 
-        // the k halves meet: warp 1's partials into warp 0's, eight of the sixteen at a time
+        // the k parts meet: each warp's partials into warp 0's in warp order, eight of the sixteen at a time
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            if (slice == 1) {
+            for (int s = 1; s < nw; ++s) {
+                if (slice == s) {
 #pragma unroll
-                for (int i = 0; i < 8; ++i) red[(i << 5) + lane] = acc[(h << 3) + i];
-            }
-            __syncthreads();
-            if (slice == 0) {
+                    for (int i = 0; i < 8; ++i) red[(i << 5) + lane] = acc[(h << 3) + i];
+                }
+                __syncthreads();
+                if (slice == 0) {
 #pragma unroll
-                for (int i = 0; i < 8; ++i) acc[(h << 3) + i] += red[(i << 5) + lane];
+                    for (int i = 0; i < 8; ++i) acc[(h << 3) + i] += red[(i << 5) + lane];
+                }
+                __syncthreads();
             }
-            __syncthreads();
         }
 
         if (slice == 0) {

@@ -666,13 +666,35 @@ class _CudaMixin(_State):
             return bool(one)
         return False
 
-    MMA_BLOCK = 64  # btb_gemv_mma_bf16: two warps over one group of 16 weight rows
-
     @staticmethod
     def _card_mma_grid(R: int, C: int) -> int:
         """the launch of btb_gemv_mma_bf16 for a [R, C] weight: one block per group of 16 rows (a shorter grid
         strides the groups and is only slower, never wrong)"""
         return (R + 15) // 16
+
+    # the row groups at which two warps a group keep the card's DRAM streaming (`_card_mma_warps`)
+    MMA_WIDE_GROUPS = 512
+
+    @classmethod
+    def _card_mma_warps(cls, R: int, C: int) -> int:
+        """the warps over one group of 16 weight rows in btb_gemv_mma_bf16, k split between them: two where the
+        groups fill the card, four on a weight too short to (Qwen3-0.6B's 1024-row o and down, 64 groups over 60
+        SMs, streamed at 350 GB/s against its head's 441). A function of the weight's shape alone - never of the
+        pass's rows - so a shape's one-row step and its verify pass sum alike, bit for bit"""
+        return 2 if (R + 15) // 16 >= cls.MMA_WIDE_GROUPS else 4
+
+    # the prefix from which a tree pass's attention reads each KV group's keys once for its heads
+    # (`_card_attn_shared`)
+    ATTN_SHARED_FROM = 8192
+
+    @classmethod
+    def _card_attn_shared(cls, T: int) -> int:
+        """the prefix length from which btb_attn_split_gqa{G} runs a block a KV group - each key read once for
+        the group's heads - where below it a block a head: a tree pass's T rows each re-read the group's keys,
+        which the L2 stops absorbing past a few thousand (Qwen3-0.6B, 5 rows: even at 4k, 11% off the attention
+        at 8k, 26% at 16k, 27% at 40k); a one-row step's re-reads it absorbs, and there the fewer blocks lose.
+        Read on the card from the live prefix, so one graph serves every length; both give the same bits"""
+        return cls.ATTN_SHARED_FROM if T > 1 else 1 << 30
 
     def _card_buffers(
         self, st: dict[str, Any], a: int, b: int, T: int, tail: bool, mma: bool | None = None, rows: bool = False
@@ -750,6 +772,11 @@ class _CudaMixin(_State):
         nrk = f"btb_norm_rope_kv_rows_d{D}" if rows else f"btb_norm_rope_kv_d{D}"
         if attn not in k.fn or nrk not in k.fn:
             raise RuntimeError(f"[card] no kernel for head_dim {D}")
+        # a tree's attention in its grouped-query form where the build has one for the model's group width
+        shared: list[Any] = []
+        gqa = f"btb_attn_split_gqa{Hq // Hk}_d{D}"
+        if not rows and Hq // Hk > 1 and gqa in k.fn:
+            attn, shared = gqa, [ci(self._card_attn_shared(T))]
         S = int(g["S"])
         # where each row's keys lie: the tree's (its prefix length, the rows' depths and parents), or the rows'
         # layout, one array for every rows graph
@@ -761,7 +788,7 @@ class _CudaMixin(_State):
                 k.launch(
                     "btb_gemv_mma_bf16",
                     (self._card_mma_grid(R, C), 1, 1),
-                    (self.MMA_BLOCK, 1, 1),
+                    (32 * self._card_mma_warps(R, C), 1, 1),
                     [P(W), P(xin), P(yout), ci(R), ci(C), ci(T)],
                 )
             else:
@@ -823,6 +850,7 @@ class _CudaMixin(_State):
                     P(g["cnt"]),
                     ci(S),
                     ci(L["win"]),
+                    *shared,
                 ],
             )
             matvec(L["o"], g["att"], g["y"], H, Hq * D)
@@ -849,7 +877,9 @@ class _CudaMixin(_State):
                 )
             matvec(L["gu"], g["x"], g["gu"], 2 * I, H)
             if mma:
-                # the tensor-core kernel has no activation fold: the two kernels, the same bits
+                # the activation its own kernel: folded into the tensor-core kernel's x load, each row group
+                # recomputed the whole row's act(gate) * up before its loads and stalled the stream (Qwen3-0.6B's
+                # down 21.6 us folded against 1.7 + its GEMV apart)
                 k.launch(
                     f"btb_{act}_mul",
                     (min(4096, (M * I + 255) // 256), 1, 1),

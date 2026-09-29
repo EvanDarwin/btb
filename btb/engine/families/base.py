@@ -119,6 +119,13 @@ class Family:
         return (self.kernel_layout or self.sandwich) and not self.own
 
     @property
+    def chunk_causal(self) -> bool:
+        """the family's layers hand the pass's mask to the engine's sdpa untouched: the plain dense block, neither run
+        as the engine's own (`own`) nor through its module's own attention (`eager`) - so a prefill chunk's causal
+        mask can go to them as the rule it is (`attention.ChunkCausal`) and never be built"""
+        return self.dense and not self.own and not self.eager
+
+    @property
     def fused_step(self) -> bool:
         """the MLX step's fused kernels (the q/k norms, the rope and the attention in one) are written for the
         family's block: the kernel layout or the sandwich one; the step takes them for a rotary over the whole head

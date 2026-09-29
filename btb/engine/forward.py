@@ -18,6 +18,7 @@ from ..options import Device
 from ..sampling import as_pick
 from .cache import GrowLayer, conv_states_as, forked
 from .device import where
+from .families.attention import ChunkCausal
 from .native import Native
 from .scheduler import EPOCH, MemoryGrantError
 from .state import _State
@@ -309,8 +310,15 @@ class _ForwardMixin(_State):
         # the graph carries its own rotary tables and its attention needs no mask, and the rotary and the
         # mask together cost more host time than the graph's replay on a small model
         # and only where the cache's rows sit in the graphs' arena, bound now if not: where the arena cannot take
-        # them, the torch layers read them where they are
-        graph_ok = self._card_pass_ok(cache, B, T, past, am, on_layer, stop_after) and self._card_arena_holds(cache, T)
+        # them, the torch layers read them where they are. Never a chunked prefill's chunk (`_batched_cont`): a
+        # prompt's rows are the torch layers' whatever its chunks - a chunk of 32 rows or fewer (a short last one,
+        # or chunks the free memory made that small) took the graph's kernels where a longer one and the
+        # layer-by-layer sweep took torch's, so the same prompt's cache parted by a bf16 step with how it was cut
+        graph_ok = (
+            not getattr(self, "_batched_cont", False)
+            and self._card_pass_ok(cache, B, T, past, am, on_layer, stop_after)
+            and self._card_arena_holds(cache, T)
+        )
         if graph_ok and self._card_segment_at(0, n_layers) == (0, n_layers) and n_layers == self.L:
             self._attn_ctx = cache
             pas = _Pass(
@@ -780,11 +788,23 @@ class _ForwardMixin(_State):
             return max(0, room)
         return int(self.device.free(torch.device("cpu"), unreserved=True) or 0)
 
-    def _chunk_cost(self, on_card: bool | None = None) -> tuple[int, int, int]:
+    def _chunk_rule(self, B: int) -> bool:
+        """a layer-by-layer prefill's card chunks take their causal mask as the rule it is (`ChunkCausal`), and the
+        engine's sdpa runs them with neither the mask nor the keys widened to every head: one sequence, no padding,
+        the family's layers handing the mask to that sdpa (`chunk_causal`), and no window anywhere in the model"""
+        return (
+            B == 1
+            and self.fam.chunk_causal
+            and getattr(self.cfg, "_attn_implementation", None) == "btb_sdpa"
+            and LayerKind.SLIDING not in self.layer_types
+        )
+
+    def _chunk_cost(self, on_card: bool | None = None, rule: bool = False) -> tuple[int, int, int]:
         """A prefill chunk's working set: per row, the bytes of its activations through the widest layer; per (row,
         key) pair, the bytes of its scores where the attention materializes them and of its mask; and per key, the
         bytes of the keys and values widened to every query head where the heads share them. `on_card`: priced for
-        the card's pass or the host's (the tier the engine's prefill runs on when None)"""
+        the card's pass or the host's (the tier the engine's prefill runs on when None); `rule`: a card chunk under
+        its causal rule (`_chunk_rule`), which has neither the mask nor the widened keys"""
         c = self.cfg
         H = int(c.hidden_size) * int(self.fam.streams)
         I = int(getattr(c, "intermediate_size", None) or 4 * H)
@@ -824,7 +844,7 @@ class _ForwardMixin(_State):
             # and the mask once, in the pass's dtype
             scores = 2 * max(nb, self._sinks_bytes()) * Hq + nb
         per_key = 0
-        if getattr(self, "mlx", None) is None and not self.fam.eager:
+        if getattr(self, "mlx", None) is None and not self.fam.eager and not (rule and on_card):
             # torch's sdpa over every key the chunk sees: the causal mask, a value a (row, key) pair at most, and the
             # keys and values widened to every query head (`btb_sdpa`'s expand, transformers' `repeat_kv`)
             scores += nb
@@ -882,7 +902,7 @@ class _ForwardMixin(_State):
         between layers and the cache's growth past what an epoch has reserved for it). The chunk size is priced
         by the two together, and the sweep asks the ledger for them"""
         card = self.dev.type == Device.CUDA
-        work = self._chunk_bytes(C, past + max(0, T - C))
+        work = self._chunk_bytes(C, past + max(0, T - C), rule=card and self._chunk_rule(B))
         if card:
             work += self._grouped_bytes(C, getattr(self, "expert_store", None))
         row_b, park = self._sweep_rows(B, T)
@@ -954,10 +974,10 @@ class _ForwardMixin(_State):
         k = int(getattr(c, "num_experts_per_tok", 1) or 1)
         return 2 * rows * k * (H + max(H + 8 * I, I + 5 * H)) + widen_scratch(store, _Experts.WIDEN_BATCH, I, H)
 
-    def _chunk_bytes(self, rows: int, past: int = 0, on_card: bool | None = None) -> int:
+    def _chunk_bytes(self, rows: int, past: int = 0, on_card: bool | None = None, rule: bool = False) -> int:
         """a prefill chunk of `rows` at position `past`: its activations, its scores and mask against every key it
         sees, and those keys widened to every query head (`_chunk_cost`)"""
-        per_token, scores, per_key = self._chunk_cost(on_card)
+        per_token, scores, per_key = self._chunk_cost(on_card, rule)
         keys = int(past) + int(rows)
         return int(rows) * (per_token + scores * keys) + per_key * keys
 
@@ -1130,6 +1150,8 @@ class _ForwardMixin(_State):
             and all(i in self.resident for i, lt in enumerate(self.layer_types) if lt == LayerKind.FULL)
         )
         self.log(f"[prefill] {T} tokens layer by layer in {len(spans)} chunks of {C} (each layer read once)")
+        # a card chunk's full-attention layers take their causal mask as the rule it is (`_chunk_rule`)
+        chunk_rule = self._chunk_rule(B)
 
         def embed(a: int, b: int) -> torch.Tensor:
             """a chunk's rows into the first layer, as `forward` embeds them"""
@@ -1199,10 +1221,14 @@ class _ForwardMixin(_State):
 
         def chunk_pass(c: int, i: int, lt: str, on_card_now: bool, h: torch.Tensor) -> _Pass:
             f, (a, b) = frames[c], spans[c]
-            causal = None
+            causal: Any = None
             if lt != LayerKind.LINEAR and not tier_owns_attention:
-                # this layer's own cache length is the chunk's position now: the mask the chunked pass built
-                causal = self._causal(h, None, cache, f["text_pos"], True, layer_idx=i)
+                if on_card_now and chunk_rule and lt == LayerKind.FULL:
+                    # the mask the chunked pass built, as its rule: the layer's sdpa runs the chunk without it
+                    causal = ChunkCausal(f["past"])
+                else:
+                    # this layer's own cache length is the chunk's position now: the mask the chunked pass built
+                    causal = self._causal(h, None, cache, f["text_pos"], True, layer_idx=i)
             return _Pass(
                 cache=cache,
                 pe=rope(f, b - a),

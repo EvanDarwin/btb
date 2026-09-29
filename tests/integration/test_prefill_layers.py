@@ -132,13 +132,85 @@ def test_drive_layers_by_layer_hold_their_ring_slot(fx: str) -> None:
     _same(kw, chunk=3, ids=_ids())
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("fx", DENSE)
-def test_dense_card_pass_by_layer_is_the_chunks_bits(fx: str) -> None:
+def test_dense_card_pass_by_layer_is_the_chunks_bits(fx: str, dtype: torch.dtype) -> None:
+    """in bf16 too: the chunks' resident layers, 3 rows past a cache, would fit the card graph, and its kernels
+    round a key a bf16 step from torch's - a chunked prefill's chunk runs the torch layers, as the sweep's does"""
     dev = need_cuda()
     L = layer_count(fixture(fx))
     StreamedTextModel.register_attention()
     kw = {"fx": fx, "device": dev, "cpu_layers": range(L - 2), "resident_layers": range(L - 2, L), "prefill_card": True}
-    _same({**kw, "prefill_card_min": 1, "prefetch": True}, chunk=3, ids=_ids())
+    _same({**kw, "prefill_card_min": 1, "prefetch": True, "compute_dtype": dtype}, chunk=3, ids=_ids())
+
+
+def test_a_card_sweep_under_the_causal_rule_is_the_masks_bits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """a dense model's bf16 card sweep, its chunks' full-attention layers taking their causal mask as the rule
+    (`ChunkCausal`: the efficient kernel's grouped call, no mask built, no keys widened), against the same sweep
+    with the mask built and the keys widened: the same logits and cache, bit for bit"""
+    dev = need_cuda()
+    L = layer_count(fixture("tiny_qwen3"))
+    StreamedTextModel.register_attention()
+    kw = {
+        "fx": "tiny_qwen3",
+        "device": dev,
+        "cpu_layers": range(L - 2),
+        "resident_layers": range(L - 2, L),
+        "prefill_card": True,
+        "prefill_card_min": 1,
+        "prefill_chunk": 3,
+        "compute_dtype": torch.bfloat16,
+    }
+    took: list[bool] = []
+    orig = StreamedTextModel._chunk_rule
+
+    def rule(self: StreamedTextModel, B: int) -> bool:
+        took.append(orig(self, B))
+        return took[-1]
+
+    monkeypatch.setattr(StreamedTextModel, "_chunk_rule", rule)
+    got, got_cache, _ = _prefill(True, _ids(), **kw)
+    assert any(took), "the sweep's chunks took the rule"
+    monkeypatch.setattr(StreamedTextModel, "_chunk_rule", lambda self, B: False)
+    ref, ref_cache, _ = _prefill(True, _ids(), **kw)
+    assert torch.equal(got, ref), f"logits part by {float((got - ref).abs().max()):.3e}"
+    for name, t in ref_cache.items():
+        assert torch.equal(got_cache[name], t), f"{name} parts by {float((got_cache[name] - t).abs().max()):.3e}"
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("past,T", [(0, 64), (0, 1), (300, 64), (1000, 7)])
+@pytest.mark.parametrize("Hq,Hk,D", [(16, 8, 128), (16, 16, 128), (32, 8, 64), (8, 1, 256), (8, 4, 80)])
+def test_a_chunks_causal_rule_is_its_masks_bits(
+    Hq: int, Hk: int, D: int, past: int, T: int, dtype: torch.dtype
+) -> None:
+    """`btb_sdpa` over a chunk's causal rule (`ChunkCausal`: the group's heads batched over the keys as they lie,
+    the kernel's own lower-right mask) against the same chunk under transformers' bool mask with the keys widened to
+    every head: the same bits, over group widths 1 to 8 and head sizes 64 to 256; and where the rule's call cannot
+    take the chunk - the keys past the rule's reach - the rule materialized, which is the mask"""
+    from transformers.masking_utils import sdpa_mask
+
+    from btb.engine.families.attention import ChunkCausal, attention
+
+    dev = need_cuda()
+    torch.manual_seed(3)
+    S = past + T
+    mod = type("M", (), {"num_key_value_groups": Hq // Hk})()
+    q = torch.randn(1, Hq, T, D, device=dev, dtype=dtype)
+    k = torch.randn(1, Hk, S, D, device=dev, dtype=dtype)
+    v = torch.randn(1, Hk, S, D, device=dev, dtype=dtype)
+    mask = sdpa_mask(batch_size=1, q_length=T, kv_length=S, q_offset=past, allow_is_causal_skip=False, device=dev)
+    assert mask is not None
+    want, _ = attention(mod, q, k, v, mask, scaling=D**-0.5)
+    got, _ = attention(mod, q, k, v, ChunkCausal(past), scaling=D**-0.5)
+    assert torch.equal(got, want)
+    # keys past the rule's reach (a cache longer than past + T): the rule's call steps aside for the rule's mask
+    k2 = torch.cat([k, torch.randn_like(k[:, :, :5])], dim=2)
+    v2 = torch.cat([v, torch.randn_like(v[:, :, :5])], dim=2)
+    wide = torch.cat([mask, torch.zeros_like(mask[..., :5])], dim=-1)
+    want2, _ = attention(mod, q, k2, v2, wide, scaling=D**-0.5)
+    got2, _ = attention(mod, q, k2, v2, ChunkCausal(past), scaling=D**-0.5)
+    assert torch.equal(got2, want2)
 
 
 @pytest.mark.parametrize("fx", DENSE)

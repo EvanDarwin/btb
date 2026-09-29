@@ -128,9 +128,13 @@ def _attn_split(
     scale: float,
     split: int = 1024,
     win: int = 0,
+    shared: int | None = None,
 ) -> torch.Tensor:
+    """the tree walk `btb_attn_split_d{D}`, or with `shared` its grouped-query form: a block a KV group from a
+    prefix of `shared` keys on, a block a head below"""
     T, Hq, D = q.shape
     Hk, cap = K.shape[0], K.shape[1]
+    G = Hq // Hk
     S = (cap + split - 1) // split
     out = torch.empty(T, Hq, D, device=dev, dtype=bf)
     n0t = torch.tensor([n0], dtype=torch.int32, device=dev)
@@ -140,7 +144,7 @@ def _attn_split(
     pa = torch.zeros(S * T * Hq * D, device=dev)
     cnt = torch.zeros(T * Hq, dtype=torch.int32, device=dev)
     cu.launch(
-        f"btb_attn_split_d{D}",
+        f"btb_attn_split_d{D}" if shared is None else f"btb_attn_split_gqa{G}_d{D}",
         (Hq, T, S),
         (256, 1, 1),
         [
@@ -163,6 +167,7 @@ def _attn_split(
             # the kernel's last parameter (0: the whole prefix, no sliding window); left off, the driver read the
             # argument array past its end - an access violation on Windows
             I(win),
+            *([] if shared is None else [I(shared)]),
         ],
     )
     assert int(cnt.abs().sum()) == 0, "every (head, row) count is reset by its last block"
@@ -190,6 +195,28 @@ def test_split_attention_matches_the_reference_across_splits_and_reproduces_one_
     K2[:, n0 + 1], V2[:, n0 + 1] = K[:, n0 + 3], V[:, n0 + 3]
     one = _attn_split(cu, q[3:4], K2, V2, n0 + 1, [-1], scale)
     assert torch.equal(one[0], out[3])
+
+
+@pytest.mark.parametrize("win", [0, 128])
+@pytest.mark.parametrize("n0", [300, 1500, 3000])
+@pytest.mark.parametrize("Hq,Hk,D", [(16, 8, 128), (32, 8, 128), (64, 8, 64), (16, 8, 256)])
+def test_the_grouped_query_split_attention_is_the_one_head_kernel_bit_for_bit(
+    cu: _Cuda, Hq: int, Hk: int, D: int, n0: int, win: int
+) -> None:
+    """a KV group's G heads in one block, each key's K and V read once for all of them
+    (`btb_attn_split_gqa{G}_d{D}`): every head's row is the one-head kernel's bit for bit - its keys in the same
+    warps and order, its splits folded in the same order - over a tree pass, across splits, under a window; and
+    below its threshold the kernel is the one-head kernel"""
+    torch.manual_seed(11)
+    cap, T = 4096, 5
+    K = torch.randn(Hk, cap, D, device=dev, dtype=bf)
+    V = torch.randn(Hk, cap, D, device=dev, dtype=bf)
+    q = torch.randn(T, Hq, D, device=dev, dtype=bf)
+    scale = 1.0 / math.sqrt(D)
+    par = [-1, 0, 1, 0, 3]
+    want = _attn_split(cu, q, K, V, n0, par, scale, win=win)
+    for shared in (0, n0, n0 + 1, 1 << 30):
+        assert torch.equal(_attn_split(cu, q, K, V, n0, par, scale, win=win, shared=shared), want), shared
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -473,49 +500,52 @@ def test_scheduler_reports_the_hierarchy(cu: _Cuda) -> None:
 
 # ---------------------------------------------------------------------------------------------------------
 # the tensor-core matvec: one kernel for every row count, the caller padding x to the 32 rows it always
-# carries. A row group is 16 weight rows to a 64-thread block, so the grid is ceil(R / 16).
+# carries. A row group is 16 weight rows to a block of 2 to 8 warps (k split between them), so the grid is
+# ceil(R / 16).
 # ---------------------------------------------------------------------------------------------------------
 
 MMA_SHAPES = [(151936, 1024), (19456, 2560), (2560, 9728), (4096, 1024), (6144, 1024), (1024, 3072), (6144, 2560)]
 
 
-def _mma(cu: _Cuda, W: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+def _mma(cu: _Cuda, W: torch.Tensor, x: torch.Tensor, warps: int = 2) -> torch.Tensor:
     M, C = x.shape
     R = W.shape[0]
     xp = x if M == 32 else torch.cat([x, torch.zeros(32 - M, C, device=dev, dtype=x.dtype)])
     y = torch.empty(32, R, device=dev, dtype=bf)
-    cu.launch("btb_gemv_mma_bf16", ((R + 15) // 16, 1, 1), (64, 1, 1), [P(W), P(xp), P(y), I(R), I(C), I(M)])
+    cu.launch("btb_gemv_mma_bf16", ((R + 15) // 16, 1, 1), (32 * warps, 1, 1), [P(W), P(xp), P(y), I(R), I(C), I(M)])
     return y[:M]
 
 
+@pytest.mark.parametrize("warps", [2, 4, 8])
 @pytest.mark.parametrize("R,C", MMA_SHAPES + [(1020, 1032), (17, 8), (16, 32)])
-def test_gemv_mma_matches_linear_within_one_ulp(cu: _Cuda, R: int, C: int) -> None:
+def test_gemv_mma_matches_linear_within_one_ulp(cu: _Cuda, R: int, C: int, warps: int) -> None:
     torch.manual_seed(0)
     W = torch.randn(R, C, device=dev, dtype=bf)
     x = torch.randn(32, C, device=dev, dtype=bf)
     ref = F.linear(x, W).float()
     # within one bf16 ulp of cuBLAS at the outputs' magnitude - the k inside a super-tile is permuted, so the
     # fp32 sums differ from cuBLAS's in the last bits and can round to the neighbouring bf16
-    assert (_mma(cu, W, x).float() - ref).abs().max().item() <= ref.abs().max().item() * 2**-7
+    assert (_mma(cu, W, x, warps).float() - ref).abs().max().item() <= ref.abs().max().item() * 2**-7
 
 
+@pytest.mark.parametrize("warps", [2, 4, 8])
 @pytest.mark.parametrize("R,C", [(151936, 1024), (2560, 9728), (1024, 3072), (1020, 1032)])
-def test_gemv_mma_is_repeat_identical_and_carries_no_row_across(cu: _Cuda, R: int, C: int) -> None:
+def test_gemv_mma_is_repeat_identical_and_carries_no_row_across(cu: _Cuda, R: int, C: int, warps: int) -> None:
     torch.manual_seed(1)
     W = torch.randn(R, C, device=dev, dtype=bf)
     x = torch.randn(32, C, device=dev, dtype=bf)
-    y = _mma(cu, W, x)
-    assert torch.equal(y, _mma(cu, W, x))
+    y = _mma(cu, W, x, warps)
+    assert torch.equal(y, _mma(cu, W, x, warps))
     # row 0 is the one-row step's bits whatever stands in the other 31: mma accumulates each output element
     # from its own row of x, so a 1-row step and a 32-row verify pass agree bit for bit
     zeros = x.clone()
     zeros[1:] = 0
-    assert torch.equal(y[:1], _mma(cu, W, zeros)[:1])
+    assert torch.equal(y[:1], _mma(cu, W, zeros, warps)[:1])
     other = x.clone()
     other[1:] = torch.randn(31, C, device=dev, dtype=bf)
-    assert torch.equal(y[:1], _mma(cu, W, other)[:1])
+    assert torch.equal(y[:1], _mma(cu, W, other, warps)[:1])
     # and a 4-row pass is the first four rows of the 32-row one
-    assert torch.equal(y[:4], _mma(cu, W, x[:4]))
+    assert torch.equal(y[:4], _mma(cu, W, x[:4], warps))
 
 
 def test_gemv_mma_streams_the_weights_at_the_cards_ceiling(cu: _Cuda, capsys: CaptureFixture[str]) -> None:

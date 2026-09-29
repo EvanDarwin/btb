@@ -311,6 +311,105 @@ def test_cuda_gemv_bf16(benchmark: object, m: int) -> None:
     benchmark(run)  # type: ignore[operator]
 
 
+# the decode's weight shapes, [R, C], on Qwen3-0.6B: q/k/v as one, the attention's output, gate/up as one, down
+MMA_SHAPES = {"qkv": (4096, 1024), "o": (1024, 2048), "gu": (6144, 1024), "down": (1024, 3072)}
+
+
+@cuda_only
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("warps", [2, 4, 8])
+@pytest.mark.parametrize("shape", list(MMA_SHAPES))
+def test_cuda_gemv_mma(benchmark: object, shape: str, warps: int) -> None:
+    """the tensor-core matvec `btb_gemv_mma_bf16` at one row over a decode's weight shapes, by warps a row group:
+    a round streams distinct weights past the card's L2 back to back, as a step reads its layers, and the rate is
+    the weights' bytes over the round (`gbps`). A short weight (1024 rows: 64 groups on a 60-SM card) streams at
+    its best with more warps to a group than a tall one"""
+    k = _cuda_kernels()
+    if "btb_gemv_mma_bf16" not in k.fn:
+        pytest.skip("the tensor-core matvec is not in this build")
+    R, C = MMA_SHAPES[shape]
+    n = -(-(160 << 20) // (R * C * 2))  # past a 48 MB L2 several times, so every read is the DRAM's
+    ws = [torch.randn(R, C, dtype=torch.bfloat16, device="cuda") for _ in range(n)]
+    x = torch.randn(32, C, dtype=torch.bfloat16, device="cuda")
+    y = torch.empty(32, R, dtype=torch.bfloat16, device="cuda")
+    grid, block = ((R + 15) // 16, 1, 1), (32 * warps, 1, 1)
+    args = [[k.ptr(w), k.ptr(x), k.ptr(y), ctypes.c_int(R), ctypes.c_int(C), ctypes.c_int(1)] for w in ws]
+
+    def body() -> None:
+        for a in args:
+            k.launch("btb_gemv_mma_bf16", grid, block, a)
+
+    # the round as one captured graph, as a step replays its layers: the host's launches out of the time
+    body()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        body()
+
+    def run() -> None:
+        g.replay()
+        torch.cuda.synchronize()
+
+    benchmark.group = f"cuda-gemv-mma-{shape}"  # type: ignore[attr-defined]
+    benchmark(run)  # type: ignore[operator]
+    mean = float(benchmark.stats.stats.mean)  # type: ignore[attr-defined]
+    benchmark.extra_info["gbps"] = round(n * R * C * 2 / mean / 1e9, 1)  # type: ignore[attr-defined]
+
+
+@cuda_only
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("how", ["split", "gqa", "gqa-off"])
+@pytest.mark.parametrize("T", [1, 5])  # the one-row step, a speculative tree's verify
+@pytest.mark.parametrize("n", [128, 512, 1024, 2048, 4096, 8192, 16384, 40960])  # the context the rows attend over
+def test_cuda_attn_gqa(benchmark: object, n: int, T: int, how: str) -> None:
+    """a decode step's attention at Qwen3-0.6B's heads (16 q, 8 kv, d 128): `btb_attn_split_d128`, a block a query
+    head, against `btb_attn_split_gqa2_d128`, a block a KV group reading each key once for its two heads - the same
+    bits (tests/kernels) - and against that kernel below its threshold (`gqa-off`: a block a head, what its
+    registers cost the one-head walk). A round runs one launch a layer over distinct caches past the L2, as a step does, and the
+    rate is the caches' live K/V bytes over the round (`gbps`)."""
+    k = _cuda_kernels()
+    if "btb_attn_split_gqa2_d128" not in k.fn:
+        pytest.skip("the grouped-query attention is not in this build")
+    Hq, Hk, D = 16, 8, 128
+    cap = (n + T + 1023) // 1024 * 1024
+    S = cap // 1024
+    live = 2 * Hk * (n + T) * D * 2
+    layers = min(28, -(-(160 << 20) // live))
+    KV = [torch.randn(2, Hk, cap, D, dtype=torch.bfloat16, device="cuda") for _ in range(layers)]
+    q = torch.randn(T, Hq, D, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty(T, Hq, D, dtype=torch.bfloat16, device="cuda")
+    pm = torch.zeros(S * T * Hq, device="cuda")
+    pl = torch.zeros(S * T * Hq, device="cuda")
+    pa = torch.zeros(S * T * Hq * D, device="cuda")
+    cnt = torch.zeros(T * Hq, dtype=torch.int32, device="cuda")
+    n0 = torch.tensor([n], dtype=torch.int32, device="cuda")
+    par = torch.tensor([-1, 0, 1, 0, 3][:T], dtype=torch.int32, device="cuda")
+    P, I, F = k.ptr, ctypes.c_int, ctypes.c_float
+    name = "btb_attn_split_d128" if how == "split" else "btb_attn_split_gqa2_d128"
+    tail = [I(T), I(Hq), I(Hk), I(cap), F(D**-0.5), P(pm), P(pl), P(pa), P(cnt), I(S), I(0)]
+    tail += [] if how == "split" else [I(0 if how == "gqa" else 1 << 30)]
+    args = [[P(q), P(kv[0]), P(kv[1]), P(out), P(n0), P(par), *tail] for kv in KV]
+
+    def body() -> None:
+        for a in args:
+            k.launch(name, (Hq, T, S), (256, 1, 1), a)
+
+    body()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        body()
+
+    def run() -> None:
+        g.replay()
+        torch.cuda.synchronize()
+
+    benchmark.group = f"cuda-attn-gqa-n{n}-t{T}"  # type: ignore[attr-defined]
+    benchmark(run)  # type: ignore[operator]
+    mean = float(benchmark.stats.stats.mean)  # type: ignore[attr-defined]
+    benchmark.extra_info["gbps"] = round(layers * live / mean / 1e9, 1)  # type: ignore[attr-defined]
+
+
 @cuda_only
 @pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
 @pytest.mark.parametrize("how", ["rows", "per-row"])

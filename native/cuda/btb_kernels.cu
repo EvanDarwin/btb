@@ -251,6 +251,32 @@ GEMV_ACT(32)
 // alone walks over a contiguous cache, so a row's bits are its own decode's whatever rows step beside it.
 // ---------------------------------------------------------------------------------------------------------
 #define ATTN_SPLIT 1024
+// the keys a warp loads, then scores, then folds in order: its K and V rows standing together, and their scores'
+// butterflies side by side instead of each behind the last key's softmax. A short sequence - a block a head, a
+// warp 128 keys at 1k - is nothing but that chain (Qwen3-0.6B at 1k: 32 us a layer for 4 MB). A key's score is
+// its own dot product and butterfly and the fold is key by key in order whatever the batch, so the batch moves
+// no bit; it is bounded by the registers the rows take (E a lane a row), which the long-context tree needs for
+// the blocks it keeps resident
+#define ATTN_BATCH(E) ((E) >= 8 ? 4 : 8)
+
+// the batch's B scores q . k_u * scale, each over the lane's E elements then the butterfly: independent chains
+template <int E, int B>
+__device__ __forceinline__ void attn_scores(float* sc, const float* qf, const Vec<E>* kv, float scale) {
+#pragma unroll
+    for (int u = 0; u < B; ++u) {
+        float d = 0.f;
+#pragma unroll
+        for (int e = 0; e < E; ++e) d = fmaf(qf[e], kv[u].at(e), d);
+        sc[u] = d;
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+#pragma unroll
+        for (int u = 0; u < B; ++u) sc[u] += __shfl_xor_sync(0xffffffffu, sc[u], o);
+    }
+#pragma unroll
+    for (int u = 0; u < B; ++u) sc[u] *= scale;
+}
 
 // the rows' layout, one int32 array on the card: [base, steps, W, then per row (col, off, len)]; a row with
 // len < 0 is padding (the pass is launched for a width its graph was captured at) and computes nothing
@@ -341,11 +367,11 @@ __device__ __forceinline__ void attn_decode_split(const bf16* __restrict__ q, co
     const int lo = s * ATTN_SPLIT, hi = min(lo + ATTN_SPLIT, n);
     for (int j0 = lo + w * 32; j0 < hi; j0 += 256) {
         const int j1 = min(j0 + 32, hi);
-        for (int j = j0; j < j1; j += 4) {
-            const int c4 = min(4, j1 - j);
-            Vec<E> kv[4], vv[4];
+        for (int j = j0; j < j1; j += ATTN_BATCH(E)) {
+            const int c4 = min(ATTN_BATCH(E), j1 - j);
+            Vec<E> kv[ATTN_BATCH(E)] = {}, vv[ATTN_BATCH(E)];
 #pragma unroll
-            for (int u = 0; u < 4; ++u) {
+            for (int u = 0; u < ATTN_BATCH(E); ++u) {
                 if (u < c4 && j + u >= first) {
                     const int jj = j + u;
                     int slot;
@@ -361,16 +387,14 @@ __device__ __forceinline__ void attn_decode_split(const bf16* __restrict__ q, co
                     vv[u].load(Vg + (size_t)slot * rowstride);
                 }
             }
+            float sc[ATTN_BATCH(E)];
+            attn_scores<E, ATTN_BATCH(E)>(sc, qf, kv, scale);
 #pragma unroll
-            for (int u = 0; u < 4; ++u) {
+            for (int u = 0; u < ATTN_BATCH(E); ++u) {
                 if (u < c4 && j + u >= first) {
-                    float sc = 0.f;
-#pragma unroll
-                    for (int e = 0; e < E; ++e) sc = fmaf(qf[e], kv[u].at(e), sc);
-                    sc = warp_sum(sc) * scale;
-                    const float mn = fmaxf(m, sc);
+                    const float mn = fmaxf(m, sc[u]);
                     const float corr = expf(m - mn);
-                    const float p = expf(sc - mn);
+                    const float p = expf(sc[u] - mn);
                     l = l * corr + p;
 #pragma unroll
                     for (int e = 0; e < E; ++e) acc[e] = fmaf(p, vv[u].at(e), acc[e] * corr);
@@ -484,6 +508,210 @@ ATTN_SPLIT_K(64)
 ATTN_SPLIT_K(128)
 ATTN_SPLIT_K(256)
 
+// ---------------------------------------------------------------------------------------------------------
+// the tree walk above for the G query heads of one KV group at once: one block loads each of its keys' K and V
+// rows once and runs every head's walk over them - where a block a query head reads the group's rows G times
+// over, and a tree pass's T rows T times more. The L2 catches most of that for a one-row step; a long tree's
+// verify it does not (Qwen3-0.6B, a 5-row tree: 11% off the attention at 8k, 27% at 40k). Each head's walk is the
+// one above operation for operation - its keys in the same warps and order, its online softmax, its warps
+// folded in order (warp h folds head h), its splits folded in order by the last block - so a head's bits are
+// the one-head kernel's, and the partials and counts are the one-head kernel's, a head's by its own row.
+// ---------------------------------------------------------------------------------------------------------
+template <int D, int G>
+__device__ __forceinline__ void attn_split_gqa(const bf16* __restrict__ q, const bf16* __restrict__ K,
+                                               const bf16* __restrict__ V, bf16* __restrict__ out, int n0,
+                                               const int* __restrict__ par, int g, int T, int Hq, int cap,
+                                               float scale, float* __restrict__ part_m, float* __restrict__ part_l,
+                                               float* __restrict__ part_acc, int* __restrict__ cnt, int win) {
+    static_assert(G <= 8, "a head's fold is one warp's");
+    constexpr int E = D / 32;
+    const int t = blockIdx.y, s = blockIdx.z;
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    __shared__ int anc[32];
+    __shared__ int s_d;
+    if (threadIdx.x == 0) {
+        int tmp[32];
+        int len = 0;
+        for (int p = t; p >= 0 && p < T && len < 32; p = par[p]) tmp[len++] = p;
+        for (int e = 0; e < len; ++e) anc[e] = tmp[len - 1 - e];
+        s_d = len - 1;
+    }
+    __syncthreads();
+    const int n = n0 + s_d + 1;
+    const int S_active = (n + ATTN_SPLIT - 1) / ATTN_SPLIT;
+    if (s >= S_active) return;
+    float qf[G][E];
+#pragma unroll
+    for (int hh = 0; hh < G; ++hh) {
+        const bf16* qp = q + ((size_t)t * Hq + g * G + hh) * D + lane * E;
+#pragma unroll
+        for (int e = 0; e < E; ++e) qf[hh][e] = bf2f(qp[e]);
+    }
+    const bf16* Kg = K + (size_t)g * cap * D + lane * E;
+    const bf16* Vg = V + (size_t)g * cap * D + lane * E;
+    float m[G], l[G], acc[G][E];
+#pragma unroll
+    for (int hh = 0; hh < G; ++hh) {
+        m[hh] = NEG_INF;
+        l[hh] = 0.f;
+#pragma unroll
+        for (int e = 0; e < E; ++e) acc[hh][e] = 0.f;
+    }
+    const int first = win > 0 ? max(n - win, 0) : 0;
+    const int lo = s * ATTN_SPLIT, hi = min(lo + ATTN_SPLIT, n);
+    // four keys a batch: the G heads' scores are the independent chains here, and the block keeps the registers
+    // the long-context tree needs resident (at eight, 97 of them on d128 x 2 heads, 16% slower at 40k)
+    constexpr int B = 4;
+    for (int j0 = lo + w * 32; j0 < hi; j0 += 256) {
+        const int j1 = min(j0 + 32, hi);
+        for (int j = j0; j < j1; j += B) {
+            const int c4 = min(B, j1 - j);
+            Vec<E> kv[B] = {}, vv[B];
+#pragma unroll
+            for (int u = 0; u < B; ++u) {
+                if (u < c4 && j + u >= first) {
+                    const int jj = j + u;
+                    const int slot = jj < n0 ? jj : n0 + anc[jj - n0];
+                    kv[u].load(Kg + (size_t)slot * D);
+                    vv[u].load(Vg + (size_t)slot * D);
+                }
+            }
+            // head by head: the batch's scores, then the head's fold over them in key order
+#pragma unroll
+            for (int hh = 0; hh < G; ++hh) {
+                float sc[B];
+                attn_scores<E, B>(sc, qf[hh], kv, scale);
+#pragma unroll
+                for (int u = 0; u < B; ++u) {
+                    if (u < c4 && j + u >= first) {
+                        const float mn = fmaxf(m[hh], sc[u]);
+                        const float corr = expf(m[hh] - mn);
+                        const float p = expf(sc[u] - mn);
+                        l[hh] = l[hh] * corr + p;
+#pragma unroll
+                        for (int e = 0; e < E; ++e) acc[hh][e] = fmaf(p, vv[u].at(e), acc[hh][e] * corr);
+                        m[hh] = mn;
+                    }
+                }
+            }
+        }
+    }
+    // every warp's state for every head, then warp h folds head h's eight in order and writes its row, or its
+    // partial and - the last split to arrive - the row from every split
+    __shared__ float sm_m[G][8], sm_l[G][8];
+    __shared__ float sm_acc[G][8][D];
+#pragma unroll
+    for (int hh = 0; hh < G; ++hh) {
+        if (lane == 0) {
+            sm_m[hh][w] = m[hh];
+            sm_l[hh][w] = l[hh];
+        }
+#pragma unroll
+        for (int e = 0; e < E; ++e) sm_acc[hh][w][lane * E + e] = acc[hh][e];
+    }
+    __syncthreads();
+    if (w >= G) return;
+    const int hh = w;
+    float M = sm_m[hh][0], L = sm_l[hh][0], o[E];
+#pragma unroll
+    for (int e = 0; e < E; ++e) o[e] = sm_acc[hh][0][lane * E + e];
+    for (int u = 1; u < 8; ++u) {
+        const float mu = sm_m[hh][u];
+        if (mu == NEG_INF) continue;
+        if (M == NEG_INF) {
+            M = mu;
+            L = sm_l[hh][u];
+#pragma unroll
+            for (int e = 0; e < E; ++e) o[e] = sm_acc[hh][u][lane * E + e];
+            continue;
+        }
+        const float Mn = fmaxf(M, mu);
+        const float c0 = expf(M - Mn), c1 = expf(mu - Mn);
+        L = L * c0 + sm_l[hh][u] * c1;
+#pragma unroll
+        for (int e = 0; e < E; ++e) o[e] = o[e] * c0 + sm_acc[hh][u][lane * E + e] * c1;
+        M = Mn;
+    }
+    const size_t row = ((size_t)t * Hq + g * G + hh);
+    if (S_active == 1) {
+        bf16* op = out + row * D + lane * E;
+        const float inv = 1.f / L;
+#pragma unroll
+        for (int e = 0; e < E; ++e) op[e] = f2bf(o[e] * inv);
+        return;
+    }
+    const size_t idx = (size_t)s * T * Hq + row;
+    if (lane == 0) {
+        part_m[idx] = M;
+        part_l[idx] = L;
+    }
+#pragma unroll
+    for (int e = 0; e < E; ++e) part_acc[idx * D + lane * E + e] = o[e];
+    __threadfence();
+    __syncwarp();
+    int last = 0;
+    if (lane == 0) last = (atomicAdd(cnt + row, 1) == S_active - 1) ? 1 : 0;
+    last = __shfl_sync(0xffffffffu, last, 0);
+    if (!last) return;
+    __threadfence();
+    M = NEG_INF;
+    L = 0.f;
+#pragma unroll
+    for (int e = 0; e < E; ++e) o[e] = 0.f;
+    for (int u = 0; u < S_active; ++u) {
+        const size_t iu = (size_t)u * T * Hq + row;
+        const float mu = __ldcg(part_m + iu);
+        if (mu == NEG_INF) continue;
+        const float lu = __ldcg(part_l + iu);
+        if (M == NEG_INF) {
+            M = mu;
+            L = lu;
+#pragma unroll
+            for (int e = 0; e < E; ++e) o[e] = __ldcg(part_acc + iu * D + lane * E + e);
+            continue;
+        }
+        const float Mn = fmaxf(M, mu);
+        const float c0 = expf(M - Mn), c1 = expf(mu - Mn);
+        L = L * c0 + lu * c1;
+#pragma unroll
+        for (int e = 0; e < E; ++e) o[e] = o[e] * c0 + __ldcg(part_acc + iu * D + lane * E + e) * c1;
+        M = Mn;
+    }
+    bf16* op = out + row * D + lane * E;
+    const float inv = 1.f / L;
+#pragma unroll
+    for (int e = 0; e < E; ++e) op[e] = f2bf(o[e] * inv);
+    if (lane == 0) cnt[row] = 0;
+}
+
+// btb_attn_split_d{D}'s launch - grid (Hq, T, S) - plus `shared`: from a prefix of that many keys on (n0, on
+// the card, so one captured graph serves every context), block (g G, t, s) runs its group's G heads and the
+// group's other blocks leave; below it every block runs its own head. Both give every head the same bits.
+#define ATTN_SPLIT_GQA_K(G, D)                                                                               \
+    extern "C" __global__ void __launch_bounds__(256) btb_attn_split_gqa##G##_d##D(                          \
+        const bf16* __restrict__ q, const bf16* __restrict__ K, const bf16* __restrict__ V,                  \
+        bf16* __restrict__ out, const int* __restrict__ n0p, const int* __restrict__ par, int T, int Hq,     \
+        int Hk, int cap, float scale, float* __restrict__ part_m, float* __restrict__ part_l,                \
+        float* __restrict__ part_acc, int* __restrict__ cnt, int S, int win, int shared) {                   \
+        const int n0 = *n0p;                                                                                 \
+        if (blockIdx.z * ATTN_SPLIT >= n0 + T) return;                                                       \
+        if (n0 >= shared) {                                                                                  \
+            if (blockIdx.x % G) return;                                                                      \
+            attn_split_gqa<D, G>(q, K, V, out, n0, par, blockIdx.x / G, T, Hq, cap, scale, part_m, part_l,   \
+                                 part_acc, cnt, win);                                                        \
+        } else {                                                                                             \
+            attn_decode_split<D, WALK_TREE>(q, K, V, out, n0p, par, nullptr, nullptr, nullptr, 0, 0, T, Hq,  \
+                                            Hk, cap, scale, part_m, part_l, part_acc, cnt, S, win);          \
+        }                                                                                                    \
+    }
+ATTN_SPLIT_GQA_K(2, 64)
+ATTN_SPLIT_GQA_K(2, 128)
+ATTN_SPLIT_GQA_K(2, 256)
+ATTN_SPLIT_GQA_K(4, 64)
+ATTN_SPLIT_GQA_K(4, 128)
+ATTN_SPLIT_GQA_K(4, 256)
+ATTN_SPLIT_GQA_K(8, 64)
+ATTN_SPLIT_GQA_K(8, 128)
 
 // ---------------------------------------------------------------------------------------------------------
 // norm + rope + cache write: qkv [T, (Hq + 2 Hk) * D] bf16 (the merged projection's output), wq/wk [D] the
