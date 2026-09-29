@@ -72,6 +72,32 @@ def test_the_os_speaks_for_its_own_memory() -> None:
     assert p["level"] >= 0.0
 
 
+def test_the_wddm_budget_is_read_for_the_card_dxgi_names_and_none_elsewhere() -> None:
+    """this process's WDDM budget room: None off Windows and for a card DXGI does not list; on Windows beside an
+    NVIDIA card nvidia-smi names, a figure no larger than the card (the budget is at most the card, less what this
+    torch-free process uses there: nothing)"""
+    import shutil
+    import subprocess
+
+    from btb.sysinfo import wddm_room
+
+    assert wddm_room("no such card", 1 << 30) is None
+    if sys.platform != "win32" or shutil.which("nvidia-smi") is None:
+        return
+    out = subprocess.run(
+        ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    ).stdout.strip()
+    rows = [r.rsplit(",", 1) for r in out.splitlines() if "," in r]
+    if len(rows) != 1:
+        return  # several cards of one name are not named uniquely, and read None
+    name, mib = rows[0][0].strip(), int(rows[0][1])
+    room = wddm_room(name, mib << 20)
+    assert room is not None and 0 < room <= (mib << 20), (name, mib, room)
+
+
 def test_raise_file_limit_lifts_a_low_soft_limit() -> None:
     """macOS starts a process at 256 open files, fewer than the drive readers' handle per thread per shard"""
     if sys.platform == "win32":

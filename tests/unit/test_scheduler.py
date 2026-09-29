@@ -67,13 +67,14 @@ def cuda_stats(
     allocated: int = 0,
     raises: BaseException | None = None,
     physical: int | None = 1 << 62,
+    budget: int | None = None,
 ) -> Iterator[dict[str, int]]:
     """`torch.cuda`'s three memory readings, patched, plus the cross-process physical free (`free_bytes` clamps
     the per-process reading to it; a huge default makes the clamp a no-op so these price the mem_get_info
-    arithmetic alone). `free` may be a list: one reading per call, the last repeating, staging a run whose free
-    memory moves between plans."""
+    arithmetic alone) and the WDDM budget's room (None: no budget, as off Windows). `free` may be a list: one
+    reading per call, the last repeating, staging a run whose free memory moves between plans."""
     saved = (torch.cuda.mem_get_info, torch.cuda.memory_reserved, torch.cuda.memory_allocated)
-    saved_phys = device_mod._physical_free_bytes
+    saved_phys, saved_budget = device_mod._physical_free_bytes, device_mod._wddm_room
     seen = {"mem_get_info": 0}
     seq = list(free) if isinstance(free, (list, tuple)) else None
 
@@ -89,11 +90,12 @@ def cuda_stats(
     torch.cuda.memory_reserved = lambda *a, **k: int(reserved)
     torch.cuda.memory_allocated = lambda *a, **k: int(allocated)
     device_mod._physical_free_bytes = lambda dev: None if physical is None else int(physical)
+    device_mod._wddm_room = lambda dev: None if budget is None else int(budget)
     try:
         yield seen
     finally:
         torch.cuda.mem_get_info, torch.cuda.memory_reserved, torch.cuda.memory_allocated = saved
-        device_mod._physical_free_bytes = saved_phys
+        device_mod._physical_free_bytes, device_mod._wddm_room = saved_phys, saved_budget
 
 
 V = 64  # the toy vocabulary
@@ -2886,6 +2888,20 @@ def test_free_bytes_adds_this_processs_own_reclaimable_pool_over_the_physical_fr
     with cuda_stats(free=10 * GB, reserved=3 * GB, allocated=1 * GB, physical=5 * GB):
         # the physical 5 GB plus this process's own 2 GB reserved-but-unallocated pool it can reuse
         assert device_mod.free_bytes(torch.device("cuda:0")) == 5 * GB + 2 * GB
+
+
+def test_free_bytes_holds_the_card_to_what_the_wddm_budget_leaves_this_process() -> None:
+    # a game in the foreground: the physical free still reads 5 GB, but Windows keeps only 1 GB more of this
+    # process resident before paging (it, or the game) out - the budget's room, this process's own reusable pool on
+    # top (the budget's usage counts it whole)
+    with cuda_stats(free=10 * GB, reserved=3 * GB, allocated=1 * GB, physical=5 * GB, budget=1 * GB):
+        assert device_mod.free_bytes(torch.device("cuda:0")) == 1 * GB + 2 * GB
+    # past its budget already: nothing more, but what it holds unused it can still reuse
+    with cuda_stats(free=10 * GB, reserved=3 * GB, allocated=1 * GB, physical=5 * GB, budget=-2 * GB):
+        assert device_mod.free_bytes(torch.device("cuda:0")) == 2 * GB
+    # a budget with more room than the card has free: the physical free stands
+    with cuda_stats(free=10 * GB, physical=5 * GB, budget=9 * GB):
+        assert device_mod.free_bytes(torch.device("cuda:0")) == 5 * GB
 
 
 def test_free_bytes_falls_back_to_mem_get_info_when_the_physical_free_is_unreadable() -> None:

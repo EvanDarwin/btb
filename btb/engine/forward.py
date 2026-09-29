@@ -16,9 +16,9 @@ from .. import mlx as mlxdev
 from ..kinds import LayerKind, LayerTier, Parents, PassTag, TokenRows
 from ..options import Device
 from ..sampling import as_pick
-from .cache import GrowLayer, conv_states_as
+from .cache import GrowLayer, conv_states_as, forked
 from .native import Native
-from .scheduler import EPOCH
+from .scheduler import EPOCH, MemoryGrantError
 from .state import _State
 
 # the ledger's tag for a layer-by-layer prefill's own working set, for the sweep: on the card, and on the host where
@@ -309,7 +309,9 @@ class _ForwardMixin(_State):
         # a pass the card graph takes whole (every layer one resident run) needs none of the preamble below:
         # the graph carries its own rotary tables and its attention needs no mask, and the rotary and the
         # mask together cost more host time than the graph's replay on a small model
-        graph_ok = self._card_pass_ok(cache, B, T, past, am, on_layer, stop_after)
+        # and only where the cache's rows sit in the graphs' arena, bound now if not: where the arena cannot take
+        # them, the torch layers read them where they are
+        graph_ok = self._card_pass_ok(cache, B, T, past, am, on_layer, stop_after) and self._card_arena_holds(cache, T)
         if graph_ok and self._card_segment_at(0, n_layers) == (0, n_layers) and n_layers == self.L:
             self._attn_ctx = cache
             pas = _Pass(
@@ -822,7 +824,10 @@ class _ForwardMixin(_State):
         """each resident attention layer's KV made `rows` long at once (`GrowLayer.presize`), granted from the epoch's
         room, before a layer-by-layer prefill cuts its working set: a cache growing mid-sweep would split it. The
         layers the card graph's arena holds keep their place there; with the rows kept on the host (`kv_host`) no
-        layer's are the card's, and nothing is presized there"""
+        layer's are the card's, and nothing is presized there. A layer's grant refused though the sweep made room for
+        them all (another program took the card's memory since) gives up the cheapest thing the card holds - the top
+        layer first, which has no rows here yet and whose rows then grow on the host - and asks again, until the rest
+        fits or this layer is the one given up; nothing is cut yet, so the sweep goes on as placed then"""
         if getattr(self, "kv_host", False):
             return
         st = getattr(self, "_cg", None)
@@ -833,13 +838,22 @@ class _ForwardMixin(_State):
         hq = int(c.num_attention_heads)
         Hk = int(getattr(c, "num_key_value_heads", None) or hq)
         d = int(getattr(c, "head_dim", None) or c.hidden_size // hq)
+        tried: set[str] = set()
         for i, cl in enumerate(cache.layers):
-            if i in self.host or i in in_arena or self.layer_types[i] == LayerKind.LINEAR:
+            if i in in_arena or self.layer_types[i] == LayerKind.LINEAR or not isinstance(cl, GrowLayer):
                 continue
-            tmpl = self.resident.get(i)
-            dt = self._layer_dtype(tmpl) if tmpl is not None else None
-            if isinstance(cl, GrowLayer) and dt is not None:
-                cl.presize(int(rows), int(B), Hk, d, dt, self.dev)
+            while i not in self.host:
+                tmpl = self.resident.get(i)
+                dt = self._layer_dtype(tmpl) if tmpl is not None else None
+                if dt is None:
+                    break
+                try:
+                    cl.presize(int(rows), int(B), Hk, d, dt, self.dev)
+                    break
+                except MemoryGrantError:
+                    if not getattr(self, "adapt", True) or not self._give_up_one(self.dev, 0, tried):
+                        self.device.refused()  # what was shed on the way grows back once there is room
+                        raise
 
     def _sinks_bytes(self) -> int:
         """the bytes of a sink logit as the resident layers hold them (float32 where none is resident to ask)"""
@@ -884,11 +898,9 @@ class _ForwardMixin(_State):
         return [on_card and getattr(self, "prefill_card_min", 64) <= min(T, a + C) - a for a in range(0, T, C)]
 
     def _hop_bytes(self, C: int, past: int, B: int, T: int) -> int:
-        """a host layer's rows on the card for a chunk of it there (`GrowLayer.hop`): its keys and values up to the
-        last such chunk's end, in the card's dtype, at most once at a time"""
-        card = self._card_chunks(C, T)
-        ends = [min(T, a + C) for a, on in zip(range(0, T, C), card) if on]
-        if not ends or self.dev.type != Device.CUDA:
+        """a host layer's rows on the card for its chunks there (`GrowLayer.hop`): the sweep's one buffer, keys and
+        values for every row the prompt reaches, in the card's dtype, taken by each host layer in turn"""
+        if not any(self._card_chunks(C, T)) or self.dev.type != Device.CUDA:
             return 0
         c = self.cfg
         hq = int(c.num_attention_heads)
@@ -896,7 +908,7 @@ class _ForwardMixin(_State):
         d = int(getattr(c, "head_dim", None) or c.hidden_size // hq)
         cd = self.compute_dtype
         nb = 4 if (cd is not None and cd != torch.bfloat16) else 2
-        return 2 * B * Hk * d * nb * (past + max(ends))
+        return 2 * B * Hk * d * nb * (past + T)
 
     def _host_bytes(self, C: int, past: int, B: int, T: int, park: bool) -> int:
         """what a layer-by-layer prefill on the card asks of the host: its host chunks' working set in float32 where
@@ -1209,6 +1221,17 @@ class _ForwardMixin(_State):
         hq = int(self.cfg.num_attention_heads)
         kv_heads = int(getattr(self.cfg, "num_key_value_heads", None) or hq)
         head_dim = int(getattr(self.cfg, "head_dim", None) or self.cfg.hidden_size // hq)
+        hop_buf: list[torch.Tensor | None] = [None]
+
+        def hop_rows(dt: torch.dtype, b: int) -> torch.Tensor:
+            """the sweep's one buffer for a host layer's rows on the card - keys and values, every row the prompt
+            reaches - made at the first host layer's first card chunk and taken by each host layer in turn"""
+            buf = hop_buf[0]
+            if buf is None or buf.dtype != dt or int(buf.shape[1]) != b:
+                hop_buf[0] = None  # the old one let go before the next is made
+                buf = hop_buf[0] = torch.empty((2, b, kv_heads, past0 + T, head_dim), dtype=dt, device=self.dev)
+            return buf
+
         # off the card the whole sweep runs on the host: its working set is the host's share
         work_host = 0 if on_cuda else sum(self._sweep_bytes(C, past0, B, T, cache)[:1])
         own_epoch = False
@@ -1258,6 +1281,13 @@ class _ForwardMixin(_State):
                     # the rows are allocated), and taken for the sweep where no epoch reserved any
                     self.device.reserve(EPOCH, growth, self.dev)
                     own_epoch = epoch == 0
+                if B == 1 and not forked(cache) and self._card_ready():
+                    # the prompt's rows made once, in the card graphs' arena grown to the sequence's reach, where no
+                    # other live cache holds it: the decode's graphs read them there with nothing moved (`presize`
+                    # then passes the arena's layers over). Taken here, after the room is made - the growth priced
+                    # above is these rows, and a layer shed for them frees nothing once the one arena is allocated -
+                    # and drawn from the epoch's room reserved for them. Refused, the layers keep rows of their own
+                    self._card_arena_take(cache, T)
                 self._presize_kv(cache, past0 + T, B)
                 if self.fam.moe and os.environ.get("BTB_PREFILL_DEPOT", "1") != "0":
                     from .experts import LayerDepot
@@ -1320,9 +1350,13 @@ class _ForwardMixin(_State):
                         if ring and i in self.cold:
                             self._cold_wait(i)
                             self._cold_held = i
-                        for c, (a_c, b_c) in enumerate(spans):
+                        hopped = False  # a host layer's rows on the card, in the sweep's one buffer for them
+                        for c in range(len(spans)):
                             h = hs[c]
                             if host and not card[c]:
+                                if hopped:
+                                    self._cache_to(cache, i, "cpu")
+                                    hopped = False
                                 if h.device.type != "cpu" or h.dtype != torch.float32:
                                     # widened on the host, where the host chunk's share was asked for it
                                     h = h.detach().cpu().float()
@@ -1335,23 +1369,37 @@ class _ForwardMixin(_State):
                             if h.device != self.dev or (wd is not None and h.dtype != wd):
                                 h = h.to(self.dev, wd) if wd is not None else h.to(self.dev)
                             cl = cache.layers[i] if host else None
-                            if isinstance(cl, GrowLayer) and not cl.shared and frames[c]["past"] == 0:
-                                # no rows yet: a buffer on the card for this chunk's alone, in the prefill's
-                                # reservation - grown there, it would be the whole sequence's, from the epoch's room
-                                cl.hop(self.dev, b_c - a_c, h.dtype, (h.shape[0], kv_heads, head_dim))
+                            if isinstance(cl, GrowLayer) and not cl.shared:
+                                if not hopped:
+                                    # the layer's rows onto the card once for all its card chunks, into one buffer
+                                    # the sweep keeps for every host layer in turn (`_hop_bytes`, in the prefill's
+                                    # reservation): each chunk writes in place, nothing grown or granted, and back to
+                                    # the host once the layer is done. A buffer a chunk, each larger than the last,
+                                    # left torch's cache a block of every size (2 GB over a 40k prompt's first layer),
+                                    # which WDDM paged a game out to keep, never failing an allocation to trim it
+                                    kv = hop_rows(h.dtype, h.shape[0])
+                                    cl.hop(kv[0], kv[1])
+                                    hopped = True
                             elif host and frames[c]["past"] > 0:
-                                if isinstance(cl, GrowLayer) and not cl.shared and cl.keys.numel():
-                                    # the rows onto the card with room for this chunk's: written in place there, in
-                                    # the prefill's reservation (`_hop_bytes`), nothing grown or granted
-                                    cl.hop(self.dev, b_c - a_c, h.dtype)
-                                else:
-                                    self._cache_to(cache, i, self.dev)
+                                self._cache_to(cache, i, self.dev)
                             pas = chunk_pass(c, i, lt, True, h)
                             pas.place = place
                             h = self._run_card_layer(i, tmpl, h, pas)
-                            if host:
+                            if host and not hopped:
                                 self._cache_to(cache, i, "cpu")
                             hs[c] = keep(c, h)
+                            # a chunk's buffers grow with the keys it sees (the mask, the keys widened to every
+                            # head), so the next chunk cannot reuse them: torch's cache kept a block of every size
+                            # until an allocation failed, and under WDDM none fails - the driver pages another
+                            # program out instead. Past the chunk's working set, the cache goes back to the driver
+                            if on_cuda and (
+                                # free-read: torch's own pool against the sweep's priced working set, not a room
+                                torch.cuda.memory_reserved(self.dev) - torch.cuda.memory_allocated(self.dev) > work
+                            ):
+                                torch.cuda.synchronize(self.dev)
+                                torch.cuda.empty_cache()
+                        if hopped:
+                            self._cache_to(cache, i, "cpu")
                         if self._cold_held is not None:
                             self._cold_held = None
                             self._cold_release(i)
@@ -1416,6 +1464,7 @@ class _ForwardMixin(_State):
                 self._sweep_keep = self._sweep_ahead = False
                 if store is not None:
                     store.sweep_end()
+            hop_buf[0] = None
             self.device.release(PREFILL)
             if own_epoch:
                 self.device.release(EPOCH)

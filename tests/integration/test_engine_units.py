@@ -343,6 +343,22 @@ def test_grow_layer_reserves_the_cap_hint_and_not_the_floor() -> None:
     assert plain._buf[0].shape[-2] == 4096, "no hint: the floor"
 
 
+def test_a_presized_layer_holds_the_answer_as_well_as_the_prompt() -> None:
+    """a prefill sweep presizes a layer for its prompt; with the sequence's reach named (`cap_hint`, the prompt and
+    its answer) the buffer is that long, as its growth was priced - sized to the prompt alone, the answer's first
+    token grew every layer again, a second whole buffer each (a 40k prompt on Qwen3-0.6B shed nine layers for it)"""
+    layer = GrowLayer(cap_hint=48)
+    layer.presize(40, 1, 2, 8, torch.bfloat16, torch.device("cpu"))
+    assert layer._buf is not None and layer._buf[0].shape[-2] == 48
+    buf = layer._buf[0]
+    layer.update(*_kv(1, 2, 40, 8, fill=1.0))
+    layer.update(*_kv(1, 2, 1, 8, fill=2.0))  # the answer's first token
+    assert layer._buf[0] is buf, "the answer grew a presized layer"
+    plain = GrowLayer()
+    plain.presize(40, 1, 2, 8, torch.bfloat16, torch.device("cpu"))
+    assert plain._buf is not None and plain._buf[0].shape[-2] == 40, "no reach named: the prompt's rows"
+
+
 def test_grow_layer_does_not_compound_its_capacity_when_only_the_placement_changes() -> None:
     """The rows come back in another dtype (or from another device, or as another batch) with room to spare:
     the buffer is re-cut where they now live, and re-cutting it must not also grow it. It did - `have +

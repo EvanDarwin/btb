@@ -198,6 +198,114 @@ def test_every_path_fits_or_is_refused_and_never_runs_the_card_out(fx: str, monk
     assert not untold, f"{fx}: memory on the card the ledger was never told of:\n" + "\n".join(untold)
 
 
+def test_a_presize_refused_after_the_sweep_made_room_sheds_from_the_top_and_goes_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """the sweep makes room for every resident layer's rows, then another program takes the card's memory before
+    they are presized (a game growing through a 40k prompt's prefill refused the tenth layer's rows and the prefill
+    raised). A refused layer gives up the top resident layer - no rows of its there yet - and asks again, until the
+    rest fits or it is the one given up; with `adapt` off the placement is pinned and the refusal stands. And a host
+    layer's first chunk on the card starts its rows in the sweep's reservation, a buffer for the chunk alone: grown
+    there, it took the whole sequence's rows out of the epoch's room (0.16 GiB at 40k on Qwen3-0.6B, refused)"""
+    dev = need_cuda()
+    kw: dict[str, Any] = {"device": dev, "cpu_layers": 1, "prefill_chunk": 8, "prefill_card_min": 4}
+    with loaded_model(fixture("tiny_qwen3"), **kw) as sm:
+        top = sorted(sm.resident)
+        assert len(top) >= 3, top
+        real = sm.scheduler.grant
+        asked: list[str] = []
+        # another session holds the card graph's arena, so the prefill's cache keeps rows of its own (a cache taking
+        # the free arena writes its rows there, and nothing of it is presized)
+        holder = sm.session(PROMPT[:8])
+        assert holder.cache is not None
+        st = sm._card_state()
+        if st.get("arena") is not None:
+            with torch.inference_mode():
+                sm._card_bind(holder.cache, st, 0)
+            assert st["arena"]["owner"]() is holder.cache, "the holder did not take the arena"
+
+        def sweep() -> None:
+            # the prompt's prefill alone: a decode step would take the arena from the holder
+            with torch.inference_mode():
+                sm._prefill(torch.tensor([PROMPT]), sm.new_cache(max_len=len(PROMPT) + 2))
+
+        started: list[str] = []
+
+        def seen(nbytes: int, kind: str, **g: Any) -> None:
+            who = str(g.get("requester", ""))
+            if "(layer cache) n=0 " in who and torch.device(g.get("device") or sm.dev).type == "cuda":
+                started.append(who)
+            real(nbytes, kind, **g)
+
+        with monkeypatch.context() as mp:
+            mp.setattr(sm.scheduler, "grant", seen)
+            sweep()
+        assert not started, f"a layer's rows started on the card by a growth, not in the sweep's reservation: {started}"
+
+        def taken(refusals: int) -> Callable[..., None]:
+            # the room gone the first `refusals` times a layer asks for the prompt's rows, as when another program
+            # took it since the sweep's room was made
+            def grant(nbytes: int, kind: str, **g: Any) -> None:
+                if "the prompt's rows at once" in str(g.get("requester", "")):
+                    asked.append(str(g["requester"]))
+                    if len(asked) <= refusals:
+                        raise MemoryGrantError("[grant] REFUSED the test's presize: another program took the room")
+                real(nbytes, kind, **g)
+
+            return grant
+
+        with monkeypatch.context() as mp:
+            mp.setattr(sm.scheduler, "grant", taken(1))
+            mp.setattr(sm, "adapt", False)
+            with pytest.raises(MemoryGrantError, match="another program took the room"):
+                sweep()
+        assert sorted(sm.resident) == top, "a pinned placement gave a layer up"
+        asked.clear()
+        with monkeypatch.context() as mp:
+            mp.setattr(sm.scheduler, "grant", taken(2))
+            sweep()
+        assert len(asked) >= 3, (asked, sorted(sm.resident), sorted(sm.host))  # two refused, then the lowest granted
+        assert sorted(sm.resident) == top[:-2], "each refusal gives up the top resident layer, and no more"
+        assert {top[-1], top[-2]} <= set(sm.host)
+        del holder
+
+
+def test_a_prefills_rows_are_made_once_in_the_arena_and_a_refused_arena_decodes_on_the_torch_layers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """with the card graphs' arena free, a prefill's cache takes it grown to its reach and its rows are made there,
+    once - presized in buffers of its own, the first decode step asked a second whole copy to move them in (3.3 GB
+    of a 40k prompt on Qwen3-0.6B, refused). Where the arena cannot take them, the cache keeps its own rows and the
+    answer goes on through the torch layers over them, not refused"""
+    dev = need_cuda()
+    kw: dict[str, Any] = {"device": dev, "cpu_layers": 1, "prefill_chunk": 8, "prefill_card_min": 4}
+    with loaded_model(fixture("tiny_qwen3"), **kw) as sm:
+        _prefill(sm)  # the card's state made the placement's
+        real = sm.scheduler.grant
+        presized: list[str] = []
+
+        def seen(nbytes: int, kind: str, **g: Any) -> None:
+            if "the prompt's rows at once" in str(g.get("requester", "")):
+                presized.append(str(g["requester"]))
+            real(nbytes, kind, **g)
+
+        with monkeypatch.context() as mp:
+            mp.setattr(sm.scheduler, "grant", seen)
+            got = sm.generate(list(PROMPT), 4, eos=(), speculate=False).tokens
+        assert len(got) == 4
+        assert not presized, f"a prefill with the arena free made rows of its own: {presized}"
+
+        def refused(*a: Any, **k: Any) -> Any:
+            raise MemoryGrantError("[grant] REFUSED the test's arena: no room for the cache's rows")
+
+        with monkeypatch.context() as mp:
+            mp.setattr(sm.scheduler, "grant", seen)
+            mp.setattr(sm, "_card_bind", refused)
+            got = sm.generate(list(PROMPT), 4, eos=(), speculate=False).tokens
+        assert len(got) == 4, "a refused arena failed the answer"
+        assert presized, "the arena refused, the prefill's rows were made nowhere of their own"
+
+
 def test_a_conv_state_left_in_float32_by_the_host_takes_the_cards_dtype() -> None:
     """a hybrid's linear-attention conv state is kept in the dtype of the pass that made it: a layer's chunk run on
     the host leaves it float32, and the layer's next run on the card joined its bf16 rows onto it promoted - the

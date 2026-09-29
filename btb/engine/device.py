@@ -23,7 +23,7 @@ import torch
 from ..kinds import LayerTier, Proposer, Tier
 from ..options import BadDevice, DeviceName, check_device
 from ..options import Device as DeviceKind
-from ..sysinfo import host_commit_bytes, host_free_bytes, host_total_bytes
+from ..sysinfo import host_commit_bytes, host_free_bytes, host_total_bytes, wddm_room
 
 # a card's nvidia-smi reading: when it was taken, the free it read, and what this process's allocator had reserved then
 _PHYS_FREE: dict[int, tuple[float, int | None, int]] = {}
@@ -61,19 +61,35 @@ def _physical_free_bytes(dev: torch.device) -> int | None:
     return free
 
 
+def _wddm_room(dev: torch.device) -> int | None:
+    """this process's WDDM budget on the card less what it uses there (`wddm_room`), or None off Windows or where it
+    cannot be read"""
+    if sys.platform != "win32":
+        return None
+    p = torch.cuda.get_device_properties(dev)
+    return wddm_room(str(p.name), int(p.total_memory))
+
+
 def free_bytes(dev: torch.device, margin: int = 0, pooled: bool = False) -> int | None:
     """Memory free on `dev` above `margin`. On a card: the physical free VRAM (nvidia-smi's, so a card shared with
-    another process is priced by what is truly free, not the per-process figure WDDM hands `mem_get_info`) plus
-    torch's own reserved-but-unallocated pool - blocks the next allocation reuses without reaching the driver, so
-    counting them keeps a later epoch from reading the previous epoch's retained pool as "used". With `pooled`, for
-    an allocation from a pool of its own (`torch.cuda.MemPool`), which cannot reuse those blocks: the physical free
-    alone. On the host: the available RAM, and on Windows no more than the commit left (the page file bounds what
-    can be allocated at all, whatever is free). None where nothing here can price the device."""
+    another process is priced by what is truly free, not the per-process figure WDDM hands `mem_get_info`) - and on
+    Windows no more than this process's WDDM budget leaves it (past that the driver pages it, or a game in the
+    foreground, out to system memory and every pass crawls over the bus; the budget falls to half the card against
+    a game while the physical free still reads room) - plus torch's own reserved-but-unallocated pool: blocks the
+    next allocation reuses without reaching the driver, so counting them keeps a later epoch from reading the
+    previous epoch's retained pool as "used". With `pooled`, for an allocation from a pool of its own
+    (`torch.cuda.MemPool`), which cannot reuse those blocks: the free alone. On the host: the available RAM, and on
+    Windows no more than the commit left (the page file bounds what can be allocated at all, whatever is free).
+    None where nothing here can price the device."""
     if dev.type == DeviceKind.CUDA:
         free, _ = torch.cuda.mem_get_info(dev)
         phys = _physical_free_bytes(dev)
         if phys is not None:
             free = min(int(free), phys)  # never trust the per-process view over the true physical free
+        budget = _wddm_room(dev)
+        if budget is not None:
+            # the budget's usage counts torch's pool whole, the reusable part too, which is added back below
+            free = min(int(free), max(0, budget))
         reclaimable = 0 if pooled else torch.cuda.memory_reserved(dev) - torch.cuda.memory_allocated(dev)
         return max(0, int(free) + int(reclaimable) - int(margin))
     if dev.type == DeviceKind.CPU:

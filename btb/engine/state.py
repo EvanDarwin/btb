@@ -394,6 +394,15 @@ class _State:
     def _card_segment_at(self, i: int, n_layers: int) -> tuple[int, int] | None:
         raise NotImplementedError
 
+    def _card_ready(self) -> bool:  # an engine without the card mixin runs no card graph
+        return False
+
+    def _card_arena_holds(self, cache: Any, T: int) -> bool:  # an engine without the card mixin has no arena
+        return False
+
+    def _card_arena_take(self, cache: Any, T: int) -> bool:
+        return False
+
     def _card_program(
         self, cache: Any, B: int, T: int, past: int, am: Any, stop_after: int | None, positions: Any
     ) -> Any:  # an engine built without the card mixin runs no card program
@@ -698,6 +707,9 @@ class _State:
         raise NotImplementedError
 
     def _make_room(self, dev: torch.device, nbytes: int, what: str, own: str | None = None) -> set[str]:
+        raise NotImplementedError
+
+    def _give_up_one(self, dev: torch.device, short: int, tried: set[str]) -> bool:
         raise NotImplementedError
 
     def room(self, nbytes: int, device: DeviceSpec | None = None, name: str = "room") -> Room:

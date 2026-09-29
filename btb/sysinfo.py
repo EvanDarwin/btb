@@ -562,6 +562,106 @@ def vram_pressure_line(pid: int | None = None) -> str:
     )
 
 
+# -- this process's WDDM video-memory budget, through DXGI (IDXGIAdapter3::QueryVideoMemoryInfo) ------------------
+# Windows keeps a process's card memory resident up to its budget and pages past it - its own allocations or, as the
+# card fills, another program's. The budget moves with the card's tenants: 10.96 GB of a 12 GB card for a process
+# alone on it, 5.8 GB against a game in the foreground. The usage it is compared to is every allocation of the
+# process on the adapter, the CUDA allocator's reserved pool included. The adapter is opened once and kept.
+_WDDM: dict[tuple[str, int], Any] = {}
+
+
+class _Guid(ctypes.Structure):
+    _fields_ = [("a", ctypes.c_uint32), ("b", ctypes.c_uint16), ("c", ctypes.c_uint16), ("d", ctypes.c_ubyte * 8)]
+
+
+def _guid(s: str) -> _Guid:
+    h = s.replace("-", "")
+    g = _Guid(int(h[0:8], 16), int(h[8:12], 16), int(h[12:16], 16))
+    for i in range(8):
+        g.d[i] = int(h[16 + 2 * i : 18 + 2 * i], 16)
+    return g
+
+
+class _AdapterDesc1(ctypes.Structure):
+    _fields_ = [
+        ("desc", ctypes.c_wchar * 128),
+        ("vendor", ctypes.c_uint),
+        ("device", ctypes.c_uint),
+        ("subsys", ctypes.c_uint),
+        ("rev", ctypes.c_uint),
+        ("dedicated_video", ctypes.c_size_t),
+        ("dedicated_system", ctypes.c_size_t),
+        ("shared_system", ctypes.c_size_t),
+        ("luid_low", ctypes.c_uint32),
+        ("luid_high", ctypes.c_int32),
+        ("flags", ctypes.c_uint),
+    ]
+
+
+class _VideoMemoryInfo(ctypes.Structure):
+    _fields_ = [
+        ("budget", ctypes.c_uint64),
+        ("usage", ctypes.c_uint64),
+        ("available_for_reservation", ctypes.c_uint64),
+        ("reservation", ctypes.c_uint64),
+    ]
+
+
+def _com(obj: ctypes.c_void_p, slot: int, *argtypes: Any) -> Any:
+    """the COM method in vtable `slot` of `obj`; a failing HRESULT raises OSError"""
+    vtbl = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+    return ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p, *argtypes)(vtbl[slot])
+
+
+def _wddm_adapter(name: str, total: int) -> Any:
+    """the one NVIDIA adapter DXGI lists as `name` with about `total` bytes of dedicated memory (DXGI counts less of
+    the card than CUDA does: 11994 MiB of a 4070 Ti's 12282), as an IDXGIAdapter3; None where none or several match"""
+    dxgi = ctypes.windll.dxgi
+    fac = ctypes.c_void_p()
+    if dxgi.CreateDXGIFactory1(ctypes.byref(_guid("770aae78-f26f-4dba-a829-253c83d1b387")), ctypes.byref(fac)):
+        return None
+    hits = []
+    for i in range(16):
+        ad = ctypes.c_void_p()
+        try:
+            _com(fac, 12, ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p))(fac, i, ctypes.byref(ad))  # EnumAdapters1
+        except OSError:  # DXGI_ERROR_NOT_FOUND: past the last adapter
+            break
+        d = _AdapterDesc1()
+        _com(ad, 10, ctypes.POINTER(_AdapterDesc1))(ad, ctypes.byref(d))  # GetDesc1
+        near = abs(int(d.dedicated_video) - total) < max(512 << 20, total // 16)
+        if d.vendor == 0x10DE and d.desc.strip() == name.strip() and near:
+            hits.append(ad)
+    if len(hits) != 1:
+        return None
+    a3 = ctypes.c_void_p()
+    _com(hits[0], 0, ctypes.POINTER(_Guid), ctypes.POINTER(ctypes.c_void_p))(  # QueryInterface: IDXGIAdapter3
+        hits[0], ctypes.byref(_guid("645967a4-1392-4310-a798-8053ce3e93fd")), ctypes.byref(a3)
+    )
+    return a3
+
+
+def wddm_room(name: str, total: int) -> int | None:
+    """This process's WDDM budget on the card named `name` with `total` bytes, less what it uses there: what Windows
+    keeps resident for it before paging - it, or as the card fills another program, out to system memory. None off
+    Windows, where DXGI cannot name the card uniquely, or where it cannot be read. Microseconds a read."""
+    if sys.platform != "win32":
+        return None
+    key = (name, int(total))
+    try:
+        if key not in _WDDM:
+            _WDDM[key] = _wddm_adapter(name, int(total))
+        a3 = _WDDM[key]
+        if a3 is None:
+            return None
+        m = _VideoMemoryInfo()
+        # QueryVideoMemoryInfo: node 0, the local (dedicated) segment group
+        _com(a3, 14, ctypes.c_uint, ctypes.c_int, ctypes.POINTER(_VideoMemoryInfo))(a3, 0, 0, ctypes.byref(m))
+        return int(m.budget) - int(m.usage)
+    except OSError:
+        return None
+
+
 def host_cache_sizes() -> dict[str, int]:
     """The host CPU's L2 (all cores' together) and L3 in bytes, read from the OS: Windows through the
     processor-information table, Linux from sysfs, macOS from sysctl. Zeros where a level cannot be read."""

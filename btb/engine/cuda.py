@@ -10,6 +10,7 @@ import itertools
 import os
 import sys
 import time
+import weakref
 from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any, cast
 
@@ -547,7 +548,10 @@ class _CudaMixin(_State):
         return new
 
     def _card_adopt_cache(self, cache: Any) -> None:
-        """a new cache takes the arena when no live cache holds it, so its prefill writes straight in"""
+        """a new cache takes the arena when no live cache holds it and it reaches as far as the cache will, so its
+        prefill writes straight in. An arena the cache would grow is left to the prefill's sweep (`_card_arena_take`),
+        which grows it once the room is made: grown here, before any, the room it took could only be looked for by
+        shedding layers - which free nothing of the one arena - and the whole model went to the host for it"""
         st = getattr(self, "_cg", None)
         if st is None or st["arena"] is None or st["version"] != self.device.snapshot().version:
             return
@@ -555,7 +559,40 @@ class _CudaMixin(_State):
         owner = ar["owner"]() if ar["owner"] is not None else None
         if owner is not None and owner is not cache:
             return
-        self._card_bind(cache, st, 0)
+        reach = max((int(getattr(cache.layers[i], "cap_hint", 0) or 0) for i in ar["slot"]), default=0)
+        if reach > int(ar["cap"]):
+            return
+        self._card_arena_holds(cache, 0)
+
+    def _card_arena_holds(self, cache: Any, T: int) -> bool:
+        """whether `cache` sits in the card graph's arena for a pass of `T` more rows - bound now where it is not,
+        the arena grown to the cache's reach as the ledger grants it. Refused, the cache keeps its rows in buffers of
+        its own (a long prompt's, presized before the arena could take them, would need a second whole copy there)
+        and its passes take the torch layers over them: the arena is the graphs' speed, never a pass's condition.
+        A refused cache is not asked again - its rows only grow"""
+        from .scheduler import MemoryGrantError
+
+        refused = self.__dict__.setdefault("_arena_refused", weakref.WeakSet())
+        if cache in refused:
+            return False
+        try:
+            self._card_bind(cache, self._card_state(), T)
+            return True
+        except MemoryGrantError as e:
+            refused.add(cache)
+            self.log(f"[card] the arena cannot take this cache's rows ({e}); its passes take the torch layers")
+            return False
+
+    def _card_arena_take(self, cache: Any, T: int) -> bool:
+        """a prefill's cache into the card graph's arena before its rows are made, where no other live cache holds
+        the arena: grown to the sequence's reach, the rows are made once, in it - presized in buffers of the cache's
+        own, the first decode step asked a second whole copy to move them in (3.3 GB of a 40k prompt, refused)"""
+        st = self._card_state()
+        ar = st["arena"]
+        owner = ar["owner"]() if ar is not None and ar["owner"] is not None else None
+        if owner is not None and owner is not cache:
+            return False
+        return self._card_arena_holds(cache, T)
 
     def _card_bind(self, cache: Any, st: dict[str, Any], T: int) -> dict[str, Any]:
         import weakref
@@ -1084,8 +1121,22 @@ class _CudaMixin(_State):
         st = self._card_state()
         steps = max_new - 1  # tokens still to produce
         U = max(1, min(self._card_unroll(), steps))
-        # the arena must hold every row the replays may write: whole replays, one past the last token
-        ar = self._card_bind(cache, st, ((steps + U - 1) // U + 1) * U + 1)
+        # the arena must hold every row the replays may write: whole replays, one past the last token. Where it
+        # cannot take the cache's rows, the answer goes on through the torch layers over them, token by token
+        if not self._card_arena_holds(cache, ((steps + U - 1) // U + 1) * U + 1):
+            pos0 = int(ids.shape[1]) - 1
+            for k in range(1, max_new):
+                if self._stop_asked():
+                    break
+                lg = self.forward(torch.tensor([[out[-1]]], device=self.dev), cache=cache)
+                tok = int(smp.pick_torch(lg[0, -1:], [smp.key_for(pos0 + k)])[0])
+                out.append(tok)
+                if on_token:
+                    on_token(tok)
+                if tok in eos:
+                    break
+            return out
+        ar = st["arena"]
         table = self._card_table(st)
         if table is None:
             # the gate granted the table moments ago; the card lost the room since. Named, not an attribute

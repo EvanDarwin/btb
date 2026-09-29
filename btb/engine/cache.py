@@ -769,9 +769,12 @@ class GrowLayer(_DynamicLayer):
         the cache does not grow while the sweep's working set is live around it - a buffer grown then would sit
         inside the one block the pass's own buffers are cut from, and split it for good. Granted as a growth is,
         the buffer it replaces counted; nothing where the buffer holds that many rows already, and nothing for rows
-        of another shape (left to their own growth)."""
+        of another shape (left to their own growth). As long as the sequence's own reach where the caller named it
+        (`cap_hint`, the prompt and its answer), as the growth is priced: sized to the prompt alone, the answer's first
+        token grew every layer again - a second whole buffer each, copied, shedding layers to make the room."""
         if self.shared:
             return
+        rows = max(int(rows), int(self.cap_hint or 0))
         b = self._buf
         if (
             b is not None
@@ -806,21 +809,15 @@ class GrowLayer(_DynamicLayer):
         if n:
             self._set_rows(kb[..., :n, :], vb[..., :n, :])
 
-    def hop(self, dev: Where, T: int, dtype: torch.dtype, shape: tuple[int, int, int] | None = None) -> None:
-        """The rows onto `dev` in a buffer of `dtype` with room for `T` more, the one they were in let go: a host
-        layer's prefill chunk on the card then writes its rows in place, the cache neither grown nor granted there
-        (the prefill's reservation holds the room, `_hop_bytes`). The rows are cast as a growth into `dtype` would
-        cast them. A layer with no rows yet (the prompt's first chunk) takes a buffer of `shape` - (B, Hk, d) - for
-        the chunk's alone: grown there instead, it would be the whole sequence's, drawn from the epoch's room"""
+    def hop(self, kb: torch.Tensor, vb: torch.Tensor) -> None:
+        """The rows into `(kb, vb)` - [B, Hk, cap, d] buffers the caller owns on another device, room for every row
+        the caller's passes bring - and the buffer they were in let go: a host layer's prefill chunks on the card
+        then write their rows in place there, the cache neither grown nor granted (the prefill's reservation holds
+        the buffers, `_hop_bytes`). The rows are cast as a growth into the buffers' dtype would cast them; a layer
+        with no rows yet (the prompt's first chunk) starts in them. Moved elsewhere (`_cache_to`), the rows become
+        a copy of their own and the buffers are the caller's again"""
         k = self.keys if self.is_initialized else None
-        if k is not None and k.numel():
-            B, Hk, n, d = k.shape
-        elif shape is not None:
-            (B, Hk, d), n = shape, 0
-        else:
-            raise ValueError("hop: a layer with no rows needs the buffer's (B, Hk, d)")
-        kb = torch.empty(B, Hk, n + int(T), d, dtype=dtype, device=dev)
-        vb = torch.empty_like(kb)
+        n = int(k.shape[-2]) if k is not None and k.numel() else 0
         self._buf, self._an = (kb, vb), None
         if k is not None and n:
             kb[..., :n, :].copy_(k)
