@@ -25,6 +25,7 @@ from ..fp8 import F8Weight
 from ..kinds import PassTag
 from ..mxfp4 import BLOCK, MxGateUp, MxWeight, stored_mxfp4
 from ..options import Device
+from .device import where
 from .host import bf16_in_place, stored_parts
 from .native import Native
 from .scheduler import MemoryGrantError
@@ -37,8 +38,10 @@ if TYPE_CHECKING:
 class ExpertProfile:
     """Everything the store did, one row per event in an append-only int64 array: no allocation on the path
     (the array doubles when full), one lock shared with the reader threads, saved by `save` as an .npz with
-    `events` [n, 11], `kinds` and `shards` (a path per shard id). Columns: t_ns from the first event, step
-    (layer 0's call starts a pass), kind, layer, expert, bytes, shard, offset, dur_ns, slot, aux. By kind:
+    `events` [n, 11], `kinds`, `shards` (a path per shard id) and `picks` [m, k] int16, every call's picks row by
+    row - which experts each of its rows asked, in the router's order - kept the same way in an array of their own.
+    Columns: t_ns from the first event, step (layer 0's call starts a pass), kind, layer, expert, bytes, shard,
+    offset, dur_ns, slot, aux. By kind:
 
         hit      the expert served from its slot
         miss     one read of a missing expert's part: bytes, shard, offset, dur_ns of that read, slot, aux the
@@ -48,7 +51,8 @@ class ExpertProfile:
         evict    the expert a slot was taken from: aux 0 for the call's need, 1 for the machine's memory
         grow     a block added: expert the slots, bytes, aux the host's free bytes after
         release  a block given back for the machine: expert the slots, bytes, aux the host's free bytes after
-        call     one layer's call done: expert the rows, bytes the hits, shard the misses, dur_ns the wait
+        call     one layer's call done: expert the rows, bytes the hits, shard the misses, dur_ns the wait, offset
+                 the call's first row in `picks` (its rows the next `expert` of them)
         ahead    the lookahead predicted the expert and queued its reads into a ring slot: aux the depth (1 the
                  next layer, 2 the one after); a hit with aux 1 later is that prediction used
         gil      the watchdog's wake (`watch`): dur_ns how late it woke; aux 1 when the threads' frames were kept
@@ -62,6 +66,10 @@ class ExpertProfile:
         self.path = str(path)
         self.a = np.zeros((int(cap), 11), dtype=np.int64)
         self.n = 0
+        # the calls' picks: sized by the first call (its k), each row an int16 per pick, -1 past a narrower call's k
+        self.p = np.full((0, 0), -1, dtype=np.int16)
+        self._pt = torch.from_numpy(self.p)  # the same memory, for a copy straight from the router's tensor
+        self.m = 0
         self.step = 0
         self.t0 = time.perf_counter_ns()
         self.shards: dict[str, int] = {}
@@ -134,13 +142,38 @@ class ExpertProfile:
             self.a[self.n] = (t, self.step, kind, layer, expert, nbytes, shard, offset, dur_ns, slot, aux)
             self.n += 1
 
+    def keep_picks(self, top: torch.Tensor) -> int:
+        """A call's picks [rows, k] (on the host) copied into `picks`, returned as the offset of its first row: the
+        `call` event's offset. The array doubles when full, as the events' does, and widens once for a call of more
+        picks than the first; the copy is torch's into the array's own memory, the int64 indices narrowed in place,
+        with nothing allocated for it."""
+        rows, k = int(top.shape[0]), int(top.shape[-1])
+        with self._lock:
+            cap, width = self.p.shape
+            if self.m + rows > cap or k > width:
+                grown = np.full((max(2 * cap, self.m + rows, 1 << 14), max(width, k)), -1, dtype=np.int16)
+                grown[: self.m, :width] = self.p[: self.m]
+                self.p, self._pt = grown, torch.from_numpy(grown)
+            off = self.m
+            self._pt[off : off + rows, :k].copy_(top.reshape(rows, k))
+            self.m += rows
+        return off
+
     def save(self) -> str:
         self._watching = False
         with self._lock:
             ev = self.a[: self.n].copy()
+            picks = self.p[: self.m].copy()
             snaps = list(self.snapshots)
         shards = [p for p, _ in sorted(self.shards.items(), key=lambda kv: kv[1])]
-        np.savez(self.path, events=ev, kinds=np.array(self.KINDS), shards=np.array(shards), snapshots=np.array(snaps))
+        np.savez(
+            self.path,
+            events=ev,
+            kinds=np.array(self.KINDS),
+            shards=np.array(shards),
+            snapshots=np.array(snaps),
+            picks=picks,
+        )
         text = self.summary(ev) + f"\n[profile] {ev.shape[0]} events -> {self.path}"
         sys.stderr.write(text + "\n")
         sys.stderr.flush()
@@ -386,7 +419,7 @@ class LayerDepot:
 
     def __init__(self, dev: torch.device, ledger: Any, sched: Any = None) -> None:
         # the card by its index: a pool of torch's allocator is a device's own
-        self.dev = torch.device(dev.type, dev.index if dev.index is not None else torch.cuda.current_device())
+        self.dev = where(dev)
         self.ledger = ledger
         self.sched = sched
         self.pool: torch.cuda.MemPool | None = torch.cuda.MemPool()
@@ -433,6 +466,8 @@ class LayerDepot:
         scheduler as a large allocation is; None where there is not that much"""
         assert self.form is not None
         nbytes = n * self.per
+        if self.pool is None:  # closed: nothing asked of the scheduler for a block never made
+            return None
         # from the depot's own pool, which reuses none of torch's cached blocks: the card's free memory alone
         if nbytes > int(self.ledger.free(self.dev, unreserved=True, pooled=True) or 0):
             return None
@@ -441,8 +476,6 @@ class LayerDepot:
                 self.sched.grant(nbytes, "depot", requester="LayerDepot", device=self.dev)
             except MemoryGrantError:
                 return None
-        if self.pool is None:  # closed
-            return None
         try:
             with torch.cuda.use_mem_pool(self.pool, device=self.dev):
                 block = [torch.empty((n, *shape), dtype=dt, device=self.dev) for shape, dt in self.form]
@@ -731,11 +764,6 @@ class VramSeats:
         self.left -= 1
         self.copies += 1
         return True
-
-    def drop(self, key: Any) -> None:
-        j = self.seat_of.pop(key, None)
-        if j is not None:
-            self.free.append(j)
 
 
 class SlotState(enum.Enum):
@@ -1230,6 +1258,15 @@ class _ExpertStore:
             + ("".join(f", {k} {n / G:.2f} GB" for k, n in held.items()) if held else "")
         )
 
+    def releasable(self) -> int:
+        """the host bytes `release` could give the machine: the blocks above the slots the largest call served
+        needs, at what a slot holds on average (blocks go whole) - a bound for sizing, not a promise"""
+        live = self.live()
+        if live <= self.max_call or not self.blocks:
+            return 0
+        held = sum(int(getattr(buf, "nbytes", 0)) for buf, _ids in self.blocks.values())
+        return held * (live - self.max_call) // live
+
     def release(self, want: int = 1) -> Any:
         """blocks given back, oldest residents' first, until the ledger has `want` bytes free on the host above the
         reserve (by default: while it has none), never below the largest call the store has served"""
@@ -1354,7 +1391,9 @@ class _ExpertStore:
             return
         if want == "auto":
             sched = getattr(self.sm, "scheduler", None)
-            free = sched.free_vram() if sched is not None else None
+            # free as the grant below reads it: less every reservation, an epoch's KV too (its room is the cache's,
+            # not the seats'), so the seats sized here are seats the grant gives
+            free = sched.free_for(dev, draws="") if sched is not None else None
             room = (free or 0) - (1 << 30)
         else:
             room = int(float(want) * 2**30)
@@ -1362,8 +1401,19 @@ class _ExpertStore:
         n = max(0, int(room // per))
         if n <= 0:
             return
+        # the seats asked of the scheduler before they are made, and lent through the ledger while they live
+        sched = getattr(self.sm, "scheduler", None)
+        if sched is not None:
+            try:
+                sched.grant(n * per, "experts", requester="the expert store's seats on the card", device=dev)
+            except MemoryGrantError as e:
+                self.sm.log(f"[experts] no seats on the card: {e}")
+                return
         gu_n, gu_shape, dn_shape = self.shapes
         self.vram = VramSeats(n, per, (self._held(gu_n), gu_shape, dn_shape), dev)
+        buf, ledger = self.vram.buf, getattr(self.sm, "device", None)
+        if ledger is not None and buf is not None:
+            ledger.lend(lambda: buf, n * per, dev, counted=False)
         self.sm.log(f"[experts] {n} seats on the card ({n * per / 2**30:.2f} GB) for the most ridden experts")
 
     @staticmethod
@@ -1923,7 +1973,16 @@ class _ExpertStore:
         prof = getattr(self.sm, "expert_profile", None)
         sched = getattr(self.sm, "scheduler", None)
         # the blocks the machine asks back given back first, so the seats counted are the seats there are - and never
-        # during the pass, where a block given back could take a hit already handed out
+        # during the pass, where a block given back could take a hit already handed out. The call's misses count first
+        # toward the seats release keeps, so it never gives back the ones this call is about to read into
+        misses = sum(
+            1
+            for e in ids
+            if self.res.peek((layer, e)) is None
+            and (layer, e) not in self.ahead
+            and not (self.vram is not None and (layer, e) in self.vram)
+        )
+        self.max_call = max(self.max_call, misses)
         self.release()
         if self.ahead:
             # every expert the call still wants, a later wave's too: a prediction one of them will want is kept
@@ -1977,6 +2036,11 @@ class _ExpertStore:
             s = self._seat_for(taken, protect, ring=True, last=n == 0)
             if s is None:
                 if whole or n == 0:
+                    # refused whole: the misses this pass seated have no reads queued, so they leave the line and
+                    # their slots go back free - left seated, a later call would take their unread bytes as a hit
+                    for m in todo:
+                        self.res.pop((layer, m))
+                        self._to_free(out[m])
                     raise RuntimeError(
                         f"[experts] one call needs {len(ids)} experts and the store seats {n} of them: "
                         f"{len(taken)} of {self.live()} live seats the call's, {len(self.ring)} the lookahead's "

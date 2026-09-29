@@ -277,6 +277,28 @@ def test_base_curve_ratio() -> None:
     assert pc.ratio(2) == pytest.approx(2**SpecCost.H0)
 
 
+def test_the_expected_gain_of_a_trees_first_nodes() -> None:
+    """before any tree, the prior's PRIOR_Q + PRIOR_Q**2 + ...; after, the decayed gain of the recent trees' first
+    j nodes, and past the widest tree drafted what that one gained; nothing for no node. A priced store's widest
+    pass is always wider than the step: its reads cost what a step's do not"""
+    pc = SpecCost()
+    q = SpecCost.PRIOR_Q
+    assert pc.expected(0) == 0.0 and pc.expected(3) == pytest.approx(q + q**2 + q**3)
+    pc.record_tree([0.5, 0.25], capped=True)
+    assert pc.expected(1) == pytest.approx(0.5) and pc.expected(2) == pytest.approx(0.75)
+    assert pc.expected(6) == pytest.approx(0.75), "past the widest tree: what it gained"
+    pc.record_tree([0.5], capped=False)  # a tree that stopped short: nothing wider would have gained more
+    assert pc.expected(2) == pytest.approx(0.8 * 0.75 + 0.2 * 0.5)
+    # a wide pass before any step is measured teaches the fits nothing: they are ratios to the step's figures
+    pc.price(TREE + 1, None, MISS_S)
+    pc.record_pass(4, 2.0, 900.0, 0.05, wait=1.0)
+    assert pc.u1 is None and pc.m1 is None and (pc.h, pc.gamma) == (SpecCost.H0, pc.gamma0)
+    pc.price(1, None, MISS_S)
+    for _ in range(SpecCost.WARM):
+        pc.record_pass(1, 1.0, 400.0, None, wait=0.5)
+    assert pc.ready() and not pc.active() and pc.plan(1, 5) == (1, False)
+
+
 def test_a_run_of_plain_steps_verifies_one_draft() -> None:
     # a drive so slow no draft pays: the passes are plain steps, but every PROBE_PLAIN-th of a run verifies one
     # draft (a row wider, not the whole tree), so the verdict rests on a fed calibration

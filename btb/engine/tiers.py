@@ -28,7 +28,8 @@ from ..options import Device
 from ..pack12 import entries, unpack_bf16
 from ..sysinfo import process_working_set_bytes
 from .cache import CardRowsLayer, ForkIndexedLayer, ForkLayer, GrowLayer
-from .host import _Experts, _HostLinear, bf16_in_place, copy_bytes
+from .device import where
+from .host import _Experts, _HostLinear, _NGramRows, bf16_in_place, copy_bytes
 from .native import Native
 from .state import DRAFT_VOCAB, _State
 
@@ -604,7 +605,7 @@ class _TiersMixin(_State):
     def _rows_to(self, caches: Sequence[Any], layers: Sequence[int], dev: str | torch.device) -> None:
         """the rows of `layers` in `caches` moved to `dev`, granted together first where they come onto the card:
         a move the card cannot take is refused whole, before a row has moved"""
-        dev = torch.device(dev)
+        dev = where(torch.device(dev))  # torch's own names too ('meta'), not only the ones --device takes
         sched = getattr(self, "scheduler", None)
         if dev.type == Device.CUDA and sched is not None:
             nbytes = sum(_rows_bytes(c, i, dev) for c in caches for i in layers)
@@ -615,9 +616,11 @@ class _TiersMixin(_State):
                 self._cache_to(c, i, dev)
 
     @staticmethod
-    def _cache_to(cache: Any, i: int, dev: str | torch.device) -> None:
+    def _cache_to(cache: Any, i: int, device: str | torch.device) -> None:
         if cache is None or i >= len(cache.layers):
             return
+        # compared with the rows' own devices below: a card by its index, as they name it
+        dev = where(torch.device(device))
         cl = cache.layers[i]
         if isinstance(cl, ForkLayer):
             cl.to(dev)
@@ -625,29 +628,24 @@ class _TiersMixin(_State):
         if isinstance(cl, CardRowsLayer):
             # a fork's or a batch's rows leaving the card's arena: a fork's layer where the layer now runs (the
             # batch takes the torch pass from its next step)
-            if torch.device(dev).type != cl.device.type:
+            if dev.type != cl.device.type:
                 cache.layers[i] = cl.to_fork(dev)
             return
-        if (
-            isinstance(cl, GrowLayer)
-            and not cl.shared
-            and cl._buf is not None
-            and cl._buf[0].device != torch.device(dev)
-        ):
+        if isinstance(cl, GrowLayer) and not cl.shared and cl._buf is not None and cl._buf[0].device != dev:
             # the rows copied out and the buffer they grew in let go now, not at the cache's next append
             k, v = cl.keys, cl.values
             cl._buf, cl._an = None, None
             cl._set_rows(k, v)
         if isinstance(cl, GrowLayer) and cl.is_initialized and isinstance(cl.keys, torch.Tensor):
-            if cl.keys.device != torch.device(dev):
+            if cl.keys.device != dev:
                 cl._set_rows(cl.keys.to(dev), cl.values.to(dev))
         for attr in ("keys", "values", "conv_states", "recurrent_states", "indexer_keys"):
             t = getattr(cl, attr, None)
             if isinstance(t, dict):
                 for k, v in t.items():
-                    if isinstance(v, torch.Tensor) and v.device != torch.device(dev):
+                    if isinstance(v, torch.Tensor) and v.device != dev:
                         t[k] = v.to(dev)
-            elif isinstance(t, torch.Tensor) and t.device != torch.device(dev):
+            elif isinstance(t, torch.Tensor) and t.device != dev:
                 setattr(cl, attr, t.to(dev))
 
     def _layer_bytes(self, i: int) -> int:
@@ -994,6 +992,14 @@ class _TiersMixin(_State):
                 m.layer = i
                 m.base = f"{self.prefix}layers.{i}.mlp.experts."
                 m.gate_up = m.down = None
+            if isinstance(m, _NGramRows):
+                # a layer's own lookup table read from the checkpoint by name (Qwen4's PLE n-grams): layer i's, and
+                # the shards opened for the layer it was built from dropped
+                at = f"{self.prefix}layers."
+                if m.base.startswith(at):
+                    base = f"{at}{i}.{m.base[len(at) :].partition('.')[2]}"
+                    if base != m.base:
+                        m.base, m.shards, m.f8 = base, None, None
         return module
 
     def _structure(self, module: Any) -> tuple[Any, ...]:

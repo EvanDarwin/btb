@@ -49,6 +49,15 @@ GGUF_DIR = spec.GGUF_DIR
 CARD_HEAD_DIMS: tuple[int, ...] = (64, 128, 256)
 MEGA_HEAD_MULTIPLE = 64
 MLX_ATTN_HEAD_DIMS: tuple[int, ...] = (128, 256)
+# a family that brings its own layer (Qwen4) verifies a speculative pass exactly only through btb's own kernels: the
+# host's node steps, and on a card its card program (`Family.verify_exact`; any other pass is plain, nothing
+# drafted). The load options a card sub-path takes the program off with, each named by the clause of the program's
+# own refusal (families/qwen4/card.py `why_not`) that turns it down - test_manifest holds each clause there
+CARD_PROGRAM_OFF: dict[str, str] = {"fp32": "sm.compute_dtype", "kv_host": "kv_host"}
+# whether the cert's Qwen4 fixtures (tiny_q4 and its twins) are shaped as the card program's kernels are written: they
+# are not (`why_not`: "shapes the kernels are not written for"), so on a card every one of their passes is plain and a
+# speculative cell there proves nothing. True once a fixture the program takes stands in for them
+CARD_PROGRAM_FIXTURES = False
 
 
 class Verdict(StrEnum):
@@ -164,10 +173,15 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "in the twins write_gguf writes, and the MTP cells run on the GGUF storages",
     ),
     Missing.SPEC_OWN_LAYER: (
-        "the engine turns speculation off for a family that brings its own layer (`sm.fam.own` sets v_max and "
-        "tree_budget to 0 at load, btb/__init__.py), so no proposer ever drafts for it",
-        "teach the family's own layer the verify pass (several rows, and the tree mask where the tier verifies "
-        "trees), drop the load's refusal, and its speculation cells run like any other family's",
+        "a family that brings its own layer (Qwen4) verifies a speculative pass only through btb's own kernels - "
+        "the host's DeltaNet and attention node steps, and on a card its card program - so where neither runs the "
+        "pass no proposer drafts: MLX, whose layers have no node steps (`Family.speculates` off at load), and a "
+        "card sub-path whose knobs the program refuses (a float32 compute, the KV on the host: `Qwen4Card.why_not`) "
+        "or whose fixture it does not take (tiny_q4 and its twins are shaped below its kernels: 'shapes the "
+        "kernels are not written for'), where `Family.verify_exact` takes every pass as a plain one-row pass",
+        "give the family's layers the node steps on MLX, the card program a float32 compute and a read of "
+        "host-held KV (or the torch path's modules row-invariant), and the cert a Qwen4 fixture shaped as the "
+        "card kernels are (as tests/integration's card fixture is), and these cells run like the host's",
     ),
     Missing.FP16_FIXTURE: (
         "this family has no fp16 safetensors twin (`<stem>-f16`, every float tensor stored F16), so its fp16 "
@@ -480,6 +494,19 @@ def subpath_gap(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath
     return None
 
 
+def own_layer_verifies(dev: spec.DeviceSubpath) -> bool:
+    """whether a family that brings its own layer verifies a speculative pass exactly on this sub-path, so its
+    passes draft: the host's node steps, or a card sub-path that leaves the card program on (`CARD_PROGRAM_OFF`) over
+    a fixture the program takes (`CARD_PROGRAM_FIXTURES`); never MLX"""
+    if dev.hardware is spec.Hardware.CPU:
+        return True
+    return (
+        dev.hardware is spec.Hardware.CUDA
+        and CARD_PROGRAM_FIXTURES
+        and not any(dev.knobs.get(k) for k in CARD_PROGRAM_OFF)
+    )
+
+
 def gap_reason(
     kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath, decode: spec.DecodePath
 ) -> Missing | None:
@@ -520,7 +547,7 @@ def gap_reason(
     if absent:
         return Missing.QUANT_FIXTURE
     # 4. a decode path the engine does not take for this family
-    if spec.DECODE_KIND[decode] is not spec.DecodeKind.PLAIN and Cap.OWN in fl:
+    if spec.DECODE_KIND[decode] is not spec.DecodeKind.PLAIN and Cap.OWN in fl and not own_layer_verifies(dev):
         return Missing.SPEC_OWN_LAYER
     proposer = spec.DECODE_PROPOSER[decode]
     if proposer is not None and proposer.mtp:

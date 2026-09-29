@@ -11,7 +11,7 @@ import sys
 import types
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 import torch
@@ -116,6 +116,120 @@ def test_a_widened_module_computes_in_float32_and_answers_in_the_callers_dtype()
     logits, idx = router(x.bfloat16())
     assert logits.dtype == torch.bfloat16 and torch.equal(logits, want_bf16[0].bfloat16())
     assert idx.dtype == torch.int64 and torch.equal(idx, want_bf16[1])
+    from btb.engine.host import _cast_floats
+
+    # what is neither a floating tensor nor a sequence of them (an int, None, an index tensor) passes through
+    t, n, i = torch.ones(2), 3, torch.tensor([1, 2])
+    out = _cast_floats((t, n, None, [i, t]), torch.bfloat16)
+    assert isinstance(out, tuple) and out[0].dtype == torch.bfloat16 and out[1:3] == (3, None)
+    assert out[3][0] is i and out[3][1].dtype == torch.bfloat16
+
+
+def test_a_reader_thread_writes_an_inference_buffer_and_widens_it_in_place() -> None:
+    """`copy_bytes` and `bf16_in_place` from a thread outside inference mode, into a buffer made inside it (a
+    bind, or the store's slot, then a reader writing it): torch refuses that write to a plain `copy_`; through
+    them it lands, and the float32 or float16 values are rewritten as their bf16 from the buffer's start"""
+    import threading
+
+    from btb.engine.host import bf16_in_place, copy_bytes
+
+    for dt in (torch.float32, torch.float16):
+        vals = torch.randn(64, generator=torch.Generator().manual_seed(5)).to(dt)
+        with torch.inference_mode():
+            buf = torch.zeros(vals.numel() * dt.itemsize, dtype=torch.uint8)
+        errors: list[BaseException] = []
+
+        def reader(
+            vals: torch.Tensor = vals,
+            buf: torch.Tensor = buf,
+            dt: torch.dtype = dt,
+            errors: list[BaseException] = errors,
+        ) -> None:
+            try:
+                with pytest.raises(RuntimeError, match=r"[Ii]nference"):
+                    buf.copy_(vals.view(torch.uint8))
+                copy_bytes(buf, vals)
+                assert torch.equal(buf.view(dt), vals)
+                bf16_in_place(buf, dt)
+            except BaseException as e:  # carried back to the test's thread
+                errors.append(e)
+
+        th = threading.Thread(target=reader)
+        th.start()
+        th.join()
+        assert not errors, errors
+        assert torch.equal(buf[: vals.numel() * 2].view(torch.bfloat16), vals.to(torch.bfloat16)), dt
+
+
+def test_stored_parts_are_the_bytes_the_card_takes_of_each_form() -> None:
+    """`stored_parts`: a bf16 expert's two matrices, an MXFP4 one in the checkpoint's layout as its blocks and
+    scales, an FP8 one as its bytes and scale grids; nothing for ggml's MXFP4 (no card path takes it), a pair of
+    two forms, or an expert already off the host"""
+    from btb.engine.host import stored_parts
+    from btb.fp8 import F8Weight, quantize
+    from btb.mxfp4 import MxWeight, hf_to_ggml
+    from tests.helpers import mxfp4_random
+
+    gu, dn = torch.zeros(8, 4, dtype=torch.bfloat16), torch.zeros(4, 4, dtype=torch.bfloat16)
+    assert stored_parts(gu, dn) == (gu, dn)
+    b, s = mxfp4_random(1, 8, 64)
+    mx = MxWeight(torch.from_numpy(b).reshape(-1), torch.from_numpy(s).reshape(-1), 8, 64)
+    assert stored_parts(mx, mx) == (mx.blocks, mx.scales, mx.blocks, mx.scales)
+    gg = MxWeight.from_ggml(torch.from_numpy(hf_to_ggml(b, s)).reshape(-1), 8, 64)
+    assert stored_parts(gg, gg) is None
+    q, sc = quantize(torch.randn(32, 32), (16, 16))
+    f8 = F8Weight(q, sc, 32, 32)
+    assert stored_parts(f8, f8) == (f8.w, f8.scales, f8.w, f8.scales)
+    assert stored_parts(gu, mx) is None and stored_parts(f8, mx) is None
+    meta = torch.empty(8, 4, dtype=torch.bfloat16, device="meta")
+    assert stored_parts(meta, dn) is None, "an expert off the host is the card's already"
+
+
+def test_the_experts_linear_widens_what_no_kernel_multiplies(monkeypatch: MonkeyPatch) -> None:
+    """`_Experts._linear` without the kernel for a form (a native library built without it): MXFP4 in either layout,
+    a GGUF's gate and up apart, and FP8 are widened and multiplied in float32 - the dequantized matrix's product,
+    and the kernel's to its float32 sums - each call tagged so; a bf16 matrix goes to torch's float32 product at
+    `gemm_rows` rows or past, and without the library, which the gemv's rows equal to its sums"""
+    import torch.nn.functional as F
+
+    from btb.engine.host import _Experts
+    from btb.engine.native import Native
+    from btb.fp8 import F8Weight, quantize
+    from btb.kinds import PassTag
+    from btb.mxfp4 import MxGateUp, MxWeight, hf_to_ggml
+    from tests.helpers import mxfp4_random
+
+    native_library()
+    tags: set[object] = set()
+    ex = _Experts(types.SimpleNamespace(_tag=lambda *t: tags.update(t)), "x.", 2, F.silu)
+    g = torch.Generator().manual_seed(3)
+    x = torch.randn(3, 64, generator=g)
+    b, s = mxfp4_random(5, 32, 64, lo=118, hi=130)
+    mx = MxWeight(torch.from_numpy(b).reshape(-1), torch.from_numpy(s).reshape(-1), 32, 64)
+    gg = MxWeight.from_ggml(torch.from_numpy(hf_to_ggml(b, s)).reshape(-1), 32, 64)
+    q, sc = quantize(torch.randn(32, 64, generator=g), (16, 16))
+    f8 = F8Weight(q, sc, 32, 64)
+    forms: dict[str, Any] = {"mxfp4": mx, "ggml": gg, "fp8": f8, "gate_up": MxGateUp(gg, gg)}
+    kernel = {name: ex._linear(x, w) for name, w in forms.items()}
+    assert tags == {PassTag.EXPERT_MXFP4_ASSTORED, PassTag.EXPERT_FP8_ASSTORED}
+    for name in ("gemv_mx4", "gemv_mx4_ggml", "gemv_fp8"):
+        monkeypatch.setattr(Native, name, None)
+    tags.clear()
+    for name, w in forms.items():
+        got = ex._linear(x, w)
+        dense = (
+            torch.cat([mx.dequantize(torch.float32)] * 2) if isinstance(w, MxGateUp) else w.dequantize(torch.float32)
+        )
+        assert torch.equal(got, F.linear(x, dense)), f"{name}: not the widened matrix's product"
+        torch.testing.assert_close(got, kernel[name], rtol=1e-5, atol=1e-5, msg=f"{name}: parts from the kernel")
+    assert tags == {PassTag.EXPERT_MXFP4_DEQUANT, PassTag.EXPERT_FP8_WIDENED}
+    w = torch.randn(32, 64, generator=g).bfloat16()
+    gemv = ex._linear(x, w)
+    monkeypatch.setattr(Native, "gemm_rows", 2)
+    wide = ex._linear(x, w)
+    monkeypatch.setattr(Native, "gemv", None)
+    assert torch.equal(ex._linear(x, w), wide) and torch.equal(wide, F.linear(x, w.float()))
+    torch.testing.assert_close(gemv, wide, rtol=1e-5, atol=1e-5)
 
 
 # --- the scheduler (btb/engine/scheduler.py) ---------------------------------------------------------------
@@ -263,11 +377,166 @@ def test_qwen4_router_rows_are_the_one_row_calls(norm_topk_prob: bool) -> None:
         assert torch.equal(logits[t], lg1[0]) and torch.equal(weights[t], w1[0]) and torch.equal(experts[t], e1[0]), (
             f"row {t} of a {T}-row call is not its one-row call"
         )
+    install(mlp, "model.layers.0.mlp.gate.weight")
+    assert mlp.gate is ours, "a router installed twice is the first one"
     ref.weight.data = ref.weight.data.float()
     r_logits, r_weights, r_experts = ref(x)
     assert torch.equal(experts, r_experts), "the reference router picks other experts"
     torch.testing.assert_close(logits, r_logits, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(weights, r_weights, rtol=1e-5, atol=1e-6)
+    # a router held at float32 (a GGUF keeps its routers so) stays the reference's module, computing in float32 and
+    # answering in the rows' dtype
+    wide = types.SimpleNamespace(gate=ref)
+    install(wide, "model.layers.0.mlp.gate.weight")
+    assert wide.gate is ref and ref.weight.dtype == torch.float32
+    b_logits, b_weights, b_experts = ref(x.bfloat16())
+    f_logits, f_weights, f_experts = ref(x.bfloat16().float())
+    assert b_logits.dtype == torch.bfloat16 and torch.equal(b_logits, f_logits.bfloat16())
+    assert torch.equal(b_weights, f_weights.bfloat16()) and torch.equal(b_experts, f_experts)
+
+
+def test_the_indexers_masks_are_told_apart_by_shape() -> None:
+    """qsa.py: a plain causal mask is every row its prefix, a speculative pass's tree every row the whole prefix
+    and its ancestors; a mask of another rank, of rows other than the pass's, or narrower than its rows is
+    neither, and a tree whose prefix a row cannot see is no tree - each takes the reference indexer"""
+    from btb.engine.families.qwen4.qsa import _plain_causal, _prefix_tree
+
+    S, off = 3, 4
+    causal = torch.ones(1, 1, S, off + S, dtype=torch.bool).tril(off)
+    assert _plain_causal(causal, S) and _prefix_tree(causal, S) is not None
+    tree = causal.clone()
+    tree[0, 0, 2, off + 1] = False  # row 2 a sibling of row 1: both under row 0
+    assert not _plain_causal(tree, S)
+    rows = _prefix_tree(tree, S)
+    assert rows is not None and [r.tolist() for r in rows[0]] == [[0], [0, 1], [0, 2]]
+    for bad in (causal[0], causal[:, :, :2], torch.ones(1, 1, S, S - 1, dtype=torch.bool)):
+        assert not _plain_causal(bad, S) and _prefix_tree(bad, S) is None, tuple(bad.shape)
+    hidden = tree.clone()
+    hidden[0, 0, 1, 0] = False  # row 1 misses a prefix row
+    assert _prefix_tree(hidden, S) is None
+
+
+def test_the_shared_drafter_leaves_its_steps_to_each_family() -> None:
+    """btb/engine/drafter.py's base: no MLX graph of its own, and the step and the MLX graph's parts each family's
+    drafter supplies - asked of the base, they refuse"""
+    from btb.engine.drafter import MTPDrafter
+
+    dr = MTPDrafter(types.SimpleNamespace(dev=torch.device("cpu")))
+    assert not dr._mlx_ready() and not dr._tree_kernel()
+    for call in (
+        lambda: dr._step(torch.zeros(1, 1, dtype=torch.long), torch.zeros(1, 1, 4), 0),
+        dr._mx_dtype,
+        lambda: dr._mlx_body(None, None, 0, None),
+        lambda: dr._mlx_draw(None, 1, None, ()),
+        lambda: dr._mlx_topk(None, 1),
+    ):
+        with pytest.raises(NotImplementedError):
+            call()
+
+
+def test_a_verify_pass_kept_for_an_engine_that_is_gone_restores_nothing() -> None:
+    """the DeltaNet's kept inputs of a verify pass hold the engine weakly: after the engine is gone the commit's
+    restore is a no-op, not an error"""
+    import gc
+
+    from btb.engine.families.qwen4.verify import _PathStep
+
+    class Engine:
+        pass
+
+    sm = Engine()
+    t = torch.zeros(2, 4)
+    step = _PathStep(sm, None, None, t, t, t, t, {})
+    del sm
+    gc.collect()
+    assert step.sm() is None
+    step.restore([0, 1])  # nothing to step, and nothing raised
+
+
+def test_a_deltanet_template_refilled_for_another_layer_rebuilds_its_operands() -> None:
+    """a streamed template or a float32 shadow is refilled in place with the next layer's weights and pointed at it
+    (`layer_idx`), its storage unchanged: the step's float32 operands are that layer's, rebuilt, never the first
+    layer's kept (bf16 weights, copied), and a float32 weight is its own operand, following the refill"""
+    from btb.engine.families.qwen4.verify import _consts
+
+    def module(dt: torch.dtype) -> Any:
+        ns = types.SimpleNamespace
+        t = lambda *s: torch.randn(*s).to(dt)
+        return ns(
+            layer_idx=3,
+            conv1d=ns(weight=t(8, 1, 4), bias=None),
+            A_log=t(2),
+            dt_bias=t(2),
+            norm=ns(weight=t(4), variance_epsilon=1e-6, activation="silu"),
+        )
+
+    cpu = torch.device("cpu")
+    for dt in (torch.bfloat16, torch.float32):
+        la = module(dt)
+        first = _consts(la, cpu)["conv_w"].clone()
+        other = module(dt)
+        for mine, theirs in ((la.conv1d.weight, other.conv1d.weight), (la.A_log, other.A_log)):
+            mine.copy_(theirs)
+        la.norm.weight.copy_(other.norm.weight)
+        la.layer_idx = 11  # `_retarget`
+        c = _consts(la, cpu)
+        assert torch.equal(c["conv_w"], other.conv1d.weight.squeeze(1).float()), dt
+        assert torch.equal(c["a_log"], other.A_log.float()) and torch.equal(c["norm_w"], other.norm.weight.float())
+        assert not torch.equal(c["conv_w"], first), dt
+
+
+def test_the_family_table_and_the_plain_blocks_answers() -> None:
+    """families/: a model type btb does not serve is refused by name, and one the kinds declare but no class here
+    builds is the table's fault, said so; the activation's name under either key; the plain block's own answers -
+    no build of its own, its name, the fused paths its flags give, no drafter, the tensors read with a layer (not
+    an FP8 scale, not an expert) and no sweep to open"""
+    from btb.engine import families
+    from btb.engine.families import FAMILIES, Family, act_name, family
+    from btb.kinds import FAMILY_NAMES, FamilyKind
+    from btb.options import UnsupportedModelType
+
+    with pytest.raises(UnsupportedModelType):
+        family(types.SimpleNamespace(model_type="not_a_model"))
+    with pytest.raises(UnsupportedModelType):
+        family(types.SimpleNamespace())
+    kept = dict(FAMILIES)
+    try:
+        del families.FAMILIES[FamilyKind.QWEN3]
+        with pytest.raises(RuntimeError, match="no Family subclass in families/ builds it"):
+            family(types.SimpleNamespace(model_type="qwen3"))
+    finally:
+        families.FAMILIES.clear()
+        families.FAMILIES.update(kept)
+    assert act_name(types.SimpleNamespace(hidden_activation="gelu_pytorch_tanh", hidden_act="silu")) == (
+        "gelu_pytorch_tanh"
+    )
+    assert act_name(types.SimpleNamespace(hidden_act="relu")) == "relu"
+    assert act_name(types.SimpleNamespace()) == "silu"
+    base = Family(kind=FamilyKind.QWEN3)
+    with pytest.raises(NotImplementedError):
+        Family.build(types.SimpleNamespace())
+    assert base.name == FAMILY_NAMES[FamilyKind.QWEN3]
+    assert not base.fused_step and not base.card_graph and not base.mega
+    assert Family(kind=FamilyKind.QWEN3, kernel_layout=True).fused_step
+    assert Family(kind=FamilyKind.QWEN3, sandwich=True, own=True).fused_step
+    assert not Family(kind=FamilyKind.QWEN3, sandwich=True, own=True).card_graph
+    assert Family(kind=FamilyKind.QWEN3, kernel_layout=True).mega
+    assert not Family(kind=FamilyKind.QWEN3, kernel_layout=True, sandwich=True).mega
+    from btb.kinds import PassTag
+
+    assert Family(kind=FamilyKind.QWEN3, dense=True).mlx_path is PassTag.MLX_STEP
+    assert Family(kind=FamilyKind.QWEN3, sandwich=True).mlx_path is PassTag.MLX_STEP
+    assert Family(kind=FamilyKind.QWEN3, hybrid=True).mlx_path is PassTag.MLX_HYBRID
+    assert base.mlx_path is PassTag.MLX_PEROP, "a mixture's layers: the per-op path"
+    assert base.drafter_cls() is None and base.open_sweep(None, 1, 1, 1) is False  # type: ignore[arg-type]
+    assert base.verify_exact(None, None)  # type: ignore[arg-type]
+    assert base.dense_key("model.layers.0.self_attn.q_proj.weight")
+    for key in (
+        "model.layers.0.self_attn.q_proj.weight_scale_inv",
+        "model.ngram.shard_0.weight_scale",
+        "model.layers.0.mlp.experts.gate_up_proj",
+    ):
+        assert not base.dense_key(key), key
 
 
 @pytest.mark.parametrize("width", [1, 4, 8, 20, 64])
@@ -591,6 +860,15 @@ def test_the_plan_prices_only_the_drafter_it_runs(monkeypatch: pytest.MonkeyPatc
     host = plan("cpu")
     assert host.has_mtp and not host.drafter_on_card and host.bytes.drafter == dense + slice_b
     assert "drafter host" in str(host)
+    # what the card can give up (`memory()`'s sheddable) counts the same head on the card: its dense tensors off the
+    # headers, never every `mtp.*` tensor read through `_get` (the store's experts too, an FP8 one widened each call)
+    from btb.engine.memory import _MemoryMixin
+
+    card = torch.device("cuda")
+    p.dev, p.compute_dtype, p.resident, p.head, p.resident_head = card, None, {}, None, False
+    p.aj = types.SimpleNamespace(dev=card)
+    p._get = lambda k, *a, **kw: pytest.fail(f"the sheddable bytes read {k}")
+    assert _MemoryMixin._sheddable(cast("_MemoryMixin", p), card) == dense
 
 
 def test_the_report_line_puts_mlx_layers_the_head_and_the_cache_on_the_gpu() -> None:

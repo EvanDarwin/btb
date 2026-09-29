@@ -13,6 +13,7 @@ import torch
 from ....kinds import FamilyKind, LayerKind
 from ....mxfp4 import stored_mxfp4
 from ...host import _Experts, _NGramRows
+from ...native import Native
 from ..base import Family, _flags
 
 if TYPE_CHECKING:
@@ -126,5 +127,19 @@ class Qwen4Family(Family):
 
     def speculates(self, mlx: bool) -> bool:
         # a verify pass runs through the layers' node steps (verify.py), which the MLX tier does not: there the
-        # decode is the plain loop
+        # decode is the plain loop. Elsewhere whether a pass verifies exactly is asked a pass at a time
+        # (`verify_exact`)
         return not mlx
+
+    def verify_exact(self, sm: _State, cache: Any) -> bool:
+        # a node computes as its path's step only through btb's own kernels: on the host the DeltaNet step and the
+        # attention over each row's cache rows (verify.py, attend.py; without them a host layer runs the reference
+        # modules, which step a tree's rows as one chain); every other layer only inside the card program, whose
+        # own gate (`_card_program`, the program's `why_not`) says whether it takes this cache's pass - where it
+        # declines (a float32 compute, the KV on the host, a streamed layer, a fork, ...) the layers run the
+        # reference router, attention and activations, which are not row-invariant
+        if sm.host and (Native.delta_step is None or Native.attn_nodes is None):
+            return False
+        if all(i in sm.host for i in range(int(sm.L))):
+            return True
+        return sm._card_program(cache, 1, 1, cache.get_seq_length(), None, None, None) is not None

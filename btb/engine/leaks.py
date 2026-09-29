@@ -35,15 +35,18 @@ import sys
 import threading
 import types
 import weakref
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
+
+if TYPE_CHECKING:
+    from .model import StreamedTextModel
 
 MIN_BYTES = 16 << 20  # smaller than this is a pass's scratch or a caller's own, never an engine's holding
 WALK_MAX = 2_000_000  # objects the ownership walk visits at most; past it the report says so
 
-_LIVE: weakref.WeakSet[Any] = weakref.WeakSet()  # engines built and not yet closed
-_SINCE: list[weakref.ref[Any]] = []  # every engine built since the baseline: the census's roots
+_LIVE: weakref.WeakSet[StreamedTextModel] = weakref.WeakSet()  # engines built and not yet closed
+_SINCE: list[weakref.ref[StreamedTextModel]] = []  # every engine built since the baseline: the census's roots
 _BASE: dict[str, Any] = {}  # the baseline: the tensors alive, and the card and pinned bytes handed out
 _FOUND: list[str] = []  # what the harness's census found, for its next report
 _LOCK = threading.RLock()  # reentrant: the census collects, and a finalizer it runs may reach here
@@ -122,7 +125,7 @@ def _baseline() -> None:
     _SINCE.clear()
 
 
-def track(engine: Any) -> None:
+def track(engine: StreamedTextModel) -> None:
     """an engine built. Armed with none alive, what exists now is the census's baseline - a baseline still
     uncounted (a module's engine closed after the last test's check) is counted first"""
     with _LOCK:
@@ -134,9 +137,10 @@ def track(engine: Any) -> None:
         _SINCE.append(weakref.ref(engine))
 
 
-def closed(engine: Any) -> None:
+def closed(engine: StreamedTextModel) -> None:
     """an engine closed: its own check - the registry emptied, nothing spoken for in its ledger - logged if it
-    fails; with `BTB_LEAK_CHECK=1` and no engine left alive, the census, logged too"""
+    fails; with `BTB_LEAK_CHECK=1` and no engine left alive, the census, logged too. Read with `getattr`: an engine
+    whose construction failed part way is closed too, and may lack what a built one has"""
     log = getattr(engine, "log", None) or (lambda msg: sys.stderr.write(msg + "\n"))
     left = []
     holdings = getattr(engine, "holdings", None)

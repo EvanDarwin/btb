@@ -106,3 +106,19 @@ def test_the_sinks_in_one_buffer_are_the_steps_they_replaced(
         assert used == (workspace == "open"), f"the workspace {'was not' if not used else 'was'} taken"
     want = _reference(q, k, v, mask if masked else None, scale, sinks, win)
     assert got.dtype == want.dtype and torch.equal(got, want)
+
+
+@pytest.mark.parametrize("win", [None, 7])
+@pytest.mark.parametrize("case", ["host", "card"])
+def test_a_decode_row_handed_no_mask_sees_the_causal_window(case: str, win: int | None) -> None:
+    """a decode row handed no mask (a tier that owns the attention elsewhere) sees the keys the reference's causal
+    mask and window leave it - on a sliding layer none past its window, however many rows the cache holds"""
+    where, dt, mask_dt, sink_dt = DTYPES[case]
+    if where == "cuda" and not torch.cuda.is_available():
+        pytest.skip("no card")
+    q, k, v, sinks, _mask = _inputs(where, dt, mask_dt, sink_dt)
+    q = q[:, :, -1:]  # the last row alone, over every key
+    scale = D**-0.5
+    got, _ = attention_sinks(types.SimpleNamespace(), q, k, v, None, scaling=scale, sliding_window=win, s_aux=sinks)
+    want = _reference(q, k, v, None, scale, sinks, win)
+    assert got.dtype == want.dtype and torch.equal(got, want)

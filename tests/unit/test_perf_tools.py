@@ -268,6 +268,99 @@ def test_render_states_the_runs_isa_tier() -> None:
     assert "ISA tier" not in body
 
 
+def _placed(lane: str, op: str, shape: str, rows: int, median: float, row: str = "", stddev: float = 0.0) -> Bench:
+    """one bench of e2e_bench's placement group, as its `_placed` names it (25 rounds)"""
+    row = row or f"r{rows}"
+    bid = f"{lane}/{op}/{shape}/{row}"
+    b = _bench(f"test_placement[{bid}]", median, stddev, 25, {"op": op, "shape": shape}, "placement")
+    b["extra_info"] = {"id": bid, "op": op, "shape": shape, "rows": rows, "row": row, "lane": lane, "err": 0.0}
+    return b
+
+
+def test_a_bench_that_names_its_own_id_keeps_it() -> None:
+    """the placement group's id is `<lane>/<op>/<shape>/<rows>`, from its extra_info, not its params joined; it names
+    its device first, and its section is still the group"""
+    doc = _doc(_placed("cuda/vram", "linear", "qkv-6144x2560", 16, 1e-4))
+    (e,) = e2e_delta.deltas(doc, doc)
+    assert (e["id"], e["section"], e["delta"]) == ("cuda/vram/linear/qkv-6144x2560/r16", "placement", 0.0)
+
+
+def test_the_crossover_renders_where_each_op_wins_by_rows(tmp_path: Path) -> None:
+    """the placement group's own times by op, shape and rows: each lane in ms, the fastest, the card's best against
+    the CPU's with the weights fed and held, the winner's runs along the rows, and the runs folded by their mean;
+    the routing replay's calls take a row each, their cuts after the three lanes"""
+    root = str(tmp_path)
+    times = {  # rows: (cpu/ram, cuda/vram, cuda/ram) seconds
+        1: (1e-4, 3e-4, 9e-4),
+        16: (4e-4, 3e-4, 9e-4),
+        64: (9e-4, 3e-4, 1e-3),
+    }
+    for run, drift in (("a", 1.0), ("b", 1.2)):
+        benches = [
+            _placed(lane, "linear", "qkv", rows, t * drift)
+            for rows, ts in times.items()
+            for lane, t in zip(("cpu/ram", "cuda/vram", "cuda/ram"), ts, strict=True)
+        ]
+        benches += [
+            _placed("split/c16", "express", "2560x640", 512, 2e-3, row="L0-c3-r512"),
+            _placed("split/c4", "express", "2560x640", 512, 3e-3, row="L0-c3-r512"),
+            _placed("cpu/ram", "express", "2560x640", 512, 5e-3, row="L0-c3-r512"),
+            _bench("cpu", 1.0, 0.0, 10, {"device": "cpu", "model": "m"}, "cpu"),  # not the placement group's
+        ]
+        with open(os.path.join(root, f"e2e-{run}.json"), "w", encoding="utf-8") as f:
+            json.dump(_doc(*benches), f)
+    body = report.crossover(root)
+    assert body.startswith("<details><summary>placement · where each op wins, by rows · 2 ops</summary>")
+    assert "**linear qkv**: cpu/ram at r1, cuda/vram r16 to r64" in body
+    assert "| r1 | 0.110 | 0.330 | 0.990 | `cpu/ram` | 9.00x | 3.00x |" in body  # a: 0.1 ms, b: 0.12 -> 0.11
+    assert "| r64 | 0.990 | 0.330 | 1.100 | `cuda/vram` | 1.11x | 0.33x |" in body
+    assert "| rows | `cpu/ram` ms | `split/c4` ms | `split/c16` ms | best |" in body  # the cuts by their number
+    assert "**express 2560x640**: split/c16 at L0-c3-r512" in body
+    assert report.crossover(str(tmp_path / "none")) == "", "no placement group, no section"
+
+
+def test_the_crossover_names_a_winner_only_when_its_lead_clears_the_noise_in_every_run(tmp_path: Path) -> None:
+    """the comment's rule, held to the crossover: a lane wins a row only when it undercuts every other by more than
+    the noise floor with the whole 95% band of the difference, in every interleaved run. A lead inside the floor, a
+    lead whose band reaches past it, or a lead one run holds and the other does not is a tie (`≈`) among the lanes the
+    row cannot tell apart; the floor is the caller's"""
+    root = str(tmp_path)
+    cases = {  # rows: {run: {lane: (median seconds, stddev)}}
+        1: {r: {"cpu/ram": (1e-4, 0.0), "cuda/vram": (3e-4, 0.0)} for r in "ab"},  # a clear win
+        2: {r: {"cpu/ram": (1.00e-4, 0.0), "cuda/vram": (1.03e-4, 0.0)} for r in "ab"},  # 3%: inside the 5% floor
+        4: {r: {"cpu/ram": (1e-4, 5e-5), "cuda/vram": (1.3e-4, 0.0)} for r in "ab"},  # 23% lead, its band past it
+        8: {  # run a has the CPU ahead, run b the card: faster on the mean, but not in every run
+            "a": {"cpu/ram": (1e-4, 0.0), "cuda/vram": (2e-4, 0.0)},
+            "b": {"cpu/ram": (2e-4, 0.0), "cuda/vram": (1.5e-4, 0.0)},
+        },
+        16: {r: {"cpu/ram": (5e-4, 0.0), "cuda/vram": (1e-4, 0.0)} for r in "ab"},  # a clear win the other way
+        32: {  # the card ahead in run a, its cell in run b failed: the run it lacks can't be won
+            "a": {"cpu/ram": (1e-4, 0.0), "cuda/vram": (5e-5, 0.0)},
+            "b": {"cpu/ram": (4e-5, 0.0)},
+        },
+        64: {r: {"cpu/ram": (1e-4, 0.0)} for r in "ab"},  # one lane timed: nothing to win against
+    }
+    for run in "ab":
+        benches = [
+            _placed(lane, "linear", "qkv", rows, m, stddev=sd)
+            for rows, by_run in cases.items()
+            for lane, (m, sd) in by_run[run].items()
+        ]
+        with open(os.path.join(root, f"e2e-{run}.json"), "w", encoding="utf-8") as f:
+            json.dump(_doc(*benches), f)
+    body = report.crossover(root)
+    assert (
+        "**linear qkv**: cpu/ram at r1, ≈ cpu/ram, cuda/vram r2 to r8, cuda/vram at r16, "
+        "≈ cpu/ram, cuda/vram at r32, cpu/ram alone at r64"
+    ) in body, body
+    assert "| r2 | 0.100 | 0.103 | `≈ cpu/ram, cuda/vram` | 1.03x |" in body
+    assert "| r16 | 0.500 | 0.100 | `cuda/vram` | 0.20x |" in body
+    assert "clears ±5% with its whole 95% CI in every run" in body
+    # a 1% floor: the 3% lead of r2 is a win; the band of r4 and the split of r8 still are not
+    tight = report.crossover(root, noise=0.01)
+    assert "**linear qkv**: cpu/ram r1 to r2, ≈ cpu/ram, cuda/vram r4 to r8, cuda/vram at r16" in tight, tight
+
+
 def test_a_new_benchmark_renders_as_new() -> None:
     new: Entry = {"id": "gemv/b16", "delta": None, "lo": 0.0, "hi": 0.0}
     body, regressed = report.render([new], 0.05)

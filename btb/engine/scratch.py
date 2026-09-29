@@ -35,17 +35,14 @@ class Scratch:
         if t is None or t.dtype != dtype or t.numel() < n:
             self._bufs.pop(key, None)
             t = None
+            # a pass takes its buffers on a live engine, whose scheduler prices every allocation
             sm = self._sm()
-            sched = getattr(sm, "scheduler", None) if sm is not None else None
+            assert sm is not None
             nbytes = n * torch.empty(0, dtype=dtype).element_size()
-            if sched is not None:
-                sched.grant(nbytes, "scratch", requester=requester, device=dev)
+            sm.scheduler.grant(nbytes, "scratch", requester=requester, device=dev)
             t = torch.empty(n, dtype=dtype, device=dev)
             self._bufs[key] = t
         return t[:n].view(*shape)
-
-    def nbytes(self) -> int:
-        return sum(t.numel() * t.element_size() for t in self._bufs.values())
 
     def clear(self) -> None:
         self._bufs.clear()

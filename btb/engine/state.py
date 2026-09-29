@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 import torch
 
 from ..kinds import LayerTier, PassReport, PassTag, Proposer
+from .device import Where
 
 # rows of the lm_head the drafter proposes from
 DRAFT_VOCAB = 32768
@@ -85,7 +86,14 @@ class _State:
     cfg: Any
     compute_dtype: torch.dtype | None
     context: int | None
-    dev: torch.device
+    if TYPE_CHECKING:
+
+        def __init__(self) -> None:
+            # the engine's device, as its tensors name it (`where`). Declared on the instance, for the checker
+            # alone: torch's stub gives `device` a `__get__`, so a class-level `dev: Where` would read back as a
+            # bare torch.device and the type would be lost
+            self.dev: Where
+
     device: Device
     dir: str
     fam: Family
@@ -339,6 +347,9 @@ class _State:
     def _regrow_bytes(self) -> int:
         raise NotImplementedError
 
+    def _drafter_bytes(self) -> int:
+        raise NotImplementedError
+
     @staticmethod
     def _set_param(module: Any, dotted: str, t: torch.Tensor, buffer: bool = False) -> None:
         raise NotImplementedError
@@ -388,7 +399,7 @@ class _State:
     ) -> Any:  # an engine built without the card mixin runs no card program
         return None
 
-    def _card_graph_run(self, holder: Any, key: Any, body: Callable[[], None], eager: bool | None = None) -> None:
+    def _card_graph_run(self, holder: Any, key: Any, body: Callable[[], None]) -> None:
         raise NotImplementedError
 
     def _forward_card_program(
@@ -683,7 +694,7 @@ class _State:
     def cache_room(self, cache: KvCache | None, B: int, T: int) -> None:
         raise NotImplementedError
 
-    def cache_growth(self, cache: KvCache | None, B: int, T: int, peak: bool = False) -> dict[torch.device, int]:
+    def cache_growth(self, cache: KvCache | None, B: int, T: int, peak: bool = False) -> dict[Where, int]:
         raise NotImplementedError
 
     def _make_room(self, dev: torch.device, nbytes: int, what: str, own: str | None = None) -> set[str]:

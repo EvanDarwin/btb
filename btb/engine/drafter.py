@@ -244,8 +244,6 @@ class MTPDrafter:
         set_rows(layer, rows[0], rows[1])
         if len(rows) > 2:
             layer.indexer_keys = rows[2]
-        if hasattr(layer, "cumulative_length"):
-            layer.cumulative_length = int(rows[0].shape[-2])
 
     def crop(self, keep: int) -> None:
         for layer in self.cache.layers:

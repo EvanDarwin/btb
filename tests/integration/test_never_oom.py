@@ -12,6 +12,7 @@ decoded, a fork stepped and kept, a batch of sessions, and a tensor lent to the 
 from __future__ import annotations
 
 import contextlib
+import os
 import sys
 from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any
@@ -32,6 +33,8 @@ PROMPT = [(7 * i + 3) % 200 + 2 for i in range(40)]
 LEFT = (0, 8 * MiB, 64 * MiB, 1024 * MiB)
 # what the host keeps while the card is squeezed (`squeezed`): the paths' host growth and staging, with room
 HOST_ROOM = 512 * MiB
+# the squeezes take the card from every program on it (`squeezed`): only on a card set aside for them
+SQUEEZE = os.environ.get("BTB_SQUEEZE_CARD") == "1"
 FAMILIES = ["tiny_q4", "tiny_gpt_oss", "tiny_qwen3", "tiny_q35"]
 
 
@@ -47,7 +50,13 @@ def squeezed(sm: StreamedTextModel, left: int) -> Iterator[None]:
     charged to the host's commit as well (WDDM), so a filler taken whole would starve the host too - the paths'
     host growth then refused, rightly, and "plenty left" not what the test meant (8.6 GB of filler took the
     machine from 11.6 to 3.0 GB of commit left, btb's host figure to 0.08 GB). There the filler leaves the host
-    `HOST_ROOM` of what it had, and the card a little more than `left`"""
+    `HOST_ROOM` of what it had, and the card a little more than `left`.
+
+    The filler takes the card's free memory as every program on it sees it, not only btb's: a game or anything else
+    on the card is left nothing to grow into, and can fail or crash. So it runs only on a card set aside for it,
+    `BTB_SQUEEZE_CARD=1`; otherwise the test is skipped saying so."""
+    if not SQUEEZE:
+        pytest.skip("squeezes the whole card, whatever else runs on it: BTB_SQUEEZE_CARD=1 on a card set aside for it")
     torch.cuda.synchronize(sm.dev)
     torch.cuda.empty_cache()
     take = max(0, int(sm.device.free(sm.dev, unreserved=True) or 0) - int(left))
@@ -139,7 +148,7 @@ PATHS: dict[str, Callable[[StreamedTextModel], None]] = {
 @pytest.mark.parametrize("fx", FAMILIES)
 def test_every_path_fits_or_is_refused_and_never_runs_the_card_out(fx: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """one load a family: every path's card peak held to what the ledger was told, then every path at every
-    squeeze, generous first (what a squeeze shed stays shed after)"""
+    squeeze, generous first (what a squeeze shed stays shed after) - on a card set aside for it (`SQUEEZE`)"""
     dev = need_cuda()
     # a host layer prefilled on the card in chunks of 8 (the card's floor at 4 rows), layer by layer
     kw: dict[str, Any] = {"device": dev, "cpu_layers": 1, "prefill_chunk": 8, "prefill_card_min": 4}
@@ -165,6 +174,8 @@ def test_every_path_fits_or_is_refused_and_never_runs_the_card_out(fx: str, monk
                     f"{(t['granted'] + t['reserved'] + t['asked']) / MiB:.2f} MiB {t} beside the pass's "
                     f"{passes / MiB:.2f} MiB of rows"
                 )
+            if not SQUEEZE:
+                continue  # the peak against the ledger holds on any card; the squeezes need one set aside
             outcomes = []
             for left in sorted(LEFT, reverse=True):
                 with squeezed(sm, left):

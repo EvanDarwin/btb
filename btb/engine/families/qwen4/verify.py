@@ -65,9 +65,12 @@ def install(layer: Any, sm: Any) -> None:
 
 
 def _consts(la: Any, dev: torch.device) -> dict[str, Any]:
-    """the layer's float32 operands on `dev`, made once per set of weights: a template retargeted to another layer
-    carries other weights, so the key is the weights' own storage"""
-    key = (dev, la.conv1d.weight.data_ptr(), la.A_log.data_ptr(), la.norm.weight.data_ptr())
+    """the layer's float32 operands on `dev`, made once per layer the module holds: a streamed template or a float32
+    shadow is refilled in place (its storage unchanged) with the next layer's weights and pointed at that layer
+    (`_retarget` sets its `layer_idx`), so the key is the layer beside the weights' storage - one build per layer
+    switch, never a first layer's operands kept for the next. A float32 weight on `dev` is its own operand (no copy):
+    it follows a refill by itself"""
+    key = (dev, int(la.layer_idx), la.conv1d.weight.data_ptr(), la.A_log.data_ptr(), la.norm.weight.data_ptr())
     c = getattr(la, "_btb_consts", None)
     if c is None or c["key"] != key:
         f = lambda t: None if t is None else t.detach().to(dev, torch.float32).contiguous()
@@ -119,8 +122,38 @@ def _delta_forward(
     cl = cache_params.layers[i]
     core = _nodes(sm, self, cl, mixed, z, a, b, chain_of(sm.ap, T) if spec else None)
     if spec:
-        sm.al[i] = _PathStep(sm, self, cl, mixed, z, a, b)
+        sm.al[i] = _PathStep(sm, self, cl, mixed, z, a, b, _kept(sm, self, i, _consts(self, x.device)))
     return self.out_proj(core.view(1, T, -1).to(x.dtype))
+
+
+_OPERANDS = ("conv_w", "conv_b", "a_log", "dt_bias", "norm_w")
+
+
+def _kept(sm: Any, la: Any, i: int, c: dict[str, Any]) -> dict[str, Any]:
+    """layer `i`'s operands `c` as the commit (`ad`, after every later layer has run) must read them. A module that
+    is the layer's own (a host or resident layer) keeps its weights to the commit, and a rebuild of its operands is
+    a new set, so `c` itself. A module that serves other layers too - a streamed template, a float32 shadow - is
+    refilled with them before the commit, which a float32 operand aliasing its weight follows, and which rebuilds
+    the operands the commit would read off it: those are copied here into the layer's own scratch (a few rows: the
+    conv's taps, the heads' decay and bias, the norm)"""
+    own = any(getattr(m, "linear_attn", None) is la for m in (sm.host.get(i), sm.resident.get(i)))
+    if own:
+        return c
+    dev = c["conv_w"].device
+    ts = [c[k] for k in _OPERANDS if c[k] is not None]
+    n = sum(t.numel() for t in ts)
+    buf = sm.scratch.take(
+        f"qwen4 delta operands {i}", (n,), torch.float32, dev, "Qwen4's DeltaNet: a verify pass's layer operands"
+    )
+    kept = dict(c)
+    at = 0
+    for k in _OPERANDS:
+        t = c[k]
+        if t is None:
+            continue
+        kept[k] = buf[at : at + t.numel()].view_as(t).copy_(t)
+        at += t.numel()
+    return kept
 
 
 def _kernels_for(dev: torch.device) -> bool:
@@ -139,11 +172,13 @@ def _nodes(
     a: torch.Tensor,
     b: torch.Tensor,
     parents: list[int] | None,
+    c: dict[str, Any] | None = None,
 ) -> torch.Tensor:
     """the DeltaNet's gated-normed output [T, Hv * dv] float32 for T nodes: a chain stepped into the cache's states
-    (`parents` None: the one-token step, or a commit), or a tree stepped in scratch from them (a verify pass)"""
+    (`parents` None: the one-token step, or a commit), or a tree stepped in scratch from them (a verify pass); over
+    the operands `c` (a commit's, kept at its pass: `_kept`), else the module's now"""
     dev = mixed.device
-    c = _consts(la, dev)
+    c = _consts(la, dev) if c is None else c
     conv, rec = _states(sm, cl)
     T, C = (int(s) for s in mixed.shape)
     hk, hv, dk, dv = int(la.num_k_heads), int(la.num_v_heads), int(la.head_k_dim), int(la.head_v_dim)
@@ -250,12 +285,13 @@ def _nodes(
 class _PathStep:
     """a verify pass's DeltaNet inputs, kept to step the accepted path into the cache's states at the commit
     (`ad` calls `restore`): the path's rows as a chain from the states the pass started from, which it left as they
-    were"""
+    were, over the layer's operands as the pass read them (`c`, from `_kept`: the module may hold another layer's
+    weights by the commit)"""
 
-    __slots__ = ("a", "b", "cl", "la", "mixed", "sm", "z")
+    __slots__ = ("a", "b", "c", "cl", "la", "mixed", "sm", "z")
 
-    def __init__(self, sm: Any, la: Any, cl: Any, mixed: Any, z: Any, a: Any, b: Any) -> None:
-        self.sm, self.la, self.cl = weakref.ref(sm), la, cl
+    def __init__(self, sm: Any, la: Any, cl: Any, mixed: Any, z: Any, a: Any, b: Any, c: dict[str, Any]) -> None:
+        self.sm, self.la, self.cl, self.c = weakref.ref(sm), la, cl, c
         self.mixed, self.z, self.a, self.b = mixed, z, a, b
 
     def restore(self, path: list[int]) -> None:
@@ -264,7 +300,7 @@ class _PathStep:
             return None
         rows = torch.tensor(path, dtype=torch.long, device=self.mixed.device)
         pick = lambda t: t.index_select(0, rows).contiguous()
-        _nodes(sm, self.la, self.cl, pick(self.mixed), pick(self.z), pick(self.a), pick(self.b), None)
+        _nodes(sm, self.la, self.cl, pick(self.mixed), pick(self.z), pick(self.a), pick(self.b), None, self.c)
         return None
 
 

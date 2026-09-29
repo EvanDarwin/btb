@@ -7,6 +7,7 @@ follow from the profile the probe took."""
 from __future__ import annotations
 
 import random
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -46,6 +47,30 @@ def test_the_probe_reads_each_drive_and_the_rule_answers_it(monkeypatch: MonkeyP
     assert p["depth"] == 16 and not p["merge"] and p["ahead"] == 3
     p, _ = _probe(monkeypatch, "nvme", True)
     assert p["depth"] == 16 and not p["merge"] and p["ahead"] == 8
+
+
+def test_the_probe_reads_through_the_direct_reader_where_no_handle_is_kept(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """a reader library without kept handles probes through its direct read: the same drive, the same costs (the
+    simulated clock's); a path that is not there is not measured, and its profile is the defaults"""
+    from btb.engine.native import Native
+
+    drive = SeekingDrive("sata_ssd", reorder=True, files={"F:/shard-00.st": SHARD})
+    drive.install(monkeypatch)
+    try:
+        kept = BatchScheduler.measure_drive("F:/shard-00.st", clock=drive.clock)
+        for name in ("open", "read_at", "close"):
+            monkeypatch.setattr(Native, name, None, raising=False)
+        direct = BatchScheduler.measure_drive("F:/shard-00.st", clock=drive.clock)
+    finally:
+        drive.stop()
+    assert kept["measured"] and direct["measured"]
+    for k in ("fixed_ms", "single_ms"):
+        assert direct[k] == pytest.approx(kept[k], rel=1e-6), k
+    assert BatchScheduler._disk_rule(direct) == BatchScheduler._disk_rule(kept)
+    gone = BatchScheduler.measure_drive(str(tmp_path / "gone.st"))
+    assert not gone["measured"] and gone["rates"] == {} and gone["single_ms"] == 0.0
 
 
 def _route_on(

@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from .... import mlx as mlxdev
 from ...cache import GrowLayer
+from ...device import Where, where
 
 
 class ScoresWorkspace:
@@ -41,23 +42,15 @@ class ScoresWorkspace:
 
 # the open workspace a device's sink attention takes its scores from (`ScoresWorkspace`): a prefill sweep's, while
 # it runs; none otherwise, the tensors then made per call
-_SCORES: dict[torch.device, ScoresWorkspace] = {}
-
-
-def _card_key(device: Any) -> torch.device:
-    """a device as the tensors on it name it: a card by its index (`cuda` is the current one, `cuda:0` here)"""
-    d = torch.device(device)
-    if d.type == "cuda" and d.index is None:
-        d = torch.device("cuda", torch.cuda.current_device())
-    return d
+_SCORES: dict[Where, ScoresWorkspace] = {}
 
 
 def open_scores(device: Any, ws: ScoresWorkspace) -> None:
-    _SCORES[_card_key(device)] = ws
+    _SCORES[where(device)] = ws
 
 
 def close_scores(device: Any) -> None:
-    _SCORES.pop(_card_key(device), None)
+    _SCORES.pop(where(device), None)
 
 
 def attention_sinks(
@@ -174,7 +167,7 @@ def attention_sinks(
     raw_dt = torch.promote_types(query.dtype, key.dtype)
     lhs = raw_dt if mask is None else torch.promote_types(raw_dt, mask.dtype)
     cdt = torch.promote_types(lhs, s_aux.dtype)
-    ws = _SCORES.get(_card_key(query.device)) if _SCORES else None
+    ws = _SCORES.get(where(query.device)) if _SCORES else None
     shape = (B, Hq, T, nk + 1)
     held: list[torch.Tensor] | None = None
     if ws is not None:
@@ -196,12 +189,12 @@ def attention_sinks(
     if mask is not None:
         torch.add(raw, mask, out=scores)  # computed in the two's dtype, then made the buffer's, as the join makes it
     else:
-        if T > 1:
-            # no mask handed over (a tier that owns the attention elsewhere): the causal one, and the window
-            pos = torch.arange(n - T, n, device=raw.device)[:, None]
-            j = start + torch.arange(nk, device=raw.device)[None]
-            allow = (j <= pos) if win is None else ((j <= pos) & (j > pos - win))
-            raw.masked_fill_(~allow, torch.finfo(raw.dtype).min)
+        # no mask handed over (a tier that owns the attention elsewhere): the causal one, and the window - a decode
+        # row's too, whose keys past the window a sliding layer must not see
+        pos = torch.arange(n - T, n, device=raw.device)[:, None]
+        j = start + torch.arange(nk, device=raw.device)[None]
+        allow = (j <= pos) if win is None else ((j <= pos) & (j > pos - win))
+        raw.masked_fill_(~allow, torch.finfo(raw.dtype).min)
         scores.copy_(raw)
     del raw
     combined[..., nk:] = s_aux.reshape(1, -1, 1, 1)

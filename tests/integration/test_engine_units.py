@@ -735,9 +735,12 @@ def test_a_verify_pass_over_a_host_cache_is_the_one_row_steps_bit_for_bit(stem: 
             assert torch.equal(out[0, r].float().cpu(), steps[want]), f"tree node {r}"
 
 
-def test_the_drafter_answers_the_greedy_loop_over_a_head_slice_on_the_card_and_on_the_host() -> None:
+def test_the_drafter_answers_the_greedy_loop_over_a_head_slice_on_the_card_and_on_the_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """With the head cut to `draft_vocab` rows, the speculative tokens must equal the greedy loop's on the card at
-    8 and 16 bits and on the host. The head must be the slice's size, and at 8 bits the bf16 fc must be released."""
+    8 and 16 bits and on the host, its kernels there or not. The head must be the slice's size, and at 8 bits the
+    bf16 fc must be released."""
     from btb.engine.drafter import _Int8Linear
     from btb.engine.host import _HostLinear
     from btb.engine.native import Native
@@ -764,6 +767,18 @@ def test_the_drafter_answers_the_greedy_loop_over_a_head_slice_on_the_card_and_o
                 head = dr._host_head()
                 assert isinstance(head, _HostLinear) and tuple(head.weight.shape) == (256, H)
                 assert getattr(dr, "_head_t", None) is None, "the host drafter built a torch head"
+                # a drafter built where the host has no gemv: the torch tier, at 8 bits its layer and its fc packed
+                # to int8 in memory, and still the greedy tokens
+                with monkeypatch.context() as mp, torch.inference_mode():
+                    mp.setattr(Native, "gemv", None)
+                    sm.aj, sm.draft_bits = None, 8
+                    greedy = sm.generate_greedy(VARIED, 48)
+                    spec, census = sm.generate_speculative(VARIED, 48, proposer="mtp_dyn", v_max=4)
+                    assert spec == greedy, f"the host's torch tier at 8 bits left the greedy path ({census})"
+                    tdr = sm.aj
+                    assert tdr is not None and tdr.fc_host is None
+                    assert tdr.fc is None and tdr.fc8 is not None, "the bf16 fc is still held beside its int8 copy"
+                    assert any(isinstance(m, _Int8Linear) for m in tdr.layer.modules()), "the layer was not packed"
                 continue
             head = dr._head_t
             assert head is not None, "the drafter never made its head"

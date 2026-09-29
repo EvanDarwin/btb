@@ -1085,13 +1085,16 @@ extern "C" __global__ void __launch_bounds__(ROUTE_THREADS) btb_moe_route(
     s = block_sum256(s, red);
     for (int e = tid; e < E; e += ROUTE_THREADS) pr[e] = pr[e] / s;
     __syncthreads();
-    // k rounds of the total order's maximum; probabilities are >= 0, so -1 is below every live one and a pick is -2
+    // k rounds of the total order's maximum; probabilities are >= 0, so -1 is below every live one and a pick is -2.
+    // A row whose probabilities are NaN (a NaN or infinite logit) compares below nothing: it still takes live experts,
+    // the first it meets, their weights NaN as torch's topk leaves them - never the "none" index, written through
+    constexpr int NONE = 0x7fffffff;
     for (int j = 0; j < k; ++j) {
         float bv = -1.f;
-        int bi = 0x7fffffff;
+        int bi = NONE;
         for (int e = tid; e < E; e += ROUTE_THREADS) {
             const float v = pr[e];
-            if (v > bv) {  // e ascends within the thread, so a tie keeps the lower index
+            if (v > bv || (bi == NONE && v != -2.f)) {  // e ascends within the thread, so a tie keeps the lower index
                 bv = v;
                 bi = e;
             }
@@ -1103,7 +1106,7 @@ extern "C" __global__ void __launch_bounds__(ROUTE_THREADS) btb_moe_route(
             if (tid < st) {
                 const float ov = red[tid + st];
                 const int oi = redi[tid + st];
-                if (ov > red[tid] || (ov == red[tid] && oi < redi[tid])) {
+                if (oi != NONE && (redi[tid] == NONE || ov > red[tid] || (ov == red[tid] && oi < redi[tid]))) {
                     red[tid] = ov;
                     redi[tid] = oi;
                 }
@@ -1113,7 +1116,7 @@ extern "C" __global__ void __launch_bounds__(ROUTE_THREADS) btb_moe_route(
         if (tid == 0) {
             topv[j] = red[0];
             topi[j] = redi[0];
-            pr[redi[0]] = -2.f;
+            if (redi[0] != NONE) pr[redi[0]] = -2.f;
         }
         __syncthreads();
     }

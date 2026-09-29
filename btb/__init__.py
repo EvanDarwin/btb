@@ -351,11 +351,10 @@ def load(
         cpu = [i for i in cpu if i not in res]
     if pl is not None:
         # every planned placement: the cold reader's depth; the drafter's head over the frequent 32K ids (a draft
-        # outside them is a missed proposal, never a wrong token); speculation on by default (the tree with a
-        # drafting head, the n-gram drafter without; --v-max 0 turns it off), a mixture of experts' included
+        # outside them is a missed proposal, never a wrong token); speculation's default is the loaded engine's
+        # (`v_max` below)
         c.setdefault("cold_slots", pl.cold_slots())
         c.setdefault("draft_vocab", DRAFT_VOCAB if pl.has_mtp else 0)
-        c.setdefault("v_max", 4)
     sm = StreamedTextModel(
         path,
         device=dev,
@@ -445,7 +444,9 @@ def load(
         sm.draft_vocab = int(c.get("draft_vocab", DRAFT_VOCAB if has_drafter else 0) or 0)
         sm.draft_temp_ratio = float(c.get("draft_temp_ratio", 1.0) or 1.0)
         sm.ngram_p = float(c.get("ngram_p", 0.9))
-        sm.v_max = int(c.get("v_max", 4))  # an explicit placement: the planned default's rule
+        # speculation on by default (the tree with a drafting head, the n-gram drafter without; --v-max 0 turns it
+        # off), a mixture of experts' included - the pricer sizes each pass by what its rows cost
+        sm.v_max = int(c.get("v_max", 4))
         if not sm.fam.speculates(mlx=sm.mlx is not None):
             # a tier the family's verify pass does not run on (Qwen4's node steps on MLX): the plain loop
             sm.tree_budget = 0

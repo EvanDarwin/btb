@@ -168,7 +168,7 @@ Every command that loads a model takes these. The placement is planned from the 
 | `--adapt 0\|1`<br/><sub>This option enables/disables `btb`'s behavior under contention, for RAM and VRAM together. When true, it aims for no apps OOMing. When false, it plans once and sticks to it - making other apps take the OOM. | `1`: free RAM/VRAM under contention, reclaim it when available again<br/>`0`: fit the model to the hardware once and don't readjust | `1` |
 | `--no-spec` | disables speculative decoding | _disabled_ |
 | `--tree-budget N` | the draft tree's size per pass; `0` turns the tree off | with drafting head: mlx = `14`, cuda = `15`, cpu = `16`<br/>without: on a card holding every layer, `15`; otherwise `0` |
-| `--v-max N` | drafted tokens verified per pass; `0` decodes one token at a time | `4`; `0` for a mixture of experts |
+| `--v-max N` | drafted tokens verified per pass; `0` decodes one token at a time | `4` |
 | `--tree-min-prob P` | minimum draft path probability kept in the tree | `0.15` |
 | `--tree-step-mass P` | a drafting step runs only when the nodes it would extend carry this much path probability; `0` always steps | `0.5` |
 | `--ngram-p P` | acceptance threshold of the n-gram drafter | `0.9` |

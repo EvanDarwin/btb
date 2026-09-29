@@ -578,7 +578,8 @@ class _Experts(torch.nn.Module):
         depot: Any,
         final: torch.Tensor,
         seated: set[int] | None = None,
-    ) -> None:
+        buf: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """A call's experts on the card as grouped matmuls over the depot's stacked slots, a wave at a time: the
         experts already in RAM, then each batch as it lands from the drive, each wave placed on the card
         (`LayerDepot.place`) and multiplied as one gate_up, one gate and one down over the slots it took - a few
@@ -586,7 +587,10 @@ class _Experts(torch.nn.Module):
         `torch.where` lists them, and the grouped matmul's product over them is the per-expert one bit for bit on
         the card, so each (row, pick) contribution is the loop's. They are summed as the loop sums them: each row's
         in ascending expert order, from zero, one add at a time (a row's picks are distinct, so its k
-        contributions fill `k` places, ranked by expert).
+        contributions fill `k` places, ranked by expert). The places are `buf`, returned unsummed: a call the store
+        serves in waves passes the one buffer to each, and sums it once they are all in (`_waves`), so the experts a
+        depot seat brings with the first wave are still added in their rank among the later waves'. An expert already
+        on the card (a VRAM seat, no bytes the depot could place) is multiplied where it is, as the loop multiplies it.
 
         MXFP4 experts (gpt-oss's) and FP8 ones cross the bus as stored and are widened to bf16 on the card
         `WIDEN_BATCH` at a time - MXFP4 by `dequant_blocks` (exact: every value times its power-of-two scale is a
@@ -603,9 +607,24 @@ class _Experts(torch.nn.Module):
         pos_s, row_s, offs, counts = group_picks(top_k_index, self.num_experts)
         ranks = torch.argsort(torch.argsort(top_k_index, dim=1), dim=1)
         # zeros: a call served in waves (`StoreCall.wave`) fills here only its wave's picks, the others' adding nothing
-        buf = torch.zeros(T, k, x.shape[-1], dtype=final.dtype, device=x.device)
+        if buf is None:
+            buf = torch.zeros(T, k, x.shape[-1], dtype=final.dtype, device=x.device)
+        places = buf
+
+        def on_card(e: int, w_gu: Any, w_dn: Any) -> None:
+            """expert `e` from weights already on the card, as `_loop` multiplies it, into its rows' places"""
+            a, n = offs[e], counts[e]
+            rows, poss = row_s[a : a + n], pos_s[a : a + n]
+            h = self._linear(self._act(self._linear(x.index_select(0, rows), w_gu), e), w_dn)
+            if self.biased:
+                h = h + self._bias(self.down_proj_bias, e, h)
+            places[rows, ranks[rows, poss]] = (h * w_top[rows, poss, None]).to(places.dtype)
 
         def wave(items: list[tuple[int, Any, Any]]) -> None:
+            for e, gu, dn in items:
+                if gu is not None and stored_parts(gu, dn) is None:
+                    on_card(e, gu, dn)
+            items = [it for it in items if it[1] is None or stored_parts(it[1], it[2]) is not None]
             while items:
                 slots = depot.place(self.layer, items)
                 if not any(sl is not None for sl in slots):
@@ -675,7 +694,7 @@ class _Experts(torch.nn.Module):
             y = torch._grouped_mm(h, dn_w.transpose(1, 2), offs=ends)
             if self.biased:
                 y = y + self._bias(self.down_proj_bias, who, y)
-            buf[rows, ranks[rows, poss]] = (y * w_top[rows, poss, None]).to(buf.dtype)
+            places[rows, ranks[rows, poss]] = (y * w_top[rows, poss, None]).to(places.dtype)
 
         # the experts seated on the card by an earlier chunk (no bytes in RAM: `place` finds their seats) and
         # those in RAM, then each batch as it lands
@@ -683,8 +702,7 @@ class _Experts(torch.nn.Module):
         for batch in store.landed(pending) if pending else ():
             wave([(e, *store._views(s)) for e, _f, s in batch])
         depot.settle()
-        for j in range(k):
-            final.add_(buf[:, j])
+        return places
 
     def _waves(
         self,
@@ -711,6 +729,8 @@ class _Experts(torch.nn.Module):
         on_host = x.device.type == "cpu" and hidden_states.device.type != "cpu"
         # experts seated on the card: the depot took this layer's form in an earlier chunk, so the path is grouped
         grouped: bool | None = True if seated else None
+        # the grouped waves' places, one buffer for the call: summed once every wave is in
+        buf: torch.Tensor | None = None
         while True:
             depot = self._depot_for(x, on_host)
             if grouped is None:
@@ -726,11 +746,15 @@ class _Experts(torch.nn.Module):
                     )
                 )
             if grouped:
-                self._card_grouped(x, w_top, top_k_index, now, views, pending, store, depot, final, seated)
+                buf = self._card_grouped(x, w_top, top_k_index, now, views, pending, store, depot, final, seated, buf)
                 seated = None  # placed with the first wave
             else:
                 self._loop(x, w_top, top_k_index, expert_mask, hidden_states, now, views, pending, store, final, x_card)
             if call is None or call.done:
+                if buf is not None:
+                    # each row's contributions in ascending expert order, from zero, one add at a time
+                    for j in range(int(buf.shape[1])):
+                        final.add_(buf[:, j])
                 return
             # this wave's experts are done with (the depot's copies out of their slots landed): the store may seat
             # the next wave in their slots
@@ -834,8 +858,9 @@ class _Experts(torch.nn.Module):
         x = hidden_states.cpu() if on_host else hidden_states
         w_top = top_k_weights.cpu() if on_host else top_k_weights
         final = torch.zeros_like(x)
+        top_host = top_k_index.cpu()  # the picks on the host: the mask's, and the profile's record of the call
         with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(top_k_index.cpu(), num_classes=self.num_experts).permute(2, 1, 0)
+            expert_mask = torch.nn.functional.one_hot(top_host, num_classes=self.num_experts).permute(2, 1, 0)
             expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
         hit = [int(e[0]) for e in expert_hit]
         store = self.sm.expert_store
@@ -921,6 +946,7 @@ class _Experts(torch.nn.Module):
                 expert=int(hidden_states.shape[0]),
                 nbytes=len(hit) - (call.read if call is not None else len(pending)),
                 shard=call.read if call is not None else len(pending),
+                offset=prof.keep_picks(top_host),
                 dur_ns=int((store.stat["wait_s"] - w0) * 1e9),
             )
         if self.sm.expert_trace is not None:

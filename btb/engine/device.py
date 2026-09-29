@@ -16,7 +16,7 @@ import time
 import weakref
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NewType
 
 import torch
 
@@ -134,6 +134,22 @@ def torch_device(device: DeviceSpec) -> torch.device:
     if d is None:
         raise BadDevice(device, f"a device is named here: {DeviceKind.CPU}, {DeviceKind.MLX} or {DeviceKind.CUDA}[:N]")
     return torch.device(DeviceKind.CPU) if d.kind is DeviceKind.MLX else torch.device(str(d))
+
+
+# A device as the tensors on it name it: a card always by its index ('cuda:0', never torch's bare 'cuda'), so two
+# compare and hash equal exactly when they are the same memory. torch's 'cuda' is not equal to 'cuda:0', though every
+# tensor on that card reports the latter: a figure keyed by one is missed under the other, and a buffer on the card
+# reads as elsewhere. The engine's own device, the devices the ledger's figures and a cache's rows are keyed by, and
+# a cache layer's own device are each one; `where()` is the one way to make one.
+Where = NewType("Where", torch.device)
+
+
+def where(device: DeviceSpec) -> Where:
+    """`device` as its tensors name it: a card without an index is the current one, by its index"""
+    d = torch_device(device)
+    if d.type == DeviceKind.CUDA and d.index is None:
+        d = torch.device(DeviceKind.CUDA, torch.cuda.current_device())
+    return Where(d)
 
 
 def resolve_device(device: Any) -> DeviceName:

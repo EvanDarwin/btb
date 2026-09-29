@@ -187,7 +187,16 @@ class Qwen4Card:
         place = sm.device.snapshot()
         if place.version != self.version:
             self._reset_weights()
-            self._layout(place.resident)
+            try:
+                self._layout(place.resident)
+            except MemoryGrantError as e:
+                # the bound cache's rows and states, copied out of the buffers the old layout sized, refused: the
+                # program declines this placement (its passes take the torch path) with the old buffers kept, so a
+                # layer still attached reads rows that stand, and the next look lays the placement out again
+                self._why = f"the bound cache's rows could not be copied out for the new placement: {e}"
+                self.version = None
+                sm.log(f"[card] Qwen4's card program off for this placement: {self._why}")
+                return False
             self.version = place.version
             self._why = self.why_not(sm)
         if self._why is None and self.host_layers and self.X is None:
@@ -674,7 +683,9 @@ class Qwen4Card:
         }
         for j, ref in enumerate(self.bound):
             layer = ref() if ref is not None else None
-            if layer is not None:
+            if layer is not None and layer.attached:
+                # a layer that let the arena go since (given up to the host, its rows a fork's) keeps its own rows: the
+                # next bind attaches it again where the program runs it
                 layer.attach(kv[j, 0], kv[j, 1], raw[j])
         self._drop_graphs()
         if old:
@@ -749,24 +760,16 @@ class Qwen4Card:
         assert sm is not None
         S = self.S
         mine = {id(t) for ts in (S or {}).values() for t in ts}
-        nbytes = 0
-        for i in self.linear:
-            cl = owner.layers[i]
-            for d in (cl.conv_states, cl.recurrent_states):
-                for t in d.values() if isinstance(d, dict) else [d]:
-                    if isinstance(t, torch.Tensor) and id(t) in mine:
-                        nbytes += t.numel() * t.element_size()
+        # a linear layer's states by index, as transformers' cache keeps them (the program binds its own into them)
+        states = [d for i in self.linear for d in (owner.layers[i].conv_states, owner.layers[i].recurrent_states)]
+        held = [(d, key) for d in states for key, t in d.items() if isinstance(t, torch.Tensor) and id(t) in mine]
+        nbytes = sum(d[key].numel() * d[key].element_size() for d, key in held)
         if nbytes and getattr(sm, "scheduler", None) is not None:
             sm.scheduler.grant(
                 nbytes, "kv", requester="Qwen4's card program: a cache's states, copied out", device=sm.dev, draws=""
             )
-        for i in self.linear:
-            cl = owner.layers[i]
-            for d in (cl.conv_states, cl.recurrent_states):
-                if isinstance(d, dict):
-                    for key, t in list(d.items()):
-                        if isinstance(t, torch.Tensor) and id(t) in mine:
-                            d[key] = t.clone()
+        for d, key in held:
+            d[key] = d[key].clone()
         for j, i in enumerate(self.sparse):
             cl = owner.layers[i]
             if isinstance(cl, ArenaIndexedLayer) and self.A is not None and cl.attached_to(self.A["kv"][j, 0]):
@@ -885,8 +888,8 @@ class Qwen4Card:
     def rehearsed(self) -> None:
         """a timing pass ended: the pooled keys it stood at let go (the next cache bound pools its own)"""
         A = self.A
-        if A is not None:
-            A["pk_len"].zero_()
+        assert A is not None  # `rehearse` made it
+        A["pk_len"].zero_()
         self.pooled = [0] * len(self.sparse)
         self.clean = True
 

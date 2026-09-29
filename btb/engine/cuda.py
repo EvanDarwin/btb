@@ -1188,6 +1188,8 @@ class _CudaMixin(_State):
         apply."""
         ids_t = torch.as_tensor(list(ids), dtype=torch.long).view(1, -1)
         if self.dev.type == Device.CUDA and self.fam.card_program() is not None:
+            if not self._card_program_on():
+                return 0  # switched off: nothing of the program made, held or timed
             t_max = int(t_max or (int(getattr(self, "tree_budget", 0) or 0) + 1))
             return self._card_program_warm(ids_t, max(1, min(t_max, self.CARD_T_MAX)))
         if self.dev.type != Device.CUDA or self._card_kernels() is None or not self._card_ready():
@@ -1284,12 +1286,13 @@ class _CudaMixin(_State):
         """a family's card program's cost curve, measured up front with no cache and no expert read: for each graph
         width M the passes of 1 .. `t_max` rows take, the program's verify graphs replayed (captured on the first
         one, the fastest of the two after it counted) at the context of `ids_t`'s length, the host's part between
-        the layers only the wait for each router's publish (`_card_program_time`). The curve (`_card_cost`) is the
-        card's compute a pass of T rows costs - the rows' expert reads, which the speculative pricer counts on its
-        own, and the host layers are not in it. Every other graph (the step's, a tap's, a commit's) is captured on
-        its first use. Returns the graphs captured; 0 where the program does not run the model."""
+        the layers only the wait for each router's publish (`_card_program_time`). The curve (`_card_prog_cost`) is
+        the card's compute a pass of T rows costs - the rows' experts and the host layers are not in it - so it is
+        the engine's pass cost (`_card_cost`, which sizes a pass the pricer does not) only where the program runs the
+        whole model on the card, as `card_warm`'s curve is. Every other graph (the step's, a tap's, a commit's) is
+        captured on its first use. Returns the graphs captured; 0 where the program does not run the model."""
         cls = self.fam.card_program()
-        if cls is None or self._card_kernels() is None:
+        if cls is None or self._card_kernels() is None or not self._card_program_on():
             return 0
         if getattr(self, "_cp", None) is None:
             self._cp = cls(self)
@@ -1309,7 +1312,9 @@ class _CudaMixin(_State):
                     times = [self._card_program_time(prog, M, n0) for _rep in range(3)]
                     by_m[M] = min(times[1:])  # the first one captures
                 cost[T] = by_m[M]
-        self._card_cost = cost
+        self._card_prog_cost = cost
+        if not self.host:
+            self._card_cost = cost
         c1 = cost[1]
         self.log(
             f"[card] {self.fam.name}'s card program: {len(prog.graphs) - before} graphs captured; its compute by "
@@ -1441,6 +1446,11 @@ class _CudaMixin(_State):
 
     # -- a family's card program: its layers as graphs replayed in turn, the host between them ------------------
 
+    def _card_program_on(self) -> bool:
+        """the family's card program not switched off (`card_programs`, `BTB_CARD_PROGRAM=0`): the one gate its
+        passes and its warm-up both ask, so a program switched off is never made, held or timed"""
+        return bool(getattr(self, "card_programs", True)) and os.environ.get("BTB_CARD_PROGRAM", "1") != "0"
+
     def _card_program(
         self, cache: Any, B: int, T: int, past: int, am: Any, stop_after: int | None, positions: Any
     ) -> Any:
@@ -1462,8 +1472,7 @@ class _CudaMixin(_State):
             and cache is not None
             and not forked(cache)
             and self.dev.type == Device.CUDA
-            and getattr(self, "card_programs", True)
-            and os.environ.get("BTB_CARD_PROGRAM", "1") != "0"
+            and self._card_program_on()
             and getattr(self, "_probe", None) is None
         ):
             return None
@@ -1474,13 +1483,11 @@ class _CudaMixin(_State):
             prog = self._cp = cls(self)
         return prog if prog.ok() else None
 
-    def _card_graph_run(self, holder: Any, key: Any, body: Callable[[], None], eager: bool | None = None) -> None:
+    def _card_graph_run(self, holder: Any, key: Any, body: Callable[[], None]) -> None:
         """`body`'s kernels as the graph `holder.graphs[key]`, captured on first use on the holder's stream and
-        replayed on the current one; `eager` (the engine's `card_program_eager` by default, a test's check) runs
-        the body itself. The capture only records: nothing a body writes (a step's states) runs twice."""
-        if eager is None:
-            eager = bool(getattr(self, "card_program_eager", False))
-        if eager:
+        replayed on the current one; the engine's `card_program_eager` (a test's check) runs the body itself. The
+        capture only records: nothing a body writes (a step's states) runs twice."""
+        if getattr(self, "card_program_eager", False):
             body()
             return
         g = holder.graphs.get(key)

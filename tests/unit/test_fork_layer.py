@@ -1,15 +1,19 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 """A fork's layer (`ForkLayer`): its rows in one buffer, the shared prefix copied in once and each step written in
 place; the buffer granted as it grows, the one it replaces counted; and the rows made the layer's dtype when it
-runs somewhere that computes in another (float32 on the host, the card's bf16), as a `GrowLayer`'s are. No model."""
+runs somewhere that computes in another (float32 on the host, the card's bf16), as a `GrowLayer`'s are. And a
+sparse-attention layer grown by concatenation (`GrantedIndexedLayer`, and a card program's `ArenaIndexedLayer` once it
+lets the arena go): priced before the pass as its grant asks, drawing on the epoch what it allocates, keeping what it
+asked on each device; its rows leaving the arena for another device moved straight there. No model."""
 
 from __future__ import annotations
 
-from typing import Any
+import types
+from typing import Any, cast
 
 import torch
 
-from btb.engine.cache import ForkIndexedLayer, ForkLayer
+from btb.engine.cache import ArenaIndexedLayer, ForkIndexedLayer, ForkLayer, GrantedIndexedLayer
 
 B, HK, P, D = 3, 2, 5, 4
 
@@ -69,3 +73,117 @@ def test_an_indexed_layers_keys_follow_the_same_rule() -> None:
     got = fl.update_indexer(torch.ones(B, 1, 3, dtype=torch.bfloat16))
     assert got.dtype == torch.bfloat16 and got.shape == (B, P + 2, 3)
     assert torch.equal(got[:, :P], ik.to(torch.bfloat16).expand(B, -1, -1))
+
+
+# -- a sparse-attention layer grown by concatenation --------------------------------------------------------------
+
+DI = 3  # the indexer's key width
+KV_ROW, IK_ROW = 2 * HK * D * 4, DI * 4  # a position's bytes in float32: keys and values, the indexer's key
+
+
+def _recorder() -> tuple[list[dict[str, Any]], Any]:
+    asked: list[dict[str, Any]] = []
+
+    def grant(nbytes: int, kind: str, **kw: Any) -> None:
+        asked.append({"nbytes": nbytes, "kind": kind, **kw})
+
+    return asked, grant
+
+
+def _drawn(asked: list[dict[str, Any]]) -> int:
+    """what the grants took off the epoch's KV: each one's bytes less the ones it replaces"""
+    return sum(a["nbytes"] - a.get("held", 0) for a in asked if a.get("draws") is None)
+
+
+def _append(cl: Any, T: int, dev: str = "cpu") -> None:
+    cl.update(torch.ones(1, HK, T, D, device=dev), torch.ones(1, HK, T, D, device=dev))
+    cl.update_indexer(torch.ones(1, T, DI, device=dev))
+
+
+def test_a_concatenated_layer_is_priced_as_it_asks_and_draws_what_it_allocates() -> None:
+    """the growth priced before a pass is what the grant then asks (twice what the rows reach, once a doubling);
+    what comes off the epoch is what the rows allocate, never the doubling's room ahead"""
+    from btb.engine.memory import _MemoryMixin
+
+    asked, grant = _recorder()
+    cl = GrantedIndexedLayer(grant)
+    cpu = torch.device("cpu")
+    probe = types.SimpleNamespace(
+        cfg=types.SimpleNamespace(num_attention_heads=HK, num_key_value_heads=HK, head_dim=D, hidden_size=HK * D),
+        resident={0: None},
+        dev=cpu,
+        compute_dtype=torch.float32,
+    )
+    probe._kv_home = lambda i, layer: _MemoryMixin._kv_home(cast("_MemoryMixin", probe), i, layer)
+    cache = types.SimpleNamespace(layers=[cl])
+    growth = lambda T: _MemoryMixin.cache_growth(cast("_MemoryMixin", probe), cast(Any, cache), 1, T)
+    assert growth(P) == {cpu: 2 * P * KV_ROW}, "an empty layer: its keys' growth, from the shape the config gives"
+    _append(cl, P)
+    assert [a["nbytes"] for a in asked] == [2 * P * KV_ROW]
+    assert growth(1) == {cpu: 0}, "an append inside the room asked for asks nothing"
+    n = P
+    while not (priced := growth(1)[cpu]):
+        _append(cl, 1)
+        n += 1
+    assert priced == 2 * (n + 1) * (KV_ROW + IK_ROW), "the doubling, the indexer's keys counted once seen"
+    before = len(asked)
+    _append(cl, 1)
+    assert len(asked) == before + 1 and asked[-1]["nbytes"] <= priced
+    assert _drawn(asked) <= cl._held_bytes(), f"drew {_drawn(asked)} on the epoch for {cl._held_bytes()} bytes of rows"
+    assert _drawn(asked) >= (n + 1) * KV_ROW
+
+
+def test_a_layer_hopping_back_to_a_device_asks_nothing_it_had_there() -> None:
+    """rows moved to another device (a shed, a prefill's hop) are counted there as the move granted them: the growth
+    there draws only its own rows; moved back, the layer grows into the room it asked for before"""
+    asked, grant = _recorder()
+    cl = GrantedIndexedLayer(grant)
+    _append(cl, P)
+    assert len(asked) == 1 and _drawn(asked) == P * KV_ROW
+    meta = torch.device("meta")
+    cl.keys, cl.values = cl.keys.to(meta), cl.values.to(meta)
+    cl.indexer_keys = cl.indexer_keys.to(meta)
+    _append(cl, 1, "meta")
+    assert len(asked) == 2 and asked[1]["device"] == meta
+    assert asked[1]["nbytes"] - asked[1]["held"] == KV_ROW, "the moved rows drawn on again"
+    # back where it grew (fresh rows standing in for the move: a meta tensor holds none to copy)
+    cl.keys, cl.values = torch.ones(1, HK, P + 1, D), torch.ones(1, HK, P + 1, D)
+    cl.indexer_keys = torch.ones(1, P + 1, DI)
+    _append(cl, 1)
+    assert len(asked) == 2, "a hop back asked the whole layer again"
+
+
+def test_an_arena_layer_leaving_for_another_device_moves_its_rows_straight_there() -> None:
+    """a card program's layer given up to another device (a shed moving its keys there): every row goes straight to
+    that device, granted there - nothing copied, or asked for, where the arena is (the room a shed is short of) -
+    and the layer, detached, grows through the grant as a `GrantedIndexedLayer` does; while attached it prices
+    nothing (the arena grows by the program's own grant)"""
+    asked, grant = _recorder()
+
+    def grow(need: int) -> None:
+        raise AssertionError(f"the arena was asked to grow to {need}")
+
+    cap = 16
+    arena = torch.zeros(HK, cap, D), torch.zeros(HK, cap, D), torch.zeros(cap, DI)
+    cl = ArenaIndexedLayer(grow, grant)
+    cl.attach(*arena)
+    _append(cl, P)
+    assert cl.attached and not asked and cl.get_seq_length() == P
+    assert cl.growth(1, cap, HK, D, torch.float32, torch.device("cpu")) == 0
+    meta = torch.device("meta")
+    cl.keys = cl.keys.to(meta)
+    assert not cl.attached
+    assert [(a["device"], a["draws"], a["nbytes"]) for a in asked] == [(meta, "", P * (KV_ROW // 2 + IK_ROW))]
+    rows = (cl.keys, cl.values, cl.indexer_keys)
+    assert all(t is not None and t.device == meta and t.shape[-2] == P for t in rows)
+    _append(cl, 1, "meta")
+    assert len(asked) == 2 and asked[1]["device"] == meta and asked[1].get("draws") is None
+    assert asked[1]["nbytes"] - asked[1]["held"] == KV_ROW, "detached, a growth draws its own rows"
+    # a batch's rows (same device) let the arena go as a copy of the rows, granted where they are
+    asked.clear()
+    cl2 = ArenaIndexedLayer(grow, grant)
+    cl2.attach(*arena)
+    cl2.update(torch.ones(1, HK, P, D), torch.ones(1, HK, P, D))
+    cl2.detach()
+    assert [(a["device"], a["draws"]) for a in asked] == [(torch.device("cpu"), "")]
+    assert cl2.keys is not None and cl2.keys.data_ptr() != arena[0].data_ptr()

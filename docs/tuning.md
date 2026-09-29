@@ -20,7 +20,8 @@ Before changing anything, look at what btb already chose.
 - `-v` prints the placement, the tiers, and per-turn timings — where each layer landed, and the tok/s and
   tokens-per-pass you're actually getting.
 - `--profile DIR` writes `report.json` (the engine's ledger) and, for a MoE model, `events.npz` (the
-  expert-store trace).
+  expert-store trace, each expert call's picks with it: `pytest bench/e2e_bench.py -k routing --routing
+  DIR/events.npz` replays those calls split between the CPU and the card).
 - `btb bench PATH --prompts prompts.jsonl` times a prompt set at several answer lengths and reports tok/s and
   tokens per pass per length. Use it to compare two configurations instead of eyeballing a single run.
 
@@ -61,7 +62,11 @@ window; past the model's own window btb applies YaRN automatically.
   the layer's experts is read from the drive once for the whole prompt, and on the card is held there for all the
   chunks (a 16k prompt on the 180B: a third of the reads, 528 s to 288 s). Same bits as the chunks one at a time;
   `BTB_PREFILL_LAYERS=0` and `BTB_PREFILL_DEPOT=0` turn the two halves off. `btb.load(..., prefill_chunk=N)`
-  fixes the rows a prefill takes at once; unset (the default), the free memory prices the chunk.
+  fixes the rows a prefill takes at once; unset (the default), the free memory prices the chunk. A hybrid
+  (Qwen3.5's DeltaNet) sums over blocks that split where its chunks do, so it sweeps only chunks `prefill_chunk`
+  names and otherwise takes a long prompt whole: its bits never depend on the machine's free memory. Qwen4's
+  DeltaNet splits the same way, but its long prompts are too big to take whole, so it sweeps chunks the free memory
+  prices: set `prefill_chunk` for bits that are the same run to run.
 - `--sparse 1` (Qwen4): the sparse attention scores every row's blocks in one pass - opt-in, since a near-tie may
   keep a different block than the reference's indexer.
 - `btb pack` writes a lossless [12-bit copy](./pack-12.md) at 0.75× the bytes, so more experts stay cached and
@@ -101,7 +106,8 @@ metric is **tokens per pass**, which `-v` and `btb bench` report. On by default 
 - `--no-spec` — decode one token at a time, no tree: the off switch for speculation. Same tokens, slower.
 - `--tree-budget N` — tree size per step. Bigger tree, more candidates per pass, more verify cost. `0` turns it
   off. Default 14–16 depending on device/head.
-- `--v-max N` — drafted tokens verified per step; `0` decodes one at a time. Default 4, `0` for MoE.
+- `--v-max N` — drafted tokens verified per step; `0` decodes one at a time. Default 4, a mixture of experts'
+  included (the pricer sizes each pass by what its rows cost).
 - `--tree-min-prob P` — drop draft branches below this path probability (default 0.15). Lower keeps more
   speculative branches alive.
 - `--tree-step-mass P` — only extend the tree when the nodes to extend hold at least this much path mass

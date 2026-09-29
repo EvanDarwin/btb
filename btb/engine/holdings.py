@@ -22,7 +22,10 @@ import enum
 import threading
 import weakref
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .model import StreamedTextModel
 
 
 class Stage(enum.IntEnum):
@@ -66,17 +69,17 @@ class Holdings:
         return len(self._held)
 
 
-_CARD: weakref.WeakSet[Any] = weakref.WeakSet()
+_CARD: weakref.WeakSet[StreamedTextModel] = weakref.WeakSet()
 _CARD_LOCK = threading.Lock()
 
 
-def on_card(engine: Any) -> None:
+def on_card(engine: StreamedTextModel) -> None:
     """an engine on a card: the process's card state stays while it lives"""
     with _CARD_LOCK:
         _CARD.add(engine)
 
 
-def last_on_card(engine: Any) -> bool:
+def last_on_card(engine: StreamedTextModel) -> bool:
     """`engine` closed: true when no other engine on a card is left, and the process's card state may go"""
     with _CARD_LOCK:
         _CARD.discard(engine)

@@ -24,9 +24,9 @@ from ..options import Device as DeviceKind
 from ..options import DeviceName
 from ..pack12 import parent_dir
 from ..sysinfo import host_free_bytes
-from .cache import GrowLayer
+from .cache import GrantedIndexedLayer, GrowLayer
 from .cuda import _CudaMixin
-from .device import Device
+from .device import Device, where
 from .drafter import MTPDrafter
 from .experts import _ExpertStore
 from .families import _FamiliesMixin, family, register_attention
@@ -180,8 +180,9 @@ class StreamedTextModel(
                 else {int(x) for x in cpu_layers} | {int(x) for x in cold_layers}
             )
             devname = DeviceName(DeviceKind.CPU)  # MLX's tensors on the torch side are host tensors
-        self.dev = torch.device(str(devname))
-        if self.dev.type == DeviceKind.CUDA and self.dev.index is not None:
+        # the card by its index, as its tensors name it (a bare 'cuda' is the current card)
+        self.dev = where(str(devname))
+        if self.dev.type == DeviceKind.CUDA:
             # make the chosen card the process's current device, so ops that take no explicit device (a
             # library's default allocation, the default stream) land on it too, not on cuda:0
             torch.cuda.set_device(self.dev)
@@ -589,9 +590,16 @@ class StreamedTextModel(
         if getattr(self, "_closed", False):
             return
         draft = getattr(self, "draft_engine", None)
+        draft_error: Exception | None = None
         if draft is not None:
             self.draft_engine = None  # the draft model is its own engine (a --draft-model load): released first
-            draft.close()
+            try:
+                draft.close()
+            except Exception as e:
+                # on its own, as every release is: the engine's own holdings are still let go, the error raised with
+                # theirs, and the draft kept for the next close to try again
+                e.add_note("[close] releasing the draft model")
+                draft_error = e
         if getattr(self, "abort", None) is not None:
             self.abort.set()
         # the MLX tier's teardown runs on the model's worker thread, where its arrays were built (see `_on_worker`),
@@ -609,6 +617,10 @@ class StreamedTextModel(
             finally:
                 w.shutdown(wait=True)
                 self._worker = None
+                if draft_error is not None:
+                    self.draft_engine, self._closed = draft, False
+            if draft_error is not None:
+                raise draft_error
             return
         if getattr(self, "_pending", None) is not None:
             self._pending[3].join()
@@ -624,6 +636,9 @@ class StreamedTextModel(
                 # the machine's commit on Windows. Let go by the last engine on a card only: another may be mid-GEMM
                 torch._C._cuda_clearCublasWorkspaces()
                 torch._C._host_emptyCache()
+        if draft_error is not None:
+            self.draft_engine, self._closed = draft, False
+            errors = [draft_error, *errors]
         _leaks_closed(self)
         if errors:
             raise ExceptionGroup(f"[close] {len(errors)} of the engine's holdings would not let go", errors)
@@ -697,7 +712,7 @@ class StreamedTextModel(
         self.gguf = None
 
     def new_cache(self, max_len: int | None = None) -> Any:
-        from transformers.cache_utils import DynamicCache, DynamicLayer
+        from transformers.cache_utils import DynamicCache, DynamicIndexedLayer, DynamicLayer
 
         cache = DynamicCache(config=self.cfg)
         # the engine's layer keeps every row of a sliding layer (the window lives in the mask), so every layer crops,
@@ -742,6 +757,10 @@ class StreamedTextModel(
                     bound=bound,
                     arena=arena[i] if arena is not None else None,
                 )
+            elif type(layer) is DynamicIndexedLayer and sched is not None:
+                # a sparse-attention layer's rows, grown as transformers grows them, each growth asked of the ledger
+                # (the epoch's KV it draws on) before it is made
+                cache.layers[i] = GrantedIndexedLayer(sched.grant)
         if self.dev.type == DeviceKind.CUDA:
             self._card_adopt_cache(cache)
         return self._track(cache)

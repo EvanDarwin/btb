@@ -146,6 +146,13 @@ class Family:
         tier verifies the plain block's"""
         return True
 
+    def verify_exact(self, sm: _State, cache: Any) -> bool:
+        """whether the next speculative pass over `cache` verifies its rows exactly - each node as the one-token step
+        of its path - on the paths the engine would run it down now; the speculative loop takes a pass that would not
+        as a plain one-row pass. Asked a pass at a time, so a load that `speculates` keeps every pass that can verify.
+        The plain block's verifies on every path it speculates on"""
+        return True
+
     def card_program(self) -> type[Any] | None:
         """the class of the family's own card program - its layers' step and verify pass as graphs over btb's card
         kernels, the engine's runner replaying them in turn (cuda.py `_forward_card_program`) - or None where the

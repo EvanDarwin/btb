@@ -39,17 +39,14 @@ def each(fn: Callable[[torch.Tensor], torch.Tensor], x: torch.Tensor, T: int, ro
 
 def install(layer: Any, sm: Any) -> None:
     """a host layer's hyper-connections and mixture block computing their activations row by row in a verify pass,
-    and the engine's closing mixer a row at a time; `sm` held weakly (the engine owns the modules)"""
+    and the engine's closing mixer a row at a time; `sm` held weakly (the engine owns the modules). Every Qwen4
+    layer, the drafting head's too, has both hyper-connections and a mixture block with its shared expert"""
     ref = weakref.ref(sm)
-    for name in ("attn_hyper_connection", "mlp_hyper_connection"):
-        m = getattr(layer, name, None)
-        if m is not None:
-            m._btb_sm = ref
-            m.forward = types.MethodType(_residual_forward, m)
-    mlp = getattr(layer, "mlp", None)
-    if mlp is not None and hasattr(mlp, "shared_expert"):
-        mlp._btb_sm = ref
-        mlp.forward = types.MethodType(_moe_forward, mlp)
+    for m in (layer.attn_hyper_connection, layer.mlp_hyper_connection):
+        m._btb_sm = ref
+        m.forward = types.MethodType(_residual_forward, m)
+    layer.mlp._btb_sm = ref
+    layer.mlp.forward = types.MethodType(_moe_forward, layer.mlp)
     mixer = getattr(sm, "mixer", None)
     if mixer is not None and getattr(mixer, "_btb_sm", None) is None:
         mixer._btb_sm = ref
@@ -68,8 +65,7 @@ def _residual_forward(self: Any, hyper_input: torch.Tensor) -> Any:
     mix = each(F.silu, self.input_mix_weight_down(normed) / hc, T)
     mix = each(torch.sigmoid, self.input_mix_weight_up(mix), T).unflatten(-1, (hc, H))
     mixed = (mix * normed.unflatten(-1, (hc, H))).mean(dim=-2)
-    if self.block_inject_weight is None:
-        return mixed
+    # a layer's hyper-connections always combine (`use_combine`); the closing mixer, which does not, is `_mixer_forward`
     inject = 2 * each(torch.sigmoid, self.block_inject_weight(normed) / hc, T)
     return mixed, hyper_input, inject
 

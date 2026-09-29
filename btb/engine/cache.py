@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 import torch
 
 from .. import mlx as mlxdev
+from .device import DeviceSpec, Where, where
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -763,7 +764,7 @@ class GrowLayer(_DynamicLayer):
         if n:
             self._set_rows(kb[..., :n, :], vb[..., :n, :])
 
-    def presize(self, rows: int, B: int, Hk: int, d: int, dtype: torch.dtype, dev: torch.device) -> None:
+    def presize(self, rows: int, B: int, Hk: int, d: int, dtype: torch.dtype, dev: Where) -> None:
         """The layer's buffer `rows` long at once, the rows it holds copied in: a prefill sweep's whole prompt, so
         the cache does not grow while the sweep's working set is live around it - a buffer grown then would sit
         inside the one block the pass's own buffers are cut from, and split it for good. Granted as a growth is,
@@ -805,19 +806,26 @@ class GrowLayer(_DynamicLayer):
         if n:
             self._set_rows(kb[..., :n, :], vb[..., :n, :])
 
-    def hop(self, dev: torch.device, T: int, dtype: torch.dtype) -> None:
+    def hop(self, dev: Where, T: int, dtype: torch.dtype, shape: tuple[int, int, int] | None = None) -> None:
         """The rows onto `dev` in a buffer of `dtype` with room for `T` more, the one they were in let go: a host
         layer's prefill chunk on the card then writes its rows in place, the cache neither grown nor granted there
         (the prefill's reservation holds the room, `_hop_bytes`). The rows are cast as a growth into `dtype` would
-        cast them."""
-        k, v = self.keys, self.values
-        B, Hk, n, d = k.shape
+        cast them. A layer with no rows yet (the prompt's first chunk) takes a buffer of `shape` - (B, Hk, d) - for
+        the chunk's alone: grown there instead, it would be the whole sequence's, drawn from the epoch's room"""
+        k = self.keys if self.is_initialized else None
+        if k is not None and k.numel():
+            B, Hk, n, d = k.shape
+        elif shape is not None:
+            (B, Hk, d), n = shape, 0
+        else:
+            raise ValueError("hop: a layer with no rows needs the buffer's (B, Hk, d)")
         kb = torch.empty(B, Hk, n + int(T), d, dtype=dtype, device=dev)
         vb = torch.empty_like(kb)
-        kb[..., :n, :].copy_(k)
-        vb[..., :n, :].copy_(v)
         self._buf, self._an = (kb, vb), None
-        self._set_rows(kb[..., :n, :], vb[..., :n, :])
+        if k is not None and n:
+            kb[..., :n, :].copy_(k)
+            vb[..., :n, :].copy_(self.values)
+            self._set_rows(kb[..., :n, :], vb[..., :n, :])
 
     def detach_bytes(self) -> int:
         """what `detach` copies"""
@@ -970,7 +978,8 @@ class ForkLayer(_DynamicLayer):
         self._kv: tuple[torch.Tensor, torch.Tensor] | None = None
         self._t = 0
         self.grant = grant
-        self.dtype, self.device = k.dtype, k.device
+        self.dtype = k.dtype
+        self.device: Where = where(k.device)
         self.is_initialized = True
 
     @classmethod
@@ -1102,9 +1111,9 @@ class ForkLayer(_DynamicLayer):
         s = slice(self._P, self._P + self._t)
         return self._kv[0][b : b + 1, :, s], self._kv[1][b : b + 1, :, s]
 
-    def to(self, dev: str | torch.device) -> None:
-        """every row to `dev`, where the layer now runs: the prefix becomes a copy of its own there"""
-        dev = torch.device(dev)
+    def to(self, device: DeviceSpec) -> None:
+        """every row to `device`, where the layer now runs: the prefix becomes a copy of its own there"""
+        dev = where(device)
         if self._kv is not None:
             k, v = self._kv
             self._ask(2 * k.numel() * k.element_size(), 0, f"to {dev}", dev, int(k.shape[0]), int(k.shape[-2]), "")
@@ -1176,8 +1185,8 @@ class ForkIndexedLayer(ForkLayer):
             return kv
         return (*kv, self._ti[b : b + 1, self._Pi : self._Pi + self._it])
 
-    def to(self, dev: str | torch.device) -> None:
-        super().to(dev)
+    def to(self, device: DeviceSpec) -> None:
+        super().to(device)
         x = self._ti if self._ti is not None else self._pi
         assert x is not None
         self._ask(x.numel() * x.element_size(), 0, f"indexer to {self.device}", self.device, int(x.shape[0]), 0, "")
@@ -1394,15 +1403,99 @@ class CardRowsLayer(_DynamicLayer):
         self.device = kb.device
 
 
-class ArenaIndexedLayer(_DynamicIndexedLayer):
+class GrantedIndexedLayer(_DynamicIndexedLayer):
+    """A sparse-attention layer's cache as transformers keeps it - its keys, values and the indexer's keys grown by
+    concatenation, which a tree's branches assign and restore as they walk - each growth past what it was granted
+    asked of the scheduler first (`grant`, as `kind`), for twice what the rows reach: a decode's per-token growth
+    reads the ledger once a doubling, and a concatenation's copy beside the rows it replaces fits what was asked. The
+    epoch's KV is drawn on for what the rows allocate - what they reach less what the ledger counted of them already -
+    not for the room ahead. The rows' own device is asked for, and what was asked there is kept: rows that came to a
+    device some other way (a shed's or a regrow's move, a copy out of a card program's arena) were granted by what
+    brought them, and a layer hopping back to a device it grew on asks nothing until it passes what it had there.
+    `growth` prices an append before the pass (`cache_growth`), as the grant will."""
+
+    def __init__(
+        self, grant: Callable[..., None] | None, kind: str = "kv", what: str = "a sparse-attention layer's cache"
+    ) -> None:
+        super().__init__()
+        self.grant = grant  # a fork of the layer asks the same (`branches._fork_layer`)
+        self._kind, self._what = kind, what
+        self._dev: torch.device | None = None  # where the rows grew last
+        self._granted: dict[torch.device, int] = {}  # the room asked for on each device: twice what the rows reached
+        self._drawn: dict[torch.device, int] = {}  # what of the rows the ledger counts on each device
+        self._ik_row = 0  # an indexer key's bytes, once the layer has seen one: `growth` prices them before the pass
+
+    @staticmethod
+    def _nbytes(*ts: Any) -> int:
+        return sum(t.numel() * t.element_size() for t in ts if isinstance(t, torch.Tensor))
+
+    def _held_bytes(self) -> int:
+        """the bytes of the rows held now: keys, values and the indexer's keys"""
+        return self._nbytes(self.keys, self.values, self.indexer_keys)
+
+    def _seen(self, dev: torch.device) -> tuple[int, int]:
+        """what was asked for on `dev` and what the ledger counts there: the rows held now at least, where they came
+        to `dev` since the layer last grew (moved or copied, and granted, by what brought them)"""
+        granted, drawn = self._granted.get(dev, 0), self._drawn.get(dev, 0)
+        if dev != self._dev:
+            held = self._held_bytes()
+            granted, drawn = max(granted, held), max(drawn, held)
+        return granted, drawn
+
+    def _room(self, dev: torch.device, need: int) -> None:
+        """room asked for on `dev` for the rows reaching `need` bytes, where that passes what was asked there"""
+        granted, drawn = self._seen(dev)
+        self._dev = dev
+        if need > granted:
+            want = 2 * need
+            if self.grant is not None:
+                # the room checked is the doubling's; what comes off the epoch is what the rows allocate past what was
+                # counted of them (`held`: the rest of the room, which nothing allocates)
+                self.grant(want, self._kind, requester=self._what, device=dev, held=want - max(0, need - drawn))
+            granted, drawn = want, max(drawn, need)
+        self._granted[dev], self._drawn[dev] = granted, drawn
+
+    def growth(self, B: int, T: int, Hk: int, d: int, dtype: torch.dtype, dev: torch.device) -> int:
+        """The bytes the grant is asked for as the next append of T rows to B sequences lands on `dev` (`_room`):
+        twice what the rows then reach, where that passes the room asked for there; 0 where it does not. The rows'
+        own shape and dtype where the layer holds any, else the ones given; the indexer's keys once it has seen one."""
+        k, ik = self.keys, self.indexer_keys
+        if isinstance(k, torch.Tensor) and k.dim() == 4 and k.numel():
+            B, Hk, d, el = int(k.shape[0]), int(k.shape[1]), int(k.shape[-1]), k.element_size()
+        else:
+            el = torch.empty(0, dtype=dtype).element_size()
+        if isinstance(ik, torch.Tensor) and ik.dim() == 3 and ik.numel():
+            self._ik_row = int(ik.shape[-1]) * ik.element_size()
+        need = (self.get_seq_length() + T) * B * (2 * Hk * d * el + self._ik_row)
+        return 2 * need if need > self._seen(dev)[0] else 0
+
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+        T = max(1, int(key_states.shape[-2]))
+        per = key_states.numel() // T * key_states.element_size()  # a position's bytes, every row and head
+        # the rows reached: keys and values with these, and the indexer's keys as they stand
+        self._room(key_states.device, 2 * (self.get_seq_length() + T) * per + self._nbytes(self.indexer_keys))
+        return super().update(key_states, value_states, *args, **kwargs)
+
+    def update_indexer(self, indexer_key_states: torch.Tensor) -> Any:
+        T = max(1, int(indexer_key_states.shape[1]))
+        have = self.indexer_keys
+        n = int(have.shape[1]) if isinstance(have, torch.Tensor) and have.dim() == 3 else 0
+        self._ik_row = int(indexer_key_states.shape[-1]) * indexer_key_states.element_size()
+        ik = (n + T) * (indexer_key_states.numel() // T) * indexer_key_states.element_size()
+        self._room(indexer_key_states.device, ik + self._nbytes(self.keys, self.values))
+        return super().update_indexer(indexer_key_states)
+
+
+class ArenaIndexedLayer(GrantedIndexedLayer):
     """A sparse-attention layer's cache - its keys and values, and the indexer's raw keys - held in an arena a card
     program owns, not grown by concatenation: rows are written in place at the front (`update`, `update_indexer`)
     and the views handed out are the front, so the program's captured kernels and the torch modules read and write
     the same rows. The program binds a sequence's cache to its arena (`attach`, rows held apart copied in) and lets
-    it go (`detach`: the rows become a copy of their own, grown after as transformers' layer grows them);
-    `grow(need)` asks the program for room past the arena's capacity (it reallocates, copies and attaches every
+    it go (`detach`: the rows become a copy of their own, grown after as transformers' layer grows them, each growth
+    asked of the scheduler as `GrantedIndexedLayer`'s are); `grow(need)` asks the program for room past the arena's capacity (it reallocates, copies and attaches every
     layer again, this one included). `keep_path` keeps a speculative pass's accepted path. Rows assigned from
-    elsewhere are copied to the front; rows on another device (the layer given up to the host) detach the layer.
+    elsewhere are copied to the front; rows on another device (the layer given up to the host) detach the layer,
+    every row moved straight there.
     `low` is the lowest indexer row written since the program last read it: its pooled keys of the blocks from
     there on are stale."""
 
@@ -1412,9 +1505,8 @@ class ArenaIndexedLayer(_DynamicIndexedLayer):
         self._own: list[torch.Tensor | None] = [None, None, None]  # detached: keys, values, indexer keys
         self._n = [0, 0, 0]  # the rows at the arena's front: keys, values, raw keys (set one at a time)
         self.low = 0
-        super().__init__()
+        super().__init__(grant, "kv", "a sparse-attention layer's cache, let go by the card program's arena")
         self._grow = grow
-        self.grant = grant
 
     # -- the rows ----------------------------------------------------------------------------------------------
 
@@ -1477,8 +1569,13 @@ class ArenaIndexedLayer(_DynamicIndexedLayer):
         if self._front(which, t):
             self._set_len(which, n)
             return
-        if t.device != a[which].device or int(t.shape[0]) != 1:
-            # rows moved to another device (the layer given up to the host) or a batch's: the layer leaves the arena
+        if t.device != a[which].device:
+            # rows moved to another device (the layer given up to the host): the layer leaves the arena, its other rows
+            # moved straight there - never copied on the card first, in the room a shed is short of
+            self.detach(t.device, {which: t})
+            return
+        if int(t.shape[0]) != 1:
+            # a batch's rows: the layer leaves the arena
             self.detach()
             self._own[which] = t
             return
@@ -1607,16 +1704,34 @@ class ArenaIndexedLayer(_DynamicIndexedLayer):
             a[2][:ni].copy_(ik[0])
         self._n, self.low = [n, n, ni], 0
 
-    def detach(self) -> None:
-        """the program lets the arena go (another sequence takes it, or the layer leaves the card): the rows held so
-        far become a copy of their own, asked of the scheduler first"""
+    @property
+    def attached(self) -> bool:
+        """whether the layer's rows are an arena's (not a copy of their own)"""
+        return self._arena is not None
+
+    def growth(self, B: int, T: int, Hk: int, d: int, dtype: torch.dtype, dev: torch.device) -> int:
+        """nothing while attached: the arena grows by the program's own grant (`grow`); detached, as
+        `GrantedIndexedLayer`'s"""
+        return 0 if self._arena is not None else super().growth(B, T, Hk, d, dtype, dev)
+
+    def detach(self, device: DeviceSpec | None = None, given: dict[int, torch.Tensor] | None = None) -> None:
+        """the program lets the arena go (another sequence takes it, a fork takes the rows, or the layer leaves the
+        card): the rows held so far become a copy of their own, asked of the scheduler first - on `device` where they
+        leave for another (the layer given up to the host), moved straight there and nothing copied where they were.
+        `given`: rows the caller made there already ({0: keys, 1: values, 2: indexer keys}), taken as they are. A
+        refusal leaves the layer attached, as it was"""
         a = self._arena
         if a is None:
             return
+        given = given or {}
         k, v, raw = a
         nk, nv, ni = self._n
-        nbytes = (int(k[:, :nk].numel()) + int(v[:, :nv].numel()) + int(raw[:ni].numel())) * k.element_size()
+        dev = k.device if device is None else where(device)
+        rows = [k[None, :, :nk], v[None, :, :nv], raw[None, :ni]]
+        nbytes = sum(int(t.numel()) * t.element_size() for w, t in enumerate(rows) if w not in given)
         if self.grant is not None and nbytes:
-            self.grant(nbytes, "kv", requester="a card program's arena rows, copied out", device=k.device, draws="")
-        self._own = [k[None, :, :nk].clone(), v[None, :, :nv].clone(), raw[None, :ni].clone()]
+            what = "copied out" if dev == k.device else f"moved to {dev}"
+            self.grant(nbytes, "kv", requester=f"a card program's arena rows, {what}", device=dev, draws="")
+        self._own = [given[w] if w in given else t.to(dev, copy=True) for w, t in enumerate(rows)]
         self._arena = None
+        self._dev = None  # the rows the copy made are counted where they are, at the next growth (`_seen`)

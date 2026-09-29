@@ -344,6 +344,27 @@ def test_card_family_predicate_matches_cuda_source() -> None:
     assert rejected == ["gpt_oss", "phi3", "qwen3_5", "qwen4"]
 
 
+def test_own_layer_speculation_gate_matches_its_source() -> None:
+    """a family that brings its own layer drafts where its passes verify exactly: every host sub-path, a card
+    sub-path the card program runs, never MLX - each knob `CARD_PROGRAM_OFF` names is one the program's own refusal
+    (families/qwen4/card.py `why_not`) turns down by the clause it quotes, and `verify_exact` asks that refusal"""
+    from btb import options
+
+    why_not = _source("engine", "families", "qwen4", "card.py").split("def why_not", 1)[1].split("\n    def ", 1)[0]
+    for knob, clause in manifest.CARD_PROGRAM_OFF.items():
+        assert knob in options.KNOWN, knob
+        assert clause in why_not, f"the card program's refusal no longer reads {clause} ({knob})"
+    family = _source("engine", "families", "qwen4", "family.py").split("def verify_exact", 1)[1]
+    assert "sm._card_program(" in family.split("\n    def ", 1)[0], "verify_exact stopped asking the card program"
+    assert "shapes the kernels are not written for" in why_not, (
+        "the program's shape refusal moved; the fixture gate is stale"
+    )
+    verifies = {d.key for d in spec.DEVICE_SUBPATHS if manifest.own_layer_verifies(d)}
+    assert "cpu" in verifies and not {"cuda-torch", "cuda-kvhost", "mlx-step"} & verifies, verifies
+    # the cert's Qwen4 fixtures are shaped below the card kernels: no card sub-path drafts until one the program takes
+    assert ("cuda-split" in verifies) == manifest.CARD_PROGRAM_FIXTURES, verifies
+
+
 def test_mega_head_multiple_matches_its_source() -> None:
     """the megakernel's head gate, quoted from mega.py so MEGA_SHAPE cannot outlive the constraint."""
     assert f"self.hd % {manifest.MEGA_HEAD_MULTIPLE}" in _source("mlx", "mega.py")

@@ -28,8 +28,8 @@ from ..sysinfo import (
     vram_pressure,
     vram_pressure_line,
 )
-from .cache import GrowLayer
-from .device import DeviceSpec, torch_device
+from .cache import GrantedIndexedLayer, GrowLayer
+from .device import DeviceSpec, Where, torch_device, where
 from .scheduler import EPOCH, MemoryGrantError
 from .state import _State
 from .tiers import ColdRing
@@ -532,47 +532,59 @@ class _MemoryMixin(_State):
             if nbytes:
                 self._make_room(dev, nbytes, f"the cache's growth for {B}x{T} rows", own=EPOCH)
 
-    def cache_growth(self, cache: KvCache | None, B: int, T: int, peak: bool = False) -> dict[torch.device, int]:
+    def cache_growth(self, cache: KvCache | None, B: int, T: int, peak: bool = False) -> dict[Where, int]:
         """the bytes the cache's appends of `T` rows to `B` sequences will allocate, by the device each layer's
-        rows live on - priced as the grant prices them; empty where nothing grows. With `peak`, the most they hold
-        at once: a layer growing in steps keeps its old buffer until the new one is filled, so the largest layer's
-        growth once more"""
-        need: dict[torch.device, int] = {}
+        rows live on - priced as the grant prices them; empty where nothing grows. A sparse-attention layer grown by
+        concatenation (`GrantedIndexedLayer`) is priced at its grant's doubling, where the append reaches it. With
+        `peak`, the most they hold at once: a layer growing in steps keeps its old buffer until the new one is filled,
+        so the largest layer's growth once more (a doubling's room holds a concatenation's copy already)"""
+        need: dict[Where, int] = {}
         if cache is None:
             return need
         first = next(((i, cl) for i, cl in enumerate(cache.layers) if isinstance(cl, GrowLayer)), None)
-        if first is None:
+        if first is None and not any(isinstance(cl, GrantedIndexedLayer) for cl in cache.layers):
             return need
         c = self.cfg
         hq = int(c.num_attention_heads)
         Hk = int(getattr(c, "num_key_value_heads", None) or hq)
         d = int(getattr(c, "head_dim", None) or c.hidden_size // hq)
-        dev0, dt0 = self._kv_home(*first)
-        if not first[1].growth(B, T, Hk, d, dt0, dev0.type == Device.CPU):
-            return need  # the layers grow together: the first one fitting is the pass needing nothing
-        most: dict[torch.device, int] = {}
+        grows = False
+        if first is not None:
+            dev0, dt0 = self._kv_home(*first)
+            # the layers grow together: the first one fitting is the pass needing nothing of them
+            grows = bool(first[1].growth(B, T, Hk, d, dt0, dev0.type == Device.CPU))
+        most: dict[Where, int] = {}
         for i, cl in enumerate(cache.layers):
-            if not isinstance(cl, GrowLayer):
+            if isinstance(cl, GrowLayer) and grows:
+                dev, dt = self._kv_home(i, cl)
+                g = cl.growth(B, T, Hk, d, dt, dev.type == Device.CPU)
+                most[dev] = max(most.get(dev, 0), g)
+            elif isinstance(cl, GrantedIndexedLayer):
+                dev, dt = self._kv_home(i, cl)
+                g = cl.growth(B, T, Hk, d, dt, dev)
+            else:
                 continue
-            dev, dt = self._kv_home(i, cl)
-            g = cl.growth(B, T, Hk, d, dt, dev.type == Device.CPU)
             need[dev] = need.get(dev, 0) + g
-            most[dev] = max(most.get(dev, 0), g)
         if peak:
             for dev, g in most.items():
                 need[dev] += g
         return need
 
-    def _kv_home(self, i: int, cl: GrowLayer) -> tuple[torch.device, torch.dtype]:
-        """where layer i's cache rows live and in what dtype: its buffer's, or where the layer runs"""
-        if cl._buf is not None:
-            return cl._buf[0].device, cl._buf[0].dtype
+    def _kv_home(self, i: int, cl: GrowLayer | GrantedIndexedLayer) -> tuple[Where, torch.dtype]:
+        """where layer i's cache rows live and in what dtype: its buffer's (a concatenated layer's rows'), or where
+        the layer runs"""
+        if isinstance(cl, GrowLayer) and cl._buf is not None:
+            return where(cl._buf[0].device), cl._buf[0].dtype
+        k = cl.keys if isinstance(cl, GrantedIndexedLayer) else None
+        if isinstance(k, torch.Tensor) and k.numel():
+            return where(k.device), k.dtype
         cdt = self.compute_dtype if self.compute_dtype is not None else torch.bfloat16
-        if cl.shared or getattr(self, "mlx", None) is not None:
-            return torch.device("cpu"), cdt
+        host = where(Device.CPU)
+        if (isinstance(cl, GrowLayer) and cl.shared) or getattr(self, "mlx", None) is not None:
+            return host, cdt
         if i in self.resident:
-            return (torch.device("cpu") if getattr(self, "kv_host", False) else self.dev), cdt
-        return torch.device("cpu"), torch.float32  # a host layer runs in float32 on the CPU
+            return (host if getattr(self, "kv_host", False) else self.dev), cdt
+        return host, torch.float32  # a host layer runs in float32 on the CPU
 
     def _give_up_one(self, dev: torch.device, short: int, tried: set[str]) -> bool:
         """the cheapest thing btb holds on `dev`, given up toward `short` bytes: on a card the drafter, then layers
@@ -653,7 +665,7 @@ class _MemoryMixin(_State):
                 n += head.weight.numel() * head.weight.element_size()
             aj = getattr(self, "aj", None)
             if aj is not None and aj.dev.type == Device.CUDA:
-                n += sum(self._get(k).numel() * 2 for k in self.weight_map if k.startswith("mtp."))
+                n += self._drafter_bytes()
             return n + sum(_bytes_on(c, dev, resident) for c in list(self.__dict__.get("_live_caches", ())))
         packed = bool(getattr(self, "_packed", None))
         n = sum(self._layer_bytes_stored(i, packed) for i in list(self.host) if i not in self.cold)

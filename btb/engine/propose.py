@@ -13,6 +13,7 @@ from ..kinds import LayerKind
 
 if TYPE_CHECKING:
     from .generate import LinSnap
+    from .model import StreamedTextModel
 
 
 class ModelProposer:
@@ -24,7 +25,12 @@ class ModelProposer:
     small model's step (the 0.6B: 11.5 ms in its kernel)."""
 
     def __init__(
-        self, engine: Any, prompt: Iterable[int], ks: Sequence[int] = (3, 2, 1), nodes: int = 14, tag: str = "draft"
+        self,
+        engine: StreamedTextModel,
+        prompt: Iterable[int],
+        ks: Sequence[int] = (3, 2, 1),
+        nodes: int = 14,
+        tag: str = "draft",
     ) -> None:
         self.sm = engine
         self.ks, self.nodes, self.tag = [int(k) for k in ks], int(nodes), tag
@@ -63,6 +69,7 @@ class ModelProposer:
                 sm.ab()
         self.passes += 1
         if not fast:
+            assert lg is not None  # a whole pass with the head returns its logits (None only stops short of the head)
             return torch.topk(lg[0].float(), min(k, lg.shape[-1]), dim=-1).indices.tolist()
         assert mg is not None  # fast is set only when the megakernel is present
         import mlx.core as mx

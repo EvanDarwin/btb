@@ -219,9 +219,8 @@ class SpecCost:
             return cap, False
         if not self.ready():
             return 1, False
+        # active and measured: the widest pass's reads cost something, so it is wider than the step
         cap = self.full
-        if cap <= 1:
-            return 1, False
         if self.probe_next or passes % self.PROBE == 0:
             self.probe_next = False
             return cap, True

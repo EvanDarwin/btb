@@ -30,8 +30,9 @@ from typing import Any
 import torch
 
 from ....kinds import LayerKind
+from ...cache import GrantedIndexedLayer
 from ...drafter import MTPDrafter
-from ...host import _HostLinear, compute_fp32
+from ...host import _HostLinear
 from ...native import Native
 
 # the drafting head's tensors, and its layer's
@@ -50,51 +51,6 @@ class _Head(torch.nn.Module):
         self.fc_embedding = torch.nn.Linear(H, H, bias=False)
         self.fc_hidden = torch.nn.Linear(H, H, bias=False)
         self.hyper_connection_mixer = mod.Qwen4ExpTextGatedResidual(cfg, use_combine=False)
-
-
-def _indexed_layer() -> type[Any]:
-    from transformers.cache_utils import DynamicIndexedLayer
-
-    return DynamicIndexedLayer
-
-
-class _GrantedIndexedLayer(_indexed_layer()):  # type: ignore[misc]
-    """The drafter's sparse-attention cache layer: transformers' own - its keys, values and the indexer's keys grown
-    by concatenation, which the tree's branches assign and restore as they walk - each growth past what it was
-    granted asked of the scheduler first, for twice what the rows reach: a decode's per-token growth reads the
-    ledger once a doubling, and a concatenation's copy beside the rows it replaces fits what was asked."""
-
-    def __init__(self, grant: Any, dev: torch.device) -> None:
-        super().__init__()
-        self._ask = grant
-        self._dev = dev
-        self._granted = 0
-        self._kv = 0  # the bytes the keys and values reach, and the indexer's keys
-        self._ik = 0
-
-    def _room(self) -> None:
-        need = self._kv + self._ik
-        if need > self._granted:
-            want = 2 * need
-            self._ask(
-                want, "drafter", requester="Qwen4's drafter: its layer's cache", device=self._dev, held=self._granted
-            )
-            self._granted = want
-
-    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
-        T = max(1, int(key_states.shape[-2]))
-        per = key_states.numel() // T * key_states.element_size()  # a position's bytes, every row and head
-        self._kv = 2 * (self.get_seq_length() + T) * per
-        self._room()
-        return super().update(key_states, value_states, *args, **kwargs)
-
-    def update_indexer(self, indexer_key_states: torch.Tensor) -> Any:
-        T = max(1, int(indexer_key_states.shape[1]))
-        have = self.indexer_keys
-        n = int(have.shape[1]) if isinstance(have, torch.Tensor) and have.dim() == 3 else 0
-        self._ik = (n + T) * (indexer_key_states.numel() // T) * indexer_key_states.element_size()
-        self._room()
-        return super().update_indexer(indexer_key_states)
 
 
 class Qwen4Drafter(MTPDrafter):
@@ -152,9 +108,6 @@ class Qwen4Drafter(MTPDrafter):
     def _grant(self, parts: list[tuple[str, torch.nn.Module]], src: dict[str, Any]) -> None:
         """the bytes the placement allocates, asked of the scheduler first: the dense tensors on a torch tier; on
         the host the norms widened to float32 (its matrices are views of the checkpoint's map)"""
-        sched = getattr(self.sm, "scheduler", None)
-        if sched is None:
-            return
         n = 0
         for _base, mod in parts:
             for name, p, _b in self.sm._named_tensors(mod):
@@ -162,14 +115,15 @@ class Qwen4Drafter(MTPDrafter):
                     n += 4 * p.numel() if p.dim() <= 1 or self.sm.fam.widened(name) else 0
                 else:
                     n += 2 * p.numel()
-        sched.grant(n, "drafter", requester="Qwen4's drafter: its dense tensors", device=self.dev)
+        self.sm.scheduler.grant(n, "drafter", requester="Qwen4's drafter: its dense tensors", device=self.dev)
 
     def _load(self, module: Any, base: str, src: dict[str, Any]) -> Any:
         """`module`'s tensors under `base` read and placed: on the host as a host layer holds them (norms and the
         family's widened matrices in float32, the rest as stored behind the host's linears, an FP8 matrix
-        multiplied as stored), elsewhere in bf16 on the drafter's device"""
+        multiplied as stored), elsewhere in bf16 on the drafter's device. The head's layer is a sparse-attention
+        one (no convolution) whose router the host multiplies as stored and whose experts the store serves, so no
+        matrix of it is widened and no module of it computes in float32 (`_make_host_layer`'s `compute_fp32`)"""
         sm = self.sm
-        fp32_owners: set[str] = set()
         f8_keys: set[str] = set()
         for name, _p, is_buf in sm._named_tensors(module):
             key = base + name
@@ -189,12 +143,8 @@ class Qwen4Drafter(MTPDrafter):
             t = src[key] if own else sm._get(key, stored=True)
             wide = t.is_floating_point() and (t.dim() <= 1 or widened)
             sm._set_param(module, name, t.float() if wide else t.bfloat16() if f8 else sm._held(t), buffer=is_buf)
-            if wide and t.dim() >= 2 and ".experts." not in name:
-                fp32_owners.add(name.rpartition(".")[0])
         if not self.host:
             return module
-        for owner in sorted(fp32_owners):
-            compute_fp32(module.get_submodule(owner))
         for mname, m in list(module.named_modules()):
             for cname, child in list(m.named_children()):
                 if isinstance(child, torch.nn.Linear) and child.weight.dtype == torch.bfloat16:
@@ -219,11 +169,11 @@ class Qwen4Drafter(MTPDrafter):
         from transformers.cache_utils import DynamicCache
 
         # one sparse-attention layer: K, V and the indexer's keys, grown as transformers grows them, the growth asked
-        # of the scheduler (`_GrantedIndexedLayer`)
+        # of the scheduler (`GrantedIndexedLayer`)
         self.cache = DynamicCache(config=self.mcfg)
-        sched = getattr(self.sm, "scheduler", None)
-        if sched is not None:
-            self.cache.layers[0] = _GrantedIndexedLayer(sched.grant, self.dev)
+        self.cache.layers[0] = GrantedIndexedLayer(
+            self.sm.scheduler.grant, "drafter", "Qwen4's drafter: its layer's cache"
+        )
 
     def _rope(self, n: int, B: int, like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """the rope of positions [0, n) - the indexer pools its key blocks at their own positions - for `B` rows

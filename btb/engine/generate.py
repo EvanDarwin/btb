@@ -28,6 +28,9 @@ if TYPE_CHECKING:
 LinState = torch.Tensor | dict[int, torch.Tensor]
 # a DeltaNet layer's (conv, recurrent) states copied, for a later `_lin_restore`
 LinSnap = tuple[LinState, LinState]
+# the committed rows a run of plain steps leaves the MTP drafter at most: past them it takes them without drafting,
+# so a long run neither regathers its hidden rows every step nor hands the next draft one outsized step
+PEND_ROWS = 16
 
 
 class LinLayer(Protocol):
@@ -327,14 +330,22 @@ class _GenerateMixin(_State):
             prop = UnionProposer(ModelProposer(draft, prompt, ks=ks), prop)
         self._tag(PassTag.SPEC_DRAFT if draft is not None and not use_mtp else PROPOSER_TAG[prop_kind])
         by_src: dict[str, dict[str, int]] = {"drafted": {}, "accepted": {}}
-        last_base = n
         if use_mtp:
             dr = self.mtp_drafter()
             h_new = last["h"]
             h_prev = (anchored.get("h_last") if anchored else session.pend_h) if (reuse and session) else None
-            if reuse and session is not None and session.dr is dr and h_prev is not None:
+            if (
+                reuse
+                and session is not None
+                and session.dr is dr
+                and h_prev is not None
+                and (anchored or reuse > int(session.dr_len))
+            ):
                 dr_len = reuse - 1 if anchored else int(session.dr_len)
                 dr.crop(dr_len)
+                # the held rows from the drafter's end up to the rows kept (a prompt parting from the session inside
+                # the rows the drafter had yet to take keeps fewer than it held)
+                h_prev = h_prev[:, : reuse - dr_len]
                 h_cat = torch.cat([h_prev.to(h_new.device, h_new.dtype), h_new], dim=1)
                 if n - 1 > dr_len:
                     dr.extend(prompt[dr_len + 1 : n], h_cat[:, : n - 1 - dr_len], dr_len)
@@ -344,6 +355,9 @@ class _GenerateMixin(_State):
                     dr.extend(prompt[reuse + 1 : n], h_new[:, : n - 1 - reuse], reuse)
             else:
                 dr.prefill(prompt, h_new)
+            # the committed rows the drafter has yet to take: their tokens, and the target's last hidden rows under
+            # them and under `cur` (one more). The drafter holds every row before them - the target's rows less
+            # 1 + len(pend_toks) - and a pass that drafts takes them first; a plain step leaves them to the next
             pend_toks: list[Any] = []
             pend_h = h_new[:, -1:]
         self.vram_trim("prefill")
@@ -353,8 +367,9 @@ class _GenerateMixin(_State):
             if session is None:
                 return
             if use_mtp:
+                # the drafter's rows: the target's (the prompt and the answer but its last token) less the pending
                 session._commit_decode(
-                    prompt, committed, cache, anchors, dr, last_base if len(committed) > 1 else n - 1, pend_h
+                    prompt, committed, cache, anchors, dr, n + len(committed) - 2 - len(pend_toks), pend_h
                 )
             else:
                 session._commit_decode(prompt, committed, cache, anchors)
@@ -403,11 +418,14 @@ class _GenerateMixin(_State):
             budget = self._spec_budget(ema_tokens, census["forwards"], v_max, cache.get_seq_length())
             rows, probe = pricer.plan(budget, census["forwards"])
             v = max(0, min(v, rows - 1))
+            if v > 0 and not self.fam.verify_exact(self, cache):
+                # a pass the family's paths would not verify exactly as they stand now (Qwen4's off its kernels)
+                # is a plain one-row pass: nothing drafted
+                v = 0
             # each draft's path probability (1 for a chain's) and the drafts made before the pricing kept a prefix
             node_p: list[float] = []
             drafted = 0
             base_len = cache.get_seq_length()
-            last_base = base_len
             src = "mtp"
             node_tags = None
             tree_now = use_tree
@@ -418,7 +436,9 @@ class _GenerateMixin(_State):
                 guesses, parents, depth = [], [-1], [0]
                 children: dict[Any, Any] = {}
             elif use_dyn:
-                dr.crop(base_len)
+                # the drafter back to the rows before the pending ones: its last draft's steps past them were over
+                # its own guesses
+                dr.crop(base_len - 1 - len(pend_toks))
                 extra = []
                 ng_p = float(getattr(self, "ngram_p", 0.0))
                 if ng_p > 0:
@@ -471,7 +491,7 @@ class _GenerateMixin(_State):
                 if tree_fn is not None:
                     g1, ca, cb = tree_fn(committed)
                 else:
-                    dr.crop(base_len)
+                    dr.crop(base_len - 1 - len(pend_toks))
                     g1, ca, cb = dr.at([*pend_toks, cur], pend_h, base_len - 1 - len(pend_toks), v)
                 guesses = [g1, *ca, *cb]
                 # each chain hangs off the first guess (row 1), its rows one after another; a pass with room for one
@@ -487,7 +507,7 @@ class _GenerateMixin(_State):
                 for j in range(1, len(guesses) + 1):
                     children.setdefault(parents[j], []).append(j)
             elif use_mtp:
-                dr.crop(base_len)
+                dr.crop(base_len - 1 - len(pend_toks))
                 guesses = dr.ar([*pend_toks, cur], pend_h, base_len - 1 - len(pend_toks), v)
             else:
                 chains = prop.propose_chains(v) if (ngram_tree and v > 0) else []
@@ -628,8 +648,18 @@ class _GenerateMixin(_State):
                 by_src["drafted"][src] = by_src["drafted"].get(src, 0) + len(guesses)
                 by_src["accepted"][src] = by_src["accepted"].get(src, 0) + a
             self.ad(cache, base_len, path)
-            if use_mtp or use_tree:
+            if (use_mtp or use_tree) and v > 0:
+                # the drafter took the pending rows and `cur`'s at the root: the pass's accepted rows wait next
                 pend_toks, pend_h = new[:a], last["h"][:, path]
+            elif use_mtp or use_tree:
+                # a plain step drafted nothing, so the drafter took nothing: `cur` and its row join the pending, which
+                # a run too long for one step goes in without drafting (its cache is every committed row either way)
+                pend_toks, pend_h = [*pend_toks, cur], torch.cat([pend_h, last["h"][:, path]], dim=1)
+                if len(pend_toks) >= PEND_ROWS:
+                    dr_rows = cache.get_seq_length() - 1 - len(pend_toks)
+                    dr.crop(dr_rows)
+                    dr.extend(pend_toks, pend_h[:, :-1], dr_rows)
+                    pend_toks, pend_h = [], pend_h[:, -1:]
             phase["commit"] += time.perf_counter() - tc
             if hk is not None and hk.on_pass is not None:
                 hk.on_pass(

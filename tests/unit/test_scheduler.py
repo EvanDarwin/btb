@@ -9,6 +9,7 @@ readings are three patched functions. The suite runs in seconds on any machine, 
 from __future__ import annotations
 
 import contextlib
+import os
 import threading
 import types
 import weakref
@@ -232,6 +233,34 @@ def test_the_epochs_kv_on_a_card_is_only_the_resident_layers() -> None:
     host = SchedulerModel(dev="cpu", layer_types=m.layer_types)
     host.resident = {2: None}  # type: ignore[attr-defined]
     assert BatchScheduler(host)._kv_bytes_per_row_token() == every, "one device: every layer's rows are its own"
+
+
+def test_a_batchs_host_rows_count_what_the_store_would_give_back() -> None:
+    """on a card whose attention rows live on the host, a batch is held to the host's room for them: its free memory
+    and what the expert store - a cache grown into free RAM, which gives blocks back as rows grow - would release.
+    A warm store at its margin no longer sizes every epoch at one row; and the epoch reserves those rows there"""
+    from btb.engine.scheduler import EPOCH
+
+    m = SchedulerModel(dev="cuda", layer_types=("full_attention",) * 4)
+    m.resident = {}  # type: ignore[attr-defined]  # every attention layer's rows on the host, float32
+    reserved: dict[tuple[str, str], int] = {}
+
+    class _Ledger:
+        def free(self, device: Any = None, unreserved: bool = False, own: Any = None, pooled: bool = False) -> int:
+            return 1 * GB if device is not None and torch.device(device).type == "cpu" else 64 * GB
+
+        def reserve(self, tag: str, nbytes: int, device: Any = None, used: Any = None) -> None:
+            reserved[(tag, "cpu" if device is not None else "card")] = int(nbytes)
+
+    m.device = _Ledger()  # type: ignore[attr-defined]
+    s = BatchScheduler(m)
+    host = s.host_kv_row_bytes(4096)
+    assert host > 0 and s.kv_row_bytes(4096) == 0, "no row on the card, every one on the host"
+    assert s.max_batch(4096) == GB // host, "the store's margin alone"
+    m.expert_store = types.SimpleNamespace(releasable=lambda: 8 * GB)  # type: ignore[attr-defined]
+    assert s.max_batch(4096) == 9 * GB // host, "and what the store would give back for them"
+    batch, _ = s.plan(10**6, 4096)
+    assert reserved[(EPOCH, "cpu")] == host * batch, "the host's rows reserved on the host"
 
 
 def _counting_max_batch(engine: _StubEngine, values: Sequence[int]) -> dict[str, int]:
@@ -1374,6 +1403,8 @@ def test_route_rule_from_the_profile() -> None:
     assert rule(sata) == {"depth": 16, "merge": False, "ahead": 3}
     assert rule({}) == {"depth": 4, "merge": False, "ahead": 2}
     assert rule({"rates": {4: (1.0, 0.0)}}) == {"depth": 4, "merge": False, "ahead": 2}
+    # a profile that stopped short of sixteen readers keeps the deepest it measured
+    assert rule({"rates": {1: (1.0, 0.0), 4: (1.1, 0.0)}}) == {"depth": 4, "merge": False, "ahead": 2}
 
 
 def test_route_queue_keeps_one_reader_for_the_prediction_class_where_the_rule_allows_none(
@@ -1509,6 +1540,137 @@ def test_route_reads_land_with_their_duration_and_callbacks(monkeypatch: MonkeyP
     assert st["workers"] == []
 
 
+def test_route_settles_a_failed_read_and_a_failing_callback_and_keeps_both_callers(monkeypatch: MonkeyPatch) -> None:
+    """the same bytes asked twice while queued are one read that runs both callers' `on_done`; a callback that
+    raises is logged and its read's future still lands; a read that raises settles every future of its merged run
+    - a prediction's pair here - with the error, and the in-flight counts go back to nothing"""
+    reads: list[tuple[str, int, int]] = []
+    s, st = _route(monkeypatch, reads)
+    lines: list[str] = []
+    s.sm.log = lines.append
+    st["workers"] = [None]
+    st["ahead_cap"] = 4
+    dst = torch.empty(8, dtype=torch.uint8)
+    seen: list[str] = []
+    f = s.disk_read("a.st", 0, 8, dst, s.DISK_DEMAND, on_done=lambda d: seen.append("first"))
+    g = s.disk_read("a.st", 0, 8, dst, s.DISK_DEMAND, on_done=lambda d: seen.append("second"))
+    assert f is g and len(st["reqs"]) == 1
+    s._disk_serve(st, s._disk_take(st), lambda *a: None)
+    assert f.result() >= 0 and seen == ["first", "second"]
+
+    def boom(dur: int) -> None:
+        raise ValueError("boom")
+
+    h = s.disk_read("a.st", 4096, 8, dst, s.DISK_DEMAND, on_done=boom)
+    s._disk_serve(st, s._disk_take(st), lambda *a: None)
+    assert h.result() >= 0 and any("a read's on_done raised: ValueError('boom')" in x for x in lines), lines
+    st["merge"] = True
+    a = s.disk_read("a.st", 64, 8, dst, s.DISK_AHEAD, key=(1, 2))
+    b = s.disk_read("a.st", 72, 8, dst, s.DISK_AHEAD, key=(1, 3))
+    t = s._disk_take(st)
+    assert t is not None and [q["off"] for q in t[1]] == [72] and st["inflight_ahead"] == 2
+
+    def gone(*args: object) -> None:
+        raise OSError("the drive went away")
+
+    s._disk_serve(st, t, gone)
+    for fut in (a, b):
+        with pytest.raises(OSError, match="the drive went away"):
+            fut.result()
+    assert st["inflight"] == st["inflight_ahead"] == st["inflight_demand"] == 0 and not st["reqs"]
+
+
+def test_route_pulse_reads_the_drives_busy_time_and_profiles_its_turns(tmp_path: Path) -> None:
+    """the live rate: reads that took no time rate nothing; the last reads' bytes over their busy time under half
+    the probe's rate is a slowed drive and above four fifths a recovered one, each turn logged and profiled"""
+    from btb.engine.experts import ExpertProfile
+
+    s = BatchScheduler(stub_engine())
+    lines: list[str] = []
+    s.sm.log = lines.append
+    prof = s.sm.expert_profile = ExpertProfile(str(tmp_path / "p.npz"))
+    st = s._disk_state()
+    st["live"] = [(t, t, MB) for t in range(32)]
+    assert s._disk_pulse(st) is None, "no busy time, no rate"
+    st["expect_gbs"] = 10.0
+    for busy_ns, what, aux in ((500_000, "slowed", 1), (100_000, "recovered", 0)):
+        st["live"] = [(i * 1_000_000, i * 1_000_000 + busy_ns, MB) for i in range(32)]
+        turn = s._disk_pulse(st)
+        assert turn is not None and turn[0] == what and turn[1] == pytest.approx(MB / busy_ns)
+        s._disk_turned(st, turn)
+        assert f"the drive {what}" in lines[-1] and (("predictions withheld" in lines[-1]) == (what == "slowed"))
+        row = prof.a[prof.n - 1]
+        assert int(row[2]) == prof.DRIVE and int(row[10]) == aux and int(row[8]) == int(turn[1] * 1e9)
+    assert s._disk_pulse(st) is None, "no turn while the rate holds"
+
+
+def test_route_depth_forced_and_a_reader_that_outlives_the_close(monkeypatch: MonkeyPatch) -> None:
+    """`BTB_ROUTE_DEPTH` forces the readers in flight over the probe's rule, the predictions capped at half of them;
+    a reader still in a read when the queue closes is said so and kept, and the queue stays stopped for it"""
+    reads: list[tuple[str, int, int]] = []
+    s, st = _route(monkeypatch, reads)
+    lines: list[str] = []
+    s.sm.log = lines.append
+    nvme = {
+        "measured": True,
+        "fixed_ms": 0.15,
+        "single_ms": 1.3,
+        "single_gbs": 4.8,
+        "copy_ms": 0.4,
+        "reps": 3,
+        "rates": {1: (4.8, 0.1), 4: (5.6, 0.1), 16: (6.2, 0.3)},
+        "seq_gbs": 6.0,
+        "big_mb": 6.25,
+        "cost_s": 1.0,
+    }
+    monkeypatch.setattr(BatchScheduler, "measure_drive", staticmethod(lambda path, clock=None: dict(nvme)))
+    monkeypatch.setattr(s, "_volume", lambda path: "Y:")
+    monkeypatch.setenv("BTB_ROUTE_DEPTH", "2")
+    p = s.disk("y.st")
+    assert p["depth"] == 2 and p["ahead"] == 1 and st["depth"] == 2, p
+    assert any("2 in flight (forced)" in x for x in lines), lines
+
+    class Stuck:
+        """a reader deep in a read: the join's timeout passes and it is still there"""
+
+        def join(self, timeout: float | None = None) -> None:
+            return None
+
+        def is_alive(self) -> bool:
+            return True
+
+    stuck = Stuck()
+    st["workers"] = [stuck]
+    s.disk_close()
+    assert any("1 reader(s) still in a read at close" in x for x in lines)
+    assert st["workers"] == [stuck] and st["stop"]
+    st["workers"], st["stop"] = [], False
+
+
+def test_the_schedulers_small_arithmetic() -> None:
+    """a size at the unit that shows it; a card's recovery pauses doubling with a streak, capped, and a streak
+    forgotten after a clean stretch; the drive file the probe reads is the largest weight file that is there"""
+    import time as _time
+
+    from btb.engine.scheduler import _size
+
+    assert (_size(1000), _size(3 * MB), _size(5 * GB)) == ("1.0 KiB", "3.00 MiB", "5.00 GiB")
+    s = BatchScheduler(stub_engine())
+    assert [s.gpu_recovered() for _ in range(6)] == pytest.approx([0.1, 0.2, 0.4, 0.8, 1.6, 2.0])
+    s._gpu_cool_until = _time.monotonic() - 6.0
+    assert s.gpu_recovered() == pytest.approx(0.1), "a clean stretch clears the streak"
+
+
+def test_the_probe_reads_the_largest_weight_file_there_is(tmp_path: Path) -> None:
+    """`_drive_file`: the largest of the model's weight files on disk, a file the map names but the disk lacks
+    passed over; nothing for a probe with no files"""
+    (tmp_path / "a.st").write_bytes(b"x" * 10)
+    (tmp_path / "c.st").write_bytes(b"x" * 20)
+    probe = types.SimpleNamespace(dir=str(tmp_path), weight_map={"a": "a.st", "b": "gone.st", "c": "c.st"})
+    assert BatchScheduler._drive_file(probe) == os.path.join(str(tmp_path), "c.st")
+    assert BatchScheduler._drive_file(types.SimpleNamespace(dir="", weight_map={})) is None
+
+
 # -- the Timetable: the next layers' picks read ahead into the ring, promoted on use, withdrawn when lapsed --
 
 
@@ -1564,6 +1726,34 @@ def test_profile_watch_sees_a_thread_holding_the_gil_and_names_it(tmp_path: Path
     snaps = "\n".join(str(x) for x in np.load(tmp_path / "p.npz")["snapshots"])
     assert "hog: " in snaps, "the snapshot, saved with the trace, lists the hog's frame"
     assert sorted(q.name for q in tmp_path.iterdir()) == ["p.npz"], "nothing beside the trace"
+
+
+def test_profile_keeps_each_calls_picks_and_saves_them(tmp_path: Path) -> None:
+    """a call's picks copied row by row into the profile's own array, the offset of its first row returned (the
+    `call` event's offset); the array doubles past its rows and widens once for a call of more picks, a narrower
+    call's rows -1 past its k; and `save` writes them beside the events"""
+    import numpy as np
+
+    from btb.engine.experts import ExpertProfile
+
+    prof = ExpertProfile(str(tmp_path / "p.npz"))
+    a = torch.randint(0, 128, (5, 8))
+    offs = [prof.keep_picks(a)]
+    cap = prof.p.shape[0]
+    b = torch.randint(0, 128, (cap, 10), dtype=torch.int32)  # past the rows, and wider: one growth covers both
+    offs.append(prof.keep_picks(b))
+    c = torch.randint(0, 128, (3, 8))
+    offs.append(prof.keep_picks(c))
+    assert offs == [0, 5, 5 + cap] and prof.m == 8 + cap and prof.p.shape == (2 * cap, 10)
+    prof.add(prof.CALL, 3, expert=3, offset=offs[2])
+    prof.save()
+    z = np.load(tmp_path / "p.npz")
+    picks, (call,) = z["picks"], z["events"]
+    assert picks.shape == (8 + cap, 10) and picks.dtype == np.int16
+    assert (picks[:5, :8] == a.numpy()).all() and (picks[:5, 8:] == -1).all()
+    assert (picks[5 : 5 + cap] == b.numpy()).all()
+    off, rows = int(call[7]), int(call[4])
+    assert (picks[off : off + rows, :8] == c.numpy()).all() and (picks[off : off + rows, 8:] == -1).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
@@ -2718,6 +2908,27 @@ def test_a_foreign_model_on_mlx_is_priced_against_the_ram_the_gpu_shares() -> No
     assert sched.kv_row_bytes(64) > 0
 
 
+def test_a_foreign_model_on_the_host_is_priced_in_its_own_dtype_and_prices_no_card() -> None:
+    """`for_model` over a torch module on the CPU: its compute dtype is its parameters', no card margin; asked for
+    room on a card it has none to price, so the request is not refused; the memory hierarchy is the host's alone
+    (the card's levels 0) and read once, and nothing is pinned in a card's L2"""
+
+    class Tiny(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = model_config(num_hidden_layers=2, vocab_size=1000)
+            self.w = torch.nn.Parameter(torch.zeros(2, dtype=torch.float16))
+
+    sched = BatchScheduler.for_model(Tiny(), device="cpu")
+    assert sched.sm.compute_dtype == torch.float16 and sched.sm.vram_margin == 0
+    assert sched.free_for("cuda") is None
+    sched.grant(GB, "kv", requester="a row", device="cuda")
+    assert sched.granted == {}, "a request nothing here can price is let through, not counted"
+    cs = sched.caches()
+    assert cs["gpu_l2"] == cs["gpu_l2_persist"] == cs["gpu_l2_window"] == 0 and sched.caches() is cs
+    assert sched.pin_bytes(MB) == 0
+
+
 def test_a_foreign_model_on_a_device_btb_cannot_run_is_an_option_error() -> None:
     """a name that is no device, or a card this machine lacks, is refused as `btb.load` refuses it - naming the
     device and what runs here - never a torch error from inside the pricing"""
@@ -2743,3 +2954,352 @@ def test_the_store_knows_an_experts_form_before_reading_one(monkeypatch: MonkeyP
     s = st.free.pop()
     read = stored_parts(*st._views(s))
     assert read is not None and form == tuple((p.shape, p.dtype) for p in read)
+
+
+# --- the store's rarer transitions ----------------------------------------------------------------------------
+
+
+def test_the_lines_demote_pop_and_name_their_oldest_seat() -> None:
+    """either residency policy: a demoted rider is the next to go, a popped one leaves no trace, `oldest_slot` is
+    the next victim's slot (None on an empty line), `items` every seat; a line whose every seat is the call's own
+    bumps nobody. A regular demoted goes before the other regulars."""
+    from btb.engine.experts import BusPass, Riders
+
+    for cls in (Riders, BusPass):
+        line = cls(lambda: 8)
+        assert line.oldest_slot() is None, cls.__name__
+        for key, s in (("a", 0), ("b", 1), ("c", 2)):
+            line.admit(key, s)
+        line.demote("c")
+        line.demote("nobody")  # not seated: nothing moves
+        assert line.oldest_slot() == 2, cls.__name__
+        assert dict(line.items()) == {"a": 0, "b": 1, "c": 2}, cls.__name__
+        assert line.pop("b") == 1 and "b" not in line and line.pop("b") is None, cls.__name__
+        assert line.victim(skip={0, 2}) is None, f"{cls.__name__}: every seat the call's own, yet one was bumped"
+        assert line.victim() == ("c", 2), cls.__name__
+    bp = BusPass(lambda: 8)
+    for key, s in (("x", 5), ("y", 6)):
+        bp.admit(key, s)
+        assert bp.get(key) == s  # a second ride: a regular
+    bp.demote("y")
+    assert bp.oldest_slot() == 6 and bp.victim() == ("y", 6), "the demoted regular goes first"
+
+
+def test_the_slot_tables_check_names_each_broken_invariant(monkeypatch: MonkeyPatch) -> None:
+    """`check` over a store holding seats on the line, predictions in the ring and free slots: each invariant
+    broken on its own is refused by name, and the table put back passes again"""
+    from btb.engine.experts import SlotState
+
+    st, route, _sm = _store_with_routers(monkeypatch, lookahead=(2, 0))
+    assert st.lookahead(0, torch.ones(1, 4)) == 2  # (1, 7) and (1, 6) predicted
+    _ready, pending = st.get(0, "layers.0.mlp.experts.", [0, 1])
+    for e, _f, _s in pending:
+        route.land((0, e))
+    st.check()
+    seat0, seat1 = st.ahead[(1, 7)], dict(st.res.items())[(0, 0)]
+    free = st.free[0]
+
+    def refused(match: str) -> None:
+        with pytest.raises(AssertionError, match=match):
+            st.check()
+
+    rec = st.slots.pop(free)
+    refused(r"slots recorded \[\d+\] differ from the blocks' live ones")
+    st.slots[free] = rec
+    st.free.append(free)
+    refused("a slot twice in the free list")
+    st.free.pop()
+    rec.state = SlotState.RESIDENT
+    refused(f"slot {free} is resident but free")
+    rec.state = SlotState.FREE
+    st.ring[free] = None
+    refused(f"slot {free} is free but in the ring")
+    del st.ring[free]
+    st.ahead[(1, 6)], was = seat1, st.ahead[(1, 6)]
+    refused(r"prediction \(1, 6\) names slot \d+, which is resident for \(0, 0\)")
+    st.ahead[(1, 6)] = was
+    st.res.admit((0, 5), seat0)
+    refused(r"line seat \(0, 5\) names slot \d+, which is predicted for \(1, 7\)")
+    st.res.pop((0, 5))
+    st.res.pop((0, 0))
+    refused(r"2 predicted slots for 2 predictions, 2 resident for 1 seats on the line")
+    st.res.admit((0, 0), seat1)
+    st.check()
+
+
+def test_a_seat_given_up_is_profiled_to_the_call_or_to_the_machine(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    """a block given back to the machine takes every seat and prediction in it off its line - an eviction for the
+    machine (aux 1) each seat, a prediction's queued reads withdrawn - and is one release in the profile; a seat
+    the line gives a later call's miss is that call's eviction (aux 0)"""
+    from btb.engine.experts import ExpertProfile
+
+    st, route, sm = _store_with_routers(monkeypatch, lookahead=(2, 0))
+    prof = sm.expert_profile = ExpertProfile(str(tmp_path / "p.npz"))
+    assert st.lookahead(0, torch.ones(1, 4)) == 2
+    _ready, pending = st.get(0, "layers.0.mlp.experts.", [0, 1])
+    for e, _f, _s in pending:
+        route.land((0, e))
+    (b, (_buf, ids)), *more = st.blocks.items()
+    assert not more, "the store grew one block"
+    st._release_block(b)
+    assert not st.slots and not st.res and not st.ahead and not st.ring and not st.free
+    assert {(1, 7), (1, 6)} <= set(route.dropped), "a prediction's queued reads outlived its block"
+    ev = prof.a[: prof.n]
+    assert {(int(r[3]), int(r[4])) for r in ev if r[2] == prof.EVICT and r[10] == 1} == {(0, 0), (0, 1)}
+    rel = [r for r in ev if r[2] == prof.RELEASE]
+    assert len(rel) == 1 and int(rel[0][4]) == len(ids) and int(rel[0][5]) == len(ids) * slot_size(st)
+    # two seats and three experts: the third's miss takes the oldest seat, an eviction for the call
+    st.block_max = 2 * slot_size(st)
+    assert st._grow(2) == 2
+    st.n_slots = st.live()
+    for e in (0, 1, 2):
+        _ready, pending = st.get(0, "layers.0.mlp.experts.", [e])
+        for pe, _f, _s in pending:
+            route.land((0, pe))
+    ev = prof.a[: prof.n]
+    assert [(int(r[3]), int(r[4])) for r in ev if r[2] == prof.EVICT and r[10] == 0] == [(0, 0)]
+
+
+def test_a_store_with_nobody_seated_gives_back_its_first_block(monkeypatch: MonkeyPatch) -> None:
+    """a release under the reserve with the line empty (nothing but free seats) gives back the store's first block,
+    and stops once the machine has the bytes"""
+    st, state = _store(monkeypatch, free=0)
+    state["free"] = st.reserve + st.margin + 10 * st.block_max
+    k0, k1 = st._grow(1), st._grow(1)
+    assert k0 > 0 and k1 > 0 and list(st.blocks) == [0, 1] and not st.res
+    state["free"] = st.reserve  # nothing above the reserve
+    assert st.release() == k0
+    assert list(st.blocks) == [1], "the first block went back, and only it"
+
+
+def test_a_missed_experts_price_is_the_probes_else_the_reads_timed(monkeypatch: MonkeyPatch) -> None:
+    """`miss_s`: nothing before a read or a probe; the reads timed so far spread over the readers that ran them;
+    the drive's probe over both, once there is one"""
+    st, _sm = expert_store(monkeypatch, FakeRoute(), n_layers=2, n_experts=4)
+    assert st.miss_s() == 0.0
+    st.stat["read_s"], st.stat["read_n"] = 0.8, 4
+    assert st.miss_s() == pytest.approx(0.8 / 4 / st.readers)
+    st.drive = {"big_mb": 6.25, "single_ms": 40.0, "fixed_ms": 5.0}
+    assert st.miss_s() == pytest.approx(2 * 0.005 + slot_size(st) * 0.040 / (6.25 * MB))
+
+
+def test_the_lookahead_passes_over_a_layer_whose_experts_it_cannot_read(monkeypatch: MonkeyPatch) -> None:
+    """a layer after this one with a router but no experts the store can read (no checkpoint prefix): its picks
+    are skipped and the layer after it is still read ahead"""
+    st, route, sm = _store_with_routers(monkeypatch, lookahead=(2, 1))
+    del sm.resident[1].mlp.experts.base
+    assert st.lookahead(0, torch.ones(1, 4)) == 1
+    assert {r["key"] for r in route.reads} == {(2, 7)} and set(st.ahead) == {(2, 7)}
+
+
+def test_a_ring_slot_the_call_holds_is_never_taken_back(monkeypatch: MonkeyPatch) -> None:
+    """`_ring_take` with a ring slot in `skip` (the wave's own): that one is passed over and the next landed
+    prediction's slot is given, its prediction forgotten"""
+    st, route, _sm = _store_with_routers(monkeypatch, lookahead=(2, 0), ring_n=2)
+    assert st.lookahead(0, torch.ones(1, 4)) == 2
+    route.land((1, 7))
+    route.land((1, 6))
+    held, other = list(st.ring)
+    other_key = st.slots[other].key
+    assert st._ring_take(skip={held}) == other
+    assert held in st.ring and other not in st.ring and other_key not in st.ahead
+    assert st.stat["ahead_dropped"] == 1
+    st._resident(other, (0, 3))  # the call seats its expert there
+    st.check()
+
+
+def test_a_sweeps_end_gives_the_rings_extra_slots_back_and_withdraws_their_reads(monkeypatch: MonkeyPatch) -> None:
+    """a layer-by-layer prefill's lookahead grows the ring past `ring_n`, one slot a prediction; the sweep's end
+    shrinks it back, newest first: a prediction still queued is withdrawn and forgotten, its slot free again"""
+    st, route, sm = _store_with_routers(monkeypatch, lookahead=(1, 0), ring_n=2)
+    sm.cfg = types.SimpleNamespace(num_experts_per_tok=6)
+    st.sweep_layer = 0
+    assert st.lookahead(0, torch.ones(3, 4), sweep=2) == 6, "a sweep reads every expert some row picks"
+    assert len(st.ring) == 6
+    newest = [st.slots[s].key for s in list(st.ring)[2:]]
+    free0 = len(st.free)
+    st.sweep_end()
+    assert st.sweep_layer == -1 and len(st.ring) == 2
+    assert route.dropped == newest[::-1], "the newest predictions withdrawn, newest first"
+    assert not any(k in st.ahead for k in newest) and len(st.ahead) == 2
+    assert st.stat["ahead_dropped"] == 4 and len(st.free) == free0 + 4
+    st.check()
+
+
+def test_a_call_the_store_cannot_seat_is_refused_whole_or_at_its_first_expert(monkeypatch: MonkeyPatch) -> None:
+    """a store of three seats that cannot grow: a call that must be seated whole (the paths that multiply its
+    experts together) asking five is refused, naming the count; a store with no seat at all refuses a wave's first
+    expert, since a wave must seat one to go on"""
+    route = FakeRoute()
+    st, _sm = expert_store(monkeypatch, route, n_layers=2, n_experts=8)
+    st.block_max = 3 * slot_size(st)
+    assert st._grow(3) == 3
+    st.n_slots = st.live()
+    with pytest.raises(RuntimeError, match="one call needs 5 experts and the store seats 3 of them"):
+        st.call(0, "layers.0.mlp.experts.", [0, 1, 2, 3, 4], rows=4).whole()
+    empty, _sm2 = expert_store(monkeypatch, FakeRoute(), n_layers=2, n_experts=8)
+    empty.n_slots = 0
+    with pytest.raises(RuntimeError, match="one call needs 2 experts and the store seats 0 of them"):
+        empty.call(0, "layers.0.mlp.experts.", [0, 1], rows=4).wave()
+    done = st.call(1, "layers.1.mlp.experts.", [], rows=1)
+    assert done.done and done.wave() == ({}, []), "a call with nothing left seats nothing"
+
+
+def _layered_store(tmp_path: Path, experts_at: Sequence[int]) -> _ExpertStore:
+    """a store over a stub model of two layers whose experts (bf16, four of them) are in the checkpoint's header at
+    `experts_at` only - a dense layer has none - read through the store's own recipe"""
+    from btb.engine import StreamedTextModel
+    from btb.engine import experts as experts_mod
+    from btb.engine.experts import ExpertProfile
+
+    E, inter, H = 4, 8, 16
+    gu, dn = 2 * inter * H * 2, H * inter * 2
+    hdr: dict[str, Json] = {}
+    for i in experts_at:
+        hdr[f"layers.{i}.mlp.experts.gate_up_proj"] = {
+            "dtype": "BF16",
+            "shape": [E, 2 * inter, H],
+            "data_offsets": [0, E * gu],
+        }
+        hdr[f"layers.{i}.mlp.experts.down_proj"] = {
+            "dtype": "BF16",
+            "shape": [E, H, inter],
+            "data_offsets": [E * gu, E * (gu + dn)],
+        }
+    sm = stub_engine(
+        mlx=None,
+        fam=Family(kind=FamilyKind.QWEN3),
+        cold_chunk=0,
+        expert_profile=ExpertProfile(str(tmp_path / "p.npz")),
+        L=2,
+        n_experts=E,
+        prefix="",
+        dir=str(tmp_path),
+        weight_map=dict.fromkeys(hdr, "experts.safetensors"),
+        _shard=lambda shard: (None, hdr, 8),
+        ST_DTYPES=StreamedTextModel.ST_DTYPES,
+        scheduler=None,
+        resident={},
+        host={},
+        device=stub_ledger(lambda: 64 * GB, GB),
+    )
+    return experts_mod._ExpertStore(sm, budget_bytes=64 * MB, reserve_bytes=GB)
+
+
+def test_a_model_whose_first_layer_is_dense_starts_its_pass_at_the_first_with_experts(tmp_path: Path) -> None:
+    """a dense first layer has no experts in the checkpoint: the pass starts at the first layer that has them (the
+    profile's step taken there, once a pass), and the experts' form is read off that layer before any call; a model
+    with none at all has no form to give"""
+    from btb.engine.host import stored_parts
+
+    st = _layered_store(tmp_path, experts_at=[1])
+    form = st.form()
+    assert form == ((torch.Size([16, 16]), torch.bfloat16), (torch.Size([16, 8]), torch.bfloat16))
+    assert st._first_layer() == 1
+    prof = st.sm.expert_profile
+    st.call(1, "layers.1.mlp.experts.", [0])
+    st.call(1, "layers.1.mlp.experts.", [2])
+    assert prof.step == 2, "every call at the first layer with experts starts a pass"
+    st._grow(1)
+    read = stored_parts(*st._views(st.free[-1]))
+    assert read is not None and form == tuple((p.shape, p.dtype) for p in read)
+    assert _layered_store(tmp_path, experts_at=[]).form() is None
+
+
+def test_the_expert_shapes_the_card_multiplies_are_read_off_each_layout(monkeypatch: MonkeyPatch) -> None:
+    """`mx_shapes` and `f8_shapes`: the logical [2I, H] and [H, I] of an MXFP4 expert in the checkpoint's layout
+    (blocks of 32) and in ggml's (gate and up apart), and of an FP8 one beside its scale grids"""
+    st, _sm = expert_store(monkeypatch, FakeRoute(), n_layers=1, n_experts=4)
+    st.mx, st.ggml = True, False
+    st.shapes = ((64, 2, 16), (64, 2), (32, 1, 16), (32, 1))
+    assert st.mx_shapes() == ((64, 64), (32, 32))
+    st.ggml = True
+    st.shapes = ((32, 64), (32, 64), (32, 32))
+    assert st.mx_shapes() == ((64, 64), (32, 32))
+    st.mx, st.ggml, st.f8 = False, False, True
+    st.shapes = ((64, 32), (4, 2), (32, 32), (2, 2))
+    assert st.f8_shapes() == ((64, 32), (32, 32))
+
+
+def test_an_fp8_scale_left_off_its_alignment_reads_the_same_scales(monkeypatch: MonkeyPatch) -> None:
+    """an FP8 expert's scale grid sitting a byte off its float32 alignment in the slot (where a direct read's
+    padding would leave a misaligned file's bytes): the view reads it through an aligned copy, the same values"""
+    from btb.engine.experts import _ExpertStore
+
+    st, _sm = expert_store(monkeypatch, FakeRoute(), n_layers=1, n_experts=4)
+    st.mx, st.f8, st.f8_sdt = False, True, torch.float32
+    st.shapes = ((32, 16), (2, 1), (16, 16), (1, 1))
+    st.sizes = (32 * 16, 2 * 4, 16 * 16, 1 * 4)
+    st.padded = True
+    st.stride, st.part_at = _ExpertStore._layout(st.sizes, True)
+    assert st._grow(1) > 0
+    s = st.free[-1]
+    st.slots[s].delta = (0, 1, 0, 1)
+    region = st._region(s)
+    want_gu, want_dn = torch.tensor([[0.5], [2.0]]), torch.tensor([[0.25]])
+    for p, w in ((1, want_gu), (3, want_dn)):
+        at = st.part_at[p] + 1
+        region[at : at + w.numel() * 4] = w.reshape(-1).view(torch.uint8)
+    gu, dn = st._views(s)
+    assert torch.equal(gu.scales, want_gu) and torch.equal(dn.scales, want_dn)
+    assert gu.shape == (32, 16) and dn.shape == (16, 16)
+
+
+@pytest.mark.parametrize("dt", [torch.float32, torch.float16])
+def test_a_store_without_a_route_reads_on_its_own_readers_and_holds_a_wide_expert_as_bf16(
+    monkeypatch: MonkeyPatch, tmp_path: Path, dt: torch.dtype
+) -> None:
+    """A store over a checkpoint whose experts are float32 or float16 and a scheduler with no Route: its own
+    readers read each miss off the drive, and every use reads the expert as the bf16 of its values - a waited-for
+    read rewritten as it is collected, and a landed one a later call hits rewritten there, once"""
+    from btb.engine.native import Native
+    from tests.helpers import native_library
+
+    native_library()
+    assert Native.read_direct is not None
+    st, _sm = expert_store(monkeypatch, object(), n_layers=1, n_experts=4, files=str(tmp_path) + os.sep)
+    per = slot_size(st)
+    n = per // 2 // dt.itemsize  # a part's values
+    st.dt = dt
+    st.shapes = (per // 2, (n,), (n,))
+    torch.manual_seed(7)
+    parts = {}
+    for name in ("gu0", "dn0"):
+        vals = torch.randn(4 * n).to(dt)
+        (tmp_path / f"{name}.st").write_bytes(vals.view(torch.uint8).numpy().tobytes())
+        parts[name] = vals.view(4, n).to(torch.bfloat16)
+    base = "layers.0.mlp.experts."
+    ready, pending = st.get(0, base, [1, 3])
+    assert not ready and [e for e, _f, _s in pending] == [1, 3]
+    got = st.wait(pending)
+    for e in (1, 3):
+        assert torch.equal(got[e][0], parts["gu0"][e]) and torch.equal(got[e][1], parts["dn0"][e]), e
+    _ready, pending = st.get(0, base, [2])
+    pending[0][1].result()  # landed; nobody has collected it
+    assert not st.slots[pending[0][2]].bf16
+    ready, again = st.get(0, base, [2])
+    assert not again and torch.equal(ready[2][0], parts["gu0"][2]) and torch.equal(ready[2][1], parts["dn0"][2])
+    assert st.slots[pending[0][2]].bf16, "the hit rewrote its expert as bf16"
+    st.close()
+
+
+def test_the_profile_grows_its_event_array_and_watches_once(tmp_path: Path) -> None:
+    """the profile's array doubles when full and keeps every event in order; a second `watch` starts no second
+    watchdog"""
+    from btb.engine.experts import ExpertProfile
+
+    prof = ExpertProfile(str(tmp_path / "p.npz"), cap=2)
+    for i in range(5):
+        prof.add(prof.HIT, layer=i)
+    assert prof.n == 5 and prof.a.shape[0] >= 5 and [int(x) for x in prof.a[:5, 3]] == [0, 1, 2, 3, 4]
+
+    def watchers() -> int:
+        return sum(1 for t in threading.enumerate() if t.name == "gil-watch")
+
+    try:
+        prof.watch(every_s=0.05)
+        n = watchers()
+        prof.watch(every_s=0.05)
+        assert watchers() == n
+    finally:
+        prof._watching = False

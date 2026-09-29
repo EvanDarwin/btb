@@ -821,7 +821,10 @@ class _ForwardMixin(_State):
     def _presize_kv(self, cache: Any, rows: int, B: int) -> None:
         """each resident attention layer's KV made `rows` long at once (`GrowLayer.presize`), granted from the epoch's
         room, before a layer-by-layer prefill cuts its working set: a cache growing mid-sweep would split it. The
-        layers the card graph's arena holds keep their place there"""
+        layers the card graph's arena holds keep their place there; with the rows kept on the host (`kv_host`) no
+        layer's are the card's, and nothing is presized there"""
+        if getattr(self, "kv_host", False):
+            return
         st = getattr(self, "_cg", None)
         ar = st["arena"] if st is not None else None
         owner = ar["owner"]() if ar is not None and ar["owner"] is not None else None
@@ -884,7 +887,7 @@ class _ForwardMixin(_State):
         """a host layer's rows on the card for a chunk of it there (`GrowLayer.hop`): its keys and values up to the
         last such chunk's end, in the card's dtype, at most once at a time"""
         card = self._card_chunks(C, T)
-        ends = [min(T, a + C) for a, on in zip(range(0, T, C), card) if on and past + a > 0]
+        ends = [min(T, a + C) for a, on in zip(range(0, T, C), card) if on]
         if not ends or self.dev.type != Device.CUDA:
             return 0
         c = self.cfg
@@ -895,16 +898,17 @@ class _ForwardMixin(_State):
         nb = 4 if (cd is not None and cd != torch.bfloat16) else 2
         return 2 * B * Hk * d * nb * (past + max(ends))
 
-    def _host_bytes(self, C: int, past: int, B: int, T: int) -> int:
+    def _host_bytes(self, C: int, past: int, B: int, T: int, park: bool) -> int:
         """what a layer-by-layer prefill on the card asks of the host: its host chunks' working set in float32 where
-        a layer lives there and the card does not take the chunk, and its rows parked between layers - each chunk's
-        a pinned buffer, which the pinned allocator rounds up to a power of two"""
+        a layer lives there and the card does not take the chunk, and - where the sweep parks them (`park`, decided
+        once before its own reservations shrink the card's room) - its rows between layers, each chunk's a pinned
+        buffer, which the pinned allocator rounds up to a power of two"""
         if self.dev.type != Device.CUDA:
             return 0
         n = 0
         if (self.host or self.cold) and not all(self._card_chunks(C, T)):
             n += self._chunk_bytes(C, past + max(0, T - C), on_card=False)
-        row_b, park = self._sweep_rows(B, T)
+        row_b, _park = self._sweep_rows(B, T)
         if park:
             n += sum(1 << max(0, (min(T, a + C) - a) * (row_b // B) * B - 1).bit_length() for a in range(0, T, C))
         return n
@@ -972,19 +976,26 @@ class _ForwardMixin(_State):
         T = ids.shape[1]
         if cache is None or attention_mask is not None or getattr(self, "aq", False):
             return self.forward(ids, cache=cache, on_layer=on_layer, attention_mask=attention_mask, last_only=last_only)
-        # a hybrid's DeltaNet continues a chunk from the cache's conv and recurrent states (the module takes them as
-        # the chunk's initial state), so it prefills layer by layer as any family does - the float32 sums inside
-        # the DeltaNet's blocks split at other rows than one pass's; outside that path the host's hybrid takes its
-        # prompt whole, as it always has (the MLX path continues its chunks from the stored states)
-        whole_hybrid = LayerKind.LINEAR in self.layer_types and not self.fam.own and self.mlx is None
-        past = int(cache.get_seq_length())
-        C = int(self.prefill_chunk or self._auto_chunk(past))
-        if T <= C:
-            return self.forward(ids, cache=cache, on_layer=on_layer, last_only=last_only)
         # a prompt past one chunk prefills layer by layer, so a layer the pass streams (a card pass's template, the
         # drive's ring, a mixture's experts) is read once for the whole prompt instead of once per chunk (the
         # chunks of a 16k prompt read the 180B's experts 3.35 times over)
-        if on_layer is None and last_only and self.mlx is None and self.prefill_layers:
+        sweep = on_layer is None and last_only and self.mlx is None and self.prefill_layers
+        # a hybrid's DeltaNet continues a chunk from the cache's states, but sums in float32 over blocks that split
+        # where its chunks do: chunks of a size the free memory picks would make the same prompt's bits depend on
+        # what else the machine holds. So the torch hybrid sweeps only chunks of the size `prefill_chunk` names, and
+        # otherwise takes its prompt whole, as it always has (the MLX path continues its chunks from the stored
+        # states)
+        whole_hybrid = (
+            LayerKind.LINEAR in self.layer_types
+            and not self.fam.own
+            and self.mlx is None
+            and not (sweep and self.prefill_chunk)
+        )
+        past = int(cache.get_seq_length())
+        C = int(self.prefill_chunk or self._auto_chunk(past))
+        if T <= C or whole_hybrid:
+            return self.forward(ids, cache=cache, on_layer=on_layer, last_only=last_only)
+        if sweep:
             if not self.prefill_chunk:
                 # every chunk is taken at one size, so it is priced where it costs the most - the last chunk's
                 # position, whose rows see every key before them (the chunks one at a time price each at its own)
@@ -993,8 +1004,6 @@ class _ForwardMixin(_State):
                 while C > PREFILL_MIN_ROWS and sum(self._sweep_bytes(C, past, ids.shape[0], T, cache)) > room:
                     C //= 2
             return self._prefill_by_layer(ids, cache, C)
-        if whole_hybrid:
-            return self.forward(ids, cache=cache, on_layer=on_layer, last_only=last_only)
         self.log(f"[prefill] {T} tokens in chunks of {C} from position {past}")
         # a layer hook sees the last layer's rows for the whole prompt once, joined at the end, as it would from
         # one forward (the drafter's prefill reads them); every other layer's rows are handed over per chunk as
@@ -1197,6 +1206,9 @@ class _ForwardMixin(_State):
         store = getattr(self, "expert_store", None)
         s0 = dict(store.stat) if store is not None else {}
         on_cuda = self.dev.type == Device.CUDA
+        hq = int(self.cfg.num_attention_heads)
+        kv_heads = int(getattr(self.cfg, "num_key_value_heads", None) or hq)
+        head_dim = int(getattr(self.cfg, "head_dim", None) or self.cfg.hidden_size // hq)
         # off the card the whole sweep runs on the host: its working set is the host's share
         work_host = 0 if on_cuda else sum(self._sweep_bytes(C, past0, B, T, cache)[:1])
         own_epoch = False
@@ -1259,7 +1271,7 @@ class _ForwardMixin(_State):
                     if form is not None:
                         n = self._depot.open_at(form, int(self.n_experts))
                         self.log(f"[prefill] depot opened up front, {n} seats of {int(self.n_experts)} and its scratch")
-            host_share = self._host_bytes(C, past0, B, T) if on_cuda else work_host
+            host_share = self._host_bytes(C, past0, B, T, park) if on_cuda else work_host
             if host_share:
                 # the host's share, asked of it as the card's is: the host chunks' working set and the parked rows,
                 # under the same tag there (the parked buffers draw on it as they are made)
@@ -1322,8 +1334,12 @@ class _ForwardMixin(_State):
                             wd = self._layer_dtype(tmpl)
                             if h.device != self.dev or (wd is not None and h.dtype != wd):
                                 h = h.to(self.dev, wd) if wd is not None else h.to(self.dev)
-                            if host and frames[c]["past"] > 0:
-                                cl = cache.layers[i]
+                            cl = cache.layers[i] if host else None
+                            if isinstance(cl, GrowLayer) and not cl.shared and frames[c]["past"] == 0:
+                                # no rows yet: a buffer on the card for this chunk's alone, in the prefill's
+                                # reservation - grown there, it would be the whole sequence's, from the epoch's room
+                                cl.hop(self.dev, b_c - a_c, h.dtype, (h.shape[0], kv_heads, head_dim))
+                            elif host and frames[c]["past"] > 0:
                                 if isinstance(cl, GrowLayer) and not cl.shared and cl.keys.numel():
                                     # the rows onto the card with room for this chunk's: written in place there, in
                                     # the prefill's reservation (`_hop_bytes`), nothing grown or granted
@@ -1394,6 +1410,12 @@ class _ForwardMixin(_State):
             # them, and the next pass would find a depot with nothing behind it
             if scores_open:
                 self.fam.close_sweep(self)
+            if self._sweep_keep or self._sweep_ahead:
+                # a sweep refused before its layers ran (or whose own cleanup raised first): no later pass runs as one
+                # of its chunks - its experts kept, the lookahead reading a sweep's worth ahead
+                self._sweep_keep = self._sweep_ahead = False
+                if store is not None:
+                    store.sweep_end()
             self.device.release(PREFILL)
             if own_epoch:
                 self.device.release(EPOCH)

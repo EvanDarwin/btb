@@ -472,6 +472,26 @@ class BatchScheduler:
         """The KV one sequence holds when it has run to `target_len` positions."""
         return self._kv_bytes_per_row_token() * max(1, int(target_len))
 
+    def host_kv_row_bytes(self, target_len: int) -> int:
+        """On a card, the KV one sequence holds on the host at `target_len` positions: the rows of the attention
+        layers that live there (`_kv_home`) - a host layer's in float32, a resident one's under `kv_host` in the
+        compute dtype. Nothing off the card, where `kv_row_bytes` counts every layer already."""
+        sm = self.sm
+        resident = getattr(sm, "resident", None)
+        if sm.dev.type != Device.CUDA or resident is None:
+            return 0
+        c = sm.cfg
+        hq = int(c.num_attention_heads)
+        hk = int(getattr(c, "num_key_value_heads", None) or hq)
+        d = int(getattr(c, "head_dim", None) or c.hidden_size // hq)
+        cd = torch.empty(0, dtype=sm.compute_dtype if sm.compute_dtype is not None else torch.bfloat16).element_size()
+        kv_host = bool(getattr(sm, "kv_host", False))
+        el = 0
+        for i, lt in enumerate(sm.layer_types):
+            if lt != LayerKind.LINEAR:
+                el += (cd if kv_host else 0) if i in resident else 4
+        return 2 * hk * d * el * max(1, int(target_len))
+
     def free_vram(self) -> int | None:
         """VRAM free right now above the engine's reserve, or None off the card (the host tier is bound by
         CPU throughput, not KV memory, so it does not size a batch this way)."""
@@ -592,12 +612,23 @@ class BatchScheduler:
         return ""
 
     def max_batch(self, target_len: int) -> int | None:
-        """Sequences to decode together: what the free VRAM holds for `target_len` positions of KV. None off the
-        card (the host tier scales by its own kernels)."""
+        """Sequences to decode together: what the free VRAM holds for `target_len` positions of KV, and on a card
+        whose layers keep some rows on the host (a host layer's, or every one's under `kv_host`), what the host
+        holds of those - its free memory and what the expert store would give back for them, the store being a cache
+        that grows into whatever RAM is free (`cache_room` has it release blocks for the rows as they grow). None off
+        the card (the host tier scales by its own kernels)."""
         free = self.free_vram()
         if free is None:
             return None
-        return max(1, int(free // max(1, self.kv_row_bytes(target_len))))
+        mb = max(1, int(free // max(1, self.kv_row_bytes(target_len))))
+        host = self.host_kv_row_bytes(target_len)
+        dv = getattr(self.sm, "device", None)
+        if host and dv is not None:
+            store = getattr(self.sm, "expert_store", None)
+            room = int(dv.free(torch.device("cpu"), unreserved=True) or 0)
+            room += int(store.releasable()) if store is not None else 0
+            mb = min(mb, max(1, room // host))
+        return mb
 
     def plan(self, n_pending: int, target_len: int) -> tuple[int, int]:
         """Size the next epoch: at most `n_pending` sequences, at most what the free VRAM holds for
@@ -609,8 +640,12 @@ class BatchScheduler:
         dv = getattr(self.sm, "device", None)
         if dv is not None and mb is not None:
             # the epoch's KV is spoken for from here to `release()`, ahead of the cache allocating it: the
-            # memory policies must not read that room as free and grow a shed layer back into it
+            # memory policies must not read that room as free and grow a shed layer back into it - on the card, and
+            # on the host for the rows that live there, which the store would otherwise grow into
             dv.reserve(EPOCH, self.kv_row_bytes(target_len) * batch)
+            host = self.host_kv_row_bytes(target_len)
+            if host:
+                dv.reserve(EPOCH, host * batch, torch.device("cpu"))
         return batch, target_len
 
     def release(self) -> None:

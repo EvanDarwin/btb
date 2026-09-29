@@ -20,6 +20,7 @@ from ..kinds import LayerKind, PassReport, PassTag, Tokens
 from ..sampling import GREEDY, Sampling
 from ..session import Step
 from .cache import (
+    ArenaIndexedLayer,
     CardRowsLayer,
     ForkIndexedLayer,
     ForkLayer,
@@ -606,8 +607,9 @@ class Branches(_Rows):
             elif card_ok:
                 continue  # every layer formed below, together, over the session's rows in the card's arena
             else:
-                if isinstance(pl, GrowLayer) and pl._buf is not None:
-                    # rows in the card's arena move out, or the next cache to take it would write over them
+                if (isinstance(pl, GrowLayer) and pl._buf is not None) or isinstance(pl, ArenaIndexedLayer):
+                    # rows in the card's arena (the card graph's, or a card program's) move out - a copy of their own,
+                    # granted - or the next cache to take it would write over them before the fork's first step
                     pl.detach()
                 k, v = attention_rows(pl)
                 cache.layers[i] = _fork_layer(pl, k, v, indexer_keys(pl), B, i)
