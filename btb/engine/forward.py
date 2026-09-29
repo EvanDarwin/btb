@@ -17,6 +17,7 @@ from ..kinds import LayerKind, LayerTier, Parents, PassTag, TokenRows
 from ..options import Device
 from ..sampling import as_pick
 from .cache import GrowLayer, conv_states_as, forked
+from .device import where
 from .native import Native
 from .scheduler import EPOCH, MemoryGrantError
 from .state import _State
@@ -243,9 +244,7 @@ class _ForwardMixin(_State):
         return logits, so a caller checks the dtype."""
         pick = as_pick(pick)
         ids_arg = ids  # as given: a card program reads the pass's ids on the host
-        ids = torch.as_tensor(ids, dtype=torch.long, device=self.dev)
-        if ids.dim() == 1:
-            ids = ids.view(1, -1)
+        ids = self._ids(ids)
         B, T = ids.shape
         if self.mlx is not None and cache is not None:
             self._mlx_flush_states(cache)
@@ -639,6 +638,19 @@ class _ForwardMixin(_State):
             pas.on_layer(i, h)
         return h
 
+    def _ids(self, ids: Any) -> torch.Tensor:
+        """token ids as a [B, T] long tensor on the engine's device, checked on the host first where they come from
+        it: an id past the vocabulary is refused by name - on the card its embedding lookup fired a device-side
+        assert, which leaves the process's CUDA context unusable (300 ids up to 484 over a 256-token fixture)"""
+        t = ids if isinstance(ids, torch.Tensor) else torch.as_tensor(ids, dtype=torch.long)
+        V = getattr(self.cfg, "vocab_size", None)
+        if t.device.type == "cpu" and t.numel() and V:
+            lo, hi = int(t.min()), int(t.max())
+            if lo < 0 or hi >= int(V):
+                raise ValueError(f"token id {hi if hi >= int(V) else lo} is outside the model's vocabulary of {int(V)}")
+        t = t.to(device=self.dev, dtype=torch.long)
+        return t.view(1, -1) if t.dim() == 1 else t
+
     def _causal(
         self,
         h: torch.Tensor,
@@ -982,9 +994,7 @@ class _ForwardMixin(_State):
     ) -> Any:
         """`ids` into `cache` in chunks the free memory prices: the last row's logits, or every row's (the chunks'
         joined) without `last_only`"""
-        ids = torch.as_tensor(ids, dtype=torch.long, device=self.dev)
-        if ids.dim() == 1:
-            ids = ids.view(1, -1)
+        ids = self._ids(ids)
         T = ids.shape[1]
         if cache is None or attention_mask is not None or getattr(self, "aq", False):
             return self.forward(ids, cache=cache, on_layer=on_layer, attention_mask=attention_mask, last_only=last_only)
@@ -1355,7 +1365,7 @@ class _ForwardMixin(_State):
                             h = hs[c]
                             if host and not card[c]:
                                 if hopped:
-                                    self._cache_to(cache, i, "cpu")
+                                    cache.layers[i].land(where(Device.CPU), self.host_kv_dtype())
                                     hopped = False
                                 if h.device.type != "cpu" or h.dtype != torch.float32:
                                     # widened on the host, where the host chunk's share was asked for it
@@ -1399,7 +1409,9 @@ class _ForwardMixin(_State):
                                 torch.cuda.synchronize(self.dev)
                                 torch.cuda.empty_cache()
                         if hopped:
-                            self._cache_to(cache, i, "cpu")
+                            # back on the host in its own dtype, as long as its growth is priced: the answer's
+                            # first token appends in place (GrowLayer.land)
+                            cache.layers[i].land(where(Device.CPU), self.host_kv_dtype())
                         if self._cold_held is not None:
                             self._cold_held = None
                             self._cold_release(i)

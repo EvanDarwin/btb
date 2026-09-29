@@ -280,7 +280,10 @@ class _GenerateMixin(_State):
         whole = not (use_mtp or tapped)
         cache, reuse, anchored = session._begin_decode(self, prompt, whole) if session is not None else (None, 0, None)
         if cache is None:
-            cache = self.new_cache()
+            # as long as the call reaches - the prompt, the answer and the widest verify pass past its last token - as
+            # the greedy loop's is, so the two hold the same rows: where no reach is named a host layer takes the whole
+            # context window's
+            cache = self.new_cache(max_len=n + int(max_new) + self._spec_full(v_max))
         logits: Any
         logits, anchors = self._session_prefill(
             ids, cache, reuse, session, on_layer=aw if (use_mtp or tapped) else None

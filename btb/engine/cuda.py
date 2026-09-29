@@ -2239,11 +2239,8 @@ class _CudaMixin(_State):
         attn_fn = ALL_ATTENTION_FUNCTIONS.get_interface(self.cfg._attn_implementation, eager_attention_forward)
         q_rot, k_rot = apply_rotary_pos_emb(q_all.transpose(1, 2), k_all.transpose(1, 2), pe[0], pe[1])
         k_full, v_full = cache.update(k_rot, v_all.transpose(1, 2), i)
-        kernel = (
-            T == 1
-            and not tree
-            and Native.attn_decode is not None
-            and k_full.shape[0] == 1
+        native = (
+            k_full.shape[0] == 1
             and k_full.device.type == "cpu"
             and k_full.dtype in (torch.bfloat16, torch.float32)
             and v_full.dtype == k_full.dtype
@@ -2252,6 +2249,12 @@ class _CudaMixin(_State):
             and v_full.stride(-1) == 1
             and v_full.stride(-2) == hd
         )
+        kernel = native and T == 1 and not tree and Native.attn_decode is not None
+        # a verify pass's rows (a chain's or a tree's) through the step's own arithmetic: each row over the cache rows
+        # its committed step will read, in the order it reads them (`attn_nodes`, row for row `attn_decode` bit for
+        # bit). Through sdpa a row at a time, a verify rounded a bf16 tie apart from the step - Qwen3-0.6B with
+        # eleven host layers took ':' where its greedy step took '.', speculation then no longer the greedy answer
+        nodes = native and not kernel and Native.attn_nodes is not None
         if kernel:
             qf = q_rot[0, :, 0].float().contiguous()
             out = torch.empty(qf.shape, dtype=torch.float32)
@@ -2259,7 +2262,21 @@ class _CudaMixin(_State):
             Native.attn_decode(qf, k_full[0][:, first:], v_full[0][:, first:], at.scaling, out)
             a1 = out.view(1, 1, -1).to(h.dtype)
             outs.append(a1 if gate_all is None else a1 * torch.sigmoid(gate_all[:, 0:1]))
-        for p in range(T) if not kernel else range(0):
+        elif nodes:
+            lists = []
+            for p in range(T):
+                rows = node_mask(base, p, parents, win)
+                lists.append(torch.arange(base + p + 1) if rows is None else rows.nonzero()[:, 0])
+            idx = torch.cat(lists).to(torch.int32).contiguous()
+            offs = torch.zeros(T + 1, dtype=torch.int32)
+            offs[1:] = torch.tensor([len(x) for x in lists]).cumsum(0).to(torch.int32)
+            qf = q_rot[0].transpose(0, 1).float().contiguous()  # [T, hq, d]
+            out = torch.empty(qf.shape, dtype=torch.float32)
+            Native.attn_nodes(qf, k_full[0], v_full[0], offs, idx, float(at.scaling), out)
+            for p in range(T):  # a row at a time, as each step casts and gates its one
+                a1 = out[p].view(1, 1, -1).to(h.dtype)
+                outs.append(a1 if gate_all is None else a1 * torch.sigmoid(gate_all[:, p : p + 1]))
+        for p in range(T) if not (kernel or nodes) else range(0):
             qs = q_rot[:, :, p : p + 1]
             ks = k_full[..., : base + p + 1, :]
             vs = v_full[..., : base + p + 1, :]

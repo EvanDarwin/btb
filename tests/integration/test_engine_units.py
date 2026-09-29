@@ -12,6 +12,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -20,6 +21,7 @@ import btb
 from btb.draft import NGramProposer, Spans
 from btb.engine import StreamedTextModel
 from btb.engine.cache import GrowLayer
+from btb.engine.device import where
 from btb.engine.generate import _chains_tree
 from btb.kinds import Json, LayerKind, TokenRows
 from tests.cert import spec
@@ -348,15 +350,33 @@ def test_a_presized_layer_holds_the_answer_as_well_as_the_prompt() -> None:
     its answer) the buffer is that long, as its growth was priced - sized to the prompt alone, the answer's first
     token grew every layer again, a second whole buffer each (a 40k prompt on Qwen3-0.6B shed nine layers for it)"""
     layer = GrowLayer(cap_hint=48)
-    layer.presize(40, 1, 2, 8, torch.bfloat16, torch.device("cpu"))
+    layer.presize(40, 1, 2, 8, torch.bfloat16, where(torch.device("cpu")))
     assert layer._buf is not None and layer._buf[0].shape[-2] == 48
     buf = layer._buf[0]
     layer.update(*_kv(1, 2, 40, 8, fill=1.0))
     layer.update(*_kv(1, 2, 1, 8, fill=2.0))  # the answer's first token
     assert layer._buf[0] is buf, "the answer grew a presized layer"
     plain = GrowLayer()
-    plain.presize(40, 1, 2, 8, torch.bfloat16, torch.device("cpu"))
+    plain.presize(40, 1, 2, 8, torch.bfloat16, where(torch.device("cpu")))
     assert plain._buf is not None and plain._buf[0].shape[-2] == 40, "no reach named: the prompt's rows"
+
+
+def test_a_hopped_layer_lands_where_its_next_token_appends_in_place() -> None:
+    """a host layer's rows hop into the sweep's buffer (the card's dtype) for its chunks there and land back on the
+    host in its own dtype, as long as its reach: the answer's first token then appends in place. Handed back as a
+    tight copy in the card's dtype, that token grew every host layer again at once (2.6 GB in one step at 40k)"""
+    cpu = where(torch.device("cpu"))
+    layer = GrowLayer(cap_hint=48)
+    kb = torch.empty(1, 2, 64, 8, dtype=torch.bfloat16)
+    layer.hop(kb, torch.empty_like(kb))
+    layer.update(*_kv(1, 2, 40, 8, fill=1.0))  # the chunks, written in place in the sweep's buffer
+    assert layer._buf is not None and layer._buf[0].data_ptr() == kb.data_ptr()
+    layer.land(cpu, torch.float32)
+    assert layer._buf is not None and layer._buf[0].dtype == torch.float32 and layer._buf[0].shape[-2] == 48
+    assert layer.get_seq_length() == 40 and bool((layer.keys == 1.0).all())
+    buf = layer._buf[0]
+    layer.update(*_kv(1, 2, 1, 8, torch.float32, fill=2.0))  # the answer's first token on the host
+    assert layer._buf[0] is buf, "the landed layer grew again for the answer's first token"
 
 
 def test_grow_layer_does_not_compound_its_capacity_when_only_the_placement_changes() -> None:
@@ -392,6 +412,37 @@ def test_load_on_the_cpu_takes_the_budget_from_the_checkpoints_drafting_head() -
     with loaded_model(fixture("tiny_q35"), device="cpu") as sm:
         assert any(k.startswith("mtp.") for k in sm.weight_map)
         assert sm.tree_budget == 16 and sm.proposer == "mtp_dyn"
+
+
+def test_a_calls_cache_is_as_long_as_the_call_and_goes_with_it() -> None:
+    """a generate's cache is let go when the call returns, plain or speculative: the engine held the last pass's
+    cache (`_attn_ctx`) until the next pass, so a 40k prompt's 2.6 GB of host rows lived on into the next call and
+    were priced twice there - its prefill refused, with the room still held by the answer before it. And it is as
+    long as the call reaches: the speculative one named none, and a host layer took the whole context window"""
+    import gc
+
+    with loaded_model(fixture("tiny_qwen3"), device="cpu") as sm:
+        made: list[int | None] = []
+        new_cache = sm.new_cache
+
+        def counted(max_len: int | None = None) -> Any:
+            made.append(max_len)
+            return new_cache(max_len=max_len)
+
+        sm.new_cache = counted  # type: ignore[method-assign]
+        for speculate in (False, True):
+            sm.generate([5, 6, 7, 8, 9, 10], 4, eos=(), speculate=speculate)
+            gc.collect()
+            assert sm._attn_ctx is None, f"the cache outlived its call (speculate={speculate})"
+        # each call's cache as long as it reaches, not the context window a host layer reserves where none is named:
+        # the speculative one the prompt, the answer and its widest verify pass
+        assert made[0] == 6 + 4 and made[-1] == 6 + 4 + sm._spec_full(), made
+        # an id past the vocabulary is refused on the host, by name: on a card its embedding lookup fired a
+        # device-side assert, which leaves the process's CUDA context unusable
+        V = int(sm.cfg.vocab_size)
+        for bad in ([5, V], [-1, 5]):
+            with pytest.raises(ValueError, match="outside the model's vocabulary"):
+                sm.generate(bad, 2, eos=(), speculate=False)
 
 
 def test_load_keeps_the_schedulers_floor_free() -> None:
@@ -700,18 +751,26 @@ def test_speculative_is_the_greedy_answer_on_the_card_with_the_ngram_tree() -> N
             assert census["proposed"] > census["accepted"], "every node was accepted: the crop never ran"
 
 
+@pytest.mark.parametrize("placement", ["kv_host", "host layers", "cpu"])
 @pytest.mark.parametrize("stem", ["tiny_qwen3", "tiny_q35"])
-def test_a_verify_pass_over_a_host_cache_is_the_one_row_steps_bit_for_bit(stem: str) -> None:
-    """With the attention cache in host RAM (kv_host), each row of a verify pass - a chain's, and a tree's with a
-    sibling beside the path - attends as the one-row step at its position does, over the same keys through the same
-    kernel, so the rows' logits are the steps' bit for bit and a speculative decode is the plain loop's (the card's
-    blocks and torch's sdpa each summed in an order of their own, and parted from the steps at a near-tie)."""
-    dev = need_cuda()
+def test_a_verify_pass_over_a_host_cache_is_the_one_row_steps_bit_for_bit(stem: str, placement: str) -> None:
+    """With the attention cache in host RAM - every layer's (kv_host), or the host layers' own on the CPU - each row
+    of a verify pass, a chain's and a tree's with a sibling beside the path, attends as the one-row step at its
+    position does, over the same keys through the same kernel, so the rows' logits are the steps' bit for bit and a
+    speculative decode is the plain loop's (the card's blocks and torch's sdpa each summed in an order of their own,
+    and parted from the steps at a near-tie: a host layer's verify through sdpa a row at a time took ':' where
+    Qwen3-0.6B's greedy step, through the native kernel, took '.'). On the CPU alone the rows are float32 to the
+    logits, where a split's cast to the card's bf16 can round a host layer's difference away"""
     from btb.engine.native import Native
 
-    if Native.attn_decode is None:
-        pytest.skip("the native attention kernel is not built")
-    with loaded_model(fixture(stem), device=dev, kv_host=True) as sm, torch.inference_mode():
+    dev = "cpu" if placement == "cpu" else need_cuda()
+    if Native.attn_decode is None or Native.attn_nodes is None:
+        pytest.skip("the native attention kernels are not built")
+    kw: dict[str, Any] = (
+        {"kv_host": True} if placement == "kv_host" else {"cpu_layers": 2} if placement != "cpu" else {}
+    )
+    with loaded_model(fixture(stem), device=dev, **kw) as sm, torch.inference_mode():
+        assert placement == "kv_host" or sm.host, "no layer on the host: the path under test never runs"
         prompt = REPEATING[0]
         toks = [int(t) for t in sm.generate(list(prompt), 5, eos=(), speculate=False).tokens]
         cache = sm.new_cache()

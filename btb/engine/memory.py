@@ -584,7 +584,23 @@ class _MemoryMixin(_State):
             return host, cdt
         if i in self.resident:
             return (host if getattr(self, "kv_host", False) else self.dev), cdt
-        return host, torch.float32  # a host layer runs in float32 on the CPU
+        return host, (self.host_kv_dtype() if isinstance(cl, GrowLayer) else torch.float32)
+
+    def host_kv_dtype(self) -> torch.dtype:
+        """the dtype a host layer's cache rows are kept in: a bf16 card engine's bf16, as every card layer's - its
+        prompt's rows are made on the card in bf16 anyway, and widened to float32 they took twice the bytes for no
+        more precision (a 40k prompt's host layers refused under a game for it); the answer's, made on the host in
+        float32, rounded as the card's are. Elsewhere float32, the host's own: an engine off the card, `--fp32`,
+        MLX, a family whose host attention does its own float arithmetic (gpt-oss's sinks), and one that runs its
+        own layers over caches of its own (Qwen4's sparse layers keep the rows their kernels make)"""
+        card_bf16 = (
+            self.dev.type == Device.CUDA
+            and self.compute_dtype in (None, torch.bfloat16)
+            and getattr(self, "mlx", None) is None
+            and not self.fam.eager
+            and not self.fam.own
+        )
+        return torch.bfloat16 if card_bf16 else torch.float32
 
     def _give_up_one(self, dev: torch.device, short: int, tried: set[str]) -> bool:
         """the cheapest thing btb holds on `dev`, given up toward `short` bytes: on a card the drafter, then layers

@@ -127,11 +127,16 @@ class GrowLayer(_DynamicLayer):
         grant: Callable[..., None] | None = None,
         bound: int = 0,
         arena: tuple[Any, int, int, int] | None = None,
+        kv_dtype: torch.dtype | None = None,
     ) -> None:
         # `grant` is the scheduler's gate (BatchScheduler.grant), asked on the growth branch alone - never per
         # token - so a buffer too large for the card, or one growing past `bound` (the length these rows can
         # reach), is refused here with a diagnostic instead of OOM-ing inside torch's allocator
         self.grant = grant
+        # the dtype the rows are kept in wherever they are made (`update` casts what comes in): a card engine's
+        # model dtype, so a host layer's rows - the prompt's made on the card, the answer's on the host - are held
+        # as every card layer's are, not widened to the host's float32 at twice the bytes. None: as they come
+        self.kv_dtype = kv_dtype
         self.bound = int(bound)
         self.shared = bool(shared)
         # bits = 8 (shared layers): int8 rows with a float32 scale each (`_mx = [k, v, ks, vs]`); torch's view is a
@@ -824,6 +829,33 @@ class GrowLayer(_DynamicLayer):
             vb[..., :n, :].copy_(self.values)
             self._set_rows(kb[..., :n, :], vb[..., :n, :])
 
+    def land(self, dev: Where, dtype: torch.dtype) -> None:
+        """The rows back from a hop onto `dev` in a buffer of `dtype` as long as a growth there would make it
+        (`_torch_cap`: the sequence's reach where it is named), granted as that growth is: the layer's next append
+        writes in place. Copied back as they were (a tight copy in the card's dtype), the answer's first token on
+        the host grew every host layer again in float32 at once, beside the rows it replaced - 2.6 GB asked in one
+        step of a 40k prompt's answer, refused"""
+        k, v = self.keys, self.values
+        B, Hk, n, d = (int(x) for x in k.shape)
+        cap = self._torch_cap(n, 0, dev.type == "cpu")
+        el = torch.empty(0, dtype=dtype).element_size()
+        if self.grant is not None:
+            self.grant(
+                2 * B * Hk * cap * d * el,
+                "kv",
+                requester=f"GrowLayer(the rows back from the card) n={n} cap={cap}",
+                B=B,
+                cap=cap,
+                bound=self._grant_bound() or None,
+                device=dev,
+            )
+        kb = torch.empty(B, Hk, cap, d, dtype=dtype, device=dev)
+        vb = torch.empty_like(kb)
+        kb[..., :n, :].copy_(k)
+        vb[..., :n, :].copy_(v)
+        self._buf, self._an = (kb, vb), None
+        self._set_rows(kb[..., :n, :], vb[..., :n, :])
+
     def detach_bytes(self) -> int:
         """what `detach` copies"""
         if self._buf is None or not (self.is_initialized and self.keys is not None and self._attached()):
@@ -866,6 +898,9 @@ class GrowLayer(_DynamicLayer):
     def update(
         self, key_states: torch.Tensor, value_states: torch.Tensor, *args: Any, **kwargs: Any
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        kd = self.kv_dtype
+        if kd is not None and not self.shared and key_states.dtype != kd:
+            key_states, value_states = key_states.to(kd), value_states.to(kd)
         if not self.is_initialized:
             self.lazy_initialization(key_states, value_states)
         if self.shared and key_states.device.type == "cpu":

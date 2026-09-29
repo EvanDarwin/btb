@@ -26,6 +26,10 @@ def attention(
     if query.device.type != "cuda":
         from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
+        if key.dtype != query.dtype:
+            # a host layer's rows kept in the card's bf16 (`host_kv_dtype`), its queries the host's float32: widened
+            # for the pass, as sdpa takes one dtype (the native kernels read them as kept)
+            key, value = key.to(query.dtype), value.to(query.dtype)
         return sdpa_attention_forward(
             module, query, key, value, attention_mask, dropout=dropout, scaling=scaling, is_causal=is_causal, **kw
         )

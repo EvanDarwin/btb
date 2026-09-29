@@ -458,8 +458,7 @@ class BatchScheduler:
         resident = getattr(self.sm, "resident", None)
         if self.sm.dev.type == Device.CUDA and resident is not None:
             # the epoch's KV is reserved on the card: only the layers whose rows live there - the resident ones,
-            # unless `kv_host` keeps even theirs on the host. A host layer's rows live on the host in float32
-            # (`_kv_home`); priced on the card they were a phantom reservation (about 1.2 GB for a 120B at 16k)
+            # unless `kv_host` keeps even theirs on the host. A host layer's rows live on the host (`_kv_home`); priced on the card they were a phantom reservation (about 1.2 GB for a 120B at 16k)
             attn = [] if getattr(self.sm, "kv_host", False) else [i for i in attn if i in resident]
         n_attn = len(attn)
         dt = self.sm.compute_dtype if self.sm.compute_dtype is not None else torch.bfloat16
@@ -474,8 +473,8 @@ class BatchScheduler:
 
     def host_kv_row_bytes(self, target_len: int) -> int:
         """On a card, the KV one sequence holds on the host at `target_len` positions: the rows of the attention
-        layers that live there (`_kv_home`) - a host layer's in float32, a resident one's under `kv_host` in the
-        compute dtype. Nothing off the card, where `kv_row_bytes` counts every layer already."""
+        layers that live there (`_kv_home`) - a host layer's in the engine's `host_kv_dtype`, a resident one's under
+        `kv_host` in the compute dtype. Nothing off the card, where `kv_row_bytes` counts every layer already."""
         sm = self.sm
         resident = getattr(sm, "resident", None)
         if sm.dev.type != Device.CUDA or resident is None:
@@ -486,10 +485,12 @@ class BatchScheduler:
         d = int(getattr(c, "head_dim", None) or c.hidden_size // hq)
         cd = torch.empty(0, dtype=sm.compute_dtype if sm.compute_dtype is not None else torch.bfloat16).element_size()
         kv_host = bool(getattr(sm, "kv_host", False))
+        hkd = getattr(sm, "host_kv_dtype", None)
+        hel = torch.empty(0, dtype=hkd()).element_size() if callable(hkd) else 4
         el = 0
         for i, lt in enumerate(sm.layer_types):
             if lt != LayerKind.LINEAR:
-                el += (cd if kv_host else 0) if i in resident else 4
+                el += (cd if kv_host else 0) if i in resident else hel
         return 2 * hk * d * el * max(1, int(target_len))
 
     def free_vram(self) -> int | None:

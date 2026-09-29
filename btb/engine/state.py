@@ -141,7 +141,19 @@ class _State:
     rotary: Any
     shadow: dict[str, Any]
     templates: dict[str, Any]
-    _attn_ctx: Any
+
+    @property
+    def _attn_ctx(self) -> Any:
+        """the cache the running pass attends over, for the module-run attention to read (gpt-oss's sinks): held
+        weakly, so a pass's cache goes with its caller. Held strongly, the last call's cache lived on into the next
+        one - a 40k prompt's 2.6 GB of host rows still there while the next prefill priced its own, refused"""
+        ref = self.__dict__.get("_attn_ref")
+        return ref() if ref is not None else None
+
+    @_attn_ctx.setter
+    def _attn_ctx(self, cache: Any) -> None:
+        self.__dict__["_attn_ref"] = weakref.ref(cache) if cache is not None else None
+
     _batched_cont: bool
     _worker: ThreadPoolExecutor | None
     _worker_thread: threading.Thread
@@ -710,6 +722,9 @@ class _State:
         raise NotImplementedError
 
     def _give_up_one(self, dev: torch.device, short: int, tried: set[str]) -> bool:
+        raise NotImplementedError
+
+    def host_kv_dtype(self) -> torch.dtype:
         raise NotImplementedError
 
     def room(self, nbytes: int, device: DeviceSpec | None = None, name: str = "room") -> Room:

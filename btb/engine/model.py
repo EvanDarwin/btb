@@ -746,6 +746,8 @@ class StreamedTextModel(
             sh = mlxdev.Shared(2 * self.L * per)
             setattr(cache, "_mega_arena", sh)  # noqa: B010  not a DynamicCache slot: the arena pinned to the cache's lifetime
             arena = [(sh.mx, (2 * i) * per, (2 * i + 1) * per, cap) for i in range(self.L)]
+        # a bf16 card engine keeps every layer's rows in bf16, a host layer's too (`host_kv_dtype`)
+        kv_dtype = torch.bfloat16 if self.host_kv_dtype() == torch.bfloat16 else None
         for i, layer in enumerate(cache.layers):
             if type(layer) is DynamicLayer or (flat and isinstance(layer, DynamicLayer)):
                 cache.layers[i] = GrowLayer(
@@ -756,6 +758,7 @@ class StreamedTextModel(
                     grant=None if sched is None else sched.grant,
                     bound=bound,
                     arena=arena[i] if arena is not None else None,
+                    kv_dtype=kv_dtype,
                 )
             elif type(layer) is DynamicIndexedLayer and sched is not None:
                 # a sparse-attention layer's rows, grown as transformers grows them, each growth asked of the ledger

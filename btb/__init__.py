@@ -38,6 +38,11 @@ from .options import Device
 
 os.environ.setdefault("KMP_BLOCKTIME", "0")
 os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+# torch's CPU tensors come from mimalloc on Windows, which by default keeps what they free committed to the process
+# for good (it purges only as it next runs, never idle): a 40k prompt's 2.5 GB of host rows stayed committed after
+# the answer, and the next call's prefill on a machine short of commit was refused for room this process held
+# unused. 0 gives each freed block back as it goes. Read once, as torch loads - so set before any import of it
+os.environ.setdefault("MIMALLOC_PURGE_DELAY", "0")
 # the Hub prints this on every cache op when symlinks are off (Windows without Developer Mode); btb says it
 # once, clearly, at download time instead (see hf._warn_windows_symlinks)
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")

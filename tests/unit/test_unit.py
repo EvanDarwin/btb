@@ -1084,6 +1084,39 @@ def test_the_package_root_and_the_cli_stay_torch_free() -> None:
     assert out.stdout.strip() == "False", out.stdout + out.stderr
 
 
+def test_the_host_memory_a_call_frees_goes_back_to_the_machine() -> None:
+    """`import btb` has torch's CPU allocator give freed memory back as it goes (`MIMALLOC_PURGE_DELAY`, set before
+    torch loads): by default mimalloc kept it committed to the process for good, and a 40k prompt's 2.5 GB of host
+    rows outlived the answer, refusing the next call's prefill on a machine short of commit. A value the caller set
+    stands. On Windows, where torch's allocator is mimalloc, 1 GB freed is back in the machine's commit at once"""
+    import subprocess
+
+    env = {k: v for k, v in os.environ.items() if k != "MIMALLOC_PURGE_DELAY"}
+    env["CUDA_VISIBLE_DEVICES"] = "-1"
+    code = (
+        "import gc, os, btb, torch; from btb.sysinfo import host_commit_bytes as c; "
+        "a = c(); t = torch.ones(1 << 28); held = c(); del t; gc.collect(); "
+        "print(os.environ['MIMALLOC_PURGE_DELAY'], a - held, a - c())"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=ROOT, env=env, check=True)
+    delay, took, kept = out.stdout.split()
+    assert delay == "0", out.stdout + out.stderr
+    if sys.platform == "win32":
+        GB = 1 << 30
+        assert int(took) > GB // 2, "the 1 GB tensor was never committed: the reading cannot tell"
+        assert int(kept) < GB // 4, f"{int(kept) / GB:.2f} GB of the freed tensor stayed committed"
+    env["MIMALLOC_PURGE_DELAY"] = "7"
+    out = subprocess.run(
+        [sys.executable, "-c", "import os, btb; print(os.environ['MIMALLOC_PURGE_DELAY'])"],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        env=env,
+        check=True,
+    )
+    assert out.stdout.strip() == "7", "a value the caller set was overridden"
+
+
 def test_the_span_bank_keeps_the_index_and_a_proposer_looks_it_up() -> None:
     """a request's proposer finds a banked continuation without re-adding every span; an evicted span is not
     served; the sweep after enough evictions drops its entries"""
