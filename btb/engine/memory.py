@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import itertools
 import math
+import threading
 import time
 import weakref
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -27,9 +29,14 @@ from ..sysinfo import (
     memory_pressure,
     vram_pressure,
     vram_pressure_line,
+    wait_event,
+    wddm_budget_event,
+    wddm_budget_unregister,
 )
+from . import device as device_mod
 from .cache import GrantedIndexedLayer, GrowLayer
 from .device import DeviceSpec, Where, torch_device, where
+from .fixed_rows import RowLinear
 from .scheduler import EPOCH, MemoryGrantError
 from .state import _State
 from .tiers import ColdRing
@@ -55,6 +62,9 @@ class VramPolicyState:
     last_t: float = 0.0
     total: int | None = None
     held: str | None = None
+    # a yield gave all that helps and the budget was still short by this much: not asked again until the process is
+    # inside the budget, or the budget is cut deeper than this (0: none given up)
+    spent: int = 0
 
 
 @dataclass
@@ -187,7 +197,7 @@ class _MemoryMixin(_State):
             self.head = None
             torch.cuda.empty_cache()
             with self._meta:
-                self.head = torch.nn.Linear(self.cfg.hidden_size, self.cfg.vocab_size, bias=False)
+                self.head = RowLinear(self.cfg.hidden_size, self.cfg.vocab_size, bias=False)
             self._adopt(self.head, "weight", self._get(self.head_key))
             done.append("head")
         aj = getattr(self, "aj", None)
@@ -207,6 +217,9 @@ class _MemoryMixin(_State):
             self.drafter_dev = torch.device("cpu")
             moved = "drafter"
         elif self.resident:
+            # the card graphs let go first: they hold the layer's merged blocks (`_card_let_go`), and a layer shed
+            # under them freed nothing
+            self._card_let_go()
             i = max(self.resident)
             tmpl = self.resident.pop(i)
             del tmpl
@@ -233,7 +246,7 @@ class _MemoryMixin(_State):
         what = self._shed.pop()
         if what == "head":
             with self._meta:
-                self.head = torch.nn.Linear(self.cfg.hidden_size, self.cfg.vocab_size, bias=False)
+                self.head = RowLinear(self.cfg.hidden_size, self.cfg.vocab_size, bias=False)
             self._adopt(self.head, "weight", self._get(self.head_key))
             self.resident_head = True
         elif what == "drafter":
@@ -276,6 +289,16 @@ class _MemoryMixin(_State):
             k0 = getattr(cache.layers[0], "keys", None)
             if k0 is not None and k0.numel() and int(k0.shape[0]) > 1:
                 return
+        # another program asking for the card first: Windows shrinks this process's budget the moment one does (a
+        # game launched or brought to the front), and the card is given back now - as much as the budget asks, not a
+        # layer a second - before the driver pages it out and before the other program's allocations fail. A DXGI
+        # read, microseconds, so every pass
+        over = self._vram_over()
+        if over <= 0:
+            self.vram_state.spent = 0  # inside the budget again: a later cut is answered afresh
+        elif not self.vram_state.spent or over > self.vram_state.spent + (256 << 20):
+            self.device.request("yield", lambda: self.vram_yield(cache, log))
+            return
         # the pressure read is a PDH query (4.4 ms on this machine) - longer than a small model's whole step on
         # the card graph. A model holding every layer on the card with a quarter of the card still free has
         # nothing to shed, so the policy stands aside for it; elsewhere it reads pressure once a second, which
@@ -358,10 +381,190 @@ class _MemoryMixin(_State):
                 self.vram_state.free_checks = 0
                 self.device.request("regrow", lambda: self.vram_regrow(cache, log))
 
+    def _vram_over(self) -> int:
+        """the bytes this process holds on the card past what Windows budgets it, less the room kept for other
+        programs (`vram_margin`): what a program asking for the card needs back; 0 within it, or with no budget to
+        read (off Windows)"""
+        room = device_mod._wddm_room(self.dev)
+        if room is None:
+            return 0
+        return max(0, int(getattr(self, "vram_margin", 0) or 0) - int(room))
+
+    def vram_yield(self, cache: Any = None, log: Log | None = None) -> list[str]:
+        """The card given back to the budget Windows asks for: shed (the drafter, the last resident layer, the head -
+        `vram_shed`'s order) until this process is inside its budget with the margin kept for other programs, or has
+        nothing left to shed. Grown back by the policy once the budget has room again (`vram_regrow`)"""
+        log = log or self.log
+        over = self._vram_over()
+        moved: list[str] = []
+        spent = self.vram_state.spent
+        if over <= 0 or (spent and over <= spent + (256 << 20)):
+            return moved
+        log(f"[vram] another program wants the card: {over / 2**30:.2f} GB past this process's budget")
+        # the card graphs first: they hold every layer's blocks, and a shed under them frees nothing
+        self._card_let_go()
+        stalled = 0
+        for _ in range(int(getattr(self, "L", 0) or 0) + 3):
+            before = self._vram_over()
+            if before <= 0:
+                break
+            m = self.vram_shed(cache, log)
+            if m is None:
+                break
+            moved.append(m)
+            # a shed that brought the card no nearer its budget twice running: what is past it is not the engine's
+            # layers (the arena, the cache, the driver's own), and shedding on would give up the card for nothing
+            stalled = stalled + 1 if self._vram_over() >= before else 0
+            if stalled >= 2:
+                break
+        self.vram_state.free_checks = 0
+        self._card_ms_min = None
+        still = self._vram_over()
+        # nothing more to give: the policy stops asking until the budget moves (`vram_policy`)
+        self.vram_state.spent = max(0, still)
+        log(
+            f"[vram] gave back {len(moved)} ({', '.join(moved) or 'nothing'})"
+            + (f"; still {still / 2**30:.2f} GB past the budget, nothing more that helps to shed" if still > 0 else "")
+        )
+        return moved
+
+    def watch_vram_budget(self) -> None:
+        """A thread waiting on Windows' budget-change event for the card: signalled, and past the budget, it gives the
+        card back at once when the engine is idle (the decode lock free) - between requests nothing else would run
+        the policy - and otherwise leaves it to the running decode's next pass (`vram_policy`), which reads the budget
+        before it runs. Off Windows, or with `adapt` off, nothing"""
+        if not getattr(self, "vram_watch", False) or self.dev.type != Device.CUDA:
+            return
+        p = torch.cuda.get_device_properties(self.dev)
+        name, total = str(p.name), int(p.total_memory)
+        reg = wddm_budget_event(name, total)
+        if reg is None:
+            return
+        # the engine by a weak reference and its abort flag alone: the thread never keeps an engine alive that its
+        # owner let go of without closing, and ends with it (its event unregistered)
+        me, abort = weakref.ref(self), self.abort
+
+        def run() -> None:
+            try:
+                while not abort.is_set():
+                    signalled = wait_event(reg[0], 1.0)
+                    sm = me()
+                    if sm is None:
+                        return
+                    if not signalled or sm._vram_over() <= 0:
+                        del sm
+                        continue
+                    lock = getattr(sm, "_decode_lock", None)
+                    if lock is not None and lock.acquire(blocking=False):  # else a decode runs: its next pass yields
+                        try:
+                            if not abort.is_set():
+                                sm.device.request("yield", partial(sm.vram_yield, None, None))
+                        finally:
+                            lock.release()
+                    del sm
+            finally:
+                wddm_budget_unregister(name, total, reg)
+
+        threading.Thread(target=run, name="btb-vram-budget", daemon=True).start()
+
+    # what a program asking for memory gets on top of the reserve, and how long the store holds off growing back
+    RAM_HEADROOM_MIN = 2 << 30
+    RAM_HOLD_S = 60.0
+
+    def _ram_headroom(self) -> int:
+        """the room a yield leaves above the reserve: enough for another program's launch to grow into (a sixteenth
+        of RAM, at least RAM_HEADROOM_MIN)"""
+        return max(self.RAM_HEADROOM_MIN, int(host_total_bytes()) // 16)
+
+    def _ram_left(self) -> int:
+        """RAM or commit left above the reserve, the tighter (negative: another program is in the reserve)"""
+        # free-read: how far another program reaches into the reserve, signed - the ledger's figure stops at zero
+        return min(int(host_free_bytes()), int(host_commit_bytes())) - int(getattr(self, "ram_reserve", 0) or 0)
+
+    def _ram_short(self) -> int:
+        """The host bytes another program needs back: none while RAM and commit both stay above the reserve and the
+        OS says nothing; else the reserve and a launch's headroom above what is left (`_ram_headroom`). Two OS reads,
+        microseconds"""
+        if not getattr(self, "adapt", False) or self.mlx is not None:
+            return 0
+        left = self._ram_left()
+        low = bool(memory_pressure().get("low"))
+        if left >= 0 and not low:
+            return 0
+        return max(0, self._ram_headroom() - left)
+
+    def ram_yield(self, log: Log | None = None) -> int:
+        """The host given back to another program at once: the expert store's blocks first (their bytes are on the
+        drive, read again on a miss), then the host layers to the drive (`ram_shed`), until the reserve and a
+        launch's headroom are free or nothing is left to give; the store then holds off growing back for
+        RAM_HOLD_S. Returns the bytes the host gained"""
+        log = log or self.log
+        short = self._ram_short()
+        if short <= 0:
+            return 0
+        head = self._ram_headroom()
+        # free-read: the yield's own log line (what it gained), never a decision
+        before = min(int(host_free_bytes()), int(host_commit_bytes()))
+        log(f"[ram] another program wants memory: {short / 2**30:.2f} GB to give back")
+        store = getattr(self, "expert_store", None)
+        blocks = 0
+        if store is not None:
+            store.hold_for(head, self.RAM_HOLD_S)
+            blocks = int(store.release(want=head) or 0)
+        layers = []
+        for _ in range(int(getattr(self, "L", 0) or 0)):
+            if self._ram_left() >= head:
+                break
+            i = self.ram_shed("another program wants memory", log) if getattr(self, "host", None) else None
+            if i is None:
+                break
+            layers.append(i)
+        # free-read: the yield's own log line (what it gained), never a decision
+        gained = min(int(host_free_bytes()), int(host_commit_bytes())) - before
+        left = self._ram_left()
+        log(
+            f"[ram] gave back {gained / 2**30:.2f} GB ({blocks} store slots, {len(layers)} host layers to the drive)"
+            + (f"; {(head - left) / 2**30:.2f} GB short of the headroom, nothing left to give" if left < head else "")
+        )
+        return gained
+
+    def watch_ram(self) -> None:
+        """A thread reading RAM, commit and the OS's low-memory word four times a second: another program short of
+        memory, it holds the expert store back from what it needs (the running decode's next expert call gives the
+        blocks back) and, the engine idle (the decode lock free), gives it all back at once (`ram_yield`). With
+        `adapt` off, or on unified memory, nothing"""
+        if not getattr(self, "adapt", False) or self.mlx is not None:
+            return
+        me, abort = weakref.ref(self), self.abort
+
+        def run() -> None:
+            while not abort.wait(0.25):
+                sm = me()
+                if sm is None:
+                    return
+                if sm._ram_short() > 0:
+                    store = getattr(sm, "expert_store", None)
+                    if store is not None:
+                        store.hold_for(sm._ram_headroom(), sm.RAM_HOLD_S)
+                    lock = getattr(sm, "_decode_lock", None)
+                    if lock is not None and lock.acquire(blocking=False):  # else a decode runs: its calls give back
+                        try:
+                            if not abort.is_set():
+                                sm.device.request("ram-yield", partial(sm.ram_yield, None))
+                        finally:
+                            lock.release()
+                del sm
+
+        threading.Thread(target=run, name="btb-ram-watch", daemon=True).start()
+
     def ram_policy(self, log: Log | None = None) -> None:
-        """Once a second: shed one warm layer to the ring after two consecutive readings with no free host memory
-        above the reserve (or an OS low-memory signal). Regrow the last shed layer after `regrow_after`
-        consecutive clean readings with room for it."""
+        """Another program short of memory first (`_ram_short`): everything it needs given back at once
+        (`ram_yield`). Else once a second: shed one warm layer to the ring after two consecutive readings with no
+        free host memory above the reserve. Regrow the last shed layer after `regrow_after` consecutive clean
+        readings with room for it."""
+        if self._ram_short() > 0:
+            self.device.request("ram-yield", lambda: self.ram_yield(log))
+            return
         if not getattr(self, "ram_watch", False) or self.mlx is not None:
             return
         st = self.ram_state

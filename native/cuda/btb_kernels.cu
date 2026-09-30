@@ -1930,6 +1930,73 @@ GEMV_LANE16(8)
 GEMV_LANE16(16)
 GEMV_LANE16(32)
 
+// btb_gemv_lane16_mx4_f32_m{1,..,32}: the host's MXFP4 gemv (native/src/gemv.rs, the mx4 tasks) to the bit, so an
+// MXFP4 expert seated on the card computes what it computes on the host. w as the checkpoint stores it: `blocks`
+// [R, C/32, 16] (byte k of a block packs weights 2k, low nibble, and 2k+1, high), `scales` [R, C/32] e8m0; x [M, C]
+// f32, y [M, R] f32. The host widens each weight to fp4 * 2^(s-127) - the code's exact value times mx_scale's exact
+// power of two (2^-126 * 0.5 for s == 0), one IEEE multiply - then runs the bf16 gemv's accumulation over the widened
+// tile: lane j the columns c = j mod 16 in order, one fma each, reduce16's pairwise fold. So here: lane j of a row's
+// half-warp takes weight j then weight j + 16 of every block (bytes j/2 and 8 + j/2, nibble j & 1), widened as the
+// host widens it, into gemv_lane16_rows's fma chain and butterfly.
+__device__ __forceinline__ float mx4_scale(unsigned s) {
+    const float f = __uint_as_float((s == 0u ? 1u : s) << 23);
+    return s == 0u ? __fmul_rn(f, 0.5f) : f;
+}
+
+template <int M>
+__device__ __forceinline__ void gemv_lane16_mx4_rows(const unsigned char* __restrict__ blocks,
+                                                     const unsigned char* __restrict__ scales,
+                                                     const float* __restrict__ x, float* __restrict__ y, int R, int C) {
+    const int j = threadIdx.x & 15;
+    const int r = blockIdx.x * (blockDim.x >> 4) + (threadIdx.x >> 4);
+    const int G = C >> 5;
+    const int sh = (j & 1) << 2;
+    float acc[M];
+#pragma unroll
+    for (int m = 0; m < M; ++m) acc[m] = 0.f;
+    if (r < R) {  // a half-warp past R runs no columns but still takes part in its warp's shuffles
+        const unsigned char* br = blocks + (size_t)r * G * 16;
+        const unsigned char* sr = scales + (size_t)r * G;
+        for (int g = 0; g < G; ++g) {
+            const float sc = mx4_scale((unsigned)__ldcs(sr + g));
+            const float w0 = __fmul_rn(BTB_FP4[(__ldcs(br + g * 16 + (j >> 1)) >> sh) & 15], sc);
+            const float w1 = __fmul_rn(BTB_FP4[(__ldcs(br + g * 16 + 8 + (j >> 1)) >> sh) & 15], sc);
+            const int c = g * 32 + j;
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+                acc[m] = fmaf(w0, __ldg(x + (size_t)m * C + c), acc[m]);
+                acc[m] = fmaf(w1, __ldg(x + (size_t)m * C + c + 16), acc[m]);
+            }
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+        float a = acc[m];
+        a += __shfl_xor_sync(0xffffffffu, a, 1);
+        a += __shfl_xor_sync(0xffffffffu, a, 2);
+        a += __shfl_xor_sync(0xffffffffu, a, 4);
+        a += __shfl_xor_sync(0xffffffffu, a, 8);
+        acc[m] = a;
+    }
+    if (r < R && j == 0) {
+#pragma unroll
+        for (int m = 0; m < M; ++m) y[(size_t)m * R + r] = acc[m];
+    }
+}
+
+#define GEMV_LANE16_MX4(M)                                                                                   \
+    extern "C" __global__ void __launch_bounds__(128) btb_gemv_lane16_mx4_f32_m##M(                          \
+        const unsigned char* __restrict__ blocks, const unsigned char* __restrict__ scales,                  \
+        const float* __restrict__ x, float* __restrict__ y, int R, int C) {                                  \
+        gemv_lane16_mx4_rows<M>(blocks, scales, x, y, R, C);                                                 \
+    }
+GEMV_LANE16_MX4(1)
+GEMV_LANE16_MX4(2)
+GEMV_LANE16_MX4(4)
+GEMV_LANE16_MX4(8)
+GEMV_LANE16_MX4(16)
+GEMV_LANE16_MX4(32)
+
 // ---------------------------------------------------------------------------------------------------------
 // Qwen4's per-layer n-gram embedding (Qwen4ExpTextPLELayer) over a pass's nodes, as families/qwen4/verify.py
 // `_ple_forward` steps it: two launches, the second reading rows the first wrote for the node's ancestors.

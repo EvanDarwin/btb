@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import os
 import threading
+import time
 import types
 import weakref
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -965,6 +966,185 @@ def test_vram_policy_does_not_stand_aside_for_a_single_row_cache() -> None:
     with pressure(512), cuda_stats(free=1 * GB):
         e.vram_policy(_batched_cache(1))
     assert len(e.shed_calls) == 1
+
+
+@contextlib.contextmanager
+def budget_room(start: int, freed_per_shed: int, e: _PolicyEngine) -> Iterator[list[int]]:
+    """the WDDM budget's room for this process, `start` bytes (negative: past the budget), rising by
+    `freed_per_shed` with every layer the stub engine sheds; the PDH sensor made to fail the test if read"""
+    room = [int(start)]
+    saved_room, saved_pdh = device_mod._wddm_room, memory_mod.vram_pressure
+    real_shed = e.vram_shed
+
+    def shed(cache: Any = None, log: Log | None = None) -> str:
+        room[0] += int(freed_per_shed)
+        return real_shed(cache, log)
+
+    def no_pdh(pid: int | None = None) -> Json:
+        raise AssertionError("the budget's answer needs no PDH read")
+
+    device_mod._wddm_room = lambda dev: room[0]
+    memory_mod.vram_pressure = no_pdh
+    e.vram_shed = shed  # type: ignore[method-assign]
+    try:
+        yield room
+    finally:
+        device_mod._wddm_room, memory_mod.vram_pressure = saved_room, saved_pdh
+
+
+def test_vram_policy_gives_the_card_back_the_moment_its_budget_shrinks() -> None:
+    """a game started beside btb: Windows cuts this process's budget below what it holds, and the next pass gives
+    back as much as the budget asks - four layers in one call, not a layer a second, and with no PDH read - leaving
+    the margin kept for other programs; adapt never reacted to this before (it waited for its memory to be paged
+    out, or its step to slow, and even then shed one layer a second: the game failed to start meanwhile)"""
+    e = _PolicyEngine(vram_margin=GB // 2)
+    e.L = 8
+    with budget_room(-3 * GB // 2, 600 * MB, e) as room:
+        e.vram_policy(_batched_cache(1))
+        assert len(e.shed_calls) == 4, f"{len(e.shed_calls)} layers given back"
+        assert room[0] >= e.vram_margin, "the margin for other programs is not kept"
+        e.vram_state.last_t = time.time()  # the PDH read is not due: only the budget is read this pass
+        e.vram_policy(_batched_cache(1))
+    assert len(e.shed_calls) == 4, "a budget with room sheds nothing more"
+    assert any("another program wants the card" in ln for ln in e.lines), e.lines
+
+
+def test_vram_policy_within_its_budget_gives_nothing_back() -> None:
+    e = _PolicyEngine(vram_margin=GB // 2)
+    e.L = 8
+    e.vram_state.last_t = time.time()  # the PDH read is not due: only the budget is read this pass
+    with budget_room(2 * GB, 600 * MB, e):
+        e.vram_policy(_batched_cache(1))
+    assert e.shed_calls == [] and e.lines == []
+
+
+def test_vram_yield_stops_when_shedding_frees_nothing_and_asks_again_only_on_a_deeper_cut() -> None:
+    """what is past the budget is not the engine's layers (Qwen3-4B beside a game: every layer was shed, each freeing
+    nothing while the card graph held the blocks): two sheds that bring the card no nearer and the yield stops, the
+    card graphs let go first; the next passes do not ask again (the log is not flooded), a cut deeper still does"""
+    e = _PolicyEngine(vram_margin=GB // 2)
+    e.L = 36
+    let_go: list[bool] = []
+    e._card_let_go = lambda: let_go.append(True)  # type: ignore[method-assign]
+    with budget_room(-GB, 0, e) as room:  # sheds free nothing
+        e.vram_policy(_batched_cache(1))
+        assert len(e.shed_calls) == 2, f"{len(e.shed_calls)} layers shed for nothing"
+        assert let_go, "the card graphs were not let go before the sheds"
+        e.vram_state.last_t = time.time()
+        e.vram_policy(_batched_cache(1))
+        assert len(e.shed_calls) == 2, "asked again with nothing more to give"
+        room[0] = -2 * GB  # the game takes more
+        e.vram_policy(_batched_cache(1))
+        assert len(e.shed_calls) == 4, "a deeper cut was not answered"
+        room[0] = GB  # the game gone: inside the budget again
+        e.vram_state.last_t = time.time()
+        e.vram_policy(_batched_cache(1))
+        assert e.vram_state.spent == 0
+    said = [ln for ln in e.lines if "another program wants the card" in ln]
+    assert len(said) == 2, e.lines
+
+
+def test_vram_yield_stops_when_nothing_is_left_to_shed() -> None:
+    e = _PolicyEngine(vram_margin=GB // 2)
+    e.L = 8
+    with budget_room(-GB, 0, e):
+        e.vram_shed = lambda cache=None, log=None: None  # type: ignore[method-assign,assignment,return-value]
+        assert e.vram_yield(_batched_cache(1)) == []
+    assert any("nothing more that helps to shed" in ln for ln in e.lines), e.lines
+
+
+class _YieldEngine(_MemoryMixin):
+    """the RAM yield's view of an engine: a machine whose free RAM and commit the test sets, an expert store and host
+    layers whose giving-back moves them"""
+
+    def __init__(self, free: int, reserve: int, per_block: int, blocks: int, host: int, per_layer: int) -> None:
+        self.dev = torch.device("cuda")
+        self.adapt, self.mlx, self.L, self.ram_reserve = True, None, 8, int(reserve)
+        self.machine = {"free": int(free), "low": False}
+        self.lines: list[str] = []
+        self.host = dict.fromkeys(range(host))
+        self.shed: list[int] = []
+        eng = self
+
+        class Store:
+            n, hold = int(blocks), (0, 0.0)
+
+            def hold_for(self, nbytes: int, seconds: float) -> None:
+                self.hold = (int(nbytes), float(seconds))
+
+            def release(self, want: int = 1) -> int:
+                freed = 0
+                while self.n and eng.machine["free"] - eng.ram_reserve < want:
+                    self.n -= 1
+                    eng.machine["free"] += per_block
+                    freed += 1
+                return freed
+
+        self.store = Store()
+        self.expert_store = cast(Any, self.store)
+        self.per_layer = int(per_layer)
+
+    def log(self, *a: object, **k: object) -> None:
+        self.lines.append(" ".join(str(x) for x in a))
+
+    def ram_shed(self, why: str = "", log: Log | None = None) -> int | None:
+        warm = [i for i in sorted(self.host) if i not in self.shed]
+        if not warm:
+            return None
+        self.shed.append(warm[-1])
+        self.machine["free"] += self.per_layer
+        return warm[-1]
+
+
+@contextlib.contextmanager
+def machine(e: _YieldEngine, total: int = 64 * GB) -> Iterator[None]:
+    """the OS's memory reads the RAM yield takes, answered from the engine's staged machine"""
+    names = ("host_free_bytes", "host_commit_bytes", "memory_pressure", "host_total_bytes")
+    saved = {n: getattr(memory_mod, n) for n in names}
+    memory_mod.host_free_bytes = lambda: e.machine["free"]
+    memory_mod.host_commit_bytes = lambda: e.machine["free"]
+    memory_mod.memory_pressure = lambda: {"low": e.machine["low"], "level": 1.0 if e.machine["low"] else 0.0}
+    memory_mod.host_total_bytes = lambda: int(total)
+    try:
+        yield
+    finally:
+        for n, f in saved.items():
+            setattr(memory_mod, n, f)
+
+
+def test_ram_short_is_the_reserve_and_a_launchs_headroom_once_another_program_takes_memory() -> None:
+    e = _YieldEngine(free=10 * GB, reserve=4 * GB, per_block=GB, blocks=8, host=0, per_layer=GB)
+    with machine(e):
+        assert e._ram_headroom() == 4 * GB, "a sixteenth of 64 GB"
+        assert e._ram_short() == 0, "plenty above the reserve: nothing is short"
+        e.machine["free"] = 3 * GB  # a game took 7 GB: 1 GB into the reserve
+        assert e._ram_short() == 5 * GB, "the reserve's gigabyte back, and a launch's headroom"
+        e.machine["free"] = 5 * GB  # above the reserve, but the OS says memory is low
+        assert e._ram_short() == 0
+        e.machine["low"] = True
+        assert e._ram_short() == 3 * GB, "the OS's word counts: the headroom above what is left"
+        e.adapt = False
+        assert e._ram_short() == 0, "adapt off: nothing is ever given back"
+
+
+def test_ram_yield_gives_the_store_back_first_then_host_layers_and_holds_the_store() -> None:
+    """a game took RAM into the reserve: the store's blocks go back until the reserve and a launch's headroom are
+    free, and the store is held off growing back; host layers go to the drive only past what the store could give"""
+    e = _YieldEngine(free=3 * GB, reserve=4 * GB, per_block=GB, blocks=3, host=4, per_layer=GB)
+    with machine(e):
+        gained = e.ram_yield()
+        assert e.store.n == 0, "the store's blocks were not given back first"
+        assert e.shed == [3, 2], f"host layers to the drive past the store: {e.shed}"
+        assert e._ram_left() == e._ram_headroom() and gained == 5 * GB, "the reserve and the headroom are free"
+        assert e.store.hold == (e._ram_headroom(), e.RAM_HOLD_S), "the store is not held off growing back"
+    assert any("another program wants memory" in ln for ln in e.lines), e.lines
+
+
+def test_ram_yield_stops_when_nothing_is_left_to_give() -> None:
+    e = _YieldEngine(free=1 * GB, reserve=4 * GB, per_block=GB, blocks=1, host=0, per_layer=GB)
+    with machine(e):
+        e.ram_yield()
+    assert any("short of the headroom, nothing left to give" in ln for ln in e.lines), e.lines
 
 
 def test_vram_policy_is_off_when_it_is_not_watching_or_not_on_a_card() -> None:

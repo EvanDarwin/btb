@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from .... import mlx as mlxdev
 from ...cache import GrowLayer
 from ...device import Where, where
+from ...fixed_rows import KeyRows
 
 
 class ScoresWorkspace:
@@ -151,6 +152,21 @@ def attention_sinks(
             qh.astype(Kv.dtype), Kv, Vv, scale=scale, mask=mask, sinks=sinks.astype(Kv.dtype)
         )
         return mlxdev.from_mx(a[0].transpose(1, 0, 2)).to(query.dtype)[None], None
+    if T == 1 and B == 1 and (sm is None or getattr(sm, "_attn_ctx", None) is not None):
+        # one query row - a greedy step, or a speculative pass's node (`KeyRows`), on the card or the host - over the rows it
+        # attends gathered in order and nothing masked: a step and a node over the same rows make the same call on the
+        # same shapes, so the same bits. The pass carries no caller's mask (`_attn_ctx`), so a mask tensor here is the
+        # causal one, all of the prefix or its window
+        idx = attention_mask.idx if isinstance(attention_mask, KeyRows) else None
+        n = int(key.shape[-2])
+        if idx is None and win and n > win:
+            idx = torch.arange(n - win, n, device=key.device)
+        if idx is not None:
+            key, value = key.index_select(-2, idx), value.index_select(-2, idx)
+        key, value = key.contiguous(), value.contiguous()
+        attention_mask, win = None, None
+    elif isinstance(attention_mask, KeyRows):
+        raise RuntimeError("[attention] a KeyRows mask reached a sink call it cannot take")
     n = int(key.shape[-2])
     # a sliding layer's prefill chunk sees [n-T-win+1, n): dropping the rest is exact (the mask zeros it) and
     # O(T*win); decode (T == 1) is unchanged

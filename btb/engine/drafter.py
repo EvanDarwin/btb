@@ -14,6 +14,7 @@ import torch
 from .. import mlx as mlxdev
 from ..kinds import Tokens
 from .cache import GrowLayer, indexer_keys, set_rows
+from .fixed_rows import RowLinear
 from .host import _HostLinear
 from .native import Native
 
@@ -217,7 +218,8 @@ class MTPDrafter:
         n = 0
         for _mname, mod in list(self.layer.named_modules()):
             for cname, child in list(mod.named_children()):
-                if type(child) is torch.nn.Linear:
+                # a plain linear, or the card layers' fixed-row one (`RowLinear`, the same parameters)
+                if type(child) in (torch.nn.Linear, RowLinear):
                     setattr(mod, cname, _Int8Linear(child.weight.data))
                     n += 1
         if self.fc_host is None and self.fc is not None:

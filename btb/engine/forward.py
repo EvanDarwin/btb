@@ -19,6 +19,7 @@ from ..sampling import as_pick
 from .cache import GrowLayer, conv_states_as, forked
 from .device import where
 from .families.attention import ChunkCausal
+from .fixed_rows import fixed_rows
 from .native import Native
 from .scheduler import EPOCH, MemoryGrantError
 from .state import _State
@@ -116,6 +117,11 @@ def tree_mask(causal: torch.Tensor, past: int, parents: Parents) -> torch.Tensor
     else:
         out[..., past : past + T] = torch.where(anc, out.new_zeros(()), torch.finfo(out.dtype).min)
     return out
+
+
+def _times_t(w: torch.Tensor) -> Callable[[torch.Tensor], torch.Tensor]:
+    """x -> x @ w.T, for a head slice's rows at the fixed shape (`fixed_rows`)"""
+    return lambda x: x @ w.T
 
 
 def _is_gpu_recovery(e: BaseException) -> bool:
@@ -337,18 +343,24 @@ class _ForwardMixin(_State):
                 n_layers=n_layers,
                 on_layer=None,
             )
-            with self.device.hold() as place:
-                pas.place = place
-                tail = head and self.head is not None and self.norm is not None
-                hcard, logits = self._forward_card_segment(0, n_layers, h, pas, tail)
-            if logits is not None:
-                return logits[:, -1:] if last_only else logits
-            assert hcard is not None  # logits None means the segment returned (h, None)
-            h = hcard[:, -1:, :] if last_only else hcard
-            h = self._final_norm(h)
-            cd = self.compute_dtype if self.compute_dtype is not None else h.dtype
-            hf = h.to(cd)
-            return hf if not head else self._apply_head(hf)
+            try:
+                with self.device.hold() as place:
+                    pas.place = place
+                    tail = head and self.head is not None and self.norm is not None
+                    hcard, logits = self._forward_card_segment(0, n_layers, h, pas, tail)
+            except torch.OutOfMemoryError as e:
+                # the graph's build found no room (another program took the card): this pass on the torch path
+                self._card_oom(e)
+                graph_ok = False
+            else:
+                if logits is not None:
+                    return logits[:, -1:] if last_only else logits
+                assert hcard is not None  # logits None means the segment returned (h, None)
+                h = hcard[:, -1:, :] if last_only else hcard
+                h = self._final_norm(h)
+                cd = self.compute_dtype if self.compute_dtype is not None else h.dtype
+                hf = h.to(cd)
+                return hf if not head else self._apply_head(hf)
         pe = self._pass_rope(h, past, am, positions, text_pos, rope_pos)
         n_layers = self.L if stop_after is None else min(self.L, int(stop_after))
         if self._mlx_ok(cache, B, T, am, positions, n_layers):
@@ -423,7 +435,13 @@ class _ForwardMixin(_State):
                     continue
                 a, b = seg
                 tail = b == self.L and head and self.head is not None and self.norm is not None
-                hcard, logits = self._forward_card_segment(a, b, h, pas, tail)
+                try:
+                    hcard, logits = self._forward_card_segment(a, b, h, pas, tail)
+                except torch.OutOfMemoryError as e:
+                    # no room for the run's graph (another program took the card): its layers on the torch path
+                    self._card_oom(e)
+                    graph_ok = False
+                    continue
                 if logits is not None:
                     self._flush_events()
                     return logits[:, -1:] if last_only else logits
@@ -572,6 +590,11 @@ class _ForwardMixin(_State):
         # path that scales to huge models, now batched
         if (spec or step1 or cont) and not pas.own and self.fam.fast and h.shape[0] == 1:
             h = self.ai(tmpl, i, h, pe_for(hc["pe"], lt), hc["pos"], cache)
+        elif spec and not pas.own and h.shape[0] == 1 and self.mlx is None:
+            # a family whose attention is its own module's (gpt-oss's sinks): the verify a row at a time, each row the
+            # one-row step's own call over its rows (`KeyRows`) - through the module over every row at once its sums
+            # moved with the pass's width, and a tree's nodes saw their siblings (the module's mask has no tree)
+            h = self.ac(tmpl, i, h, hc["pe"], hc["pos"], cache)
         else:
             kw = self.fam.layer_kw(
                 lt,
@@ -611,7 +634,10 @@ class _ForwardMixin(_State):
         if (
             getattr(self, "kv_host", False)
             and cache is not None
-            and lt == LayerKind.FULL
+            # a sliding layer too: the one-row step (`_forward_fast`) runs every attention layer's rows through btb's
+            # native attention over its window, so a verify's must (`_kv_split` reads the window) - Gemma 3's sliding
+            # layers went through the module's sdpa here, and every verify row parted from its step
+            and lt in (LayerKind.FULL, LayerKind.SLIDING)
             and i in self.resident
             and am is None
             and not pas.own
@@ -625,8 +651,10 @@ class _ForwardMixin(_State):
             and am is None
             and not pas.batched
             and not pas.own
-            and self.fam.fast
+            and (self.fam.fast or self.mlx is None)
         ):
+            # a verify pass a row at a time, each row the greedy step's own call (a node's rows as `KeyRows` on the
+            # card, which gpt-oss's sinks take there too): through every module a row meets the step's shapes
             h = self.ac(tmpl, i, h, pas.pe, pas.text_pos, cache)
         else:
             h = tmpl(
@@ -721,9 +749,8 @@ class _ForwardMixin(_State):
             W = self._get(self.head_key)
             parts = []
             for c in range(0, W.shape[0], step):
-                wc: Any = W[c : c + step].to(self.dev)
-                parts.append(hf @ wc.to(cd).T)
-                wc = None
+                # a small pass's rows at the fixed shape on the card (fixed_rows.py)
+                parts.append(fixed_rows(_times_t(W[c : c + step].to(self.dev).to(cd)), hf))
             return torch.cat(parts, dim=-1).float()
         self._tag(PassTag.HEAD_RESIDENT)
         if self.head is None and self.head_host is not None:
@@ -748,7 +775,9 @@ class _ForwardMixin(_State):
                 Native.gemv(self.head.weight, x2, y)
                 return y.view(*hf.shape[:-1], rows).float()
             W = self.head.weight
-            return torch.cat([hf @ W[c : c + step].to(cd).T for c in range(0, W.shape[0], step)], dim=-1).float()
+            return torch.cat(
+                [fixed_rows(_times_t(W[c : c + step].to(cd)), hf) for c in range(0, W.shape[0], step)], dim=-1
+            ).float()
         return self.head(hf).float()
 
     def _finish(self, h: torch.Tensor, last_only: bool, head: bool) -> torch.Tensor:

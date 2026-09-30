@@ -9,6 +9,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from ..fixed_rows import KeyRows
 from .gpt_oss.sinks import attention_sinks
 
 
@@ -27,6 +28,52 @@ class ChunkCausal:
         """the rule as transformers' bool mask [1, 1, T, S]"""
         rows = torch.arange(self.past, self.past + T, device=device)[:, None]
         return (torch.arange(S, device=device)[None, :] <= rows)[None, None]
+
+
+def one_query_rows(
+    module: Any, n: int, attention_mask: torch.Tensor | KeyRows | None, device: torch.device
+) -> torch.Tensor | None:
+    """The cache rows a one-query call attends: as `KeyRows` names them, or as its layer's window leaves them (the
+    last `sliding_window` of its `n`, as transformers' sliding mask leaves a step), or None for all `n`"""
+    if isinstance(attention_mask, KeyRows):
+        return attention_mask.idx
+    win = int(getattr(module, "sliding_window", None) or 0)
+    if win and n > win:
+        return torch.arange(n - win, n, device=device)
+    return None
+
+
+def attend_one(
+    module: Any,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | KeyRows | None,
+    g: int,
+    scaling: float | None,
+) -> torch.Tensor | None:
+    """A one-query row's attention as the greedy step at its position computes it, whoever calls: the rows it attends
+    gathered in order (`one_query_rows`), its keys and values made contiguous at [1, Hq, rows, D] - every head's -
+    and sdpa over them with no mask. A step and a speculative pass's node over the same rows then make the same call
+    on the same shapes, so the same bits (a node's bool mask moved sdpa off its flash path, and the node saw its
+    siblings' rows masked where the step never had them). None where the call is not one this form takes: a batch,
+    or a mask tensor on a layer with no window (a caller's padding), which the general path reads."""
+    if query.shape[0] != 1 or query.shape[2] != 1:
+        return None
+    if isinstance(attention_mask, torch.Tensor) and not int(getattr(module, "sliding_window", None) or 0):
+        return None
+    n = int(key.shape[-2])
+    idx = one_query_rows(module, n, attention_mask, key.device)
+    if idx is not None:
+        key, value = key.index_select(-2, idx), value.index_select(-2, idx)
+    b, hk, t, d = key.shape
+    if g > 1:
+        key = key[:, :, None].expand(b, hk, g, t, d).reshape(b, hk * g, t, d)
+        value = value[:, :, None].expand(b, hk, g, t, d).reshape(b, hk * g, t, d)
+    else:
+        key, value = key.contiguous(), value.contiguous()
+    out = F.scaled_dot_product_attention(query, key, value, attn_mask=None, is_causal=False, scale=scaling)
+    return out.transpose(1, 2).contiguous()
 
 
 def _grouped_chunk(
@@ -78,6 +125,11 @@ def attention(
 
         if isinstance(attention_mask, ChunkCausal):
             attention_mask = attention_mask.mask(query.shape[2], key.shape[-2], query.device)
+        elif isinstance(attention_mask, KeyRows):
+            # off the card the rows as the bool mask they stand for: the host's sdpa takes the node that way
+            allow = torch.zeros(int(key.shape[-2]), dtype=torch.bool, device=query.device)
+            allow[attention_mask.idx.to(query.device)] = True
+            attention_mask = allow.view(1, 1, 1, -1)
         if key.dtype != query.dtype:
             # a host layer's rows kept in the card's bf16 (`host_kv_dtype`), its queries the host's float32: widened
             # for the pass, as sdpa takes one dtype (the native kernels read them as kept)
@@ -86,6 +138,15 @@ def attention(
             module, query, key, value, attention_mask, dropout=dropout, scaling=scaling, is_causal=is_causal, **kw
         )
     g = int(getattr(module, "num_key_value_groups", 1) or 1)
+    one = (
+        attend_one(module, query, key, value, attention_mask, g, scaling)
+        if dropout == 0.0 and not isinstance(attention_mask, ChunkCausal)
+        else None
+    )
+    if one is not None:
+        return one, None
+    if isinstance(attention_mask, KeyRows):
+        raise RuntimeError("[attention] a KeyRows mask reached a call of more than one query row")
     if isinstance(attention_mask, ChunkCausal):
         T, S = query.shape[2], key.shape[-2]
         if (

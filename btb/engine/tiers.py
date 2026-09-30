@@ -29,6 +29,7 @@ from ..pack12 import entries, unpack_bf16
 from ..sysinfo import process_working_set_bytes
 from .cache import CardRowsLayer, ForkIndexedLayer, ForkLayer, GrowLayer
 from .device import where
+from .fixed_rows import fix_linears, fix_rows_cls
 from .host import _Experts, _HostLinear, _NGramRows, bf16_in_place, copy_bytes
 from .native import Native
 from .state import DRAFT_VOCAB, _State
@@ -40,6 +41,25 @@ if TYPE_CHECKING:
 _DTYPE_NAME = {torch.bfloat16: "bf16", torch.float32: "fp32", torch.float16: "fp16"}
 RAM_BPS = 50 * 2**30  # the read bandwidth the plan prices a RAM tier at, weights and cache alike
 DRIVE_BPS = int(3.4 * 2**30)  # the cold tier's rate until the drive is probed (scheduler.DriveBenchmark)
+# the card tier: its weights and cache at the share of the card's own memory rate its matvecs and attention reach
+# (Qwen3-0.6B on a 4070 Ti, 504 GB/s: 415-477 GB/s for the matvecs, 400-480 for the attention), and the rate
+# where the card cannot be asked (`card_bps`)
+CARD_EFF = 0.85
+CARD_BPS = 400 * 10**9
+# a card layer's fixed cost past its bytes: its nine kernels' launches, ramps and tails (Qwen3-0.6B's 28 layers
+# stepped in 4.2 ms where their bytes alone take 2.8)
+CARD_LAYER_MS = 0.05
+
+
+def card_bps(dev: Any) -> float:
+    """the rate the plan prices the card's reads at: the memory clock the driver reports, double-pumped, over its
+    bus, at `CARD_EFF` of it; `CARD_BPS` where the card cannot be asked"""
+    try:
+        p = torch.cuda.get_device_properties(dev)
+        peak = float(p.memory_clock_rate) * 1e3 * 2 * int(p.memory_bus_width) / 8
+    except Exception:
+        return float(CARD_BPS)
+    return peak * CARD_EFF if peak > 0 else float(CARD_BPS)
 
 
 @dataclass
@@ -112,6 +132,7 @@ class _TiersMixin(_State):
         context: int = 0,
         kv_host: bool = False,
         drive_bps: float | None = None,
+        gpu_bps: float | None = None,
     ) -> Json:
         L = self.L
         cfg = self.cfg
@@ -218,6 +239,14 @@ class _TiersMixin(_State):
         warm_ms = warm_b / RAM_BPS * 1e3
         cold_ms = cold_b / (drive_bps or DRIVE_BPS) * 1e3
         kv_read_ms = kv_host_b / RAM_BPS * 1e3  # the host's attention over the whole cache, at the full context
+        # the card's share of a token, priced as the host's is, by what it reads: its layers, the head where it holds
+        # it and the cache it holds at the full context, at the card's rate, and each layer's kernels' fixed cost.
+        # A flat 3 ms a resident layer priced Qwen3-0.6B at 89 ms a token (it runs at 4) and made a layer more on
+        # the card look dearer, where the cache's placement (`choose`) weighs one against the other
+        vram_layers_b = sum(bf16[i] for i in resident) * (2 if (fp32 and resident_fp32) else 1)
+        card_b = vram_layers_b + (head_b if head_on_card else 0) + kv_card_b
+        card_ms = card_b / (gpu_bps or CARD_BPS) * 1e3 + CARD_LAYER_MS * len(resident)
+        head_host_ms = 0.0 if head_on_card else head_host_b / RAM_BPS * 1e3
         return {
             "head_on_card": head_on_card,
             "drafter_on_card": drafter_on_card,
@@ -228,7 +257,7 @@ class _TiersMixin(_State):
             "prefill_card": prefill_card,
             "prefill_card_room": prefill_card_room,
             "bytes": {
-                "vram_layers": sum(bf16[i] for i in resident) * (2 if (fp32 and resident_fp32) else 1),
+                "vram_layers": vram_layers_b,
                 "head": head_b if head_on_card else head_host_b,
                 "drafter": drafter_b,
                 "warm": warm_b,
@@ -240,9 +269,9 @@ class _TiersMixin(_State):
                 "kv_host": kv_host_b,
                 "staging": staging_b,
             },
-            "predicted_ms_per_token": max(warm_ms, cold_ms)
-            + (3.0 * len(resident))
-            + (50.0 if not head_on_card else 5.0),
+            # the host's layers (the RAM's and the drive's streaming side by side), then the card's, one after the
+            # other as a token passes them
+            "predicted_ms_per_token": max(warm_ms, cold_ms) + head_host_ms + card_ms,
             "kv_read_ms": kv_read_ms,
             "caps": {
                 "ram_gb": ram_gb,
@@ -1125,6 +1154,10 @@ class _TiersMixin(_State):
         with self._meta:
             layer = self.fam.layer(self.cfg, idx).eval()
         layer = self.fam.shape_layer(self, layer, idx)
+        # a card layer's torch path row-invariant: its matmuls and norms at the fixed shape for a small pass, so a
+        # step and a verify pass over the same token agree to the bit (fixed_rows.py); a no-op off the card
+        fix_linears(layer)
+        fix_rows_cls(self.fam.norm)
         base = f"{self.prefix}layers.{idx}."
         for name, _b in layer.named_buffers():
             if base + name not in self.weight_map:

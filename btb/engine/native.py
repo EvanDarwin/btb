@@ -851,6 +851,10 @@ class _Cuda:
         "btb_gemv_gelu_bf16_m16",
         "btb_gemv_gelu_bf16_m32",
         "btb_gemv_mma_bf16",
+        "btb_gemv_mma8_bf16",
+        "btb_gemv_mma_glu_silu",
+        "btb_gemv_mma_glu_gelu",
+        "btb_l2_warm",
         "btb_attn_split_d64",
         "btb_attn_split_d128",
         "btb_attn_split_d256",
@@ -905,6 +909,12 @@ class _Cuda:
         "btb_gemv_lane16_f32_m8",
         "btb_gemv_lane16_f32_m16",
         "btb_gemv_lane16_f32_m32",
+        "btb_gemv_lane16_mx4_f32_m1",
+        "btb_gemv_lane16_mx4_f32_m2",
+        "btb_gemv_lane16_mx4_f32_m4",
+        "btb_gemv_lane16_mx4_f32_m8",
+        "btb_gemv_lane16_mx4_f32_m16",
+        "btb_gemv_lane16_mx4_f32_m32",
         "btb_ple_gate",
         "btb_ple_conv",
         "btb_publish",
@@ -1822,6 +1832,31 @@ class _Cuda:
                 ((R + 7) // 8, 1, 1),
                 (128, 1, 1),
                 [self.ptr(w), self.ptr(x), self.ptr(y), ci(R), ci(C)],
+            )
+
+    def gemv_lane16_mx4(self, w: Any, x: torch.Tensor, y: torch.Tensor) -> None:
+        """The host's MXFP4 gemv on the card (`btb_gemv_lane16_mx4_f32_m{M}`): `y` [M, R] float32 = `w` (an MxWeight
+        in the checkpoint's layout, [R, C], its blocks and scales on the card) times `x` [M, C] float32, bit for bit
+        `Native.gemv_mx4`'s (each weight widened as the host widens it, then gemv_lane16's sums), M one of GEMV_ROWS"""
+        if getattr(w, "ggml", True) or w.scales is None:
+            raise ValueError("[cuda] gemv_lane16_mx4: the checkpoint's MXFP4 layout only (blocks and scales apart)")
+        self._want("gemv_lane16_mx4", torch.uint8, blocks=w.blocks, scales=w.scales)
+        self._want("gemv_lane16_mx4", torch.float32, x=x, y=y)
+        R, C = (int(s) for s in w.shape)
+        M = int(x.shape[0])
+        if C % 32 or x.dim() != 2 or M not in self.GEMV_ROWS or int(x.shape[1]) != C or tuple(y.shape) != (M, R):
+            raise ValueError(
+                f"[cuda] gemv_lane16_mx4: shapes do not agree (w {w.shape}, x {tuple(x.shape)}, y {tuple(y.shape)})"
+            )
+        if w.blocks.numel() != R * C // 2 or w.scales.numel() != R * C // 32:
+            raise ValueError(f"[cuda] gemv_lane16_mx4: w {w.shape} needs {R * C // 2} + {R * C // 32} bytes")
+        if R:
+            ci = ctypes.c_int
+            self.launch(
+                f"btb_gemv_lane16_mx4_f32_m{M}",
+                ((R + 7) // 8, 1, 1),
+                (128, 1, 1),
+                [self.ptr(w.blocks), self.ptr(w.scales), self.ptr(x), self.ptr(y), ci(R), ci(C)],
             )
 
     PLE_WALK = 32  # the ancestors btb_ple_conv's walk follows (its path[32])

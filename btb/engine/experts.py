@@ -10,7 +10,7 @@ import threading
 import time
 import weakref
 from collections import OrderedDict
-from collections.abc import Container, Sequence
+from collections.abc import Callable, Container, Sequence
 from concurrent.futures import FIRST_COMPLETED
 from concurrent.futures import wait as wait_for
 from dataclasses import dataclass
@@ -717,13 +717,24 @@ class VramSeats:
     """The first-class seats: the regulars with the most rides copied onto the card, where an expert costs no
     host memory traffic and no read. A rider earns a seat with `min_rides` rides; the seats are given up by
     last ride; at most `per_pass` promotions a pass keep the copies off the token's time. The RAM copy stays
-    (a seat given up falls back to it), so a seat costs the store nothing but the copy. bf16 experts only (an
-    fp16/fp32 one is seated as the bf16 its slot holds): the card multiplies the stored tensors as they are."""
+    (a seat given up falls back to it), so a seat costs the store nothing but the copy. bf16 experts (an fp16/fp32
+    one is seated as the bf16 its slot holds), or MXFP4 ones in the checkpoint's layout (`make`: a seat's bytes to
+    its two MxWeights): the card multiplies the stored bytes as they are."""
 
-    def __init__(self, n_seats: int, per: int, shapes: Any, device: Any, min_rides: int = 8, per_pass: int = 4) -> None:
+    def __init__(
+        self,
+        n_seats: int,
+        per: int,
+        shapes: Any,
+        device: Any,
+        min_rides: int = 8,
+        per_pass: int = 4,
+        make: Callable[[torch.Tensor], tuple[Any, Any]] | None = None,
+    ) -> None:
         self.n = int(n_seats)
         self.per = int(per)
         self.shapes = shapes
+        self.make = make
         self.device = device
         self.min_rides = int(min_rides)
         self.per_pass = int(per_pass)
@@ -741,6 +752,8 @@ class VramSeats:
         self.seat_of.move_to_end(key)
         assert self.buf is not None  # a seated key implies the depot buffer was allocated
         region = self.buf[j * self.per : (j + 1) * self.per]
+        if self.make is not None:
+            return self.make(region)
         gu_n, gu_shape, dn_shape = self.shapes
         return (
             region[:gu_n].view(torch.bfloat16).view(*gu_shape),
@@ -1150,8 +1163,9 @@ class _ExpertStore:
         if room <= 0:
             return 0
         # the device's ledger on the host: above the reserve, less what is spoken for (on MLX its own count of what
-        # the load started with less what MLX holds, exact whether or not the pages are touched)
-        usable = self._host_free() - self.margin
+        # the load started with less what MLX holds, exact whether or not the pages are touched), less what another
+        # program was just given back (`hold_for`): the store does not grow straight back into it
+        usable = self._host_free() - self.margin - self.held()
         # a whole block while the room above the margin holds one, then what is left of it (the fill is a few
         # blocks, never a trickle of ever smaller ones), at least what the call needs
         k = max(int(need), int(min(usable - 2 * self.per, self.block_max) // self.per))
@@ -1257,6 +1271,17 @@ class _ExpertStore:
             f"{commit / G:.1f} GB of commit left, less the {self.reserve / G:.1f} GB reserve"
             + ("".join(f", {k} {n / G:.2f} GB" for k, n in held.items()) if held else "")
         )
+
+    def hold_for(self, nbytes: int, seconds: float) -> None:
+        """keep `nbytes` free above the reserve for another program for `seconds`: every call gives blocks back until
+        the host has that much (`call`'s release) and the store grows into none of it meanwhile (`_grow`). The RAM
+        watcher's, from its own thread - two plain stores the calls read"""
+        self._hold = (int(nbytes), time.time() + float(seconds))
+
+    def held(self) -> int:
+        """the bytes kept free for another program now (`hold_for`); 0 once the hold has run out"""
+        n, until = getattr(self, "_hold", (0, 0.0))
+        return int(n) if time.time() < until else 0
 
     def releasable(self) -> int:
         """the host bytes `release` could give the machine: the blocks above the slots the largest call served
@@ -1382,13 +1407,16 @@ class _ExpertStore:
         return r
 
     def _open_vram(self) -> None:
-        """the card's seats for the bf16 experts, sized by `sm.vram_experts_gb`: a figure, or "auto" for the
-        card's free memory less its margin and a gigabyte kept for the cache to grow into"""
+        """the card's seats for the bf16 experts, or the MXFP4 ones in the checkpoint's layout as stored, sized by
+        `sm.vram_experts_gb`: a figure, or "auto" for the card's free memory less its margin and a gigabyte kept for
+        the cache to grow into"""
         assert self.per is not None  # the store is sized before this runs
         want = getattr(self.sm, "vram_experts_gb", 0)
         dev = getattr(self.sm, "dev", None)
-        if self.mx or self.f8 or dev is None or dev.type != Device.CUDA or not want or self.stride is None:
+        if self.ggml or self.f8 or dev is None or dev.type != Device.CUDA or not want or self.stride is None:
             return
+        if self.mx and Native.card_kernels() is None:
+            return  # an MXFP4 seat is multiplied by the card's MXFP4 gemv alone (bf16 seats have torch's matmuls too)
         if want == "auto":
             sched = getattr(self.sm, "scheduler", None)
             # free as the grant below reads it: less every reservation, an epoch's KV too (its room is the cache's,
@@ -1409,8 +1437,18 @@ class _ExpertStore:
             except MemoryGrantError as e:
                 self.sm.log(f"[experts] no seats on the card: {e}")
                 return
-        gu_n, gu_shape, dn_shape = self.shapes
-        self.vram = VramSeats(n, per, (self._held(gu_n), gu_shape, dn_shape), dev)
+        if self.mx:
+            # the seat holds the four parts back to back (`_seat` packs them): gate_up's blocks and scales, down's
+            (gu_r, gu_k), (dn_r, dn_k) = self.mx_shapes()
+            a, b, c = self.sizes[0], self.sizes[0] + self.sizes[1], self.sizes[0] + self.sizes[1] + self.sizes[2]
+
+            def make(region: torch.Tensor) -> tuple[MxWeight, MxWeight]:
+                return MxWeight(region[:a], region[a:b], gu_r, gu_k), MxWeight(region[b:c], region[c:per], dn_r, dn_k)
+
+            self.vram = VramSeats(n, per, None, dev, make=make)
+        else:
+            gu_n, gu_shape, dn_shape = self.shapes
+            self.vram = VramSeats(n, per, (self._held(gu_n), gu_shape, dn_shape), dev)
         buf, ledger = self.vram.buf, getattr(self.sm, "device", None)
         if ledger is not None and buf is not None:
             ledger.lend(lambda: buf, n * per, dev, counted=False)
@@ -1498,8 +1536,12 @@ class _ExpertStore:
         key = (layer, e)
         if key in v.seat_of or self.rides.get(key, 0) < v.min_rides or v.left <= 0:
             return
-        self._to_bf16(slot)
         region = self._region(slot)
+        if self.mx:
+            # the four parts back to back, as the seat's `make` splits them, wherever the read left each
+            v.offer(key, self.rides.get(key, 0), torch.cat([self._part(slot, region, p) for p in range(4)]))
+            return
+        self._to_bf16(slot)
         d = self.slots[slot].delta or (0,) * len(self.sizes)
         at0 = (self.part_at[0] if self.part_at else 0) + d[0]
         at1 = (self.part_at[1] if self.part_at else self.sizes[0]) + d[1]
@@ -1983,7 +2025,8 @@ class _ExpertStore:
             and not (self.vram is not None and (layer, e) in self.vram)
         )
         self.max_call = max(self.max_call, misses)
-        self.release()
+        # what another program asked back (`hold_for`, the RAM watcher's) as well as the reserve
+        self.release(want=max(1, self.held()))
         if self.ahead:
             # every expert the call still wants, a later wave's too: a prediction one of them will want is kept
             self._lapsed(layer, set(ids), sched)

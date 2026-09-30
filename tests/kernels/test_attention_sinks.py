@@ -112,7 +112,10 @@ def test_the_sinks_in_one_buffer_are_the_steps_they_replaced(
 @pytest.mark.parametrize("case", ["host", "card"])
 def test_a_decode_row_handed_no_mask_sees_the_causal_window(case: str, win: int | None) -> None:
     """a decode row handed no mask (a tier that owns the attention elsewhere) sees the keys the reference's causal
-    mask and window leave it - on a sliding layer none past its window, however many rows the cache holds"""
+    mask and window leave it - on a sliding layer none past its window, however many rows the cache holds - and
+    only those: it attends the window's keys gathered, the reference's arithmetic over exactly them, bit for bit (the
+    one-query form a speculative node makes too, so a node and its step agree; over every key with the rest masked
+    the sums took another shape and parted in the last bits on the host)"""
     where, dt, mask_dt, sink_dt = DTYPES[case]
     if where == "cuda" and not torch.cuda.is_available():
         pytest.skip("no card")
@@ -120,5 +123,7 @@ def test_a_decode_row_handed_no_mask_sees_the_causal_window(case: str, win: int 
     q = q[:, :, -1:]  # the last row alone, over every key
     scale = D**-0.5
     got, _ = attention_sinks(types.SimpleNamespace(), q, k, v, None, scaling=scale, sliding_window=win, s_aux=sinks)
-    want = _reference(q, k, v, None, scale, sinks, win)
+    n = int(k.shape[-2])
+    first = max(0, n - win) if win else 0
+    want = _reference(q, k[..., first:, :], v[..., first:, :], None, scale, sinks, None)
     assert got.dtype == want.dtype and torch.equal(got, want)

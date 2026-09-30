@@ -692,6 +692,10 @@ class BatchScheduler:
             budget = BatchScheduler.measure_host(os_reserve_gb, BatchScheduler.growth_estimate(probe))
         hb = budget
         ram_gb = hb.available / 2**30
+        from .tiers import card_bps
+
+        # the card's reads priced at its own memory rate (`card_bps`): its layers, the head and the cache it holds
+        gpu = card_bps(str(device)) if name is not None and name.kind is Device.CUDA else None
         price = lambda ram, kv, bps: probe.plan_budget(
             ram,
             vram_gb,
@@ -705,6 +709,7 @@ class BatchScheduler:
             context=int(context or 0),
             kv_host=kv,
             drive_bps=bps,
+            gpu_bps=gpu,
         )
 
         def choose(ram: float, bps: float | None = None) -> tuple[dict[str, Any], bool]:

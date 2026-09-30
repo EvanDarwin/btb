@@ -662,6 +662,56 @@ def wddm_room(name: str, total: int) -> int | None:
         return None
 
 
+def wddm_budget_event(name: str, total: int) -> tuple[int, int] | None:
+    """(a Windows event handle, its registration's cookie): the event the OS signals whenever this process's WDDM
+    budget on the card named `name` changes - another program asking for the card (a game started or brought to the
+    front) shrinks it at once, before any of this process's memory is paged out
+    (IDXGIAdapter3::RegisterVideoMemoryBudgetChangeNotificationEvent). An auto-reset event, until
+    `wddm_budget_unregister`. None off Windows or where the card cannot be named."""
+    if sys.platform != "win32":
+        return None
+    key = (name, int(total))
+    try:
+        if key not in _WDDM:
+            _WDDM[key] = _wddm_adapter(name, int(total))
+        a3 = _WDDM[key]
+        if a3 is None:
+            return None
+        k32 = ctypes.windll.kernel32
+        k32.CreateEventW.restype = ctypes.c_void_p
+        ev = k32.CreateEventW(None, False, False, None)
+        if not ev:
+            return None
+        cookie = ctypes.c_uint32(0)
+        try:
+            _com(a3, 16, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32))(a3, ev, ctypes.byref(cookie))
+        except OSError:
+            k32.CloseHandle(ctypes.c_void_p(ev))
+            return None
+        return int(ev), int(cookie.value)
+    except OSError:
+        return None
+
+
+def wddm_budget_unregister(name: str, total: int, reg: tuple[int, int]) -> None:
+    """the budget event `wddm_budget_event` registered, unregistered and its handle closed"""
+    a3 = _WDDM.get((name, int(total)))
+    ev, cookie = reg
+    if a3 is not None:
+        # UnregisterVideoMemoryBudgetChangeNotification returns void, not an HRESULT: called through its own prototype
+        vtbl = ctypes.cast(a3, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+        ctypes.WINFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint32)(vtbl[17])(a3, ctypes.c_uint32(cookie))
+    ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(ev))
+
+
+def wait_event(handle: int, timeout_s: float) -> bool:
+    """whether the Windows event `handle` was signalled within `timeout_s` seconds"""
+    k32 = ctypes.windll.kernel32
+    k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    k32.WaitForSingleObject.restype = ctypes.c_uint32
+    return int(k32.WaitForSingleObject(handle, int(timeout_s * 1000))) == 0  # WAIT_OBJECT_0
+
+
 def host_cache_sizes() -> dict[str, int]:
     """The host CPU's L2 (all cores' together) and L3 in bytes, read from the OS: Windows through the
     processor-information table, Linux from sysfs, macOS from sysctl. Zeros where a level cannot be read."""

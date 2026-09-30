@@ -185,6 +185,35 @@ def stored_parts(gu: Any, dn: Any) -> tuple[torch.Tensor, ...] | None:
     return parts if all(p.device.type == "cpu" for p in parts) else None
 
 
+def on_card_device(w: Any) -> torch.device | None:
+    """the card an expert's weight is seated on - a bf16 tensor there, or an MxWeight whose blocks are - else None"""
+    t = w.blocks if isinstance(w, MxWeight) else w
+    return t.device if isinstance(t, torch.Tensor) and t.device.type != "cpu" else None
+
+
+def lane16(kern: Any, w: Any, x: torch.Tensor) -> torch.Tensor:
+    """the host's gemv on the card over `x` [n, C] float32 there: `w` bf16 (`gemv_lane16`) or MXFP4 in the
+    checkpoint's layout (`gemv_lane16_mx4`), [n, R] float32 on the card. The kernels' widths are 1..32 rows: a longer
+    call goes 32 rows at a time, each row's value its own whatever travels with it"""
+    dev = on_card_device(w)
+    R = int(w.shape[0])
+    gemv = kern.gemv_lane16_mx4 if isinstance(w, MxWeight) else kern.gemv_lane16
+    n = int(x.shape[0])
+    y = torch.empty(n, R, dtype=torch.float32, device=dev)
+    for a in range(0, n, 32):
+        m = min(32, n - a)
+        M = next(r for r in kern.GEMV_ROWS if r >= m)
+        if M == m and a == 0 and n == m and x.is_contiguous():
+            gemv(w, x, y)
+            continue
+        xin = torch.zeros(M, int(x.shape[1]), dtype=torch.float32, device=dev)
+        xin[:m].copy_(x[a : a + m])
+        yo = torch.empty(M, R, dtype=torch.float32, device=dev)
+        gemv(w, xin, yo)
+        y[a : a + m].copy_(yo[:m])
+    return y
+
+
 def group_picks(top_k_index: torch.Tensor, num_experts: int) -> tuple[torch.Tensor, torch.Tensor, list[int], list[int]]:
     """A call's (pick, row) pairs grouped by expert in one sort on the picks' own device: (top_k_pos, token_idx)
     of every pair sorted by expert, and each expert's offset and count into them. An expert's pairs come pick-major,
@@ -299,6 +328,13 @@ class _Experts(torch.nn.Module):
         halves, the other families concatenate them"""
         return MxGateUp.interleave(gate, up) if self.gate is not None else torch.cat([gate, up], dim=-1)
 
+    def _down(self, y: torch.Tensor, e: int, dt: torch.dtype) -> torch.Tensor:
+        """expert `e`'s down product `y` (float32, from the matvec) as the row's dtype, its bias added after the
+        rounding - as the per-expert loop and transformers' GptOssExperts add it (the bf16 product, then the bf16
+        bias) - so a one-row pass's row is a many-row pass's bit for bit"""
+        o = y.to(dt)
+        return o + self._bias(self.down_proj_bias, e, o) if self.biased else o
+
     @staticmethod
     def _bias(param: Any, rows: Any, like: torch.Tensor) -> torch.Tensor:
         # the layer may sit on the card while the experts are multiplied on the CPU, and a resident
@@ -343,41 +379,33 @@ class _Experts(torch.nn.Module):
             gu_buf[i] = self._join(tg[j], tu[j])
 
     def _seated(
-        self, xs: list[torch.Tensor], pairs: list[tuple[torch.Tensor, torch.Tensor]], dt: torch.dtype
+        self,
+        xs: list[torch.Tensor],
+        pairs: list[tuple[Any, Any]],
+        dt: torch.dtype,
+        es: list[int] | None = None,
     ) -> list[torch.Tensor]:
-        """Experts seated on the card (bf16 `pairs` of gate_up and down there), each over its own rows `xs[j]` [n,
-        H], computed as the host computes them: gate_up and down through the host's gemv on the card (`gemv_lane16`,
-        the host kernel's bits), the activation between them on the host in `dt` as `_act` takes it there - so an
-        expert's rows do not depend on which side of the bus it is seated. Returns each expert's rows [n, H] float32
-        on the host, before the routing weight. Without the card's kernels the float32 matmuls on the card."""
+        """Experts seated on the card (`pairs` of gate_up and down there: bf16, or MXFP4 as stored), each over its
+        own rows `xs[j]` [n, H], computed as the host computes them: gate_up and down through the host's gemv on the
+        card (`gemv_lane16`, `gemv_lane16_mx4`: the host kernels' bits), the activation between them on the host in
+        `dt` as `_act` takes it there, expert `es[j]`'s gate/up bias with it - so an expert's rows do not depend on
+        which side of the bus it is seated. Returns each expert's rows [n, H] float32 on the host, before the down
+        bias and the routing weight. Without the card's kernels the float32 matmuls on the card (bf16 seats only:
+        MXFP4 ones are made only where the kernels are)."""
         kern = Native.card_kernels()
-        dev = pairs[0][0].device
+        dev = on_card_device(pairs[0][0])
+        rows = es if es is not None else [None] * len(pairs)
         with torch.no_grad():
             if kern is None:
                 outs = []
-                for x, (w_gu, w_dn) in zip(xs, pairs, strict=True):
+                for x, (w_gu, w_dn), e in zip(xs, pairs, rows, strict=True):
                     xc = x.to(dev).float()
-                    hmid = self._act(torch.nn.functional.linear(xc, w_gu.float()).to(dt), None)
+                    hmid = self._act(torch.nn.functional.linear(xc, w_gu.float()).to(dt), e)
                     outs.append(torch.nn.functional.linear(hmid.float(), w_dn.float()).cpu())
                 return outs
-
-            def lane16(w: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-                # the gemv's widths are 1..32 rows: a longer call goes 32 rows at a time, the rows independent
-                n = int(x.shape[0])
-                y = torch.empty(n, int(w.shape[0]), dtype=torch.float32, device=dev)
-                for a in range(0, n, 32):
-                    m = min(32, n - a)
-                    M = next(r for r in kern.GEMV_ROWS if r >= m)
-                    xin = torch.zeros(M, int(x.shape[1]), dtype=torch.float32, device=dev)
-                    xin[:m].copy_(x[a : a + m])
-                    yo = torch.empty(M, int(w.shape[0]), dtype=torch.float32, device=dev)
-                    kern.gemv_lane16(w, xin, yo)
-                    y[a : a + m].copy_(yo[:m])
-                return y
-
-            gus = [lane16(w_gu, x.to(dev).float()) for x, (w_gu, _dn) in zip(xs, pairs, strict=True)]
-            mids = [self._act(g.cpu().to(dt), None).float() for g in gus]
-            return [lane16(w_dn, h.to(dev)).cpu() for h, (_gu, w_dn) in zip(mids, pairs, strict=True)]
+            gus = [lane16(kern, w_gu, x.to(dev).float()) for x, (w_gu, _dn) in zip(xs, pairs, strict=True)]
+            mids = [self._act(g.cpu().to(dt), e).float() for g, e in zip(gus, rows, strict=True)]
+            return [lane16(kern, w_dn, h.to(dev)).cpu() for h, (_gu, w_dn) in zip(mids, pairs, strict=True)]
 
     def _one_row(
         self,
@@ -406,16 +434,12 @@ class _Experts(torch.nn.Module):
         dn_buf = torch.empty(k, first[1].shape[0], dtype=torch.float32)
         out = torch.empty(k, first[1].shape[0], dtype=dt)
         # the experts seated on the card: multiplied there as the host multiplies them (`_seated`), the row back
-        card = [
-            i
-            for i, e in enumerate(hit)
-            if e in views and isinstance(views[e][0], torch.Tensor) and views[e][0].device.type != "cpu"
-        ]
+        card = [i for i, e in enumerate(hit) if e in views and on_card_device(views[e][0]) is not None]
         if card:
             xc = (x if x_card is None else x_card).reshape(1, -1)
-            back = self._seated([xc] * len(card), [views[hit[i]] for i in card], dt)
+            back = self._seated([xc] * len(card), [views[hit[i]] for i in card], dt, [hit[i] for i in card])
             for r, i in enumerate(card):
-                out[i] = back[r][0].to(dt) * weights[slot[hit[i]]]
+                out[i] = self._down(back[r][0], hit[i], dt) * weights[slot[hit[i]]]
 
         def stage(pos: Any, ws: Any) -> None:
             if not pos:
@@ -425,8 +449,7 @@ class _Experts(torch.nn.Module):
             h = self._act(gu_buf[pos].to(dt), rows).float().contiguous()
             gemv_group([w[1] for w in ws], [h[j : j + 1] for j in range(len(pos))], [dn_buf[i : i + 1] for i in pos])
             for _j, i in enumerate(pos):
-                o = dn_buf[i] + self._bias(self.down_proj_bias, hit[i], dn_buf) if self.biased else dn_buf[i]
-                out[i] = o.to(dt) * weights[slot[hit[i]]]
+                out[i] = self._down(dn_buf[i], hit[i], dt) * weights[slot[hit[i]]]
 
         ready = [i for i, e in enumerate(hit) if e in views and i not in card]
         stage(ready, [views[hit[i]] for i in ready])
@@ -527,6 +550,12 @@ class _Experts(torch.nn.Module):
         if isinstance(w, MxGateUp):
             return self._join(self._linear(x, w.gate), self._linear(x, w.up))
         if isinstance(w, MxWeight):
+            seat = on_card_device(w)
+            kern = Native.card_kernels() if seat is not None else None
+            if kern is not None:
+                # seated on the card: the host kernel's bits there (`gemv_lane16_mx4`), the rows brought to it
+                self.sm._tag(PassTag.EXPERT_MXFP4_ASSTORED)
+                return lane16(kern, w, x.float().to(seat).contiguous()).to(x.device).to(x.dtype)
             # the MXFP4 kernel widens a column tile once and reuses it over the batch tile, so it is the
             # path at every batch size and a row's value does not depend on how many rows travel with it
             kernel = Native.gemv_mx4_ggml if w.ggml else Native.gemv_mx4
@@ -799,12 +828,13 @@ class _Experts(torch.nn.Module):
                     top_k_pos, token_idx = top_k_pos.to(dev), token_idx.to(dev)
             if depot is not None:
                 w_gu, w_dn = depot.get(self.layer, e, w_gu, w_dn)
-            if isinstance(w_gu, torch.Tensor) and w_gu.device.type != "cpu" and x.device != w_gu.device:
+            seat = on_card_device(w_gu)
+            if seat is not None and x.device != seat:
                 # an expert seated on the card while the rows are on the host: its rows multiplied there as the host
                 # multiplies them (`_seated`), as the one-row path does
                 src = x_card if x_card is not None else hidden_states
                 cur = src[token_idx.to(src.device)]
-                h = self._seated([cur], [(w_gu, w_dn)], x.dtype)[0].to(x.device).to(x.dtype)
+                h = self._seated([cur], [(w_gu, w_dn)], x.dtype, [e])[0].to(x.device).to(x.dtype)
             else:
                 cur = x[token_idx]
                 h = self._act(self._linear(cur, w_gu), e)

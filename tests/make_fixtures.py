@@ -459,7 +459,8 @@ def _reshard(out_dir: str, state: dict[str, torch.Tensor], cap: int = 100_000) -
 QWEN3_SEED = 0
 
 
-def build_qwen3(out_dir: str, seed: int = QWEN3_SEED) -> None:
+def build_qwen3(out_dir: str, seed: int = QWEN3_SEED, over: Json | None = None) -> None:
+    """tiny_qwen3; `over` replaces config fields (a test's model at a real model's widths)"""
     import torch
     from transformers import Qwen3Config, Qwen3ForCausalLM
 
@@ -471,16 +472,18 @@ def build_qwen3(out_dir: str, seed: int = QWEN3_SEED) -> None:
         "use_sliding_window": False, "attention_bias": False, "pad_token_id": 1, "eos_token_id": 1,
         "bos_token_id": 0, "torch_dtype": "bfloat16",
     }  # fmt: skip
+    kw.update(over or {})
     m = Qwen3ForCausalLM(Qwen3Config(**kw)).eval().to(torch.bfloat16)
     os.makedirs(out_dir, exist_ok=True)
-    m.save_pretrained(out_dir, max_shard_size="100KB", safe_serialization=True)
+    m.save_pretrained(out_dir, max_shard_size="100KB" if over is None else "2GB", safe_serialization=True)
 
 
 # a draw whose oracle decodes (base and FP8 twin) keep every greedy top-2 gap above the oracle's margin floor
 PHI3_SEED = 2
 
 
-def build_phi3(out_dir: str, seed: int = PHI3_SEED) -> None:
+def build_phi3(out_dir: str, seed: int = PHI3_SEED, over: Json | None = None) -> None:
+    """tiny_phi3; `over` replaces config fields (a test's model at a real model's widths)"""
     import torch
     from transformers import Phi3Config, Phi3ForCausalLM
 
@@ -496,16 +499,18 @@ def build_phi3(out_dir: str, seed: int = PHI3_SEED) -> None:
                          "short_factor": [1.0 for _ in range(rot // 2)]},
         "attention_bias": False, "torch_dtype": "bfloat16",
     }  # fmt: skip
+    kw.update(over or {})
     m = Phi3ForCausalLM(Phi3Config(**kw)).eval().to(torch.bfloat16)
     os.makedirs(out_dir, exist_ok=True)
-    m.save_pretrained(out_dir, max_shard_size="100KB", safe_serialization=True)
+    m.save_pretrained(out_dir, max_shard_size="100KB" if over is None else "2GB", safe_serialization=True)
 
 
 # a draw whose oracle decodes (base and FP8 twin) keep every greedy top-2 gap above the oracle's margin floor
 GEMMA3_SEED = 44
 
 
-def build_gemma3(out_dir: str, seed: int = GEMMA3_SEED) -> None:
+def build_gemma3(out_dir: str, seed: int = GEMMA3_SEED, over: Json | None = None) -> None:
+    """tiny_gemma3; `over` replaces config fields (a test's model at a real model's widths)"""
     import torch
     from transformers import Gemma3ForCausalLM, Gemma3TextConfig
 
@@ -520,9 +525,10 @@ def build_gemma3(out_dir: str, seed: int = GEMMA3_SEED) -> None:
         "hidden_activation": "gelu_pytorch_tanh", "query_pre_attn_scalar": 256,
         "pad_token_id": 0, "eos_token_id": 1, "bos_token_id": 2,
     }  # fmt: skip
+    kw.update(over or {})
     m = Gemma3ForCausalLM(Gemma3TextConfig(**kw)).eval().to(torch.bfloat16)
     os.makedirs(out_dir, exist_ok=True)
-    m.save_pretrained(out_dir, max_shard_size="100KB", safe_serialization=True)
+    m.save_pretrained(out_dir, max_shard_size="100KB" if over is None else "2GB", safe_serialization=True)
 
 
 # a draw whose oracle decodes (base and FP8 twin) keep every greedy top-2 gap above the oracle's margin floor
@@ -723,8 +729,8 @@ def add_q4_mtp() -> None:
 Q35_SEED = 59
 
 
-def _q35_model(seed: int = Q35_SEED) -> tuple[PretrainedConfig, GenerativePreTrainedModel]:
-    """tiny_q35's trunk in bf16, transformers' own init under `seed`"""
+def _q35_model(seed: int = Q35_SEED, over: Json | None = None) -> tuple[PretrainedConfig, GenerativePreTrainedModel]:
+    """tiny_q35's trunk in bf16, transformers' own init under `seed`; `over` replaces config fields"""
     import torch
     from transformers import Qwen3_5ForCausalLM
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
@@ -742,17 +748,19 @@ def _q35_model(seed: int = Q35_SEED) -> tuple[PretrainedConfig, GenerativePreTra
         "linear_num_key_heads": 2, "linear_num_value_heads": 4, "pad_token_id": 1, "eos_token_id": 1,
         "bos_token_id": 0, "dtype": "bfloat16",
     }  # fmt: skip
+    kw.update(over or {})
     cfg = Qwen3_5TextConfig(**kw)
     return cfg, Qwen3_5ForCausalLM(cfg).eval().to(torch.bfloat16)
 
 
-def build_q35(out_dir: str, seed: int = Q35_SEED) -> None:
-    cfg, m = _q35_model(seed)
+def build_q35(out_dir: str, seed: int = Q35_SEED, over: Json | None = None) -> None:
+    """tiny_q35 with its drafting head; `over` replaces config fields (a test's model at a real model's widths)"""
+    cfg, m = _q35_model(seed, over)
     os.makedirs(out_dir, exist_ok=True)
-    m.save_pretrained(out_dir, max_shard_size="100KB", safe_serialization=True)  # config + generation_config
+    m.save_pretrained(out_dir, max_shard_size="100KB" if over is None else "2GB", safe_serialization=True)
     sd = {k: v.detach().contiguous() for k, v in m.state_dict().items()}
     sd.update(_mtp_head(cfg))  # the speculative drafter head, appended to the trunk (not a transformers module)
-    _reshard(out_dir, sd)
+    _reshard(out_dir, sd, cap=100_000 if over is None else 1 << 30)
 
 
 def _mtp_head(cfg: PretrainedConfig) -> dict[str, torch.Tensor]:
@@ -788,8 +796,7 @@ GPT_OSS = {"H": 64, "HEADS": 4, "KV_HEADS": 2, "HEAD_DIM": 64, "INTER": 64, "EXP
            "LAYERS": 4, "VOCAB": 512, "WINDOW": 4}  # fmt: skip
 
 
-def _gpt_oss_config() -> Json:
-    g = GPT_OSS
+def _gpt_oss_config(g: Json = GPT_OSS) -> Json:
     return {
         "architectures": ["GptOssForCausalLM"], "attention_bias": True, "attention_dropout": 0.0,
         "dtype": "bfloat16", "eos_token_id": 1, "experts_per_token": g["TOP_K"], "head_dim": g["HEAD_DIM"],
@@ -809,11 +816,10 @@ def _gpt_oss_config() -> Json:
 GPT_OSS_SEED = 20260926
 
 
-def _gpt_oss_tensors(seed: int = GPT_OSS_SEED) -> dict[str, torch.Tensor]:
+def _gpt_oss_tensors(seed: int = GPT_OSS_SEED, g: Json = GPT_OSS) -> dict[str, torch.Tensor]:
     import numpy as np
     import torch
 
-    g = GPT_OSS
     rng = np.random.default_rng(seed)
     # the matrices at transformers' init scale, as the other families' fixtures are drawn: hotter projections
     # compound a layer's rounding into a token flip by the last layer, so bf16 and fp32 paths could not agree.
@@ -860,11 +866,13 @@ def _gpt_oss_tensors(seed: int = GPT_OSS_SEED) -> dict[str, torch.Tensor]:
     return t
 
 
-def build_gpt_oss(out_dir: str, seed: int = GPT_OSS_SEED) -> None:
+def build_gpt_oss(out_dir: str, seed: int = GPT_OSS_SEED, over: Json | None = None) -> None:
+    """tiny_gpt_oss; `over` replaces entries of the GPT_OSS shape table (a test's model at a real model's widths)"""
+    g = {**GPT_OSS, **(over or {})}
     os.makedirs(out_dir, exist_ok=True)
-    _reshard(out_dir, _gpt_oss_tensors(seed))
+    _reshard(out_dir, _gpt_oss_tensors(seed, g), cap=100_000 if over is None else 1 << 30)
     with open(os.path.join(out_dir, "config.json"), "w", encoding="utf-8") as f:
-        json.dump(_gpt_oss_config(), f, indent=2)
+        json.dump(_gpt_oss_config(g), f, indent=2)
     gen = {"_from_model_config": True, "bos_token_id": 0, "eos_token_id": 1, "pad_token_id": 1}
     with open(os.path.join(out_dir, "generation_config.json"), "w", encoding="utf-8") as f:
         json.dump(gen, f, indent=2)

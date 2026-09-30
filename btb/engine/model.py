@@ -9,7 +9,7 @@ import math
 import os
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any, Concatenate, ParamSpec, Protocol, TypeVar
 
 import torch
@@ -24,12 +24,14 @@ from ..options import Device as DeviceKind
 from ..options import DeviceName
 from ..pack12 import parent_dir
 from ..sysinfo import host_free_bytes
+from . import device as device_mod
 from .cache import GrantedIndexedLayer, GrowLayer
 from .cuda import _CudaMixin
 from .device import Device, where
 from .drafter import MTPDrafter
 from .experts import _ExpertStore
 from .families import _FamiliesMixin, family, register_attention
+from .fixed_rows import RowLinear, fix_rows_cls
 from .forward import _ForwardMixin
 from .generate import _GenerateMixin
 from .holdings import Holdings, Stage, last_on_card, on_card
@@ -265,6 +267,7 @@ class StreamedTextModel(
         # a family's final norm is `norm`, which the fused paths fold into their graphs; a family without one closes
         # with its own module (Qwen4's mixer of its streams), `mixer`, run as its module runs
         self.norm, self.mixer = (last, None) if self.fam.norm is not None else (None, last)
+        fix_rows_cls(self.fam.norm)  # the final norm's small passes at the fixed shape (fixed_rows.py)
         # the parameters are widened to a float32 compute dtype below: read at the checkpoint's own precision for it
         wide = self.compute_dtype is not None and self.compute_dtype != torch.bfloat16
         for name, _, is_buf in self._named_tensors(last):
@@ -280,7 +283,8 @@ class StreamedTextModel(
             self._bind_mlx_linears([self.head_host])
         elif resident_head:
             with self._meta:
-                self.head = torch.nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+                # the head's small passes at the fixed shape, as the card layers' (fixed_rows.py)
+                self.head = RowLinear(cfg.hidden_size, cfg.vocab_size, bias=False)
             self._adopt(self.head, "weight", self._get(self.head_key))
         # the embedding table, unless the tied head is Q6_K: then its packed bytes are the table, gathered on demand
         # (embed / _mlx_embed_rows) instead of a bf16 copy of the whole vocabulary
@@ -342,10 +346,9 @@ class StreamedTextModel(
         self._dma_done = {}
         self._events = []
         self.resident = {}
-        for i in sorted({int(x) for x in resident_layers}):
-            tmpl = self._new_layer(i)
-            self._load_layer(i, tmpl, first=True)
-            self.resident[i] = tmpl
+        # initializing: the plan still bends to another program taking the card while the layers load (a layer not
+        # yet placed goes to the host instead); a layer placed stays until the engine is up, when `adapt` takes over
+        given_up = self._place_planned(sorted({int(x) for x in resident_layers}), bool(adapt))
         self.cold = {int(x) for x in cold_layers} - set(self.resident)
         self.cold_slots = int(cold_slots)
         self._mega = None
@@ -353,7 +356,7 @@ class StreamedTextModel(
         self.cold_chunk = int(cold_chunk_mb) << 20
         self.cold_ring = ColdRing()
         self.host = {}
-        for i in sorted({int(x) for x in cpu_layers} | self.cold):
+        for i in sorted({int(x) for x in cpu_layers} | self.cold | given_up):
             if i in self.resident:
                 continue
             self.host[i] = self._make_host_layer(i)
@@ -455,6 +458,7 @@ class StreamedTextModel(
         self.holdings.own(Stage.STOP, "the drive's readers", self.scheduler.disk_close)
         self.holdings.own(Stage.STOP, "the cold ring's reader", self._cold_stop)
         self.holdings.own(Stage.RECORD, "the expert profile", self._save_profile)
+        self.holdings.own(Stage.MEMORY, "a verify pass's recurrent-state checkpoints", self._drop_spec_state)
         # free-read: the load's log line
         res = torch.cuda.memory_allocated(self.dev) / 2**30 if self.dev.type == DeviceKind.CUDA else 0.0
         n_templates = sum(len(v) for v in self.templates.values())
@@ -463,6 +467,10 @@ class StreamedTextModel(
             f"{'on' if self.prefetch else 'off'}), prefix '{self.prefix}', head "
             f"{'resident' if resident_head else 'streamed'}; resident {res:.2f} GB; init {time.time() - t0:.1f}s"
         )
+        # the placement taken: from here another program asking for the card, or for memory, gets it back at once
+        # (`adapt`)
+        self.watch_vram_budget()
+        self.watch_ram()
         if self.mlx is not None:
             n_cpu = len([i for i in self.host if i not in self.mlx_layers])
             n_cold = len([i for i in self.cold if i in self.mlx_layers])
@@ -471,6 +479,56 @@ class StreamedTextModel(
                 f"), {n_cold} streamed from the drive each pass, {n_cpu} on the CPU kernels; "
                 f"MLX active {self.mlx.active_bytes() / 2**30:.2f} GB"
             )
+
+    # what the card's budget may move by, beyond the engine's own allocations, before a layer still to place is given
+    # up: the driver's own bookkeeping moves the reading by tens of MB
+    INIT_SLACK = 256 << 20
+
+    def _place_planned(self, planned: Sequence[int], adapt: bool) -> set[int]:
+        """The plan's card layers placed one at a time while the engine initializes, the plan still open to the card
+        changing under it: before each, this process's WDDM budget room is read (microseconds) against what it was
+        when placing began less what the layers placed since took. Where it fell further - another program took the
+        card meanwhile (a game launched during a load of minutes) - the layers still to place that the gap would take
+        (the last ones, as a shed would give them up) go to the host instead, and the plan is the smaller one from
+        there. A layer already placed is never moved while initializing; past the budget still once the engine is
+        up, the VRAM policy gives it back (`vram_yield`). Returns the layers given up. With `adapt` off, or no
+        budget to read (off Windows), the plan as it was"""
+        dev = self.dev
+        r0 = device_mod._wddm_room(dev) if (adapt and dev.type == DeviceKind.CUDA) else None
+        # the engine's own growth while it places its layers, to tell it from another program's in the budget's room:
+        # the ledger is not made yet (initializing), and this is no allocation's decision
+        # free-read: the engine's own growth while initializing, before its ledger exists
+        base = torch.cuda.memory_reserved(dev) if r0 is not None else 0
+        todo = list(planned)
+        sizes: list[int] = []
+        given_up: set[int] = set()
+        while todo:
+            if r0 is not None and sizes:
+                room = device_mod._wddm_room(dev)
+                # free-read: the engine's own growth since placing began (above), set against the budget's room
+                taken = 0 if room is None else (r0 - (torch.cuda.memory_reserved(dev) - base)) - room
+                if taken > self.INIT_SLACK:
+                    per = max(1, sum(sizes) // len(sizes))
+                    k = min(len(todo), -(-taken // per))
+                    todo, give = todo[: len(todo) - k], todo[len(todo) - k :]
+                    given_up.update(give)
+                    r0 -= taken  # the smaller card is the plan's from here
+                    self.log(
+                        f"[plan] another program took {taken / 2**30:.2f} GB of the card while loading: "
+                        f"{k} layer{'s' if k != 1 else ''} ({give[0]}-{give[-1]}) to the host instead"
+                    )
+                    if not todo:
+                        break
+            i = todo.pop(0)
+            # free-read: a placed layer's own size on the card, to size the layers still to place (above)
+            before = torch.cuda.memory_reserved(dev) if r0 is not None else 0
+            tmpl = self._new_layer(i)
+            self._load_layer(i, tmpl, first=True)
+            self.resident[i] = tmpl
+            if r0 is not None:
+                # free-read: the same layer's size, after
+                sizes.append(max(0, torch.cuda.memory_reserved(dev) - before))
+        return given_up
 
     def embed(self, ids: Any) -> torch.Tensor:
         rows = self._embed_rows(torch.as_tensor(ids, dtype=torch.long))

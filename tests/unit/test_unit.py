@@ -235,17 +235,63 @@ def test_the_experts_linear_widens_what_no_kernel_multiplies(monkeypatch: Monkey
 # --- the scheduler (btb/engine/scheduler.py) ---------------------------------------------------------------
 
 
+def test_gpt_oss_experts_give_a_row_the_same_bits_alone_or_among_others() -> None:
+    """gpt-oss's MXFP4 experts with their two biases and clamped gate: a row's routed sum is the same bits in a pass
+    of one row (the greedy step's path, `_one_row`) as in a pass of several (a verify's or a prompt's, the per-expert
+    loop) - the row invariance speculation stands on. It did not hold: the one-row path added the down bias to the
+    float32 product before rounding, the loop (and transformers' reference) to the bf16 product, and gpt-oss-120b's
+    speculative answer parted from its greedy one. Compared as bits: a token test on a tiny random model misses an
+    ulp that a real model's argmax finds dozens of tokens in."""
+    from btb.engine.host import _Experts
+    from btb.mxfp4 import BLOCK
+    from tests.helpers import mxfp4_random
+
+    native_library()
+    E, H, inter, k = 8, 64, 64, 4
+    blocks, scales = {}, {}
+    for name, (rows, cols) in (("gate_up_proj", (2 * inter, H)), ("down_proj", (H, inter))):
+        b, s = mxfp4_random(11 + rows, (E, rows), cols, lo=118, hi=130)
+        blocks[name], scales[name] = torch.from_numpy(b), torch.from_numpy(s)
+    tensors = {f"x.{n}_blocks": blocks[n] for n in blocks} | {f"x.{n}_scales": scales[n] for n in scales}
+    sm = types.SimpleNamespace(
+        _tag=lambda *t: None,
+        _get=lambda key, *a, **kw: tensors[key],
+        expert_store=None,
+        expert_probe=None,
+        expert_profile=None,
+        expert_trace=None,
+        mlx=None,
+        expert_stat={"experts": 0, "bytes": 0, "calls": 0, "s": 0.0},
+    )
+    ex = _Experts(sm, "x.", E, None, layer=0, mx=True, biases=True, gate=_Experts.gpt_oss_gate)
+    g = torch.Generator().manual_seed(5)
+    ex.gate_up_proj_bias = torch.nn.Parameter(torch.randn(E, 2 * inter, generator=g).bfloat16(), requires_grad=False)
+    ex.down_proj_bias = torch.nn.Parameter(torch.randn(E, H, generator=g).bfloat16(), requires_grad=False)
+    assert blocks["down_proj"].shape[-2] * BLOCK == inter
+    T = 6
+    x = (torch.randn(T, H, generator=g) * 2).bfloat16()
+    top = torch.stack([torch.randperm(E, generator=g)[:k] for _ in range(T)])
+    w = torch.softmax(torch.randn(T, k, generator=g), dim=-1).bfloat16()
+    with torch.no_grad():
+        together = ex(x, top, w)
+        for r in range(T):
+            alone = ex(x[r : r + 1], top[r : r + 1], w[r : r + 1])
+            assert torch.equal(alone[0].view(torch.int16), together[r].view(torch.int16)), (
+                f"row {r}: {int((alone[0] != together[r]).sum())} of {H} values part alone from among {T} rows"
+            )
+
+
 def test_the_step_tuner_engages_the_deep_queue_releases_it_and_engages_it_again() -> None:
     """the step loop's tuner (`_Tuner`) over synthetic replay times on its two lanes: alone on the card the usual
     replays are faster and it stays there, saying nothing; when another program's load makes the deep queue faster
     by more than its margin it moves there and says the card is shared, holds while the deep queue stays faster by
-    less than the margin, moves back and says the card is free as soon as the usual lane is as fast, and engages
-    again after; each lane still tried a window in every `explore`; the switches written only when the arm
-    changes"""
+    less than the margin, moves back and says so as soon as the usual lane is as fast, and engages again after; a
+    free card's drift inside the margin moves nothing; each lane still tried a window in every `explore`; the
+    switches written only when the arm changes"""
     from btb.engine.cuda import _Tuner
 
-    arms = [("usual", [1, 0, 0], "usual"), ("queued deep", [2, 0, 0], "deep")]
-    tu = _Tuner(arms, torch.device("cpu"), window=2, rounds=2, explore=4, keep=5, margin=0.05, least=3, dwell=6)
+    arms = [("usual", [1, 0, 0], ("usual", False)), ("queued deep", [2, 0, 0], ("deep", False))]
+    tu = _Tuner(arms, torch.device("cpu"), window=2, rounds=2, explore=4, keep=5, margin=0.10, least=3, dwell=6)
     switch = torch.zeros(3, dtype=torch.int32)
     speed = {0: 4.2, 1: 4.4}  # ms a token: alone, the usual lane a little faster
     said: list[str] = []
@@ -261,7 +307,8 @@ def test_the_step_tuner_engages_the_deep_queue_releases_it_and_engages_it_again(
             runs[arm] += 1
             s = tu.after_replay(arm, speed[arm] * 1e-3)
             if s:
-                said.append(s)
+                assert s[1]  # a move of the queue is the console's
+                said.append(s[0])
 
     run(80)
     assert tu.chosen == 0 and not said and runs[1] >= 8  # alone: usual, the deep lane still tried
@@ -271,7 +318,9 @@ def test_the_step_tuner_engages_the_deep_queue_releases_it_and_engages_it_again(
     speed.update({1: 6.0})
     run(400)
     assert tu.chosen == 0 and tu.every == 64 and runs[1] - before < 400 // 8
-    speed.update({1: 4.4})
+    speed.update({0: 4.6, 1: 4.35})  # a free card's drift: the deep lane 6% ahead, inside the margin - no move
+    run(120)
+    assert tu.chosen == 0 and not said
     speed.update({0: 9.0, 1: 7.8})  # a game on the card: the deep queue runs in its gaps
     run(80)
     assert tu.chosen == 1 and len(said) == 1 and "shared" in said[0]
@@ -285,6 +334,48 @@ def test_the_step_tuner_engages_the_deep_queue_releases_it_and_engages_it_again(
     run(120)
     assert tu.chosen == 1 and len(said) == 3 and "shared" in said[2]
     assert "*queued deep 7.80" in tu.report()
+    # an answer over another length: windows timed at one prefix never meet another's. A short prompt's deep
+    # windows against a long one's usual ones read as a shared card on a free one
+    speed.update({0: 4.2, 1: 4.4})
+    tu.at_context(100)
+    run(120)
+    assert tu.chosen == 0 and len(said) == 4
+    tu.at_context(4000)
+    assert all(not m for m in tu.meds)  # the short prompt's windows are gone
+    speed.update({0: 5.5, 1: 5.6})  # a free card at 4k: every step slower, the usual lane still the faster
+    run(120)
+    assert tu.chosen == 0 and len(said) == 4
+    tu.at_context(4050)
+    assert any(tu.meds)  # the same power of two: the windows stand
+
+
+def test_the_step_tuner_takes_the_fused_kernels_where_they_win_and_only_logs_it() -> None:
+    """the tuner over four lanes - the usual and the deep queue, each in the plain and the fused kernels: alone on
+    the card the usual plain lane stands; where another program's load makes the fused kernels the faster (fewer
+    edges where it takes the card), it takes the usual fused lane and says so to the log alone; where the deep queue
+    in the fused kernels wins, it moves there and the console hears of the queue"""
+    from btb.engine.cuda import _Tuner
+
+    lanes = [("usual", False), ("usual", True), ("deep", False), ("deep", True)]
+    tu = _Tuner(
+        [(str(ln), [0, 0], ln) for ln in lanes], torch.device("cpu"), window=2, rounds=2, explore=4, least=3, dwell=6
+    )
+    switch = torch.zeros(2, dtype=torch.int32)
+    said: list[tuple[str, bool]] = []
+
+    def run(n: int, speed: list[float]) -> None:
+        for _ in range(n):
+            arm = tu.before_replay(switch)
+            s = tu.after_replay(arm, speed[arm] * 1e-3)
+            if s:
+                said.append(s)
+
+    run(200, [4.2, 4.3, 4.4, 4.5])  # alone
+    assert tu.chosen == 0 and not said
+    run(200, [9.0, 7.6, 8.8, 8.0])  # beside a game: the fused kernels win, on the usual queue
+    assert tu.chosen == 1 and len(said) == 1 and not said[0][1] and "fused kernels run" in said[0][0]
+    run(300, [9.0, 7.6, 8.8, 6.5])  # and then the deep queue in them
+    assert tu.chosen == 3 and len(said) == 2 and said[1][1] and "shared" in said[1][0] and "fused" in said[1][0]
 
 
 def test_scheduler_kv_bytes_count_the_attention_layers_only() -> None:

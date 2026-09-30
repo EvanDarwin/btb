@@ -279,6 +279,48 @@ def test_the_stores_seats_on_the_card_are_granted_and_change_no_bit(
         assert rel_err(b, a) < 1e-4, f"pass {j}: the seats' float32 matmuls are {rel_err(b, a):.2e} from the host's"
 
 
+def test_mxfp4_experts_seated_on_the_card_change_no_bit(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+    """gpt-oss's MXFP4 experts take seats on the card as stored (four parts, the checkpoint's layout) and are
+    multiplied there by the host's MXFP4 gemv's bits (`gemv_lane16_mx4`), their gate/up bias before the gate and their
+    down bias before the row's rounding as the host adds them - so a prompt's rows (the per-expert loop) and each
+    decode step's (the one-row path) are the logits without seats, bit for bit"""
+    from btb.engine import StreamedTextModel
+    from tests.helpers import need_card_kernels
+
+    need_card_kernels()
+    StreamedTextModel.register_attention()
+    path = fixture("tiny_gpt_oss")
+    sm = host_model(path, device="cuda", cpu_layers=range(layer_count(path)))
+    try:
+        store = sm.expert_store
+        toks = [77, 5, 9, 31]
+        with torch.inference_mode():
+            want = _steps(sm, toks)
+            assert store is not None and store.mx and store.per is not None
+            every = int(sm.L) * int(sm.n_experts)
+            with monkeypatch.context() as mp:
+                mp.setattr(sm, "vram_experts_gb", (every * store.per + store.per // 2) / 2**30, raising=False)
+                store.vram = None
+                store._open_vram()
+            assert store.vram is not None and store.vram.n == every, "no MXFP4 seats were opened"
+            store.vram.min_rides, store.vram.per_pass = 1, every
+            prof = ExpertProfile(str(tmp_path / "events.npz"))
+            monkeypatch.setattr(sm, "expert_profile", prof)
+            _steps(sm, toks)  # the first rides seat the experts
+            seated = _steps(sm, toks)
+            monkeypatch.setattr(sm, "expert_profile", None)
+            assert store.vram.copies > 0 and store.vram.seat_of, "no expert was seated on the card"
+            gu, dn = store.vram.views(next(iter(store.vram.seat_of)))
+            assert gu.blocks.is_cuda and gu.scales is not None and dn.blocks.is_cuda, "a seat is not MXFP4 on the card"
+            ev = prof.a[: prof.n]
+            assert bool(((ev[:, 2] == prof.HIT) & (ev[:, 9] == -2) & (ev[:, 10] == 2)).any()), "no hit from a seat"
+            store.vram = None
+        for j, (a, b) in enumerate(zip(want, seated, strict=True)):
+            assert torch.equal(a, b), f"pass {j} parts with MXFP4 experts seated on the card"
+    finally:
+        sm.close()
+
+
 def test_the_layout_is_read_off_the_first_layer_with_experts(q4: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """the form a prefill's depot opens at, read off the store's layout with no expert read: a layer with no experts
     (a dense one: its recipe has no such tensors) is passed over for the next, and a model with none has no form"""

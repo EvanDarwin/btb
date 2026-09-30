@@ -550,6 +550,45 @@ def test_gemv_mma_is_repeat_identical_and_carries_no_row_across(cu: _Cuda, R: in
     assert torch.equal(y[:4], _mma(cu, W, x[:4], warps))
 
 
+@pytest.mark.parametrize("M", [1, 5, 32])
+@pytest.mark.parametrize("warps", [2, 4, 8])
+@pytest.mark.parametrize("R,C", [(1024, 2048), (1024, 3072), (1020, 1032), (17, 8), (4096, 1024)])
+def test_the_eight_row_matvec_is_the_sixteen_row_one_bit_for_bit(cu: _Cuda, R: int, C: int, warps: int, M: int) -> None:
+    """`btb_gemv_mma8_bf16`, a block 8 weight rows, against btb_gemv_mma_bf16's 16: each output the same mma, k
+    slices and fold, so the same bits at any warps and any live rows"""
+    torch.manual_seed(12)
+    W = torch.randn(R, C, device=dev, dtype=bf)
+    x = torch.randn(M, C, device=dev, dtype=bf)
+    xp = x if M == 32 else torch.cat([x, torch.zeros(32 - M, C, device=dev, dtype=bf)])
+    y = torch.empty(32, R, device=dev, dtype=bf)
+    cu.launch("btb_gemv_mma8_bf16", ((R + 7) // 8, 1, 1), (32 * warps, 1, 1), [P(W), P(xp), P(y), I(R), I(C), I(M)])
+    assert torch.equal(y[:M], _mma(cu, W, x, warps))
+
+
+@pytest.mark.parametrize("act", ["silu", "gelu"])
+@pytest.mark.parametrize("M", [1, 5, 32])
+@pytest.mark.parametrize("warps", [2, 4, 8])
+@pytest.mark.parametrize("Ii,C", [(3072, 1024), (1000, 1032), (24, 64)])
+def test_the_glu_matvec_is_the_matvec_and_the_activation_bit_for_bit(
+    cu: _Cuda, Ii: int, C: int, warps: int, M: int, act: str
+) -> None:
+    """`btb_gemv_mma_glu_{act}`, gate and up in one kernel and the activation in its epilogue, against
+    btb_gemv_mma_bf16 over the merged [2I, C] weight and btb_{act}_mul over its output - at any I (a row group's
+    gate and up rows need not line up with the plain kernel's groups), any warps, any live rows"""
+    torch.manual_seed(9)
+    W = torch.randn(2 * Ii, C, device=dev, dtype=bf)
+    x = torch.randn(M, C, device=dev, dtype=bf)
+    gu = _mma(cu, W, x, warps)
+    want = torch.empty(M, Ii, device=dev, dtype=bf)
+    cu.launch(f"btb_{act}_mul", (min(4096, (M * Ii + 255) // 256), 1, 1), (256, 1, 1), [P(gu), P(want), I(M), I(Ii)])
+    xp = x if M == 32 else torch.cat([x, torch.zeros(32 - M, C, device=dev, dtype=bf)])
+    m = torch.empty(32, Ii, device=dev, dtype=bf)
+    cu.launch(
+        f"btb_gemv_mma_glu_{act}", ((Ii + 15) // 16, 1, 1), (32 * warps, 1, 1), [P(W), P(xp), P(m), I(Ii), I(C), I(M)]
+    )
+    assert torch.equal(m[:M], want)
+
+
 def test_gemv_mma_streams_the_weights_at_the_cards_ceiling(cu: _Cuda, capsys: CaptureFixture[str]) -> None:
     """Prints GB/s at M=1 and the M=32 / M=1 ratio; asserts nothing about speed - the card is shared."""
     free = torch.cuda.mem_get_info()[0]
