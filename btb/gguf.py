@@ -300,6 +300,11 @@ class GGUFModel:
             fields.update(self._qwen35_fields())
         if self.arch == QWEN4EXP:
             fields.update(self._qwen4exp_config())
+        if "token_embd.weight" in self.tensors:
+            # the model's vocabulary is its embedding table's rows - what its head can emit, as a checkpoint's config
+            # counts it (Qwen's padded 151936, not its tokenizer's 151669). A file whose tokenizer lists fewer tokens
+            # took the tokenizer's count, and the engine refused the ids past it that the model itself predicted
+            fields["vocab_size"] = self._shape("token_embd.weight")[0]
         cfg = AutoConfig.for_model(fields.pop("model_type"), **fields)
         # the head size is in the file (attention.key_length) but not in transformers' table for these families,
         # which leaves the family's default: read it off the typed key when the file carries it
