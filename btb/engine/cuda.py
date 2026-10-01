@@ -2052,6 +2052,8 @@ class _CudaMixin(_State):
             spans.append((e0, e1))
 
         collecting = gc.isenabled()
+        # the sample named for a profiler (nsys -t nvtx): its kernels apart from the passes' and the other widths'
+        torch.cuda.nvtx.range_push(f"card program warm-up: {M}-row pass")
         try:
             torch.cuda.synchronize(self.dev)
             # a collection the replays' small allocations set off is the host's time, not the pass's
@@ -2068,6 +2070,7 @@ class _CudaMixin(_State):
             wall = time.perf_counter() - t0
             return wall, sum(e0.elapsed_time(e1) for e0, e1 in spans) / 1e3
         finally:
+            torch.cuda.nvtx.range_pop()
             if collecting:
                 gc.enable()
             prog.rehearsed()
@@ -2079,16 +2082,15 @@ class _CudaMixin(_State):
         return max(int(getattr(self, "tree_budget", 0) or 0), v) + 1
 
     def _spec_budget(self, ema_tokens: float, passes: int, v_max: int | None = None, past: int = 0) -> int:
-        """Rows a speculative pass may carry, the root included, from the warm-up's cost curve of the card
-        graph's passes and the running acceptance: the widest pass costing at most a quarter more than the
+        """Rows a speculative pass may carry, the root included, from the cost curve of the card graph's passes -
+        the warm-up's, as the passes measure it now (`_spec_curve`) - and the running acceptance: the widest pass
+        costing at most a quarter more than the
         one-row step, and only while the tokens a pass yields pay for its width - otherwise one-row passes,
         with a wide probe every sixteenth pass so a stretch of accepted drafts can reopen the tree. Without a
         cost curve (the MLX and host paths) the configured budget stands: the tree's rows, or a chain's
         `v_max` drafts and the root, whichever is wider."""
         full = self._spec_full(v_max)
-        cost = (
-            getattr(self, "_card_cost", None) or getattr(self, "_mlx_cost", None) or getattr(self, "_host_cost", None)
-        )
+        cost = self._spec_curve()
         if not cost or 1 not in cost or len(cost) <= 1 or full <= 1:
             return full
         slope = getattr(self, "_mlx_attn_slope", None)
@@ -2127,8 +2129,20 @@ class _CudaMixin(_State):
         # `spec_price` off prices no read (the pricer inactive): the passes sized as with no store to read from - what a
         # test of the verify pass pins, so what earlier calls taught the pricer cannot choose to draft nothing
         miss_s = miss() if callable(miss) and bool(getattr(self, "spec_price", True)) else 0.0
-        pc.price(self._spec_full(v_max), cost, miss_s)
+        # a card program's passes run at its graphs' widths, its rows padded to them: a 3-row pass is a 4-row one
+        prog = cost is not None and cost is getattr(self, "_card_prog_cost", None)
+        pc.price(self._spec_full(v_max), cost, miss_s, self._card_m if prog else None)
         return pc
+
+    def _spec_curve(self) -> dict[int, float] | None:
+        """the pass-cost curve the budget sizes a pass by: the warm-up's as the passes measure it now (the pricer's
+        `curve_now`), the warm-up's own before a pricer is made"""
+        pc: SpecCost | None = getattr(self, "_spec_cost", None)
+        if pc is not None and pc.curve:
+            return pc.curve_now()
+        return (
+            getattr(self, "_card_cost", None) or getattr(self, "_mlx_cost", None) or getattr(self, "_host_cost", None)
+        )
 
     def _forward_card_segment(
         self, a: int, b: int, h: torch.Tensor, pas: Any, tail: bool

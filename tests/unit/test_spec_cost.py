@@ -279,6 +279,65 @@ def test_base_curve_ratio() -> None:
     assert pc.ratio(2) == pytest.approx(2**SpecCost.H0)
 
 
+def test_a_warm_up_curve_a_burst_spoiled_is_measured_back_by_the_passes() -> None:
+    """the warm-up timed beside a game, its 2-row samples catching the card's bursts and its 1-row ones not: the
+    2-row pass priced at 6 one-row ones (the card program's measured 6, 21 and 53). The passes measure the curve back:
+    each width a pass ran at its measured seconds, the others the warm-up's scaled to the step's measured seconds"""
+    pc = SpecCost()
+    pc.price(9, {1: 1.0, 2: 6.0, 4: 7.0}, 0.0)
+    assert pc.curve_now() == {1: 1.0, 2: 6.0, 4: 7.0}, "nothing measured: the warm-up's"
+    for _ in range(3):
+        pc.record_pass(1, 2.0, 0.0, None)  # the step, measured, twice the warm-up's: the curve scaled with it
+    assert pc.curve_now()[4] == pytest.approx(14.0) and pc.ratio(4) == pytest.approx(7.0)
+    for _ in range(12):
+        pc.record_pass(2, 2.2, 0.0, 0.01)
+    assert pc.curve_now()[2] == pytest.approx(2.2, rel=0.01) and pc.ratio(2) == pytest.approx(1.1, rel=0.01)
+    # the next call's warm-up curve (the engine prices every call) keeps what the passes measured
+    pc.price(9, {1: 1.0, 2: 6.0, 4: 7.0}, 0.0)
+    assert pc.ratio(2) == pytest.approx(1.1, rel=0.01)
+
+
+def test_a_burst_moves_a_measured_width_as_twice_its_seconds_at_most_and_a_faster_pass_as_itself() -> None:
+    pc = SpecCost()
+    pc.price(9, {1: 1.0, 2: 1.2}, 0.0)
+    pc.record_pass(1, 1.0, 0.0, None)
+    pc.record_pass(1, 200.0, 0.0, None)  # another program's slice of the card: a pass 200 times its width's
+    k = SpecCost.TIME_DECAY
+    assert pc.live[1] == pytest.approx(k * 1.0 + (1 - k) * 2.0), "the burst taken as twice the width's seconds"
+    pc.record_pass(1, 0.5, 0.0, None)  # the card freed: the pass faster than the estimate, taken whole
+    assert pc.live[1] == pytest.approx(k * (k * 1.0 + (1 - k) * 2.0) + (1 - k) * 0.5)
+
+
+def test_a_card_programs_pass_is_measured_at_its_graphs_width() -> None:
+    """a card program pads a pass's rows to its graphs' widths: a 3-row pass is measured as the 4-row one it ran"""
+    pc = SpecCost()
+    pc.price(9, {1: 1.0, 2: 1.5, 3: 2.0, 4: 2.0}, 0.0, lambda k: 4 if k > 2 else k)
+    pc.record_pass(3, 1.25, 0.0, 0.01)
+    now = pc.curve_now()
+    assert now[3] == now[4] == pytest.approx(1.25)
+    assert set(pc.live) == {4}
+
+
+def test_a_base_curve_that_priced_every_pass_plain_is_measured_again_after_a_run_of_steps() -> None:
+    """the base curve, as measured, sized every pass a plain step (`_spec_budget` 1): a run of PROBE_FAR plain steps
+    across calls verifies one draft - the wider widths measured again, so a curve the warm-up took beside a game does
+    not keep speculation off for the load; never where no speculation is configured, nor without a curve"""
+    pc = SpecCost()
+    pc.price(9, {1: 1.0, 2: 6.0}, 0.0)
+    for i in range(SpecCost.PROBE_FAR):
+        assert pc.plan(1, i % 7 + 1) == (1, False), i  # the calls' own pass counts start again each call
+        pc.record_pass(1, 1.0, 0.0, None)
+    assert pc.plan(1, 3) == (2, True)
+    pc.record_pass(2, 1.1, 0.0, 0.01)
+    assert pc.plan(1, 4) == (1, False), "the draft verified: the run starts again"
+    assert pc.ratio(2) < 2.0, "the 2-row pass measured back from the warm-up's 6 steps"
+    for pc2, full, curve in ((SpecCost(), 1, {1: 1.0, 2: 6.0}), (SpecCost(), 9, None)):
+        pc2.price(full, curve, 0.0)
+        for _ in range(SpecCost.PROBE_FAR + 1):
+            pc2.record_pass(1, 1.0, 0.0, None)
+        assert pc2.plan(1, 5) == (1, False)
+
+
 def test_the_expected_gain_of_a_trees_first_nodes() -> None:
     """before any tree, the prior's PRIOR_Q + PRIOR_Q**2 + ...; after, the decayed gain of the recent trees' first
     j nodes, and past the widest tree drafted what that one gained; nothing for no node. A priced store's widest

@@ -46,13 +46,17 @@ the same widths.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 
 def _mix(old: float | None, new: float, keep: float) -> float:
     """a decayed mean: `new` taken whole when there is no `old`"""
     return new if old is None else keep * old + (1.0 - keep) * new
+
+
+def _rows(k: int) -> int:
+    return k
 
 
 class SpecCost:
@@ -90,6 +94,8 @@ class SpecCost:
         self.draft_s: float | None = None  # the drafter's seconds a pass that drafted
         self.miss_s = 0.0
         self.curve: dict[int, float] = {}
+        self.width: Callable[[int], int] = _rows  # the curve's width a pass of k rows runs at
+        self.live: dict[int, float] = {}  # each width's seconds as the passes measure them, decayed
         self.full = 1
         self.cal_a: dict[tuple[str, int], float] = {}
         self.cal_p: dict[tuple[str, int], float] = {}
@@ -121,12 +127,32 @@ class SpecCost:
         self.meas_s = 0.0
         self.priced = 0
 
-    def price(self, full: int, curve: Mapping[int, float] | None, miss_s: float) -> None:
-        """the pass's inputs: the widest pass (root included), the base cost curve {rows: seconds}, a missed
-        expert's seconds (0: no store, or its drive unmeasured)"""
+    def price(
+        self,
+        full: int,
+        curve: Mapping[int, float] | None,
+        miss_s: float,
+        width: Callable[[int], int] | None = None,
+    ) -> None:
+        """the pass's inputs: the widest pass (root included), the base cost curve {rows: seconds} the load's
+        warm-up timed, a missed expert's seconds (0: no store, or its drive unmeasured), and the width a pass of k
+        rows runs at (a card program pads its rows to its graphs' widths; the rows themselves by default)"""
         self.full = max(1, int(full))
         self.curve = {int(t): float(c) for t, c in curve.items()} if curve and curve.get(1, 0.0) > 0 else {}
         self.miss_s = max(0.0, float(miss_s))
+        self.width = width or _rows
+
+    def curve_now(self) -> dict[int, float]:
+        """the base curve as the passes measure it now: each width a pass ran at its measured seconds, the others
+        the warm-up's scaled by the step's measured seconds over the warm-up's. The warm-up times the load's moment:
+        beside another program its samples caught the card's bursts unevenly (a 2-row pass priced at 6, 21 and 53
+        one-row ones), and taken as it was the curve kept speculation priced out for the load; {} without one"""
+        cv = self.curve
+        if not cv:
+            return {}
+        step = self.live.get(self.width(1))
+        scale = step / cv[1] if step else 1.0
+        return {t: self.live.get(self.width(t), c * scale) for t, c in cv.items()}
 
     # -- the model ---------------------------------------------------------------------------------------------
 
@@ -137,11 +163,11 @@ class SpecCost:
 
     def ratio(self, k: int) -> float:
         """the rows' compute over one row's: with a priced store k ** h, fitted; else the base curve's k-row pass
-        over its one-row pass (timed widths read, others interpolated, past the widest extended along its last
-        step); 1 without a curve"""
+        over its one-row pass as the passes measure it (`curve_now`: timed widths read, others interpolated, past the
+        widest extended along its last step); 1 without a curve"""
         if self.miss_s > 0:
             return float(k) ** self.h
-        cv = self.curve
+        cv = self.curve_now()
         if not cv:
             return 1.0
         c1 = cv[1]
@@ -231,6 +257,11 @@ class SpecCost:
         the rows - the first WARM passes plain steps measuring the step, a probe the full width"""
         cap = max(1, int(cap))
         if not self.active():
+            if cap == 1 and self.full > 1 and self.curve and self.plain_run >= self.PROBE_FAR:
+                # the base curve, as measured, sized every pass a plain step: a run of PROBE_FAR of them (the
+                # pricer's, across calls) verifies one draft, so the wider widths are measured again - a curve that
+                # priced the drafts out beside a game reopens them once the game lets the card go
+                return 2, True
             return cap, False
         if not self.ready():
             return 1, False
@@ -329,6 +360,11 @@ class SpecCost:
             self.u1 = _mix(self.u1, compute / max(1e-9, self.ratio(k)), self.TIME_DECAY)
         if draft_s is not None:
             self.draft_s = _mix(self.draft_s, max(0.0, float(draft_s)), self.TIME_DECAY)
+        # the width's measured seconds (`curve_now`), decayed: a burst - another program's slice of the card - is taken
+        # as twice what they were at most, a faster pass (the card freed again) as it is
+        w = self.width(k)
+        old = self.live.get(w)
+        self.live[w] = compute if old is None else _mix(old, min(compute, 2.0 * old), self.TIME_DECAY)
 
     def calibration(self, tag: str) -> list[float]:
         """`tag`'s calibration by depth, 1 .. DEPTHS"""
