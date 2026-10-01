@@ -53,6 +53,7 @@ from ....kinds import LayerKind
 from ...cache import ArenaIndexedLayer, indexer_keys
 from ...forward import path_of
 from ...host import _Experts
+from ...hostmem import pinned
 from ...native import Native, _Cuda
 from ...scheduler import MemoryGrantError
 from .verify import _slots
@@ -156,6 +157,7 @@ class Qwen4Card:
         self.S: dict[str, list[torch.Tensor]] | None = None  # the states bound into the cache
         self.A: dict[str, Any] | None = None  # the arena
         self.X: dict[str, torch.Tensor] | None = None  # the edge's pinned rows, where host layers run between segments
+        self.P: dict[str, torch.Tensor] | None = None  # a torch-path slice's tree over the rows in RAM (`attend_rows`)
         self.held: dict[str, int] = {}  # the bytes granted, by what they hold
         self.graphs: dict[Any, torch.cuda.CUDAGraph] = {}
         self.pool: Any = None
@@ -220,7 +222,7 @@ class Qwen4Card:
         if owner is not None:
             self._evict(owner)
         self._drop_graphs()
-        self.B = self.S = self.A = self.X = None
+        self.B = self.S = self.A = self.X = self.P = None
         self.owner = None
         for what in [w for w in self.held if not w.startswith("layer ")]:
             del self.held[what]
@@ -263,7 +265,7 @@ class Qwen4Card:
             return f"the kernels lack {missing[0]}"
         if sm.compute_dtype not in (None, torch.bfloat16) or getattr(sm, "resident_fp32", False) or sm.shadow:
             return "a float32 compute"
-        if sm.mlx is not None or getattr(sm, "kv_host", False):
+        if sm.mlx is not None:
             return "not the card's tier"
         if not self.res:
             return "no layer on the card"
@@ -375,6 +377,7 @@ class Qwen4Card:
         add(self.S)
         add(self.A)
         add(self.X)
+        add(self.P)
         for W in self.W.values():
             add(W.get("_own", []))
         return n
@@ -644,48 +647,74 @@ class Qwen4Card:
         }
         return self.S
 
+    # positions of the rope tables made on the card at a time, for an arena kept in RAM: the tables' float32 rows of a
+    # million positions at once were half a GiB of the card's
+    ROPE_CHUNK = 1 << 16
+
     def arena(self, need: int) -> dict[str, Any]:
         """the sparse layers' rows - keys and values [layers, 2, Hk, cap, D], the indexer's raw keys [layers, cap,
         di] and pooled keys - and the rope over `cap` positions, at least `need` rows deep: grown by reallocation (the
-        rows copied over, every bound layer attached again, the graphs dropped)"""
+        rows copied over, every bound layer attached again, the graphs dropped).
+
+        With the attention's rows kept in RAM (`kv_host`: a context the card has no room for) the rows and the rope
+        tables are pinned host memory the kernels read and write in place (`hostmem.pinned`: its exact size, freed
+        with it) - a pass reads only the rows its picks name, the indexer's budget whatever the context - and the
+        arena is made for the load's whole context at once, a regrowth copying every row; the pooled keys and the
+        scores, which every pass reads whole, stay the card's"""
         A = self.A
         if A is not None and A["cap"] >= need:
             return A
         sm = self._sm()
         assert sm is not None
+        ram = bool(getattr(sm, "kv_host", False))
         old = A["cap"] if A is not None else 0
-        cap = max(int(need) + ROWS, self.ARENA_MIN, old + old // 4)
+        whole = int(getattr(sm, "context", 0) or 0) + ROWS if ram else 0
+        cap = max(int(need) + ROWS, self.ARENA_MIN, old + old // 4, whole)
         cap = (cap + 1023) // 1024 * 1024
         n = len(self.sparse)
-        nb = cap // max(1, self.r) + 1
+        r = max(1, self.r)
+        nb = cap // r + 1
         rot = self._rot(sm)
-        per = lambda c: (
-            n * (2 * self.Hk * c * self.D + c * self.di + (c // max(1, self.r) + 1) * self.di) * 2
-            + 2 * c * rot * 2
-            + ROWS * (c // max(1, self.r) + 1) * 4
-            + n * 2 * 4
-        )
-        self._grant(f"the arena, {cap} rows", per(cap), "kv", sm.dev, held=per(old) if old else 0, cap=cap, bound=None)
-        kv = torch.zeros(n, 2, self.Hk, cap, self.D, dtype=torch.bfloat16, device=sm.dev)
-        raw = torch.zeros(n, cap, self.di, dtype=torch.bfloat16, device=sm.dev)
-        pk = torch.zeros(n, nb, self.di, dtype=torch.bfloat16, device=sm.dev)
+        # the rows and the rope tables: on the card, or in RAM
+        rows = lambda c: n * (2 * self.Hk * c * self.D + c * self.di) * 2 + 2 * c * rot * 2
+        # the pooled keys, their lengths and the scores: the card's
+        card = lambda c: n * (c // r + 1) * self.di * 2 + ROWS * (c // r + 1) * 4 + n * 2 * 4
+        cpu = torch.device("cpu")
+        if ram:
+            self._grant(f"the arena's rows in RAM, {cap} rows", rows(cap), "kv", cpu, held=rows(old) if old else 0)
+            self._grant(
+                f"the arena, {cap} rows", card(cap), "kv", sm.dev, held=card(old) if old else 0, cap=cap, bound=None
+            )
+        else:
+            per = lambda c: rows(c) + card(c)
+            self._grant(
+                f"the arena, {cap} rows", per(cap), "kv", sm.dev, held=per(old) if old else 0, cap=cap, bound=None
+            )
+        bf = torch.bfloat16
+        if ram:
+            kv = pinned((n, 2, self.Hk, cap, self.D), bf)
+            raw = pinned((n, cap, self.di), bf)
+        else:
+            kv = torch.zeros(n, 2, self.Hk, cap, self.D, dtype=bf, device=sm.dev)
+            raw = torch.zeros(n, cap, self.di, dtype=bf, device=sm.dev)
+        pk = torch.zeros(n, nb, self.di, dtype=bf, device=sm.dev)
         pk_len = torch.zeros(n, 2, dtype=torch.int32, device=sm.dev)
         if A is not None:
+            if ram:
+                torch.cuda.synchronize(sm.dev)  # every kernel's write to the old rows landed before they are copied
             kv[:, :, :, :old].copy_(A["kv"])
             raw[:, :old].copy_(A["raw"])
             pk[:, : A["pk"].shape[1]].copy_(A["pk"])
             pk_len.copy_(A["pk_len"])
-        x = torch.zeros(1, 1, self.H, dtype=torch.bfloat16, device=sm.dev)
-        pos = torch.arange(cap, device=sm.dev).view(1, 1, -1).expand(3, 1, -1)
-        cos, sin = sm.rotary(x, pos)
+        cos, sin = self._rope(sm, cap, rot, A, ram)
         self.A = {
             "cap": cap,
             "kv": kv,
             "raw": raw,
             "pk": pk,
             "pk_len": pk_len,
-            "cos": cos[0].to(torch.bfloat16).contiguous(),
-            "sin": sin[0].to(torch.bfloat16).contiguous(),
+            "cos": cos,
+            "sin": sin,
             "scores": torch.zeros(ROWS, nb, dtype=torch.float32, device=sm.dev),
         }
         for j, ref in enumerate(self.bound):
@@ -699,15 +728,41 @@ class Qwen4Card:
             sm.log(f"[card] Qwen4's arena grown to {cap} rows ({per(cap) / 2**20:.0f} MB); graphs dropped")
         return self.A
 
+    def _rope(
+        self, sm: Any, cap: int, rot: int, A: dict[str, Any] | None, ram: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """the rope's cos and sin [cap, rot] bf16 at every position of the arena: on the card in one go, or in RAM
+        (pinned) made a chunk at a time on the card, an old arena's positions copied over"""
+        x = torch.zeros(1, 1, self.H, dtype=torch.bfloat16, device=sm.dev)
+        if not ram:
+            pos = torch.arange(cap, device=sm.dev).view(1, 1, -1).expand(3, 1, -1)
+            cos, sin = sm.rotary(x, pos)
+            return cos[0].to(torch.bfloat16).contiguous(), sin[0].to(torch.bfloat16).contiguous()
+        out = pinned((cap, rot), torch.bfloat16), pinned((cap, rot), torch.bfloat16)
+        start = 0
+        if A is not None and A["cos"].device.type == "cpu":
+            start = int(A["cap"])
+            out[0][:start].copy_(A["cos"])
+            out[1][:start].copy_(A["sin"])
+        for a in range(start, cap, self.ROPE_CHUNK):
+            b = min(cap, a + self.ROPE_CHUNK)
+            pos = torch.arange(a, b, device=sm.dev).view(1, 1, -1).expand(3, 1, -1)
+            c, s = sm.rotary(x, pos)
+            out[0][a:b].copy_(c[0].to(torch.bfloat16))
+            out[1][a:b].copy_(s[0].to(torch.bfloat16))
+        return out
+
     def _arena_grow(self, need: int) -> None:
         self.arena(need)
 
     # -- binding a cache --------------------------------------------------------------------------------------
 
-    def _bind(self, cache: Any, need: int) -> None:
-        """`cache`'s layers bound to the program's arena and states: a cache the program holds already only
-        checked (a torch path may have replaced a state tensor, or a layer given up the arena); another one
-        takes them over, the one holding them before keeping copies of its own"""
+    def adopt(self, cache: Any, need: int) -> None:
+        """`cache`'s sparse layers bound to the program's arena, at least `need` rows deep: the cache the program
+        holds already only checked (a layer given up the arena is attached again), another one taking it over - the
+        one holding it before keeping copies of its own. The rows only: the linear layers' states are bound by a
+        pass's `begin` (`_bind`). A torch-path pass over an arena in RAM adopts its cache first (`attend_rows`), so
+        its rows go where the program's kernels read them"""
         sm = self._sm()
         assert sm is not None
         owner = self.owner() if self.owner is not None else None
@@ -718,7 +773,6 @@ class Qwen4Card:
             self.ctx = [None] * len(self.ple)
             self.seen = None
         A = self.arena(need)
-        S = self.states()
         grant = sm.scheduler.grant if getattr(sm, "scheduler", None) is not None else None
         for j, i in enumerate(self.sparse):
             cl = cache.layers[i]
@@ -737,10 +791,17 @@ class Qwen4Card:
                 cache.layers[i] = new
                 cl = new
             self.bound[j] = weakref.ref(cl)
-            pk_len = self.A["pk_len"] if self.A is not None else None
-            assert pk_len is not None
-            pk_len[j].zero_()
+            A["pk_len"][j].zero_()
             self.pooled[j] = 0
+
+    def _bind(self, cache: Any, need: int) -> None:
+        """`cache`'s layers bound to the program's arena and states: a cache the program holds already only
+        checked (a torch path may have replaced a state tensor, or a layer given up the arena); another one
+        takes them over, the one holding them before keeping copies of its own"""
+        sm = self._sm()
+        assert sm is not None
+        self.adopt(cache, need)
+        S = self.states()
         for j, i in enumerate(self.linear):
             cl = cache.layers[i]
             conv, rec = sm._lin(cl)
@@ -1122,6 +1183,102 @@ class Qwen4Card:
         )  # fmt: skip
         k.gemv_sgate(W["o"], B["att"][:M].view(M, Hq * D), qkv, B["y"][:M], D, D, 2 * D)
 
+    def attend_rows(
+        self, attn: Any, hs: torch.Tensor, pe: tuple[torch.Tensor, torch.Tensor], cache: Any, parents: list[int]
+    ) -> torch.Tensor:
+        """A torch-path pass's sparse attention for resident layer `attn.layer_idx` over the arena in RAM (`kv_host`):
+        the queries, the gate, the keys and values, and the indexer's query and raw key made as the reference makes
+        them (attend.py, qsa.py), the rows written into the arena, then the program's own kernels a slice of up to
+        ROWS rows at a time - the pooled keys caught up to the slice, its picks, the attention over them - so the card
+        reads the indexer's budget of rows a query whatever the context. A prefill's chunk is a chain of slices;
+        `parents` a verify pass's tree (ROWS rows at most) or a chain's. `hs` [1, T, H]; returns the output rows
+        [1, T, H] (o_proj through the gate), as the reference module returns them"""
+        from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_emb
+
+        sm = self._sm()
+        assert sm is not None
+        B, T, _ = hs.shape
+        chain = parents == list(range(-1, T - 1))
+        if B != 1 or (T > ROWS and not chain):
+            raise RuntimeError(
+                f"[card] Qwen4's attention over its rows in RAM takes one sequence and a tree of {ROWS} rows at most "
+                f"(a batch of {B}, {T} rows)"
+            )
+        i = int(attn.layer_idx)
+        j = self.sj[i]
+        r = max(1, self.r)
+        past = int(cache.layers[i].get_seq_length())
+        self.adopt(cache, past + T + ROWS)
+        cl = cache.layers[i]
+        past = int(cl.get_seq_length())
+        # the queries, the gate, the keys and the values, and the indexer's query and raw key, as the reference
+        cos, sin = (x[:, -T:, :] for x in pe)
+        hd = int(attn.head_dim)
+        q, gate = torch.chunk(attn.q_proj(hs).view(B, T, -1, hd * 2), 2, dim=-1)
+        gate = gate.reshape(B, T, -1)
+        q = attn.q_norm(q.reshape(B, T, -1, hd)).transpose(1, 2)
+        k = attn.k_norm(attn.k_proj(hs).view(B, T, -1, hd)).transpose(1, 2)
+        v = attn.v_proj(hs).view(B, T, -1, hd).transpose(1, 2)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        ix = attn.indexer
+        d = int(ix.index_head_dim)
+        qi, raw = torch.split(ix.index_qk_proj(hs), [int(ix.index_n_heads) * d, int(ix.index_kv_heads) * d], dim=-1)
+        qi = apply_rotary_pos_emb(ix.q_layernorm(qi.reshape(B, T, -1, d)), cos=cos, sin=sin, unsqueeze_dim=2)
+        # the rows into the arena (a growth there reallocates it: read after), then every slice over them
+        cl.update(k, v)
+        cl.update_indexer(raw.reshape(B, T, -1, d).squeeze(2))
+        A, Bf, kern, W = self.A, self.buffers(), self.k, self.weights(i)
+        assert A is not None
+        P = self._tree_rows()
+        qs = q[0].transpose(0, 1)
+        out = torch.empty(T, self.Hq, hd, dtype=hs.dtype, device=hs.device)
+        for s in range(0, T, ROWS):
+            e = min(T, s + ROWS)
+            t = e - s
+            n0 = past + s
+            # the pooled keys of every complete block before the slice: those its rows rewrote pooled again
+            done = min(self.pooled[j], n0 // r, int(cl.low) // r)
+            cl.low = sys.maxsize
+            A["pk_len"][j, 0].fill_(done)
+            P["n0"].fill_(n0)
+            if n0 // r > done:
+                kern.qsa_pool(
+                    A["raw"][j],
+                    A["pk"][j],
+                    A["pk_len"][j],
+                    P["n0"],
+                    A["cos"],
+                    A["sin"],
+                    W["ik"],
+                    self.eps,
+                    r,
+                    n0 // r - done,
+                )
+            self.pooled[j] = n0 // r
+            par = list(range(-1, t - 1)) if chain else parents
+            P["par"][:t].copy_(torch.tensor(par, dtype=torch.int32))
+            kern.qsa_select(
+                qi[0, s:e].contiguous(), A["pk"][j], A["raw"][j], P["n0"], P["par"][:t], A["cos"], A["sin"], W["ik"],
+                self.eps, r, self.ktop, A["scores"][:t], Bf["sel"][:t], Bf["nsel"][:t],
+            )  # fmt: skip
+            kern.qsa_attn_split(
+                qs[s:e].contiguous(), A["kv"][j, 0], A["kv"][j, 1], out[s:e], P["n0"], P["par"][:t], Bf["sel"][:t],
+                Bf["nsel"][:t], r, self.ktop, W["scale"], Bf["part_m"], Bf["part_l"], Bf["part_acc"], Bf["acnt"],
+            )  # fmt: skip
+        a = out.view(B, T, -1)
+        return attn.o_proj(a * torch.sigmoid(gate))
+
+    def _tree_rows(self) -> dict[str, torch.Tensor]:
+        """the length and the parents a torch-path slice over the arena in RAM hands the kernels (`attend_rows`)"""
+        P = self.P
+        if P is None:
+            P = self.P = self._alloc(
+                "the torch path's slices over the rows in RAM",
+                {"n0": ((1,), torch.int32), "par": ((ROWS,), torch.int32)},
+                "scratch",
+            )
+        return P
+
     def _delta(self, i: int, M: int, mode: str) -> None:
         """the gated DeltaNet: q|k|v|z|b|a in one gemv into the layer's own rows (the commit steps them again),
         the nodes stepped - a step's in place, a verify pass's in scratch from the cache's state - out_proj"""
@@ -1282,7 +1439,7 @@ class Qwen4Card:
         """the graphs reset and every buffer let go (a cache still bound keeps the arena's rows it views)"""
         self._drop_graphs()
         self.W.clear()
-        self.B = self.S = self.A = self.X = None
+        self.B = self.S = self.A = self.X = self.P = None
         self.owner = None
         self.bound = [None] * len(self.sparse)
         self.held.clear()

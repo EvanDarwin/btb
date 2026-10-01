@@ -52,8 +52,9 @@ MLX_ATTN_HEAD_DIMS: tuple[int, ...] = (128, 256)
 # a family that brings its own layer (Qwen4) verifies a speculative pass exactly only through btb's own kernels: the
 # host's node steps, and on a card its card program (`Family.verify_exact`; any other pass is plain, nothing
 # drafted). The load options a card sub-path takes the program off with, each named by the clause of the program's
-# own refusal (families/qwen4/card.py `why_not`) that turns it down - test_manifest holds each clause there
-CARD_PROGRAM_OFF: dict[str, str] = {"fp32": "sm.compute_dtype", "kv_host": "kv_host"}
+# own refusal (families/qwen4/card.py `why_not`) that turns it down - test_manifest holds each clause there. The KV in
+# RAM (`kv_host`) no longer does: the program keeps the rows there and reads them in place
+CARD_PROGRAM_OFF: dict[str, str] = {"fp32": "sm.compute_dtype"}
 # whether the cert's Qwen4 fixtures (tiny_q4 and its twins) are shaped as the card program's kernels are written: they
 # are not (`why_not`: "shapes the kernels are not written for"), so on a card every one of their passes is plain and a
 # speculative cell there proves nothing. True once a fixture the program takes stands in for them

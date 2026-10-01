@@ -173,6 +173,12 @@ class Family:
         plain block's checkpoints carry no such head)"""
         return None
 
+    def attn_index_bytes(self, cfg: Any, rows: int) -> tuple[int, int]:
+        """what a resident attention layer's index adds to its cache at `rows` positions, as the placement prices
+        it: (the bytes that stay on the card wherever the rows live - what every pass reads whole; the bytes that
+        live with the rows). The plain block's attention keeps no index: (0, 0)"""
+        return 0, 0
+
     def prepare(self, sm: _State) -> None:
         """what the family sets on the engine's config and on its transformers module once the engine knows its
         device, before any layer is made: nothing for the plain block"""

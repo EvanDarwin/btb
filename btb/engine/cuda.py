@@ -2207,6 +2207,20 @@ class _CudaMixin(_State):
             prog = self._cp = cls(self)
         return prog if prog.ok() else None
 
+    def _card_program_for_rows(self) -> Any:
+        """the family's card program where it keeps the attention's rows in RAM (`kv_host`: a context the card has no
+        room for) and runs the model as placed - a torch-path pass's sparse attention then reads the rows through its
+        kernels (Qwen4's `attend_rows`), so they never come to the card - else None"""
+        if not getattr(self, "kv_host", False) or self.dev.type != Device.CUDA or not self._card_program_on():
+            return None
+        cls = self.fam.card_program()
+        if cls is None or self._card_kernels() is None:
+            return None
+        prog = getattr(self, "_cp", None)
+        if prog is None:
+            prog = self._cp = cls(self)
+        return prog if prog.ok() else None
+
     def _card_graph_run(self, holder: Any, key: Any, body: Callable[[], None]) -> None:
         """`body`'s kernels as the graph `holder.graphs[key]`, captured on first use on the holder's stream and
         replayed on the current one; the engine's `card_program_eager` (a test's check) runs the body itself. The

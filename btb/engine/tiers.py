@@ -147,10 +147,14 @@ class _TiersMixin(_State):
         hq = int(cfg.num_attention_heads)
         hk = int(getattr(cfg, "num_key_value_heads", None) or hq)
         hd = int(getattr(cfg, "head_dim", None) or cfg.hidden_size // hq)
+        # an attention layer's index (Qwen4's sparse attention): its raw keys live with the rows, its pooled keys on
+        # the card wherever the rows are - under `kv_host` too, where nothing else of the cache is the card's
+        index_card, index_rows = self.fam.attn_index_bytes(cfg, kv_rows)
         kv_layer = {
-            i: 0 if self.layer_types[i] == LayerKind.LINEAR else 2 * hk * hd * (4 if fp32 else 2) * kv_rows
+            i: 0 if self.layer_types[i] == LayerKind.LINEAR else 2 * hk * hd * (4 if fp32 else 2) * kv_rows + index_rows
             for i in range(L)
         }
+        index_layer = {i: 0 if self.layer_types[i] == LayerKind.LINEAR else index_card for i in range(L)}
         # the drafter the load runs (`drafter`: speculation on, with the drafting head as its proposer), its dense
         # tensors and its head slice at bf16; a mixture in its layer is the expert store's, never placed with it
         drafter_b = (
@@ -186,7 +190,7 @@ class _TiersMixin(_State):
             tmpl_b = 0
         resident = []
         for i in reversed(range(L)):
-            b = bf16[i] * (2 if (fp32 and resident_fp32) else 1) + (0 if kv_host else kv_layer[i])
+            b = bf16[i] * (2 if (fp32 and resident_fp32) else 1) + (0 if kv_host else kv_layer[i]) + index_layer[i]
             if vram >= b:
                 resident.append(i)
                 vram -= b
@@ -207,7 +211,7 @@ class _TiersMixin(_State):
             ram -= head_host_b
         if drafter and not drafter_on_card:
             ram -= drafter_b
-        kv_card_b = 0 if kv_host else sum(kv_layer[i] for i in resident)
+        kv_card_b = (0 if kv_host else sum(kv_layer[i] for i in resident)) + sum(index_layer[i] for i in resident)
         kv_host_b = sum(kv_layer[i] for i in rest) + (sum(kv_layer[i] for i in resident) if kv_host else 0)
         ram -= kv_host_b
         total_rest = sum(stored[i] for i in rest)
@@ -635,6 +639,10 @@ class _TiersMixin(_State):
         """the rows of `layers` in `caches` moved to `dev`, granted together first where they come onto the card:
         a move the card cannot take is refused whole, before a row has moved"""
         dev = where(torch.device(dev))  # torch's own names too ('meta'), not only the ones --device takes
+        if dev.type == Device.CUDA and getattr(self, "kv_host", False):
+            # the attention's rows live in RAM (`kv_host`): a layer coming to the card leaves them there, its linear
+            # states (small, the layer's own step's) come with it
+            layers = [i for i in layers if self.layer_types[i] == LayerKind.LINEAR]
         sched = getattr(self, "scheduler", None)
         if dev.type == Device.CUDA and sched is not None:
             nbytes = sum(_rows_bytes(c, i, dev) for c in caches for i in layers)

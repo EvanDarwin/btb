@@ -1190,6 +1190,24 @@ class _Cuda:
             raise ValueError(f"[cuda] {call}: {', '.join(bad)} must be contiguous {name} on the card")
 
     @staticmethod
+    def _want_rows(call: str, dtype: torch.dtype, **named: torch.Tensor | None) -> None:
+        """`_want` for a card program's arena rows, which may be kept in RAM (`kv_host`): contiguous `dtype` on the
+        card, or in pinned host memory the kernels read in place (btb/engine/hostmem.py)"""
+        bad = [
+            k
+            for k, t in named.items()
+            if t is not None
+            and (
+                t.dtype != dtype
+                or not t.is_contiguous()
+                or not (t.is_cuda or (t.device.type == "cpu" and t.is_pinned()))
+            )
+        ]
+        if bad:
+            name = str(dtype).removeprefix("torch.")
+            raise ValueError(f"[cuda] {call}: {', '.join(bad)} must be contiguous {name} on the card or pinned in RAM")
+
+    @staticmethod
     def _at(t: torch.Tensor, off: int) -> ctypes.c_void_p:
         """the address of element `off` of contiguous `t`"""
         return ctypes.c_void_p(t.data_ptr() + int(off) * t.element_size())
@@ -1494,7 +1512,8 @@ class _Cuda:
         their width); row t sits at position n0 + depth[t] and cache slot n0 + t of `K`/`V` [kv_heads, cap, D]; the q
         heads go to `qo` [T, heads, D]. `wq`/`wk` [D] the zero-centred norms (None: none). `raw_key`: the QSA indexer
         - its key heads copied raw into `K` (the raw-key arena), `V` None."""
-        self._want("norm_rope_part", torch.bfloat16, qkv=qkv, qo=qo, K=K, V=V, cos=cos, sin=sin, wq=wq, wk=wk)
+        self._want("norm_rope_part", torch.bfloat16, qkv=qkv, qo=qo, wq=wq, wk=wk)
+        self._want_rows("norm_rope_part", torch.bfloat16, K=K, V=V, cos=cos, sin=sin)
         self._want("norm_rope_part", torch.int32, n0=n0, depth=depth)
         Hq, Hk, qs, ko, vo, q0 = int(heads), int(kv_heads), int(q_stride), int(k_off), int(v_off), int(q_col)
         if K.dim() != 3 or qkv.dim() != 2 or cos.dim() != 2:
@@ -1627,7 +1646,8 @@ class _Cuda:
         each the mean of its `ratio` raw keys, k_layernorm'd by `kw` [di] (zero-centred), roped by `cos`/`sin`
         [positions, rot] at its first position - into `pk` [NBcap, di] (NBcap >= cap // ratio), at most `max_new` of
         them a launch; pk_len[0] then n0 // ratio (pk_len[1] the launch's arrival count, zero between launches)."""
-        self._want("qsa_pool", torch.bfloat16, raw=raw, pk=pk, cos=cos, sin=sin, kw=kw)
+        self._want("qsa_pool", torch.bfloat16, pk=pk, kw=kw)
+        self._want_rows("qsa_pool", torch.bfloat16, raw=raw, cos=cos, sin=sin)
         self._want("qsa_pool", torch.int32, pk_len=pk_len, n0=n0)
         di, _cap, rot = self._qsa_keys("qsa_pool", raw, pk, cos, sin, kw, ratio)
         if pk_len.numel() != 2 or n0.numel() != 1 or int(max_new) < 1:
@@ -1675,7 +1695,8 @@ class _Cuda:
         `par` [T] int32 the tree (par -2: a padding row). `sel` [T, k_top] int32 takes each node's picked blocks in
         ascending order and `nsel` [T] int32 their count (k_top, or every complete block it sees when they number
         k_top or fewer; 0 for padding); `scores` [T, NBcap] float32 is the kernel's scratch."""
-        self._want("qsa_select", torch.bfloat16, qi=qi, pk=pk, raw=raw, cos=cos, sin=sin, kw=kw)
+        self._want("qsa_select", torch.bfloat16, qi=qi, pk=pk, kw=kw)
+        self._want_rows("qsa_select", torch.bfloat16, raw=raw, cos=cos, sin=sin)
         self._want("qsa_select", torch.int32, n0=n0, par=par, sel=sel, nsel=nsel)
         self._want("qsa_select", torch.float32, scores=scores)
         di, _cap, rot = self._qsa_keys("qsa_select", raw, pk, cos, sin, kw, ratio)
@@ -1751,7 +1772,8 @@ class _Cuda:
         `n0` [1] and `par` [T] int32 the tree as `btb_attn_split` walks it. The splits' states: `part_m`/`part_l`
         [S * T * Hq] and `part_acc` [S * T * Hq * D] float32, `cnt` [T * Hq] int32 (zero; the kernel leaves it zero),
         S = `qsa_splits(ratio, k_top)`."""
-        self._want("qsa_attn_split", torch.bfloat16, q=q, K=K, V=V, out=out)
+        self._want("qsa_attn_split", torch.bfloat16, q=q, out=out)
+        self._want_rows("qsa_attn_split", torch.bfloat16, K=K, V=V)
         self._want("qsa_attn_split", torch.int32, n0=n0, par=par, sel=sel, nsel=nsel, cnt=cnt)
         self._want("qsa_attn_split", torch.float32, part_m=part_m, part_l=part_l, part_acc=part_acc)
         if q.dim() != 3 or K.dim() != 3:

@@ -1601,9 +1601,10 @@ class ArenaIndexedLayer(GrantedIndexedLayer):
         if self._front(which, t):
             self._set_len(which, n)
             return
-        if t.device != a[which].device:
+        if t.device != a[which].device and not (self.in_ram and t.is_cuda):
             # rows moved to another device (the layer given up to the host): the layer leaves the arena, its other rows
-            # moved straight there - never copied on the card first, in the room a shed is short of
+            # moved straight there - never copied on the card first, in the room a shed is short of. Rows from the
+            # card to an arena kept in RAM are copied in: RAM is where they live
             self.detach(t.device, {which: t})
             return
         if int(t.shape[0]) != 1:
@@ -1674,6 +1675,7 @@ class ArenaIndexedLayer(GrantedIndexedLayer):
         prefix = path == list(range(n))
         if a is not None:
             if not prefix:
+                self._settle()
                 idx = torch.tensor(path, device=a[0].device) + base
                 for b in a[:2]:
                     b[:, base : base + n] = b.index_select(1, idx)
@@ -1741,6 +1743,18 @@ class ArenaIndexedLayer(GrantedIndexedLayer):
         """whether the layer's rows are an arena's (not a copy of their own)"""
         return self._arena is not None
 
+    @property
+    def in_ram(self) -> bool:
+        """whether the layer's arena is kept in RAM (`kv_host`), pinned, the card's kernels reading it in place"""
+        a = self._arena
+        return a is not None and a[0].device.type == "cpu"
+
+    def _settle(self) -> None:
+        """the card's kernels done with an arena in RAM before the host reads or moves its rows: they write it in
+        place, behind the host's back (a verify pass's rows, still landing as the commit asks for them)"""
+        if self.in_ram and torch.cuda.is_initialized():  # no kernel ran without the card started: nothing to wait for
+            torch.cuda.synchronize()
+
     def growth(self, B: int, T: int, Hk: int, d: int, dtype: torch.dtype, dev: torch.device) -> int:
         """nothing while attached: the arena grows by the program's own grant (`grow`); detached, as
         `GrantedIndexedLayer`'s"""
@@ -1755,6 +1769,7 @@ class ArenaIndexedLayer(GrantedIndexedLayer):
         a = self._arena
         if a is None:
             return
+        self._settle()
         given = given or {}
         k, v, raw = a
         nk, nv, ni = self._n

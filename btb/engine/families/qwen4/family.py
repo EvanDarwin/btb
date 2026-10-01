@@ -91,6 +91,11 @@ class Qwen4Family(Family):
             from .qsa import install
 
             install(indexer, sparse=bool(getattr(sm, "sparse", False)))
+            # a resident layer's attention over rows the card program keeps in RAM through the program's kernels
+            # (ram.py); a host layer's takes attend.py's over it (`finish_host_layer`)
+            from .ram import install as install_ram
+
+            install_ram(layer.self_attn, sm)
         # the DeltaNet and the n-gram embedding stepped node by node: the one-token step and a verify pass alike
         from .verify import install as install_steps
 
@@ -119,6 +124,16 @@ class Qwen4Family(Family):
         from .card import Qwen4Card
 
         return Qwen4Card
+
+    def attn_index_bytes(self, cfg: Any, rows: int) -> tuple[int, int]:
+        # the sparse attention's indexer: its pooled keys, one a block of `indexer_compress_ratio` rows, on the card
+        # whatever the rows' home (every pass scores them all: a million positions' worth read over the bus a pass
+        # was milliseconds a layer); a raw key a row, beside the keys and values (card.py `arena`)
+        r = int(getattr(cfg, "indexer_compress_ratio", 0) or 0)
+        di = int(getattr(cfg, "indexer_head_dim", 0) or 0)
+        if r <= 0 or di <= 0:
+            return 0, 0
+        return (int(rows) // r + 1) * di * 2, int(rows) * di * 2
 
     def drafter_cls(self) -> type[MTPDrafter] | None:
         from .drafter import Qwen4Drafter

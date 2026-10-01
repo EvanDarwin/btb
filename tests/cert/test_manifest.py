@@ -360,9 +360,11 @@ def test_own_layer_speculation_gate_matches_its_source() -> None:
         "the program's shape refusal moved; the fixture gate is stale"
     )
     verifies = {d.key for d in spec.DEVICE_SUBPATHS if manifest.own_layer_verifies(d)}
-    assert "cpu" in verifies and not {"cuda-torch", "cuda-kvhost", "mlx-step"} & verifies, verifies
-    # the cert's Qwen4 fixtures are shaped below the card kernels: no card sub-path drafts until one the program takes
+    assert "cpu" in verifies and not {"cuda-torch", "mlx-step"} & verifies, verifies
+    # the cert's Qwen4 fixtures are shaped below the card kernels: no card sub-path drafts until one the program takes -
+    # the KV in RAM among them, which the program now runs
     assert ("cuda-split" in verifies) == manifest.CARD_PROGRAM_FIXTURES, verifies
+    assert ("cuda-kvhost" in verifies) == manifest.CARD_PROGRAM_FIXTURES, verifies
 
 
 def test_mega_head_multiple_matches_its_source() -> None:

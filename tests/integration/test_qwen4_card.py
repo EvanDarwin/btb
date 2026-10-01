@@ -856,7 +856,7 @@ def test_the_program_names_what_keeps_it_off(card: StreamedTextModel, monkeypatc
         ),
         ("float32", [(sm, "compute_dtype", torch.float32)], None, "a float32 compute"),
         ("resident fp32", [(sm, "resident_fp32", True)], None, "a float32 compute"),
-        ("kv on the host", [(sm, "kv_host", True)], None, "not the card's tier"),
+        ("kv on the host", [(sm, "kv_host", True)], None, None),  # its rows kept in RAM, read in place
         ("no layer", [], (), "no layer on the card"),
         ("streamed", [], tuple(range(L - 1)), f"layer {L - 1} streamed through the card, neither resident nor on the host"),
         ("other kind", [], "full", "a layer type the program has no body for"),
@@ -964,3 +964,102 @@ def test_a_placement_whose_edge_the_ledger_refuses_takes_the_torch_path(
         assert len(toks) == 8, "the decode ran to its end on the torch path"
         prog.close()
         sm._cp = None
+
+
+# -- the attention's rows in RAM (`kv_host`): a context the card has no room for -----------------------------------
+
+RAM_CONTEXT = 8192
+
+
+@pytest.fixture(scope="module")
+def ram(card_path: str) -> Iterator[StreamedTextModel]:
+    """the card fixture with its attention's rows kept in RAM, for a context of RAM_CONTEXT positions"""
+    sm = host_model(
+        card_path,
+        device="cuda",
+        dtype=torch.bfloat16,
+        cpu_layers=[],
+        resident_layers=range(layer_count(card_path)),
+        kv_host=True,
+        context=RAM_CONTEXT,
+    )
+    try:
+        yield sm
+    finally:
+        sm.close()
+
+
+def test_a_cache_kept_in_ram_keeps_its_rows_there_and_reads_them_in_place(ram: StreamedTextModel) -> None:
+    """With the rows in RAM the program runs the model: the sparse layers' keys, values and raw indexer keys, and
+    the rope's tables, are pinned host memory made once for the whole context - never on the card, where only the
+    pooled keys and the scores are - and the prefill (its chunk in slices of the program's rows) and the program's
+    steps after it read and grow them there. (Against the rows-on-the-card engine the logits part by the prefills'
+    rounding compounded through the layers - 6% here, the attention itself within 2% of the reference's on the same
+    rows: `test_the_attention_over_rows_in_ram_is_the_reference_modules`)"""
+    steps = (NEXT, 5, 9)
+    with torch.inference_mode():
+        for name, prompt in PROMPTS.items():
+            cache, first = _prefilled(ram, prompt)
+            prog = _prog(ram)
+            A = prog.A
+            assert A is not None and int(A["cap"]) >= RAM_CONTEXT, "the arena not made for the whole context"
+            for key in ("kv", "raw", "cos", "sin"):
+                assert A[key].device.type == "cpu" and A[key].is_pinned(), f"{name}: the arena's {key} not in RAM"
+            assert A["pk"].is_cuda and A["scores"].is_cuda, f"{name}: the pooled keys or the scores left the card"
+            assert torch.isfinite(first).all(), f"{name}: the prefill's logits"
+            n = len(prompt)
+            for t in steps:
+                assert torch.isfinite(forward_logits(ram, [[t]], cache)[0, -1]).all(), f"{name}: a step's logits"
+                n += 1
+            assert any(k[2] == "step" for k in prog.graphs if len(k) == 4), f"{name}: the steps were not the program's"
+            for i in prog.sparse:
+                cl = cache.layers[i]
+                assert isinstance(cl, ArenaIndexedLayer) and cl.in_ram and cl.keys is not None, f"{name}: layer {i}"
+                assert cl.keys.device.type == "cpu" and cl.get_seq_length() == n, f"{name}: layer {i}'s rows"
+
+
+def test_the_attention_over_rows_in_ram_is_the_reference_modules(ram: StreamedTextModel) -> None:
+    """one sparse layer's attention over the rows in RAM (`attend_rows`: the program's picks and attention, a slice
+    at a time) against the reference module's over a copy of the same rows on the card - the same new rows, the same
+    rope, the indexer's reference selection - within the sums' rounding: short of the indexer's budget, where every
+    block is seen, and past it, where it picks; three new rows and a chunk of forty (two slices)"""
+    from transformers.cache_utils import DynamicCache
+
+    from btb.engine.cache import GrantedIndexedLayer
+
+    sm = ram
+    H = int(sm.cfg.hidden_size)
+    g = torch.Generator(device="cuda").manual_seed(5)
+    with torch.inference_mode():
+        for name, prompt in PROMPTS.items():
+            for T in (3, 40):
+                cache, _ = _prefilled(sm, prompt)
+                prog = _prog(sm)
+                i = prog.sparse[-1]
+                attn = sm.resident[i].self_attn
+                past = cache.layers[i].get_seq_length()
+                ik = indexer_keys(cache.layers[i])
+                assert ik is not None
+                # the reference's cache: the same rows on the card
+                ref = DynamicCache(config=sm.cfg)
+                ref.layers[i] = GrantedIndexedLayer(None)
+                ref.layers[i].update(cache.layers[i].keys.cuda(), cache.layers[i].values.cuda())
+                ref.layers[i].update_indexer(ik.cuda())
+                hs = torch.randn(1, T, H, generator=g, device="cuda").to(torch.bfloat16)
+                pos = torch.arange(past + T, device="cuda").view(1, 1, -1).expand(3, 1, -1)
+                pe = sm.rotary(hs, pos)
+                causal = torch.ones(T, past + T, dtype=torch.bool, device="cuda").tril(past).view(1, 1, T, past + T)
+                want, _ = type(attn).forward(attn, hs, pe, causal, ref)
+                got = prog.attend_rows(attn, hs, pe, cache, list(range(-1, T - 1)))
+                err = rel_err(got.float(), want.float())
+                assert err < 0.02, f"{name}, {T} rows: the attention over rows in RAM is {err:.4f} from the reference's"
+
+
+def test_a_verify_pass_over_rows_in_ram_is_its_paths_steps(ram: StreamedTextModel) -> None:
+    """the rows in RAM, each node of a tree's verify pass is the one-token steps of its path, bit for bit, and the
+    commit leaves the cache as those steps would: the same kernels over the same rows, wherever they lie"""
+    _verify_is_steps(ram)
+
+
+def test_a_speculative_decode_over_rows_in_ram_is_the_plain_decode(ram: StreamedTextModel) -> None:
+    _speculative_is_plain(ram)

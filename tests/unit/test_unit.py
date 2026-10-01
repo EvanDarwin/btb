@@ -845,12 +845,16 @@ def _probe(L: int = 8, layer_bytes: int = 64 * 2**20, hk: int = 2, hd: int = 64)
     """a model opened on the CPU as the planner sees it: sizes off the headers, nothing loaded"""
     import types
 
+    from btb.engine.families import Family
+    from btb.kinds import FamilyKind
+
     cfg = types.SimpleNamespace(
         vocab_size=1000, hidden_size=256, num_attention_heads=4, num_key_value_heads=hk, head_dim=hd
     )
     return types.SimpleNamespace(
         L=L,
         cfg=cfg,
+        fam=Family(kind=FamilyKind.QWEN3),  # the plain block's flags: no mixture, no attention index
         layer_types=["full_attention"] * L,
         weight_map={},
         _layer_bytes=lambda i: layer_bytes,
@@ -893,6 +897,44 @@ def test_plan_prices_the_cache_for_the_context() -> None:
     assert out["kv_read_ms"] == 8 * 64 * MB / RAM_BPS * 1e3 and budget()["kv_read_ms"] == 0.0
 
 
+def test_plan_keeps_a_sparse_attentions_pooled_keys_on_the_card_with_the_rows_in_ram() -> None:
+    """Qwen4's sparse attention indexes its rows: a raw key a row, which lives with the rows, and a pooled key a
+    block, which every pass scores whole and so stays on the card - under `kv_host` too, where nothing else of the
+    cache is the card's. At a million positions the pooled keys are the card's share of the context"""
+    from btb.engine.families.base import _flags
+    from btb.engine.families.qwen4.family import Qwen4Family
+    from btb.engine.tiers import _TiersMixin
+    from btb.kinds import FamilyKind
+
+    MB = 2**20
+    p = _probe()
+    p.fam = Qwen4Family(kind=FamilyKind.QWEN4, streams=4, **_flags(FamilyKind.QWEN4))
+    p.layer_types = ["qwen_sparse_attention", "linear_attention"] * 4
+    p.cfg.indexer_compress_ratio, p.cfg.indexer_head_dim = 4, 128
+    rows = 1 << 20
+    pooled, raw = (rows // 4 + 1) * 128 * 2, rows * 128 * 2
+    assert p.fam.attn_index_bytes(p.cfg, rows) == (pooled, raw)
+    out = _TiersMixin.plan_budget(
+        cast("_TiersMixin", p),
+        ram_gb=256.0,
+        vram_gb=64.0,
+        packed=False,
+        fp32=False,
+        drafter=False,
+        prefill_card=False,
+        os_reserve_gb=1.0,
+        vram_reserve_gb=0.5,
+        context=rows,
+        kv_host=True,
+    )
+    kv_row = 2 * 2 * 64 * 2 * rows  # keys and values: 2 heads of 64, bf16
+    assert len(out["resident"]) == 8
+    assert out["bytes"]["kv_card"] == 4 * pooled, "the four sparse layers' pooled keys, and nothing else"
+    assert out["bytes"]["kv_host"] == 4 * (kv_row + raw), "their rows and raw keys in RAM; DeltaNet keeps none"
+    # the card's share: 64 MiB a layer at a million positions, a twelfth of what the layer keeps in RAM
+    assert pooled == 64 * MB + 256 and (kv_row + raw) / pooled == pytest.approx(12.0, rel=1e-4)
+
+
 def test_an_mlx_plan_prices_the_gpu_and_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
     """on Apple silicon a pass reads its layers and the head on the GPU from the one memory: the prediction is those
     bytes at the GPU's measured read rate (not the host tier's CPU price and its host head), and the summary puts
@@ -905,7 +947,6 @@ def test_an_mlx_plan_prices_the_gpu_and_says_so(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(btb.mlx, "read_bps", lambda: 100e9)
     p = _probe()
     p.plan_budget = lambda *a, **kw: _TiersMixin.plan_budget(cast("_TiersMixin", p), *a, **kw)
-    p.fam = types.SimpleNamespace(moe=False)
     hb = HostBudget(total=64 * GB, available=48 * GB, commit=64 * GB, footprint=0, os_floor=0, growth=0, floor=4 * GB)
     pl = BatchScheduler.plan_placement(p, "mlx", 0.0, packed=False, fp32=False, vram_reserve_gb=0.0, budget=hb)
     assert len(pl.warm) == 8 and not pl.cold and pl.gpu_bps == 100e9

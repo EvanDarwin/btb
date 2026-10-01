@@ -176,9 +176,11 @@ def host_model(
     expert_cache_gb: float | None = None,
     prefill_chunk: int | None = None,
     kv_bits: int | None = None,
+    kv_host: bool = False,
+    context: int | None = None,
 ) -> StreamedTextModel:
     """the engine as the receipts run it: the head resident, every layer on the host tier unless placed
-    otherwise, quiet; `packed` binds the 12-bit store"""
+    otherwise, quiet; `packed` binds the 12-bit store; `kv_host` keeps a resident layer's attention rows in RAM"""
     from btb.engine import StreamedTextModel
 
     sm = StreamedTextModel(
@@ -193,6 +195,8 @@ def host_model(
         expert_cache_gb=expert_cache_gb,
         prefill_chunk=prefill_chunk,
         kv_bits=kv_bits,
+        kv_host=kv_host,
+        context=context,
     )
     if packed:
         sm.open_packed()
