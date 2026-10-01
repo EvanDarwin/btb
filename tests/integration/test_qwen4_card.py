@@ -294,6 +294,28 @@ def test_the_program_holds_what_it_was_granted(card: StreamedTextModel) -> None:
         assert granted.get("scratch@cpu", 0) >= prog.held["the host's pinned rows"]
 
 
+def test_a_let_go_drops_the_programs_blocks_and_the_next_pass_reads_them_again(card: StreamedTextModel) -> None:
+    """a shed lets the card's graphs go first (`_card_let_go`), the program's with them: its merged weight blocks,
+    their float32 operands and its graphs - held, a layer shed freed nothing on the card, and a yield gave up every
+    layer and the head for one cut of the budget. The next pass reads them again, and its logits are the ones
+    before, bit for bit"""
+    sm = card
+    with torch.inference_mode():
+        cache, _ = _prefilled(sm, PROMPTS["short"])
+        before = forward_logits(sm, [[NEXT]], cache)[0, -1].clone()
+        prog = _prog(sm)
+        assert prog.W and prog.graphs, "no pass ran the program"
+        sm._card_let_go()
+        assert not prog.W and not prog.graphs, "the program kept its blocks or its graphs through a let-go"
+        assert not [w for w in prog.held if w.endswith("operands in float32")], f"operands still held: {prog.held}"
+        assert prog.held_bytes() == sum(prog.held.values()), prog.held
+        del cache
+        cache, _ = _prefilled(sm, PROMPTS["short"])
+        after = forward_logits(sm, [[NEXT]], cache)[0, -1]
+        assert prog.W and prog.graphs, "the pass after the let-go did not run the program"
+    assert torch.equal(before, after), f"the pass after a let-go parts by {float((before - after).abs().max()):.3e}"
+
+
 def test_a_state_left_in_bf16_is_widened_in_place_on_the_torch_path(card: StreamedTextModel) -> None:
     """the torch path's DeltaNet step on the card (the program off) over a recurrent state a pass left in bf16: the
     state is widened to float32 in place in the cache, once, and the step computes as it does over the same values

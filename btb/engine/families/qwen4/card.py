@@ -381,6 +381,13 @@ class Qwen4Card:
 
     # -- the weights ------------------------------------------------------------------------------------------
 
+    def let_go(self) -> None:
+        """the merged blocks, their float32 operands and the graphs let go now - what a new placement's `ok()` does
+        on the next pass - the arena and a bound cache's rows kept: a layer the engine sheds meanwhile frees its
+        blocks on the card at once (the modules only view them; held here, a shed freed nothing and a yield gave up
+        every layer and the head for one cut of the budget). Read again, lazily, as the next pass asks"""
+        self._reset_weights()
+
     def _reset_weights(self) -> None:
         self.W.clear()
         # the operands the weights' reading made go with them (a merged block is the modules' own, granted as moved)

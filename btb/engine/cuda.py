@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ctypes
 import functools
+import gc
 import itertools
 import os
 import sys
@@ -544,6 +545,7 @@ class _CudaMixin(_State):
     _cg: Any
     CARD_T_MAX = 32
     ATTN_SPLIT = 1024  # keys per attention block along the sequence (ATTN_SPLIT in btb_kernels.cu)
+    PROGRAM_SAMPLES = 5  # the timed replays of each width a card program's warm-up keeps the fastest of
 
     def _card_kernels(self) -> Any:
         """the card's kernels, else None once `_card_warning` has said why the card runs through torch alone"""
@@ -652,10 +654,13 @@ class _CudaMixin(_State):
         which the modules only view), keeping the arena and the rope tables the cache and the next state carry over;
         and the kv_host step's graphs (`_g`), which read the modules' weights by pointer. A layer shed while these
         hold its blocks frees nothing on the card - a yield once shed every layer for nothing - and a graph kept past
-        its layer's regrowth would replay freed memory. The next pass builds what it needs again"""
+        its layer's regrowth would replay freed memory. A family's card program (`_cp`) the same: its merged blocks
+        and graphs (`let_go`), which held every resident layer's weights through Qwen4's sheds. The next pass builds
+        what it needs again"""
         st = getattr(self, "_cg", None)
         g = vars(self).pop("_g", None)
-        if st is None and g is None:
+        cp = getattr(self, "_cp", None)
+        if st is None and g is None and cp is None:
             return
         torch.cuda.synchronize(self.dev)  # nothing still replaying into what goes
         before = self._trace_mem()
@@ -667,6 +672,8 @@ class _CudaMixin(_State):
         if g is not None:
             for graph in _graphs_in(g):
                 graph.reset()
+        if cp is not None:
+            cp.let_go()
         torch.cuda.empty_cache()
         if trace.ON:  # no log line says this: the trace does
             trace.event("card graph: let go, the next pass builds it again%s", self._trace_grew(before))
@@ -1970,8 +1977,9 @@ class _CudaMixin(_State):
     def _card_program_warm(self, ids_t: torch.Tensor, t_max: int) -> int:
         """a family's card program's cost curve, measured up front with no cache and no expert read: for each graph
         width M the passes of 1 .. `t_max` rows take, the program's verify graphs replayed (captured on the first
-        one, the fastest of the two after it counted) at the context of `ids_t`'s length, the host's part between
-        the layers only the wait for each router's publish (`_card_program_time`). The curve (`_card_prog_cost`) is
+        one, timed on the card's clock over PROGRAM_SAMPLES after it, the fastest counted) at the context of `ids_t`'s
+        length, plus the host's handshake between the layers - the wait for each router's publish - once, the
+        cleanest pass's (`_card_program_time`). The curve (`_card_prog_cost`) is
         the card's compute a pass of T rows costs - the rows' experts and the host layers are not in it - so it is
         the engine's pass cost (`_card_cost`, which sizes a pass the pricer does not) only where the program runs the
         whole model on the card, as `card_warm`'s curve is. Every other graph (the step's, a tap's, a commit's) is
@@ -1986,17 +1994,33 @@ class _CudaMixin(_State):
             return 0
         n0 = max(1, int(ids_t.shape[-1]))
         before = len(prog.graphs)
-        by_m: dict[int, float] = {}
-        cost: dict[int, float] = {}
+        widths = sorted({self._card_m(T) for T in range(1, t_max + 1)})
         with torch.inference_mode(), self.device.hold() as place:
             if place.version != prog.version:
                 return 0
-            for T in range(1, t_max + 1):
-                M = self._card_m(T)
-                if M not in by_m:
-                    times = [self._card_program_time(prog, M, n0) for _rep in range(3)]
-                    by_m[M] = min(times[1:])  # the first one captures
-                cost[T] = by_m[M]
+            for M in widths:
+                self._card_program_time(prog, M, n0)  # the first replay of a width captures its graphs: untimed
+            # each width timed PROGRAM_SAMPLES times, the widths in turns
+            samples: dict[int, list[tuple[float, float]]] = {M: [] for M in widths}
+            for _rep in range(self.PROGRAM_SAMPLES):
+                for M in widths:
+                    samples[M].append(self._card_program_time(prog, M, n0))
+        # a width's compute is its graphs' time on the card's clock, the fastest sample's; the host's handshake (the
+        # launches, the wait for each router's publish past the card's own work) is the same whatever the rows, so
+        # one figure for every width - the cleanest pass's. By the host's clock alone, the wait carried every delay
+        # the card's queue saw: 0.4 to 200 ms a pass beside another program, the 2-row pass priced at 6, 21 and 53
+        # one-row ones where its samples caught the bursts and the 1-row ones did not - and speculation with it
+        card = {M: min(c for _w, c in got) for M, got in samples.items()}
+        handoff = min(max(0.0, w - c) for got in samples.values() for w, c in got)
+        if trace.ON:
+            for M, got in samples.items():
+                trace.event(
+                    "card program warm-up: %d-row passes on the card %s ms, by the host's clock %s",
+                    M,
+                    " ".join(f"{c * 1e3:.2f}" for _w, c in got),
+                    " ".join(f"{w * 1e3:.2f}" for w, _c in got),
+                )
+        cost = {T: card[self._card_m(T)] + handoff for T in range(1, t_max + 1)}
         self._card_prog_cost = cost
         if not self.host:
             self._card_cost = cost
@@ -2009,28 +2033,43 @@ class _CudaMixin(_State):
         )
         return len(prog.graphs) - before
 
-    def _card_program_time(self, prog: Any, T: int, n0: int) -> float:
-        """seconds one T-row verify pass of the program's resident layers takes on the card at `n0` rows of
-        context: its segments' graphs, closes and tail replayed in turn with the host's part rehearsed
-        (`between(i, dry=True)`: the publish waited for, no expert read) and the host layers left out - the card's
-        compute a pass of T rows costs, over the program's own buffers and no cache (`rehearse`)"""
+    def _card_program_time(self, prog: Any, T: int, n0: int) -> tuple[float, float]:
+        """(seconds by the host's clock, seconds of the graphs on the card's): one T-row verify pass of the
+        program's resident layers on the card at `n0` rows of context - its segments' graphs, closes and tail
+        replayed in turn with the host's part rehearsed (`between(i, dry=True)`: the publish waited for, no expert
+        read) and the host layers left out - the card's compute a pass of T rows costs, over the program's own
+        buffers and no cache (`rehearse`)"""
         M = prog.rehearse(T, n0)
         L = int(prog.L)
-        run = self._card_graph_run
         mode, tap = "tree", False
+        spans: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+
+        def run(key: Any, body: Callable[[], None]) -> None:
+            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            e0.record()
+            self._card_graph_run(prog, key, body)
+            e1.record()
+            spans.append((e0, e1))
+
+        collecting = gc.isenabled()
         try:
             torch.cuda.synchronize(self.dev)
+            # a collection the replays' small allocations set off is the host's time, not the pass's
+            gc.disable()
             t0 = time.perf_counter()
             for a, b in prog.segs:
                 for j in range(a, b):
-                    run(prog, (j, M, mode, tap), functools.partial(prog.layer_body, j, M, mode, tap))
+                    run((j, M, mode, tap), functools.partial(prog.layer_body, j, M, mode, tap))
                     prog.between(j, dry=True)
                 if b < L:
-                    run(prog, ("close", b - 1, M, mode, tap), functools.partial(prog.close_body, b - 1, M, mode, tap))
-            run(prog, (L, M, mode, tap), functools.partial(prog.tail_body, M, mode, tap))
+                    run(("close", b - 1, M, mode, tap), functools.partial(prog.close_body, b - 1, M, mode, tap))
+            run((L, M, mode, tap), functools.partial(prog.tail_body, M, mode, tap))
             torch.cuda.synchronize(self.dev)
-            return time.perf_counter() - t0
+            wall = time.perf_counter() - t0
+            return wall, sum(e0.elapsed_time(e1) for e0, e1 in spans) / 1e3
         finally:
+            if collecting:
+                gc.enable()
             prog.rehearsed()
 
     def _spec_full(self, v_max: int | None = None) -> int:

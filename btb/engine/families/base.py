@@ -163,7 +163,9 @@ class Family:
     def card_program(self) -> type[Any] | None:
         """the class of the family's own card program - its layers' step and verify pass as graphs over btb's card
         kernels, the engine's runner replaying them in turn (cuda.py `_forward_card_program`) - or None where the
-        family's layers take the card graph or the torch path; the plain block's take those"""
+        family's layers take the card graph or the torch path; the plain block's take those. A program answers
+        `ok()` (whether it runs the model as placed now), `let_go()` (its weight blocks and graphs dropped before a
+        shed, read again as asked) and `close()`"""
         return None
 
     def drafter_cls(self) -> type[MTPDrafter] | None:
