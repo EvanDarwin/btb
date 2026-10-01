@@ -21,6 +21,7 @@ import numpy as np
 import torch
 
 from .. import mlx as mlxdev
+from .. import trace
 from ..fp8 import F8Weight
 from ..kinds import PassTag
 from ..mxfp4 import BLOCK, MxGateUp, MxWeight, stored_mxfp4
@@ -28,7 +29,7 @@ from ..options import Device
 from .device import where
 from .host import bf16_in_place, stored_parts
 from .native import Native
-from .scheduler import MemoryGrantError
+from .scheduler import MemoryGrantError, _size
 
 if TYPE_CHECKING:
     from concurrent.futures import ThreadPoolExecutor
@@ -1276,6 +1277,10 @@ class _ExpertStore:
         """keep `nbytes` free above the reserve for another program for `seconds`: every call gives blocks back until
         the host has that much (`call`'s release) and the store grows into none of it meanwhile (`_grow`). The RAM
         watcher's, from its own thread - two plain stores the calls read"""
+        if trace.ON and not self.held():  # a hold begun, said once: the watcher renews it four times a second
+            trace.event(
+                "experts: the store holds %s free for another program for %.0f s", _size(int(nbytes)), float(seconds)
+            )
         self._hold = (int(nbytes), time.time() + float(seconds))
 
     def held(self) -> int:
@@ -1452,7 +1457,7 @@ class _ExpertStore:
         buf, ledger = self.vram.buf, getattr(self.sm, "device", None)
         if ledger is not None and buf is not None:
             ledger.lend(lambda: buf, n * per, dev, counted=False)
-        self.sm.log(f"[experts] {n} seats on the card ({n * per / 2**30:.2f} GB) for the most ridden experts")
+        self.sm.log(f"[experts] {n} seats on {dev} ({n * per / 2**30:.2f} GB) for the most ridden experts")
 
     @staticmethod
     def expert_s(drive: dict[str, Any], per: int) -> float:

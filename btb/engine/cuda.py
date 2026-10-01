@@ -18,15 +18,18 @@ import torch
 import torch.nn.functional as F
 
 from .. import mlx as mlxdev
+from .. import trace
 from ..kinds import LayerKind, NodePath, Parents, PassTag, Tokens
 from ..options import Device
 from ..sampling import GREEDY
+from . import device as device_mod
 from .cache import CardRowsLayer, GrowLayer, attention_rows, forked, indexer_keys, set_rows
 from .families import act_name
 from .fixed_rows import KeyRows
 from .forward import chain_of, layer_window, node_mask, pe_for
 from .fused import _fused_rope
 from .native import Native, kernels_path
+from .scheduler import _size
 from .spec_cost import SpecCost
 from .state import _State
 
@@ -275,6 +278,13 @@ class _Tuner:
             mid = sorted(m)[len(m) // 2]
             self.shift = self.shift + 1 if abs(w - mid) > 2.0 * self.margin * mid else 0
             if self.shift >= 2:
+                trace.event(
+                    "tuner: the load on the card moved (%s at %.2f ms a token, its median %.2f) - measuring every "
+                    "lane afresh",
+                    self.labels[self.chosen],
+                    1e3 * w,
+                    1e3 * mid,
+                )
                 self._afresh()
                 self.meds[self.chosen].append(w)
                 self.arm = self._next_arm()
@@ -648,6 +658,7 @@ class _CudaMixin(_State):
         if st is None and g is None:
             return
         torch.cuda.synchronize(self.dev)  # nothing still replaying into what goes
+        before = self._trace_mem()
         if st is not None:
             for graph in _graphs_in(st["graphs"]):
                 graph.reset()
@@ -657,13 +668,18 @@ class _CudaMixin(_State):
             for graph in _graphs_in(g):
                 graph.reset()
         torch.cuda.empty_cache()
+        if trace.ON:  # no log line says this: the trace does
+            trace.event("card graph: let go, the next pass builds it again%s", self._trace_grew(before))
 
     def _card_oom(self, e: BaseException) -> None:
         """a card-graph build the card had no room for (another program took it mid-pass): the graphs let go, the
         card graph off for this placement - the pass runs the torch path - and back once the placement moves"""
-        self.log(f"[card] no room on the card for the card graph ({str(e).splitlines()[0][:120]}): the torch path")
         self._card_let_go()
         self._card_off_ver = self.device.snapshot().version
+        self.log(
+            f"[card] no room on the card for the card graph ({str(e).splitlines()[0][:120]}): the torch path until "
+            f"the placement moves (version {self._card_off_ver})"
+        )
 
     def _card_state(self) -> dict[str, Any]:
         ver = self.device.snapshot().version
@@ -920,25 +936,39 @@ class _CudaMixin(_State):
         """Which GEMV a T-row pass runs: the fp32 chain (`gemv_rows`) or the tensor-core kernel
         (`btb_gemv_mma.cuh`); `card_mma` / BTB_CARD_MMA force it, else `card_warm`'s measurement. One kernel
         for every width: the two sum a row in different orders, and a step on one with a pass on the other
-        would part at a bf16 near-tie."""
+        would part at a bf16 near-tie. The warm-up's choice is the engine's (`_mma_for`, `_mma_one`): the card's and
+        the model's, not the placement's, so no card state carries it and none left behind holds it."""
+        on, why = self._card_mma_pick(T)
+        if trace.ON:  # a pass's path: nothing built for the trace when it is off
+            trace.changed(
+                (trace.token(self), "card gemv", T),
+                on,
+                "card gemv: %d-row passes take the %s kernel (%s)",
+                T,
+                "tensor-core" if on else "fp32-chain",
+                why,
+            )
+        return on
+
+    def _card_mma_pick(self, T: int) -> tuple[bool, str]:
+        """`_card_mma_for`'s answer and what gave it"""
         if not self._card_mma_avail():
-            return False
+            return False, "no tensor-core kernel in this build"
         on = getattr(self, "card_mma", None)
         if on is None:
             env = os.environ.get("BTB_CARD_MMA")
             if env in ("0", "1"):
-                on = env == "1"
+                return env == "1", "BTB_CARD_MMA"
         if on is not None:
-            return bool(on)
-        st = getattr(self, "_cg", None)
-        choice = st.get("mma_for") if st is not None else None
+            return bool(on), "card_mma"
+        choice: dict[int, bool] | None = vars(self).get("_mma_for")
         if choice is not None and T in choice:
-            return bool(choice[T])
-        one = st.get("mma_one") if st is not None else None
+            return bool(choice[T]), "the warm-up measured it at this width"
+        one = vars(self).get("_mma_one")
         if one is not None:
             # a width past the timed ones (a long prompt's prefill) takes the engine's kernel
-            return bool(one)
-        return False
+            return bool(one), "past the widths the warm-up timed: the engine's kernel"
+        return False, "not measured yet"
 
     @staticmethod
     def _card_mma_grid(R: int, C: int) -> int:
@@ -1324,11 +1354,35 @@ class _CudaMixin(_State):
             body()
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
+        before = self._trace_mem()
         cg = torch.cuda.CUDAGraph()
         with torch.cuda.graph(cg, pool=st["pool"], stream=s):
             body()
         g["graph"] = cg
-        self.log(f"[card] {what}")
+        self.log(f"[card] {what}{self._trace_grew(before)}")
+
+    def _trace_mem(self) -> tuple[int, int]:
+        """-vv: torch's reserved bytes on the card and the bytes Windows counts this process using there, to say
+        what a step took on the card and where it sits (0s with the trace off)"""
+        if not trace.ON:
+            return 0, 0
+        torch.cuda.synchronize(self.dev)
+        info = device_mod._wddm_info(self.dev)
+        # free-read: the trace's figure, never a decision
+        return int(torch.cuda.memory_reserved(self.dev)), (info[1] if info is not None else 0)
+
+    def _trace_grew(self, before: tuple[int, int]) -> str:
+        """-vv: the card memory taken since `before` (`_trace_mem`), as the tail of the line that says what took it -
+        in torch's pools, and past them (the driver's graph execs, the context); '' with the trace off"""
+        if not trace.ON:
+            return ""
+        res, used = self._trace_mem()
+        d_res = res - before[0]
+        d_out = (used - before[1]) - d_res if used and before[1] else 0
+        # signed: a capture starts by emptying torch's cache (torch.cuda.graph), so the blocks it held show as given
+        return f" ({'+' if d_res >= 0 else '-'}{_size(abs(d_res))} in torch's pools, " + (
+            f"{'+' if d_out >= 0 else '-'}{_size(abs(d_out))} outside them)"
+        )
 
     def _card_capture(self, st: dict[str, Any], g: dict[str, Any]) -> None:
         """Capture the pass graph over `g`'s buffers. The sequence runs once eagerly first (the module's
@@ -1434,11 +1488,20 @@ class _CudaMixin(_State):
                 f"{' (the fused kernels)' if fused else ''}",
             )
             g["execs"] = [g["graph"]]
+            before = self._trace_mem()
             for e in range(1, len(g["pin_tok"]) // U):
                 cg = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(cg, pool=st["pool"], stream=st["stream"]):
                     body(e)
                 g["execs"].append(cg)
+            if trace.ON:  # no log line says this: the trace does
+                trace.event(
+                    "card graph: %d more execs of the %d-step lane%s%s",
+                    len(g["execs"]) - 1,
+                    U,
+                    " (fused)" if fused else "",
+                    self._trace_grew(before),
+                )
             g["n0"].fill_(past)
             g["ids"].fill_(first)
         if not smp.greedy:
@@ -1809,8 +1872,11 @@ class _CudaMixin(_State):
             if forced is None and os.environ.get("BTB_CARD_MMA") in ("0", "1"):
                 forced = os.environ["BTB_CARD_MMA"] == "1"
             variants = [bool(forced)] if forced is not None else ([False, True] if self._card_mma_avail() else [False])
-            choice: dict[int, bool] = st.setdefault("mma_for", {})
+            # the engine's one kernel is the card's and the model's (`_card_mma_pick`); each variant set per width while
+            # it is timed, the choice made after
+            choice: dict[int, bool] = self.__dict__.setdefault("_mma_for", {})
             timed_all: dict[int, dict[bool, float]] = {}
+            moved = False
             for T in range(1, t_max + 1):
                 if not self._card_pass_ok(cache, 1, T, cache.get_seq_length(), None, None, None):
                     break
@@ -1825,6 +1891,12 @@ class _CudaMixin(_State):
                     finally:
                         self.ab()
                     self.ad(cache, base, [0])
+                if self._card_state() is not st:
+                    # the placement moved during the warm-up (room made on demand for its passes): these graphs are
+                    # another placement's, and the widths timed so far choose
+                    self.log(f"[card] the warm-up stops at {T}-row passes: the placement moved under it")
+                    moved = True
+                    break
                 timed: dict[bool, float] = {m: float("inf") for m in variants}
                 keys = {m: [(*sg, T, tails[sg], m) for sg in segs] for m in variants}
                 if any(
@@ -1855,6 +1927,11 @@ class _CudaMixin(_State):
                         f"[card] {T}-row pass: fp32 chain {timed[False] * 1e3:.2f} ms, tensor cores "
                         f"{timed[True] * 1e3:.2f} ms"
                     )
+            # a width set for a variant and never timed (the build found no room, the loop broke) holds the last
+            # variant tried, not the engine's one kernel: let go, it takes `_mma_one` like any width past the timed
+            # ones - kept, a later placement's passes of that width ran the other kernel than the step
+            for T in [t for t in choice if t not in timed_all]:
+                del choice[T]
             if timed_all:
                 # one kernel for every width: the two sum a row in different orders, and a step on one with a
                 # pass on the other parted at bf16 near-ties (0/8 identical at 256 tokens on the 0.6B). The
@@ -1862,7 +1939,7 @@ class _CudaMixin(_State):
                 # a speculative engine, the one-row step for a greedy one - and the other's graphs are dropped
                 w = max(timed_all) if int(getattr(self, "v_max", 0) or 0) > 0 else 1
                 pick = min(variants, key=lambda m: timed_all[w][m])
-                st["mma_one"] = pick
+                self._mma_one = pick
                 for T, timed in timed_all.items():
                     choice[T] = pick
                     cost[T] = timed[pick]
@@ -1878,8 +1955,9 @@ class _CudaMixin(_State):
                         f"{timed_all[1][not pick] * 1e3:.2f} ms)"
                     )
             n = len(st["graphs"]) - before
-            # the cost curve covers the whole model only; with a layer on the CPU the timing above is partial
-            if cost and segs == [(0, self.L)] and tails[segs[0]]:
+            # the cost curve covers the whole model only; with a layer on the CPU the timing above is partial, and
+            # with the placement moved under it another placement's
+            if cost and not moved and segs == [(0, self.L)] and tails[segs[0]]:
                 self._card_cost = cost
                 c1 = cost[1]
                 self.log(

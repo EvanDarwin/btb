@@ -9,10 +9,8 @@ import contextlib
 import importlib.util
 import os
 import platform
-import subprocess
 import sys
 import threading
-import time
 import weakref
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -23,55 +21,41 @@ import torch
 from ..kinds import LayerTier, Proposer, Tier
 from ..options import BadDevice, DeviceName, check_device
 from ..options import Device as DeviceKind
-from ..sysinfo import host_commit_bytes, host_free_bytes, host_total_bytes, wddm_room
-
-# a card's nvidia-smi reading: when it was taken, the free it read, and what this process's allocator had reserved then
-_PHYS_FREE: dict[int, tuple[float, int | None, int]] = {}
+from ..sysinfo import host_commit_bytes, host_free_bytes, host_total_bytes, nvml_free_bytes, wddm_info
 
 
 def _physical_free_bytes(dev: torch.device) -> int | None:
-    """The card's free VRAM across every process, from nvidia-smi (NVML), or None when it cannot be read.
+    """The card's free VRAM across every process, from NVML, or None when it cannot be read.
     `torch.cuda.mem_get_info` is a per-process figure on Windows - WDDM virtualizes VRAM, so it reads high while
-    another process holds the card - and only NVML sees the true physical free. Cached for a second: this is an
-    allocation-path read, not a per-token one, so one subprocess a second is nothing - and it can go stale the
-    moment it is read whatever the rate. What this process does meanwhile is its own to count, both ways: a cached
-    reading is less what its allocator has reserved since, so a pass's grants in the same second each see the ones
-    before them rather than all spending the one reading, and more what it has given back to the driver since, so
-    a buffer let go is free again at once rather than a second later."""
-    idx = dev.index if dev.index is not None else torch.cuda.current_device()
-    now = time.monotonic()
-    hit = _PHYS_FREE.get(idx)
-    if hit is not None and now - hit[0] < 1.0:
-        if hit[1] is None:
-            return None
-        return max(0, hit[1] + hit[2] - int(torch.cuda.memory_reserved(idx)))
-    free: int | None = None
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits", "-i", str(idx)],
-            capture_output=True,
-            text=True,
-            timeout=2,
-            check=True,
-        ).stdout
-        free = int(out.strip().splitlines()[0]) * (1 << 20)  # MiB -> bytes
-    except Exception:
-        free = None
-    _PHYS_FREE[idx] = (now, free, int(torch.cuda.memory_reserved(idx)))
-    return free
+    another process holds the card - and only NVML sees the true physical free: read from NVML's own library, fresh
+    each time (microseconds), for the card at this one's PCI address"""
+    p: Any = torch.cuda.get_device_properties(dev)  # its PCI ids are there, not in torch's stubs
+    return nvml_free_bytes(f"{p.pci_domain_id:08X}:{p.pci_bus_id:02X}:{p.pci_device_id:02X}.0")
+
+
+def card_ids(dev: torch.device) -> tuple[str, int, int]:
+    """the card as DXGI is asked about it: its name, its bytes, and its CUDA ordinal (a bare 'cuda' is the current
+    card) - what names its adapter by LUID where DXGI lists it more than once"""
+    p = torch.cuda.get_device_properties(dev)
+    return str(p.name), int(p.total_memory), dev.index if dev.index is not None else torch.cuda.current_device()
+
+
+def _wddm_info(dev: torch.device) -> tuple[int, int] | None:
+    """this process's WDDM (budget, usage) on the card (`wddm_info`), or None off Windows or where it cannot be read"""
+    if sys.platform != "win32":
+        return None
+    return wddm_info(*card_ids(dev))
 
 
 def _wddm_room(dev: torch.device) -> int | None:
-    """this process's WDDM budget on the card less what it uses there (`wddm_room`), or None off Windows or where it
-    cannot be read"""
-    if sys.platform != "win32":
-        return None
-    p = torch.cuda.get_device_properties(dev)
-    return wddm_room(str(p.name), int(p.total_memory))
+    """this process's WDDM budget on the card less what it uses there: the room before Windows pages it - it, or as
+    the card fills another program, out to system memory. None off Windows or where it cannot be read"""
+    info = _wddm_info(dev)
+    return None if info is None else info[0] - info[1]
 
 
 def free_bytes(dev: torch.device, margin: int = 0, pooled: bool = False) -> int | None:
-    """Memory free on `dev` above `margin`. On a card: the physical free VRAM (nvidia-smi's, so a card shared with
+    """Memory free on `dev` above `margin`. On a card: the physical free VRAM (NVML's, so a card shared with
     another process is priced by what is truly free, not the per-process figure WDDM hands `mem_get_info`) - and on
     Windows no more than this process's WDDM budget leaves it (past that the driver pages it, or a game in the
     foreground, out to system memory and every pass crawls over the bus; the budget falls to half the card against

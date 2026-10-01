@@ -228,6 +228,17 @@ def _pick_gguf_quant(path: str) -> str:
     return f"{path}:{files[i][0]}"
 
 
+def _log_for(a: argparse.Namespace, out: Callable[..., object]) -> Callable[..., object] | None:
+    """the engine's log for -v (`out`, as it is written) and -vv (the trace's: each line said once, timestamped
+    among the decisions, off the passes' thread); none without either"""
+    verbose = int(getattr(a, "verbose", 0) or 0)
+    if verbose >= 2:
+        from . import trace
+
+        return trace.say
+    return out if verbose else None
+
+
 def _open(a: argparse.Namespace) -> Any:
     from . import load, resolve
 
@@ -241,7 +252,7 @@ def _open(a: argparse.Namespace) -> Any:
     a.path = resolve(a.path)
     kw, nat = _kw(a)
     out = _e if a.cmd == "run" else _p  # run keeps stdout for the model's text
-    sm = load(a.path, device=a.device, native=nat, log=(out if a.verbose else None), **kw)
+    sm = load(a.path, device=a.device, native=nat, log=_log_for(a, out), **kw)
     if getattr(a, "profile", None):
         from .engine.experts import ExpertProfile
 
@@ -283,7 +294,13 @@ def _common(ap: argparse.ArgumentParser, path_required: bool = True) -> None:
         "cuda without a card: an error). Default: the card, else mlx on Apple silicon, else cpu",
     )
     ap.add_argument(
-        "-v", "--verbose", action="store_true", help="print the placement, the tiers and each turn's timings"
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="print the placement, the tiers and each turn's timings; -vv also traces every automatic decision as it "
+        "is taken - a layer moved between the card, RAM and the drive, memory given back to another program, the path "
+        "a pass takes, the tuner's lane - on stderr, never holding the passes up (BTB_TRACE=1 in a library)",
     )
     ap.add_argument(
         "--confirm",
@@ -844,7 +861,7 @@ def cmd_serve(a: argparse.Namespace) -> Any:
         port=a.port,
         device=a.device,
         max_new=a.new,
-        log=(_p if a.verbose else None),
+        log=_log_for(a, _p),
         native=nat,
         extra_paths=a.models_dir or (),
         pattern=a.models_filter,
@@ -864,7 +881,7 @@ def cmd_ollama(a: argparse.Namespace) -> Any:
         port=a.port,
         device=a.device,
         max_new=a.new,
-        log=(_p if a.verbose else None),
+        log=_log_for(a, _p),
         native=nat,
         args=a.args,
         extra_paths=a.models_dir or (),
@@ -886,7 +903,7 @@ def cmd_pi(a: argparse.Namespace) -> Any:
         port=a.port,
         device=a.device,
         max_new=a.new,
-        log=(_p if a.verbose else None),
+        log=_log_for(a, _p),
         native=nat,
         extra_paths=a.models_dir or (),
         pattern=a.models_filter,
@@ -1185,6 +1202,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         a.args = rest
     elif rest:
         ap.error(f"unrecognized arguments: {' '.join(rest)}")
+    if int(getattr(a, "verbose", 0) or 0) >= 2:
+        from . import trace
+
+        trace.enable()  # -vv: every automatic decision as it is taken (btb/trace.py)
     if a.cmd != "devices":  # devices reports the hardware; it needs no model stack
         _require_deps(getattr(a, "device", None))
     if getattr(a, "device", None) is not None and a.device.kind is Device.CPU:

@@ -9,6 +9,8 @@ import ctypes
 import ctypes.util
 import os
 import sys
+import time
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
@@ -566,8 +568,12 @@ def vram_pressure_line(pid: int | None = None) -> str:
 # Windows keeps a process's card memory resident up to its budget and pages past it - its own allocations or, as the
 # card fills, another program's. The budget moves with the card's tenants: 10.96 GB of a 12 GB card for a process
 # alone on it, 5.8 GB against a game in the foreground. The usage it is compared to is every allocation of the
-# process on the adapter, the CUDA allocator's reserved pool included. The adapter is opened once and kept.
-_WDDM: dict[tuple[str, int], Any] = {}
+# process on the adapter, the CUDA allocator's reserved pool included. The adapter is opened once and kept while it
+# answers (`_wddm_for`): (the IDXGIAdapter3 or None, when it was looked for)
+_WDDM: dict[tuple[str, int, int | None], tuple[Any, float]] = {}
+# a card DXGI could not name is looked for again this often, not every pass: a driver reset (a TDR) lists it twice
+# for a while, then once again
+WDDM_RETRY_S = 10.0
 
 
 class _Guid(ctypes.Structure):
@@ -613,13 +619,41 @@ def _com(obj: ctypes.c_void_p, slot: int, *argtypes: Any) -> Any:
     return ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p, *argtypes)(vtbl[slot])
 
 
-def _wddm_adapter(name: str, total: int) -> Any:
-    """the one NVIDIA adapter DXGI lists as `name` with about `total` bytes of dedicated memory (DXGI counts less of
-    the card than CUDA does: 11994 MiB of a 4070 Ti's 12282), as an IDXGIAdapter3; None where none or several match"""
+_CUDA_LUID: dict[int, int] = {}  # each card's LUID once read; one that could not be is asked again
+
+
+def cuda_luid(ordinal: int) -> int | None:
+    """The LUID Windows knows the card by that CUDA numbers `ordinal` (the driver's cuDeviceGetLuid): what names the
+    one DXGI adapter that is this card where DXGI lists it more than once. None off Windows or where it cannot be
+    read"""
+    if sys.platform != "win32":
+        return None
+    if ordinal not in _CUDA_LUID:
+        try:
+            cu = ctypes.WinDLL("nvcuda.dll")
+            d = ctypes.c_int()
+            buf = (ctypes.c_char * 8)()
+            mask = ctypes.c_uint()
+            if (
+                cu.cuInit(0) == 0
+                and cu.cuDeviceGet(ctypes.byref(d), int(ordinal)) == 0
+                and cu.cuDeviceGetLuid(buf, ctypes.byref(mask), d) == 0
+            ):
+                _CUDA_LUID[ordinal] = int.from_bytes(bytes(buf), "little")  # LowPart, then HighPart
+        except (OSError, AttributeError):
+            pass
+    return _CUDA_LUID.get(ordinal)
+
+
+def _wddm_matches(name: str, total: int) -> list[tuple[Any, int]]:
+    """every NVIDIA adapter DXGI lists as `name` with about `total` bytes of dedicated memory, as (IDXGIAdapter1, its
+    LUID as one unsigned 64-bit figure - CUDA's form, `cuda_luid`); none off Windows or where DXGI cannot be asked"""
+    if sys.platform != "win32":
+        return []
     dxgi = ctypes.windll.dxgi
     fac = ctypes.c_void_p()
     if dxgi.CreateDXGIFactory1(ctypes.byref(_guid("770aae78-f26f-4dba-a829-253c83d1b387")), ctypes.byref(fac)):
-        return None
+        return []
     hits = []
     for i in range(16):
         ad = ctypes.c_void_p()
@@ -631,50 +665,85 @@ def _wddm_adapter(name: str, total: int) -> Any:
         _com(ad, 10, ctypes.POINTER(_AdapterDesc1))(ad, ctypes.byref(d))  # GetDesc1
         near = abs(int(d.dedicated_video) - total) < max(512 << 20, total // 16)
         if d.vendor == 0x10DE and d.desc.strip() == name.strip() and near:
-            hits.append(ad)
+            # HighPart is a signed LONG: its bits taken as they are, so the figure is CUDA's unsigned one
+            hits.append((ad, ((int(d.luid_high) & 0xFFFFFFFF) << 32) | (int(d.luid_low) & 0xFFFFFFFF)))
+    return hits
+
+
+def _wddm_adapter(name: str, total: int, ordinal: int | None = None) -> Any:
+    """the NVIDIA adapter DXGI lists as `name` with about `total` bytes of dedicated memory (DXGI counts less of the
+    card than CUDA does: 11994 MiB of a 4070 Ti's 12282), as an IDXGIAdapter3: the one whose LUID is CUDA's for card
+    `ordinal` where DXGI lists several - after a driver reset (a TDR) it listed this 4070 Ti twice, and matched by name
+    alone the budget went unread, so adapt gave nothing back to a game - else the one match by name; None where none
+    or several match"""
+    hits = _wddm_matches(name, total)
+    luid = cuda_luid(ordinal) if ordinal is not None and len(hits) > 1 else None
+    if luid is not None:
+        hits = [h for h in hits if h[1] == luid]
     if len(hits) != 1:
         return None
+    ad = hits[0][0]
     a3 = ctypes.c_void_p()
-    _com(hits[0], 0, ctypes.POINTER(_Guid), ctypes.POINTER(ctypes.c_void_p))(  # QueryInterface: IDXGIAdapter3
-        hits[0], ctypes.byref(_guid("645967a4-1392-4310-a798-8053ce3e93fd")), ctypes.byref(a3)
+    _com(ad, 0, ctypes.POINTER(_Guid), ctypes.POINTER(ctypes.c_void_p))(  # QueryInterface: IDXGIAdapter3
+        ad, ctypes.byref(_guid("645967a4-1392-4310-a798-8053ce3e93fd")), ctypes.byref(a3)
     )
     return a3
 
 
-def wddm_room(name: str, total: int) -> int | None:
-    """This process's WDDM budget on the card named `name` with `total` bytes, less what it uses there: what Windows
-    keeps resident for it before paging - it, or as the card fills another program, out to system memory. None off
-    Windows, where DXGI cannot name the card uniquely, or where it cannot be read. Microseconds a read."""
+def _wddm_for(name: str, total: int, ordinal: int | None) -> Any:
+    """the card's IDXGIAdapter3 (`_wddm_adapter`): found once and kept while it answers (`wddm_info` drops one that
+    fails a read - a driver reset leaves the old adapter answering nothing); a card not found is looked for again
+    after WDDM_RETRY_S"""
+    key = (name, int(total), ordinal)
+    hit = _WDDM.get(key)
+    now = time.monotonic()
+    if hit is None or (hit[0] is None and now - hit[1] >= WDDM_RETRY_S):
+        hit = _WDDM[key] = (_wddm_adapter(name, int(total), ordinal), now)
+    return hit[0]
+
+
+def wddm_info(name: str, total: int, ordinal: int | None = None) -> tuple[int, int] | None:
+    """(budget, usage): this process's WDDM budget on the card named `name` with `total` bytes (CUDA's card `ordinal`,
+    which names it where DXGI lists it more than once) - what Windows keeps resident for it before paging, which
+    falls when another program takes the card - and what it uses there. None off Windows, where DXGI cannot name the
+    card uniquely, or where it cannot be read. Microseconds a read."""
     if sys.platform != "win32":
         return None
-    key = (name, int(total))
     try:
-        if key not in _WDDM:
-            _WDDM[key] = _wddm_adapter(name, int(total))
-        a3 = _WDDM[key]
-        if a3 is None:
-            return None
-        m = _VideoMemoryInfo()
-        # QueryVideoMemoryInfo: node 0, the local (dedicated) segment group
-        _com(a3, 14, ctypes.c_uint, ctypes.c_int, ctypes.POINTER(_VideoMemoryInfo))(a3, 0, 0, ctypes.byref(m))
-        return int(m.budget) - int(m.usage)
+        a3 = _wddm_for(name, total, ordinal)
     except OSError:
         return None
+    if a3 is None:
+        return None
+    m = _VideoMemoryInfo()
+    try:
+        # QueryVideoMemoryInfo: node 0, the local (dedicated) segment group
+        _com(a3, 14, ctypes.c_uint, ctypes.c_int, ctypes.POINTER(_VideoMemoryInfo))(a3, 0, 0, ctypes.byref(m))
+    except OSError:
+        _WDDM.pop((name, int(total), ordinal), None)  # the adapter gone (a driver reset): found afresh next read
+        return None
+    return int(m.budget), int(m.usage)
 
 
-def wddm_budget_event(name: str, total: int) -> tuple[int, int] | None:
-    """(a Windows event handle, its registration's cookie): the event the OS signals whenever this process's WDDM
-    budget on the card named `name` changes - another program asking for the card (a game started or brought to the
-    front) shrinks it at once, before any of this process's memory is paged out
-    (IDXGIAdapter3::RegisterVideoMemoryBudgetChangeNotificationEvent). An auto-reset event, until
-    `wddm_budget_unregister`. None off Windows or where the card cannot be named."""
+@dataclass(frozen=True)
+class BudgetEvent:
+    """a budget event's registration (`wddm_budget_event`): the Windows event, the cookie, and the adapter it was
+    registered on - unregistered on that one, whatever has been found for the card since"""
+
+    event: int
+    cookie: int
+    adapter: Any
+
+
+def wddm_budget_event(name: str, total: int, ordinal: int | None = None) -> BudgetEvent | None:
+    """the event the OS signals whenever this process's WDDM budget on the card named `name` changes - another
+    program asking for the card (a game started or brought to the front) shrinks it at once, before any of this
+    process's memory is paged out (IDXGIAdapter3::RegisterVideoMemoryBudgetChangeNotificationEvent). An auto-reset
+    event, until `wddm_budget_unregister`. None off Windows or where the card cannot be named."""
     if sys.platform != "win32":
         return None
-    key = (name, int(total))
     try:
-        if key not in _WDDM:
-            _WDDM[key] = _wddm_adapter(name, int(total))
-        a3 = _WDDM[key]
+        a3 = _wddm_for(name, total, ordinal)
         if a3 is None:
             return None
         k32 = ctypes.windll.kernel32
@@ -688,20 +757,17 @@ def wddm_budget_event(name: str, total: int) -> tuple[int, int] | None:
         except OSError:
             k32.CloseHandle(ctypes.c_void_p(ev))
             return None
-        return int(ev), int(cookie.value)
+        return BudgetEvent(int(ev), int(cookie.value), a3)
     except OSError:
         return None
 
 
-def wddm_budget_unregister(name: str, total: int, reg: tuple[int, int]) -> None:
+def wddm_budget_unregister(reg: BudgetEvent) -> None:
     """the budget event `wddm_budget_event` registered, unregistered and its handle closed"""
-    a3 = _WDDM.get((name, int(total)))
-    ev, cookie = reg
-    if a3 is not None:
-        # UnregisterVideoMemoryBudgetChangeNotification returns void, not an HRESULT: called through its own prototype
-        vtbl = ctypes.cast(a3, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
-        ctypes.WINFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint32)(vtbl[17])(a3, ctypes.c_uint32(cookie))
-    ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(ev))
+    # UnregisterVideoMemoryBudgetChangeNotification returns void, not an HRESULT: called through its own prototype
+    vtbl = ctypes.cast(reg.adapter, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+    ctypes.WINFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint32)(vtbl[17])(reg.adapter, ctypes.c_uint32(reg.cookie))
+    ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(reg.event))
 
 
 def wait_event(handle: int, timeout_s: float) -> bool:
@@ -710,6 +776,58 @@ def wait_event(handle: int, timeout_s: float) -> bool:
     k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
     k32.WaitForSingleObject.restype = ctypes.c_uint32
     return int(k32.WaitForSingleObject(handle, int(timeout_s * 1000))) == 0  # WAIT_OBJECT_0
+
+
+class _NvmlMemory(ctypes.Structure):
+    _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+
+
+# NVML, loaded once: the library (None where it is absent or would not initialize) and each card's handle by its PCI
+# bus id - dropped when a read fails, as after a driver reset
+_NVML: dict[str, Any] = {"lib": None, "tried": False, "handles": {}}
+
+
+def _nvml() -> Any:
+    if not _NVML["tried"]:
+        _NVML["tried"] = True
+        # the driver's own copy in System32 on current drivers; the NVSMI folder on older ones
+        nvsmi = os.path.join(os.environ.get("PROGRAMFILES", r"C:\Program Files"), "NVIDIA Corporation", "NVSMI")
+        names = (
+            ["nvml.dll", os.path.join(nvsmi, "nvml.dll")]
+            if sys.platform == "win32"
+            else ["libnvidia-ml.so.1", "libnvidia-ml.so"]
+        )
+        for n in names:
+            try:
+                lib = ctypes.CDLL(n)
+            except OSError:
+                continue
+            if lib.nvmlInit_v2() == 0:
+                _NVML["lib"] = lib
+                break
+    return _NVML["lib"]
+
+
+def nvml_free_bytes(bus_id: str) -> int | None:
+    """The card's free memory across every process as NVML counts it - the reading `nvidia-smi` prints, without
+    starting it (a process a read, 36 ms each on this machine) - for the card at PCI `bus_id` ("00000000:01:00.0"):
+    NVML numbers the cards in its own order, which CUDA's (and CUDA_VISIBLE_DEVICES) does not follow. None where NVML
+    is absent (no NVIDIA driver) or the card cannot be read. Microseconds a read."""
+    lib = _nvml()
+    find = getattr(lib, "nvmlDeviceGetHandleByPciBusId_v2", None) if lib is not None else None
+    if find is None:
+        return None
+    h = _NVML["handles"].get(bus_id)
+    if h is None:
+        h = ctypes.c_void_p()
+        if find(bus_id.encode(), ctypes.byref(h)) != 0:
+            return None
+        _NVML["handles"][bus_id] = h
+    m = _NvmlMemory()
+    if lib.nvmlDeviceGetMemoryInfo(h, ctypes.byref(m)) != 0:
+        _NVML["handles"].pop(bus_id, None)  # a stale handle (a driver reset): looked up afresh next read
+        return None
+    return int(m.free)
 
 
 def host_cache_sizes() -> dict[str, int]:

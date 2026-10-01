@@ -256,7 +256,7 @@ def test_the_default_engine_takes_one_gemv_for_every_width_and_is_exact(default_
     step on one with a pass on the other parted at bf16 near-ties (0/8 identical at 256 tokens on this model);
     on one kernel a step and a 15-row pass agree bit for bit, and the speculative answer is the greedy answer"""
     sm = default_engine
-    choice = sm._cg["mma_for"]
+    choice = sm._mma_for
     assert choice and len(set(choice.values())) == 1, f"a kernel per width: {choice}"
     with open(checkout("bench", "questions.jsonl"), encoding="utf-8") as fh:
         prompts = [sm.prompt_ids(json.loads(line)["prompt"]) for line in fh if line.strip()][:3]

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import dataclasses
 import http.client
 import json
 import os
@@ -715,6 +716,82 @@ def loaded_model(path: str, **load_kw: Any) -> Iterator[StreamedTextModel]:
         yield sm
     finally:
         sm.close()
+
+
+# --- models shared by the tests that load the same file with the same options -------------------------------
+#
+# A test module that loads one model file with one set of options in many tests declares each test's models in a
+# module-level `shared_model_keys(item) -> list[key]` (keys from `shared_key`) and takes them with `shared_model`.
+# The suite then runs the tests sharing a model one after another (conftest's `pytest_collection_modifyitems`) and
+# loads it once, when the first of them asks, closing it as soon as the next test to run does not declare it
+# (conftest's `pytest_runtest_teardown`) - before that test's leak check, which then covers it. `slot` tells apart
+# the independent loads of one file a test compares (a cert cell's two).
+
+
+@dataclasses.dataclass
+class _Shared:
+    sm: StreamedTextModel
+    knobs: dict[str, Any]  # the engine knobs a test may set, as the load left them
+    at: int  # the placement version as it loaded
+
+
+_SHARED: dict[tuple[Any, ...], _Shared] = {}
+_KNOBS = ("proposer", "_host_cost", "_mlx_cost", "_card_cost")
+
+
+def shared_key(path: str, knobs: dict[str, Any], slot: int = 0) -> tuple[Any, ...]:
+    """the key of one load: the file, its options, and which of a test's independent loads it is"""
+    return (os.path.normpath(path), tuple(sorted((str(k), repr(v)) for k, v in knobs.items())), int(slot))
+
+
+def shared_model(path: str, slot: int = 0, **knobs: Any) -> StreamedTextModel:
+    """the model at `path` loaded with `knobs` (`slot`: which of a test's independent loads), shared with every test
+    declaring the same key. What one test would see of another's on it is put back as the load left it: the API
+    calls the model records (never reset by a decode - a later test's 'every call engaged' would pass on a call it
+    never made), the speculation pricer's learning, and the knobs a test sets on the engine (the proposer, the pass
+    cost curves a speculation cell empties)"""
+    import btb
+
+    key = shared_key(path, knobs, slot)
+    held = _SHARED.get(key)
+    if held is not None and (
+        held.sm.device.snapshot().version != held.at or getattr(held.sm, "_card_off_ver", None) is not None
+    ):
+        # the model is not as it loaded: a layer moved by adapt (another program took the card), the card graph off
+        # after it found no room - this test takes a fresh load, not what befell an earlier one
+        errors = _close(key)
+        if errors:
+            raise ExceptionGroup("a shared model would not close", errors)  # type: ignore[type-var]
+        held = None
+    if held is None:
+        sm = btb.load(path, **{"log": NO_LOG, **knobs})
+        _SHARED[key] = _Shared(sm, {name: getattr(sm, name, None) for name in _KNOBS}, sm.device.snapshot().version)
+        return sm
+    sm = held.sm
+    sm._calls = frozenset()
+    sm._spec_cost = None
+    for name, value in held.knobs.items():
+        setattr(sm, name, value)
+    return sm
+
+
+def _close(key: tuple[Any, ...]) -> list[BaseException]:
+    """the shared model under `key` dropped from the pool and closed; what its close raised"""
+    sm = _SHARED.pop(key).sm
+    try:
+        sm.close()
+    except Exception as e:  # a close that raised is still gone from the pool: never handed to a test again
+        return [e]
+    return []
+
+
+def release_shared(keep: Iterable[tuple[Any, ...]] = ()) -> list[BaseException]:
+    """every shared model but those in `keep` closed - each of them, whatever one's close raised; what they raised"""
+    keep = set(keep)
+    errors: list[BaseException] = []
+    for key in [k for k in _SHARED if k not in keep]:
+        errors += _close(key)
+    return errors
 
 
 def need_cached(spec: str, why: str | None = None) -> str:

@@ -16,6 +16,7 @@ import sys
 import weakref
 from typing import TYPE_CHECKING, Any
 
+from . import trace
 from .hf import (
     PACK12_FORMAT,
     SERVE_TYPES,  # noqa: F401
@@ -390,7 +391,8 @@ def load(
         bus_pass=bool(int(c.get("bus_pass", 1))),
         store_pin=int(c.get("store_pin", 0)),
         sparse=bool(int(c.get("sparse", 0))),
-        log=log or (lambda *_a: None),
+        # every line the engine logs is a trace event too while the trace runs (-vv, BTB_TRACE=1): said once there
+        log=trace.logged(log),
     )
     # the engine is built: from here a failure (a draft that does not match, a declined download, a warm-up
     # that raises) closes it before the error goes on, so nothing it took is left to the collector

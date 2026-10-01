@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 import torch
 
+from .. import trace
 from ..kinds import LayerTier, PassReport, PassTag, Proposer
 from .device import Where
 
@@ -209,6 +210,10 @@ class _State:
     _in_epoch: bool
     _pass_rec: _PassRecorder | None = None  # the provenance accumulator, created on first tag or reset
     _calls: frozenset[PassTag] = frozenset()  # every API call made on the model (btb.api), never reset
+    warming: bool = False  # the load's warm-up is timing: the memory policies stand aside (model.py `_warming`)
+    # the card's one GEMV, by the warm-up (cuda.py `card_warm`): per width timed, and the engine's kernel past them
+    _mma_for: dict[int, bool]
+    _mma_one: bool
     _cancel: threading.Event | None = None  # the running decode's own stop (a Stream's), set under the lock
 
     # -- the card graph (cuda.py); the mechanism keeps its letters --
@@ -760,6 +765,10 @@ class _State:
         rec = self._pass_rec
         if rec is None:
             rec = self._pass_rec = _PassRecorder()
+        if trace.ON:  # a fork this request had not taken yet: the path it runs, said as it first runs it
+            for t in tags:
+                if t not in rec.tags:
+                    trace.event("path: %s (first this request)", t.value)
         rec.tags.update(tags)
 
     def _tag_tiers(self, n_layers: int) -> None:

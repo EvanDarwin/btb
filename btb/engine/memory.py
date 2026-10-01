@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from .. import trace
 from ..api import api
 from ..kinds import Log, PassTag
 from ..options import Device
@@ -37,7 +38,7 @@ from . import device as device_mod
 from .cache import GrantedIndexedLayer, GrowLayer
 from .device import DeviceSpec, Where, torch_device, where
 from .fixed_rows import RowLinear
-from .scheduler import EPOCH, MemoryGrantError
+from .scheduler import EPOCH, MemoryGrantError, _size
 from .state import _State
 from .tiers import ColdRing
 
@@ -65,6 +66,15 @@ class VramPolicyState:
     # a yield gave all that helps and the budget was still short by this much: not asked again until the process is
     # inside the budget, or the budget is cut deeper than this (0: none given up)
     spent: int = 0
+    # the largest WDDM budget Windows has given this process (read as the engine comes up and each second after, by
+    # the budget watcher): a budget below it is another program's doing (`_vram_why`) - the budget at load alone was
+    # a game's when btb loaded beside one, and a game's later cut back to it read as btb's own growth
+    budget_hi: int = 0
+    # when torch's freed blocks were last given back to answer the budget alone (`_vram_trim_enough`)
+    trim_t: float = 0.0
+    # -vv: when the card's figures were last traced (a monotonic clock), and the figures last said (`_trace_card`)
+    trace_t: float = 0.0
+    trace_said: tuple[int, ...] = ()
 
 
 @dataclass
@@ -211,12 +221,14 @@ class _MemoryMixin(_State):
     def vram_shed(self, cache: Any = None, log: Log | None = None) -> str | None:
         log = log or self.log
         moved = None
+        size = 0
         aj = getattr(self, "aj", None)
         if aj is not None and aj.dev.type == Device.CUDA:
             self.aj = None
             self.drafter_dev = torch.device("cpu")
             moved = "drafter"
         elif self.resident:
+            size = self._layer_bytes(max(self.resident))
             # the card graphs let go first: they hold the layer's merged blocks (`_card_let_go`), and a layer shed
             # under them freed nothing
             self._card_let_go()
@@ -236,7 +248,8 @@ class _MemoryMixin(_State):
         self._shed.append(moved)
         if self.dev.type == Device.CUDA:
             torch.cuda.empty_cache()
-        log(f"[vram] SHED {moved} -> host (shed so far: {self._shed}); " + vram_pressure_line())
+        moving = f" ({_size(size)} from the card to RAM)" if size else ""
+        log(f"[vram] SHED {moved} -> host{moving} (shed so far: {self._shed}); " + vram_pressure_line())
         return moved
 
     def vram_regrow(self, cache: Any = None, log: Log | None = None) -> Any:
@@ -262,7 +275,7 @@ class _MemoryMixin(_State):
             self.resident[i] = tmpl
             self.host.pop(i, None)
             self._caches_to(i, self.dev, cache)
-        log(f"[vram] REGROW {what} -> card (still shed: {self._shed}); " + vram_pressure_line())
+        log(f"[vram] REGROW {what} -> {self.dev} (still shed: {self._shed}); " + vram_pressure_line())
         return what
 
     def vram_trim(self, tag: str = "") -> Any:
@@ -280,9 +293,85 @@ class _MemoryMixin(_State):
             )
         return alloc, res
 
-    def vram_policy(self, cache: Any = None, log: Log | None = None) -> None:
-        if not self.vram_watch or self.dev.type != Device.CUDA:
+    def _trace_card(self) -> None:
+        """-vv, once a second and when it moves: what this process holds on the card, split by who can account for
+        it - the weights placed there, the rest torch allocated (caches, scratch, activations), torch's cache of
+        freed blocks, and what Windows counts past torch (the CUDA context, the card graphs' own pools, cuBLAS) -
+        against the budget, with what the ledger speaks for; memory no plan counts shows here as it appears. The
+        weights are every one placed on the card: the resident layers and the head, the drafter, the expert store's
+        seats, the step graph's embedding table - counted elsewhere they read as the caches'"""
+        st = self.vram_state
+        now = time.monotonic()
+        if now - st.trace_t < 1.0:
             return
+        st.trace_t = now
+        weights = self._card_weight_bytes()
+        # free-read: the trace's figures, never a decision
+        alloc, res = int(torch.cuda.memory_allocated(self.dev)), int(torch.cuda.memory_reserved(self.dev))
+        info = device_mod._wddm_info(self.dev)
+        budget, used = info if info is not None else (0, 0)
+        # said again when this process's figures move 64 MB from the ones last said, or the budget 256 MB (Windows
+        # moves it by tens of MB a second with another program's own use)
+        now_figs = (weights, alloc, res, used, budget)
+        last = st.trace_said
+        steps = (64 << 20,) * 4 + (256 << 20,)
+        if last and all(abs(a - b) < s for a, b, s in zip(now_figs, last, steps, strict=True)):
+            return
+        st.trace_said = now_figs
+        held = self.device.spoken_for(self.dev)
+        said = ", ".join(f"{k} {_size(v)}" for k, v in sorted(held.items(), key=lambda kv: -kv[1])) or "nothing"
+        trace.event(
+            "card: %s used of a %s budget = weights %s + other allocated %s + torch's cache %s + outside torch %s "
+            "| the ledger speaks for %s",
+            _size(used),
+            _size(budget),
+            _size(weights),
+            _size(alloc - weights),
+            _size(res - alloc),
+            _size(used - res) if used else _size(0),
+            said,
+        )
+
+    def _card_weight_bytes(self) -> int:
+        """the bytes of every weight placed on the card, each storage once: the resident layers and the head, the
+        drafter, the expert store's seats, the step graph's embedding table (a tied head is the same storage)"""
+        seen: dict[int, int] = {}
+
+        def add(t: Any) -> None:
+            if isinstance(t, torch.Tensor) and t.device.type == Device.CUDA:
+                st = t.untyped_storage()
+                seen[int(st.data_ptr())] = int(st.nbytes())
+
+        mods: list[Any] = [*self.resident.values()]
+        if self.resident_head and self.head is not None:
+            mods.append(self.head)
+        # the drafter is no module: its layer, its fc and its head's slices are attributes of it
+        aj = getattr(self, "aj", None)
+        for v in vars(aj).values() if aj is not None else ():
+            if isinstance(v, torch.nn.Module):
+                mods.append(v)
+            else:
+                add(v)
+        for m in mods:
+            for t in (*m.parameters(), *m.buffers()):
+                add(t)
+        store = getattr(self, "expert_store", None)
+        seats = getattr(store, "vram", None)
+        add(getattr(seats, "buf", None))
+        cg = getattr(self, "_cg", None)
+        add(cg.get("table") if cg is not None else None)
+        return sum(seen.values())
+
+    def vram_policy(self, cache: Any = None, log: Log | None = None) -> None:
+        if trace.ON and self.dev.type == Device.CUDA:
+            try:
+                self._trace_card()
+            except Exception as e:  # the trace watches the pass, never stops it: a figure it cannot read is said
+                trace.changed(
+                    (trace.token(self), "card unread"), repr(e), "card: the figures could not be read (%r)", e
+                )
+        if not self.vram_watch or self.dev.type != Device.CUDA or self.warming:
+            return  # the warm-up's own passes: answered once it is done (model.py `_warming`)
         # a batched decode is sized by the scheduler (the one OOM guard), so the per-step streaming policy stands
         # aside: shedding mid-batch only slows it, and the triggers fire on a large batch's legitimate KV growth
         if cache is not None and getattr(cache, "layers", None):
@@ -297,7 +386,10 @@ class _MemoryMixin(_State):
         if over <= 0:
             self.vram_state.spent = 0  # inside the budget again: a later cut is answered afresh
         elif not self.vram_state.spent or over > self.vram_state.spent + (256 << 20):
-            self.device.request("yield", lambda: self.vram_yield(cache, log))
+            # torch's freed blocks before any placement change: a request moves the placement's version, and the
+            # card graphs and a card program are rebuilt for the new one - for nothing, where the cache was enough
+            if not self._vram_trim_enough(over, log):
+                self.device.request("yield", lambda: self.vram_yield(cache, log))
             return
         # the pressure read is a PDH query (4.4 ms on this machine) - longer than a small model's whole step on
         # the card graph. A model holding every layer on the card with a quarter of the card still free has
@@ -390,33 +482,67 @@ class _MemoryMixin(_State):
             return 0
         return max(0, int(getattr(self, "vram_margin", 0) or 0) - int(room))
 
+    def _vram_why(self) -> str:
+        """Who put this process past its budget: Windows cutting the budget (another program took the card - a game
+        started or brought to the front) or this process growing past it (its plan did not count what it holds), read
+        against the largest budget it has been given (`vram_state.budget_hi`)"""
+        info = device_mod._wddm_info(self.dev)
+        if info is None:
+            return "the budget cannot be read here"
+        budget, usage = info
+        hi = max(self.vram_state.budget_hi, budget)
+        if budget < hi - (256 << 20):
+            return f"another program took {_size(hi - budget)} of the card (budget {_size(budget)})"
+        return (
+            f"this process grew past its own budget ({_size(usage)} used of {_size(budget)}): the placement's "
+            "plan did not count all it holds on the card"
+        )
+
+    # a budget answered by torch's freed blocks alone is answered so at most this often: past it again sooner, the
+    # process's own passes need the room (a prefill's working set refilled the cache each chunk) - a shed, not a trim
+    # a pass
+    TRIM_AGAIN_S = 10.0
+
+    def _vram_trim_enough(self, over: int, log: Log | None = None) -> bool:
+        """torch's freed blocks - this process's own and no pass's: a warm-up's, a prefill's transients - given back
+        to a budget `over` bytes short, before any placement change: True where that was enough (no layer moves, no
+        card graph is rebuilt, nothing slower after). Not twice within TRIM_AGAIN_S: then the policy yields"""
+        if self.dev.type != Device.CUDA:
+            return False
+        now = time.monotonic()
+        if now - self.vram_state.trim_t < self.TRIM_AGAIN_S:
+            return False
+        self.vram_state.trim_t = now
+        self.vram_trim(f"{_size(over)} past the budget: {self._vram_why()}")
+        if self._vram_over() > 0:
+            return False
+        (log or self.log)("[vram] inside the budget again on torch's cached blocks alone: nothing shed")
+        return True
+
     def vram_yield(self, cache: Any = None, log: Log | None = None) -> list[str]:
         """The card given back to the budget Windows asks for: shed (the drafter, the last resident layer, the head -
         `vram_shed`'s order) until this process is inside its budget with the margin kept for other programs, or has
-        nothing left to shed. Grown back by the policy once the budget has room again (`vram_regrow`)"""
+        nothing left to shed - one at least, torch's cache having been tried first (`_vram_trim_enough`): what is
+        left past the budget is not a cache, and the card graphs let go come back with the next pass. Grown back by the
+        policy once the budget has room again (`vram_regrow`)"""
         log = log or self.log
         over = self._vram_over()
         moved: list[str] = []
         spent = self.vram_state.spent
         if over <= 0 or (spent and over <= spent + (256 << 20)):
             return moved
-        log(f"[vram] another program wants the card: {over / 2**30:.2f} GB past this process's budget")
+        log(f"[vram] {_size(over)} past this process's budget, giving the card back: {self._vram_why()}")
         # the card graphs first: they hold every layer's blocks, and a shed under them frees nothing
         self._card_let_go()
-        stalled = 0
-        for _ in range(int(getattr(self, "L", 0) or 0) + 3):
-            before = self._vram_over()
-            if before <= 0:
+        # as long as Windows asks: a program taking the card as it frees (a game loading) cuts this process's budget
+        # with every layer given back, and gets the card - a layer a shed frees its ~0.2 GB (Qwen3-4B, measured)
+        for k in range(int(getattr(self, "L", 0) or 0) + 3):
+            if k and self._vram_over() <= 0:
                 break
             m = self.vram_shed(cache, log)
             if m is None:
                 break
             moved.append(m)
-            # a shed that brought the card no nearer its budget twice running: what is past it is not the engine's
-            # layers (the arena, the cache, the driver's own), and shedding on would give up the card for nothing
-            stalled = stalled + 1 if self._vram_over() >= before else 0
-            if stalled >= 2:
-                break
         self.vram_state.free_checks = 0
         self._card_ms_min = None
         still = self._vram_over()
@@ -424,7 +550,7 @@ class _MemoryMixin(_State):
         self.vram_state.spent = max(0, still)
         log(
             f"[vram] gave back {len(moved)} ({', '.join(moved) or 'nothing'})"
-            + (f"; still {still / 2**30:.2f} GB past the budget, nothing more that helps to shed" if still > 0 else "")
+            + (f"; still {still / 2**30:.2f} GB past the budget, nothing left to shed" if still > 0 else "")
         )
         return moved
 
@@ -432,12 +558,16 @@ class _MemoryMixin(_State):
         """A thread waiting on Windows' budget-change event for the card: signalled, and past the budget, it gives the
         card back at once when the engine is idle (the decode lock free) - between requests nothing else would run
         the policy - and otherwise leaves it to the running decode's next pass (`vram_policy`), which reads the budget
-        before it runs. Off Windows, or with `adapt` off, nothing"""
+        before it runs. A signal the engine was busy for (a decode, the load's warm-up) is kept, and the budget read
+        again each second until the engine lets go of the lock - the event resets as it is waited on, and the
+        warm-up's last pass reads no budget after it. Each second it notes the largest budget given (`_vram_why`).
+        Off Windows, or with `adapt` off, nothing"""
         if not getattr(self, "vram_watch", False) or self.dev.type != Device.CUDA:
             return
-        p = torch.cuda.get_device_properties(self.dev)
-        name, total = str(p.name), int(p.total_memory)
-        reg = wddm_budget_event(name, total)
+        info = device_mod._wddm_info(self.dev)
+        if info is not None:
+            self.vram_state.budget_hi = max(self.vram_state.budget_hi, info[0])
+        reg = wddm_budget_event(*device_mod.card_ids(self.dev))
         if reg is None:
             return
         # the engine by a weak reference and its abort flag alone: the thread never keeps an engine alive that its
@@ -445,25 +575,34 @@ class _MemoryMixin(_State):
         me, abort = weakref.ref(self), self.abort
 
         def run() -> None:
+            pending = False  # a signal the engine was busy for
             try:
                 while not abort.is_set():
-                    signalled = wait_event(reg[0], 1.0)
+                    signalled = wait_event(reg.event, 1.0)
                     sm = me()
                     if sm is None:
                         return
-                    if not signalled or sm._vram_over() <= 0:
+                    info = device_mod._wddm_info(sm.dev)
+                    if info is not None:
+                        sm.vram_state.budget_hi = max(sm.vram_state.budget_hi, info[0])
+                    over = sm._vram_over() if (signalled or pending) else 0
+                    if over <= 0:
+                        pending = False
                         del sm
                         continue
                     lock = getattr(sm, "_decode_lock", None)
-                    if lock is not None and lock.acquire(blocking=False):  # else a decode runs: its next pass yields
+                    if lock is not None and lock.acquire(blocking=False):
+                        pending = False
                         try:
-                            if not abort.is_set():
+                            if not abort.is_set() and not sm._vram_trim_enough(over, None):
                                 sm.device.request("yield", partial(sm.vram_yield, None, None))
                         finally:
                             lock.release()
+                    else:
+                        pending = True  # a decode runs, or the load's warm-up: asked again each second till it ends
                     del sm
             finally:
-                wddm_budget_unregister(name, total, reg)
+                wddm_budget_unregister(reg)
 
         threading.Thread(target=run, name="btb-vram-budget", daemon=True).start()
 
@@ -523,7 +662,8 @@ class _MemoryMixin(_State):
         gained = min(int(host_free_bytes()), int(host_commit_bytes())) - before
         left = self._ram_left()
         log(
-            f"[ram] gave back {gained / 2**30:.2f} GB ({blocks} store slots, {len(layers)} host layers to the drive)"
+            f"[ram] gave back {gained / 2**30:.2f} GB ({blocks} store slots, host layers {layers or 'none'} to the "
+            f"drive; the store holds off growing back for {self.RAM_HOLD_S:.0f} s)"
             + (f"; {(head - left) / 2**30:.2f} GB short of the headroom, nothing left to give" if left < head else "")
         )
         return gained
@@ -562,6 +702,8 @@ class _MemoryMixin(_State):
         (`ram_yield`). Else once a second: shed one warm layer to the ring after two consecutive readings with no
         free host memory above the reserve. Regrow the last shed layer after `regrow_after` consecutive clean
         readings with room for it."""
+        if self.warming:
+            return  # the warm-up's own passes: answered once it is done (model.py `_warming`)
         if self._ram_short() > 0:
             self.device.request("ram-yield", lambda: self.ram_yield(log))
             return
@@ -609,7 +751,11 @@ class _MemoryMixin(_State):
         self.cold.add(i)
         self.ram_state.shed.append(i)
         self._bind_cold()
-        log(f"[ram] SHED layer {i} -> drive ({why or 'asked'}); {len(self.cold)} layers from the drive each pass")
+        size = _size(self._layer_bytes_stored(i, bool(getattr(self, "_packed", None))))
+        log(
+            f"[ram] SHED layer {i} -> drive ({size} of RAM given back; {why or 'asked'}); {len(self.cold)} layers "
+            "from the drive each pass"
+        )
         return i
 
     def ram_regrow(self, log: Log | None = None) -> int | None:
@@ -626,7 +772,11 @@ class _MemoryMixin(_State):
             self._bind_cold()
         else:
             self.cold_ring = ColdRing()
-        log(f"[ram] REGROW layer {i} -> RAM (still shed: {self.ram_state.shed}); {len(self.cold)} from the drive")
+        size = _size(self._layer_bytes_stored(i, bool(getattr(self, "_packed", None))))
+        log(
+            f"[ram] REGROW layer {i} -> RAM ({size}; still shed: {self.ram_state.shed}); {len(self.cold)} from the "
+            "drive"
+        )
         return i
 
     def layer_bytes(self) -> dict[int, int]:

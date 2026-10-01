@@ -35,18 +35,17 @@ import sys
 import threading
 import types
 import weakref
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
-
-if TYPE_CHECKING:
-    from .model import StreamedTextModel
 
 MIN_BYTES = 16 << 20  # smaller than this is a pass's scratch or a caller's own, never an engine's holding
 WALK_MAX = 2_000_000  # objects the ownership walk visits at most; past it the report says so
 
-_LIVE: weakref.WeakSet[StreamedTextModel] = weakref.WeakSet()  # engines built and not yet closed
-_SINCE: list[weakref.ref[StreamedTextModel]] = []  # every engine built since the baseline: the census's roots
+# an engine is any object to the census - its fields read with `getattr`, its holdings walked as found - so a stand-in
+# (tests/unit/test_leaks.py) or an engine whose construction failed part way is counted as a built one is
+_LIVE: weakref.WeakSet[object] = weakref.WeakSet()  # engines built and not yet closed
+_SINCE: list[weakref.ref[object]] = []  # every engine built since the baseline: the census's roots
 _BASE: dict[str, Any] = {}  # the baseline: the tensors alive, and the card and pinned bytes handed out
 _FOUND: list[str] = []  # what the harness's census found, for its next report
 _LOCK = threading.RLock()  # reentrant: the census collects, and a finalizer it runs may reach here
@@ -125,7 +124,7 @@ def _baseline() -> None:
     _SINCE.clear()
 
 
-def track(engine: StreamedTextModel) -> None:
+def track(engine: object) -> None:
     """an engine built. Armed with none alive, what exists now is the census's baseline - a baseline still
     uncounted (a module's engine closed after the last test's check) is counted first"""
     with _LOCK:
@@ -137,7 +136,7 @@ def track(engine: StreamedTextModel) -> None:
         _SINCE.append(weakref.ref(engine))
 
 
-def closed(engine: StreamedTextModel) -> None:
+def closed(engine: object) -> None:
     """an engine closed: its own check - the registry emptied, nothing spoken for in its ledger - logged if it
     fails; with `BTB_LEAK_CHECK=1` and no engine left alive, the census, logged too. Read with `getattr`: an engine
     whose construction failed part way is closed too, and may lack what a built one has"""
@@ -161,6 +160,49 @@ def closed(engine: StreamedTextModel) -> None:
         lines = _census()
     if lines:
         log("[leak] a closed engine kept memory:\n" + "\n".join(lines))
+
+
+def live() -> bool:
+    """engines built and not yet closed: the census waits for them (`verify`)"""
+    with _LOCK:
+        return bool(_LIVE)
+
+
+def cycles() -> list[str]:
+    """what only a reference cycle keeps now, as report lines - each storage of MIN_BYTES or more, and what the cycle
+    is made of; none below. The harness's check at a test's end while an engine it shares with the next test is
+    still alive (tests.helpers.shared_model): the census waits for that engine, and the collection after the test
+    frees a cycle the test left before any census could see it. One collection that saves its garbage"""
+    lines: list[str] = []
+    gc.set_debug(gc.DEBUG_SAVEALL)
+    try:
+        gc.collect()
+        saved = {id(o): o for o in gc.garbage}  # alive while saved: their ids are theirs
+        found: dict[tuple[str, int], tuple[int, Any]] = {}
+        for o in gc.garbage:
+            if _is_tensor(o):
+                key = _key(o)
+                if key is not None and key[1] >= MIN_BYTES and key[0] not in found:
+                    found[key[0]] = (key[1], o)
+        if found:
+            back: dict[int, list[Any]] = {}
+            for o in gc.garbage:
+                for c in gc.get_referents(o):
+                    if id(c) in saved:
+                        back.setdefault(id(c), []).append(o)
+            for (dev, _ptr), (nb, t) in sorted(found.items(), key=lambda kv: -kv[1][0]):
+                kinds = _cycle(t, back)
+                lines.append(
+                    f"  {_size(nb)} {dev} {t.dtype} {list(t.shape)}: held only by a reference cycle"
+                    + (f" with {', '.join(kinds[:6])}" if kinds else "")
+                )
+            del back
+        del saved, found
+    finally:
+        gc.set_debug(0)
+        gc.garbage.clear()
+        gc.collect()
+    return lines
 
 
 def verify() -> list[str]:

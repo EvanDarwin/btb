@@ -543,8 +543,10 @@ def test_a_bound_layer_given_up_to_the_host_moves_its_rows_straight_there(
         i = prog.sparse[0]
         cl = cache.layers[i]
         assert isinstance(cl, ArenaIndexedLayer) and cl.attached
+        assert cl.keys is not None and cl.values is not None and cl.indexer_keys is not None
         rows = [t.clone() for t in (cl.keys, cl.values, cl.indexer_keys)]
         real = cl.grant  # the grant the layer was bound with, which its move asks through
+        assert real is not None, "a bound layer with no grant to ask its move through"
         asked: list[str] = []
 
         def grant(nbytes: int, kind: str, **kw: Any) -> None:

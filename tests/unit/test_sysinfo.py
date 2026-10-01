@@ -79,7 +79,11 @@ def test_the_wddm_budget_is_read_for_the_card_dxgi_names_and_none_elsewhere() ->
     import shutil
     import subprocess
 
-    from btb.sysinfo import wddm_room
+    from btb.sysinfo import _wddm_matches, cuda_luid, wddm_info
+
+    def wddm_room(name: str, total: int, ordinal: int | None = None) -> int | None:
+        info = wddm_info(name, total, ordinal)
+        return None if info is None else info[0] - info[1]
 
     assert wddm_room("no such card", 1 << 30) is None
     if sys.platform != "win32" or shutil.which("nvidia-smi") is None:
@@ -94,7 +98,10 @@ def test_the_wddm_budget_is_read_for_the_card_dxgi_names_and_none_elsewhere() ->
     if len(rows) != 1:
         return  # several cards of one name are not named uniquely, and read None
     name, mib = rows[0][0].strip(), int(rows[0][1])
-    room = wddm_room(name, mib << 20)
+    # the one card, CUDA's ordinal 0: its LUID names it where DXGI lists it twice (after a driver reset it did)
+    room = wddm_room(name, mib << 20, 0)
+    if room is None and cuda_luid(0) is None and len(_wddm_matches(name, mib << 20)) > 1:
+        return  # CUDA hidden (CUDA_VISIBLE_DEVICES=-1) and the card listed twice: no LUID here to name it by
     assert room is not None and 0 < room <= (mib << 20), (name, mib, room)
 
 

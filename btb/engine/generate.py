@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 import torch
 
 from .. import mlx as mlxdev
+from .. import trace
 from ..draft import NGramProposer, SpanBank, Spans
 from ..kinds import PROPOSER_TAG, Json, LayerKind, PassTag, Proposer, TokenRows, Tokens
 from ..options import Device
@@ -97,6 +98,14 @@ def _chains_tree(
                 children.setdefault(node, []).append(nxt)
             node = nxt
     return guesses, parents, depth, children, tags
+
+
+def _children(parents: Sequence[int]) -> dict[int, list[int]]:
+    """each tree node's children in node order, from the nodes' parents (node 0 the root)"""
+    children: dict[int, list[int]] = {}
+    for j in range(1, len(parents)):
+        children.setdefault(parents[j], []).append(j)
+    return children
 
 
 class _GenerateMixin(_State):
@@ -420,14 +429,33 @@ class _GenerateMixin(_State):
             v = min(v_max, max_new - len(committed) - 1)
             budget = self._spec_budget(ema_tokens, census["forwards"], v_max, cache.get_seq_length())
             rows, probe = pricer.plan(budget, census["forwards"])
+            if trace.ON:  # every pass: nothing built for the trace when it is off
+                trace.changed(
+                    (trace.token(self), "spec rows"),
+                    rows,
+                    "speculation: passes %d rows wide as priced (%s)",
+                    rows,
+                    "a plain step - no width pays" if rows <= 1 else f"the budget {budget}",
+                )
             v = max(0, min(v, rows - 1))
-            if v > 0 and not self.fam.verify_exact(self, cache):
-                # a pass the family's paths would not verify exactly as they stand now (Qwen4's off its kernels)
-                # is a plain one-row pass: nothing drafted
-                v = 0
-            # each draft's path probability (1 for a chain's) and the drafts made before the pricing kept a prefix
+            if v > 0:
+                exact = self.fam.verify_exact(self, cache)
+                if trace.ON:
+                    trace.changed(
+                        (trace.token(self), "spec exact"),
+                        exact,
+                        "speculation: %s",
+                        "the paths verify exactly - drafting"
+                        if exact
+                        else "the paths would not verify exactly as they stand - plain one-row passes",
+                    )
+                if not exact:
+                    # a pass the family's paths would not verify exactly as they stand now (Qwen4's off its kernels)
+                    # is a plain one-row pass: nothing drafted
+                    v = 0
+            # each draft's path probability (1 for a chain's), and the width the drafter was asked for
             node_p: list[float] = []
-            drafted = 0
+            asked = v
             base_len = cache.get_seq_length()
             src = "mtp"
             node_tags = None
@@ -470,26 +498,14 @@ class _GenerateMixin(_State):
                 # nodes' distributions: the verify pass accepts against them
                 tk, par, dep, tg = drawn[:4]
                 qrows, draws = (drawn[4], drawn[5]) if len(drawn) > 4 else (None, None)
-                drafted = len(tk)
                 node_p = [float(x) for x in getattr(dr, "last_p", ())]
-                if len(node_p) != drafted:
-                    node_p = [1.0] * drafted
-                # the tree priced node by node in the drafter's order: the prefix whose expected tokens a second
-                # are the most is verified (a prefix keeps each node's parent; a row's draws under a temperature
-                # stay whole, so a pruned child ends the walk as one the tree never held). Size only, never a token
-                gains = [pricer.gain(str(tg[j]), int(dep[j]), node_p[j]) for j in range(drafted)]
-                pricer.record_tree(gains, capped=drafted >= n_draft)
-                keep = pricer.prune(gains, probe)
-                if keep < drafted:
-                    tk, par, dep, tg, node_p = tk[:keep], par[:keep], dep[:keep], tg[:keep], node_p[:keep]
                 guesses = [int(t) for t in tk]
                 parents = [-1] + [0 if p < 0 else p + 1 for p in par]
                 depth = [0] + [int(d) for d in dep]
                 node_tags = ["root", *list(tg)]
-                children = {}
-                for j in range(1, len(guesses) + 1):
-                    children.setdefault(parents[j], []).append(j)
+                children = _children(parents)
                 src = "union" if extra else "mtp"
+                asked = n_draft
             elif use_tree:
                 if tree_fn is not None:
                     g1, ca, cb = tree_fn(committed)
@@ -506,9 +522,7 @@ class _GenerateMixin(_State):
                     *([1, *range(2 + len(ca), 1 + len(ca) + len(cb))] if cb else []),
                 ]
                 depth = [0, 1, *list(range(2, 2 + len(ca))), *list(range(2, 2 + len(cb)))]
-                children = {}
-                for j in range(1, len(guesses) + 1):
-                    children.setdefault(parents[j], []).append(j)
+                children = _children(parents)
             elif use_mtp:
                 dr.crop(base_len - 1 - len(pend_toks))
                 guesses = dr.ar([*pend_toks, cur], pend_h, base_len - 1 - len(pend_toks), v)
@@ -526,16 +540,30 @@ class _GenerateMixin(_State):
                     guesses, where = prop.propose_with_source(v)
                     guesses = [int(g) for g in guesses]
                     src = where[0] if isinstance(where, tuple) else "self"
-            if not node_p and guesses:
-                drafted = len(guesses)
-                node_p = [1.0] * drafted
-                if pricer.active():
-                    # a chain or an unweighted tree: its nodes' gains are their source's acceptance by depth
-                    tags_ = node_tags[1:] if node_tags else [src] * drafted
-                    deps_ = depth[1:] if tree_now else list(range(1, drafted + 1))
-                    pricer.record_tree(
-                        [pricer.gain(str(t_), int(d_), 1.0) for t_, d_ in zip(tags_, deps_)], capped=drafted >= v
-                    )
+            # the drafts made before the pricing kept a prefix
+            drafted = len(guesses)
+            if len(node_p) != drafted:
+                node_p = [1.0] * drafted  # a chain or an unweighted tree: each node's gain its source's acceptance
+            # the drafter's tree is priced always - an empty one too, saying nothing wider gained - the other drafts
+            # where the pricing sizes the pass
+            if use_dyn or (drafted and pricer.active()):
+                # the drafts priced node by node in the drafter's order, and verified as far as they pay (`prune`):
+                # a probe drafts the whole width and verifies one draft at least - unpriced, a chain verified every
+                # one of them, 15 rows of a mixture's experts for drafts accepted one time in ten (gpt-oss-120b,
+                # n-gram chains). A prefix keeps every node's parent (a node follows its parent in the chain, the
+                # merged tree and the drafter's); a row's draws under a temperature stay whole, so a pruned child
+                # ends the walk as one the tree never held. Size only, never a token
+                tags_ = node_tags[1:] if node_tags else [src] * drafted
+                deps_ = depth[1:] if tree_now else list(range(1, drafted + 1))
+                gains_ = [pricer.gain(str(t_), int(d_), node_p[j]) for j, (t_, d_) in enumerate(zip(tags_, deps_))]
+                pricer.record_tree(gains_, capped=drafted >= asked)
+                keep = pricer.prune(gains_, probe)
+                if keep < drafted:
+                    guesses, node_p = guesses[:keep], node_p[:keep]
+                    if tree_now:
+                        parents, depth = parents[: keep + 1], depth[: keep + 1]
+                        node_tags = node_tags[: keep + 1] if node_tags else node_tags
+                        children = _children(parents)
             self.aa(parents if tree_now else None)
             pick: Any = smp
             if tree_now and qrows is not None:
@@ -696,8 +724,10 @@ class _GenerateMixin(_State):
             f"{phase['forward'] / max(1, census['forwards'] - 1) * 1e3:.1f} + commit "
             f"{phase['commit'] / max(1, census['forwards'] - 1) * 1e3:.1f}"
             + (
-                f" (the drafter {dr.step_s / max(1, census['forwards'] - 1) * 1e3:.1f} of the propose, "
-                f"{dr.steps / max(1, census['forwards'] - 1):.1f} steps a pass)"
+                # this call's steps (`mtp_steps`): the drafter's own totals ran from its first call, and read as
+                # 409 ms of a 128 ms propose on Qwen3.8-flash-next's second prompt
+                f" (the drafter {census['mtp_step_s'] / max(1, census['forwards'] - 1) * 1e3:.1f} of the propose, "
+                f"{census['mtp_steps'] / max(1, census['forwards'] - 1):.1f} steps a pass)"
                 if use_mtp
                 else ""
             )

@@ -30,7 +30,11 @@ Width. A pass carries the k maximizing (1 + G(k - 1)) / (d + cost(k)) against th
 the expected gain of a tree's first nodes in the drafter's order: before drafting, the decayed gains of the recent
 passes' trees; after, the drafted tree's own (a prefix of that order keeps every node's parent). Every PROBE-th pass
 (and the first priced one) drafts the whole tree and verifies one draft at least, whatever the model says, and the
-pass after a run of PROBE_PLAIN plain steps verifies one draft: the calibration is always fed. The pricing sizes a
+pass after a run of PROBE_PLAIN plain steps verifies one draft: the calibration is fed while a draft could pay at all.
+Where no width would beat the step even were every draft accepted (`could_pay`: the rows cost near a step each, the
+drafter a large share of one), the acceptance decides nothing and only a run of PROBE_FAR plain steps - the pricer's,
+across calls - verifies one draft, the rows' cost and the drafter's measured again: a store that fills, a drive that
+speeds up, a card no longer contended, reopen the drafts. The pricing sizes a
 pass only where the rows' reads matter - the widest pass's modelled reads a twentieth of a step or more - and then
 over the engine's full width, the base curve's budget set aside (its curve priced the reads into the rows); a model
 whose experts sit in VRAM or RAM, and a dense model, keep the width the base curve gives them.
@@ -64,6 +68,11 @@ class SpecCost:
     # a run of plain steps this long verifies one draft on the next pass: the calibration a plain verdict rests on
     # is kept fed, at most one pass in PROBE_PLAIN a row wider than the step
     PROBE_PLAIN = 8
+    # where no width would beat the step were every draft it carries accepted (`could_pay`), the acceptance has
+    # nothing to decide: a run of plain steps this long, across calls, verifies one draft - the rows' cost and the
+    # drafter's measured again (Qwen3.8-flash-next on the host: a 2-row pass 2.2 steps and the drafter 0.58 s, its
+    # probes a sixth of the call)
+    PROBE_FAR = 64
     DRIVE_SHARE = 0.05  # the widest pass's modelled reads under this share of a step: the base sizing stands
     DEPTHS = 8  # depths reported
     # plain steps measured before a priced store's passes are sized: the first after a prefill reloads what the
@@ -196,6 +205,12 @@ class SpecCost:
         d = (self.draft_s or 0.0) if (drafted or k > 1) else 0.0
         return (1.0 + g) / max(1e-9, d + self.cost(k))
 
+    def could_pay(self) -> bool:
+        """whether some width would beat the plain step were every draft it carries accepted: only then has the
+        drafts' acceptance a verdict to give, and the calibration probes something to feed"""
+        plain = self.rate(1, 0.0, False)
+        return any(self.rate(k, k - 1.0, True) > plain for k in range(2, self.full + 1))
+
     def best(self, gains: Sequence[float], drafted: bool, at_least: int = 1) -> int:
         """the rows (root included) of the fastest pass, `gains[j]` the gain of its first j nodes; the narrowest
         of equals"""
@@ -221,11 +236,16 @@ class SpecCost:
             return 1, False
         # active and measured: the widest pass's reads cost something, so it is wider than the step
         cap = self.full
-        if self.probe_next or passes % self.PROBE == 0:
+        # the probes feed the calibration while a draft could pay at all, and measure the cost now and then when none
+        # could (the first probe always: it measures the rows and the drafter the verdict rests on). The run of plain
+        # steps is the pricer's own, across calls: `passes` starts again each call, and a count of it never reached
+        # PROBE_FAR in calls of fewer passes - a verdict fitted once under contention kept the drafts off for good
+        pays = self.could_pay()
+        if self.probe_next or (passes % self.PROBE == 0 and pays):
             self.probe_next = False
             return cap, True
         k = self.best([self.expected(j) for j in range(cap)], drafted=False)
-        if k == 1 and self.plain_run >= self.PROBE_PLAIN:
+        if k == 1 and self.plain_run >= (self.PROBE_PLAIN if pays else self.PROBE_FAR):
             return 2, True
         return k, False
 

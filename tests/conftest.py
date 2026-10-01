@@ -6,7 +6,7 @@ import gc
 import json
 import os
 import sys
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from typing import TYPE_CHECKING
 
 import pytest
@@ -44,6 +44,11 @@ def _release_allocator_caches() -> Iterator[None]:
     yield
     leaks = sys.modules.get("btb.engine.leaks")  # only a test that built an engine has one to check
     found = leaks.verify() if leaks is not None else []
+    helpers = sys.modules.get("tests.helpers")
+    if leaks is not None and helpers is not None and helpers._SHARED:
+        # a model shared with the next test is still alive, so the census waits for it; what only a cycle keeps is
+        # found now, before the collection below frees it unseen
+        found += leaks.cycles()
     gc.collect()
     _release_cuda_cache()
     mx = sys.modules.get("mlx.core")  # only a test that loaded MLX has an MLX cache to return
@@ -51,6 +56,81 @@ def _release_allocator_caches() -> Iterator[None]:
         mx.clear_cache()
     if found:
         pytest.fail("a closed engine kept memory:\n" + "\n".join(found), pytrace=False)
+
+
+def _shared_keys(item: pytest.Item | None) -> frozenset[tuple[object, ...]]:
+    """the shared models a test declares (its module's `shared_model_keys`, tests.helpers.shared_model); none for a
+    test that is skipped before it runs"""
+    if item is None or item.get_closest_marker("skip") is not None:
+        return frozenset()
+    fn = getattr(getattr(item, "module", None), "shared_model_keys", None)
+    return frozenset(fn(item)) if fn is not None else frozenset()
+
+
+def pytest_collection_modifyitems(config: Config, items: list[pytest.Item]) -> None:
+    """the tests of a module that share a model run one after another, so it is loaded once for them all
+    (tests.helpers.shared_model): within each module, and only among its tests that declare one - every other test
+    keeps its place, so a module's fixtures and the tests that read what earlier ones recorded are left as they were"""
+    start = 0
+    while start < len(items):
+        mod = getattr(items[start], "module", None)
+        end = start
+        while end < len(items) and getattr(items[end], "module", None) is mod:
+            end += 1
+        slots = [i for i in range(start, end) if _shared_keys(items[i])]
+        if len(slots) > 1:
+            ordered = sorted((items[i] for i in slots), key=lambda it: sorted(map(repr, _shared_keys(it))))
+            for i, it in zip(slots, ordered, strict=True):
+                items[i] = it
+        start = end
+
+
+# a test whose call failed: the shared models it used are let go at its teardown, never handed to the next test in
+# whatever state the failure left them (a pass cut short, the card graph turned off, a session still bound)
+_FAILED = pytest.StashKey[bool]()
+# the first test after each that is not skipped before it runs, by the test's id (`_next_to_run`)
+_NEXT_RUN: dict[int, pytest.Item | None] = {}
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(
+    item: pytest.Item, call: pytest.CallInfo[None]
+) -> Generator[None, TestReport, TestReport]:
+    report = yield
+    if report.when == "call" and report.failed:
+        item.stash[_FAILED] = True
+    return report
+
+
+def _next_to_run(item: pytest.Item, nextitem: pytest.Item | None) -> pytest.Item | None:
+    """the next test that runs: `nextitem`, or past it the first not skipped before it runs - a skipped cell between
+    two tests sharing a model otherwise let the model go and the second loaded it again"""
+    if nextitem is None or nextitem.get_closest_marker("skip") is None:
+        return nextitem
+    if not _NEXT_RUN:
+        after: pytest.Item | None = None
+        for it in reversed(item.session.items):
+            _NEXT_RUN[id(it)] = after
+            if it.get_closest_marker("skip") is None:
+                after = it
+    return _NEXT_RUN.get(id(nextitem))
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> Iterator[None]:
+    """a shared model the next test to run does not declare closed now, before this test's fixtures are torn down -
+    so the leak check of `_release_allocator_caches` covers it at this test; every one this test used, where it
+    failed. A model that would not close is this test's teardown error, raised after pytest's own teardown has run
+    (raised before it, the test's fixtures were never torn down and the next test failed its setup)"""
+    helpers = sys.modules.get("tests.helpers")
+    errors: list[BaseException] = []
+    if helpers is not None and helpers._SHARED:
+        keep = frozenset() if item.stash.get(_FAILED, False) else _shared_keys(_next_to_run(item, nextitem))
+        errors = helpers.release_shared(keep)
+    result = yield
+    if errors:
+        raise ExceptionGroup("a shared model would not close", errors)  # type: ignore[type-var]
+    return result
 
 
 def pytest_configure(config: Config) -> None:
@@ -123,6 +203,12 @@ def _ledger_path(config: Config) -> str | None:
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """write the collected skips to the ledger (see `_ledger_path`), and, when BTB_CERT_RECEIPT names a path,
     this machine's cert coverage receipt (what the cert runner ran and passed here) for the cross-machine union"""
+    helpers = sys.modules.get("tests.helpers")
+    if helpers is not None:
+        # a run stopped part way (-x, a keyboard interrupt) leaves no shared model open; a close that raised is said,
+        # the receipt and the ledger written all the same
+        for e in helpers.release_shared():
+            sys.stderr.write(f"\n[shared model] would not close at the session's end: {e!r}\n")
     receipt_path = os.environ.get("BTB_CERT_RECEIPT")
     if receipt_path:
         from tests.cert import receipt

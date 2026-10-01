@@ -25,28 +25,23 @@ from btb.engine.branches import Batch, Branches
 from btb.kinds import LayerKind
 from btb.session import Mark, Session, State
 from tests.cert import spec
-from tests.helpers import fixture, loaded_model
+from tests.helpers import FIXTURES, fixture, shared_key, shared_model
 
 STEMS = sorted(set(spec.FIXTURE_STEM.values()))
 SEEDS = range(int(os.environ.get("BTB_WALK_SEEDS", "3")))
 STEPS = 40
 VOCAB = 200  # the tokens a walk feeds: inside every fixture's vocabulary
 
-_models: dict[str, StreamedTextModel] = {}
-_open = contextlib.ExitStack()
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _close_models() -> Iterator[None]:
-    yield
-    _open.close()
-    _models.clear()
-
 
 def model(stem: str) -> StreamedTextModel:
-    if stem not in _models:
-        _models[stem] = _open.enter_context(loaded_model(fixture(stem), device="cpu"))
-    return _models[stem]
+    """the fixture on the CPU, loaded once for the walks on it (tests.helpers.shared_model)"""
+    return shared_model(fixture(stem), device="cpu")
+
+
+def shared_model_keys(item: pytest.Item) -> list[tuple[object, ...]]:
+    """every test here takes one model: its cell's fixture, the first stem where it names none"""
+    p = getattr(getattr(item, "callspec", None), "params", {})
+    return [shared_key(os.path.join(FIXTURES, p.get("stem", STEMS[0])), {"device": "cpu"})]
 
 
 class Boom(RuntimeError):

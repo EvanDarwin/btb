@@ -27,7 +27,7 @@ from pytest import MonkeyPatch
 from btb.engine import BatchScheduler
 from btb.engine import device as device_mod
 from btb.engine import memory as memory_mod
-from btb.engine.device import Device
+from btb.engine.device import Device, Where
 from btb.engine.families import Family
 from btb.engine.forward import _ForwardMixin
 from btb.engine.generate import _GenerateMixin
@@ -59,6 +59,13 @@ TOTAL_VRAM = 12 * GB
 
 
 # --- the stubs ----------------------------------------------------------------------------------------------
+
+
+def _where(dev: str) -> Where:
+    """`dev` as the engine names its device (`device.where`): a card always by its index - the card 0, no card here
+    to ask which is current"""
+    d = torch.device(dev)
+    return Where(torch.device("cuda", 0) if d.type == "cuda" and d.index is None else d)
 
 
 @contextlib.contextmanager
@@ -135,7 +142,7 @@ class _StubEngine(_GenerateMixin):
         self.layer_types = list(layer_types)
         self.compute_dtype = None
         self.kv_bits = None
-        self.dev = torch.device(dev)
+        self.dev = _where(dev)
         self.mlx = None
         self.mem_start = 0
         self.ram_reserve = 0
@@ -860,7 +867,7 @@ class _PolicyEngine(_MemoryMixin):
     """the policy's state, with the two actions it can take recorded instead of run"""
 
     def __init__(self, vram_margin: int = 1 * GB, shed: Sequence[str] = (), watch: bool = True) -> None:
-        self.dev = torch.device("cuda")
+        self.dev = _where("cuda")
         self.vram_watch = watch
         self.vram_margin = int(vram_margin)
         # the policy reads free memory and applies its moves through the engine's device, as the real one does
@@ -969,11 +976,18 @@ def test_vram_policy_does_not_stand_aside_for_a_single_row_cache() -> None:
 
 
 @contextlib.contextmanager
-def budget_room(start: int, freed_per_shed: int, e: _PolicyEngine) -> Iterator[list[int]]:
+def budget_room(start: int, freed_per_shed: int, e: _PolicyEngine, trim_frees: int = 0) -> Iterator[list[int]]:
     """the WDDM budget's room for this process, `start` bytes (negative: past the budget), rising by
-    `freed_per_shed` with every layer the stub engine sheds; the PDH sensor made to fail the test if read"""
+    `freed_per_shed` with every layer the stub engine sheds and by `trim_frees` with every emptying of torch's cache
+    (the trim tried before any shed); the PDH sensor made to fail the test if read"""
     room = [int(start)]
-    saved_room, saved_pdh = device_mod._wddm_room, memory_mod.vram_pressure
+    saved_room, saved_pdh, saved_info = device_mod._wddm_room, memory_mod.vram_pressure, device_mod._wddm_info
+    saved_cuda = (
+        torch.cuda.synchronize,
+        torch.cuda.empty_cache,
+        torch.cuda.memory_reserved,
+        torch.cuda.memory_allocated,
+    )
     real_shed = e.vram_shed
 
     def shed(cache: Any = None, log: Log | None = None) -> str:
@@ -984,12 +998,23 @@ def budget_room(start: int, freed_per_shed: int, e: _PolicyEngine) -> Iterator[l
         raise AssertionError("the budget's answer needs no PDH read")
 
     device_mod._wddm_room = lambda dev: room[0]
+    # the budget and the usage apart, the budget 11 GB as the engine came up: a room below zero is a smaller budget
+    device_mod._wddm_info = lambda dev: (11 * GB + min(0, room[0]), 11 * GB - max(0, room[0]))
+    e.vram_state.budget_hi = 11 * GB
     memory_mod.vram_pressure = no_pdh
     e.vram_shed = shed  # type: ignore[method-assign]
+    # the trim's own torch calls: no card here (CUDA hidden), its cache a figure the budget answers to
+    torch.cuda.synchronize = lambda *a, **k: None
+    torch.cuda.empty_cache = lambda: room.__setitem__(0, room[0] + int(trim_frees))
+    torch.cuda.memory_reserved = lambda *a, **k: 0
+    torch.cuda.memory_allocated = lambda *a, **k: 0
     try:
         yield room
     finally:
-        device_mod._wddm_room, memory_mod.vram_pressure = saved_room, saved_pdh
+        device_mod._wddm_room, memory_mod.vram_pressure, device_mod._wddm_info = saved_room, saved_pdh, saved_info
+        (torch.cuda.synchronize, torch.cuda.empty_cache, torch.cuda.memory_reserved, torch.cuda.memory_allocated) = (
+            saved_cuda
+        )
 
 
 def test_vram_policy_gives_the_card_back_the_moment_its_budget_shrinks() -> None:
@@ -1006,7 +1031,19 @@ def test_vram_policy_gives_the_card_back_the_moment_its_budget_shrinks() -> None
         e.vram_state.last_t = time.time()  # the PDH read is not due: only the budget is read this pass
         e.vram_policy(_batched_cache(1))
     assert len(e.shed_calls) == 4, "a budget with room sheds nothing more"
-    assert any("another program wants the card" in ln for ln in e.lines), e.lines
+    assert any("another program took 1.50 GiB of the card" in ln for ln in e.lines), e.lines
+
+
+def test_vram_yield_names_its_own_growth_past_the_budget_apart_from_another_programs() -> None:
+    """the budget as it was when the engine came up, the process's own use past it: the log says the plan fell short,
+    not that another program took the card (Qwen3-4B alone on the card read as a game for hours)"""
+    e = _PolicyEngine(vram_margin=GB // 2)
+    e.L = 8
+    with budget_room(-GB, 600 * MB, e):
+        device_mod._wddm_info = lambda dev: (11 * GB, 12 * GB)  # the budget unmoved, the process past it
+        e.vram_yield(_batched_cache(1))
+    assert any("grew past its own budget" in ln for ln in e.lines), e.lines
+    assert not any("another program" in ln for ln in e.lines), e.lines
 
 
 def test_vram_policy_within_its_budget_gives_nothing_back() -> None:
@@ -1018,30 +1055,138 @@ def test_vram_policy_within_its_budget_gives_nothing_back() -> None:
     assert e.shed_calls == [] and e.lines == []
 
 
-def test_vram_yield_stops_when_shedding_frees_nothing_and_asks_again_only_on_a_deeper_cut() -> None:
-    """what is past the budget is not the engine's layers (Qwen3-4B beside a game: every layer was shed, each freeing
-    nothing while the card graph held the blocks): two sheds that bring the card no nearer and the yield stops, the
-    card graphs let go first; the next passes do not ask again (the log is not flooded), a cut deeper still does"""
+def test_vram_yield_gives_all_it_can_and_asks_again_only_when_the_budget_moves() -> None:
+    """a game taking the card as it frees (Windows cuts the budget with every layer given back): the card graphs let
+    go first, then every layer the engine holds; with nothing left, the next passes do not ask again (the log is not
+    flooded) until the budget is cut deeper or recovers"""
     e = _PolicyEngine(vram_margin=GB // 2)
     e.L = 36
+    left = [3]  # layers the stub still holds
+    real_shed = e.vram_shed
+
+    def shed(cache: Any = None, log: Log | None = None) -> str | None:
+        if not left[0]:
+            return None
+        left[0] -= 1
+        return real_shed(cache, log)
+
     let_go: list[bool] = []
     e._card_let_go = lambda: let_go.append(True)  # type: ignore[method-assign]
-    with budget_room(-GB, 0, e) as room:  # sheds free nothing
+    with budget_room(-GB, 0, e) as room:  # the game takes each freed chunk: the budget does not move
+        e.vram_shed = shed  # type: ignore[method-assign,assignment]
         e.vram_policy(_batched_cache(1))
-        assert len(e.shed_calls) == 2, f"{len(e.shed_calls)} layers shed for nothing"
+        assert len(e.shed_calls) == 3 and left[0] == 0, f"{len(e.shed_calls)} layers given back of 3"
         assert let_go, "the card graphs were not let go before the sheds"
         e.vram_state.last_t = time.time()
         e.vram_policy(_batched_cache(1))
-        assert len(e.shed_calls) == 2, "asked again with nothing more to give"
+        said = [ln for ln in e.lines if "past this process's budget" in ln]
+        assert len(said) == 1, "asked again with nothing more to give"
         room[0] = -2 * GB  # the game takes more
         e.vram_policy(_batched_cache(1))
-        assert len(e.shed_calls) == 4, "a deeper cut was not answered"
+        said = [ln for ln in e.lines if "past this process's budget" in ln]
+        assert len(said) == 2, "a deeper cut was not answered"
         room[0] = GB  # the game gone: inside the budget again
         e.vram_state.last_t = time.time()
         e.vram_policy(_batched_cache(1))
         assert e.vram_state.spent == 0
-    said = [ln for ln in e.lines if "another program wants the card" in ln]
-    assert len(said) == 2, e.lines
+
+
+def test_torchs_cached_blocks_answer_a_budget_before_any_placement_change() -> None:
+    """a warm-up's 1.5 GB of freed blocks still in torch's cache when another program asks (Qwen3-4B, measured by
+    the -vv trace): emptying the cache is enough - no layer leaves the card, no card graph is let go, and the
+    placement's version does not move (a request moves it, and every card graph and card program is rebuilt for
+    the new one: for nothing, where the cache was enough)"""
+    e = _PolicyEngine(vram_margin=GB // 2)
+    e.L = 8
+    let_go: list[bool] = []
+    e._card_let_go = lambda: let_go.append(True)  # type: ignore[method-assign]
+    with budget_room(-GB, 600 * MB, e, trim_frees=2 * GB):
+        v0 = e.device.version
+        e.vram_policy(_batched_cache(1))
+        assert e.device.version == v0, "the placement moved for torch's own cache"
+    assert e.shed_calls == [] and not let_go, "a layer or the graphs given up for torch's own cache"
+    assert e.vram_state.spent == 0
+    assert any("torch's cached blocks" in ln for ln in e.lines), e.lines
+
+
+def test_a_budget_past_again_soon_after_a_trim_is_answered_by_a_shed() -> None:
+    """a pass's own transients refilling the cache: the trim answers the first time; past the budget again within
+    TRIM_AGAIN_S the policy yields and sheds a layer at least - lasting room, where a trim a pass had emptied the
+    cache and moved the placement on every pass without ever making any"""
+    e = _PolicyEngine(vram_margin=GB // 2)
+    e.L = 8
+    e._card_let_go = lambda: None  # type: ignore[method-assign]
+    with budget_room(-GB, 600 * MB, e, trim_frees=2 * GB) as room:
+        e.vram_policy(_batched_cache(1))
+        assert e.shed_calls == [], "the first trim was enough"
+        room[0] = -GB // 4  # the next pass's transients: past the budget again
+        e.vram_policy(_batched_cache(1))
+    assert len(e.shed_calls) >= 1, "past again within TRIM_AGAIN_S and no layer shed"
+
+
+def test_a_cut_back_to_the_budget_at_load_is_another_programs_once_the_budget_rose() -> None:
+    """btb loaded beside a game (its budget then 5.8 GB), the game gone (11 GB given, the watcher noting it), then
+    back: the cut is the game's - read against the largest budget given, where the budget at load called it btb's
+    own growth past its plan"""
+    e = _PolicyEngine(vram_margin=GB // 2)
+    e.vram_state.budget_hi = 11 * GB
+    saved = device_mod._wddm_info
+    device_mod._wddm_info = lambda dev: (int(5.8 * GB), int(6.2 * GB))
+    try:
+        why = e._vram_why()
+    finally:
+        device_mod._wddm_info = saved
+    assert why.startswith("another program took"), why
+
+
+def test_the_memory_policies_stand_aside_for_the_warm_up_and_answer_once_it_is_done() -> None:
+    """the load's warm-up times passes: a yield between two of its captures let the card graphs go and moved the
+    placement (its kernel choice written into a state no pass read). The watchers' try at the decode lock fails during
+    it, the warm-up's own passes' policies stand aside (`warming`), and once it is done each policy reads its budget
+    - the watcher's try then succeeds"""
+    from btb.engine import StreamedTextModel
+
+    seen: list[bool] = []
+    policies: list[tuple[str, bool]] = []
+    stub = types.SimpleNamespace(
+        dev=torch.device("cuda"), mlx=None, _decode_lock=threading.RLock(), vram_trim=lambda tag="": None
+    )
+    stub.warming = False
+    stub.vram_policy = lambda cache=None, log=None: policies.append(("vram", stub.warming))
+    stub.ram_policy = lambda log=None: policies.append(("ram", stub.warming))
+    stub._warming = lambda: StreamedTextModel._warming(cast(Any, stub))
+
+    def watcher_try() -> None:
+        got = stub._decode_lock.acquire(blocking=False)
+        seen.append(got)
+        if got:
+            stub._decode_lock.release()
+
+    def card_warm(ids: Tokens) -> int:
+        assert stub.warming, "the warm-up's passes ran with the policies acting"
+        t = threading.Thread(target=watcher_try)
+        t.start()
+        t.join()
+        return 3
+
+    stub.card_warm = card_warm
+    assert StreamedTextModel.warm(cast(Any, stub)) == 3
+    watcher_try()
+    assert seen == [False, True], f"the watcher's tries during and after the warm-up: {seen}"
+    assert policies == [("vram", False), ("ram", False)], f"the policies once the warm-up is done: {policies}"
+    assert not stub.warming
+
+
+def test_a_warm_up_pass_gives_nothing_back_however_short_the_budget() -> None:
+    """a pass of the warm-up (`warming`) past its budget: nothing shed, trimmed or requested - the placement stays
+    as the warm-up is timing it; the budget is answered once it is done (`_warming`)"""
+    e = _PolicyEngine(vram_margin=GB // 2)
+    e.L = 8
+    e.warming = True
+    with budget_room(-2 * GB, 600 * MB, e):
+        v0 = e.device.version
+        e.vram_policy(_batched_cache(1))
+        assert e.device.version == v0 and e.shed_calls == [] and e.vram_state.trim_t == 0.0
 
 
 def test_vram_yield_stops_when_nothing_is_left_to_shed() -> None:
@@ -1050,7 +1195,7 @@ def test_vram_yield_stops_when_nothing_is_left_to_shed() -> None:
     with budget_room(-GB, 0, e):
         e.vram_shed = lambda cache=None, log=None: None  # type: ignore[method-assign,assignment,return-value]
         assert e.vram_yield(_batched_cache(1)) == []
-    assert any("nothing more that helps to shed" in ln for ln in e.lines), e.lines
+    assert any("nothing left to shed" in ln for ln in e.lines), e.lines
 
 
 class _YieldEngine(_MemoryMixin):
@@ -1058,7 +1203,7 @@ class _YieldEngine(_MemoryMixin):
     layers whose giving-back moves them"""
 
     def __init__(self, free: int, reserve: int, per_block: int, blocks: int, host: int, per_layer: int) -> None:
-        self.dev = torch.device("cuda")
+        self.dev = _where("cuda")
         self.adapt, self.mlx, self.L, self.ram_reserve = True, None, 8, int(reserve)
         self.machine = {"free": int(free), "low": False}
         self.lines: list[str] = []
@@ -1153,7 +1298,7 @@ def test_vram_policy_is_off_when_it_is_not_watching_or_not_on_a_card() -> None:
         e.vram_policy(_batched_cache(1))
     assert e.shed_calls == [] and e.lines == []
     host = _PolicyEngine()
-    host.dev = torch.device("cpu")
+    host.dev = _where("cpu")
     with pressure(512), cuda_stats(free=0):
         host.vram_policy(_batched_cache(1))
     assert host.shed_calls == []
@@ -2436,21 +2581,24 @@ def test_grant_keeps_a_ledger_of_what_it_gave() -> None:
     assert e.scheduler.granted == {"kv@cuda": GB + GB // 2, "table@cuda": GB // 4}
 
 
-def test_a_cached_card_reading_moves_with_what_this_process_takes_and_gives_back(monkeypatch: MonkeyPatch) -> None:
-    """nvidia-smi is read at most once a second; within that second the reading moves by this process's own
-    allocator: less what it reserved since, more what it gave back - a buffer let go is free again at once, not a
-    second later (a pass right after one let go of a big buffer was refused the room it had)"""
-    monkeypatch.setattr(device_mod, "_PHYS_FREE", {})
-    monkeypatch.setattr(device_mod.time, "monotonic", lambda: 100.0)
-    monkeypatch.setattr(device_mod.subprocess, "run", lambda *a, **k: types.SimpleNamespace(stdout="4096\n"))
-    held = [GB]
-    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *a, **k: held[0])
+def test_the_card_reading_is_nvmls_own_for_the_card_at_this_pci_address(monkeypatch: MonkeyPatch) -> None:
+    """NVML read in the process, every reading fresh, for the card at CUDA's card's PCI address: NVML numbers the
+    cards in its own order, so under CUDA_VISIBLE_DEVICES=1 CUDA's card 0 is NVML's 1 - by index the free memory read
+    was another card's"""
+    reads = iter([4 * GB, 3 * GB])
+    asked: list[str] = []
+
+    def nvml(bus_id: str) -> int:
+        asked.append(bus_id)
+        return next(reads)
+
+    monkeypatch.setattr(device_mod, "nvml_free_bytes", nvml)
+    props = types.SimpleNamespace(pci_domain_id=0, pci_bus_id=0x2B, pci_device_id=0)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda dev=None: props)
     dev = torch.device("cuda", 0)
     assert device_mod._physical_free_bytes(dev) == 4 * GB
-    held[0] = 2 * GB
-    assert device_mod._physical_free_bytes(dev) == 3 * GB, "what it took since is not free"
-    held[0] = 0
-    assert device_mod._physical_free_bytes(dev) == 5 * GB, "what it gave back since is"
+    assert device_mod._physical_free_bytes(dev) == 3 * GB, "a second reading is NVML's own, not the first one cached"
+    assert asked == ["00000000:2B:00.0"] * 2, asked
 
 
 def test_a_reservation_allocated_out_of_piecemeal_holds_only_what_is_not_in_use() -> None:

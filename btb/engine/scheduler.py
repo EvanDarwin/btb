@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 import torch
 
-from .. import pool
+from .. import pool, trace
 from ..kinds import LayerKind, Log, Tier
 from ..options import Device, DeviceName
 from ..sysinfo import (
@@ -575,6 +575,7 @@ class BatchScheduler:
         # the card's margin is its OOM guard and the host's floor is the OS's own (or the one --ram-reserve
         # names): a request past either is refused
         if nbytes > free:
+            # the refusal's words travel with it: whoever catches it says them (a trace here said them twice)
             raise MemoryGrantError(
                 f"[grant] REFUSED {who}: {kind} {_size(nbytes)} on {dev}, only {_size(free)} free"
                 f"{self._held_line(dev, tag)}{self._ledger_line()}"
@@ -583,6 +584,16 @@ class BatchScheduler:
         self.granted[seen] = self.granted.get(seen, 0) + nbytes
         if free and nbytes >= self.warn_fraction * free:
             self.sm.log(f"[grant] LARGE {who}: {kind} {_size(nbytes)} of {_size(free)} free")
+        elif trace.ON and nbytes >= 16 << 20:  # the trace's floor: the scratch's small takes would bury the rest
+            trace.event(
+                "grant: %s %s on %s for %s (%s free)%s",
+                kind,
+                _size(nbytes),
+                dev,
+                who,
+                _size(free),
+                f", replacing {_size(int(held))}" if held else "",
+            )
         dv = getattr(self.sm, "device", None)
         if dv is None:
             return

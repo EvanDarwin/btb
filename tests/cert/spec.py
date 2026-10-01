@@ -17,6 +17,7 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
 from btb.kinds import (
     PROPOSER_TAG,
@@ -175,6 +176,27 @@ def kind_of_stem(stem: str) -> FamilyKind | None:
 
 # --- what the committed fixtures actually are (read from disk, never asserted from a name) -----------------
 
+# each fixture file as last read, by what the file system says of it: a walk of the cells asks for the same configs
+# and shard headers tens of thousands of times (a PR comment's render opened 184,580 files, 29 s of its 47 s). A file
+# rewritten - its time or size moved - or a directory whose shards were added, removed or renamed - its own time
+# moved - is read again
+_READ: dict[tuple[str, int, int], Any] = {}
+
+
+def _read_once(path: str, read: Callable[[str], Any]) -> Any:
+    """`read(path)`, read again only once the file system says `path` changed. Its answer is shared: read-only"""
+    st = os.stat(path)
+    key = (path, st.st_mtime_ns, st.st_size)
+    if key not in _READ:
+        _READ[key] = read(path)
+    return _READ[key]
+
+
+def _json(path: str) -> Json:
+    with open(path, encoding="utf-8") as f:
+        doc: Json = json.load(f)
+    return doc
+
 
 def fixture_config(kind: FamilyKind) -> Json:
     """a tiny fixture's config.json, its text half where the config nests one; {} when the fixture is absent."""
@@ -184,8 +206,7 @@ def fixture_config(kind: FamilyKind) -> Json:
     path = os.path.join(FIXTURES, stem, "config.json")
     if not os.path.isfile(path):
         return {}
-    with open(path, encoding="utf-8") as f:
-        cfg: Json = json.load(f)
+    cfg = _read_once(path, _json)
     sub = cfg.get("text_config")
     return sub if isinstance(sub, dict) else cfg
 
@@ -215,9 +236,7 @@ def has_mtp_head(kind: FamilyKind) -> bool:
     index = os.path.join(FIXTURES, stem, "model.safetensors.index.json")
     if not os.path.isfile(index):
         return False
-    with open(index, encoding="utf-8") as f:
-        doc: Json = json.load(f)
-    return any(str(k).startswith("mtp.") for k in doc.get("weight_map", {}))
+    return any(str(k).startswith("mtp.") for k in _read_once(index, _json).get("weight_map", {}))
 
 
 def gguf_name(stem: str, q: Quant) -> str:
@@ -255,6 +274,11 @@ def header_dtypes(path: str) -> frozenset[str]:
     no tensor is read); empty when the directory is absent or holds no shard."""
     if not os.path.isdir(path):
         return frozenset()
+    found: frozenset[str] = _read_once(path, _header_dtypes)
+    return found
+
+
+def _header_dtypes(path: str) -> frozenset[str]:
     out: set[str] = set()
     for name in os.listdir(path):
         if not name.endswith(".safetensors"):

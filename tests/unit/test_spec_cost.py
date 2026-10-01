@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from itertools import pairwise
 
 import pytest
 
@@ -82,16 +83,17 @@ WORLD_CARD = World(
 )
 
 
-def run(passes: int, w: World = WORLD_180B, seed: int = 0) -> tuple[SpecCost, list[int]]:
+def run(passes: int, w: World = WORLD_180B, seed: int = 0, call: int | None = None) -> tuple[SpecCost, list[int]]:
     """`passes` of the loop against the scripted world: plan, draft, prune, verify, record; the rows each carried.
     How deep each verified pass is accepted follows the golden-ratio sequence from `seed`: the world's acceptance
-    by depth, evenly spread, never a lucky or unlucky streak"""
+    by depth, evenly spread, never a lucky or unlucky streak. `call`: the passes of one generate call - the loop's
+    pass count starts again each call (generate.py's `census["forwards"]`), where one pricer serves them all"""
     pc = SpecCost(SpecCost.gamma_of(512, 10))
     u = (seed * 0.7548776662) % 1.0
     rows_seen = []
     for i in range(1, passes + 1):
         pc.price(TREE + 1, w.curve, w.miss_s)
-        rows, probe = pc.plan(w.cap, i)
+        rows, probe = pc.plan(w.cap, (i - 1) % call + 1 if call else i)
         if rows <= 1:
             pc.record_pass(1, w.seconds(1), w.n_reads(1), None, wait=w.waited(1))
             rows_seen.append(1)
@@ -300,13 +302,38 @@ def test_the_expected_gain_of_a_trees_first_nodes() -> None:
 
 
 def test_a_run_of_plain_steps_verifies_one_draft() -> None:
-    # a drive so slow no draft pays: the passes are plain steps, but every PROBE_PLAIN-th of a run verifies one
-    # draft (a row wider, not the whole tree), so the verdict rests on a fed calibration
-    w = World(miss_s=0.05, reach=[0.1, 0.0])
+    # drafts that could pay were they accepted, accepted one time in ten: the passes are plain steps, but the pass
+    # after a run of PROBE_PLAIN asks for one draft (its prune may keep a second, never the tree), so the verdict
+    # rests on a fed calibration
+    w = World(miss_s=0.002, reach=[0.1, 0.0])
     pc, rows = run(48, w)
-    st = steady(rows, skip=4)
+    assert pc.could_pay(), "the world was meant to be one where an accepted draft pays"
+    st = steady(rows, skip=8)
     assert st.count(1) >= len(st) * 0.8, rows
-    assert all(r <= 2 for r in st), rows
-    runs = "".join("p" if r == 1 else "d" for r in rows[2:]).split("d")
+    assert all(r <= 3 for r in st), rows
+    # once the rows' cost is fitted (the first probes' passes; before it the verdict can lean either way)
+    runs = "".join("p" if r == 1 else "d" for r in rows[SpecCost.PROBE :]).split("d")
     assert max(len(r) for r in runs) <= SpecCost.PROBE_PLAIN, rows
     assert pc.report()["calibration"]
+
+
+def test_where_no_draft_could_pay_the_probes_only_measure_the_cost() -> None:
+    # a drive so slow no width beats the step even were every draft accepted: the acceptance decides nothing, so
+    # the calibration probes stop - the first probe, then one every PROBE_FAR passes measuring the rows' cost again -
+    # where they had cost Qwen3.8-flash-next a sixth of its call (a probe every 16 passes and after every 8 plain)
+    w = World(miss_s=0.05, reach=[1.0, 1.0, 1.0, 0.0])
+    # calls of 40 passes, the pricer across them: a count of the call's passes never reached PROBE_FAR, and a verdict
+    # fitted once kept the drafts off for the engine's life
+    pc, rows = run(3 * SpecCost.PROBE_FAR, w, call=40)
+    assert not pc.could_pay()
+    wide = [i for i, r in enumerate(rows, 1) if r > 1]
+    first = SpecCost.WARM + 1
+    assert wide[0] == first and len(wide) >= 3, f"passes wider than the step: {wide}"
+    assert all(b - a == SpecCost.PROBE_FAR + 1 for a, b in pairwise(wide)), f"not every PROBE_FAR plain steps: {wide}"
+    assert all(rows[i - 1] == 2 for i in wide), rows
+    # a drive that speeds up reopens them: the plain steps' own figures move the verdict
+    fast = World(miss_s=0.0005, reach=[1.0, 1.0, 1.0, 0.0])
+    for _ in range(40):
+        pc.record_pass(1, fast.seconds(1), fast.n_reads(1), None, wait=fast.waited(1))
+    pc.price(TREE + 1, None, fast.miss_s)
+    assert pc.could_pay()

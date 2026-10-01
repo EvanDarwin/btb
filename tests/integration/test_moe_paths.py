@@ -10,7 +10,7 @@ a store below its experts (every pass reads some of them again), each twin once.
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -261,9 +261,11 @@ def test_a_sampled_tree_of_the_drafting_head_verifies_against_the_targets_draws(
 def test_the_pricer_sizes_real_passes_by_the_drives_reads(q4: StreamedTextModel) -> None:
     """The verify pass priced by what its rows cost over a drive the store's probe prices (a missed expert ~10 ms):
     the first passes are plain steps measuring the step, then the drafting head's tree is probed whole, pruned to
-    the prefix the model says pays and its calibration fed - the passes of more than one row verified; on a drive
-    where a miss costs seconds no draft pays, and after a run of plain steps a pass verifies one draft all the same.
-    Whatever the widths, the speculative tokens are the plain ones."""
+    the prefix the model says pays and its calibration fed - where some width could pay, every call verifies passes
+    of more than one row; on a drive where a miss costs seconds no draft pays, and after a run of plain steps a pass
+    verifies one draft all the same. Whether a width could pay is the pricer's measurement of this machine as it is
+    (a contended card prices the fast drive's drafts out too), and the test holds each call to it. Whatever the
+    widths, the speculative tokens are the plain ones."""
     store = q4.expert_store
     assert store is not None
     with torch.inference_mode():
@@ -275,6 +277,7 @@ def test_the_pricer_sizes_real_passes_by_the_drives_reads(q4: StreamedTextModel)
                 miss = store.miss_s()
                 assert miss == pytest.approx(store.expert_s(drive, int(store.per or 0))) and miss > 0
                 speculation(q4, tree_budget=16, tree_min_prob=0.0, ngram_p=0.0, v_max=4, price=True)
+                plain_total = wide_total = 0  # the pricer's passes across the drive's calls
                 for i, (name, prompt) in enumerate(PROMPTS.items()):
                     toks, census = q4.generate_speculative(prompt, 40, proposer="mtp_dyn", v_max=4)
                     assert toks == plain[name], f"{name}: {toks} != {plain[name]}"
@@ -285,10 +288,54 @@ def test_the_pricer_sizes_real_passes_by_the_drives_reads(q4: StreamedTextModel)
                     rows = {int(k): int(v) for k, v in rep["rows"].items()}
                     if i == 0:
                         assert rows.get(1, 0) >= SpecCost.WARM, f"the step was not measured first: {rows}"
-                    assert any(k > 1 for k in rows), f"no pass verified a draft: {rows}"
+                        assert any(k > 1 for k in rows), f"no pass verified a draft: {rows}"
+                    pc = q4._spec_cost
+                    assert pc is not None
+                    plain_total += rows.get(1, 0)
+                    wide_total += sum(v for k, v in rows.items() if k > 1)
+                    if pc.could_pay():
+                        # a width could pay: every PROBE-th pass probes, and a run of PROBE_PLAIN plain steps
+                        # verifies one draft - every call verifies drafts
+                        assert any(k > 1 for k in rows), f"no pass verified a draft: {rows}"
                     if drive is SLOW:
                         assert rows.get(1, 0) > sum(v for k, v in rows.items() if k > 1), f"drafts paid: {rows}"
-                        assert rows.get(2, 0) >= 1, f"no run of plain steps verified one draft: {rows}"
+                        if pc.could_pay():
+                            assert rows.get(2, 0) >= 1, f"no run of plain steps verified one draft: {rows}"
+                pc = q4._spec_cost
+                assert pc is not None
+                if not pc.could_pay():
+                    # no width beats the step even were every draft accepted - the slow drive's misses, or the fast
+                    # one's on a contended card (under a game the suite saw a 39-pass call all plain there): past the
+                    # first probe the passes are plain, one after each run of PROBE_FAR plain steps - the pricer's,
+                    # across the calls - measuring the cost again
+                    assert wide_total <= 1 + plain_total // SpecCost.PROBE_FAR, (wide_total, plain_total)
+
+            # the n-gram proposer's drafts pruned as the drafter's are (generate.py): a probe drafts the whole width and
+            # verifies what the pricing keeps, where it verified every draft (gpt-oss-120b: 16-row passes of experts
+            # for drafts accepted one time in ten, speculation 10-35% behind the plain loop). A pricing that probes every
+            # pass and keeps one draft: every pass that drafts is two rows, the plain decode handed to the proposer as a
+            # span so it drafts, and the tokens are the plain ones
+            class _OneDraft(SpecCost):
+                def active(self) -> bool:
+                    return True
+
+                def ready(self) -> bool:
+                    return True
+
+                def plan(self, cap: int, passes: int) -> tuple[int, bool]:
+                    return self.full, True
+
+                def prune(self, gains: Sequence[float], probe: bool) -> int:
+                    return min(1, len(gains))
+
+            for name, prompt in PROMPTS.items():
+                q4._spec_cost = _OneDraft()
+                span = [("plain", [*prompt, *plain[name]])]
+                toks, census = q4.generate_speculative(prompt, 40, proposer="ngram", v_max=4, spans=span)
+                assert toks == plain[name], f"{name} (n-gram): {toks} != {plain[name]}"
+                rows = {int(k): int(v) for k, v in census["priced"]["rows"].items()}
+                assert rows.get(2, 0) > 0, f"{name}: no n-gram pass drafted: {rows}"
+                assert max(rows) <= 2, f"{name}: an n-gram probe verified past the pricing's prune: {rows}"
         finally:
             store.drive = None
             q4._spec_cost = None

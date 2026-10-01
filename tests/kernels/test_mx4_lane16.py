@@ -72,6 +72,7 @@ def test_a_malformed_call_is_refused() -> None:
         cu.gemv_lane16_mx4(w, torch.zeros(3, 64, device="cuda"), torch.zeros(3, 8, device="cuda"))  # M 3
     with pytest.raises(ValueError, match="shapes"):
         cu.gemv_lane16_mx4(w, ok[0], torch.zeros(1, 9, device="cuda"))
+    assert w.scales is not None  # the checkpoint's layout: its scales apart
     with pytest.raises(ValueError, match="uint8"):
         cu.gemv_lane16_mx4(mxfp4.MxWeight(w.blocks.cpu(), w.scales.cpu(), 8, 64), *ok)  # the bytes in RAM
     with pytest.raises(ValueError, match="layout"):

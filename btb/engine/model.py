@@ -9,13 +9,14 @@ import math
 import os
 import threading
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import Any, Concatenate, ParamSpec, Protocol, TypeVar
 
 import torch
 
 from .. import mlx as mlxdev
 from .. import pool as _pool
+from .. import trace
 from ..gguf import GGUFModel
 from ..hf import is_gguf, pack_format, shard_map
 from ..kinds import LayerKind, Log, Tokens
@@ -41,7 +42,7 @@ from .leaks import track as _leaks_track
 from .memory import RamPolicyState, VramPolicyState, _LendMixin
 from .mlx_forward import MlxState, _MlxMixin
 from .native import Native
-from .scheduler import BatchScheduler
+from .scheduler import BatchScheduler, _size
 from .scratch import Scratch
 from .text import _TextMixin
 from .tiers import ColdRing, _TiersMixin
@@ -360,6 +361,9 @@ class StreamedTextModel(
             if i in self.resident:
                 continue
             self.host[i] = self._make_host_layer(i)
+            trace.event(
+                "load: layer %d on the host (%s)", i, "read from the drive each pass" if i in self.cold else "in RAM"
+            )
         self.mlx_state.ahead = None
         self._bind_cold()
         # the RAM kept free of the engine's own grants and the store's budget: the plan's host budget where the
@@ -520,14 +524,20 @@ class StreamedTextModel(
                     if not todo:
                         break
             i = todo.pop(0)
+            sized = r0 is not None or (trace.ON and dev.type == DeviceKind.CUDA)
             # free-read: a placed layer's own size on the card, to size the layers still to place (above)
-            before = torch.cuda.memory_reserved(dev) if r0 is not None else 0
+            before = torch.cuda.memory_reserved(dev) if sized else 0
             tmpl = self._new_layer(i)
             self._load_layer(i, tmpl, first=True)
             self.resident[i] = tmpl
-            if r0 is not None:
+            if sized:
                 # free-read: the same layer's size, after
-                sizes.append(max(0, torch.cuda.memory_reserved(dev) - before))
+                size = max(0, torch.cuda.memory_reserved(dev) - before)
+                trace.event("load: layer %d on the card (%s, +%s)", i, dev, _size(size))
+                if r0 is not None:
+                    sizes.append(size)
+            else:
+                trace.event("load: layer %d on %s", i, dev)
         return given_up
 
     def embed(self, ids: Any) -> torch.Tensor:
@@ -559,7 +569,13 @@ class StreamedTextModel(
         timed (0 elsewhere)."""
         ids = [1] * 8
         if self.dev.type == DeviceKind.CUDA:
-            return int(self.card_warm(ids))
+            with self._warming():
+                n = int(self.card_warm(ids))
+                # the warm-up's passes and its throwaway cache let go: an engine up and idle does not sit on 1.5 GB
+                # of torch's freed blocks (Qwen3-4B, 12 layers on the card) until its first pass, a budget's worth
+                # that a program asking for the card meanwhile saw a layer shed for instead
+                self.vram_trim("warm-up")
+            return n
         if self.mlx is not None:
             n = int(self.mlx_warm(ids))
             if n:
@@ -568,8 +584,27 @@ class StreamedTextModel(
                 self.mlx_attn_cost()
             return n
         if self.dev.type == DeviceKind.CPU:
-            return int(self.host_warm(ids))
+            with self._warming():
+                return int(self.host_warm(ids))
         return 0
+
+    @contextlib.contextmanager
+    def _warming(self) -> Iterator[None]:
+        """The warm-up's timing, the memory policies standing aside for it and answering once it is done: the decode
+        lock held as a decode holds it, so the watchers (`watch_vram_budget`, `watch_ram`) leave it be, and
+        `warming` set, so its own passes' `vram_policy` and `ram_policy` give nothing back mid-timing - a yield there
+        let the card graphs go and moved the placement between two captures (the warm-up's kernel choice written
+        into a card state no pass read), a ram-yield moved a host layer to the drive inside a timed pass. Room made
+        on demand (`_give_up_one`) still moves what it must. Once done, each policy reads its budget: a program
+        that asked meanwhile (its signal kept by the watcher) is answered now, not at the first request"""
+        with self._decode_lock:
+            self.warming = True
+            try:
+                yield
+            finally:
+                self.warming = False
+            self.vram_policy(None)
+            self.ram_policy()
 
     def host_warm(self, ids: Tokens, t_max: int | None = None) -> int:
         """The cost of a verify pass of 1 .. `t_max` rows on the host tier, timed over a throwaway cache of

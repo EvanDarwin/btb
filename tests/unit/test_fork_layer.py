@@ -14,6 +14,7 @@ from typing import Any, cast
 import torch
 
 from btb.engine.cache import ArenaIndexedLayer, ForkIndexedLayer, ForkLayer, GrantedIndexedLayer
+from btb.engine.device import where
 
 B, HK, P, D = 3, 2, 5, 4
 
@@ -107,7 +108,7 @@ def test_a_concatenated_layer_is_priced_as_it_asks_and_draws_what_it_allocates()
 
     asked, grant = _recorder()
     cl = GrantedIndexedLayer(grant)
-    cpu = torch.device("cpu")
+    cpu = where("cpu")
     probe = types.SimpleNamespace(
         cfg=types.SimpleNamespace(num_attention_heads=HK, num_key_value_heads=HK, head_dim=D, hidden_size=HK * D),
         resident={0: None},
@@ -140,6 +141,7 @@ def test_a_layer_hopping_back_to_a_device_asks_nothing_it_had_there() -> None:
     cl = GrantedIndexedLayer(grant)
     _append(cl, P)
     assert len(asked) == 1 and _drawn(asked) == P * KV_ROW
+    assert cl.keys is not None and cl.values is not None and cl.indexer_keys is not None
     meta = torch.device("meta")
     cl.keys, cl.values = cl.keys.to(meta), cl.values.to(meta)
     cl.indexer_keys = cl.indexer_keys.to(meta)
@@ -171,6 +173,7 @@ def test_an_arena_layer_leaving_for_another_device_moves_its_rows_straight_there
     assert cl.attached and not asked and cl.get_seq_length() == P
     assert cl.growth(1, cap, HK, D, torch.float32, torch.device("cpu")) == 0
     meta = torch.device("meta")
+    assert cl.keys is not None
     cl.keys = cl.keys.to(meta)
     assert not cl.attached
     assert [(a["device"], a["draws"], a["nbytes"]) for a in asked] == [(meta, "", P * (KV_ROW // 2 + IK_ROW))]
