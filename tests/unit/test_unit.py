@@ -904,12 +904,12 @@ def test_plan_keeps_a_sparse_attentions_pooled_keys_on_the_card_with_the_rows_in
     from btb.engine.families.base import _flags
     from btb.engine.families.qwen4.family import Qwen4Family
     from btb.engine.tiers import _TiersMixin
-    from btb.kinds import FamilyKind
+    from btb.kinds import FamilyKind, LayerKind
 
     MB = 2**20
     p = _probe()
     p.fam = Qwen4Family(kind=FamilyKind.QWEN4, streams=4, **_flags(FamilyKind.QWEN4))
-    p.layer_types = ["qwen_sparse_attention", "linear_attention"] * 4
+    p.layer_types = [LayerKind.QWEN_SPARSE, LayerKind.LINEAR] * 4
     p.cfg.indexer_compress_ratio, p.cfg.indexer_head_dim, p.cfg.indexer_budget = 4, 128, 2048
     rows = 1 << 20
     pooled, raw = (rows // 4 + 1) * 128 * 2, rows * 128 * 2
@@ -1259,16 +1259,22 @@ def test_session_reuses_the_shared_prefix_and_learns_the_tail() -> None:
 
 
 def test_the_engine_vocabularies_are_spelled_once() -> None:
-    """the layer kinds are transformers' own `layer_types` names, the whole of its ALLOWED_ATTN_LAYER_TYPES, so
-    any config it accepts reads into the enum; the family kinds and tiers equal their strings, so a report
-    reads as before"""
+    """the layer kinds are transformers' own `layer_types` names, the whole of its ALLOWED_ATTN_LAYER_TYPES read
+    through their legacy names, so any config it accepts - under the names of transformers 5.16-5.17 or 5.18 on -
+    reads into the enum, and a kind handed back to it is the installed version's name; the family kinds and tiers
+    equal their strings, so a report reads as before"""
     import json
 
     from transformers.configuration_utils import ALLOWED_ATTN_LAYER_TYPES
 
-    from btb.kinds import FamilyKind, LayerKind, LayerTier, Tier, UnknownKind
+    from btb.kinds import LEGACY, FamilyKind, LayerKind, LayerTier, Tier, UnknownKind
 
-    assert set(LayerKind) == set(ALLOWED_ATTN_LAYER_TYPES), "transformers' list moved: add the new kinds"
+    assert {LayerKind.of(t) for t in ALLOWED_ATTN_LAYER_TYPES} == set(LayerKind), (
+        "transformers' list moved: add the new kinds"
+    )
+    assert all(LayerKind.of(old) is LayerKind(new) for old, new in LEGACY.items())
+    assert LayerKind.of("qwen_sparse_attention") is LayerKind.of("indexed_attention") is LayerKind.QWEN_SPARSE
+    assert LayerKind.QWEN_SPARSE.hf_name() in ALLOWED_ATTN_LAYER_TYPES, "a drafter's config named its layer unknown"
     assert LayerKind.of("full_attention") is LayerKind.FULL and LayerKind.of("conv") is LayerKind.CONV
     with pytest.raises(UnknownKind) as e:
         LayerKind.of("not_a_kind")

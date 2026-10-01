@@ -1526,7 +1526,7 @@ def test_a_layers_rows_stay_in_ram_when_it_comes_to_the_card_under_kv_host() -> 
     moved: list[Any] = []
     stub = types.SimpleNamespace(
         kv_host=True,
-        layer_types=[LayerKind.LINEAR, "qwen_sparse_attention", LayerKind.FULL],
+        layer_types=[LayerKind.LINEAR, LayerKind.QWEN_SPARSE, LayerKind.FULL],
         _rows_to=lambda caches, layers, dev: moved.append(list(layers)),
         __dict__={},
     )

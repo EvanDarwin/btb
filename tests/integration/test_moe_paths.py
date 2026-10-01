@@ -21,6 +21,7 @@ from btb.engine import StreamedTextModel
 from btb.engine.host import _HostLinear
 from btb.engine.native import Native
 from btb.engine.spec_cost import SpecCost
+from btb.kinds import LayerKind
 from tests.helpers import (
     GGUF_FIXTURES,
     NO_LOG,
@@ -380,8 +381,8 @@ def test_the_host_layers_refuse_what_they_cannot_compute_and_take_any_cache_layo
     bit; a hyper-connection refuses the wrong width; the DeltaNet's step takes a recurrent state a prefill left
     strided or in bf16 as its float32 values, rewritten in the cache; a pass with no cache at all is a prefill's"""
     prompt = PROMPTS["short"]
-    sparse = next(i for i, lt in enumerate(q4.layer_types) if lt == "qwen_sparse_attention")
-    delta = next(i for i, lt in enumerate(q4.layer_types) if lt == "linear_attention")
+    sparse = next(i for i, lt in enumerate(q4.layer_types) if lt == LayerKind.QWEN_SPARSE)
+    delta = next(i for i, lt in enumerate(q4.layer_types) if lt == LayerKind.LINEAR)
     with torch.inference_mode():
         # a pass with no cache: the indexer pools the pass's own keys, and the logits are a prefill's
         assert torch.equal(forward_logits(q4, [prompt], None), forward_logits(q4, [prompt], q4.new_cache()))

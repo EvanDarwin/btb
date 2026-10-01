@@ -71,7 +71,7 @@ class Qwen4Drafter(MTPDrafter):
         # the drafter's one layer as a model of its own: one sparse-attention layer, no n-gram embedding
         mcfg = copy.deepcopy(cfg)
         mcfg.num_hidden_layers = 1
-        mcfg.layer_types = [LayerKind.QWEN_SPARSE.value]
+        mcfg.layer_types = [LayerKind.QWEN_SPARSE.hf_name()]
         mcfg.ple_layer_ids = []
         self.mcfg = mcfg
         src = {} if weights is None else torch.load(weights, map_location="cpu", weights_only=True)

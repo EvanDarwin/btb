@@ -378,7 +378,10 @@ class GGUFModel:
                 "mrope_section": [int(x) for x in m("Rope.DIMENSION_SECTIONS")[:3]],
                 "mrope_interleaved": True,
             },
-            "layer_types": ["linear_attention" if r else "qwen_sparse_attention" for r in recurrent],
+            # the attention layers as Qwen's checkpoints name them: every transformers btb takes maps `full_attention`
+            # to its own name for Qwen4's indexed attention (5.16-5.17 `qwen_sparse_attention`, 5.18 on
+            # `indexed_attention`)
+            "layer_types": ["linear_attention" if r else "full_attention" for r in recurrent],
             "linear_conv_kernel_dim": int(m("SSM.CONV_KERNEL")),
             "linear_key_head_dim": int(m("SSM.STATE_SIZE")),
             "linear_num_key_heads": int(m("SSM.GROUP_COUNT")),

@@ -34,14 +34,17 @@ class UnknownKind(ValueError):
 
 class LayerKind(StrEnum):
     """A decoder layer's kind, as transformers' `layer_types` names it: every entry of its
-    ALLOWED_ATTN_LAYER_TYPES (a test holds the two lists equal), so any config transformers accepts reads into
-    the enum. The engine runs FULL, SLIDING, LINEAR and QWEN_SPARSE; a family the engine does not drive is
-    refused at the family table, never here."""
+    ALLOWED_ATTN_LAYER_TYPES, read through its legacy names (`LEGACY`; a test holds the lists equal), so any config
+    transformers accepts reads into the enum. The engine runs FULL, SLIDING, LINEAR and QWEN_SPARSE (Qwen4's
+    indexed sparse attention); a family the engine does not drive is refused at the family table, never here."""
 
     FULL = "full_attention"
     SLIDING = "sliding_attention"
     CHUNKED = "chunked_attention"
     WINDOW = "window_attention"
+    # an indexer's attention: Qwen4's QSA, DeepSeek's DSA. transformers 5.18 names it so; 5.16-5.17 named each its own
+    # (`LEGACY`), and a config read under them, or saved by them, carries those
+    QWEN_SPARSE = "indexed_attention"
     COMPRESSED_SPARSE = "compressed_sparse_attention"
     HEAVILY_COMPRESSED = "heavily_compressed_attention"
     MINIMAX_M3_SPARSE = "minimax_m3_sparse"
@@ -49,17 +52,38 @@ class LayerKind(StrEnum):
     MOE = "moe"
     HYBRID = "hybrid"
     HYBRID_SLIDING = "hybrid_sliding"
-    DEEPSEEK_SPARSE = "deepseek_sparse_attention"
-    QWEN_SPARSE = "qwen_sparse_attention"
     LINEAR = "linear_attention"
 
     @classmethod
     def of(cls, text: str) -> LayerKind:
-        """the kind of a config's entry; a name transformers itself does not allow is an UnknownKind naming it"""
+        """the kind of a config's entry, its legacy names too (`LEGACY`); a name transformers itself does not allow
+        is an UnknownKind naming it"""
+        text = str(text)
         try:
-            return cls(str(text))
+            return cls(LEGACY.get(text, text))
         except ValueError:
             raise UnknownKind(text, cls) from None
+
+    def hf_name(self) -> str:
+        """the kind as the installed transformers spells it in a config it is handed (a drafter's config built
+        here): its cache picks the layer's form by that name - under another spelling Qwen4's attention got a plain
+        cache layer, with no indexer keys. btb takes transformers 5.16 on, which named Qwen4's indexed attention
+        `qwen_sparse_attention` until 5.18"""
+        if self is LayerKind.QWEN_SPARSE:
+            from transformers.configuration_utils import ALLOWED_ATTN_LAYER_TYPES
+
+            if self.value not in ALLOWED_ATTN_LAYER_TYPES:
+                return "qwen_sparse_attention"
+        return self.value
+
+
+# a config's layer type by a name transformers used before (and still reads, mapping it on): its kind's name now
+LEGACY: dict[str, str] = {
+    "qwen_sparse_attention": "indexed_attention",  # transformers <= 5.17: Qwen4's QSA
+    "deepseek_sparse_attention": "indexed_attention",  # transformers <= 5.17: DeepSeek's DSA
+    "mamba": "linear_attention",
+    "attention": "full_attention",
+}
 
 
 class FamilyKind(StrEnum):

@@ -750,7 +750,7 @@ mod tests {
             };
             let (mixed, z, a, b) = (gen(s.c_dim), gen(hv * dv), gen(hv), gen(hv));
             let (a_log, dt_bias, norm_w, state) = (gen(hv), gen(hv), gen(dv), gen(hv * dk * dv));
-            let run = |neon: bool| {
+            let run = |neon: bool, gate: u32| {
                 let mut y = mixed.clone();
                 let mut st = state.clone();
                 let mut out = vec![f32::NAN; hv * dv];
@@ -768,6 +768,7 @@ mod tests {
                     norm_w: norm_w.as_ptr(),
                     out: out.as_mut_ptr(),
                     eps: 1e-6,
+                    gate,
                 };
                 for h in 0..hv {
                     unsafe {
@@ -781,9 +782,12 @@ mod tests {
                 let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
                 (bits(&st), bits(&out))
             };
-            let (scalar, neon) = (run(false), run(true));
-            assert_eq!(scalar.0, neon.0, "{hk}/{hv}/{dk}/{dv}: state");
-            assert_eq!(scalar.1, neon.1, "{hk}/{hv}/{dk}/{dv}: out");
+            // the gated norm's both activations: Qwen3.5's silu, Qwen4's sigmoid
+            for gate in [GATE_SILU, GATE_SIGMOID] {
+                let (scalar, neon) = (run(false, gate), run(true, gate));
+                assert_eq!(scalar.0, neon.0, "{hk}/{hv}/{dk}/{dv} gate {gate}: state");
+                assert_eq!(scalar.1, neon.1, "{hk}/{hv}/{dk}/{dv} gate {gate}: out");
+            }
         }
     }
 }

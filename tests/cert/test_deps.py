@@ -20,7 +20,7 @@ import pytest
 
 # The transformers major.minor the family cert was last validated against. Bump ONLY after re-running the cert
 # on the new version (see the failure message). A patch difference (5.17.0 -> 5.17.3) is not a change here.
-CERT_TRANSFORMERS: tuple[int, int] = (5, 17)
+CERT_TRANSFORMERS: tuple[int, int] = (5, 18)
 
 
 def _installed() -> tuple[int, int] | None:

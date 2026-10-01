@@ -49,16 +49,11 @@ GGUF_DIR = spec.GGUF_DIR
 CARD_HEAD_DIMS: tuple[int, ...] = (64, 128, 256)
 MEGA_HEAD_MULTIPLE = 64
 MLX_ATTN_HEAD_DIMS: tuple[int, ...] = (128, 256)
-# a family that brings its own layer (Qwen4) verifies a speculative pass exactly only through btb's own kernels: the
-# host's node steps, and on a card its card program (`Family.verify_exact`; any other pass is plain, nothing
-# drafted). The load options a card sub-path takes the program off with, each named by the clause of the program's
-# own refusal (families/qwen4/card.py `why_not`) that turns it down - test_manifest holds each clause there. The KV in
-# RAM (`kv_host`) no longer does: the program keeps the rows there and reads them in place
-CARD_PROGRAM_OFF: dict[str, str] = {"fp32": "sm.compute_dtype"}
-# whether the cert's Qwen4 fixtures (tiny_q4 and its twins) are shaped as the card program's kernels are written: they
-# are not (`why_not`: "shapes the kernels are not written for"), so on a card every one of their passes is plain and a
-# speculative cell there proves nothing. True once a fixture the program takes stands in for them
-CARD_PROGRAM_FIXTURES = False
+# a family that brings its own layer (Qwen4) verifies a speculative pass exactly through btb's own kernels for the
+# layers that carry state - the host's node steps, the card's DeltaNet node kernel - and the rest row-invariant
+# wherever it runs: on a card the card program, or where it declines (a float32 compute, a fixture shaped below its
+# kernels) the torch path's fixed-row layers and its attention a row at a time (`Family.verify_exact`, which asks only
+# for the card's kernels there - test_manifest holds it). Never MLX, whose layers have no node steps
 
 
 class Verdict(StrEnum):
@@ -174,15 +169,11 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "in the twins write_gguf writes, and the MTP cells run on the GGUF storages",
     ),
     Missing.SPEC_OWN_LAYER: (
-        "a family that brings its own layer (Qwen4) verifies a speculative pass only through btb's own kernels - "
-        "the host's DeltaNet and attention node steps, and on a card its card program - so where neither runs the "
-        "pass no proposer drafts: MLX, whose layers have no node steps (`Family.speculates` off at load), and a "
-        "card sub-path whose knobs the program refuses (a float32 compute, the KV on the host: `Qwen4Card.why_not`) "
-        "or whose fixture it does not take (tiny_q4 and its twins are shaped below its kernels: 'shapes the "
-        "kernels are not written for'), where `Family.verify_exact` takes every pass as a plain one-row pass",
-        "give the family's layers the node steps on MLX, the card program a float32 compute and a read of "
-        "host-held KV (or the torch path's modules row-invariant), and the cert a Qwen4 fixture shaped as the "
-        "card kernels are (as tests/integration's card fixture is), and these cells run like the host's",
+        "a family that brings its own layer (Qwen4) verifies a speculative pass only through btb's own node steps "
+        "for its DeltaNet and attention - the host's, and the card's DeltaNet node kernel - so on MLX, whose layers "
+        "have none (`Family.speculates` off at load), no proposer drafts and every pass is plain",
+        "give the family's layers the node steps on MLX (the DeltaNet's per node from its parent's state, the "
+        "attention over each row's own rows), and these cells run like the host's and the card's",
     ),
     Missing.FP16_FIXTURE: (
         "this family has no fp16 safetensors twin (`<stem>-f16`, every float tensor stored F16), so its fp16 "
@@ -497,15 +488,9 @@ def subpath_gap(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath
 
 def own_layer_verifies(dev: spec.DeviceSubpath) -> bool:
     """whether a family that brings its own layer verifies a speculative pass exactly on this sub-path, so its
-    passes draft: the host's node steps, or a card sub-path that leaves the card program on (`CARD_PROGRAM_OFF`) over
-    a fixture the program takes (`CARD_PROGRAM_FIXTURES`); never MLX"""
-    if dev.hardware is spec.Hardware.CPU:
-        return True
-    return (
-        dev.hardware is spec.Hardware.CUDA
-        and CARD_PROGRAM_FIXTURES
-        and not any(dev.knobs.get(k) for k in CARD_PROGRAM_OFF)
-    )
+    passes draft: the host's node steps, and every card sub-path - the card program, or the torch path's
+    row-invariant layers where it declines; never MLX"""
+    return dev.hardware in (spec.Hardware.CPU, spec.Hardware.CUDA)
 
 
 def gap_reason(

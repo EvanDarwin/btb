@@ -28,7 +28,7 @@ import sys
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Protocol
 
-from btb.kinds import FamilyKind, Json, QuantClass, TokenRows, quants_of
+from btb.kinds import FamilyKind, Json, LayerKind, QuantClass, TokenRows, quants_of
 from tests.helpers import (
     CHUNK,
     FIXTURES,
@@ -631,7 +631,7 @@ def _q4_mtp(cfg: PretrainedConfig, seed: int = Q4_MTP_SEED) -> dict[str, torch.T
 
     mcfg: Any = copy.deepcopy(cfg)
     mcfg.num_hidden_layers = 1
-    mcfg.layer_types = ["qwen_sparse_attention"]
+    mcfg.layer_types = [LayerKind.QWEN_SPARSE.hf_name()]  # as the installed transformers names it
     mcfg.ple_layer_ids = []
     with torch.device("meta"):
         layer = Qwen4ExpTextDecoderLayer(mcfg, 0)
