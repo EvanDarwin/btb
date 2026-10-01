@@ -478,6 +478,12 @@ def test_the_ram_policy_sheds_a_warm_layer_to_the_ring_and_takes_it_back() -> No
     with loaded_model(fixture("tiny_qwen3-pack12"), device="cpu", v_max=0) as sm:
         assert sm.host and not sm.cold and sm.ram_watch
         before = sm.generate(REPEATING, 12, speculate=False).tokens
+        # the layer's weights are the store's mapped pages, not memory of its own: a shed frees RAM (the pages taken
+        # out of the process's resident memory) and no commit
+        held = sm._layer_storages(max(sm.host), sm._mapped_spans())
+        mapped = sum(n for n, m in held.values() if m)
+        assert mapped > 0.9 * sum(n for n, _m in held.values()), held
+        assert sm._shed_gain(max(sm.host))[1] <= 0, "a mapped layer's shed counted as freeing commit"
         i = sm.ram_shed("the test")
         assert i == max(sm.host) and sm.cold == {i} and sm.ram_state.shed == [i]
         assert sm.cold_ring.slots and i in sm.cold_ring.slot_of
@@ -923,10 +929,13 @@ def test_spec_budget_without_a_cost_curve_is_the_wider_of_the_tree_and_the_chain
     tiers) the budget must be the configured width, the chain's included: a tree budget of 0 with v_max 4 once
     returned 1 and switched speculation off on every model without a drafting head."""
     from btb.engine.cuda import _CudaMixin
+    from btb.engine.families.base import Family
+    from btb.kinds import FamilyKind
 
     class _Engine(_CudaMixin):
         def __init__(self, tree_budget: int) -> None:
             self.tree_budget = tree_budget
+            self.fam = Family(kind=FamilyKind.QWEN3)  # the plain block's: no bound on a pass's rows
 
     assert _Engine(0)._spec_budget(1.0, 0, v_max=4) == 5, "a chain of four drafts and the root"
     assert _Engine(16)._spec_budget(1.0, 0, v_max=4) == 17, "the tree's rows when wider"

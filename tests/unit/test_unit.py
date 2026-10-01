@@ -910,7 +910,7 @@ def test_plan_keeps_a_sparse_attentions_pooled_keys_on_the_card_with_the_rows_in
     p = _probe()
     p.fam = Qwen4Family(kind=FamilyKind.QWEN4, streams=4, **_flags(FamilyKind.QWEN4))
     p.layer_types = ["qwen_sparse_attention", "linear_attention"] * 4
-    p.cfg.indexer_compress_ratio, p.cfg.indexer_head_dim = 4, 128
+    p.cfg.indexer_compress_ratio, p.cfg.indexer_head_dim, p.cfg.indexer_budget = 4, 128, 2048
     rows = 1 << 20
     pooled, raw = (rows // 4 + 1) * 128 * 2, rows * 128 * 2
     assert p.fam.attn_index_bytes(p.cfg, rows) == (pooled, raw)
@@ -933,6 +933,32 @@ def test_plan_keeps_a_sparse_attentions_pooled_keys_on_the_card_with_the_rows_in
     assert out["bytes"]["kv_host"] == 4 * (kv_row + raw), "their rows and raw keys in RAM; DeltaNet keeps none"
     # the card's share: 64 MiB a layer at a million positions, a twelfth of what the layer keeps in RAM
     assert pooled == 64 * MB + 256 and (kv_row + raw) / pooled == pytest.approx(12.0, rel=1e-4)
+    # a token reads the indexer's budget of those rows and a block's tail - 2052 of a million - not every one
+    from btb.engine.tiers import RAM_BPS
+
+    assert p.fam.attn_read_rows(p.cfg, rows) == 2048 + 4
+    assert out["kv_read_ms"] == pytest.approx(4 * (kv_row + raw) * 2052 / rows / RAM_BPS * 1e3)
+    assert out["kv_read_ms"] < 0.2, "a million positions in RAM priced as a whole read a token"
+    # a sparse layer on the host reads every one of its rows (its path grows and re-pools them whole): the budget's
+    # discount is the card program's, for the resident layers' rows alone
+    few = _TiersMixin.plan_budget(
+        cast("_TiersMixin", p),
+        ram_gb=256.0,
+        vram_gb=1.5 + 0.5 + 0.55,
+        packed=False,
+        fp32=False,
+        drafter=False,
+        prefill_card=False,
+        os_reserve_gb=1.0,
+        vram_reserve_gb=0.5,
+        context=rows,
+        kv_host=True,
+    )
+    on_host = [i for i in range(8) if i not in few["resident"] and i % 2 == 0]
+    on_card = [i for i in few["resident"] if i % 2 == 0]
+    assert on_host and on_card, few["resident"]
+    whole, read = len(on_host) * (kv_row + raw), len(on_card) * (kv_row + raw) * 2052 / rows
+    assert few["kv_read_ms"] == pytest.approx((whole + read) / RAM_BPS * 1e3)
 
 
 def test_an_mlx_plan_prices_the_gpu_and_says_so(monkeypatch: pytest.MonkeyPatch) -> None:

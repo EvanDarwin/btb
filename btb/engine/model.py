@@ -32,7 +32,7 @@ from .device import Device, where
 from .drafter import MTPDrafter
 from .experts import _ExpertStore
 from .families import _FamiliesMixin, family, register_attention
-from .fixed_rows import RowLinear, fix_rows_cls
+from .fixed_rows import RowLinear, fix_linears, fix_rows_cls
 from .forward import _ForwardMixin
 from .generate import _GenerateMixin
 from .holdings import Holdings, Stage, last_on_card, on_card
@@ -269,6 +269,9 @@ class StreamedTextModel(
         # with its own module (Qwen4's mixer of its streams), `mixer`, run as its module runs
         self.norm, self.mixer = (last, None) if self.fam.norm is not None else (None, last)
         fix_rows_cls(self.fam.norm)  # the final norm's small passes at the fixed shape (fixed_rows.py)
+        # a closing mixer's linears too: its small passes' rows on the card a row's own whatever travels with them
+        # (Qwen4's, whose plain linears parted a verify row from its step)
+        fix_linears(last)
         # the parameters are widened to a float32 compute dtype below: read at the checkpoint's own precision for it
         wide = self.compute_dtype is not None and self.compute_dtype != torch.bfloat16
         for name, _, is_buf in self._named_tensors(last):

@@ -22,22 +22,26 @@ from ..api import api
 from ..kinds import Log, PassTag
 from ..options import Device
 from ..sysinfo import (
+    BudgetEvent,
     _darwin_available_bytes,
     hard_page_faults,
     host_commit_bytes,
     host_free_bytes,
     host_total_bytes,
     memory_pressure,
+    release_pages,
     vram_pressure,
     vram_pressure_line,
     wait_event,
     wddm_budget_event,
+    wddm_budget_stale,
     wddm_budget_unregister,
 )
 from . import device as device_mod
 from .cache import GrantedIndexedLayer, GrowLayer
 from .device import DeviceSpec, Where, torch_device, where
 from .fixed_rows import RowLinear
+from .host import _HostLinear
 from .scheduler import EPOCH, MemoryGrantError, _size
 from .state import _State
 from .tiers import ColdRing
@@ -72,6 +76,9 @@ class VramPolicyState:
     budget_hi: int = 0
     # when torch's freed blocks were last given back to answer the budget alone (`_vram_trim_enough`)
     trim_t: float = 0.0
+    # the budget watcher found the card past the budget while a decode held the engine: the step graph's loop, which
+    # runs no pass's policy, hands the answer to the passes that do (`_card_generate_greedy`); a policy's read clears
+    asked: bool = False
     # -vv: when the card's figures were last traced (a monotonic clock), and the figures last said (`_trace_card`)
     trace_t: float = 0.0
     trace_said: tuple[int, ...] = ()
@@ -88,6 +95,9 @@ class RamPolicyState:
     paging: int = 0
     clean: int = 0
     shed: list[int] = field(default_factory=list)
+    # a yield gave all that helps and the host was still this short: not asked again until the host is clear, or
+    # another program wants RAM_AGAIN more than this (0: none given up)
+    spent: int = 0
 
 
 @dataclass(frozen=True)
@@ -233,9 +243,12 @@ class _MemoryMixin(_State):
             # under them freed nothing
             self._card_let_go()
             i = max(self.resident)
+            # the host's copy made before the card's leaves: one that raises leaves the layer where it was, never in
+            # neither tier
+            host = self._make_host_layer(i)
             tmpl = self.resident.pop(i)
             del tmpl
-            self.host[i] = self._make_host_layer(i)
+            self.host[i] = host
             self._caches_to(i, "cpu", cache)
             moved = f"layer {i}"
         elif self.resident_head and self.dev.type == Device.CUDA:
@@ -372,6 +385,7 @@ class _MemoryMixin(_State):
                 )
         if not self.vram_watch or self.dev.type != Device.CUDA or self.warming:
             return  # the warm-up's own passes: answered once it is done (model.py `_warming`)
+        self.vram_state.asked = False  # the budget read here, by the pass
         # a batched decode is sized by the scheduler (the one OOM guard), so the per-step streaming policy stands
         # aside: shedding mid-batch only slows it, and the triggers fire on a large batch's legitimate KV growth
         if cache is not None and getattr(cache, "layers", None):
@@ -383,9 +397,7 @@ class _MemoryMixin(_State):
         # layer a second - before the driver pages it out and before the other program's allocations fail. A DXGI
         # read, microseconds, so every pass
         over = self._vram_over()
-        if over <= 0:
-            self.vram_state.spent = 0  # inside the budget again: a later cut is answered afresh
-        elif not self.vram_state.spent or over > self.vram_state.spent + (256 << 20):
+        if self._vram_yield_due(over):
             # torch's freed blocks before any placement change: a request moves the placement's version, and the
             # card graphs and a card program are rebuilt for the new one - for nothing, where the cache was enough
             if not self._vram_trim_enough(over, log):
@@ -472,6 +484,18 @@ class _MemoryMixin(_State):
             if self.vram_state.free_checks >= self.vram_state.regrow_after:
                 self.vram_state.free_checks = 0
                 self.device.request("regrow", lambda: self.vram_regrow(cache, log))
+
+    def _vram_yield_due(self, over: int) -> bool:
+        """whether a budget `over` bytes short is one a yield has not answered yet: past the budget, and not the
+        shortfall the last yield left with nothing more to shed - asked again only once inside the budget, or cut 256
+        MB deeper. A yield moves the placement's version whether or not it sheds anything (the card graphs and a card
+        program rebuilt), so a shortfall it cannot answer is not asked again on every pass or signal. The policy's and
+        the watcher's one test"""
+        if over <= 0:
+            self.vram_state.spent = 0  # inside the budget again: a later cut is answered afresh
+            return False
+        spent = self.vram_state.spent
+        return not spent or over > spent + (256 << 20)
 
     def _vram_over(self) -> int:
         """the bytes this process holds on the card past what Windows budgets it, less the room kept for other
@@ -567,44 +591,67 @@ class _MemoryMixin(_State):
         info = device_mod._wddm_info(self.dev)
         if info is not None:
             self.vram_state.budget_hi = max(self.vram_state.budget_hi, info[0])
-        reg = wddm_budget_event(*device_mod.card_ids(self.dev))
-        if reg is None:
+        ids = device_mod.card_ids(self.dev)
+        first = wddm_budget_event(*ids)
+        if first is None:
             return
         # the engine by a weak reference and its abort flag alone: the thread never keeps an engine alive that its
         # owner let go of without closing, and ends with it (its event unregistered)
         me, abort = weakref.ref(self), self.abort
 
-        def run() -> None:
+        def run(reg: BudgetEvent) -> None:
             pending = False  # a signal the engine was busy for
+            said = ""
             try:
                 while not abort.is_set():
                     signalled = wait_event(reg.event, 1.0)
                     sm = me()
                     if sm is None:
                         return
-                    info = device_mod._wddm_info(sm.dev)
-                    if info is not None:
-                        sm.vram_state.budget_hi = max(sm.vram_state.budget_hi, info[0])
-                    over = sm._vram_over() if (signalled or pending) else 0
-                    if over <= 0:
-                        pending = False
-                        del sm
-                        continue
-                    lock = getattr(sm, "_decode_lock", None)
-                    if lock is not None and lock.acquire(blocking=False):
-                        pending = False
-                        try:
-                            if not abort.is_set() and not sm._vram_trim_enough(over, None):
-                                sm.device.request("yield", partial(sm.vram_yield, None, None))
-                        finally:
-                            lock.release()
-                    else:
-                        pending = True  # a decode runs, or the load's warm-up: asked again each second till it ends
+                    try:
+                        if wddm_budget_stale(reg, *ids):
+                            # the card found afresh after a driver reset: the old adapter's event signals nothing, so
+                            # the new one's is waited on, and the budget read once now
+                            new = wddm_budget_event(*ids)
+                            if new is not None:
+                                wddm_budget_unregister(reg)
+                                reg, signalled = new, True
+                        pending = sm._vram_watch_once(signalled, pending, abort)
+                    except Exception as e:
+                        # the watcher outlives any read or yield that raises - one that ended the thread turned adapt
+                        # off for the engine's life, unsaid: said once, and the signal asked again next second
+                        if repr(e) != said:
+                            said = repr(e)
+                            sm.log(f"[vram] the budget watcher: {e!r}; still watching")
                     del sm
             finally:
                 wddm_budget_unregister(reg)
 
-        threading.Thread(target=run, name="btb-vram-budget", daemon=True).start()
+        threading.Thread(target=run, args=(first,), name="btb-vram-budget", daemon=True).start()
+
+    def _vram_watch_once(self, signalled: bool, pending: bool, abort: threading.Event) -> bool:
+        """one second of the budget watcher (`watch_vram_budget`): the largest budget noted, and a signal - this
+        second's, or one the engine was busy for - answered when the engine is idle and no yield answered it yet
+        (`_vram_yield_due`). Returns whether a signal still waits on a busy engine"""
+        info = device_mod._wddm_info(self.dev)
+        if info is not None:
+            self.vram_state.budget_hi = max(self.vram_state.budget_hi, info[0])
+        if not (signalled or pending):
+            return False
+        over = self._vram_over()
+        if not self._vram_yield_due(over):
+            return False
+        lock = getattr(self, "_decode_lock", None)
+        if lock is None or not lock.acquire(blocking=False):
+            # a decode runs, or the load's warm-up: asked again each second till it ends, and the decode told
+            self.vram_state.asked = True
+            return True
+        try:
+            if not abort.is_set() and not self._vram_trim_enough(over, None):
+                self.device.request("yield", partial(self.vram_yield, None, None))
+        finally:
+            lock.release()
+        return False
 
     # what a program asking for memory gets on top of the reserve, and how long the store holds off growing back
     RAM_HEADROOM_MIN = 2 << 30
@@ -632,14 +679,90 @@ class _MemoryMixin(_State):
             return 0
         return max(0, self._ram_headroom() - left)
 
+    # a yield answered: asked again only once the host is clear of other programs, or one wants this much more
+    RAM_AGAIN = 512 << 20
+
+    def _ram_yield_due(self, short: int) -> bool:
+        """whether another program `short` bytes short of memory is one a yield has not answered yet: short, and not
+        the shortfall the last yield left with nothing more that helps - asked again only once the host was clear, or
+        the other program wants RAM_AGAIN more. A yield moves the placement's version whether or not it gives anything
+        back (the card graphs rebuilt), so a shortfall it cannot answer is not asked again every pass and four times a
+        second. The policy's and the watcher's one test"""
+        if short <= 0:
+            self.ram_state.spent = 0  # clear again: a later shortfall is answered afresh
+            return False
+        spent = self.ram_state.spent
+        return not spent or short > spent + self.RAM_AGAIN
+
+    def _ram_needs(self, head: int) -> tuple[int, int]:
+        """what the host is short of `head` above the reserve, RAM and commit apart (negative: room to spare). A layer
+        read from the checkpoint's mapping holds RAM and no commit, a ring slot or the store's blocks both, so a yield
+        answers each with what frees it"""
+        reserve = int(getattr(self, "ram_reserve", 0) or 0)
+        # the ledger's figure is the tighter of the two, and stops at zero
+        # free-read: how far another program reaches into the reserve, RAM and commit apart and signed
+        ram, commit = int(host_free_bytes()), int(host_commit_bytes())
+        return head - (ram - reserve), head - (commit - reserve)
+
+    def _mapped_spans(self) -> list[tuple[int, int]]:
+        """the address ranges of the checkpoint's own mappings (its shards, the 12-bit store's): a tensor inside one is
+        the file's pages, not memory of its own"""
+        import warnings
+
+        maps = [v[0] for v in getattr(self, "_maps", {}).values()] + list(getattr(self, "_packed_maps", {}).values())
+        spans = []
+        for mm in maps:
+            if mm is None or not len(mm):
+                continue
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                p = int(torch.frombuffer(mm, dtype=torch.uint8, count=1).data_ptr())
+            spans.append((p, p + len(mm)))
+        return spans
+
+    def _layer_storages(self, i: int, spans: list[tuple[int, int]]) -> dict[int, tuple[int, bool]]:
+        """the storages host layer `i`'s linears read their weights from, by address: (bytes, whether they are the
+        checkpoint's mapped pages - inside `spans` - rather than memory of the layer's own)"""
+        out: dict[int, tuple[int, bool]] = {}
+        for m in self.host[i].modules():
+            if not (isinstance(m, _HostLinear) and m.key):
+                continue
+            for t in (m.weight, *(m.packed or ())):
+                if isinstance(t, torch.Tensor):
+                    st = t.untyped_storage()
+                    p = int(st.data_ptr())
+                    out[p] = (int(st.nbytes()), any(a <= p < b for a, b in spans))
+        return out
+
+    def _ring_bytes(self) -> int:
+        return sum(int(s.numel()) * int(s.element_size()) for s in (getattr(self.cold_ring, "slots", None) or ()))
+
+    def _shed_gain(self, i: int) -> tuple[int, int]:
+        """(RAM, commit) a shed of warm layer `i` would give back: the weights it lets go - the mapping's pages RAM
+        alone, its own copies both - less what the ring grows by to read it from the drive (a slot more while the ring
+        has fewer than `cold_slots`, each slot as large as the largest cold layer)"""
+        st = self._layer_storages(i, self._mapped_spans())
+        mapped = sum(n for n, m in st.values() if m)
+        own = sum(n for n, m in st.values() if not m)
+        slots = getattr(self.cold_ring, "slots", None) or []
+        stored = self._layer_bytes_stored(i, bool(getattr(self, "_packed", None)))
+        slot = max([int(s.numel()) for s in slots] + [stored])
+        grow = max(1, min(int(self.cold_slots), len(self.cold) + 1)) * slot - self._ring_bytes()
+        return mapped + own - grow, own - grow
+
     def ram_yield(self, log: Log | None = None) -> int:
         """The host given back to another program at once: the expert store's blocks first (their bytes are on the
-        drive, read again on a miss), then the host layers to the drive (`ram_shed`), until the reserve and a
-        launch's headroom are free or nothing is left to give; the store then holds off growing back for
-        RAM_HOLD_S. Returns the bytes the host gained"""
+        drive, read again on a miss), then host layers to the drive (`_shed_warm`) while a shed frees what is short -
+        RAM, or commit, each counted down by what the shed let go (a layer on the checkpoint's mapping frees RAM and
+        no commit, and its ring slot takes both), not read again from the OS, whose figures move only as it gets round
+        to the pages - until the reserve and a launch's headroom are free, or no shed frees what is short without
+        taking the other; the store then holds off growing back for RAM_HOLD_S. What is still short after is not asked
+        again (`_ram_yield_due`). Returns the bytes the host gained"""
         log = log or self.log
+        st = self.ram_state
         short = self._ram_short()
         if short <= 0:
+            st.spent = 0
             return 0
         head = self._ram_headroom()
         # free-read: the yield's own log line (what it gained), never a decision
@@ -650,62 +773,91 @@ class _MemoryMixin(_State):
         if store is not None:
             store.hold_for(head, self.RAM_HOLD_S)
             blocks = int(store.release(want=head) or 0)
+        # the store's blocks are memory of its own, back to the OS as they go: the figures read after them stand
+        need_ram, need_commit = self._ram_needs(head)
         layers = []
-        for _ in range(int(getattr(self, "L", 0) or 0)):
-            if self._ram_left() >= head:
-                break
-            i = self.ram_shed("another program wants memory", log) if getattr(self, "host", None) else None
+        while need_ram > 0 or need_commit > 0:
+            i = self._next_warm()
             if i is None:
                 break
-            layers.append(i)
+            g_ram, g_commit = self._shed_gain(i)
+            helps = (need_ram > 0 and g_ram > 0) or (need_commit > 0 and g_commit > 0)
+            # one freed at the other's cost is no answer: a mapped layer's ring slot under a commit shortfall
+            hurts = (g_ram < 0 and need_ram - g_ram > 0) or (g_commit < 0 and need_commit - g_commit > 0)
+            if not helps or hurts:
+                break
+            r = self._shed_warm("another program wants memory", log)
+            if r is None:
+                break
+            layers.append(r[0])
+            need_ram -= r[1]
+            need_commit -= r[2]
         # free-read: the yield's own log line (what it gained), never a decision
         gained = min(int(host_free_bytes()), int(host_commit_bytes())) - before
-        left = self._ram_left()
+        still = max(need_ram, need_commit)
         log(
             f"[ram] gave back {gained / 2**30:.2f} GB ({blocks} store slots, host layers {layers or 'none'} to the "
             f"drive; the store holds off growing back for {self.RAM_HOLD_S:.0f} s)"
-            + (f"; {(head - left) / 2**30:.2f} GB short of the headroom, nothing left to give" if left < head else "")
+            + (f"; {still / 2**30:.2f} GB short of the headroom, nothing more a shed frees" if still > 0 else "")
         )
+        st.spent = max(1, self._ram_short())
         return gained
 
     def watch_ram(self) -> None:
         """A thread reading RAM, commit and the OS's low-memory word four times a second: another program short of
         memory, it holds the expert store back from what it needs (the running decode's next expert call gives the
-        blocks back) and, the engine idle (the decode lock free), gives it all back at once (`ram_yield`). With
-        `adapt` off, or on unified memory, nothing"""
+        blocks back) and, the engine idle (the decode lock free), gives it all back at once (`ram_yield`) - once a
+        shortfall (`_ram_yield_due`). With `adapt` off, or on unified memory, nothing"""
         if not getattr(self, "adapt", False) or self.mlx is not None:
             return
         me, abort = weakref.ref(self), self.abort
 
         def run() -> None:
+            said = ""
             while not abort.wait(0.25):
                 sm = me()
                 if sm is None:
                     return
-                if sm._ram_short() > 0:
-                    store = getattr(sm, "expert_store", None)
-                    if store is not None:
-                        store.hold_for(sm._ram_headroom(), sm.RAM_HOLD_S)
-                    lock = getattr(sm, "_decode_lock", None)
-                    if lock is not None and lock.acquire(blocking=False):  # else a decode runs: its calls give back
-                        try:
-                            if not abort.is_set():
-                                sm.device.request("ram-yield", partial(sm.ram_yield, None))
-                        finally:
-                            lock.release()
+                try:
+                    sm._ram_watch_once(abort)
+                except Exception as e:
+                    # the watcher outlives any read or yield that raises - one that ended the thread turned adapt off
+                    # for the engine's life, unsaid: said once, and asked again next reading
+                    if repr(e) != said:
+                        said = repr(e)
+                        sm.log(f"[ram] the memory watcher: {e!r}; still watching")
                 del sm
 
         threading.Thread(target=run, name="btb-ram-watch", daemon=True).start()
 
+    def _ram_watch_once(self, abort: threading.Event) -> None:
+        """one reading of the RAM watcher (`watch_ram`)"""
+        short = self._ram_short()
+        if short > 0:
+            store = getattr(self, "expert_store", None)
+            if store is not None:
+                store.hold_for(self._ram_headroom(), self.RAM_HOLD_S)
+        if not self._ram_yield_due(short):
+            return
+        lock = getattr(self, "_decode_lock", None)
+        if lock is not None and lock.acquire(blocking=False):  # else a decode runs: its calls give back
+            try:
+                if not abort.is_set():
+                    self.device.request("ram-yield", partial(self.ram_yield, None))
+            finally:
+                lock.release()
+
     def ram_policy(self, log: Log | None = None) -> None:
         """Another program short of memory first (`_ram_short`): everything it needs given back at once
-        (`ram_yield`). Else once a second: shed one warm layer to the ring after two consecutive readings with no
-        free host memory above the reserve. Regrow the last shed layer after `regrow_after` consecutive clean
-        readings with room for it."""
+        (`ram_yield`), once a shortfall (`_ram_yield_due`). Else once a second: shed one warm layer to the ring after
+        two consecutive readings with no free host memory above the reserve. Regrow the last shed layer after
+        `regrow_after` consecutive clean readings with room for it."""
         if self.warming:
             return  # the warm-up's own passes: answered once it is done (model.py `_warming`)
-        if self._ram_short() > 0:
+        short = self._ram_short()
+        if self._ram_yield_due(short):
             self.device.request("ram-yield", lambda: self.ram_yield(log))
+        if short > 0:
             return
         if not getattr(self, "ram_watch", False) or self.mlx is not None:
             return
@@ -739,24 +891,48 @@ class _MemoryMixin(_State):
                 st.clean = 0
                 self.device.request("ram-regrow", lambda: self.ram_regrow(log))
 
+    def _next_warm(self) -> int | None:
+        """the warm host layer a shed takes next: the last"""
+        warm = [i for i in sorted(getattr(self, "host", None) or ()) if i not in self.cold]
+        return warm[-1] if warm else None
+
     def ram_shed(self, why: str = "", log: Log | None = None) -> int | None:
-        """the last warm layer to the ring: its weights read each pass from the drive, its pages in RAM given back
-        to the OS, the ring rebuilt over the new order (the next pass restarts its reader)"""
+        """the last warm layer to the ring (`_shed_warm`)"""
+        r = self._shed_warm(why, log)
+        return None if r is None else r[0]
+
+    def _shed_warm(self, why: str = "", log: Log | None = None) -> tuple[int, int, int] | None:
+        """The last warm layer to the ring: its weights read each pass from the drive, the ring rebuilt over the new
+        order (the next pass restarts its reader), and its pages in RAM given back to the OS - its own copies freed,
+        the checkpoint's mapped pages taken out of the process's resident memory (`release_pages`), where else they sat
+        until the OS trimmed them and a shed gave back nothing it could see. Returns (the layer, the RAM and the commit
+        it gave back, less the ring's growth)"""
         log = log or self.log
-        warm = [i for i in sorted(self.host) if i not in self.cold]
-        if not warm:
+        i = self._next_warm()
+        if i is None:
             return None
-        i = warm[-1]
+        spans = self._mapped_spans()
+        held = self._layer_storages(i, spans)
+        ring = self._ring_bytes()
         self._cold_stop()
         self.cold.add(i)
         self.ram_state.shed.append(i)
         self._bind_cold()
-        size = _size(self._layer_bytes_stored(i, bool(getattr(self, "_packed", None))))
+        now = self._layer_storages(i, spans)
+        gone = [(p, n, m) for p, (n, m) in held.items() if p not in now]
+        if self.mlx is None:
+            for p, n, m in gone:
+                if m:
+                    release_pages(p, n)
+        grow = self._ring_bytes() - ring
+        own = sum(n for _p, n, m in gone if not m)
+        freed_ram, freed_commit = sum(n for _p, n, _m in gone) - grow, own - grow
         log(
-            f"[ram] SHED layer {i} -> drive ({size} of RAM given back; {why or 'asked'}); {len(self.cold)} layers "
-            "from the drive each pass"
+            f"[ram] SHED layer {i} -> drive ({_size(max(0, freed_ram))} of RAM and {_size(max(0, freed_commit))} of "
+            f"commit given back, the ring's growth taken off; {why or 'asked'}); {len(self.cold)} layers from the "
+            "drive each pass"
         )
-        return i
+        return i, freed_ram, freed_commit
 
     def ram_regrow(self, log: Log | None = None) -> int | None:
         """the last layer shed back into RAM: its linears on the store's mapped bytes again, the ring rebuilt

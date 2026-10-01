@@ -420,6 +420,10 @@ class _State:
     def _card_oom(self, e: BaseException) -> None:  # an engine without the card mixin builds no card graph
         return None
 
+    @staticmethod
+    def _is_card_oom(e: BaseException) -> bool:  # an engine without the card mixin builds no card graph to refuse
+        return False
+
     def _card_arena_holds(self, cache: Any, T: int) -> bool:  # an engine without the card mixin has no arena
         return False
 

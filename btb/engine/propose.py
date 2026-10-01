@@ -4,6 +4,7 @@ big model's tree pass (every output token the big model's own). The proposer's i
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -36,12 +37,18 @@ class ModelProposer:
         self.ks, self.nodes, self.tag = [int(k) for k in ks], int(nodes), tag
         ids = [int(t) for t in prompt]
         self.cache = engine.new_cache()
-        with torch.inference_mode():
+        with torch.inference_mode(), self._held():
             engine._prefill(torch.tensor([ids]), self.cache)
         self.n = len(ids)
         self.pending: list[int] = []
         self.passes = 0
         self.marks: dict[int, LinSnap] = {}  # a hybrid drafter's DeltaNet state at the committed rows, by layer
+
+    def _held(self) -> Any:
+        """the drafting engine's decode lock, held for its passes as a decode holds it: its adapt watchers
+        (`watch_vram_budget`, `watch_ram`) take a free lock for an idle engine, and moved its layers mid-pass"""
+        lock = getattr(self.sm, "_decode_lock", None)
+        return lock if lock is not None else contextlib.nullcontext()
 
     def add_sequence(self, ids: Iterable[int], tag: Any) -> int:
         return 0
@@ -58,7 +65,7 @@ class ModelProposer:
         T = len(toks)
         mg = getattr(sm, "_mega", None)
         fast = mg is not None and sm._mega_ok(self.cache, T, None, True, True, None)
-        with torch.inference_mode():
+        with torch.inference_mode(), self._held():
             sm.aa(parents)
             try:
                 if fast:

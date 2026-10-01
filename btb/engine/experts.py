@@ -1281,12 +1281,12 @@ class _ExpertStore:
             trace.event(
                 "experts: the store holds %s free for another program for %.0f s", _size(int(nbytes)), float(seconds)
             )
-        self._hold = (int(nbytes), time.time() + float(seconds))
+        self._hold = (int(nbytes), time.monotonic() + float(seconds))  # a clock set back holds no longer
 
     def held(self) -> int:
         """the bytes kept free for another program now (`hold_for`); 0 once the hold has run out"""
         n, until = getattr(self, "_hold", (0, 0.0))
-        return int(n) if time.time() < until else 0
+        return int(n) if time.monotonic() < until else 0
 
     def releasable(self) -> int:
         """the host bytes `release` could give the machine: the blocks above the slots the largest call served

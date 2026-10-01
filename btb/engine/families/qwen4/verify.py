@@ -15,7 +15,6 @@ outside speculation) takes the module's own forward."""
 from __future__ import annotations
 
 import math
-import types
 import weakref
 from typing import Any
 
@@ -24,6 +23,7 @@ import torch.nn.functional as F
 
 from ...forward import chain_of, path_of
 from ...native import Native
+from . import bind_forward
 from .rows import each
 
 
@@ -57,11 +57,11 @@ def install(layer: Any, sm: Any) -> None:
     la = getattr(layer, "linear_attn", None)
     if la is not None:
         la._btb_sm = ref
-        la.forward = types.MethodType(_delta_forward, la)
+        bind_forward(la, _delta_forward)
     ple = getattr(layer, "ple", None)
     if ple is not None:
         ple._btb_sm = ref
-        ple.forward = types.MethodType(_ple_forward, ple)
+        bind_forward(ple, _ple_forward)
 
 
 def _consts(la: Any, dev: torch.device) -> dict[str, Any]:

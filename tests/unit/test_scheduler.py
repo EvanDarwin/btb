@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import sys
 import threading
 import time
 import types
@@ -33,7 +34,7 @@ from btb.engine.forward import _ForwardMixin
 from btb.engine.generate import _GenerateMixin
 from btb.engine.memory import RamPolicyState, VramPolicyState, _MemoryMixin
 from btb.engine.scheduler import MemoryGrantError
-from btb.kinds import FamilyKind, Json, Log, TokenRows, Tokens
+from btb.kinds import FamilyKind, Json, LayerKind, Log, TokenRows, Tokens
 from tests.helpers import (
     ABSENT,
     GB,
@@ -1199,8 +1200,9 @@ def test_vram_yield_stops_when_nothing_is_left_to_shed() -> None:
 
 
 class _YieldEngine(_MemoryMixin):
-    """the RAM yield's view of an engine: a machine whose free RAM and commit the test sets, an expert store and host
-    layers whose giving-back moves them"""
+    """the RAM yield's view of an engine: a machine whose free RAM and commit the test sets (commit as RAM unless
+    staged apart), an expert store and host layers whose giving-back moves them - a shed by `gain` (RAM, commit), the
+    OS's figures moved by it unless `lag` (the pages not yet taken back)"""
 
     def __init__(self, free: int, reserve: int, per_block: int, blocks: int, host: int, per_layer: int) -> None:
         self.dev = _where("cuda")
@@ -1208,7 +1210,13 @@ class _YieldEngine(_MemoryMixin):
         self.machine = {"free": int(free), "low": False}
         self.lines: list[str] = []
         self.host = dict.fromkeys(range(host))
+        self.cold: set[int] = set()
         self.shed: list[int] = []
+        self.gain = (int(per_layer), int(per_layer))
+        self.lag = False
+        self.warming = False
+        self.ram_state = RamPolicyState()
+        self.requests: list[str] = []
         eng = self
 
         class Store:
@@ -1222,23 +1230,40 @@ class _YieldEngine(_MemoryMixin):
                 while self.n and eng.machine["free"] - eng.ram_reserve < want:
                     self.n -= 1
                     eng.machine["free"] += per_block
+                    if "commit" in eng.machine:
+                        eng.machine["commit"] += per_block
                     freed += 1
                 return freed
 
+        class Dev:
+            version = 0
+
+            def request(self, what: str, fn: Callable[[], Any]) -> Any:
+                self.version += 1
+                eng.requests.append(what)
+                return fn()
+
         self.store = Store()
         self.expert_store = cast(Any, self.store)
-        self.per_layer = int(per_layer)
+        self.device = cast(Any, Dev())
 
     def log(self, *a: object, **k: object) -> None:
         self.lines.append(" ".join(str(x) for x in a))
 
-    def ram_shed(self, why: str = "", log: Log | None = None) -> int | None:
-        warm = [i for i in sorted(self.host) if i not in self.shed]
-        if not warm:
+    def _shed_gain(self, i: int) -> tuple[int, int]:
+        return self.gain
+
+    def _shed_warm(self, why: str = "", log: Log | None = None) -> tuple[int, int, int] | None:
+        i = self._next_warm()
+        if i is None:
             return None
-        self.shed.append(warm[-1])
-        self.machine["free"] += self.per_layer
-        return warm[-1]
+        self.cold.add(i)
+        self.shed.append(i)
+        if not self.lag:
+            self.machine["free"] += self.gain[0]
+            if "commit" in self.machine:
+                self.machine["commit"] += self.gain[1]
+        return i, *self.gain
 
 
 @contextlib.contextmanager
@@ -1247,7 +1272,7 @@ def machine(e: _YieldEngine, total: int = 64 * GB) -> Iterator[None]:
     names = ("host_free_bytes", "host_commit_bytes", "memory_pressure", "host_total_bytes")
     saved = {n: getattr(memory_mod, n) for n in names}
     memory_mod.host_free_bytes = lambda: e.machine["free"]
-    memory_mod.host_commit_bytes = lambda: e.machine["free"]
+    memory_mod.host_commit_bytes = lambda: e.machine.get("commit", e.machine["free"])
     memory_mod.memory_pressure = lambda: {"low": e.machine["low"], "level": 1.0 if e.machine["low"] else 0.0}
     memory_mod.host_total_bytes = lambda: int(total)
     try:
@@ -1289,7 +1314,331 @@ def test_ram_yield_stops_when_nothing_is_left_to_give() -> None:
     e = _YieldEngine(free=1 * GB, reserve=4 * GB, per_block=GB, blocks=1, host=0, per_layer=GB)
     with machine(e):
         e.ram_yield()
-    assert any("short of the headroom, nothing left to give" in ln for ln in e.lines), e.lines
+    assert any("short of the headroom, nothing more a shed frees" in ln for ln in e.lines), e.lines
+
+
+def test_ram_yield_counts_what_each_shed_frees_not_the_lagging_os_figure() -> None:
+    """the OS takes a shed layer's pages back only as it gets round to them: read again after each shed, the figure
+    did not move and one yield sent every warm layer to the drive. Counted by what each shed let go, the yield stops
+    once the reserve and the headroom are covered"""
+    e = _YieldEngine(free=3 * GB, reserve=4 * GB, per_block=GB, blocks=0, host=8, per_layer=GB)
+    e.lag = True
+    with machine(e):
+        e.ram_yield()
+    assert e.shed == [7, 6, 5, 4, 3], f"5 GB short, 1 GB a layer: {e.shed}"
+
+
+def test_ram_yield_sheds_no_mapped_layer_for_a_commit_shortfall() -> None:
+    """a layer on the checkpoint's mapping holds RAM and no commit, and its ring slot takes both: with commit short
+    and RAM to spare a shed of it only makes things worse, and none is made; a layer of its own copies frees both"""
+    e = _YieldEngine(free=20 * GB, reserve=4 * GB, per_block=GB, blocks=0, host=8, per_layer=GB)
+    e.machine["commit"] = 3 * GB
+    e.gain = (GB, -GB // 4)  # mapped: its pages back, the ring's slot taken
+    with machine(e):
+        e.ram_yield()
+        assert e.shed == [], f"a mapped layer shed for commit: {e.shed}"
+        e.ram_state.spent = 0
+        e.gain = (GB, GB)  # its own copies: RAM and commit both freed
+        e.ram_yield()
+    assert e.shed == [7, 6, 5, 4, 3], e.shed
+
+
+def test_a_shortfall_a_yield_cannot_answer_is_asked_once_not_every_pass() -> None:
+    """with nothing left to give and another program still in the reserve, every pass asked again - a request
+    moves the placement's version (the card graphs rebuilt) and the yield logged two lines - and the watcher four
+    times a second. Asked once; again only when the other program wants RAM_AGAIN more, or after the host was clear"""
+    e = _YieldEngine(free=1 * GB, reserve=4 * GB, per_block=GB, blocks=0, host=0, per_layer=GB)
+    e._decode_lock = threading.RLock()
+    abort = threading.Event()
+    with machine(e):
+        for _ in range(3):
+            e.ram_policy()
+            e._ram_watch_once(abort)
+        assert e.requests == ["ram-yield"], e.requests
+        assert sum("another program wants memory" in ln for ln in e.lines) == 1, e.lines
+        e.machine["free"] -= GB  # the other program takes a gigabyte more
+        e.ram_policy()
+        e._ram_watch_once(abort)
+        assert e.requests == ["ram-yield"] * 2, "a deeper shortfall was not answered"
+        e.machine["free"] = 20 * GB  # gone: clear again
+        e.ram_policy()
+        assert e.ram_state.spent == 0 and e.requests == ["ram-yield"] * 2
+        e.machine["free"] = 1 * GB  # back: a fresh shortfall is answered
+        e._ram_watch_once(abort)
+        assert e.requests == ["ram-yield"] * 3, e.requests
+
+
+def test_the_adapt_watchers_outlive_an_exception(monkeypatch: MonkeyPatch) -> None:
+    """a read or a yield that raised ended a watcher's thread, and adapt was off for the engine's life, unsaid: each
+    watcher says the error once and keeps watching"""
+    e = _YieldEngine(free=20 * GB, reserve=4 * GB, per_block=GB, blocks=0, host=0, per_layer=GB)
+    e.abort = threading.Event()
+    e.vram_watch = True
+    calls = {"ram": 0, "vram": 0}
+    again = {"ram": threading.Event(), "vram": threading.Event()}
+
+    def once(kind: str) -> Callable[..., Any]:
+        def f(*a: object) -> bool:
+            calls[kind] += 1
+            if calls[kind] <= 2:
+                raise RuntimeError(f"{kind} read failed")
+            again[kind].set()
+            return False
+
+        return f
+
+    e._ram_watch_once = once("ram")  # type: ignore[method-assign]
+    e._vram_watch_once = once("vram")  # type: ignore[method-assign]
+    reg = types.SimpleNamespace(event=0)
+    monkeypatch.setattr(memory_mod, "wddm_budget_event", lambda *a: reg)
+    monkeypatch.setattr(memory_mod, "wddm_budget_unregister", lambda r: None)
+
+    def wait_event(handle: int, timeout_s: float) -> bool:
+        time.sleep(0.01)
+        return False
+
+    monkeypatch.setattr(memory_mod, "wait_event", wait_event)
+    monkeypatch.setattr(device_mod, "_wddm_info", lambda dev: None)
+    monkeypatch.setattr(device_mod, "card_ids", lambda dev: ("card", GB, 0))
+    try:
+        e.watch_ram()
+        e.watch_vram_budget()
+        assert again["ram"].wait(5.0) and again["vram"].wait(5.0), f"a watcher stopped after raising: {calls}"
+    finally:
+        e.abort.set()
+        # ended before the patched OS calls are put back
+        for t in threading.enumerate():
+            if t.name in ("btb-ram-watch", "btb-vram-budget"):
+                t.join(5.0)
+    assert sum("the memory watcher: RuntimeError" in ln for ln in e.lines) == 1, e.lines
+    assert sum("the budget watcher: RuntimeError" in ln for ln in e.lines) == 1, e.lines
+
+
+def test_a_shed_whose_host_copy_is_refused_leaves_the_layer_on_the_card() -> None:
+    """the host's copy is made before the card's leaves: refused, the layer stays resident, never in neither tier"""
+
+    def refuse(i: int) -> Any:
+        raise MemoryGrantError("no room on the host")
+
+    stub = types.SimpleNamespace(
+        aj=None,
+        resident={3: object()},
+        host={},
+        dev=torch.device("cpu"),
+        resident_head=False,
+        _shed=[],
+        log=lambda *a: None,
+        _layer_bytes=lambda i: GB,
+        _card_let_go=lambda: None,
+        _make_host_layer=refuse,
+    )
+    with pytest.raises(MemoryGrantError):
+        _MemoryMixin.vram_shed(cast(Any, stub))
+    assert 3 in stub.resident and not stub.host
+
+
+def test_the_widest_speculative_pass_is_held_to_what_the_family_verifies() -> None:
+    """a tree budget past what the family verifies exactly (Qwen4's card program: 32 rows) is held to it - a wider
+    pass took the torch path, and its pricing raised past the program's widths - and a pass the pricer is handed past
+    them is priced at its own rows"""
+    from btb.engine.cuda import _CudaMixin
+
+    stub = types.SimpleNamespace(v_max=4, tree_budget=40, fam=types.SimpleNamespace(verify_rows=lambda sm: 32))
+    assert _CudaMixin._spec_full(cast(Any, stub)) == 32
+    stub.fam = types.SimpleNamespace(verify_rows=lambda sm: None)
+    assert _CudaMixin._spec_full(cast(Any, stub)) == 41
+    w = types.SimpleNamespace(CARD_T_MAX=32, _card_m=_CudaMixin._card_m)
+    assert _CudaMixin._card_width(cast(Any, w), 3) == 4 and _CudaMixin._card_width(cast(Any, w), 41) == 41
+
+
+def test_one_burst_does_not_price_a_width_out_for_good() -> None:
+    """a width's first pass caught in another program's burst is taken as twice what the curve says of it at most,
+    and a width not run since takes the warm-up's figure again after LIVE_STALE passes: measured once at ten times
+    its cost, it was priced out and never run again. With a store priced, one burst no longer drives the rows'
+    compute exponent to its ceiling"""
+    from btb.engine.spec_cost import SpecCost
+
+    curve = {1: 0.010, 2: 0.011, 4: 0.012, 8: 0.015}
+    pc = SpecCost()
+    pc.price(9, curve, 0.0)
+    pc.record_pass(4, 0.12, 0.0, None)
+    assert pc.curve_now()[4] == pytest.approx(0.024), pc.curve_now()
+    for _ in range(pc.LIVE_STALE + 1):
+        pc.record_pass(1, 0.010, 0.0, None)
+    assert pc.curve_now()[4] == pytest.approx(0.012), pc.curve_now()
+    priced = SpecCost()
+    priced.price(9, curve, 0.001)
+    for _ in range(priced.WARM):
+        priced.record_pass(1, 0.010, 10.0, None)
+    priced.record_pass(2, 0.080, 12.0, None)  # eight steps' time for two rows: a burst
+    assert priced.h < 1.0, f"one burst drove the exponent to {priced.h}"
+
+
+def test_a_card_graph_the_card_had_no_room_for_is_tried_again(monkeypatch: MonkeyPatch) -> None:
+    """an out-of-memory build turned the card graph off until the placement moved - for the engine's life where none
+    did (adapt off, a budget a trim answered, a model wholly on the card). It is tried again after CARD_RETRY_S,
+    doubling with each refusal at one placement; the driver's own out-of-memory errors count as torch's do"""
+    from btb.engine import cuda as cuda_mod
+    from btb.engine.cuda import _CudaMixin
+
+    now = [100.0]
+    # cuda.py's clock alone: frozen for the whole process, every wait on it elsewhere stood still
+    monkeypatch.setattr(cuda_mod, "time", types.SimpleNamespace(monotonic=lambda: now[0]))
+    dev = types.SimpleNamespace(version=3)
+    dev.snapshot = lambda: types.SimpleNamespace(version=dev.version)
+    stub = types.SimpleNamespace(
+        device=dev, CARD_RETRY_S=10.0, CARD_RETRY_MAX_S=300.0, _card_let_go=lambda: None, log=lambda *a: None
+    )
+    e = cast(Any, stub)
+    oom = RuntimeError("CUDA error: out of memory (cudaGraphInstantiate)")
+    assert _CudaMixin._is_card_oom(oom) and _CudaMixin._is_card_oom(torch.OutOfMemoryError("x"))
+    assert not _CudaMixin._is_card_oom(RuntimeError("an index out of range"))
+    _CudaMixin._card_oom(e, oom)
+    assert _CudaMixin._card_off_now(e)
+    now[0] += 11
+    assert not _CudaMixin._card_off_now(e), "not tried again once its retry was due"
+    _CudaMixin._card_oom(e, oom)
+    now[0] += 11
+    assert _CudaMixin._card_off_now(e), "a second refusal at one placement waits twice as long"
+    dev.version += 1
+    assert not _CudaMixin._card_off_now(e), "a placement moved: tried at once"
+
+
+def test_a_let_go_drops_the_step_graphs_embedding_table(monkeypatch: MonkeyPatch) -> None:
+    """the step graph's table - a granted copy, or a tied head's weight - went with nothing: a yield measured with it
+    held shed layers past what the budget asked, and a tied head's shed freed nothing"""
+    from btb.engine.cuda import _CudaMixin
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    st = {"graphs": {}, "layers": {"x": 1}, "table": torch.zeros(4)}
+    stub = types.SimpleNamespace(_cg=st, _cp=None, dev=torch.device("cpu"), _trace_mem=lambda: (0, 0))
+    _CudaMixin._card_let_go(cast(Any, stub))
+    assert "table" not in st and not st["layers"]
+
+
+def test_a_layers_rows_stay_in_ram_when_it_comes_to_the_card_under_kv_host() -> None:
+    """under `kv_host` a layer regrown onto the card leaves its attention rows in RAM (a DeltaNet's states come
+    with it), and its regrowth is priced without them; the card pass's move of the host layers' rows is the plain
+    move (`_rows_to`), refused whole before a row moves"""
+    from btb.engine.tiers import _TiersMixin
+
+    moved: list[Any] = []
+    stub = types.SimpleNamespace(
+        kv_host=True,
+        layer_types=[LayerKind.LINEAR, "qwen_sparse_attention", LayerKind.FULL],
+        _rows_to=lambda caches, layers, dev: moved.append(list(layers)),
+        __dict__={},
+    )
+    e = cast(Any, stub)
+    stub._rows_stay = types.MethodType(_TiersMixin._rows_stay, stub)
+    assert _TiersMixin._rows_stay(e, 1, "cuda") and _TiersMixin._rows_stay(e, 2, "cuda")
+    assert not _TiersMixin._rows_stay(e, 0, "cuda") and not _TiersMixin._rows_stay(e, 1, "cpu")
+    _TiersMixin._caches_to(e, 1, "cuda")
+    _TiersMixin._caches_to(e, 0, "cuda")
+    assert moved == [[0]], moved
+
+
+def test_a_float32_chunk_is_not_priced_under_the_chunk_rule() -> None:
+    """the rule's sweep priced a card chunk with neither the mask nor the keys widened to every head; under --fp32
+    (or a head wider than 256) the attention builds both after all, a gigabyte a layer at 32k unpriced"""
+    from btb.engine.forward import _ForwardMixin
+
+    cfg = types.SimpleNamespace(num_attention_heads=8, head_dim=128, hidden_size=1024, _attn_implementation="btb_sdpa")
+    stub = types.SimpleNamespace(
+        cfg=cfg,
+        fam=types.SimpleNamespace(chunk_causal=True),
+        layer_types=[LayerKind.FULL] * 2,
+        dev=torch.device("cuda"),
+        compute_dtype=torch.float32,
+    )
+    assert not _ForwardMixin._chunk_rule(cast(Any, stub), 1)
+    stub.compute_dtype, cfg.head_dim = torch.bfloat16, 512
+    assert not _ForwardMixin._chunk_rule(cast(Any, stub), 1)
+
+
+def test_a_drafting_engines_passes_hold_its_decode_lock() -> None:
+    """a --draft-model engine runs its own adapt watchers, which take a free decode lock for an idle engine: its
+    passes, driven by the proposer, hold the lock as a decode does, so a yield waits for them"""
+    from btb.engine.propose import ModelProposer
+
+    lock = threading.RLock()
+    seen: list[bool] = []
+
+    class Eng:
+        _decode_lock, _mega = lock, None
+        layer_types: list[str] = []
+
+        def new_cache(self) -> Any:
+            return types.SimpleNamespace(layers=[])
+
+        def _prefill(self, ids: Any, cache: Any) -> None:
+            seen.append(lock._is_owned())  # type: ignore[attr-defined]
+
+        def aa(self, parents: Any) -> None:
+            pass
+
+        def ab(self) -> None:
+            pass
+
+        def forward(self, ids: Any, cache: Any = None, last_only: bool = True, **kw: Any) -> torch.Tensor:
+            seen.append(lock._is_owned())  # type: ignore[attr-defined]
+            return torch.zeros(1, len(ids[0]), 8)
+
+    p = ModelProposer(cast(Any, Eng()), [1, 2, 3])
+    p._topk([4], [-1], 2)
+    assert seen == [True, True], seen
+
+
+def test_the_cuda_runtime_to_pin_with_is_found() -> None:
+    """the RAM arena's pinning needs the runtime torch loaded: found beside torch, where the process maps it, or in
+    the nvidia-cuda-runtime package (a Linux wheel keeps it there); with none, the program declines kv_host rather
+    than failing the load"""
+    from btb.engine import hostmem
+
+    if torch.version.cuda is None:
+        pytest.skip("a torch without CUDA")
+    path = hostmem._runtime_path()
+    assert path is not None and "cudart" in os.path.basename(path), path
+    assert hostmem.can_pin()
+
+
+def test_a_budget_event_registered_on_a_lost_adapter_is_stale(monkeypatch: MonkeyPatch) -> None:
+    """after a driver reset the card is found afresh as another adapter: the event registered on the old one
+    signals nothing, and the watcher registers again"""
+    import ctypes
+
+    from btb import sysinfo
+
+    if sys.platform != "win32":
+        pytest.skip("Windows' budget events")
+    key = ("a card", GB, 0)
+    reg = sysinfo.BudgetEvent(0, 0, ctypes.c_void_p(4))
+    monkeypatch.setitem(sysinfo._WDDM, key, (ctypes.c_void_p(4), 0.0))
+    assert not sysinfo.wddm_budget_stale(reg, *key)
+    monkeypatch.setitem(sysinfo._WDDM, key, (ctypes.c_void_p(5), 0.0))
+    assert sysinfo.wddm_budget_stale(reg, *key)
+
+
+def test_a_failed_dxgi_lookup_is_tried_again_after_the_retry_not_every_read(monkeypatch: MonkeyPatch) -> None:
+    """a lookup DXGI raised for was never kept, so it ran again on every read - every pass and every watcher second -
+    each one leaking the factory and adapters it enumerated"""
+    from btb import sysinfo
+
+    n = [0]
+
+    def lookup(*a: object) -> Any:
+        n[0] += 1
+        raise OSError("GetDesc1 failed")
+
+    monkeypatch.setattr(sysinfo, "_wddm_adapter", lookup)
+    key = ("no such card", GB, None)
+    try:
+        for _ in range(3):
+            assert sysinfo._wddm_for("no such card", GB, None) is None
+        assert n[0] == 1, f"looked up {n[0]} times within the retry"
+    finally:
+        sysinfo._WDDM.pop(key, None)
 
 
 def test_vram_policy_is_off_when_it_is_not_watching_or_not_on_a_card() -> None:
@@ -3011,7 +3360,7 @@ class _RamEngine(_MemoryMixin):
         self.mlx = None
         self.ram_watch = True
         self.ram_state = RamPolicyState(period=0.0)
-        self.host = {0: None, 1: None, 2: None}
+        self.host = {i: torch.nn.Module() for i in range(3)}
         self.cold = set()
         self._packed = None
         self.device = _RamDevice(free=free)

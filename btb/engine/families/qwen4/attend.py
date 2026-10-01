@@ -13,13 +13,13 @@ a pass on the card or a library without the kernel takes the module's own forwar
 
 from __future__ import annotations
 
-import types
 import weakref
 from typing import Any
 
 import torch
 
 from ...native import Native
+from . import bind_forward
 from .rows import each
 
 
@@ -27,7 +27,7 @@ def install(attn: Any, sm: Any) -> None:
     """`attn` (a host layer's `Qwen4ExpTextAttention`) forwarding through `_forward`; `sm` held weakly (the engine
     owns the layer)"""
     attn._btb_sm = weakref.ref(sm)
-    attn.forward = types.MethodType(_forward, attn)
+    bind_forward(attn, _forward)
 
 
 def _forward(

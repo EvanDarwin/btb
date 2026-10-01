@@ -8,10 +8,9 @@ attention cache in host RAM (kv_host), a layer on the host, and the CPU alone.
 At a tiny fixture's widths cuBLAS runs one row and five through one kernel, so a step and a verify agreed there while
 Qwen3-4B's parted (a kv_host verify's projections at five rows, its steps' at one) and gpt-oss-120b's did (its verify's
 rows in one call). So each family's model here is built at real widths - two layers of Qwen3-4B's, Phi-4-mini's,
-gpt-oss's attention, Qwen3.5's gated DeltaNet and attention, Gemma 3's with a small window - into the test's folder,
-loaded once a placement, and gone when its test ends (one wide model on the disk at a time). Qwen4 runs at its
-fixture's widths here; its card program is btb's row-invariant kernels throughout, and gpt-oss-120b's and Qwen3.8-Flash's
-own runs hold the real widths. The rows are compared as bits, never tokens: a random model's argmax shrugs off the ulp
+gpt-oss's attention, Qwen3.5's gated DeltaNet and attention, Gemma 3's with a small window, Qwen4's five layers at
+its card program's head shapes - into the test's folder, loaded once a placement, and gone when its test ends (one
+wide model on the disk at a time). The rows are compared as bits, never tokens: a random model's argmax shrugs off the ulp
 a real model's finds dozens of tokens in. Every placement is run and every parting reported together."""
 
 from __future__ import annotations
@@ -36,7 +35,7 @@ SPEC_NEW = 32
 
 def _wide(fam: str) -> tuple[Callable[..., None], dict[str, Any]]:
     """a family's builder and the widths it is built at here"""
-    from tests.make_fixtures import build_gemma3, build_gpt_oss, build_phi3, build_q35, build_qwen3
+    from tests.make_fixtures import build_gemma3, build_gpt_oss, build_phi3, build_q4_card, build_q35, build_qwen3
 
     specs: dict[str, tuple[Callable[..., None], dict[str, Any]]] = {
         "qwen3": (
@@ -66,21 +65,27 @@ def _wide(fam: str) -> tuple[Callable[..., None], dict[str, Any]]:
              "linear_key_head_dim": 128, "linear_value_head_dim": 128, "linear_num_key_heads": 16,
              "linear_num_value_heads": 32, "vocab_size": 4096},
         ),
+        # Qwen4 at the card program's shapes (`build_q4_card`: its kernels' head and indexer widths), as wide as a
+        # real model's projections and experts
+        "q4": (
+            build_q4_card,
+            {"hidden_size": 2048, "num_attention_heads": 16, "num_key_value_heads": 2, "head_dim": 128,
+             "moe_intermediate_size": 768, "shared_expert_intermediate_size": 768, "num_experts": 16,
+             "num_experts_per_tok": 4, "hc_lowrank": 64, "linear_key_head_dim": 128, "linear_value_head_dim": 128,
+             "linear_num_key_heads": 16, "linear_num_value_heads": 32, "indexer_n_heads": 16, "ple_embed_dim": 512,
+             "vocab_size": 4096},
+        ),
     }  # fmt: skip
     return specs[fam]
 
 
 def _model(fam: str, root: str) -> str:
-    """the family's model: built at real widths under `root`; Qwen4 at its card program's shapes (`build_q4_card`: the
-    tiny fixture is narrower than the program's kernels take, so every card placement declined it)"""
-    from tests.make_fixtures import build_q4_card, write_tokenizer
+    """the family's model: built at real widths under `root`"""
+    from tests.make_fixtures import write_tokenizer
 
     out = os.path.join(root, fam)
-    if fam == "q4":
-        build_q4_card(out)
-    else:
-        build, over = _wide(fam)
-        build(out, over=over)
+    build, over = _wide(fam)
+    build(out, over=over)
     write_tokenizer(out)
     return out
 
@@ -147,7 +152,12 @@ def _partings(sm: Any, where: str) -> list[str]:
 # (name, load options, after the load) for each placement a family is run on
 PLACEMENTS: list[tuple[str, dict[str, Any], Callable[[Any], None] | None]] = [
     ("the card", {"device": "cuda"}, None),
-    ("the card's torch path", {"device": "cuda"}, lambda sm: setattr(sm, "card_graphs", False)),
+    # the card graph and a family's card program (Qwen4's) both off: the torch layers on the card, as when they decline
+    (
+        "the card's torch path",
+        {"device": "cuda"},
+        lambda sm: sm.__dict__.update(card_graphs=False, card_programs=False),
+    ),
     ("kv in host RAM", {"device": "cuda", "kv_host": True}, None),
     ("a layer on the host", {"device": "cuda", "cpu_layers": 1}, None),
     ("the CPU", {"device": "cpu"}, None),

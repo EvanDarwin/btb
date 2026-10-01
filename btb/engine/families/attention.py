@@ -76,6 +76,40 @@ def attend_one(
     return out.transpose(1, 2).contiguous()
 
 
+def _rows_apart(
+    module: Any,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor,
+    g: int,
+    scaling: float | None,
+) -> torch.Tensor:
+    """Each query row of one sequence's pass through its own one-row call (`attend_one`) over the cache rows its mask
+    row lets it see, in ascending order: the call a one-token step makes over the rows it sees, so a speculative pass's
+    node and its step make the same call on the same rows and agree to the bit. For a layer whose mask is its own -
+    Qwen4's sparse attention, the indexer's picks per row (`btb_rows_apart`, which says for which passes): sdpa over the
+    rows together with that mask picks its kernel by how many rows travel together. Returns [1, T, Hq, D]"""
+    T, S = int(query.shape[2]), int(key.shape[-2])
+    rows = attention_mask[0, 0, :, :S]
+    outs = []
+    for t in range(T):
+        one = attend_one(module, query[:, :, t : t + 1], key, value, KeyRows(rows[t].nonzero().flatten()), g, scaling)
+        assert one is not None  # one row of one sequence, its rows named: attend_one's own form
+        outs.append(one)
+    return outs[0] if T == 1 else torch.cat(outs, dim=1)
+
+
+def grouped_chunk_ok(dtype: torch.dtype, head_dim: int, device: torch.device) -> bool:
+    """whether a chunk's queries of `dtype` and `head_dim` on `device` take the efficient kernel's own call
+    (`_grouped_chunk`): a half dtype, the head a multiple of 8 dims up to 256, and bf16 on a card that has the
+    kernel's bf16 build (compute capability 8.0 on: sdpa checks this before choosing the kernel, a direct call does
+    not)"""
+    if dtype not in (torch.bfloat16, torch.float16) or head_dim % 8 or head_dim > 256:
+        return False
+    return dtype == torch.float16 or torch.cuda.get_device_capability(device)[0] >= 8
+
+
 def _grouped_chunk(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, g: int, scaling: float | None
 ) -> torch.Tensor:
@@ -138,6 +172,17 @@ def attention(
             module, query, key, value, attention_mask, dropout=dropout, scaling=scaling, is_causal=is_causal, **kw
         )
     g = int(getattr(module, "num_key_value_groups", 1) or 1)
+    apart = getattr(module, "btb_rows_apart", None)
+    if (
+        apart is not None
+        and dropout == 0.0
+        and query.shape[0] == 1
+        and isinstance(attention_mask, torch.Tensor)
+        and attention_mask.dim() == 4
+        and attention_mask.dtype == torch.bool
+        and apart(int(query.shape[2]))
+    ):
+        return _rows_apart(module, query, key, value, attention_mask, g, scaling), None
     one = (
         attend_one(module, query, key, value, attention_mask, g, scaling)
         if dropout == 0.0 and not isinstance(attention_mask, ChunkCausal)
@@ -153,10 +198,8 @@ def attention(
             query.shape[0] == 1
             and S == attention_mask.past + T
             and dropout == 0.0
-            and query.dtype in (torch.bfloat16, torch.float16)
             and key.dtype == query.dtype
-            and query.shape[-1] % 8 == 0
-            and query.shape[-1] <= 256
+            and grouped_chunk_ok(query.dtype, int(query.shape[-1]), query.device)
         ):
             return _grouped_chunk(query, key, value, g, scaling), None
         attention_mask = attention_mask.mask(T, S, query.device)

@@ -152,6 +152,7 @@ class Qwen4Card:
         self.k: Any = None
         self.version: Any = None
         self._why: str | None = "not checked"
+        self._why_rows: str | None = "not checked"  # what keeps `attend_rows` off (`why_not_rows`)
         self.W: dict[Any, dict[str, Any]] = {}
         self.B: dict[str, Any] | None = None  # the pass buffers
         self.S: dict[str, list[torch.Tensor]] | None = None  # the states bound into the cache
@@ -196,11 +197,13 @@ class Qwen4Card:
                 # program declines this placement (its passes take the torch path) with the old buffers kept, so a
                 # layer still attached reads rows that stand, and the next look lays the placement out again
                 self._why = f"the bound cache's rows could not be copied out for the new placement: {e}"
+                self._why_rows = self._why
                 self.version = None
                 sm.log(f"[card] Qwen4's card program off for this placement: {self._why}")
                 return False
             self.version = place.version
-            self._why = self.why_not(sm)
+            self._why_rows = self.why_not_rows(sm)
+            self._why = self._why_rows or self.why_not(sm)
         if self._why is None and self.host_layers and self.X is None:
             # the edge's rows before the pass, not at its first crossing: the ledger refusing them here declines the
             # program for this placement (its passes take the torch path) instead of failing a pass part way
@@ -211,20 +214,35 @@ class Qwen4Card:
                 sm.log(f"[card] Qwen4's card program off for this placement: {self._why}")
         return self._why is None
 
+    def rows_ok(self) -> bool:
+        """whether `attend_rows` reads the sparse layers' rows in RAM as the model is placed now: the placement laid
+        out and the attention's own gates (`why_not_rows`) - not the rest of the model's (the head on the card, the
+        edge's rows), which decline the program's passes but not its attention. A torch-path pass over a cache whose
+        rows the arena holds in RAM reads them through it whatever else declines the program"""
+        self.ok()
+        return self.version is not None and self._why_rows is None
+
     def _layout(self, resident: tuple[int, ...]) -> None:
         """the program's layers as placed: the resident ones by kind and the segments they run in, the rest the
         host's. A placement that moves a layer on or off the card lets go of every buffer sized by the resident
-        layers - the cache bound to them keeping copies of its own - and they are made again for the new one"""
+        layers - the cache bound to them keeping copies of its own - and they are made again for the new one. An
+        arena in RAM (`kv_host`) whose sparse layers stay as they were is kept, the cache's rows in it: they live in
+        RAM whatever the placement, and copied out and back they were twice the arena's RAM and every row moved twice
+        for a shed of a DeltaNet layer"""
         res = tuple(sorted(int(i) for i in resident))
         if res == self.res:
             return
+        sparse = [i for i in res if self.types[i] == LayerKind.QWEN_SPARSE]
+        keep = self.A is not None and self.A["kv"].device.type == "cpu" and sparse == self.sparse
         owner = self.owner() if self.owner is not None else None
         if owner is not None:
-            self._evict(owner)
+            self._evict(owner, rows=not keep)
         self._drop_graphs()
-        self.B = self.S = self.A = self.X = self.P = None
-        self.owner = None
-        for what in [w for w in self.held if not w.startswith("layer ")]:
+        self.B = self.S = self.X = self.P = None
+        if not keep:
+            self.A = None
+            self.owner = None
+        for what in [w for w in self.held if not w.startswith("layer ") and not (keep and w.startswith("the arena"))]:
             del self.held[what]
         self.res = res
         self.at = set(res)
@@ -242,8 +260,9 @@ class Qwen4Card:
         self.sj = {i: j for j, i in enumerate(self.sparse)}
         self.lj = {i: j for j, i in enumerate(self.linear)}
         self.pj = {i: j for j, i in enumerate(self.ple)}
-        self.bound = [None] * len(self.sparse)
-        self.pooled = [0] * len(self.sparse)
+        if not keep:
+            self.bound = [None] * len(self.sparse)
+            self.pooled = [0] * len(self.sparse)
         self.ctx = [None] * len(self.ple)
         self.seen = None
 
@@ -283,24 +302,13 @@ class Qwen4Card:
         cfg = sm.cfg
         if act_name(cfg) != "silu" or not bool(getattr(cfg, "norm_topk_prob", True)):
             return "an activation or a routing the kernels are not written for"
-        rot = self._rot(sm)
-        H, G, R, D, di = self.H, self.G, self.R, self.D, self.di
-
-        def rope_ok(d: int) -> bool:
-            e = d // 32
-            half = rot // (2 * e) if e else 0
-            return 0 < rot <= d and rot % (2 * e) == 0 and half > 0 and not half & (half - 1)
-
+        H, G, R = self.H, self.G, self.R
         shapes = [
             H % 8 == 0 and (G * H) % 8 == 0 and R % 8 == 0 and R > 0 and G > 1,
             self.Is % 8 == 0 and 0 < self.topk <= _Cuda.ROUTE_MAX_K and self.E * 4 <= 48 * 1024,
         ]
         if self.sparse:
-            shapes += [
-                D in (128, 256) and di in (128, 256) and rope_ok(D) and rope_ok(di),
-                self.Hk > 0 and self.Hq % self.Hk == 0 and (self.Hq * D) % 8 == 0 and self.Hi > 0 and self.ktop > 0,
-                (self.Hi + 33) * di * 2 + 2048 <= 48 * 1024,
-            ]
+            shapes += [self._sparse_shapes_ok(self._rot(sm))]
         if self.linear:
             shapes += [0 < self.Kc <= 8 and self.hk > 0 and self.hv % self.hk == 0 and (self.hv * self.dv) % 8 == 0]
         if self.ple:
@@ -308,11 +316,9 @@ class Qwen4Card:
         if not all(shapes):
             return "shapes the kernels are not written for"
         if self.sparse:
-            names = [f"btb_norm_rope_part_d{d}" for d in {D, di}]
-            names += [f"btb_qsa_pool_d{di}", f"btb_qsa_select_d{di}", f"btb_qsa_attn_split_d{D}"]
-            missing = [n for n in names if n not in k.fn]
-            if missing:
-                return f"the kernels lack {missing[0]}"
+            lack = self._sparse_kernels_missing(k)
+            if lack:
+                return f"the kernels lack {lack}"
         for i in self.res:
             layer = sm.resident[i]
             if not isinstance(getattr(layer.mlp, "experts", None), _Experts):
@@ -320,6 +326,60 @@ class Qwen4Card:
             if (layer.ple is not None) != (i in self.pj):
                 return "a PLE layer the config does not name"
         return None
+
+    def why_not_rows(self, sm: Any) -> str | None:
+        """what keeps `attend_rows` - the sparse layers' attention through the program's kernels - off this engine's
+        model as placed, or None: the card and its kernels, a bf16 compute, a sparse layer on the card and the shapes
+        its kernels are written for, and, with the rows in RAM, memory the card reads there (`hostmem.can_pin`)"""
+        from ...hostmem import can_pin
+
+        k = Native.card_kernels()
+        if sm.dev.type != "cuda" or k is None:
+            return "no card kernels"
+        if sm.compute_dtype not in (None, torch.bfloat16) or getattr(sm, "resident_fp32", False) or sm.shadow:
+            return "a float32 compute"
+        if sm.mlx is not None:
+            return "not the card's tier"
+        if not self.sparse:
+            return None  # no sparse layer on the card: no rows of the program's to read
+        if not self._sparse_shapes_ok(self._rot(sm)):
+            return "shapes the kernels are not written for"
+        missing = self._sparse_kernels_missing(k)
+        if missing:
+            return f"the kernels lack {missing}"
+        if getattr(sm, "kv_host", False) and not can_pin():
+            return "no CUDA runtime to pin the rows in RAM with"
+        return None
+
+    @staticmethod
+    def _rope_ok(rot: int, d: int) -> bool:
+        e = d // 32
+        half = rot // (2 * e) if e else 0
+        return 0 < rot <= d and rot % (2 * e) == 0 and half > 0 and not half & (half - 1)
+
+    def _sparse_shapes_ok(self, rot: int) -> bool:
+        """the sparse attention's shapes as its kernels are written for: the heads' and the indexer's widths, the
+        rope's rotated dims, the selection's shared memory"""
+        D, di = self.D, self.di
+        return (
+            D in (128, 256)
+            and di in (128, 256)
+            and self._rope_ok(rot, D)
+            and self._rope_ok(rot, di)
+            and self.Hk > 0
+            and self.Hq % self.Hk == 0
+            and (self.Hq * D) % 8 == 0
+            and self.Hi > 0
+            and self.ktop > 0
+            and (self.Hi + 33) * di * 2 + 2048 <= 48 * 1024
+        )
+
+    def _sparse_kernels_missing(self, k: Any) -> str | None:
+        """the first kernel of the sparse attention's for this model's widths the build lacks, or None"""
+        D, di = self.D, self.di
+        names = [f"btb_norm_rope_part_d{d}" for d in {D, di}]
+        names += [f"btb_qsa_pool_d{di}", f"btb_qsa_select_d{di}", f"btb_qsa_attn_split_d{D}"]
+        return next((n for n in names if n not in k.fn), None)
 
     def _rot(self, sm: Any) -> int:
         """the rope's rotated dims (the table's width)"""
@@ -658,9 +718,10 @@ class Qwen4Card:
 
         With the attention's rows kept in RAM (`kv_host`: a context the card has no room for) the rows and the rope
         tables are pinned host memory the kernels read and write in place (`hostmem.pinned`: its exact size, freed
-        with it) - a pass reads only the rows its picks name, the indexer's budget whatever the context - and the
-        arena is made for the load's whole context at once, a regrowth copying every row; the pooled keys and the
-        scores, which every pass reads whole, stay the card's"""
+        with it) - a pass reads only the rows its picks name, the indexer's budget whatever the context - grown as the
+        rows are, as the card's is: pinned for the load's whole context at once, a short conversation held 20 GB of
+        RAM no other program could have at a million positions. The pooled keys and the scores, which every pass reads
+        whole, stay the card's"""
         A = self.A
         if A is not None and A["cap"] >= need:
             return A
@@ -668,8 +729,7 @@ class Qwen4Card:
         assert sm is not None
         ram = bool(getattr(sm, "kv_host", False))
         old = A["cap"] if A is not None else 0
-        whole = int(getattr(sm, "context", 0) or 0) + ROWS if ram else 0
-        cap = max(int(need) + ROWS, self.ARENA_MIN, old + old // 4, whole)
+        cap = max(int(need) + ROWS, self.ARENA_MIN, old + old // 4)
         cap = (cap + 1023) // 1024 * 1024
         n = len(self.sparse)
         r = max(1, self.r)
@@ -679,21 +739,28 @@ class Qwen4Card:
         rows = lambda c: n * (2 * self.Hk * c * self.D + c * self.di) * 2 + 2 * c * rot * 2
         # the pooled keys, their lengths and the scores: the card's
         card = lambda c: n * (c // r + 1) * self.di * 2 + ROWS * (c // r + 1) * 4 + n * 2 * 4
+        per = lambda c: rows(c) + card(c)
         cpu = torch.device("cpu")
+        held = dict(self.held)
         if ram:
             self._grant(f"the arena's rows in RAM, {cap} rows", rows(cap), "kv", cpu, held=rows(old) if old else 0)
             self._grant(
                 f"the arena, {cap} rows", card(cap), "kv", sm.dev, held=card(old) if old else 0, cap=cap, bound=None
             )
         else:
-            per = lambda c: rows(c) + card(c)
             self._grant(
                 f"the arena, {cap} rows", per(cap), "kv", sm.dev, held=per(old) if old else 0, cap=cap, bound=None
             )
         bf = torch.bfloat16
         if ram:
-            kv = pinned((n, 2, self.Hk, cap, self.D), bf)
-            raw = pinned((n, cap, self.di), bf)
+            try:
+                kv = pinned((n, 2, self.Hk, cap, self.D), bf)
+                raw = pinned((n, cap, self.di), bf)
+            except MemoryError as e:
+                # the ledger saw the RAM free, the driver would not pin that much of it: a refusal as the ledger's
+                # would be, the arena as it was and its grants as they were
+                self.held = held
+                raise MemoryGrantError(f"[card] Qwen4's arena in RAM, {cap} rows: {e}") from e
         else:
             kv = torch.zeros(n, 2, self.Hk, cap, self.D, dtype=bf, device=sm.dev)
             raw = torch.zeros(n, cap, self.di, dtype=bf, device=sm.dev)
@@ -822,8 +889,9 @@ class Qwen4Card:
                         states[idx] = mine
                         self.ctx[p] = None
 
-    def _evict(self, owner: Any) -> None:
-        """the cache holding the program's buffers lets them go: its rows and states become copies of its own"""
+    def _evict(self, owner: Any, rows: bool = True) -> None:
+        """the cache holding the program's buffers lets them go: its states, and with `rows` its rows, become copies
+        of its own (an arena in RAM a new placement keeps holds the rows where they are: `_layout`)"""
         sm = self._sm()
         assert sm is not None
         S = self.S
@@ -838,6 +906,8 @@ class Qwen4Card:
             )
         for d, key in held:
             d[key] = d[key].clone()
+        if not rows:
+            return
         for j, i in enumerate(self.sparse):
             cl = owner.layers[i]
             if isinstance(cl, ArenaIndexedLayer) and self.A is not None and cl.attached_to(self.A["kv"][j, 0]):

@@ -759,7 +759,7 @@ def shared_model(path: str, slot: int = 0, **knobs: Any) -> StreamedTextModel:
     key = shared_key(path, knobs, slot)
     held = _SHARED.get(key)
     if held is not None and (
-        held.sm.device.snapshot().version != held.at or getattr(held.sm, "_card_off_ver", None) is not None
+        held.sm.device.snapshot().version != held.at or getattr(held.sm, "_card_off", None) is not None
     ):
         # the model is not as it loaded: a layer moved by adapt (another program took the card), the card graph off
         # after it found no room - this test takes a fresh load, not what befell an earlier one

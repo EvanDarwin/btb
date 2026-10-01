@@ -578,32 +578,36 @@ def _write_q4(out_dir: str, cfg: PretrainedConfig) -> None:
     write_mtp(out_dir, _q4_mtp(cfg))  # the drafting head, its own draw in its own shard (not a transformers module)
 
 
-def build_q4_card(out_dir: str, seed: int = Q4_SEED) -> None:
+def build_q4_card(out_dir: str, seed: int = Q4_SEED, over: Json | None = None) -> None:
     """A Qwen4 the card program runs (btb/engine/families/qwen4/card.py): tiny_q4's structure at the kernels'
     shapes - head and indexer dims of 128, the rope a quarter of a head, four streams - over five layers (DeltaNet,
     the n-gram embedding's layer, sparse attention, DeltaNet, sparse attention), eight experts, an indexer budget of
     four blocks of four and a drafting head. It banks no receipts: the program is held to its own one-token steps
     and within tolerance to the torch path, so tests/integration/test_qwen4_card.py builds it where it runs rather
-    than beside the cert's fixtures (whose manifest binds every directory here)."""
+    than beside the cert's fixtures (whose manifest binds every directory here). `over` replaces config fields (a
+    test's model at a real model's widths)"""
     import torch
     from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
 
     torch.manual_seed(seed)
     lt = ["linear_attention", "linear_attention", "full_attention", "linear_attention", "full_attention"]
-    cfg = Qwen4ExpTextConfig(
-        vocab_size=512, hidden_size=256, num_hidden_layers=5, num_attention_heads=2, num_key_value_heads=1,
-        head_dim=128, max_position_embeddings=4096, rms_norm_eps=1e-6, tie_word_embeddings=False, hidden_act="silu",
-        attention_bias=False, layer_types=lt,
-        rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.25,
-                         "mrope_section": [8, 4, 4], "mrope_interleaved": True},
-        linear_conv_kernel_dim=4, linear_key_head_dim=32, linear_value_head_dim=32, linear_num_key_heads=2,
-        linear_num_value_heads=4, moe_intermediate_size=64, shared_expert_intermediate_size=64, num_experts=8,
-        num_experts_per_tok=2, norm_topk_prob=True, hc_count=4, hc_lowrank=32, ple_layer_ids=[2], ple_embed_dim=64,
-        ple_conv_kernel_size=4, ngram_size=3, heads_per_ngram=2, ngram_vocab_size_base=1000,
-        make_ngram_vocab_size_divisible_by=128, seed=1234, split_ngram_parts=4, indexer_n_heads=2,
-        indexer_kv_heads=1, indexer_head_dim=128, indexer_budget=16, indexer_compress_ratio=4,
-        output_gate_type="sigmoid", pad_token_id=1, eos_token_id=1, bos_token_id=0, dtype="bfloat16",
-    )  # fmt: skip
+    kw: Json = {
+        "vocab_size": 512, "hidden_size": 256, "num_hidden_layers": 5, "num_attention_heads": 2,
+        "num_key_value_heads": 1, "head_dim": 128, "max_position_embeddings": 4096, "rms_norm_eps": 1e-6,
+        "tie_word_embeddings": False, "hidden_act": "silu", "attention_bias": False, "layer_types": lt,
+        "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.25,
+                            "mrope_section": [8, 4, 4], "mrope_interleaved": True},
+        "linear_conv_kernel_dim": 4, "linear_key_head_dim": 32, "linear_value_head_dim": 32,
+        "linear_num_key_heads": 2, "linear_num_value_heads": 4, "moe_intermediate_size": 64,
+        "shared_expert_intermediate_size": 64, "num_experts": 8, "num_experts_per_tok": 2, "norm_topk_prob": True,
+        "hc_count": 4, "hc_lowrank": 32, "ple_layer_ids": [2], "ple_embed_dim": 64, "ple_conv_kernel_size": 4,
+        "ngram_size": 3, "heads_per_ngram": 2, "ngram_vocab_size_base": 1000, "make_ngram_vocab_size_divisible_by": 128,
+        "seed": 1234, "split_ngram_parts": 4, "indexer_n_heads": 2, "indexer_kv_heads": 1, "indexer_head_dim": 128,
+        "indexer_budget": 16, "indexer_compress_ratio": 4, "output_gate_type": "sigmoid", "pad_token_id": 1,
+        "eos_token_id": 1, "bos_token_id": 0, "dtype": "bfloat16",
+    }  # fmt: skip
+    kw.update(over or {})
+    cfg = Qwen4ExpTextConfig(**kw)
     _write_q4(out_dir, cfg)
 
 

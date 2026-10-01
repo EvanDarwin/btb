@@ -619,6 +619,19 @@ def _com(obj: ctypes.c_void_p, slot: int, *argtypes: Any) -> Any:
     return ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p, *argtypes)(vtbl[slot])
 
 
+def _com_ref(obj: Any, slot: int) -> None:
+    """IUnknown's AddRef (slot 1) or Release (slot 2) on `obj`: each returns the new count, not an HRESULT"""
+    if obj:
+        vtbl = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+        ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl[slot])(obj)
+
+
+def _com_release(obj: Any) -> None:
+    """one reference to the COM object `obj` let go: every factory and adapter DXGI hands out is counted, and one
+    never released keeps the kernel's adapter handle open for the life of the process"""
+    _com_ref(obj, 2)
+
+
 _CUDA_LUID: dict[int, int] = {}  # each card's LUID once read; one that could not be is asked again
 
 
@@ -647,26 +660,41 @@ def cuda_luid(ordinal: int) -> int | None:
 
 def _wddm_matches(name: str, total: int) -> list[tuple[Any, int]]:
     """every NVIDIA adapter DXGI lists as `name` with about `total` bytes of dedicated memory, as (IDXGIAdapter1, its
-    LUID as one unsigned 64-bit figure - CUDA's form, `cuda_luid`); none off Windows or where DXGI cannot be asked"""
+    LUID as one unsigned 64-bit figure - CUDA's form, `cuda_luid`); none off Windows or where DXGI cannot be asked.
+    The caller owns each adapter's reference (`_com_release`); the factory and every adapter not returned are
+    released here"""
     if sys.platform != "win32":
         return []
     dxgi = ctypes.windll.dxgi
     fac = ctypes.c_void_p()
     if dxgi.CreateDXGIFactory1(ctypes.byref(_guid("770aae78-f26f-4dba-a829-253c83d1b387")), ctypes.byref(fac)):
         return []
-    hits = []
-    for i in range(16):
-        ad = ctypes.c_void_p()
-        try:
-            _com(fac, 12, ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p))(fac, i, ctypes.byref(ad))  # EnumAdapters1
-        except OSError:  # DXGI_ERROR_NOT_FOUND: past the last adapter
-            break
-        d = _AdapterDesc1()
-        _com(ad, 10, ctypes.POINTER(_AdapterDesc1))(ad, ctypes.byref(d))  # GetDesc1
-        near = abs(int(d.dedicated_video) - total) < max(512 << 20, total // 16)
-        if d.vendor == 0x10DE and d.desc.strip() == name.strip() and near:
-            # HighPart is a signed LONG: its bits taken as they are, so the figure is CUDA's unsigned one
-            hits.append((ad, ((int(d.luid_high) & 0xFFFFFFFF) << 32) | (int(d.luid_low) & 0xFFFFFFFF)))
+    hits: list[tuple[Any, int]] = []
+    try:
+        for i in range(16):
+            ad = ctypes.c_void_p()
+            try:
+                _com(fac, 12, ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p))(fac, i, ctypes.byref(ad))  # EnumAdapters1
+            except OSError:  # DXGI_ERROR_NOT_FOUND: past the last adapter
+                break
+            kept = False
+            try:
+                d = _AdapterDesc1()
+                _com(ad, 10, ctypes.POINTER(_AdapterDesc1))(ad, ctypes.byref(d))  # GetDesc1
+                near = abs(int(d.dedicated_video) - total) < max(512 << 20, total // 16)
+                if d.vendor == 0x10DE and d.desc.strip() == name.strip() and near:
+                    # HighPart is a signed LONG: its bits taken as they are, so the figure is CUDA's unsigned one
+                    hits.append((ad, ((int(d.luid_high) & 0xFFFFFFFF) << 32) | (int(d.luid_low) & 0xFFFFFFFF)))
+                    kept = True
+            finally:
+                if not kept:
+                    _com_release(ad)
+    except BaseException:
+        for ad, _luid in hits:
+            _com_release(ad)
+        raise
+    finally:
+        _com_release(fac)
     return hits
 
 
@@ -677,28 +705,35 @@ def _wddm_adapter(name: str, total: int, ordinal: int | None = None) -> Any:
     alone the budget went unread, so adapt gave nothing back to a game - else the one match by name; None where none
     or several match"""
     hits = _wddm_matches(name, total)
-    luid = cuda_luid(ordinal) if ordinal is not None and len(hits) > 1 else None
-    if luid is not None:
-        hits = [h for h in hits if h[1] == luid]
-    if len(hits) != 1:
-        return None
-    ad = hits[0][0]
-    a3 = ctypes.c_void_p()
-    _com(ad, 0, ctypes.POINTER(_Guid), ctypes.POINTER(ctypes.c_void_p))(  # QueryInterface: IDXGIAdapter3
-        ad, ctypes.byref(_guid("645967a4-1392-4310-a798-8053ce3e93fd")), ctypes.byref(a3)
-    )
-    return a3
+    try:
+        luid = cuda_luid(ordinal) if ordinal is not None and len(hits) > 1 else None
+        found = [h for h in hits if h[1] == luid] if luid is not None else hits
+        if len(found) != 1:
+            return None
+        ad = found[0][0]
+        a3 = ctypes.c_void_p()
+        _com(ad, 0, ctypes.POINTER(_Guid), ctypes.POINTER(ctypes.c_void_p))(  # QueryInterface: IDXGIAdapter3
+            ad, ctypes.byref(_guid("645967a4-1392-4310-a798-8053ce3e93fd")), ctypes.byref(a3)
+        )
+        return a3  # its own reference: the IDXGIAdapter1 it was asked of is released with the rest
+    finally:
+        for ad1, _luid in hits:
+            _com_release(ad1)
 
 
 def _wddm_for(name: str, total: int, ordinal: int | None) -> Any:
     """the card's IDXGIAdapter3 (`_wddm_adapter`): found once and kept while it answers (`wddm_info` drops one that
-    fails a read - a driver reset leaves the old adapter answering nothing); a card not found is looked for again
-    after WDDM_RETRY_S"""
+    fails a read - a driver reset leaves the old adapter answering nothing); a card not found, or a lookup DXGI
+    failed, is looked for again after WDDM_RETRY_S, not on every read"""
     key = (name, int(total), ordinal)
     hit = _WDDM.get(key)
     now = time.monotonic()
     if hit is None or (hit[0] is None and now - hit[1] >= WDDM_RETRY_S):
-        hit = _WDDM[key] = (_wddm_adapter(name, int(total), ordinal), now)
+        try:
+            a3 = _wddm_adapter(name, int(total), ordinal)
+        except OSError:
+            a3 = None
+        hit = _WDDM[key] = (a3, now)
     return hit[0]
 
 
@@ -720,7 +755,11 @@ def wddm_info(name: str, total: int, ordinal: int | None = None) -> tuple[int, i
         # QueryVideoMemoryInfo: node 0, the local (dedicated) segment group
         _com(a3, 14, ctypes.c_uint, ctypes.c_int, ctypes.POINTER(_VideoMemoryInfo))(a3, 0, 0, ctypes.byref(m))
     except OSError:
-        _WDDM.pop((name, int(total), ordinal), None)  # the adapter gone (a driver reset): found afresh next read
+        # the adapter gone (a driver reset): released, and found afresh next read (a budget event registered on it
+        # holds a reference of its own until it is unregistered)
+        gone = _WDDM.pop((name, int(total), ordinal), None)
+        if gone is not None:
+            _com_release(gone[0])
         return None
     return int(m.budget), int(m.usage)
 
@@ -757,17 +796,57 @@ def wddm_budget_event(name: str, total: int, ordinal: int | None = None) -> Budg
         except OSError:
             k32.CloseHandle(ctypes.c_void_p(ev))
             return None
+        # a reference of the registration's own: the cache's is released when a read finds the adapter gone, and the
+        # unregister still needs the adapter it registered on
+        _com_ref(a3, 1)
         return BudgetEvent(int(ev), int(cookie.value), a3)
     except OSError:
         return None
 
 
+def wddm_budget_stale(reg: BudgetEvent, name: str, total: int, ordinal: int | None = None) -> bool:
+    """whether `reg` was registered on an adapter the card is no longer found as (a driver reset: `wddm_info` let
+    the old one go and found it afresh), so the OS signals another registration's event now, not this one's"""
+    if sys.platform != "win32":
+        return False
+    hit = _WDDM.get((name, int(total), ordinal))
+    a3 = hit[0] if hit is not None else None
+    return a3 is not None and getattr(a3, "value", a3) != getattr(reg.adapter, "value", reg.adapter)
+
+
 def wddm_budget_unregister(reg: BudgetEvent) -> None:
-    """the budget event `wddm_budget_event` registered, unregistered and its handle closed"""
+    """the budget event `wddm_budget_event` registered, unregistered, its handle closed and its adapter released"""
     # UnregisterVideoMemoryBudgetChangeNotification returns void, not an HRESULT: called through its own prototype
     vtbl = ctypes.cast(reg.adapter, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
     ctypes.WINFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint32)(vtbl[17])(reg.adapter, ctypes.c_uint32(reg.cookie))
     ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(reg.event))
+    _com_release(reg.adapter)
+
+
+def release_pages(ptr: int, nbytes: int) -> None:
+    """The pages of [ptr, ptr + nbytes) of a read-only file mapping out of this process's resident memory, counted
+    available by the OS at once: on Windows to the standby list (VirtualUnlock on pages never locked takes them out
+    of the working set), elsewhere unmapped from the process (madvise MADV_DONTNEED; the file's pages stay in the page
+    cache). A mapping no longer read otherwise stays resident until the OS gets round to trimming it, and a program
+    asking for memory meanwhile sees none of it. Only for a read-only file mapping: its bytes are the file's, read
+    again on the next touch"""
+    if nbytes <= 0:
+        return
+    import mmap
+
+    page = int(mmap.PAGESIZE)
+    lo = int(ptr) // page * page
+    hi = -(-(int(ptr) + int(nbytes)) // page) * page
+    if sys.platform == "win32":
+        k32 = ctypes.windll.kernel32
+        k32.VirtualUnlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        k32.VirtualUnlock.restype = ctypes.c_int
+        k32.VirtualUnlock(lo, hi - lo)  # FALSE with ERROR_NOT_LOCKED: the pages left the working set, as asked
+        return
+    libc = ctypes.CDLL(ctypes.util.find_library("c") or None)
+    libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    libc.madvise.restype = ctypes.c_int
+    libc.madvise(lo, hi - lo, int(getattr(mmap, "MADV_DONTNEED", 4)))
 
 
 def wait_event(handle: int, timeout_s: float) -> bool:

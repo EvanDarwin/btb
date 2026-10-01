@@ -9,7 +9,6 @@ drafter's own cache, a fork's or a batch's rows - the module's forward, as it is
 
 from __future__ import annotations
 
-import types
 import weakref
 from typing import Any
 
@@ -17,13 +16,15 @@ import torch
 
 from ...cache import forked
 from ...forward import chain_of
+from ...scheduler import MemoryGrantError
+from . import bind_forward
 
 
 def install(attn: Any, sm: Any) -> None:
     """`attn` (a layer's `Qwen4ExpTextAttention`) forwarding through `_forward`; `sm` held weakly (the engine owns
     the layer). A host layer's attention takes attend.py's forward over this one"""
     attn._btb_ram_sm = weakref.ref(sm)
-    attn.forward = types.MethodType(_forward, attn)
+    bind_forward(attn, _forward)
 
 
 def _forward(
@@ -47,7 +48,28 @@ def _forward(
     ):
         prog = sm._card_program_for_rows()
     if prog is None or int(self.layer_idx) not in prog.sj:
+        if hidden_states.is_cuda and _rows_in_ram(past_key_values, int(self.layer_idx)):
+            # the rows the arena kept in RAM, and nothing here to read them where they are (the program's attention
+            # refused this placement): the reference module would meet the card's queries with the host's keys
+            cp = getattr(sm, "_cp", None) if sm is not None else None
+            why = getattr(cp, "_why_rows", None) or "the card program is off"
+            raise MemoryGrantError(
+                f"[card] layer {int(self.layer_idx)}'s rows are in RAM and the card program cannot read them as the "
+                f"model is placed now ({why})"
+            )
         return type(self).forward(self, hidden_states, position_embeddings, attention_mask, past_key_values, **kw)
     T = int(hidden_states.shape[1])
     parents = chain_of(getattr(sm, "ap", None) if getattr(sm, "aq", False) else None, T)
     return prog.attend_rows(self, hidden_states, position_embeddings, past_key_values, parents), None
+
+
+def _rows_in_ram(cache: Any, i: int) -> bool:
+    """whether layer `i` of `cache` holds its rows in RAM: an arena kept there, or the copies it left on the host"""
+    layers = getattr(cache, "layers", None)
+    if layers is None or i >= len(layers):
+        return False
+    cl = layers[i]
+    if getattr(cl, "in_ram", False):
+        return True
+    k = getattr(cl, "keys", None)
+    return isinstance(k, torch.Tensor) and k.numel() > 0 and k.device.type == "cpu"

@@ -348,7 +348,9 @@ class _ForwardMixin(_State):
                     pas.place = place
                     tail = head and self.head is not None and self.norm is not None
                     hcard, logits = self._forward_card_segment(0, n_layers, h, pas, tail)
-            except torch.OutOfMemoryError as e:
+            except RuntimeError as e:
+                if not self._is_card_oom(e):
+                    raise
                 # the graph's build found no room (another program took the card): this pass on the torch path
                 self._card_oom(e)
                 graph_ok = False
@@ -394,11 +396,16 @@ class _ForwardMixin(_State):
             and bool(self.templates)
             and bool(self.host)
         )
+        if card_pass and cache is not None and past > 0:
+            # every host layer's rows onto the card for the pass, granted together before any moves: refused (a
+            # context the card has no room for - its rows kept in RAM, `kv_host`), the host layers run on the host
+            # this pass, over their rows where they are
+            try:
+                self._rows_to([cache], [i for i in self.host if i < n_layers], self.dev)
+            except MemoryGrantError:
+                card_pass = False
         if card_pass:
             self._tag(PassTag.PREFILL_CARD)  # the host layers prefill on the card for this pass
-        if card_pass and cache is not None and past > 0:
-            # every host layer's rows onto the card for the pass, granted together before any moves
-            self._rows_to([cache], [i for i in self.host if i < n_layers], self.dev)
 
         pas = _Pass(
             cache=cache,
@@ -437,7 +444,9 @@ class _ForwardMixin(_State):
                 tail = b == self.L and head and self.head is not None and self.norm is not None
                 try:
                     hcard, logits = self._forward_card_segment(a, b, h, pas, tail)
-                except torch.OutOfMemoryError as e:
+                except RuntimeError as e:
+                    if not self._is_card_oom(e):
+                        raise
                     # no room for the run's graph (another program took the card): its layers on the torch path
                     self._card_oom(e)
                     graph_ok = False
@@ -820,12 +829,22 @@ class _ForwardMixin(_State):
     def _chunk_rule(self, B: int) -> bool:
         """a layer-by-layer prefill's card chunks take their causal mask as the rule it is (`ChunkCausal`), and the
         engine's sdpa runs them with neither the mask nor the keys widened to every head: one sequence, no padding,
-        the family's layers handing the mask to that sdpa (`chunk_causal`), and no window anywhere in the model"""
+        the family's layers handing the mask to that sdpa (`chunk_causal`), no window anywhere in the model, and the
+        queries' dtype and width the kernel's own call takes (`grouped_chunk_ok`) - else `attention` builds the mask
+        and the widened keys after all, and a chunk priced without them did not fit"""
+        from .families.attention import grouped_chunk_ok
+
+        c = self.cfg
+        hq = int(c.num_attention_heads)
+        d = int(getattr(c, "head_dim", None) or c.hidden_size // hq)
+        cd = self.compute_dtype if self.compute_dtype is not None else torch.bfloat16
         return (
             B == 1
             and self.fam.chunk_causal
-            and getattr(self.cfg, "_attn_implementation", None) == "btb_sdpa"
+            and getattr(c, "_attn_implementation", None) == "btb_sdpa"
             and LayerKind.SLIDING not in self.layer_types
+            and self.dev.type == Device.CUDA
+            and grouped_chunk_ok(cd, d, self.dev)
         )
 
     def _chunk_cost(self, on_card: bool | None = None, rule: bool = False) -> tuple[int, int, int]:

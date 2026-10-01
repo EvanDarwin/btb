@@ -20,16 +20,17 @@ budget's edge may choose the other block. It is held against the reference index
 from __future__ import annotations
 
 import math
-import types
 from typing import Any
 
 import torch
+
+from . import bind_forward
 
 
 def install(indexer: Any, sparse: bool = False) -> None:
     """`indexer` (a `Qwen4ExpTextQSAIndexer`) forwarding through `select`; `sparse` fixed for its life"""
     indexer.btb_sparse = bool(sparse)
-    indexer.forward = types.MethodType(select, indexer)
+    bind_forward(indexer, select)
 
 
 def _plain_causal(visible: torch.Tensor, S: int) -> bool:

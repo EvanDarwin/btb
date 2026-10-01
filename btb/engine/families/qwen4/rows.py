@@ -14,13 +14,14 @@ prefill - every module runs as the reference's."""
 
 from __future__ import annotations
 
-import types
 import weakref
 from collections.abc import Callable
 from typing import Any
 
 import torch
 import torch.nn.functional as F
+
+from . import bind_forward
 
 
 def apart(sm: Any, x: torch.Tensor, T: int) -> bool:
@@ -44,13 +45,13 @@ def install(layer: Any, sm: Any) -> None:
     ref = weakref.ref(sm)
     for m in (layer.attn_hyper_connection, layer.mlp_hyper_connection):
         m._btb_sm = ref
-        m.forward = types.MethodType(_residual_forward, m)
+        bind_forward(m, _residual_forward)
     layer.mlp._btb_sm = ref
-    layer.mlp.forward = types.MethodType(_moe_forward, layer.mlp)
+    bind_forward(layer.mlp, _moe_forward)
     mixer = getattr(sm, "mixer", None)
     if mixer is not None and getattr(mixer, "_btb_sm", None) is None:
         mixer._btb_sm = ref
-        mixer.forward = types.MethodType(_mixer_forward, mixer)
+        bind_forward(mixer, _mixer_forward)
 
 
 def _residual_forward(self: Any, hyper_input: torch.Tensor) -> Any:

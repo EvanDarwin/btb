@@ -242,13 +242,23 @@ class _TiersMixin(_State):
         warm_b = sum(stored[i] for i in warm)
         warm_ms = warm_b / RAM_BPS * 1e3
         cold_ms = cold_b / (drive_bps or DRIVE_BPS) * 1e3
-        kv_read_ms = kv_host_b / RAM_BPS * 1e3  # the host's attention over the whole cache, at the full context
+        # what a token's attention reads of the cache at the full context: every row for the plain block's, the
+        # indexer's picks for a sparse attention's on the card (`attn_read_rows`) - priced whole, a million positions
+        # of Qwen4's rows in RAM read as 20 GB a token, where its card program reads a budget of them. A host layer's
+        # attention reads every row whatever the family (Qwen4's host path grows and re-pools its rows whole)
+        reads = min(1.0, self.fam.attn_read_rows(cfg, kv_rows) / kv_rows)
+        rest_kv_b = sum(kv_layer[i] for i in rest)
+        # the host's attention over the cache at the full context: the host layers' rows whole, the resident layers'
+        # kept in RAM (`kv_host`) as their attention reads them
+        kv_read_ms = (rest_kv_b + (kv_host_b - rest_kv_b) * reads) / RAM_BPS * 1e3
         # the card's share of a token, priced as the host's is, by what it reads: its layers, the head where it holds
-        # it and the cache it holds at the full context, at the card's rate, and each layer's kernels' fixed cost.
-        # A flat 3 ms a resident layer priced Qwen3-0.6B at 89 ms a token (it runs at 4) and made a layer more on
-        # the card look dearer, where the cache's placement (`choose`) weighs one against the other
+        # it and the cache it holds at the full context (what its attention reads of it, and an index's share whole),
+        # at the card's rate, and each layer's kernels' fixed cost. A flat 3 ms a resident layer priced Qwen3-0.6B at
+        # 89 ms a token (it runs at 4) and made a layer more on the card look dearer, where the cache's placement
+        # (`choose`) weighs one against the other
         vram_layers_b = sum(bf16[i] for i in resident) * (2 if (fp32 and resident_fp32) else 1)
-        card_b = vram_layers_b + (head_b if head_on_card else 0) + kv_card_b
+        index_card_b = sum(index_layer[i] for i in resident)
+        card_b = vram_layers_b + (head_b if head_on_card else 0) + (kv_card_b - index_card_b) * reads + index_card_b
         card_ms = card_b / (gpu_bps or CARD_BPS) * 1e3 + CARD_LAYER_MS * len(resident)
         head_host_ms = 0.0 if head_on_card else head_host_b / RAM_BPS * 1e3
         return {
@@ -630,19 +640,28 @@ class _TiersMixin(_State):
         return cache
 
     def _caches_to(self, i: int, dev: str | torch.device, cache: KvCache | None = None) -> None:
-        """layer i's rows in every live cache (and `cache`) moved to `dev`, where the layer now runs"""
+        """layer i's rows in every live cache (and `cache`) moved to `dev`, where the layer now runs - an attention
+        layer coming to the card under `kv_host` leaves its rows in RAM, where they live whatever the placement (its
+        linear states, small and its own step's, come with it)"""
+        if self._rows_stay(i, dev):
+            return
         live: list[KvCache] = list(self.__dict__.get("_live_caches", ()))
         caches = list({id(c): c for c in [*live, *([cache] if cache is not None else [])]}.values())
         self._rows_to(caches, [i], dev)
+
+    def _rows_stay(self, i: int, dev: str | torch.device) -> bool:
+        """whether layer `i`'s rows stay where they are as the layer moves to `dev`: an attention layer's coming to
+        the card under `kv_host`"""
+        return (
+            torch.device(dev).type == Device.CUDA
+            and bool(getattr(self, "kv_host", False))
+            and self.layer_types[i] != LayerKind.LINEAR
+        )
 
     def _rows_to(self, caches: Sequence[Any], layers: Sequence[int], dev: str | torch.device) -> None:
         """the rows of `layers` in `caches` moved to `dev`, granted together first where they come onto the card:
         a move the card cannot take is refused whole, before a row has moved"""
         dev = where(torch.device(dev))  # torch's own names too ('meta'), not only the ones --device takes
-        if dev.type == Device.CUDA and getattr(self, "kv_host", False):
-            # the attention's rows live in RAM (`kv_host`): a layer coming to the card leaves them there, its linear
-            # states (small, the layer's own step's) come with it
-            layers = [i for i in layers if self.layer_types[i] == LayerKind.LINEAR]
         sched = getattr(self, "scheduler", None)
         if dev.type == Device.CUDA and sched is not None:
             nbytes = sum(_rows_bytes(c, i, dev) for c in caches for i in layers)
@@ -718,8 +737,9 @@ class _TiersMixin(_State):
             return self._drafter_bytes()
         fp32 = self.compute_dtype is not None and self.compute_dtype != torch.bfloat16
         i = int(what.split()[1])
-        # and its rows in every live cache, which follow it onto the card
-        rows = sum(_rows_bytes(c, i, self.dev) for c in list(self.__dict__.get("_live_caches", ())))
+        # and its rows in every live cache, which follow it onto the card (not under `kv_host`: `_rows_stay`)
+        live = [] if self._rows_stay(i, self.dev) else list(self.__dict__.get("_live_caches", ()))
+        rows = sum(_rows_bytes(c, i, self.dev) for c in live)
         return self._layer_bytes(i) * (2 if (fp32 and self.resident_fp32) else 1) + rows
 
     def _realloc_bytes(self) -> int:

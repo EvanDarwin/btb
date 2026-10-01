@@ -77,6 +77,8 @@ class SpecCost:
     # drafter's measured again (Qwen3.8-flash-next on the host: a 2-row pass 2.2 steps and the drafter 0.58 s, its
     # probes a sixth of the call)
     PROBE_FAR = 64
+    # passes past a width's last measure before the curve takes the warm-up's figure for it again (`curve_now`)
+    LIVE_STALE = 256
     DRIVE_SHARE = 0.05  # the widest pass's modelled reads under this share of a step: the base sizing stands
     DEPTHS = 8  # depths reported
     # plain steps measured before a priced store's passes are sized: the first after a prefill reloads what the
@@ -96,6 +98,8 @@ class SpecCost:
         self.curve: dict[int, float] = {}
         self.width: Callable[[int], int] = _rows  # the curve's width a pass of k rows runs at
         self.live: dict[int, float] = {}  # each width's seconds as the passes measure them, decayed
+        self.live_at: dict[int, int] = {}  # the pass each width was last measured at
+        self.passes_seen = 0  # every pass recorded
         self.full = 1
         self.cal_a: dict[tuple[str, int], float] = {}
         self.cal_p: dict[tuple[str, int], float] = {}
@@ -146,13 +150,21 @@ class SpecCost:
         """the base curve as the passes measure it now: each width a pass ran at its measured seconds, the others
         the warm-up's scaled by the step's measured seconds over the warm-up's. The warm-up times the load's moment:
         beside another program its samples caught the card's bursts unevenly (a 2-row pass priced at 6, 21 and 53
-        one-row ones), and taken as it was the curve kept speculation priced out for the load; {} without one"""
+        one-row ones), and taken as it was the curve kept speculation priced out for the load; {} without one. A width
+        not run for LIVE_STALE passes takes the warm-up's again, scaled: a measure of it that priced it out was never
+        taken again, the budget sizing no pass that wide"""
         cv = self.curve
         if not cv:
             return {}
-        step = self.live.get(self.width(1))
+        live = {w: self.live[w] for w in self.measured()}
+        step = live.get(self.width(1))
         scale = step / cv[1] if step else 1.0
-        return {t: self.live.get(self.width(t), c * scale) for t, c in cv.items()}
+        return {t: live.get(self.width(t), c * scale) for t, c in cv.items()}
+
+    def measured(self) -> set[int]:
+        """the widths whose seconds `curve_now` takes from the passes (run within LIVE_STALE passes): what they cost
+        at the context they ran at, everything a pass reads included"""
+        return {w for w in self.live if self.passes_seen - self.live_at.get(w, 0) <= self.LIVE_STALE}
 
     # -- the model ---------------------------------------------------------------------------------------------
 
@@ -345,9 +357,12 @@ class SpecCost:
             self.w1 = wait if warm else _mix(self.w1, wait, self.TIME_DECAY)
         elif self.m1 is not None and self.u1 is not None and self.miss_s > 0:
             x = math.log(k)
-            # the rows' compute over a step's against ln k, through the origin, from rows near free
+            # the rows' compute over a step's against ln k, through the origin, from rows near free - a burst taken
+            # as twice the fit's figure at most, as the curve's widths are: one drove the exponent to its ceiling,
+            # and the drafts stayed priced out for a hundred plain steps
+            fit = min(compute, 2.0 * self.u1 * float(k) ** self.h)
             self._hxx = self.FIT_DECAY * self._hxx + x * x
-            self._hxy = self.FIT_DECAY * self._hxy + x * math.log(compute / self.u1)
+            self._hxy = self.FIT_DECAY * self._hxy + x * math.log(fit / self.u1)
             self.h = min(1.5, max(0.0, self._hxy / self._hxx))
             # ln of the reads' growth over a step's likewise, from the independent routing's exponent; the one
             # keeps a pass without reads defined
@@ -361,10 +376,17 @@ class SpecCost:
         if draft_s is not None:
             self.draft_s = _mix(self.draft_s, max(0.0, float(draft_s)), self.TIME_DECAY)
         # the width's measured seconds (`curve_now`), decayed: a burst - another program's slice of the card - is taken
-        # as twice what they were at most, a faster pass (the card freed again) as it is
+        # as twice what they were at most (a width's first pass, twice what the curve says of it now), a faster pass
+        # (the card freed again) as it is
+        self.passes_seen += 1
         w = self.width(k)
         old = self.live.get(w)
-        self.live[w] = compute if old is None else _mix(old, min(compute, 2.0 * old), self.TIME_DECAY)
+        if old is None:
+            ref = self.curve_now().get(w) if self.curve else None
+            self.live[w] = min(compute, 2.0 * ref) if ref else compute
+        else:
+            self.live[w] = _mix(old, min(compute, 2.0 * old), self.TIME_DECAY)
+        self.live_at[w] = self.passes_seen
 
     def calibration(self, tag: str) -> list[float]:
         """`tag`'s calibration by depth, 1 .. DEPTHS"""

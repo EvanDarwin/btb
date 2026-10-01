@@ -479,7 +479,9 @@ class _GenerateMixin(_State):
                         extra.append((ng, ng_p, "ngram"))
                 for sp_toks, sp_p, sp_tag in getattr(self, "extra_chains", ()):
                     extra.append((sp_toks, sp_p, sp_tag))
-                n_draft = int(getattr(self, "tree_budget", 0) or v)
+                # the tree's nodes, the root's row beside them within the widest pass (`_spec_full`: a family's exact
+                # verify bounds it)
+                n_draft = min(int(getattr(self, "tree_budget", 0) or v), self._spec_full(v_max) - 1)
                 if pricer.active() and rows < pricer.full:
                     # the pricing sized the pass short of the whole tree: one node past its plan, so the prune
                     # below has a choice

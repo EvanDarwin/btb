@@ -6,6 +6,7 @@ Its layers take the pass whole, so the engine hands them their own keywords and 
 from __future__ import annotations
 
 import importlib
+import weakref
 from typing import TYPE_CHECKING, Any, Self
 
 import torch
@@ -100,6 +101,19 @@ class Qwen4Family(Family):
         from .verify import install as install_steps
 
         install_steps(layer, sm)
+        # the card's torch path row-invariant where the card program does not take a pass: the router's matmul at the
+        # fixed shape (its rows' sum otherwise moved with how many travel together), the norms likewise, and the
+        # sparse attention a row at a time in the step and in a speculative pass - each row the step's own call over
+        # the rows its mask lets it see (attention.py `_rows_apart`); the linears are the engine's fixed-row ones
+        from ...fixed_rows import fix_rows_cls
+        from .router import install_card as install_card_router
+
+        install_card_router(layer.mlp)
+        fix_rows_cls(self.mod.Qwen4ExpTextRMSNorm)
+        attn = getattr(layer, "self_attn", None)
+        if attn is not None:
+            ref = weakref.ref(sm)
+            attn.btb_rows_apart = lambda T: T == 1 or bool(getattr(ref(), "aq", False))
         return layer
 
     def closing(self, cfg: Any) -> tuple[str, torch.nn.Module]:
@@ -135,6 +149,15 @@ class Qwen4Family(Family):
             return 0, 0
         return (int(rows) // r + 1) * di * 2, int(rows) * di * 2
 
+    def attn_read_rows(self, cfg: Any, rows: int) -> int:
+        # the sparse attention reads the blocks its indexer picks - `indexer_budget` rows - and the partial block
+        # after them, whatever the context; the pooled keys it scores are `attn_index_bytes`' card share, read whole
+        budget = int(getattr(cfg, "indexer_budget", 0) or 0)
+        r = int(getattr(cfg, "indexer_compress_ratio", 0) or 0)
+        if budget <= 0 or r <= 0:
+            return int(rows)
+        return min(int(rows), budget + r)
+
     def drafter_cls(self) -> type[MTPDrafter] | None:
         from .drafter import Qwen4Drafter
 
@@ -147,14 +170,24 @@ class Qwen4Family(Family):
         return not mlx
 
     def verify_exact(self, sm: _State, cache: Any) -> bool:
-        # a node computes as its path's step only through btb's own kernels: on the host the DeltaNet step and the
-        # attention over each row's cache rows (verify.py, attend.py; without them a host layer runs the reference
-        # modules, which step a tree's rows as one chain); every other layer only inside the card program, whose
-        # own gate (`_card_program`, the program's `why_not`) says whether it takes this cache's pass - where it
-        # declines (a float32 compute, the KV on the host, a streamed layer, a fork, ...) the layers run the
-        # reference router, attention and activations, which are not row-invariant
+        # a node computes as its path's step only through btb's own kernels for the two layers that carry state - on
+        # the host the DeltaNet step and the attention over each row's cache rows (verify.py, attend.py), on the card
+        # the DeltaNet's node kernel (without them a layer runs the reference modules, which step a tree's rows as one
+        # chain). The rest is row-invariant wherever it runs: on the card the card program's kernels, or where it
+        # declines (a float32 compute, a streamed layer, the head given up, a fork, ...) the torch path's fixed-row
+        # linears, norms and router and its attention a row at a time (`shape_layer`)
         if sm.host and (Native.delta_step is None or Native.attn_nodes is None):
             return False
         if all(i in sm.host for i in range(int(sm.L))):
             return True
-        return sm._card_program(cache, 1, 1, cache.get_seq_length(), None, None, None) is not None
+        return Native.card_kernels() is not None
+
+    def verify_rows(self, sm: _State) -> int | None:
+        # a layer on the card verifies exactly at the card program's ROWS at most (the engine's CARD_T_MAX), the
+        # torch path's fixed-row chunks and its host experts within them - and over rows in RAM, the program's
+        # attention takes no tree wider
+        from .card import ROWS
+
+        if all(i in sm.host for i in range(int(sm.L))):
+            return None
+        return ROWS

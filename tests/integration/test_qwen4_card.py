@@ -218,6 +218,41 @@ def _speculative_is_plain(sm: StreamedTextModel) -> None:
             sm._card_cost = cost
 
 
+def _a_wide_tree_is_held_to_the_programs_rows(sm: StreamedTextModel) -> None:
+    """a tree budget past the program's ROWS: no pass is wider than the program verifies exactly - a wider one took
+    the torch path, which is not row-invariant (over rows in RAM it raised, and its pricing raised past 32 rows) - and
+    the decode is the plain decode's tokens"""
+    from btb.engine.families.qwen4.card import ROWS
+
+    cost = sm.__dict__.pop("_card_cost", None)
+    # the knobs as the load left them - a test model may have none set (`btb.load` sets them, `host_model` does not)
+    knobs = {k: sm.__dict__.get(k) for k in ("tree_budget", "tree_min_prob", "ngram_p", "v_max")}
+    try:
+        speculation(sm, tree_budget=40, tree_min_prob=0.0, ngram_p=0.0, v_max=4, price=False)
+        assert sm._spec_full() == ROWS, f"the widest pass {sm._spec_full()} rows, past the program's {ROWS}"
+        with torch.inference_mode():
+            prompt = PROMPTS["long"]
+            plain = sm.generate_greedy(prompt, 12)
+            toks, census = sm.generate_speculative(prompt, 12, proposer="mtp_dyn", v_max=4)
+        assert toks == plain, f"{toks} != {plain}"
+        assert census["mtp_steps"] > 0, "the drafter never stepped"
+        pc = getattr(sm, "_spec_cost", None)
+        assert pc is not None
+        assert max(pc.rows) <= ROWS, f"a pass of {max(pc.rows)} rows"
+    finally:
+        for k, v in knobs.items():
+            if v is None:
+                sm.__dict__.pop(k, None)
+            else:
+                setattr(sm, k, v)
+        if cost is not None:
+            sm._card_cost = cost
+
+
+def test_a_wide_tree_on_the_card_is_held_to_the_programs_rows(card: StreamedTextModel) -> None:
+    _a_wide_tree_is_held_to_the_programs_rows(card)
+
+
 def _speculative_passes(sm: StreamedTextModel) -> None:
     with torch.inference_mode():
         for name, prompt in PROMPTS.items():
@@ -991,9 +1026,10 @@ def ram(card_path: str) -> Iterator[StreamedTextModel]:
 
 def test_a_cache_kept_in_ram_keeps_its_rows_there_and_reads_them_in_place(ram: StreamedTextModel) -> None:
     """With the rows in RAM the program runs the model: the sparse layers' keys, values and raw indexer keys, and
-    the rope's tables, are pinned host memory made once for the whole context - never on the card, where only the
-    pooled keys and the scores are - and the prefill (its chunk in slices of the program's rows) and the program's
-    steps after it read and grow them there. (Against the rows-on-the-card engine the logits part by the prefills'
+    the rope's tables, are pinned host memory grown as the rows are, never pinned for the whole context up front -
+    never on the card, where only the pooled keys and the scores are - and the prefill (its chunk in slices of the
+    program's rows) and the program's steps after it read and grow them there. (Against the rows-on-the-card engine
+    the logits part by the prefills'
     rounding compounded through the layers - 6% here, the attention itself within 2% of the reference's on the same
     rows: `test_the_attention_over_rows_in_ram_is_the_reference_modules`)"""
     steps = (NEXT, 5, 9)
@@ -1002,7 +1038,9 @@ def test_a_cache_kept_in_ram_keeps_its_rows_there_and_reads_them_in_place(ram: S
             cache, first = _prefilled(ram, prompt)
             prog = _prog(ram)
             A = prog.A
-            assert A is not None and int(A["cap"]) >= RAM_CONTEXT, "the arena not made for the whole context"
+            assert A is not None and len(prompt) < int(A["cap"]) < RAM_CONTEXT, (
+                f"{name}: an arena of {int(A['cap'])} rows for {len(prompt)}: pinned for the context up front"
+            )
             for key in ("kv", "raw", "cos", "sin"):
                 assert A[key].device.type == "cpu" and A[key].is_pinned(), f"{name}: the arena's {key} not in RAM"
             assert A["pk"].is_cuda and A["scores"].is_cuda, f"{name}: the pooled keys or the scores left the card"
@@ -1063,3 +1101,74 @@ def test_a_verify_pass_over_rows_in_ram_is_its_paths_steps(ram: StreamedTextMode
 
 def test_a_speculative_decode_over_rows_in_ram_is_the_plain_decode(ram: StreamedTextModel) -> None:
     _speculative_is_plain(ram)
+
+
+def test_a_wide_tree_over_rows_in_ram_is_held_to_the_programs_rows(ram: StreamedTextModel) -> None:
+    _a_wide_tree_is_held_to_the_programs_rows(ram)
+
+
+def test_an_arena_in_ram_grows_past_its_context_with_its_rows(ram: StreamedTextModel) -> None:
+    """a session past the context the arena was made for grows it, its rows copied over and the cache's layers bound
+    to the new one (its size said in the log: the line once raised on a name only the card's arena bound)"""
+    sm = ram
+    with torch.inference_mode():
+        cache, _ = _prefilled(sm, PROMPTS["long"])
+        prog = _prog(sm)
+        A = prog.A
+        assert A is not None
+        before = {i: cache.layers[i].keys.clone() for i in prog.sparse}
+        cap = int(A["cap"])
+        grown = prog.arena(cap + 1)
+        assert int(grown["cap"]) > cap and grown["kv"].device.type == "cpu" and grown["kv"].is_pinned()
+        for i in prog.sparse:
+            cl = cache.layers[i]
+            assert cl.in_ram and cl.attached_to(grown["kv"][prog.sj[i], 0]), f"layer {i} not bound to the new arena"
+            assert torch.equal(cl.keys, before[i]), f"layer {i}'s rows not carried over"
+        assert torch.isfinite(forward_logits(sm, [[NEXT]], cache)[0, -1]).all()
+
+
+def _shed(sm: StreamedTextModel, what: str, cache: Any) -> None:
+    """a layer (`layer i`) or the head given up to the host as a yield gives it, the placement moved"""
+
+    def go() -> None:
+        if what == "head":
+            sm._head_host()
+            sm.head = None
+            sm.resident_head = False
+        else:
+            i = int(what.split()[1])
+            host = sm._make_host_layer(i)
+            sm.resident.pop(i)
+            sm.host[i] = host
+            sm._caches_to(i, "cpu", cache)
+        sm._shed.append(what)
+
+    sm.device.request("shed", go)
+
+
+def test_rows_in_ram_are_read_through_the_program_whatever_else_declines_it(ram: StreamedTextModel) -> None:
+    """the head given up to the host declines the program's passes, not its attention over the rows in RAM: the
+    torch path's steps read them through it (the reference module met the card's queries with the host's keys); a
+    DeltaNet layer given up leaves the arena and the cache's rows where they are (copied out and back, they were twice
+    the arena's RAM). Each grown back after"""
+    sm = ram
+    with torch.inference_mode():
+        cache, _ = _prefilled(sm, PROMPTS["long"])
+        prog = _prog(sm)
+        _shed(sm, "head", cache)
+        try:
+            assert torch.isfinite(forward_logits(sm, [[NEXT]], cache)[0, -1]).all()
+            assert not prog.ok() and "head" in str(prog._why) and prog.rows_ok(), prog._why
+        finally:
+            sm.device.request("regrow", sm.vram_regrow)
+        A = prog.A
+        delta = max(i for i in prog.linear if i not in prog.ple)
+        _shed(sm, f"layer {delta}", cache)
+        try:
+            assert torch.isfinite(forward_logits(sm, [[5]], cache)[0, -1]).all()
+            assert prog.A is A, "the arena in RAM let go for a DeltaNet layer's shed"
+            for i in prog.sparse:
+                assert cache.layers[i].attached_to(A["kv"][prog.sj[i], 0]), f"layer {i}'s rows copied out"
+        finally:
+            sm.device.request("regrow", sm.vram_regrow)
+        assert torch.isfinite(forward_logits(sm, [[9]], cache)[0, -1]).all()

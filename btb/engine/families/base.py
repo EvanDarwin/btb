@@ -160,6 +160,12 @@ class Family:
         The plain block's verifies on every path it speculates on"""
         return True
 
+    def verify_rows(self, sm: _State) -> int | None:
+        """the widest speculative pass, the root included, the family verifies exactly as placed (`verify_exact`), or
+        None where no path bounds it: the tree's budget is held to it, so no pass is wider than the paths that verify
+        it. The plain block's verify at any width"""
+        return None
+
     def card_program(self) -> type[Any] | None:
         """the class of the family's own card program - its layers' step and verify pass as graphs over btb's card
         kernels, the engine's runner replaying them in turn (cuda.py `_forward_card_program`) - or None where the
@@ -178,6 +184,11 @@ class Family:
         it: (the bytes that stay on the card wherever the rows live - what every pass reads whole; the bytes that
         live with the rows). The plain block's attention keeps no index: (0, 0)"""
         return 0, 0
+
+    def attn_read_rows(self, cfg: Any, rows: int) -> int:
+        """the cached rows a token's attention reads at `rows` positions, as the placement prices a pass: the plain
+        block's reads every one"""
+        return int(rows)
 
     def prepare(self, sm: _State) -> None:
         """what the family sets on the engine's config and on its transformers module once the engine knows its
