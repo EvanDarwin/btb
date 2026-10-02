@@ -304,6 +304,32 @@ def test_the_step_graph_samples_as_the_step_loop_and_repeats_under_a_seed(
     assert census["seed"] == 1
 
 
+def test_the_arena_grows_under_a_sequence_without_moving_its_rows_or_a_bit(
+    engine: EngineTok, greedy_reference: GreedyRef
+) -> None:
+    """The arena outrun mid-answer grows where it stands: mapped on in place where the card's driver can (every
+    layer's rows at the addresses the kernels held), else regrown a layer at a time; either way the steps after it
+    are the greedy steps bit for bit."""
+    sm, _ = engine
+    ids, toks, logits = greedy_reference
+    with torch.inference_mode():
+        cache = sm.new_cache(max_len=len(ids) + 64)
+        sm._prefill(torch.tensor([ids]), cache)
+        st = sm._card_state()
+        for j in range(30):
+            if j == 10:
+                ar = st["arena"]
+                assert ar is not None and ar["owner"] is not None and ar["owner"]() is cache, "the cache holds it"
+                before = [ar["A"][s, w].data_ptr() for s in ar["slot"].values() for w in (0, 1)]
+                grown = sm._card_arena(st, int(ar["cap"]) + 1)
+                assert grown["cap"] > ar["cap"]
+                if grown["A"].in_place:
+                    after = [grown["A"][s, w].data_ptr() for s in grown["slot"].values() for w in (0, 1)]
+                    assert after == before, "a growth in place moved a layer's rows"
+            lg = forward_logits(sm, torch.tensor([[toks[j]]]), cache=cache)[0, -1].float()
+            assert torch.equal(lg, logits[j]), f"step {j} parts from the greedy step"
+
+
 def test_the_speculative_answer_is_the_greedy_answer(engine: EngineTok, prompt_ids: list[list[int]]) -> None:
 
     sm, _ = engine

@@ -358,7 +358,7 @@ def _attn_split(kern: Any, q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, n0
         (HQ, n, S),
         (256, 1, 1),
         [
-            P(q), P(K), P(V), P(out), P(n0t), P(part), ci(n), ci(HQ), ci(HK), ci(cap),
+            P(q), P(K), P(V), P(out), P(n0t), P(part), ci(n), ci(HQ), ci(HK), ci(K.stride(0)), ci(K.stride(1)),
             ctypes.c_float(SCALE), P(pm), P(pl), P(pa), P(cnt), ci(S), ci(0),
         ],
     )  # fmt: skip

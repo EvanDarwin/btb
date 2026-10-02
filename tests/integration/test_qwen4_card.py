@@ -680,30 +680,46 @@ def test_a_chunk_the_torch_path_writes_past_the_arena_grows_it(
     """a chunk of rows the torch path writes into the bound cache (a pass of many rows outside speculation) past the
     arena's rows: the layer asks the program for room, which regrows the arena - the rows copied, every bound layer
     attached again, the graphs dropped - and, the pass being off the program, reads the cache's mirrors again. The
-    steps after it are the same decode's over an arena that never had to grow"""
+    steps after it are the same decode's over an arena made long enough before it. The chunk is as long as a fresh
+    arena's rows - whole chunks of them where the driver maps in place - so it always lands past them"""
     sm = card
     prompt = PROMPTS["short"]
-    chunk = [(7 * i + 3) % 500 + 2 for i in range(1100)]
 
-    def run() -> list[torch.Tensor]:
+    def run(chunk: list[int], presize: int) -> list[torch.Tensor]:
         cache, _ = _prefilled(sm, prompt)
+        if presize:
+            _prog(sm).arena(presize)
         out = [forward_logits(sm, [[NEXT]], cache)[0, -1].clone()]
         forward_logits(sm, [chunk], cache)
         out += [forward_logits(sm, [[t]], cache)[0, -1].clone() for t in (5, 9)]
         assert cache.get_seq_length() == len(prompt) + 1 + len(chunk) + 2
         return out
 
+    def first_pass() -> None:
+        cache, _ = _prefilled(sm, prompt)
+        forward_logits(sm, [[NEXT]], cache)  # the program's first pass makes it, and its arena
+
     with torch.inference_mode():
-        want = run()
+        first_pass()
         prog = _prog(sm)
-        assert prog.A is not None and int(prog.A["cap"]) >= len(prompt) + len(chunk) + 3 + prog.ROWS
         prog.close()  # the arena made afresh, at the smallest it starts at
         monkeypatch.setattr(prog, "ARENA_MIN", 1024)
+        first_pass()
+        assert prog.A is not None
+        cap0 = int(prog.A["cap"])
+        chunk = [(7 * i + 3) % 500 + 2 for i in range(cap0)]
+        total = len(prompt) + len(chunk) + 3 + prog.ROWS
+        prog.close()
+        want = run(chunk, total)
+        assert prog.A is not None and int(prog.A["cap"]) >= total
+        prog.close()
         logs: list[str] = []
         monkeypatch.setattr(sm, "log", lambda *a, **_k: logs.append(" ".join(str(x) for x in a)))
-        got = run()
-        assert prog.A is not None and int(prog.A["cap"]) == 2048
-        assert any("arena grown to 2048 rows" in line for line in logs), logs
+        got = run(chunk, 0)
+        assert prog.A is not None
+        cap = int(prog.A["cap"])
+        assert cap >= total > cap0
+        assert any(f"arena grown to {cap} rows" in line for line in logs), logs
         assert prog.held_bytes() == sum(prog.held.values())
     for j, (a, b) in enumerate(zip(want, got, strict=True)):
         assert torch.equal(a, b), f"step {j} parts once the chunk grew the arena"
@@ -1003,7 +1019,9 @@ def test_a_placement_whose_edge_the_ledger_refuses_takes_the_torch_path(
 
 # -- the attention's rows in RAM (`kv_host`): a context the card has no room for -----------------------------------
 
-RAM_CONTEXT = 8192
+# past the fixture's first chunk of rows: where the driver maps in place a region grows by whole 2 MiB chunks, 8192
+# of the fixture's 256-byte rows, so a context of 8192 would be held whole by its first growth
+RAM_CONTEXT = 32768
 
 
 @pytest.fixture(scope="module")
@@ -1041,9 +1059,10 @@ def test_a_cache_kept_in_ram_keeps_its_rows_there_and_reads_them_in_place(ram: S
             assert A is not None and len(prompt) < int(A["cap"]) < RAM_CONTEXT, (
                 f"{name}: an arena of {int(A['cap'])} rows for {len(prompt)}: pinned for the context up front"
             )
-            for key in ("kv", "raw", "cos", "sin"):
-                assert A[key].device.type == "cpu" and A[key].is_pinned(), f"{name}: the arena's {key} not in RAM"
-            assert A["pk"].is_cuda and A["scores"].is_cuda, f"{name}: the pooled keys or the scores left the card"
+            rows = {"k": A["kv"][0, 0], "v": A["kv"][1, 1], "raw": A["raw"][1], "cos": A["cos"], "sin": A["sin"]}
+            for key, t in rows.items():
+                assert t.device.type == "cpu" and t.is_pinned(), f"{name}: the arena's {key} not in RAM"
+            assert A["pk"][1].is_cuda and A["scores"].is_cuda, f"{name}: the pooled keys or the scores left the card"
             assert torch.isfinite(first).all(), f"{name}: the prefill's logits"
             n = len(prompt)
             for t in steps:
@@ -1119,7 +1138,8 @@ def test_an_arena_in_ram_grows_past_its_context_with_its_rows(ram: StreamedTextM
         before = {i: cache.layers[i].keys.clone() for i in prog.sparse}
         cap = int(A["cap"])
         grown = prog.arena(cap + 1)
-        assert int(grown["cap"]) > cap and grown["kv"].device.type == "cpu" and grown["kv"].is_pinned()
+        kv = grown["kv"][0, 0]
+        assert int(grown["cap"]) > cap and kv.device.type == "cpu" and kv.is_pinned()
         for i in prog.sparse:
             cl = cache.layers[i]
             assert cl.in_ram and cl.attached_to(grown["kv"][prog.sj[i], 0]), f"layer {i} not bound to the new arena"

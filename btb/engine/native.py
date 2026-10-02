@@ -1235,6 +1235,29 @@ class _Cuda:
             raise ValueError(f"[cuda] {call}: {', '.join(bad)} must be contiguous {name} on the card or pinned in RAM")
 
     @staticmethod
+    def _want_kv_rows(call: str, K: torch.Tensor, V: torch.Tensor | None) -> None:
+        """a cache's K/V rows as [Hk, cap, D] views the kernels index by their strides (head g's row j at g * hs +
+        j * rs): bf16 on the card or pinned in RAM, a row's D elements side by side, V laid out as K - head-major or
+        position-major (the arenas'), contiguous or not"""
+        bad = [
+            name
+            for name, t in (("K", K), ("V", V))
+            if t is not None
+            and (
+                t.dtype != torch.bfloat16
+                or t.dim() != 3
+                or t.stride(-1) != 1
+                or not (t.is_cuda or (t.device.type == "cpu" and t.is_pinned()))
+                or (t is V and (V.shape != K.shape or V.stride() != K.stride()))
+            )
+        ]
+        if bad:
+            raise ValueError(
+                f"[cuda] {call}: {', '.join(bad)} must be [Hk, cap, D] bf16 rows (a row's D side by side, V laid out "
+                f"as K) on the card or pinned in RAM"
+            )
+
+    @staticmethod
     def _at(t: torch.Tensor, off: int) -> ctypes.c_void_p:
         """the address of element `off` of contiguous `t`"""
         return ctypes.c_void_p(t.data_ptr() + int(off) * t.element_size())
@@ -1540,12 +1563,13 @@ class _Cuda:
         heads go to `qo` [T, heads, D]. `wq`/`wk` [D] the zero-centred norms (None: none). `raw_key`: the QSA indexer
         - its key heads copied raw into `K` (the raw-key arena), `V` None."""
         self._want("norm_rope_part", torch.bfloat16, qkv=qkv, qo=qo, wq=wq, wk=wk)
-        self._want_rows("norm_rope_part", torch.bfloat16, K=K, V=V, cos=cos, sin=sin)
+        self._want_rows("norm_rope_part", torch.bfloat16, cos=cos, sin=sin)
+        self._want_kv_rows("norm_rope_part", K, V)
         self._want("norm_rope_part", torch.int32, n0=n0, depth=depth)
         Hq, Hk, qs, ko, vo, q0 = int(heads), int(kv_heads), int(q_stride), int(k_off), int(v_off), int(q_col)
         if K.dim() != 3 or qkv.dim() != 2 or cos.dim() != 2:
             raise ValueError(f"[cuda] norm_rope_part: shapes do not agree (K {tuple(K.shape)}, qkv {tuple(qkv.shape)})")
-        D, cap = int(K.shape[2]), int(K.shape[1])
+        D = int(K.shape[2])
         T, width = (int(s) for s in qkv.shape)
         rot = int(cos.shape[1])
         E = D // 32
@@ -1602,7 +1626,8 @@ class _Cuda:
                     P(qo),
                     ci(Hq),
                     ci(Hk),
-                    ci(cap),
+                    ci(int(K.stride(0))),  # head g's slot j at g * hs + j * rs: either layout of [Hk, cap, D]
+                    ci(int(K.stride(1))),
                     ci(int(bool(centered))),
                     ci(int(bool(raw_key))),
                 ],
@@ -1800,13 +1825,13 @@ class _Cuda:
         [S * T * Hq] and `part_acc` [S * T * Hq * D] float32, `cnt` [T * Hq] int32 (zero; the kernel leaves it zero),
         S = `qsa_splits(ratio, k_top)`."""
         self._want("qsa_attn_split", torch.bfloat16, q=q, out=out)
-        self._want_rows("qsa_attn_split", torch.bfloat16, K=K, V=V)
+        self._want_kv_rows("qsa_attn_split", K, V)
         self._want("qsa_attn_split", torch.int32, n0=n0, par=par, sel=sel, nsel=nsel, cnt=cnt)
         self._want("qsa_attn_split", torch.float32, part_m=part_m, part_l=part_l, part_acc=part_acc)
         if q.dim() != 3 or K.dim() != 3:
             raise ValueError(f"[cuda] qsa_attn_split: shapes do not agree (q {tuple(q.shape)}, K {tuple(K.shape)})")
         T, Hq, D = (int(s) for s in q.shape)
-        Hk, cap = int(K.shape[0]), int(K.shape[1])
+        Hk = int(K.shape[0])
         k = int(k_top)
         S = self.qsa_splits(ratio, k)
         if (
@@ -1851,7 +1876,8 @@ class _Cuda:
                 ci(T),
                 ci(Hq),
                 ci(Hk),
-                ci(cap),
+                ci(int(K.stride(0))),  # head g's row j at g * hs + j * rs: either layout of [Hk, cap, D]
+                ci(int(K.stride(1))),
                 ctypes.c_float(float(scale)),
                 P(part_m),
                 P(part_l),

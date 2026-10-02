@@ -25,6 +25,7 @@ from ..kinds import LayerKind, NodePath, Parents, PassTag, Tokens
 from ..options import Device
 from ..sampling import GREEDY
 from . import device as device_mod
+from .arena import KvArena
 from .cache import CardRowsLayer, GrowLayer, attention_rows, forked, indexer_keys, set_rows
 from .families import act_name
 from .fixed_rows import KeyRows
@@ -661,6 +662,9 @@ class _CudaMixin(_State):
         if cg is not None and cg.get("arena") is not None and cg.get("k") is not None:
             cg["k"].persist(0, 0, stream=cg["stream"])
             cg["k"].persist(0, 0)
+        if cg is not None and cg.get("arena") is not None:
+            # the arena's hold on its memory: what no cache still views goes back to the card now
+            cg["arena"]["A"].close()
         vars(self).pop("_g", None)
         vars(self).pop("_cg", None)
 
@@ -830,63 +834,87 @@ class _CudaMixin(_State):
         return tb
 
     def _card_arena(self, st: dict[str, Any], need: int, reach: int = 0) -> dict[str, Any]:
-        """the arena holding every run layer's cache rows, one tensor [runs' layers, 2, Hk, cap, d] the caches
-        attach to (a cache attached elsewhere copies its rows in), at least `need` rows deep and `reach` deep when it
-        is made (`_card_reach`: a growth step past the rows); grown by reallocation (rows copied over, graphs dropped)
-        when a context outruns it. Its front lies in a persisting-L2 window, so a short context's attention reads hit
-        L2 under the weights' evict-first loads"""
+        """The arena holding every run layer's cache rows (`KvArena`, position-major: a layer's rows grow at the end
+        of its own region) the caches attach to - a cache attached elsewhere copies its rows in - at least `need` rows
+        deep, and `reach` deep when it grows (`_card_reach`: a growth step past the rows). A growth maps memory onto
+        the rows' end where the card's driver can (nothing moves), else regrows the layers one at a time; only a
+        change of the layers on the card makes a new arena, the common layers' rows copied over. Its front lies in a
+        persisting-L2 window, so a short context's attention reads hit L2 under the weights' evict-first loads"""
         ar = st["arena"]
         if ar is not None and ar["cap"] >= need:
             return ar
         H, Hq, Hk, D, I = self._card_dims()
         layers = [i for a, b in st["segments"] for i in range(a, b)]
-        cap = max(int(need), int(reach), 4096)
-        cap = (cap + 1023) // 1024 * 1024
-        nbytes = len(layers) * 2 * Hk * cap * D * 2
+        slot = {i: j for j, i in enumerate(layers)}
+        same = ar is not None and ar["slot"] == slot
+        store = ar["A"] if same else KvArena(len(layers), Hk, D, self.dev, self._card_ceiling())
+        cap = store.rows_for((max(int(need), int(reach), 4096) + 1023) // 1024 * 1024)
         sched = getattr(self, "scheduler", None)
         if sched is not None:
             sched.grant(
-                nbytes,
+                store.nbytes(cap),
                 "kv",
                 requester=f"card arena {len(layers)} layers x {cap} rows",
                 B=1,
                 cap=cap,
                 bound=None,
                 device=self.dev,
-                # the arena this one replaces, let go once its rows are copied over
-                held=len(layers) * 2 * Hk * int(ar["cap"]) * D * 2 if ar is not None else 0,
+                # what the arena holds now: grown in place it stays (only the growth is new), else it is let go
+                # once its rows are copied over
+                held=ar["A"].nbytes(ar["cap"]) if ar is not None else 0,
             )
-        A = torch.empty(len(layers), 2, Hk, cap, D, dtype=torch.bfloat16, device=self.dev)
-        slot = {i: j for j, i in enumerate(layers)}
-        new = {"A": A, "cap": cap, "slot": slot, "owner": ar["owner"] if ar is not None else None}
-        if ar is not None:
-            owner = ar["owner"]() if ar["owner"] is not None else None
-            for i, j in ar["slot"].items():
-                if i in slot:
-                    A[slot[i], :, :, : ar["cap"]].copy_(ar["A"][j])
-                    if owner is not None and isinstance(owner.layers[i], CardRowsLayer):
-                        # a fork's or a batch's rows keep their slots: only the slices move
-                        if owner.layers[i]._buf is not None:
-                            owner.layers[i]._buf = (A[slot[i], 0], A[slot[i], 1])
-                    elif owner is not None:
-                        layer = owner.layers[i]
-                        n = int(layer.keys.shape[-2]) if (layer.is_initialized and layer.keys is not None) else 0
-                        layer._buf = (A[slot[i], 0][None], A[slot[i], 1][None])
-                        if n:
-                            layer._set_rows(layer._buf[0][..., :n, :], layer._buf[1][..., :n, :])
+        owner = ar["owner"]() if ar is not None and ar["owner"] is not None else None
+
+        def moved(j: int) -> None:
+            """layer layers[j]'s holder takes the arena's views of it (the rows are in them already)"""
+            i = layers[j]
+            if owner is None:
+                return
+            if isinstance(owner.layers[i], CardRowsLayer):
+                # a fork's or a batch's rows keep their slots: only the slices move
+                if owner.layers[i]._buf is not None:
+                    owner.layers[i]._buf = (store[j, 0], store[j, 1])
+                return
+            layer = owner.layers[i]
+            n = int(layer.keys.shape[-2]) if (layer.is_initialized and layer.keys is not None) else 0
+            layer._buf = (store[j, 0][None], store[j, 1][None])
+            if n:
+                layer._set_rows(layer._buf[0][..., :n, :], layer._buf[1][..., :n, :])
+
+        if same:
+            store.grow(cap, moved=moved)
+            if store.in_place:
+                for j in range(len(layers)):
+                    moved(j)  # the same addresses, longer views
+        else:
+            store.grow(cap)
+            if ar is not None:
+                for i, j in ar["slot"].items():
+                    if i in slot:
+                        for w in (0, 1):
+                            store[slot[i], w][:, : ar["cap"]].copy_(ar["A"][j, w])
+                        moved(slot[i])
+                ar["A"].close()
+        new = {"A": store, "cap": store.cap, "slot": slot, "owner": ar["owner"] if ar is not None else None}
         st["arena"] = new
         st["graphs"].clear()
         # how much of the arena's front sits in persisting L2 is the scheduler's call (it holds the
         # hierarchy's sizes); the driver call is only the mechanism
         k = st["k"]
-        pinned = self.scheduler.pin_bytes(A.numel() * 2) if getattr(self, "scheduler", None) is not None else 0
-        k.persist(A.data_ptr(), pinned, stream=st["stream"])
-        k.persist(A.data_ptr(), pinned)
+        pinned = self.scheduler.pin_bytes(store.nbytes(store.cap)) if sched is not None else 0
+        k.persist(store.front(), pinned, stream=st["stream"])
+        k.persist(store.front(), pinned)
         self.log(
-            f"[card] arena {len(layers)} layers x {cap} rows ({nbytes / 2**20:.0f} MB), {pinned / 2**20:.0f} MB "
-            f"of it pinned in L2"
+            f"[card] arena {len(layers)} layers x {store.cap} rows ({store.nbytes(store.cap) / 2**20:.0f} MB, "
+            f"{'mapped in place' if store.in_place else 'regrown layer by layer'}), {pinned / 2**20:.0f} MB of it "
+            f"pinned in L2"
         )
         return new
+
+    def _card_ceiling(self) -> int:
+        """the rows a sequence of this model reaches: its context where one is set, else its own position limit -
+        the addresses an arena reserves up front where the driver maps in place (none of it memory until used)"""
+        return max(int(self.context or 0), int(getattr(self.cfg, "max_position_embeddings", 0) or 0), 4096)
 
     @staticmethod
     def _card_reach(cache: Any, layers: Iterable[int], rows: int) -> int:
@@ -1210,6 +1238,8 @@ class _CudaMixin(_State):
         for n, L in enumerate(Ls):
             j = ar["slot"][a + n]
             kb, vb = ar["A"][j, 0], ar["A"][j, 1]
+            # where head g's row r lies (elements): g * hs + r * rs, read off the arena's [Hk, cap, D] view
+            kv_strides = (ci(int(kb.stride(0))), ci(int(kb.stride(1))))
             cos_t, sin_t = tables[self.layer_types[a + n]]
             # the last layer's MLP output folded into this input norm's add (a sandwich layer added its own)
             k.launch(
@@ -1237,7 +1267,7 @@ class _CudaMixin(_State):
                     ci(T),
                     ci(Hq),
                     ci(Hk),
-                    ci(ar["cap"]),
+                    *kv_strides,
                     cen,
                 ],
             )
@@ -1254,7 +1284,7 @@ class _CudaMixin(_State):
                     ci(T),
                     ci(Hq),
                     ci(Hk),
-                    ci(ar["cap"]),
+                    *kv_strides,
                     cf(L["scale"]),
                     P(g["part_m"]),
                     P(g["part_l"]),

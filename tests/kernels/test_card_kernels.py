@@ -159,7 +159,9 @@ def _attn_split(
             I(T),
             I(Hq),
             I(Hk),
-            I(cap),
+            # where head g's row r lies: g * hs + r * rs, read off K's [Hk, cap, D] view (either layout)
+            I(K.stride(0)),
+            I(K.stride(1)),
             Fl(scale),
             P(pm),
             P(pl),
@@ -197,6 +199,57 @@ def test_split_attention_matches_the_reference_across_splits_and_reproduces_one_
     K2[:, n0 + 1], V2[:, n0 + 1] = K[:, n0 + 3], V[:, n0 + 3]
     one = _attn_split(cu, q[3:4], K2, V2, n0 + 1, [-1], scale)
     assert torch.equal(one[0], out[3])
+
+
+def _position_major(K: torch.Tensor) -> torch.Tensor:
+    """`K` [Hk, cap, D] laid out position-major - row by row, a row's heads side by side, as the card arena keeps
+    them - and viewed back as [Hk, cap, D]"""
+    return K.permute(1, 0, 2).contiguous().permute(1, 0, 2)
+
+
+@pytest.mark.parametrize("Hq,Hk,D", [(16, 8, 128), (32, 8, 128), (16, 8, 64)])
+def test_position_major_rows_are_read_and_written_as_head_major_ones(cu: _Cuda, Hq: int, Hk: int, D: int) -> None:
+    """The card arena keeps its rows position-major so they grow at its end alone. The tree walk, its grouped-query
+    form, the rows walk and the norm/rope write take head g's row r at g * hs + r * rs, and over either layout give
+    the same bits at the same logical rows."""
+    torch.manual_seed(11)
+    cap, n0, T, eps = 4096, 1500, 4, 1e-6
+    K = torch.randn(Hk, cap, D, device=dev, dtype=bf)
+    V = torch.randn(Hk, cap, D, device=dev, dtype=bf)
+    Kp, Vp = _position_major(K), _position_major(V)
+    assert (Kp.stride(0), Kp.stride(1)) == (D, Hk * D) and torch.equal(Kp, K)
+    q = torch.randn(T, Hq, D, device=dev, dtype=bf)
+    scale = 1.0 / math.sqrt(D)
+    par = [-1, 0, 1, 0]
+    assert torch.equal(_attn_split(cu, q, Kp, Vp, n0, par, scale), _attn_split(cu, q, K, V, n0, par, scale))
+    if Hq // Hk > 1:
+        grouped = _attn_split(cu, q, Kp, Vp, n0, par, scale, shared=0)
+        assert torch.equal(grouped, _attn_split(cu, q, K, V, n0, par, scale, shared=0))
+    base, step, W, rows = FORK
+    rw = _rows_layout(base, step, W, rows)
+    qr = torch.randn(len(rows), Hq, D, device=dev, dtype=bf)
+    assert torch.equal(_attn_rows(cu, qr, Kp, Vp, rw, scale), _attn_rows(cu, qr, K, V, rw, scale))
+    # the write: a pass's rows land at the same logical slots whichever layout holds them
+    wq = torch.rand(D, device=dev, dtype=bf) + 0.5
+    wk = torch.rand(D, device=dev, dtype=bf) + 0.5
+    cos_t, sin_t = _rope_tables(cap, D)
+    qkv = torch.randn(T, (Hq + 2 * Hk) * D, device=dev, dtype=bf)
+    depth = torch.tensor([0, 1, 2, 1], dtype=torch.int32, device=dev)
+    n0t = torch.tensor([n0], dtype=torch.int32, device=dev)
+    written = []
+    for lay in (lambda t: t, _position_major):
+        Kw, Vw = lay(torch.zeros(Hk, cap, D, device=dev, dtype=bf)), lay(torch.zeros(Hk, cap, D, device=dev, dtype=bf))
+        qo = torch.empty(T, Hq, D, device=dev, dtype=bf)
+        cu.launch(
+            f"btb_norm_rope_kv_d{D}",
+            (Hq + 2 * Hk, T, 1),
+            (32, 1, 1),
+            [P(qkv), P(wq), P(wk), Fl(eps), P(cos_t), P(sin_t), P(n0t), P(depth), P(Kw), P(Vw), P(qo)]
+            + [I(T), I(Hq), I(Hk), I(Kw.stride(0)), I(Kw.stride(1)), I(0)],
+        )
+        written.append((Kw, Vw, qo))
+    (k0, v0, q0), (k1, v1, q1) = written
+    assert torch.equal(k0, k1) and torch.equal(v0, v1) and torch.equal(q0, q1)
 
 
 @pytest.mark.parametrize("win", [0, 128])
@@ -267,7 +320,8 @@ def _attn_rows(
             I(T),
             I(Hq),
             I(Hk),
-            I(cap),
+            I(K.stride(0)),
+            I(K.stride(1)),
             Fl(scale),
             P(pm),
             P(pl),
@@ -338,7 +392,7 @@ def test_norm_rope_kv_rows_writes_each_row_as_its_own_step(
     V = torch.zeros_like(K)
     qo = torch.zeros(T, Hq, D, device=dev, dtype=bf)
     rw = _rows_layout(base, step, W, rows)
-    common = [I(T), I(Hq), I(Hk), I(cap), I(0)]
+    common = [I(T), I(Hq), I(Hk), I(K.stride(0)), I(K.stride(1)), I(0)]
     cu.launch(
         f"btb_norm_rope_kv_rows_d{D}",
         (Hq + 2 * Hk, T, 1),
@@ -378,7 +432,8 @@ def test_norm_rope_kv_rows_writes_each_row_as_its_own_step(
                 I(1),
                 I(Hq),
                 I(Hk),
-                I(cap),
+                I(K1.stride(0)),
+                I(K1.stride(1)),
                 I(0),
             ],
         )
@@ -428,7 +483,8 @@ def test_norm_rope_kv_is_bit_exact_against_the_fused_ops(cu: _Cuda, D: int) -> N
             I(T),
             I(Hq),
             I(Hk),
-            I(cap),
+            I(K.stride(0)),
+            I(K.stride(1)),
             I(0),
         ],
     )
