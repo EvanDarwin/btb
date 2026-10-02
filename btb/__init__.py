@@ -151,7 +151,8 @@ def plan(
         vram_reserve_gb = (
             BatchScheduler.vram_margin_gb(torch.cuda.get_device_properties(str(dev)).total_memory) if card else 0.0
         )
-    p = StreamedTextModel(path, device="cpu", resident_head=False, log=quiet)
+    # priced from the checkpoint's headers: no layer read, no expert store (`weights=False`)
+    p = StreamedTextModel(path, device="cpu", resident_head=False, log=quiet, weights=False)
     try:
         if p.pack is not None and p.pack["format"] == PACK12_FORMAT:
             p.open_packed()

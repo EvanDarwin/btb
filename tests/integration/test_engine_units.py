@@ -26,6 +26,7 @@ from btb.engine.generate import _chains_tree
 from btb.kinds import Json, LayerKind, TokenRows
 from tests.cert import spec
 from tests.helpers import (
+    NO_LOG,
     ROOT,
     fixture,
     forward_logits,
@@ -358,7 +359,49 @@ def test_a_presized_layer_holds_the_answer_as_well_as_the_prompt() -> None:
     assert layer._buf[0] is buf, "the answer grew a presized layer"
     plain = GrowLayer()
     plain.presize(40, 1, 2, 8, torch.bfloat16, where(torch.device("cpu")))
-    assert plain._buf is not None and plain._buf[0].shape[-2] == 40, "no reach named: the prompt's rows"
+    assert plain._buf is not None and plain._buf[0].shape[-2] == 40 + 4096, "no reach named: a growth step past it"
+
+
+def test_a_reach_far_past_the_rows_is_a_ceiling_not_a_reservation() -> None:
+    """`cap_hint` names the most the rows can reach; growth goes in steps up to it. An answer left uncapped (`btb
+    run` with no --new) names the whole window, and reserved up front that was 262144 positions of Qwen3-4B's cache -
+    36 GB asked for a 22-token prompt, committed where the RAM held it and the load refused where it did not. The
+    first append, a presize, a landing and the growth the ledger prices all take one step past the rows instead"""
+    window = 262144
+    layer = GrowLayer(cap_hint=window)
+    layer.update(*_kv(1, 2, 22, 8, fill=1.0))
+    assert layer._buf[0].shape[-2] == 4096, "the first append takes a step, not the window"
+    assert layer.growth(1, 1, 2, 8, torch.float32) == 0, "the next token appends in place"
+    # 4096 more rows outrun the buffer: the growth priced is the next step (8192 rows of K and V), not the window
+    assert layer.growth(1, 4096, 2, 8, torch.float32) == 2 * 1 * 2 * 8192 * 8 * 4
+    cpu = where(torch.device("cpu"))
+    pre = GrowLayer(cap_hint=window)
+    pre.presize(40, 1, 2, 8, torch.bfloat16, cpu)
+    assert pre._buf is not None and pre._buf[0].shape[-2] == 40 + 4096, "a presize takes a step past the prompt"
+    hop = GrowLayer(cap_hint=window)
+    kb = torch.empty(1, 2, 64, 8, dtype=torch.bfloat16)
+    hop.hop(kb, torch.empty_like(kb))
+    hop.update(*_kv(1, 2, 40, 8, fill=1.0))
+    hop.land(cpu, torch.float32)
+    assert hop._buf is not None and hop._buf[0].shape[-2] == 40 + 4096, "a landing takes a step past the rows"
+    # a reach just past the rows cuts the step there: a capped answer's buffer is its own rows, no more
+    near = GrowLayer(cap_hint=4200)
+    near.update(*_kv(1, 2, 4096, 8, fill=1.0))
+    near.update(*_kv(1, 2, 1, 8, fill=2.0))
+    assert near._buf[0].shape[-2] == 4200
+
+
+def test_an_uncapped_answers_cache_grows_from_the_prompt_not_the_window() -> None:
+    """the engine's cache for an answer left to run to the window (`new_cache(max_len=the window)`, as `generate`
+    makes it with no max_new): a prompt's pass leaves every layer a step past its rows, not the window's rows"""
+    window = 262144
+    with loaded_model(fixture("tiny_qwen3"), device="cpu", context=window) as sm:
+        cache = sm.new_cache(max_len=window)
+        sm.forward([list(range(5, 27))], cache=cache)
+        rows = {int(cl._buf[0].shape[-2]) for cl in cache.layers if isinstance(cl, GrowLayer) and cl._buf is not None}
+        assert rows and max(rows) <= 22 + 4096, (
+            f"a 22-token prompt's cache took {sorted(rows)} rows of a {window} window"
+        )
 
 
 def test_a_hopped_layer_lands_where_its_next_token_appends_in_place() -> None:
@@ -1235,3 +1278,45 @@ def test_a_layer_shed_to_the_drive_off_a_weight_not_stored_as_bf16_answers_as_fr
         assert sm.ram_regrow() == i and not sm.cold
         after = sm.generate(REPEATING, 12, speculate=False).tokens
         assert after == before
+
+
+@pytest.mark.parametrize("name", ["tiny_qwen3", "tiny_gpt_oss"])
+def test_plan_and_pack_read_no_layer_and_build_no_store(
+    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`btb.plan` prices a model and `pack_model` walks its tensors, both from the checkpoint, through an engine
+    that runs no pass. That engine read a layer into a template - on the CPU a copy of the whole layer, 256 MB at
+    Qwen3-4B on every load - and built a mixture's expert store, budgeted at all the free RAM. Opened without its
+    weights it reads neither, and prices the placement exactly as an engine holding them does"""
+    from btb.engine import model as engine_model
+    from btb.engine import pack_model
+    from btb.engine.tiers import _TiersMixin
+
+    native_library()  # the store is built only where the native reader is bound, as in a load
+    path = fixture(name)
+    kw: dict[str, Any] = {"ram_gb": 64.0, "vram_gb": 2.0, "packed": False, "fp32": False, "drafter": False}
+    priced = []
+    for weights in (True, False):
+        # the engine `plan` opened before (every layer streamed, so a template of each kind), then the one it opens
+        sm = StreamedTextModel(path, device="cpu", resident_head=False, log=NO_LOG, weights=weights)
+        try:
+            if weights:
+                assert sm.templates and (sm.expert_store is not None) == sm.fam.moe, "the fixture builds both"
+            else:
+                assert not sm.templates and sm.expert_store is None
+            priced.append(sm.plan_budget(**kw))
+        finally:
+            sm.close()
+    assert priced[1] == priced[0], "the headers price the placement as the weights do"
+
+    def refused(what: str) -> Any:
+        def call(*_a: Any, **_k: Any) -> Any:
+            raise AssertionError(f"{what} while pricing or packing")
+
+        return call
+
+    monkeypatch.setattr(_TiersMixin, "_load_layer", refused("a layer read"))
+    monkeypatch.setattr(engine_model, "_ExpertStore", refused("an expert store built"))
+    pl = btb.plan(path, device="cpu")
+    assert len(pl.resident) + len(pl.host) + len(pl.cold) == layer_count(path)
+    pack_model(path, out_dir=str(tmp_path / "packed"), log=NO_LOG)

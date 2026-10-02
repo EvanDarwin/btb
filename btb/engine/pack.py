@@ -95,7 +95,9 @@ def pack_model(model_dir: str, out_dir: str | None = None, prefix_filter: str = 
     in_cache = out_dir is None and cache_repo_id(model_dir) is not None
     out_dir = os.path.normpath(out_dir) if out_dir else pack_dir(model_dir)
     source = source_for(model_dir, out_dir)
-    sm = StreamedTextModel(model_dir, device="cpu", resident_head=False, log=lambda *_a: None)
+    # the checkpoint walked by its tensors (`_get`, views of the shards): no layer read into a template, no expert
+    # store (`weights=False`)
+    sm = StreamedTextModel(model_dir, device="cpu", resident_head=False, log=lambda *_a: None, weights=False)
     try:
         # an MXFP4 expert is already 4.25 bits and the expert store reads it out of the checkpoint as it is:
         # the 12-bit store has nothing to add and would write the model's bulk a second time

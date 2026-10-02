@@ -120,7 +120,6 @@ class GrowLayer(_DynamicLayer):
 
     def __init__(
         self,
-        reserve: int = 0,
         shared: bool = False,
         bits: int | None = None,
         cap_hint: int = 0,
@@ -175,7 +174,6 @@ class GrowLayer(_DynamicLayer):
         self._shape = None
         self._b = 0
         super().__init__()
-        self.reserve = int(reserve)
 
     # -- torch's view of the cache --
     @property
@@ -567,34 +565,36 @@ class GrowLayer(_DynamicLayer):
         the bare ceiling would refuse the top of every long run. 0 where no ceiling is known (no check)."""
         return self.bound + max(4096, self.bound // 8) if self.bound else 0
 
+    def _ceiling(self, cap: int, need: int) -> int:
+        """`cap` rows held to the most these rows can reach where the caller named it (`cap_hint`: the prompt and
+        its answer's cap) - a ceiling, never a reservation. Reserved up front, an answer left uncapped (`btb run` with
+        no --new: the window's 262144 positions on Qwen3-4B) asked 36 GB of cache for a 22-token prompt"""
+        return min(cap, max(need, self.cap_hint)) if self.cap_hint else cap
+
+    def _step(self, need: int, have: int) -> int:
+        """the rows a growth past `have` makes to hold `need`: an eighth more, at least 4096, held to the ceiling - so
+        a short decode's buffer is its own few rows, not the 4096-position floor times the batch"""
+        return self._ceiling(max(need, have + max(4096, have // 8), 4096), need)
+
     def _mx_cap(self, need: int, have: int) -> int:
         """the rows a new shared buffer holds for `need` rows, `have` the rows of the one it replaces"""
         if have >= need:
             return have
-        if self.cap_hint:
-            # the caller knows how far these rows run (prompt + max_new): reserved once, no regrowth
-            return max(need, self.cap_hint)
-        return max(need, have + max(4096, have // 8), 4096)
+        return self._step(need, have)
 
-    def _torch_cap(self, need: int, have: int, host: bool) -> int:
+    def _torch_cap(self, need: int, have: int) -> int:
         """the rows a new torch buffer holds for `need` rows, `have` the rows of the one it replaces"""
-        if self.cap_hint:
-            # the caller knows how far this sequence runs (prompt + max_new): reserve exactly that once, so a
-            # short decode does not take the 4096-position floor times the batch and OOM
-            return max(need, self.cap_hint)
         if have >= need:
             # only the placement changed - the batch, the dtype or the device (a layer shed to the host and
             # regrown, its rows cast on each move): the rows keep their capacity and the buffer is re-cut at the
             # same size where they now live. Growing an eighth on every move compounded a 0.6B model's cache to
             # gigabytes over one answer
             return have
-        cap = max(need, have + max(4096, have // 8), 4096)
-        return max(cap, self.reserve + 1024) if host and self.reserve else cap
+        return self._step(need, have)
 
-    def growth(self, B: int, T: int, Hk: int, d: int, dtype: torch.dtype, host: bool) -> int:
+    def growth(self, B: int, T: int, Hk: int, d: int, dtype: torch.dtype) -> int:
         """The bytes the next append of T rows to B sequences allocates: a new buffer where they do not fit the
-        layer's own, 0 where they do. `host`: the rows land in the host's memory. A fork's or a batch's layer
-        grows its step buffer by its own and reads 0."""
+        layer's own, 0 where they do. A fork's or a batch's layer grows its step buffer by its own and reads 0."""
         if self._ns is not None or self._flat:
             return 0
         need = self.get_seq_length() + T if self.is_initialized else T
@@ -613,7 +613,7 @@ class GrowLayer(_DynamicLayer):
             if buf[0].shape[-2] >= need:
                 return 0
         have = int(buf[0].shape[-2]) if buf is not None else 0
-        return 2 * B * Hk * self._torch_cap(need, have, host) * d * dtype.itemsize
+        return 2 * B * Hk * self._torch_cap(need, have) * d * dtype.itemsize
 
     def _ensure(self, B: int, Hk: int, need: int, d: int, dtype: torch.dtype) -> None:
         m = mlxdev.mx()
@@ -774,12 +774,12 @@ class GrowLayer(_DynamicLayer):
         the cache does not grow while the sweep's working set is live around it - a buffer grown then would sit
         inside the one block the pass's own buffers are cut from, and split it for good. Granted as a growth is,
         the buffer it replaces counted; nothing where the buffer holds that many rows already, and nothing for rows
-        of another shape (left to their own growth). As long as the sequence's own reach where the caller named it
-        (`cap_hint`, the prompt and its answer), as the growth is priced: sized to the prompt alone, the answer's first
-        token grew every layer again - a second whole buffer each, copied, shedding layers to make the room."""
+        of another shape (left to their own growth). With a growth step's room past the prompt, held to the
+        sequence's reach where the caller named it (`_step`): sized to the prompt alone, the answer's first token grew
+        every layer again - a second whole buffer each, copied, shedding layers to make the room."""
         if self.shared:
             return
-        rows = max(int(rows), int(self.cap_hint or 0))
+        rows = self._step(int(rows), int(rows))
         b = self._buf
         if (
             b is not None
@@ -830,14 +830,14 @@ class GrowLayer(_DynamicLayer):
             self._set_rows(kb[..., :n, :], vb[..., :n, :])
 
     def land(self, dev: Where, dtype: torch.dtype) -> None:
-        """The rows back from a hop onto `dev` in a buffer of `dtype` as long as a growth there would make it
-        (`_torch_cap`: the sequence's reach where it is named), granted as that growth is: the layer's next append
-        writes in place. Copied back as they were (a tight copy in the card's dtype), the answer's first token on
+        """The rows back from a hop onto `dev` in a buffer of `dtype` with a growth step's room past them (`_step`,
+        held to the sequence's reach where it is named), granted as that growth is: the layer's next append writes in
+        place. Copied back as they were (a tight copy in the card's dtype), the answer's first token on
         the host grew every host layer again in float32 at once, beside the rows it replaced - 2.6 GB asked in one
         step of a 40k prompt's answer, refused"""
         k, v = self.keys, self.values
         B, Hk, n, d = (int(x) for x in k.shape)
-        cap = self._torch_cap(n, 0, dev.type == "cpu")
+        cap = self._step(n, n)
         el = torch.empty(0, dtype=dtype).element_size()
         if self.grant is not None:
             self.grant(
@@ -936,7 +936,7 @@ class GrowLayer(_DynamicLayer):
             self._set_rows(self._buf[0][..., :n, :], self._buf[1][..., :n, :])
         if not fits:
             have = self._buf[0].shape[-2] if self._buf is not None else 0
-            cap = self._torch_cap(n + T, have, key_states.device.type == "cpu")
+            cap = self._torch_cap(n + T, have)
             if self.grant is not None:
                 self.grant(
                     2 * B * Hk * cap * d * key_states.element_size(),

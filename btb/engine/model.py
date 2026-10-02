@@ -24,7 +24,7 @@ from ..mlx.q6k import gather_q6k
 from ..options import Device as DeviceKind
 from ..options import DeviceName
 from ..pack12 import parent_dir
-from ..sysinfo import host_free_bytes
+from ..sysinfo import host_free_bytes, vram_pressure_close
 from . import device as device_mod
 from .cache import GrantedIndexedLayer, GrowLayer
 from .cuda import _CudaMixin
@@ -143,6 +143,7 @@ class StreamedTextModel(
         bus_pass: bool = True,
         store_pin: int = 0,
         sparse: bool = False,
+        weights: bool = True,
     ) -> None:
         from transformers import AutoConfig
 
@@ -316,7 +317,10 @@ class StreamedTextModel(
         self.rotary = self.fam.rotary(config=cfg).to(self.dev)
         _res_set = {int(x) for x in resident_layers}
         _host_set = {int(x) for x in cpu_layers} - _res_set
-        self._streamed_any = any(i not in _res_set and i not in _host_set for i in range(self.L))
+        # `weights` off: an engine opened to price its layers from the checkpoint's headers (`btb.plan`), which
+        # runs no pass - so it reads no layer into a template (on the CPU a copy of the whole layer) and builds no
+        # expert store
+        self._streamed_any = weights and any(i not in _res_set and i not in _host_set for i in range(self.L))
         self.prefill_card = bool(prefill_card) and self.dev.type == DeviceKind.CUDA
         self.prefill_card_min = int(prefill_card_min)
         if self.prefill_card:
@@ -396,7 +400,7 @@ class StreamedTextModel(
         # bookkeeping its only cost), and the store's pages pageable unless `store_pin` asks for pinned ones
         self.bus_pass = bool(bus_pass)
         self.store_pin = int(store_pin)
-        if self.fam.moe and Native.read_direct is not None and expert_cache_gb != 0:
+        if weights and self.fam.moe and Native.read_direct is not None and expert_cache_gb != 0:
             if expert_cache_gb is None:
                 # the MLX tier's ledger: the RAM the load started with, less the reserve, less what MLX holds; the
                 # OS's free count reads high for untouched Metal buffers
@@ -732,6 +736,12 @@ class StreamedTextModel(
                 # the machine's commit on Windows. Let go by the last engine on a card only: another may be mid-GEMM
                 torch._C._cuda_clearCublasWorkspaces()
                 torch._C._host_emptyCache()
+                # and what btb keeps for the card: the GPU counters' query, and the card's kernels - the module
+                # out of the driver - once nothing that launches them is left (a graph a failed release kept
+                # still holds them)
+                vram_pressure_close()
+                if self._closed:
+                    Native.unload_cuda()
         if draft_error is not None:
             self.draft_engine, self._closed = draft, False
             errors = [draft_error, *errors]
@@ -847,7 +857,6 @@ class StreamedTextModel(
         for i, layer in enumerate(cache.layers):
             if type(layer) is DynamicLayer or (flat and isinstance(layer, DynamicLayer)):
                 cache.layers[i] = GrowLayer(
-                    reserve=self.context or 0,
                     shared=self.mlx is not None,
                     bits=self.kv_bits if self.mlx is not None else None,
                     cap_hint=int(max_len or 0),

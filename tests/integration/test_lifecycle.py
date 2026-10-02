@@ -68,3 +68,35 @@ def test_a_load_that_fails_after_the_engine_is_built_closes_it(monkeypatch: Monk
     # the engine load built, not its placement probe (closed however the load ends): the one given a draft slot
     engines = [e for e in built if "draft_engine" in vars(e)]
     assert len(engines) == 1 and len(engines[0].holdings) == 0, "the built engine was closed"
+
+
+def test_the_last_engine_off_the_card_lets_go_of_the_kernels_and_the_gpu_counters() -> None:
+    """What btb keeps for the card while an engine is on one - its kernels' module in the driver, the GPU counters'
+    query - was let go of only with the process. The last engine to close lets go of both, a kernel handle kept
+    from before refuses to launch, and the next load takes them again and decodes as the first did."""
+    import sys
+
+    from btb import sysinfo
+    from btb.engine.native import Native
+    from tests.helpers import need_cuda
+
+    dev = need_cuda()
+    prompt = [(5 * i + 2) % 200 + 2 for i in range(24)]
+    sm = btb.load(fixture("tiny_qwen3"), device=dev, log=NO_LOG)
+    first = sm.generate(prompt, 8, speculate=False).tokens
+    k = Native.card_kernels()
+    assert k is not None and Native.cuda is k
+    sysinfo.vram_pressure()  # the read the card's memory policy keeps its query open for
+    assert bool(sysinfo._PDH) == (sys.platform == "win32")
+    sm.close()
+    assert Native.cuda is None and k.module is None, "the module is out of the driver"
+    assert not sysinfo._PDH, "the GPU counters' query is closed"
+    with pytest.raises(RuntimeError, match="let go with the last engine on the card"):
+        k.launch(k.KERNELS[0], (1, 1, 1), (1, 1, 1), [])
+    sm = btb.load(fixture("tiny_qwen3"), device=dev, log=NO_LOG)
+    try:
+        again = Native.card_kernels()
+        assert again is not None and again is not k and again.module is not None
+        assert sm.generate(prompt, 8, speculate=False).tokens == first
+    finally:
+        sm.close()

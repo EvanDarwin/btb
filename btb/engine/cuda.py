@@ -13,7 +13,7 @@ import os
 import sys
 import time
 import weakref
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -829,17 +829,18 @@ class _CudaMixin(_State):
         st["tables"] = tb
         return tb
 
-    def _card_arena(self, st: dict[str, Any], need: int) -> dict[str, Any]:
+    def _card_arena(self, st: dict[str, Any], need: int, reach: int = 0) -> dict[str, Any]:
         """the arena holding every run layer's cache rows, one tensor [runs' layers, 2, Hk, cap, d] the caches
-        attach to (a cache attached elsewhere copies its rows in), at least `need` rows deep; grown by
-        reallocation (rows copied over, graphs dropped) when a context outruns it. Its front lies in a
-        persisting-L2 window, so a short context's attention reads hit L2 under the weights' evict-first loads"""
+        attach to (a cache attached elsewhere copies its rows in), at least `need` rows deep and `reach` deep when it
+        is made (`_card_reach`: a growth step past the rows); grown by reallocation (rows copied over, graphs dropped)
+        when a context outruns it. Its front lies in a persisting-L2 window, so a short context's attention reads hit
+        L2 under the weights' evict-first loads"""
         ar = st["arena"]
         if ar is not None and ar["cap"] >= need:
             return ar
         H, Hq, Hk, D, I = self._card_dims()
         layers = [i for a, b in st["segments"] for i in range(a, b)]
-        cap = max(int(need), 4096)
+        cap = max(int(need), int(reach), 4096)
         cap = (cap + 1023) // 1024 * 1024
         nbytes = len(layers) * 2 * Hk * cap * D * 2
         sched = getattr(self, "scheduler", None)
@@ -887,6 +888,15 @@ class _CudaMixin(_State):
         )
         return new
 
+    @staticmethod
+    def _card_reach(cache: Any, layers: Iterable[int], rows: int) -> int:
+        """the rows the arena takes for `cache` holding `rows`: a growth step past them (an eighth, at least 4096),
+        held to the most its layers reach where the caller named it (`cap_hint`) - a ceiling, never a reservation:
+        an answer left uncapped names the whole window, and an arena that deep was asked of the card up front"""
+        step = rows + max(4096, rows // 8)
+        hint = max((int(getattr(cache.layers[i], "cap_hint", 0) or 0) for i in layers), default=0)
+        return min(step, max(rows, hint)) if hint else step
+
     def _card_adopt_cache(self, cache: Any) -> None:
         """a new cache takes the arena when no live cache holds it and it reaches as far as the cache will, so its
         prefill writes straight in. An arena the cache would grow is left to the prefill's sweep (`_card_arena_take`),
@@ -899,8 +909,7 @@ class _CudaMixin(_State):
         owner = ar["owner"]() if ar["owner"] is not None else None
         if owner is not None and owner is not cache:
             return
-        reach = max((int(getattr(cache.layers[i], "cap_hint", 0) or 0) for i in ar["slot"]), default=0)
-        if reach > int(ar["cap"]):
+        if self._card_reach(cache, ar["slot"], 0) > int(ar["cap"]):
             return
         self._card_arena_holds(cache, 0)
 
@@ -951,8 +960,8 @@ class _CudaMixin(_State):
         for i in layers:
             layer = cache.layers[i]
             n = layer.get_seq_length() if layer.is_initialized else 0
-            need = max(need, n + T, int(getattr(layer, "cap_hint", 0) or 0))
-        ar = self._card_arena(st, need)
+            need = max(need, n + T)
+        ar = self._card_arena(st, need, self._card_reach(cache, layers, need))
         owner = ar["owner"]() if ar["owner"] is not None else None
         if owner is not cache:
             self._card_evict(ar)

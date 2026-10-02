@@ -771,7 +771,8 @@ class Native(metaclass=_Binding):
                     setattr(cls, name, _checked(name, bound))
         return cls.gemv
 
-    # the card's own kernels (a `_Cuda`), bound by `load_cuda` once per process; None until then
+    # the card's own kernels (a `_Cuda`), bound by `load_cuda` while an engine is on a card; None until then and
+    # again once the last one closes (`unload_cuda`)
     cuda: Any = None
     cuda_reason: str | None = None  # why they are not bound, once `card_kernels` tried and failed
 
@@ -780,6 +781,14 @@ class Native(metaclass=_Binding):
         if cls.cuda is None:
             cls.cuda = _Cuda(fatbin_path)
         return cls.cuda
+
+    @classmethod
+    def unload_cuda(cls) -> None:
+        """the card's kernels let go - the module and its image out of the driver - by the last engine on a card
+        to close; the next `card_kernels` loads them again"""
+        k, cls.cuda = cls.cuda, None
+        if k is not None:
+            k.close()
 
     @classmethod
     def card_kernels(cls) -> _Cuda | None:
@@ -954,11 +963,14 @@ class _Cuda:
         dev0 = ctypes.c_int(torch.cuda.current_device())
         ctx = ctypes.c_void_p()
         self._call("cuDevicePrimaryCtxRetain", ctypes.byref(ctx), dev0)
+        self._retained = dev0
         self._call("cuCtxSetCurrent", ctx)
+        # the image is the driver's once loaded (it copies what it keeps): read for the call, not held after it
         with open(fatbin_path, "rb") as fh:
-            self._image = fh.read()
-        self.module = ctypes.c_void_p()
-        self._call("cuModuleLoadData", ctypes.byref(self.module), ctypes.c_char_p(self._image))
+            image = fh.read()
+        self.module: ctypes.c_void_p | None = ctypes.c_void_p()
+        self._call("cuModuleLoadData", ctypes.byref(self.module), ctypes.c_char_p(image))
+        del image
         self.fn: dict[str, ctypes.c_void_p] = {}
         for k in self.KERNELS:
             f = ctypes.c_void_p()
@@ -1020,6 +1032,11 @@ class _Cuda:
     ) -> None:
         """Launch kernel `name` with `args` - each a ctypes value (c_void_p for a pointer, c_int, c_float) - on
         `stream` (the current torch stream by default)."""
+        if self.module is None:
+            raise RuntimeError(
+                f"[cuda] {name}: the card's kernels were let go with the last engine on the card "
+                "(`Native.unload_cuda`); `Native.card_kernels()` loads them again"
+            )
         n = len(args)
         params = (ctypes.c_void_p * n)(*[ctypes.addressof(a) for a in args])
         st = (stream or torch.cuda.current_stream()).cuda_stream
@@ -1037,6 +1054,16 @@ class _Cuda:
             params,
             None,
         )
+
+    def close(self) -> None:
+        """The module unloaded - its code and the driver's copy of the image - and the primary context's retain
+        given back; the function handles go with it. Safe to call twice"""
+        if self.module is None:
+            return
+        module, self.module = self.module, None
+        self.fn = {}
+        self._call("cuModuleUnload", module)
+        self._call("cuDevicePrimaryCtxRelease", self._retained)
 
     @staticmethod
     def ptr(t: torch.Tensor | None) -> ctypes.c_void_p:

@@ -1079,14 +1079,14 @@ class _MemoryMixin(_State):
         d = int(getattr(c, "head_dim", None) or c.hidden_size // hq)
         grows = False
         if first is not None:
-            dev0, dt0 = self._kv_home(*first)
+            _dev0, dt0 = self._kv_home(*first)
             # the layers grow together: the first one fitting is the pass needing nothing of them
-            grows = bool(first[1].growth(B, T, Hk, d, dt0, dev0.type == Device.CPU))
+            grows = bool(first[1].growth(B, T, Hk, d, dt0))
         most: dict[Where, int] = {}
         for i, cl in enumerate(cache.layers):
             if isinstance(cl, GrowLayer) and grows:
                 dev, dt = self._kv_home(i, cl)
-                g = cl.growth(B, T, Hk, d, dt, dev.type == Device.CPU)
+                g = cl.growth(B, T, Hk, d, dt)
                 most[dev] = max(most.get(dev, 0), g)
             elif isinstance(cl, GrantedIndexedLayer):
                 dev, dt = self._kv_home(i, cl)

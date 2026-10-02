@@ -9,6 +9,7 @@ import ctypes
 import ctypes.util
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from functools import lru_cache
@@ -471,9 +472,11 @@ def memory_pressure() -> Json:
 
 # -- the GPU memory the OS reports for this process and the adapters it shares, through Windows PDH ----------
 # opening a query and adding its four counters cost ~4 ms a call - longer than a small model's whole decode
-# step - where a collect on a kept query is a fraction of a millisecond; the query lives for the process
+# step - where a collect on a kept query is a fraction of a millisecond; the query is kept while an engine is on a
+# card and closed with the last (`vram_pressure_close`): its counter providers hold tens of MB of the process
 _PDH_FMT = 0x00000400 | 0x00001000
 _PDH: dict[int, Any] = {}
+_PDH_LOCK = threading.Lock()  # a read on a watcher's thread and the close on the engine's never cross
 
 
 class _PdhV(ctypes.Union):
@@ -516,6 +519,20 @@ def vram_pressure(pid: int | None = None) -> Json | None:
     if sys.platform != "win32":
         return None
     pid = os.getpid() if pid is None else int(pid)
+    with _PDH_LOCK:
+        return _vram_pressure(pid)
+
+
+def vram_pressure_close() -> None:
+    """every kept query closed (`vram_pressure` opens one again on its next read): the last engine on a card
+    closing lets go of what its counter providers hold"""
+    with _PDH_LOCK:
+        for pdh, q, _hs in _PDH.values():
+            pdh.PdhCloseQuery(q)
+        _PDH.clear()
+
+
+def _vram_pressure(pid: int) -> Json | None:
     st = _PDH.get(pid)
     if st is None:
         st = _pdh_open(pid)
