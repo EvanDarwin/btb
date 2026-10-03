@@ -217,10 +217,14 @@ def test_the_experts_linear_widens_what_no_kernel_multiplies(monkeypatch: Monkey
     tags.clear()
     for name, w in forms.items():
         got = ex._linear(x, w)
-        dense = (
-            torch.cat([mx.dequantize(torch.float32)] * 2) if isinstance(w, MxGateUp) else w.dequantize(torch.float32)
-        )
-        assert torch.equal(got, F.linear(x, dense)), f"{name}: not the widened matrix's product"
+        if isinstance(w, MxGateUp):
+            # the gate and the up are each their own widened product, joined: one product of the two stacked is
+            # not the same bits on every host's BLAS (arm64's sums a row of a taller matrix otherwise)
+            half = F.linear(x, mx.dequantize(torch.float32))
+            want = torch.cat([half, half], dim=-1)
+        else:
+            want = F.linear(x, w.dequantize(torch.float32))
+        assert torch.equal(got, want), f"{name}: not the widened matrix's product"
         torch.testing.assert_close(got, kernel[name], rtol=1e-5, atol=1e-5, msg=f"{name}: parts from the kernel")
     assert tags == {PassTag.EXPERT_MXFP4_DEQUANT, PassTag.EXPERT_FP8_WIDENED}
     w = torch.randn(32, 64, generator=g).bfloat16()

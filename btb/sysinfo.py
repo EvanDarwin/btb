@@ -632,12 +632,16 @@ class _VideoMemoryInfo(ctypes.Structure):
 
 def _com(obj: ctypes.c_void_p, slot: int, *argtypes: Any) -> Any:
     """the COM method in vtable `slot` of `obj`; a failing HRESULT raises OSError"""
+    if sys.platform != "win32":
+        raise OSError("[sysinfo] COM is a Windows interface")
     vtbl = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
     return ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p, *argtypes)(vtbl[slot])
 
 
 def _com_ref(obj: Any, slot: int) -> None:
     """IUnknown's AddRef (slot 1) or Release (slot 2) on `obj`: each returns the new count, not an HRESULT"""
+    if sys.platform != "win32":
+        return
     if obj:
         vtbl = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
         ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl[slot])(obj)
@@ -833,6 +837,8 @@ def wddm_budget_stale(reg: BudgetEvent, name: str, total: int, ordinal: int | No
 
 def wddm_budget_unregister(reg: BudgetEvent) -> None:
     """the budget event `wddm_budget_event` registered, unregistered, its handle closed and its adapter released"""
+    if sys.platform != "win32":
+        return
     # UnregisterVideoMemoryBudgetChangeNotification returns void, not an HRESULT: called through its own prototype
     vtbl = ctypes.cast(reg.adapter, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
     ctypes.WINFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint32)(vtbl[17])(reg.adapter, ctypes.c_uint32(reg.cookie))
@@ -868,6 +874,8 @@ def release_pages(ptr: int, nbytes: int) -> None:
 
 def wait_event(handle: int, timeout_s: float) -> bool:
     """whether the Windows event `handle` was signalled within `timeout_s` seconds"""
+    if sys.platform != "win32":
+        raise RuntimeError("[sysinfo] WaitForSingleObject is a Windows call")
     k32 = ctypes.windll.kernel32
     k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
     k32.WaitForSingleObject.restype = ctypes.c_uint32

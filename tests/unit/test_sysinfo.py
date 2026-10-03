@@ -4,6 +4,8 @@ the OS's own word on its memory floor and pressure. Reads this process and the O
 
 import os
 import sys
+from collections.abc import Iterator
+from typing import Any
 
 import pytest
 
@@ -72,7 +74,20 @@ def test_the_os_speaks_for_its_own_memory() -> None:
     assert p["level"] >= 0.0
 
 
-def test_the_wddm_budget_is_read_for_the_card_dxgi_names_and_none_elsewhere() -> None:
+@pytest.fixture
+def wddm_cache(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[Any, Any]]:
+    """sysinfo's adapter cache, the test's own: the lookups it makes - a card not found, the card's adapter - are let
+    go after it, not left in the process for another test's lookup of the same card to find"""
+    from btb import sysinfo
+
+    cache: dict[Any, Any] = {}
+    monkeypatch.setattr(sysinfo, "_WDDM", cache)
+    yield cache
+    for adapter, _at in cache.values():
+        sysinfo._com_release(adapter)
+
+
+def test_the_wddm_budget_is_read_for_the_card_dxgi_names_and_none_elsewhere(wddm_cache: dict[Any, Any]) -> None:
     """this process's WDDM budget room: None off Windows and for a card DXGI does not list; on Windows beside an
     NVIDIA card nvidia-smi names, a figure no larger than the card (the budget is at most the card, less what this
     torch-free process uses there: nothing)"""

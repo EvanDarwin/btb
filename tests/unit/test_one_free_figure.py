@@ -16,7 +16,7 @@ from __future__ import annotations
 import ast
 import os
 
-from tests.helpers import checkout
+import btb
 
 # the calls that read free memory, or what torch holds, directly
 READS = frozenset(
@@ -39,9 +39,16 @@ HOME = frozenset({"btb/engine/device.py", "btb/sysinfo.py"})
 NOTE = "free-read:"
 
 
+def _root() -> str:
+    """the directory the imported `btb` sits in: the checkout, or site-packages where the wheel's verification runs
+    these tests against the installed package (its source tree moved aside, a scan of the checkout's `btb` walked
+    nothing and passed blind)"""
+    return os.path.dirname(os.path.dirname(os.path.abspath(btb.__file__)))
+
+
 def _reads() -> list[tuple[str, int, str, str]]:
     """every direct read outside the ledger's home: (path, line, the call, the function it is in)"""
-    root = checkout()
+    root = _root()
     out = []
     for dirpath, _dirs, files in os.walk(os.path.join(root, "btb")):
         for f in files:
@@ -71,7 +78,7 @@ def _reads() -> list[tuple[str, int, str, str]]:
 
 def _noted(rel: str, line: int, lines: dict[str, list[str]]) -> bool:
     if rel not in lines:
-        lines[rel] = open(os.path.join(checkout(), rel), encoding="utf-8").read().splitlines()
+        lines[rel] = open(os.path.join(_root(), rel), encoding="utf-8").read().splitlines()
     src = lines[rel]
     return any(NOTE in src[i] for i in (line - 1, line - 2) if 0 <= i < len(src))
 
