@@ -1,8 +1,8 @@
 """transformers version-drift guard (cert-coverage-gaps #29). The floor `transformers>=5.16,<6` lets any minor
 inside the major install silently, and minor releases are where transformers changes model/family code - the
-qwen4 router-dtype failure IS a transformers-version issue. So the cert records the major.minor it was last
-validated against and this test fails when the installed version differs, forcing a dep bump to be a deliberate,
-re-certified event instead of silent drift.
+qwen4 router-dtype failure IS a transformers-version issue. So the cert records the newest major.minor it was
+validated against and this test fails when the installed version is newer, forcing a dep bump to be a deliberate,
+re-certified event instead of silent drift; or older than the pyproject floor, the oldest supported.
 
 Granularity is major.minor on purpose: a patch bump (bugfixes, no model-code change) would be noise, but a minor
 or major bump is exactly where family behavior moves and MUST re-run the cert. Torch-free - it reads the installed
@@ -51,13 +51,19 @@ def _pyproject_bounds() -> tuple[tuple[int, int], tuple[int, int] | None]:
     return lo, hi
 
 
-def test_transformers_matches_cert() -> None:
-    """the drift gate: the installed transformers must be the major.minor the cert was validated against."""
+def test_transformers_is_a_supported_version() -> None:
+    """the drift gate: the installed transformers sits between the pyproject floor (the oldest supported) and the
+    newest major.minor the cert was validated against. An older supported minor runs as the newest does; a newer one
+    is the drift this guards."""
     installed = _installed()
     if installed is None:
         pytest.skip("transformers not installed; nothing to guard (the engine cert installs it)")
-    assert installed == CERT_TRANSFORMERS, (
-        f"transformers {installed[0]}.{installed[1]} differs from the cert-validated "
+    lo, _hi = _pyproject_bounds()
+    assert installed >= lo, (
+        f"transformers {installed[0]}.{installed[1]} is below the supported floor {lo[0]}.{lo[1]} (pyproject)."
+    )
+    assert installed <= CERT_TRANSFORMERS, (
+        f"transformers {installed[0]}.{installed[1]} is newer than the cert-validated "
         f"{CERT_TRANSFORMERS[0]}.{CERT_TRANSFORMERS[1]}. A minor/major bump can change family/model behavior "
         f"(e.g. the qwen4 router dtype). Re-run the family cert on this version, then set CERT_TRANSFORMERS in "
         f"tests/cert/test_deps.py to {installed}."
