@@ -100,6 +100,38 @@ def _chains_tree(
     return guesses, parents, depth, children, tags
 
 
+class PassClock:
+    """A speculative pass's seconds, as the pricer takes them. On a card, the time the card spends between two events
+    on the stream the pass is launched on (the card graph's side streams join it): the pass's own work and the gaps
+    while the host launches it, not the work queued before it. Timed from the host, a pass's figure took whatever the
+    card still had in hand - the last commit's writes, the drafter's - so a one-row step read slow and a wide pass
+    fast or slow by what preceded it: 0.17 to 3.3 one-row steps between answers on one card, and where no width came
+    within a quarter over a step the answers took plain steps throughout. Elsewhere the wall clock: the host computes
+    as it goes. Read after the pass's results reached the host, when both events have completed."""
+
+    def __init__(self, dev: torch.device) -> None:
+        self.dev = dev
+        self.card = dev.type == "cuda"
+        self.ev = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) if self.card else None
+        self.t0 = self.t1 = 0.0
+
+    def start(self) -> None:
+        if self.ev is not None:
+            self.ev[0].record(torch.cuda.current_stream(self.dev))
+        self.t0 = time.perf_counter()
+
+    def stop(self) -> None:
+        if self.ev is not None:
+            self.ev[1].record(torch.cuda.current_stream(self.dev))
+        self.t1 = time.perf_counter()
+
+    def seconds(self) -> float:
+        if self.ev is not None:
+            self.ev[1].synchronize()  # done already where the results were read; a wait otherwise
+            return self.ev[0].elapsed_time(self.ev[1]) / 1e3
+        return self.t1 - self.t0
+
+
 def _children(parents: Sequence[int]) -> dict[int, list[int]]:
     """each tree node's children in node order, from the nodes' parents (node 0 the root)"""
     children: dict[int, list[int]] = {}
@@ -419,6 +451,7 @@ class _GenerateMixin(_State):
         # expert reads outweigh what their drafts return, a plain step where no width pays
         pricer = self._spec_pricer(v_max)
         pricer.begin()
+        clock = PassClock(self.dev)
         store = getattr(self, "expert_store", None)
         store_reads = getattr(store, "reads", None)
         store_waited = getattr(store, "waited", None)
@@ -575,6 +608,7 @@ class _GenerateMixin(_State):
             taps.clear()
             reads0 = store_reads() if store_reads is not None else 0
             wait0 = store_waited() if store_waited is not None else 0.0
+            clock.start()
             try:
                 out = self.forward(
                     [[cur, *guesses]],
@@ -596,7 +630,7 @@ class _GenerateMixin(_State):
             # the fused MLX path hands back the picks itself; the other paths the logits, picked here under the
             # same keys (a node's cache position)
             if out.dtype in (torch.int32, torch.int64):
-                am_all = out.tolist()
+                picked = out
             else:
                 if hk is not None and hk.needs_logits:
                     # each node's row read with the ids that reach it: the committed ones and its drafts
@@ -606,7 +640,9 @@ class _GenerateMixin(_State):
                     ]
                     out = hk.process(ctx, out.float())
                 keys = [smp.key_for(base_len + (depth[j] if tree_now else j)) for j in range(len(guesses) + 1)]
-                am_all = pick.pick_torch(out, keys).tolist()
+                picked = pick.pick_torch(out, keys)
+            clock.stop()
+            am_all = picked.tolist()
             tc = time.perf_counter()
             phase["forward"] += tc - tf
             if tree_now:
@@ -669,7 +705,7 @@ class _GenerateMixin(_State):
             deps_all = depth if tree_now else list(range(n_rows))
             pricer.record_pass(
                 n_rows,
-                tc - tf,
+                clock.seconds(),
                 (store_reads() - reads0) if store_reads is not None else 0,
                 (tf - tp) if drafted else None,
                 [(str(tags_all[j]), int(deps_all[j]), node_p[j - 1]) for j in range(1, n_rows)],

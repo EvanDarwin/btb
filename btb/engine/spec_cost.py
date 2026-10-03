@@ -46,6 +46,7 @@ the same widths.
 from __future__ import annotations
 
 import math
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -79,6 +80,7 @@ class SpecCost:
     PROBE_FAR = 64
     # passes past a width's last measure before the curve takes the warm-up's figure for it again (`curve_now`)
     LIVE_STALE = 256
+    LIVE_N = 8  # a width's recent passes the curve takes the fastest of
     DRIVE_SHARE = 0.05  # the widest pass's modelled reads under this share of a step: the base sizing stands
     DEPTHS = 8  # depths reported
     # plain steps measured before a priced store's passes are sized: the first after a prefill reloads what the
@@ -97,7 +99,8 @@ class SpecCost:
         self.miss_s = 0.0
         self.curve: dict[int, float] = {}
         self.width: Callable[[int], int] = _rows  # the curve's width a pass of k rows runs at
-        self.live: dict[int, float] = {}  # each width's seconds as the passes measure them, decayed
+        self.live: dict[int, float] = {}  # each width's seconds as the passes measure them: the fastest of `live_win`
+        self.live_win: dict[int, deque[float]] = {}  # each width's last LIVE_N passes' seconds
         self.live_at: dict[int, int] = {}  # the pass each width was last measured at
         self.passes_seen = 0  # every pass recorded
         self.full = 1
@@ -375,17 +378,21 @@ class SpecCost:
             self.u1 = _mix(self.u1, compute / max(1e-9, self.ratio(k)), self.TIME_DECAY)
         if draft_s is not None:
             self.draft_s = _mix(self.draft_s, max(0.0, float(draft_s)), self.TIME_DECAY)
-        # the width's measured seconds (`curve_now`), decayed: a burst - another program's slice of the card - is taken
-        # as twice what they were at most (a width's first pass, twice what the curve says of it now), a faster pass
-        # (the card freed again) as it is
+        # the width's measured seconds (`curve_now`): the fastest of its last LIVE_N passes. Another program's slices of
+        # the card only ever add to a pass, whatever its width, and land on whichever pass they meet: a Qwen3-0.6B step
+        # took 4.4 ms on a free card and 37 to 218 beside a program that had it, and a decayed mean of those priced a
+        # 9-row pass at a tenth of a step one answer and every width out the next. The warm-up takes its fastest sample
+        # likewise. A width's first pass is held to twice what the curve says of it now
         self.passes_seen += 1
         w = self.width(k)
-        old = self.live.get(w)
-        if old is None:
+        win = self.live_win.setdefault(w, deque(maxlen=self.LIVE_N))
+        if w not in self.measured():
+            win.clear()  # stale: the curve took the warm-up's figure again, and the next passes measure it afresh
+        if not win:
             ref = self.curve_now().get(w) if self.curve else None
-            self.live[w] = min(compute, 2.0 * ref) if ref else compute
-        else:
-            self.live[w] = _mix(old, min(compute, 2.0 * old), self.TIME_DECAY)
+            compute = min(compute, 2.0 * ref) if ref else compute
+        win.append(compute)
+        self.live[w] = min(win)
         self.live_at[w] = self.passes_seen
 
     def calibration(self, tag: str) -> list[float]:

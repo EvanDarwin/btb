@@ -8,6 +8,7 @@ the acceptance it is shown."""
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 from itertools import pairwise
 
@@ -297,15 +298,14 @@ def test_a_warm_up_curve_a_burst_spoiled_is_measured_back_by_the_passes() -> Non
     assert pc.ratio(2) == pytest.approx(1.1, rel=0.01)
 
 
-def test_a_burst_moves_a_measured_width_as_twice_its_seconds_at_most_and_a_faster_pass_as_itself() -> None:
+def test_a_burst_leaves_a_measured_width_as_it_was_and_a_faster_pass_moves_it_at_once() -> None:
     pc = SpecCost()
     pc.price(9, {1: 1.0, 2: 1.2}, 0.0)
     pc.record_pass(1, 1.0, 0.0, None)
     pc.record_pass(1, 200.0, 0.0, None)  # another program's slice of the card: a pass 200 times its width's
-    k = SpecCost.TIME_DECAY
-    assert pc.live[1] == pytest.approx(k * 1.0 + (1 - k) * 2.0), "the burst taken as twice the width's seconds"
+    assert pc.live[1] == pytest.approx(1.0), "the burst moved the width's seconds"
     pc.record_pass(1, 0.5, 0.0, None)  # the card freed: the pass faster than the estimate, taken whole
-    assert pc.live[1] == pytest.approx(k * (k * 1.0 + (1 - k) * 2.0) + (1 - k) * 0.5)
+    assert pc.live[1] == pytest.approx(0.5)
 
 
 def test_a_card_programs_pass_is_measured_at_its_graphs_width() -> None:
@@ -396,3 +396,85 @@ def test_where_no_draft_could_pay_the_probes_only_measure_the_cost() -> None:
         pc.record_pass(1, fast.seconds(1), fast.n_reads(1), None, wait=fast.waited(1))
     pc.price(TREE + 1, None, fast.miss_s)
     assert pc.could_pay()
+
+
+def test_another_programs_slices_of_the_card_do_not_price_the_widths() -> None:
+    """beside a program that has the card, a pass takes whatever slices of it land on that pass - 4.4 ms for a
+    Qwen3-0.6B step on a free card, 37 to 218 beside one - whatever its width. The curve takes each width's fastest
+    recent pass, so the widths keep their own costs' ratios: a decayed mean priced a 9-row pass at a tenth of a step
+    one answer and every width out the next"""
+    import random
+
+    curve = {1: 0.0044, 2: 0.0046, 5: 0.0050, 9: 0.0053}
+    pc = SpecCost()
+    pc.price(9, curve, 0.0)
+    rng = random.Random(7)
+    for _ in range(200):
+        k = rng.choice(list(curve))
+        # three passes in four meet a slice of 30 to 210 ms; the rest run on a free card
+        extra = rng.uniform(0.030, 0.210) if rng.random() < 0.75 else 0.0
+        pc.record_pass(k, curve[k] + extra, 0.0, None)
+    now = pc.curve_now()
+    for k in curve:
+        assert now[k] / now[1] == pytest.approx(curve[k] / curve[1], rel=1e-9), now
+
+
+def test_a_width_that_costs_more_now_is_priced_at_it_within_its_window() -> None:
+    """the fastest of a width's last LIVE_N passes: a pass grown dearer (a longer context's attention) is priced at
+    its new cost once its window holds no faster one"""
+    pc = SpecCost()
+    pc.price(9, {1: 0.004, 4: 0.005}, 0.0)
+    for _ in range(pc.LIVE_N):
+        pc.record_pass(4, 0.005, 0.0, None)
+    for _ in range(pc.LIVE_N):
+        pc.record_pass(4, 0.008, 0.0, None)
+    assert pc.live[4] == pytest.approx(0.008)
+
+
+def test_a_pass_on_the_card_is_timed_by_its_own_work_not_what_was_queued_before_it() -> None:
+    """the card's clock (`PassClock`): work the card still had in hand when the pass began - the last commit's
+    writes, the drafter's - is not the pass's. Timed from the host, a short pass behind a long queue read as the
+    queue, and the widths' measured costs swung from 0.17 to 3.3 one-row steps between answers"""
+    import torch
+
+    from btb.engine.generate import PassClock
+    from tests.helpers import need_cuda
+
+    dev = torch.device(need_cuda())
+    x = torch.ones(1 << 20, device=dev)
+    clock = PassClock(dev)
+    for _ in range(3):  # the first launch's setup out of the way
+        clock.start()
+        (x * 2).sum()
+        clock.stop()
+        clock.seconds()
+    torch.cuda.synchronize()
+    alone = []
+    for _ in range(5):
+        clock.start()
+        y = (x * 2).sum()
+        clock.stop()
+        y.item()
+        alone.append(clock.seconds())
+    torch.cuda._sleep(300_000_000)  # the card's queue busy for a while (~0.1 s) before the pass begins
+    t0 = time.perf_counter()
+    clock.start()
+    y = (x * 2).sum()
+    clock.stop()
+    y.item()
+    host = time.perf_counter() - t0
+    busy = clock.seconds()
+    assert host > 10 * max(alone), "the queue was not busy: the test shows nothing"
+    assert busy < 5 * max(alone) + 1e-3, f"{busy * 1e3:.3f} ms behind the queue, {max(alone) * 1e3:.3f} ms alone"
+
+
+def test_a_pass_off_the_card_is_timed_by_the_wall_clock() -> None:
+    import torch
+
+    from btb.engine.generate import PassClock
+
+    clock = PassClock(torch.device("cpu"))
+    clock.start()
+    time.sleep(0.02)
+    clock.stop()
+    assert 0.015 <= clock.seconds() < 1.0
