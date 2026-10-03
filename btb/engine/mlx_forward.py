@@ -441,7 +441,7 @@ class _MlxMixin(_State):
         fam = self.fam
         ok = self.mlx_state.family_ok
         if ok is None:
-            if fam.dense or fam.sandwich:
+            if fam.mlx_path is PassTag.MLX_STEP:
                 attn = next((self.host[i].self_attn for i in self.host if hasattr(self.host[i], "self_attn")), None)
                 # a sandwich family (Gemma 3) runs its sliding layers through the fused path too, windowed per layer;
                 # the plain dense path has no window, so it stays whole-prefix only
@@ -456,7 +456,7 @@ class _MlxMixin(_State):
                         )
                     )
                 )
-            elif fam.hybrid:
+            elif fam.mlx_path is PassTag.MLX_HYBRID:
                 # the DeltaNet step per position runs through the native kernel; without it the host path
                 ok = self._mlx_act() is not None and Native.delta_step is not None
             else:
@@ -1143,7 +1143,7 @@ class _MlxMixin(_State):
             and rows is None
             and forest is None
             and T <= 16
-            and (self.fam.kernel_layout or self.fam.sandwich)
+            and self.fam.fused_step
             and rd == int(self.host[0].self_attn.head_dim)
             and hm.dtype == m.bfloat16
         )
@@ -1327,7 +1327,7 @@ class _MlxMixin(_State):
         mg = getattr(self, "_mega", None)
         if mg is None or cache is None or not (1 <= T <= 16) or on_layer is not None or not head or pick is None:
             return False
-        if self.cold or not self.fam.kernel_layout or self.fam.sandwich or self.mlx_state.affine:
+        if self.cold or not self.fam.mega or self.mlx_state.affine:
             return False
         if positions is not None and not self._mega_positions_ok(cache, T, positions):
             return False

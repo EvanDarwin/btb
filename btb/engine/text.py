@@ -56,6 +56,7 @@ class GenerateStats(TypedDict, total=False):
     mtp_build_s: float
     mtp_steps: int
     mtp_step_s: float
+    priced: dict[str, Any]  # the passes' pricing by their rows' cost (`SpecCost.report`)
 
 
 # a generation's shape: a row's tokens, logprobs and taps, or a list of each per row

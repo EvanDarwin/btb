@@ -113,6 +113,7 @@ def _environment(argv: Sequence[str] | None = None) -> Json:
             gpu = f"{p.name}, {p.total_memory / 2**30:.1f} GB"
     mem = "unknown"
     with contextlib.suppress(Exception):
+        # free-read: a bug report's environment line
         mem = f"{host_free_bytes() / 2**30:.1f} GB free of {host_total_bytes() / 2**30:.1f} GB"
     cpu = "unknown"
     with contextlib.suppress(Exception):

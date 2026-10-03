@@ -37,7 +37,7 @@ def test_family_flags_cover_every_cap() -> None:
     """the Flags TypedDict family() spreads has one field per Cap, and _flags() fills each from CAPS - a
     capability added to kinds.Cap without a Flags field (so family() would silently drop it), or a flag that
     disagrees with the CAPS table, fails here."""
-    from btb.engine.families import Family, Flags, _flags
+    from btb.engine.families.base import Family, Flags, _flags
 
     names = {c.value for c in Cap}
     assert set(Flags.__annotations__) == names, set(Flags.__annotations__) ^ names

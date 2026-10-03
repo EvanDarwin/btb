@@ -256,7 +256,7 @@ def test_the_default_engine_takes_one_gemv_for_every_width_and_is_exact(default_
     step on one with a pass on the other parted at bf16 near-ties (0/8 identical at 256 tokens on this model);
     on one kernel a step and a 15-row pass agree bit for bit, and the speculative answer is the greedy answer"""
     sm = default_engine
-    choice = sm._cg["mma_for"]
+    choice = sm._mma_for
     assert choice and len(set(choice.values())) == 1, f"a kernel per width: {choice}"
     with open(checkout("bench", "questions.jsonl"), encoding="utf-8") as fh:
         prompts = [sm.prompt_ids(json.loads(line)["prompt"]) for line in fh if line.strip()][:3]
@@ -304,15 +304,74 @@ def test_the_step_graph_samples_as_the_step_loop_and_repeats_under_a_seed(
     assert census["seed"] == 1
 
 
-def test_the_speculative_answer_is_the_greedy_answer(engine: EngineTok, prompt_ids: list[list[int]]) -> None:
-
+def test_the_arena_grows_under_a_sequence_without_moving_its_rows_or_a_bit(
+    engine: EngineTok, greedy_reference: GreedyRef
+) -> None:
+    """The arena outrun mid-answer grows where it stands: mapped on in place where the card's driver can (every
+    layer's rows at the addresses the kernels held), else regrown a layer at a time; either way the steps after it
+    are the greedy steps bit for bit."""
     sm, _ = engine
+    ids, toks, logits = greedy_reference
+    with torch.inference_mode():
+        cache = sm.new_cache(max_len=len(ids) + 64)
+        sm._prefill(torch.tensor([ids]), cache)
+        st = sm._card_state()
+        for j in range(30):
+            if j == 10:
+                ar = st["arena"]
+                assert ar is not None and ar["owner"] is not None and ar["owner"]() is cache, "the cache holds it"
+                before = [ar["A"][s, w].data_ptr() for s in ar["slot"].values() for w in (0, 1)]
+                grown = sm._card_arena(st, int(ar["cap"]) + 1)
+                assert grown["cap"] > ar["cap"]
+                if grown["A"].in_place:
+                    after = [grown["A"][s, w].data_ptr() for s in grown["slot"].values() for w in (0, 1)]
+                    assert after == before, "a growth in place moved a layer's rows"
+            lg = forward_logits(sm, torch.tensor([[toks[j]]]), cache=cache)[0, -1].float()
+            assert torch.equal(lg, logits[j]), f"step {j} parts from the greedy step"
+
+
+def _speculated(
+    sm: StreamedTextModel, prompt_ids: list[list[int]], monkeypatch: pytest.MonkeyPatch, wide: float
+) -> list[tuple[list[int], list[int], int]]:
+    """each prompt's greedy answer and its speculative one with the passes priced by a pinned cost curve - a pass of
+    two rows or more at `wide` one-row steps - not by what the card measures while the test runs: (greedy,
+    speculative, passes). Measured, the curve's widths swung from 0.17 to 3.3 steps between answers on one card, and
+    which path an answer took was the timing's"""
+    full = sm._spec_full()
+    curve = {T: 1.0 if T == 1 else wide for T in range(1, max(2, full) + 1)}
+    monkeypatch.setattr(sm, "_spec_curve", lambda: curve)
+    out = []
     for ids in prompt_ids:
         g = sm.generate(ids, 128, eos=(), speculate=False).tokens
         gen = sm.generate(ids, 128, eos=())
-        o, census = gen.tokens, gen.stats
+        o = gen.tokens
         assert o == g, f"diverged at token {next(i for i, (a, b) in enumerate(zip(g, o)) if a != b)} of {len(g)}"
-        assert census["forwards"] < len(o)
+        out.append((g, o, int(gen.stats["forwards"])))
+    return out
+
+
+def test_the_speculative_answer_is_the_greedy_answer(
+    engine: EngineTok, prompt_ids: list[list[int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """every width priced at a step: each pass drafts to the full width, and the answer is the greedy one in fewer
+    passes than tokens"""
+    sm, _ = engine
+    for _g, o, forwards in _speculated(sm, prompt_ids, monkeypatch, 1.0):
+        assert forwards < len(o), f"{forwards} passes for {len(o)} tokens: no draft was accepted"
+
+
+def test_an_answer_no_width_pays_for_is_the_greedy_answer_in_plain_steps(
+    engine: EngineTok, prompt_ids: list[list[int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """every width priced past the budget's quarter over a step, the probes included: each pass is a plain step but
+    the one draft a run of PROBE_FAR plain steps verifies (`SpecCost.plan`), and the answer is the greedy one"""
+    from btb.engine.spec_cost import SpecCost
+
+    sm, _ = engine
+    for _g, o, forwards in _speculated(sm, prompt_ids, monkeypatch, 2.0):
+        # a probe verifies one draft: a token at most over a plain step's, one probe a PROBE_FAR run (the run the
+        # pricer's, across calls: one may land at once)
+        assert len(o) - forwards <= 1 + len(o) // SpecCost.PROBE_FAR, f"{forwards} passes for {len(o)} tokens"
 
 
 # -- the rows pass: a fork's or a batch's rows, a token each at its own position, read in place in the arena ---------

@@ -49,9 +49,10 @@ MISSING: dict[Missing, tuple[str, str]] = {
 # a kernel entry point: `extern "C" __global__ void [__launch_bounds__(...)] btb_<name>(`, the name possibly on
 # the next line (the MMA kernel), and NOT a macro template (a name ending at `##` is caught by _macro_kernels).
 _EXTERN = re.compile(r'extern\s+"C"\s+__global__\s+void\s+(?:__launch_bounds__\([^)]*\)\s*)?(btb_\w+)\s*\(')
-_TEMPLATE = re.compile(r"(btb_\w+)##")  # a macro body's templated name(s), e.g. btb_gemv_bf16_m##M
-_DEFINE = re.compile(r"#define\s+(\w+)\(")  # a macro definition head
-_INST = re.compile(r"^(\w+)\((\d+)\)", re.M)  # a macro instantiation, e.g. GEMV(16)
+# a macro body's templated name(s), every `##` part: btb_gemv_bf16_m##M, btb_attn_split_gqa##G##_d##D
+_TEMPLATE = re.compile(r"(btb_\w+(?:##\w+)+)")
+_DEFINE = re.compile(r"#define\s+(\w+)\(([^)]*)\)")  # a macro definition head and its parameters
+_INST = re.compile(r"^(\w+)\(([\d,\s]+)\)", re.M)  # a macro instantiation, e.g. GEMV(16) or ATTN(2, 64)
 _KERNELS_BLOCK = re.compile(r"KERNELS\s*=\s*\((.*?)\)", re.S)
 
 
@@ -80,14 +81,20 @@ def defined_kernels() -> set[str]:
     macro-generated ones (each `#define MACRO(P) ... btb_x##P ...` expanded over its `MACRO(v)` instantiations)."""
     src = _cuda_source()
     out = set(_EXTERN.findall(src))
-    templates: dict[str, list[str]] = {}
+    templates: dict[str, tuple[list[str], list[str]]] = {}
     for line in src.splitlines():
         d = _DEFINE.match(line.strip())
         if d:
-            templates[d.group(1)] = _TEMPLATE.findall(line)
-    for macro, value in _INST.findall(src):
-        for prefix in templates.get(macro, ()):
-            out.add(f"{prefix}{value}")
+            params = [p.strip() for p in d.group(2).split(",") if p.strip()]
+            templates[d.group(1)] = (params, _TEMPLATE.findall(line))
+    for macro, args in _INST.findall(src):
+        if macro not in templates:
+            continue
+        params, names = templates[macro]
+        values = dict(zip(params, (a.strip() for a in args.split(",")), strict=False))
+        for name in names:
+            # each `##` part a parameter's value where it names one, else the literal text between them
+            out.add("".join(values.get(part, part) for part in name.split("##")))
     return out
 
 

@@ -17,6 +17,7 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
 from btb.kinds import (
     PROPOSER_TAG,
@@ -175,6 +176,27 @@ def kind_of_stem(stem: str) -> FamilyKind | None:
 
 # --- what the committed fixtures actually are (read from disk, never asserted from a name) -----------------
 
+# each fixture file as last read, by what the file system says of it: a walk of the cells asks for the same configs
+# and shard headers tens of thousands of times (a PR comment's render opened 184,580 files, 29 s of its 47 s). A file
+# rewritten - its time or size moved - or a directory whose shards were added, removed or renamed - its own time
+# moved - is read again
+_READ: dict[tuple[str, int, int], Any] = {}
+
+
+def _read_once(path: str, read: Callable[[str], Any]) -> Any:
+    """`read(path)`, read again only once the file system says `path` changed. Its answer is shared: read-only"""
+    st = os.stat(path)
+    key = (path, st.st_mtime_ns, st.st_size)
+    if key not in _READ:
+        _READ[key] = read(path)
+    return _READ[key]
+
+
+def _json(path: str) -> Json:
+    with open(path, encoding="utf-8") as f:
+        doc: Json = json.load(f)
+    return doc
+
 
 def fixture_config(kind: FamilyKind) -> Json:
     """a tiny fixture's config.json, its text half where the config nests one; {} when the fixture is absent."""
@@ -184,8 +206,7 @@ def fixture_config(kind: FamilyKind) -> Json:
     path = os.path.join(FIXTURES, stem, "config.json")
     if not os.path.isfile(path):
         return {}
-    with open(path, encoding="utf-8") as f:
-        cfg: Json = json.load(f)
+    cfg = _read_once(path, _json)
     sub = cfg.get("text_config")
     return sub if isinstance(sub, dict) else cfg
 
@@ -215,9 +236,7 @@ def has_mtp_head(kind: FamilyKind) -> bool:
     index = os.path.join(FIXTURES, stem, "model.safetensors.index.json")
     if not os.path.isfile(index):
         return False
-    with open(index, encoding="utf-8") as f:
-        doc: Json = json.load(f)
-    return any(str(k).startswith("mtp.") for k in doc.get("weight_map", {}))
+    return any(str(k).startswith("mtp.") for k in _read_once(index, _json).get("weight_map", {}))
 
 
 def gguf_name(stem: str, q: Quant) -> str:
@@ -255,6 +274,11 @@ def header_dtypes(path: str) -> frozenset[str]:
     no tensor is read); empty when the directory is absent or holds no shard."""
     if not os.path.isdir(path):
         return frozenset()
+    found: frozenset[str] = _read_once(path, _header_dtypes)
+    return found
+
+
+def _header_dtypes(path: str) -> frozenset[str]:
     out: set[str] = set()
     for name in os.listdir(path):
         if not name.endswith(".safetensors"):
@@ -337,10 +361,22 @@ def residency_tag(kind: FamilyKind, knobs: dict[str, object]) -> PassTag | None:
 
 def storage_tag(storage: Storage, hw: Hardware) -> PassTag | None:
     """the tag a storage's own read leaves, or None where it has none: FP8 multiplied as stored on the host's
-    kernels, widened into the bf16 slots MLX and a card read (families.py `f8_host`)"""
+    kernels, widened into the bf16 slots MLX and a card read (families/__init__.py `f8_host`)"""
     if storage is not Storage.SAFE_FP8:
         return None
     return PassTag.FP8_ASSTORED if hw is Hardware.CPU else PassTag.FP8_WIDENED
+
+
+def expert_tag(kind: FamilyKind, storage: Storage) -> PassTag | None:
+    """the stored form a MoE family's experts must be multiplied in where the storage decides it, or None: an FP8
+    twin stores its fused expert tensors e4m3, multiplied as stored on every tier (MLX has no FP8 matvec, and a
+    card's few-row pass takes the host's kernels) - except where the family's experts are MXFP4 in every
+    checkpoint (gpt-oss): the twin keeps their packed blocks as they are, so it is an FP8 trunk over MXFP4
+    experts, and its cells assert the experts it has. `storage_tag`'s FP8 tag alone would pass on the trunk."""
+    fl = core.flags(kind)
+    if storage is not Storage.SAFE_FP8 or Cap.MOE not in fl:
+        return None
+    return PassTag.EXPERT_MXFP4_ASSTORED if Cap.MXFP4 in fl else PassTag.EXPERT_FP8_ASSTORED
 
 
 @dataclass(frozen=True)
@@ -361,12 +397,16 @@ class DeviceSubpath:
     # the card graph runs the sub-path's passes: its knobs leave the card's kernels on (the rows of a fork or a
     # batch then take the card graph's rows pass where the family's layers do)
     card_graph: bool = False
+    # its knobs act on a prompt past one prefill chunk: it runs on the long-prompt axis (Surface.CONTEXT) alone,
+    # and a storage cell's short prompt, which one chunk takes, is the plain run of its hardware
+    long_prompt: bool = False
 
     def expects(self, kind: FamilyKind, storage: Storage) -> frozenset[PassTag]:
         """every tag a run of this cell must carry: the sub-path's own, the residency policy this cell's own knobs
         select where the family has an expert store - so the default's Bus Pass is asserted too - and the
-        storage's own read where it leaves one (`storage_tag`)."""
-        extra = (residency_tag(kind, self.knobs), storage_tag(storage, self.hardware))
+        storage's own read where it leaves one (`storage_tag`), and the form a MoE family's experts take there
+        (`expert_tag`)."""
+        extra = (residency_tag(kind, self.knobs), storage_tag(storage, self.hardware), expert_tag(kind, storage))
         return frozenset({self.expect(kind, storage), *(t for t in extra if t is not None)})
 
 
@@ -469,6 +509,15 @@ DEVICE_SUBPATHS: tuple[DeviceSubpath, ...] = (
         "cpu/card split",
     ),
     DeviceSubpath(
+        "cuda-prefill",
+        Hardware.CUDA,
+        lambda k, s: PassTag.PREFILL_CARD,
+        {"device": "cuda", "cpu_layers": 1, "prefill_chunk": 64},
+        "a long prompt's host layers prefilled on the card a 64-row chunk at a time (a chunk reaches the card's "
+        "row floor, `Native.gemm_rows`): a mixture layer by layer, its experts grouped on the card",
+        long_prompt=True,
+    ),
+    DeviceSubpath(
         "cuda-kvhost",
         Hardware.CUDA,
         lambda k, s: PassTag.CUDA_TORCH_FALLBACK,
@@ -528,7 +577,7 @@ CONTAINER_SURFACE: dict[Container, Surface] = {
 
 def container_subpaths(container: Container) -> tuple[str, ...]:
     """every sub-path a container's cells run: those whose knob is no other container's"""
-    return tuple(d.key for d in DEVICE_SUBPATHS if d.only in (None, container))
+    return tuple(d.key for d in DEVICE_SUBPATHS if d.only in (None, container) and not d.long_prompt)
 
 
 # which device sub-paths the runner exercises on each surface: a container's every sub-path, and for the shape
@@ -536,7 +585,7 @@ def container_subpaths(container: Container) -> tuple[str, ...]:
 SURFACE_SUBPATHS: dict[Surface, tuple[str, ...]] = {
     **{CONTAINER_SURFACE[c]: container_subpaths(c) for c in Container},
     Surface.BATCH: ("cpu", "mlx-step"),
-    Surface.CONTEXT: ("cpu", "mlx-step"),
+    Surface.CONTEXT: ("cpu", "mlx-step", "cuda-prefill"),
     Surface.HOOKED: ("cpu", "mlx-step", "cuda-torch"),
     Surface.FORK: ("cpu", "mlx-step", "cuda-graph", "cuda-torch"),
     Surface.MODEL: ("cpu", "mlx-step", "cuda-torch"),
@@ -558,7 +607,23 @@ def rows_tag(kind: FamilyKind, dev: DeviceSubpath) -> PassTag:
 # the tags a cell of an axis beside the cartesian must show, by family and device sub-path (the sub-path's own
 # `expects` is about the single stream these axes leave). The API surfaces take every call their owners declare
 # (btb.kinds.api_tags), so a method added to an API class is a tag its cell must show.
+def prefill_tags(kind: FamilyKind, dev: DeviceSubpath) -> frozenset[PassTag]:
+    """the forks a long prompt's prefill must show on a sub-path made for it: the card's prefill of the host
+    layers, and for a mixture the grouped expert calls of its layer-by-layer prefill - gpt-oss's MXFP4 experts
+    widened on the card for them. The plain sub-paths assert none: the axis holds them to determinism alone."""
+    if not dev.long_prompt:
+        return frozenset()
+    fl = core.flags(kind)
+    out = {dev.expect(kind, Storage.SAFE_BF16)}
+    if Cap.MOE in fl:
+        out.add(PassTag.EXPERT_CARD_GROUPED)
+        if Cap.MXFP4 in fl:
+            out.add(PassTag.EXPERT_MXFP4_DEQUANT)
+    return frozenset(out)
+
+
 SURFACE_TAGS: dict[Surface, Callable[[FamilyKind, DeviceSubpath], frozenset[PassTag]]] = {
+    Surface.CONTEXT: prefill_tags,
     Surface.HOOKED: lambda k, dev: frozenset({PassTag.PICK_HOOKED}),
     Surface.FORK: lambda k, dev: (
         frozenset({rows_tag(k, dev)}) | api_tags("rows") | api_tags("branches") | api_tags("batch")

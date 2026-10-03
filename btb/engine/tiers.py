@@ -27,8 +27,10 @@ from ..mlx.legacyq import KINDS as LEGACY_KINDS
 from ..options import Device
 from ..pack12 import entries, unpack_bf16
 from ..sysinfo import process_working_set_bytes
-from .cache import CardRowsLayer, ForkLayer, GrowLayer
-from .host import _Experts, _HostLinear, bf16_in_place, copy_bytes
+from .cache import CardRowsLayer, ForkIndexedLayer, ForkLayer, GrowLayer
+from .device import where
+from .fixed_rows import fix_linears, fix_rows_cls
+from .host import _Experts, _HostLinear, _NGramRows, bf16_in_place, copy_bytes
 from .native import Native
 from .state import DRAFT_VOCAB, _State
 
@@ -39,6 +41,25 @@ if TYPE_CHECKING:
 _DTYPE_NAME = {torch.bfloat16: "bf16", torch.float32: "fp32", torch.float16: "fp16"}
 RAM_BPS = 50 * 2**30  # the read bandwidth the plan prices a RAM tier at, weights and cache alike
 DRIVE_BPS = int(3.4 * 2**30)  # the cold tier's rate until the drive is probed (scheduler.DriveBenchmark)
+# the card tier: its weights and cache at the share of the card's own memory rate its matvecs and attention reach
+# (Qwen3-0.6B on a 4070 Ti, 504 GB/s: 415-477 GB/s for the matvecs, 400-480 for the attention), and the rate
+# where the card cannot be asked (`card_bps`)
+CARD_EFF = 0.85
+CARD_BPS = 400 * 10**9
+# a card layer's fixed cost past its bytes: its nine kernels' launches, ramps and tails (Qwen3-0.6B's 28 layers
+# stepped in 4.2 ms where their bytes alone take 2.8)
+CARD_LAYER_MS = 0.05
+
+
+def card_bps(dev: Any) -> float:
+    """the rate the plan prices the card's reads at: the memory clock the driver reports, double-pumped, over its
+    bus, at `CARD_EFF` of it; `CARD_BPS` where the card cannot be asked"""
+    try:
+        p = torch.cuda.get_device_properties(dev)
+        peak = float(p.memory_clock_rate) * 1e3 * 2 * int(p.memory_bus_width) / 8
+    except Exception:
+        return float(CARD_BPS)
+    return peak * CARD_EFF if peak > 0 else float(CARD_BPS)
 
 
 @dataclass
@@ -84,7 +105,7 @@ class _TiersMixin(_State):
         base = f"{self.prefix}layers.{i}."
         n = 0
         for k in self.weight_map:
-            if k.startswith(base) and self._dense_key(k):
+            if k.startswith(base) and self.fam.dense_key(k):
                 e = self._packed.get(k)
                 if e is not None and not e["raw"]:
                     n += e["lo"] + e["hi4"] + e["pad"] + 5 * e["esc"]
@@ -111,6 +132,7 @@ class _TiersMixin(_State):
         context: int = 0,
         kv_host: bool = False,
         drive_bps: float | None = None,
+        gpu_bps: float | None = None,
     ) -> Json:
         L = self.L
         cfg = self.cfg
@@ -125,16 +147,18 @@ class _TiersMixin(_State):
         hq = int(cfg.num_attention_heads)
         hk = int(getattr(cfg, "num_key_value_heads", None) or hq)
         hd = int(getattr(cfg, "head_dim", None) or cfg.hidden_size // hq)
+        # an attention layer's index (Qwen4's sparse attention): its raw keys live with the rows, its pooled keys on
+        # the card wherever the rows are - under `kv_host` too, where nothing else of the cache is the card's
+        index_card, index_rows = self.fam.attn_index_bytes(cfg, kv_rows)
         kv_layer = {
-            i: 0 if self.layer_types[i] == LayerKind.LINEAR else 2 * hk * hd * (4 if fp32 else 2) * kv_rows
+            i: 0 if self.layer_types[i] == LayerKind.LINEAR else 2 * hk * hd * (4 if fp32 else 2) * kv_rows + index_rows
             for i in range(L)
         }
-        # the drafter plus its head slice, both at bf16
+        index_layer = {i: 0 if self.layer_types[i] == LayerKind.LINEAR else index_card for i in range(L)}
+        # the drafter the load runs (`drafter`: speculation on, with the drafting head as its proposer), its dense
+        # tensors and its head slice at bf16; a mixture in its layer is the expert store's, never placed with it
         drafter_b = (
-            sum(self._get(k).numel() * 2 for k in self.weight_map if k.startswith("mtp."))
-            + min(DRAFT_VOCAB, int(cfg.vocab_size)) * int(cfg.hidden_size) * 2
-            if drafter
-            else 0
+            self._drafter_bytes() + min(DRAFT_VOCAB, int(cfg.vocab_size)) * int(cfg.hidden_size) * 2 if drafter else 0
         )
         bf16 = {i: self._layer_bytes(i) for i in range(L)}
         stored = {i: self._layer_bytes_stored(i, packed) for i in range(L)}
@@ -166,13 +190,16 @@ class _TiersMixin(_State):
             tmpl_b = 0
         resident = []
         for i in reversed(range(L)):
-            b = bf16[i] * (2 if (fp32 and resident_fp32) else 1) + (0 if kv_host else kv_layer[i])
+            b = bf16[i] * (2 if (fp32 and resident_fp32) else 1) + (0 if kv_host else kv_layer[i]) + index_layer[i]
             if vram >= b:
                 resident.append(i)
                 vram -= b
             else:
                 break
         resident = sorted(resident)
+        # the card has room for the templates: a split the caller forces (`cpu_layers`) prefills its host layers
+        # there, where a plan that holds every layer on the card has no host layer to prefill
+        prefill_card_room = prefill_card
         if len(resident) == L:
             prefill_card = False
         rest = [i for i in range(L) if i not in resident]
@@ -184,7 +211,7 @@ class _TiersMixin(_State):
             ram -= head_host_b
         if drafter and not drafter_on_card:
             ram -= drafter_b
-        kv_card_b = 0 if kv_host else sum(kv_layer[i] for i in resident)
+        kv_card_b = (0 if kv_host else sum(kv_layer[i] for i in resident)) + sum(index_layer[i] for i in resident)
         kv_host_b = sum(kv_layer[i] for i in rest) + (sum(kv_layer[i] for i in resident) if kv_host else 0)
         ram -= kv_host_b
         total_rest = sum(stored[i] for i in rest)
@@ -215,7 +242,25 @@ class _TiersMixin(_State):
         warm_b = sum(stored[i] for i in warm)
         warm_ms = warm_b / RAM_BPS * 1e3
         cold_ms = cold_b / (drive_bps or DRIVE_BPS) * 1e3
-        kv_read_ms = kv_host_b / RAM_BPS * 1e3  # the host's attention over the whole cache, at the full context
+        # what a token's attention reads of the cache at the full context: every row for the plain block's, the
+        # indexer's picks for a sparse attention's on the card (`attn_read_rows`) - priced whole, a million positions
+        # of Qwen4's rows in RAM read as 20 GB a token, where its card program reads a budget of them. A host layer's
+        # attention reads every row whatever the family (Qwen4's host path grows and re-pools its rows whole)
+        reads = min(1.0, self.fam.attn_read_rows(cfg, kv_rows) / kv_rows)
+        rest_kv_b = sum(kv_layer[i] for i in rest)
+        # the host's attention over the cache at the full context: the host layers' rows whole, the resident layers'
+        # kept in RAM (`kv_host`) as their attention reads them
+        kv_read_ms = (rest_kv_b + (kv_host_b - rest_kv_b) * reads) / RAM_BPS * 1e3
+        # the card's share of a token, priced as the host's is, by what it reads: its layers, the head where it holds
+        # it and the cache it holds at the full context (what its attention reads of it, and an index's share whole),
+        # at the card's rate, and each layer's kernels' fixed cost. A flat 3 ms a resident layer priced Qwen3-0.6B at
+        # 89 ms a token (it runs at 4) and made a layer more on the card look dearer, where the cache's placement
+        # (`choose`) weighs one against the other
+        vram_layers_b = sum(bf16[i] for i in resident) * (2 if (fp32 and resident_fp32) else 1)
+        index_card_b = sum(index_layer[i] for i in resident)
+        card_b = vram_layers_b + (head_b if head_on_card else 0) + (kv_card_b - index_card_b) * reads + index_card_b
+        card_ms = card_b / (gpu_bps or CARD_BPS) * 1e3 + CARD_LAYER_MS * len(resident)
+        head_host_ms = 0.0 if head_on_card else head_host_b / RAM_BPS * 1e3
         return {
             "head_on_card": head_on_card,
             "drafter_on_card": drafter_on_card,
@@ -224,8 +269,9 @@ class _TiersMixin(_State):
             "cold": cold,
             "warm": warm,
             "prefill_card": prefill_card,
+            "prefill_card_room": prefill_card_room,
             "bytes": {
-                "vram_layers": sum(bf16[i] for i in resident) * (2 if (fp32 and resident_fp32) else 1),
+                "vram_layers": vram_layers_b,
                 "head": head_b if head_on_card else head_host_b,
                 "drafter": drafter_b,
                 "warm": warm_b,
@@ -237,9 +283,9 @@ class _TiersMixin(_State):
                 "kv_host": kv_host_b,
                 "staging": staging_b,
             },
-            "predicted_ms_per_token": max(warm_ms, cold_ms)
-            + (3.0 * len(resident))
-            + (50.0 if not head_on_card else 5.0),
+            # the host's layers (the RAM's and the drive's streaming side by side), then the card's, one after the
+            # other as a token passes them
+            "predicted_ms_per_token": max(warm_ms, cold_ms) + head_host_ms + card_ms,
             "kv_read_ms": kv_read_ms,
             "caps": {
                 "ram_gb": ram_gb,
@@ -276,13 +322,7 @@ class _TiersMixin(_State):
         head_b = int(cfg.vocab_size) * int(cfg.hidden_size) * 2 if cfg is not None else 0
         # off the headers, never through `_get`: a report may not move the engine's counters
         mtp = [k for k in getattr(self, "weight_map", {}) if k.startswith("mtp.")]
-        drafter_b = 0
-        for k in mtp:
-            _mm, hdr, _ = self._shard(self.weight_map[k])
-            n = 1
-            for d in hdr[k]["shape"]:
-                n *= int(d)
-            drafter_b += n * 2
+        drafter_b = self._drafter_bytes() if mtp else 0
         tmpl_b = 0
         for lt, mods in (getattr(self, "templates", {}) or {}).items():
             tmpl_b += len(mods) * max((bf16.get(i, 0) for i in range(L) if types[i] == lt), default=0)
@@ -357,7 +397,9 @@ class _TiersMixin(_State):
             },
             "peak": {
                 "ram_gb": rss / 2**30,
+                # free-read: the run's report
                 "vram_reserved_gb": (torch.cuda.max_memory_reserved(dev) / 2**30) if cuda else 0.0,
+                # free-read: the run's report
                 "vram_allocated_gb": (torch.cuda.max_memory_allocated(dev) / 2**30) if cuda else 0.0,
                 "mlx_gb": (mlx.peak_bytes() / 2**30) if mlx is not None else 0.0,
             },
@@ -503,7 +545,7 @@ class _TiersMixin(_State):
         base = f"{self.prefix}layers.{i}."
         n = 0
         for k in self.weight_map:
-            if k.startswith(base) and self._dense_key(k):
+            if k.startswith(base) and self.fam.dense_key(k):
                 _mm, hdr, _ = self._shard(self.weight_map[k])
                 a, b = hdr[k]["data_offsets"]
                 n += int(b - a) - self._held_nbytes(hdr[k])
@@ -598,15 +640,43 @@ class _TiersMixin(_State):
         return cache
 
     def _caches_to(self, i: int, dev: str | torch.device, cache: KvCache | None = None) -> None:
-        """layer i's rows in every live cache (and `cache`) moved to `dev`, where the layer now runs"""
+        """layer i's rows in every live cache (and `cache`) moved to `dev`, where the layer now runs - an attention
+        layer coming to the card under `kv_host` leaves its rows in RAM, where they live whatever the placement (its
+        linear states, small and its own step's, come with it)"""
+        if self._rows_stay(i, dev):
+            return
         live: list[KvCache] = list(self.__dict__.get("_live_caches", ()))
-        for c in {id(c): c for c in [*live, *([cache] if cache is not None else [])]}.values():
-            self._cache_to(c, i, dev)
+        caches = list({id(c): c for c in [*live, *([cache] if cache is not None else [])]}.values())
+        self._rows_to(caches, [i], dev)
+
+    def _rows_stay(self, i: int, dev: str | torch.device) -> bool:
+        """whether layer `i`'s rows stay where they are as the layer moves to `dev`: an attention layer's coming to
+        the card under `kv_host`"""
+        return (
+            torch.device(dev).type == Device.CUDA
+            and bool(getattr(self, "kv_host", False))
+            and self.layer_types[i] != LayerKind.LINEAR
+        )
+
+    def _rows_to(self, caches: Sequence[Any], layers: Sequence[int], dev: str | torch.device) -> None:
+        """the rows of `layers` in `caches` moved to `dev`, granted together first where they come onto the card:
+        a move the card cannot take is refused whole, before a row has moved"""
+        dev = where(torch.device(dev))  # torch's own names too ('meta'), not only the ones --device takes
+        sched = getattr(self, "scheduler", None)
+        if dev.type == Device.CUDA and sched is not None:
+            nbytes = sum(_rows_bytes(c, i, dev) for c in caches for i in layers)
+            if nbytes:
+                sched.grant(nbytes, "kv", requester=f"layers {list(layers)}'s rows onto the card", device=dev, draws="")
+        for c in caches:
+            for i in layers:
+                self._cache_to(c, i, dev)
 
     @staticmethod
-    def _cache_to(cache: Any, i: int, dev: str | torch.device) -> None:
+    def _cache_to(cache: Any, i: int, device: str | torch.device) -> None:
         if cache is None or i >= len(cache.layers):
             return
+        # compared with the rows' own devices below: a card by its index, as they name it
+        dev = where(torch.device(device))
         cl = cache.layers[i]
         if isinstance(cl, ForkLayer):
             cl.to(dev)
@@ -614,38 +684,47 @@ class _TiersMixin(_State):
         if isinstance(cl, CardRowsLayer):
             # a fork's or a batch's rows leaving the card's arena: a fork's layer where the layer now runs (the
             # batch takes the torch pass from its next step)
-            if torch.device(dev).type != cl.device.type:
+            if dev.type != cl.device.type:
                 cache.layers[i] = cl.to_fork(dev)
             return
-        if (
-            isinstance(cl, GrowLayer)
-            and not cl.shared
-            and cl._buf is not None
-            and cl._buf[0].device != torch.device(dev)
-        ):
+        if isinstance(cl, GrowLayer) and not cl.shared and cl._buf is not None and cl._buf[0].device != dev:
             # the rows copied out and the buffer they grew in let go now, not at the cache's next append
             k, v = cl.keys, cl.values
             cl._buf, cl._an = None, None
             cl._set_rows(k, v)
         if isinstance(cl, GrowLayer) and cl.is_initialized and isinstance(cl.keys, torch.Tensor):
-            if cl.keys.device != torch.device(dev):
+            if cl.keys.device != dev:
                 cl._set_rows(cl.keys.to(dev), cl.values.to(dev))
         for attr in ("keys", "values", "conv_states", "recurrent_states", "indexer_keys"):
             t = getattr(cl, attr, None)
             if isinstance(t, dict):
                 for k, v in t.items():
-                    if isinstance(v, torch.Tensor) and v.device != torch.device(dev):
+                    if isinstance(v, torch.Tensor) and v.device != dev:
                         t[k] = v.to(dev)
-            elif isinstance(t, torch.Tensor) and t.device != torch.device(dev):
+            elif isinstance(t, torch.Tensor) and t.device != dev:
                 setattr(cl, attr, t.to(dev))
 
     def _layer_bytes(self, i: int) -> int:
         base = f"{self.prefix}layers.{i}."
         n = 0
         for k in self.weight_map:
-            if k.startswith(base) and self._dense_key(k):
+            if k.startswith(base) and self.fam.dense_key(k):
                 _mm, hdr, _ = self._shard(self.weight_map[k])
                 n += self._held_nbytes(hdr[k])
+        return n
+
+    def _drafter_bytes(self) -> int:
+        """the drafting head's bytes where it is placed, at bf16 off the headers: its `mtp.*` tensors the family
+        reads with a layer (`dense_key`) - a mixture's experts in its drafting layer stream through the expert
+        store as every MoE layer's do, and an FP8 scale is read with the tensor it scales"""
+        n = 0
+        for k in self.weight_map:
+            if k.startswith("mtp.") and self.fam.dense_key(k):
+                _mm, hdr, _ = self._shard(self.weight_map[k])
+                c = 2
+                for d in hdr[k]["shape"]:
+                    c *= int(d)
+                n += c
         return n
 
     def _regrow_bytes(self) -> int:
@@ -655,9 +734,13 @@ class _TiersMixin(_State):
         if what == "head":
             return self.cfg.vocab_size * self.cfg.hidden_size * 2
         if what == "drafter":
-            return sum(self._get(k).numel() * 2 for k in self.weight_map if k.startswith("mtp."))
+            return self._drafter_bytes()
         fp32 = self.compute_dtype is not None and self.compute_dtype != torch.bfloat16
-        return self._layer_bytes(int(what.split()[1])) * (2 if (fp32 and self.resident_fp32) else 1)
+        i = int(what.split()[1])
+        # and its rows in every live cache, which follow it onto the card (not under `kv_host`: `_rows_stay`)
+        live = [] if self._rows_stay(i, self.dev) else list(self.__dict__.get("_live_caches", ()))
+        rows = sum(_rows_bytes(c, i, self.dev) for c in live)
+        return self._layer_bytes(i) * (2 if (fp32 and self.resident_fp32) else 1) + rows
 
     def _realloc_bytes(self) -> int:
         n = 0
@@ -665,7 +748,7 @@ class _TiersMixin(_State):
             n += self.head.weight.numel() * self.head.weight.element_size()
         aj = getattr(self, "aj", None)
         if aj is not None and aj.dev.type == Device.CUDA:
-            n += sum(self._get(k).numel() * 2 for k in self.weight_map if k.startswith("mtp."))
+            n += self._drafter_bytes()
         return n
 
     def _bind_cold(self) -> None:
@@ -905,6 +988,10 @@ class _TiersMixin(_State):
         for ev in self.cold_ring.free:
             ev.set()
         th.join(timeout=60)
+        if th.is_alive():
+            # still in a read into a ring slot after a minute: the ring is not reused or let go while it writes -
+            # the thread stays the ring's, and the pass (or the close, which tries again) is told
+            raise RuntimeError("[stream] the cold ring's reader is still in a read after 60 s; its slots stay held")
         self.cold_ring.thread = None
 
     def _cold_wait(self, i: int) -> None:
@@ -951,17 +1038,25 @@ class _TiersMixin(_State):
         return self.templates[lt][k]
 
     def _retarget(self, module: Any, i: int) -> Any:
-        """Point a template or shadow at layer `i`: the attention's cache index and, for a mixture of experts, where
-        the expert store reads its experts from."""
-        if hasattr(module, "linear_attn"):
-            module.linear_attn.layer_idx = i
-        if hasattr(module, "self_attn"):
-            module.self_attn.layer_idx = i
+        """Point a template or shadow at layer `i`: every cache index its modules hold and, for a mixture of experts,
+        where the expert store reads its experts from. Every submodule that carries a `layer_idx` is one: beside the
+        attention's own, Qwen4's sparse attention indexer and its PLE and n-gram convolutions each keep theirs, and a
+        template built from layer 3 and run as layer 11 wrote layer 11's indexer keys into layer 3's cache."""
         for m in module.modules():
+            if isinstance(getattr(m, "layer_idx", None), int):
+                m.layer_idx = i
             if isinstance(m, _Experts) and m.layer != i:
                 m.layer = i
                 m.base = f"{self.prefix}layers.{i}.mlp.experts."
                 m.gate_up = m.down = None
+            if isinstance(m, _NGramRows):
+                # a layer's own lookup table read from the checkpoint by name (Qwen4's PLE n-grams): layer i's, and
+                # the shards opened for the layer it was built from dropped
+                at = f"{self.prefix}layers."
+                if m.base.startswith(at):
+                    base = f"{at}{i}.{m.base[len(at) :].partition('.')[2]}"
+                    if base != m.base:
+                        m.base, m.shards, m.f8 = base, None, None
         return module
 
     def _structure(self, module: Any) -> tuple[Any, ...]:
@@ -1086,7 +1181,11 @@ class _TiersMixin(_State):
     def _new_layer(self, idx: int) -> Any:
         with self._meta:
             layer = self.fam.layer(self.cfg, idx).eval()
-        layer = self._shape_layer(layer, idx)
+        layer = self.fam.shape_layer(self, layer, idx)
+        # a card layer's torch path row-invariant: its matmuls and norms at the fixed shape for a small pass, so a
+        # step and a verify pass over the same token agree to the bit (fixed_rows.py); a no-op off the card
+        fix_linears(layer)
+        fix_rows_cls(self.fam.norm)
         base = f"{self.prefix}layers.{idx}."
         for name, _b in layer.named_buffers():
             if base + name not in self.weight_map:
@@ -1205,7 +1304,7 @@ class _TiersMixin(_State):
             name = self._gguf_names[key]
             i = self._gguf_layer_index(key)
             # a layer bound to MLX always runs its linears through `_bind_mlx_resident` right after loading
-            # (`families.py`'s `i in self.mlx_layers and i not in self.cold`); `gguf_shortcut` lets a caller that
+            # (`_make_host_layer`'s `i in self.mlx_layers and i not in self.cold`); `gguf_shortcut` lets a caller that
             # knows its own tensor rebinds immediately (the resident head) claim the same skip
             resolved = gguf_shortcut or (i is not None and i in self.mlx_layers and i not in getattr(self, "cold", ()))
             if resolved and self._gguf_binds_packed(name):
@@ -1266,7 +1365,7 @@ class _TiersMixin(_State):
                     )
                 p.data.copy_(t)
             seen += 1
-        extra = [k for k in self.weight_map if k.startswith(base) and self._dense_key(k)]
+        extra = [k for k in self.weight_map if k.startswith(base) and self.fam.dense_key(k)]
         if len(extra) != seen:
             raise RuntimeError(f"[stream] layer {i}: template consumed {seen} tensors, the index holds {len(extra)}")
         self._retarget(tmpl, i)
@@ -1274,3 +1373,26 @@ class _TiersMixin(_State):
             tmpl.to(self.dev)
         self._sync()
         self.load_s += time.time() - t0
+
+
+def _rows_bytes(cache: Any, i: int, dev: torch.device) -> int:
+    """the bytes layer i's rows in `cache` take once moved to `dev` (`_cache_to`): nothing for those there already"""
+    if cache is None or i >= len(cache.layers):
+        return 0
+    cl = cache.layers[i]
+    if isinstance(cl, CardRowsLayer):
+        return 0  # the arena's rows: a fork's layer made of them grants its own buffer (`to_fork`)
+    if isinstance(cl, ForkLayer):
+        held = [*(cl._kv or (cl._pk, cl._pv))]
+        if isinstance(cl, ForkIndexedLayer):
+            held.append(cl._ti if cl._ti is not None else cl._pi)
+    else:
+        held = [getattr(cl, a, None) for a in ("keys", "values", "indexer_keys")]
+        for a in ("conv_states", "recurrent_states"):
+            d = getattr(cl, a, None)
+            held += list(d.values()) if isinstance(d, dict) else [d]
+    return sum(
+        t.numel() * t.element_size()
+        for t in held
+        if isinstance(t, torch.Tensor) and t.device.type != dev.type and t.device.type != "meta"
+    )

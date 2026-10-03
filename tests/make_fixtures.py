@@ -11,9 +11,12 @@ native gemv kernel is loaded first so the receipts match the tolerance the suite
     python tests/make_fixtures.py            # all families
     python tests/make_fixtures.py qwen3 q4   # a subset
     python tests/make_fixtures.py twins      # only the precision twins of every cert fixture
+    python tests/make_fixtures.py q4_mtp     # tiny_q4's drafting head added to the built fixture and its twins
     python -m tests.make_fixtures seed phi3  # a family's first draw the oracle's margin floor accepts (its *_SEED)
 
-Families: qwen3, q35, phi3, q4, gpt_oss.
+Families: qwen3, q35, phi3, q4, gpt_oss. `build_q4_card` draws a Qwen4 at the card kernels' shapes, which
+tests/integration/test_qwen4_card.py builds where it runs (it banks no receipts, and the cert's manifest binds every
+directory here).
 """
 
 from __future__ import annotations
@@ -23,9 +26,9 @@ import os
 import shutil
 import sys
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
-from btb.kinds import FamilyKind, Json, QuantClass, TokenRows, quants_of
+from btb.kinds import FamilyKind, Json, LayerKind, QuantClass, TokenRows, quants_of
 from tests.helpers import (
     CHUNK,
     FIXTURES,
@@ -378,6 +381,20 @@ def requantize_gguf(src: str, like: str, out: str, outtype: str) -> None:
     w.close()
 
 
+def _drop_mtp(model_dir: str) -> None:
+    """a copy of a checkpoint without the drafting head `write_mtp` added: its shard and its index entries gone"""
+    path = os.path.join(model_dir, MTP_SHARD)
+    if not os.path.isfile(path):
+        return
+    os.remove(path)
+    index = os.path.join(model_dir, "model.safetensors.index.json")
+    with open(index, encoding="utf-8") as fh:
+        doc: Json = json.load(fh)
+    doc["weight_map"] = {k: f for k, f in doc["weight_map"].items() if f != MTP_SHARD}
+    with open(index, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(doc, fh, indent=2)
+
+
 def make_q4_gguf() -> None:
     """tiny_q4's GGUF twins as llama.cpp's converter writes them, from a copy of the fixture whose config spells
     the attention layers "full_attention" as the released checkpoint does (transformers reads both spellings as
@@ -391,6 +408,7 @@ def make_q4_gguf() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         stage = os.path.join(tmp, "tiny_q4")
         shutil.copytree(src, stage)
+        _drop_mtp(stage)  # the converter is not asked for Qwen4's drafting head: the twins stay the trunk's
         cfg = json.load(open(os.path.join(stage, "config.json"), encoding="utf-8"))
         cfg["layer_types"] = ["full_attention" if t != "linear_attention" else t for t in cfg["layer_types"]]
         with open(os.path.join(stage, "config.json"), "w", encoding="utf-8") as f:
@@ -441,7 +459,8 @@ def _reshard(out_dir: str, state: dict[str, torch.Tensor], cap: int = 100_000) -
 QWEN3_SEED = 0
 
 
-def build_qwen3(out_dir: str, seed: int = QWEN3_SEED) -> None:
+def build_qwen3(out_dir: str, seed: int = QWEN3_SEED, over: Json | None = None) -> None:
+    """tiny_qwen3; `over` replaces config fields (a test's model at a real model's widths)"""
     import torch
     from transformers import Qwen3Config, Qwen3ForCausalLM
 
@@ -453,16 +472,18 @@ def build_qwen3(out_dir: str, seed: int = QWEN3_SEED) -> None:
         "use_sliding_window": False, "attention_bias": False, "pad_token_id": 1, "eos_token_id": 1,
         "bos_token_id": 0, "torch_dtype": "bfloat16",
     }  # fmt: skip
+    kw.update(over or {})
     m = Qwen3ForCausalLM(Qwen3Config(**kw)).eval().to(torch.bfloat16)
     os.makedirs(out_dir, exist_ok=True)
-    m.save_pretrained(out_dir, max_shard_size="100KB", safe_serialization=True)
+    m.save_pretrained(out_dir, max_shard_size="100KB" if over is None else "2GB", safe_serialization=True)
 
 
 # a draw whose oracle decodes (base and FP8 twin) keep every greedy top-2 gap above the oracle's margin floor
 PHI3_SEED = 2
 
 
-def build_phi3(out_dir: str, seed: int = PHI3_SEED) -> None:
+def build_phi3(out_dir: str, seed: int = PHI3_SEED, over: Json | None = None) -> None:
+    """tiny_phi3; `over` replaces config fields (a test's model at a real model's widths)"""
     import torch
     from transformers import Phi3Config, Phi3ForCausalLM
 
@@ -478,16 +499,18 @@ def build_phi3(out_dir: str, seed: int = PHI3_SEED) -> None:
                          "short_factor": [1.0 for _ in range(rot // 2)]},
         "attention_bias": False, "torch_dtype": "bfloat16",
     }  # fmt: skip
+    kw.update(over or {})
     m = Phi3ForCausalLM(Phi3Config(**kw)).eval().to(torch.bfloat16)
     os.makedirs(out_dir, exist_ok=True)
-    m.save_pretrained(out_dir, max_shard_size="100KB", safe_serialization=True)
+    m.save_pretrained(out_dir, max_shard_size="100KB" if over is None else "2GB", safe_serialization=True)
 
 
 # a draw whose oracle decodes (base and FP8 twin) keep every greedy top-2 gap above the oracle's margin floor
 GEMMA3_SEED = 44
 
 
-def build_gemma3(out_dir: str, seed: int = GEMMA3_SEED) -> None:
+def build_gemma3(out_dir: str, seed: int = GEMMA3_SEED, over: Json | None = None) -> None:
+    """tiny_gemma3; `over` replaces config fields (a test's model at a real model's widths)"""
     import torch
     from transformers import Gemma3ForCausalLM, Gemma3TextConfig
 
@@ -502,9 +525,10 @@ def build_gemma3(out_dir: str, seed: int = GEMMA3_SEED) -> None:
         "hidden_activation": "gelu_pytorch_tanh", "query_pre_attn_scalar": 256,
         "pad_token_id": 0, "eos_token_id": 1, "bos_token_id": 2,
     }  # fmt: skip
+    kw.update(over or {})
     m = Gemma3ForCausalLM(Gemma3TextConfig(**kw)).eval().to(torch.bfloat16)
     os.makedirs(out_dir, exist_ok=True)
-    m.save_pretrained(out_dir, max_shard_size="100KB", safe_serialization=True)
+    m.save_pretrained(out_dir, max_shard_size="100KB" if over is None else "2GB", safe_serialization=True)
 
 
 # a draw whose oracle decodes (base and FP8 twin) keep every greedy top-2 gap above the oracle's margin floor
@@ -513,7 +537,6 @@ Q4_SEED = 0
 
 def build_q4(out_dir: str, seed: int = Q4_SEED) -> None:
     import torch
-    from transformers import Qwen4ExpForCausalLM
     from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
 
     torch.manual_seed(seed)
@@ -532,6 +555,16 @@ def build_q4(out_dir: str, seed: int = Q4_SEED) -> None:
         indexer_kv_heads=1, indexer_head_dim=16, indexer_budget=8, indexer_compress_ratio=4,
         output_gate_type="sigmoid", pad_token_id=1, eos_token_id=1, bos_token_id=0, dtype="bfloat16",
     )  # fmt: skip
+    _write_q4(out_dir, cfg)
+
+
+def _write_q4(out_dir: str, cfg: PretrainedConfig) -> None:
+    """a Qwen4 checkpoint of `cfg` drawn under the seed set before (transformers' own init), written as Qwen4's
+    checkpoints lay it out: the n-gram embedding in `split_ngram_parts` shards, ~100 KB shards, the drafting head in
+    its own shard"""
+    import torch
+    from transformers import Qwen4ExpForCausalLM
+
     m = Qwen4ExpForCausalLM(cfg).eval().to(torch.bfloat16)
     os.makedirs(out_dir, exist_ok=True)
     m.save_pretrained(out_dir, max_shard_size="100KB", safe_serialization=True)  # config + generation_config
@@ -542,14 +575,166 @@ def build_q4(out_dir: str, seed: int = Q4_SEED) -> None:
         for j, p in enumerate(torch.chunk(w, cfg.split_ngram_parts, dim=0)):
             sd[k.replace("ngram_embedding.weight", f"ngram_embedding.shard_{j}.weight")] = p.contiguous()
     _reshard(out_dir, sd)
+    write_mtp(out_dir, _q4_mtp(cfg))  # the drafting head, its own draw in its own shard (not a transformers module)
+
+
+def build_q4_card(out_dir: str, seed: int = Q4_SEED, over: Json | None = None) -> None:
+    """A Qwen4 the card program runs (btb/engine/families/qwen4/card.py): tiny_q4's structure at the kernels'
+    shapes - head and indexer dims of 128, the rope a quarter of a head, four streams - over five layers (DeltaNet,
+    the n-gram embedding's layer, sparse attention, DeltaNet, sparse attention), eight experts, an indexer budget of
+    four blocks of four and a drafting head. It banks no receipts: the program is held to its own one-token steps
+    and within tolerance to the torch path, so tests/integration/test_qwen4_card.py builds it where it runs rather
+    than beside the cert's fixtures (whose manifest binds every directory here). `over` replaces config fields (a
+    test's model at a real model's widths)"""
+    import torch
+    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
+
+    torch.manual_seed(seed)
+    lt = ["linear_attention", "linear_attention", "full_attention", "linear_attention", "full_attention"]
+    kw: Json = {
+        "vocab_size": 512, "hidden_size": 256, "num_hidden_layers": 5, "num_attention_heads": 2,
+        "num_key_value_heads": 1, "head_dim": 128, "max_position_embeddings": 4096, "rms_norm_eps": 1e-6,
+        "tie_word_embeddings": False, "hidden_act": "silu", "attention_bias": False, "layer_types": lt,
+        "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.25,
+                            "mrope_section": [8, 4, 4], "mrope_interleaved": True},
+        "linear_conv_kernel_dim": 4, "linear_key_head_dim": 32, "linear_value_head_dim": 32,
+        "linear_num_key_heads": 2, "linear_num_value_heads": 4, "moe_intermediate_size": 64,
+        "shared_expert_intermediate_size": 64, "num_experts": 8, "num_experts_per_tok": 2, "norm_topk_prob": True,
+        "hc_count": 4, "hc_lowrank": 32, "ple_layer_ids": [2], "ple_embed_dim": 64, "ple_conv_kernel_size": 4,
+        "ngram_size": 3, "heads_per_ngram": 2, "ngram_vocab_size_base": 1000, "make_ngram_vocab_size_divisible_by": 128,
+        "seed": 1234, "split_ngram_parts": 4, "indexer_n_heads": 2, "indexer_kv_heads": 1, "indexer_head_dim": 128,
+        "indexer_budget": 16, "indexer_compress_ratio": 4, "output_gate_type": "sigmoid", "pad_token_id": 1,
+        "eos_token_id": 1, "bos_token_id": 0, "dtype": "bfloat16",
+    }  # fmt: skip
+    kw.update(over or {})
+    cfg = Qwen4ExpTextConfig(**kw)
+    _write_q4(out_dir, cfg)
+
+
+# the drafting head's own draw, apart from the trunk's: appending it leaves every trunk tensor as it was
+Q4_MTP_SEED = 4
+# the shard a drafting head is written to beside the trunk's, so the trunk's shards and their bytes stay as they were
+MTP_SHARD = "model-mtp.safetensors"
+
+
+def _q4_mtp(cfg: PretrainedConfig, seed: int = Q4_MTP_SEED) -> dict[str, torch.Tensor]:
+    """tiny_q4's MTP drafter as Qwen4's checkpoints lay it out (Qwen3.8-Flash-Next's `mtp.*`): one sparse-attention
+    decoder layer with its mixture (`mtp.layers.0.*`, its experts fused as the trunk's are), `fc_embedding` and
+    `fc_hidden` over the normed embedding and the normed streams, and the mixer closing the streams. The names and
+    shapes are transformers' own layer's and mixer's, made on the meta device; the values random bf16 under `seed`
+    (norms around zero, which Qwen4's scale by one plus) - the verify pass makes speculation exact whatever the
+    drafter proposes, so the weights need only be well-formed."""
+    import copy
+
+    import torch
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextDecoderLayer, Qwen4ExpTextGatedResidual
+
+    mcfg: Any = copy.deepcopy(cfg)
+    mcfg.num_hidden_layers = 1
+    mcfg.layer_types = [LayerKind.QWEN_SPARSE.hf_name()]  # as the installed transformers names it
+    mcfg.ple_layer_ids = []
+    with torch.device("meta"):
+        layer = Qwen4ExpTextDecoderLayer(mcfg, 0)
+        mixer = Qwen4ExpTextGatedResidual(mcfg, use_combine=False)
+    H, S = int(cfg.hidden_size), int(cfg.hc_count)
+    shapes = {f"mtp.layers.0.{n}": tuple(p.shape) for n, p in layer.named_parameters()}
+    shapes |= {f"mtp.hyper_connection_mixer.{n}": tuple(p.shape) for n, p in mixer.named_parameters()}
+    shapes |= {
+        "mtp.fc_embedding.weight": (H, H),
+        "mtp.fc_hidden.weight": (H, H),
+        "mtp.pre_fc_norm_embedding.weight": (H,),
+        "mtp.pre_fc_norm_hidden.weight": (S * H,),
+    }
+    g = torch.Generator().manual_seed(seed)
+    return {k: (torch.randn(*shp, generator=g) * 0.02).bfloat16() for k, shp in sorted(shapes.items())}
+
+
+def write_mtp(out_dir: str, tensors: dict[str, torch.Tensor]) -> None:
+    """`tensors` written as the checkpoint's `MTP_SHARD`, beside its other shards, and named in its index (in place
+    of any it named there before); every other shard and entry as it was, the index's total recounted off the
+    shards' headers"""
+    import struct
+
+    from safetensors.torch import save_file
+
+    save_file({k: v.contiguous() for k, v in tensors.items()}, os.path.join(out_dir, MTP_SHARD), {"format": "pt"})
+    index = os.path.join(out_dir, "model.safetensors.index.json")
+    with open(index, encoding="utf-8") as fh:
+        doc: Json = json.load(fh)
+    wm = {k: f for k, f in doc["weight_map"].items() if f != MTP_SHARD}
+    wm.update(dict.fromkeys(sorted(tensors), MTP_SHARD))
+    total = 0
+    for f in sorted(set(wm.values())):
+        with open(os.path.join(out_dir, f), "rb") as fh:
+            hdr: Json = json.loads(fh.read(struct.unpack("<Q", fh.read(8))[0]))
+        total += sum(int(v["data_offsets"][1]) - int(v["data_offsets"][0]) for k, v in hdr.items() if k in wm)
+    doc["weight_map"] = wm
+    doc.setdefault("metadata", {})["total_size"] = total
+    with open(index, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(doc, fh, indent=2)
+
+
+def _mtp_split(base: str, state: dict[str, torch.Tensor]) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """`state` as (the trunk's tensors, the drafting head's) where `base` keeps its head in `MTP_SHARD` (the whole
+    state the trunk's otherwise), an FP8 scale going with the tensor it scales"""
+    if not os.path.isfile(os.path.join(base, MTP_SHARD)):
+        return state, {}
+    trunk = {k: v for k, v in state.items() if not k.startswith("mtp.")}
+    return trunk, {k: v for k, v in state.items() if k.startswith("mtp.")}
+
+
+def add_q4_mtp() -> None:
+    """tiny_q4's drafting head added to the built fixture and its precision twins, nothing else rewritten: the
+    trunk's shards, index entries and receipts stay as they are (`make q4_mtp`). The 12-bit twin reads what it did
+    not pack from tiny_q4 itself, so it finds the head there; the GGUF twins are converted without it
+    (`make_q4_gguf`). The oracle's references never read the head, so only their fixture hashes move: the family is
+    rebanked on its reference device, and the run refuses a bank whose tokens moved."""
+    from transformers import AutoConfig
+
+    from btb.engine import StreamedTextModel
+    from tests.cert import oracle, spec
+
+    base = os.path.join(FIXTURES, "tiny_q4")
+    mtp = _q4_mtp(AutoConfig.from_pretrained(base))
+    write_mtp(base, mtp)
+    for storage, info in spec.STORAGE.items():
+        dtype = StreamedTextModel.ST_DTYPES.get(info.fp)
+        out = spec.twin_path("tiny_q4", storage)
+        if info.container is not spec.Container.SAFETENSORS or storage is spec.Storage.SAFE_BF16 or dtype is None:
+            continue
+        if not os.path.isdir(out):
+            continue
+        if storage is spec.Storage.SAFE_FP8:
+            tensors, kept = fp8_state(mtp)
+            cfg_path = os.path.join(out, "config.json")
+            with open(cfg_path, encoding="utf-8") as f:
+                cfg: Json = json.load(f)
+            qc = cfg["quantization_config"]
+            qc["modules_to_not_convert"] = sorted(set(qc["modules_to_not_convert"]) | set(kept))
+            with open(cfg_path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(cfg, f, indent=2)
+        else:
+            tensors = {k: v.to(dtype) for k, v in mtp.items()}
+        write_mtp(out, tensors)
+        print(f"[fixture] {os.path.basename(out)}: the drafting head added ({info.fp})")
+    committed = oracle.load_bank()
+    fresh = oracle.bank([FamilyKind.QWEN4], device=str(committed.get("reference_device", "cpu")))
+    was = committed["families"][FamilyKind.QWEN4.value]
+    now = fresh["families"][FamilyKind.QWEN4.value]
+    for key in oracle.DECODES:
+        if was[key] != now[key]:
+            raise RuntimeError(f"[fixture] the drafting head moved tiny_q4's {key}: {was[key]} != {now[key]}")
+    committed["families"][FamilyKind.QWEN4.value] = now
+    oracle.write_bank(committed)
+    print("[fixture] tiny_q4: the drafting head added; the oracle's qwen4 hashes rebanked, its tokens unchanged")
 
 
 # a draw whose oracle decodes (base and FP8 twin) keep every greedy top-2 gap above the oracle's margin floor
 Q35_SEED = 59
 
 
-def _q35_model(seed: int = Q35_SEED) -> tuple[PretrainedConfig, GenerativePreTrainedModel]:
-    """tiny_q35's trunk in bf16, transformers' own init under `seed`"""
+def _q35_model(seed: int = Q35_SEED, over: Json | None = None) -> tuple[PretrainedConfig, GenerativePreTrainedModel]:
+    """tiny_q35's trunk in bf16, transformers' own init under `seed`; `over` replaces config fields"""
     import torch
     from transformers import Qwen3_5ForCausalLM
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
@@ -567,17 +752,19 @@ def _q35_model(seed: int = Q35_SEED) -> tuple[PretrainedConfig, GenerativePreTra
         "linear_num_key_heads": 2, "linear_num_value_heads": 4, "pad_token_id": 1, "eos_token_id": 1,
         "bos_token_id": 0, "dtype": "bfloat16",
     }  # fmt: skip
+    kw.update(over or {})
     cfg = Qwen3_5TextConfig(**kw)
     return cfg, Qwen3_5ForCausalLM(cfg).eval().to(torch.bfloat16)
 
 
-def build_q35(out_dir: str, seed: int = Q35_SEED) -> None:
-    cfg, m = _q35_model(seed)
+def build_q35(out_dir: str, seed: int = Q35_SEED, over: Json | None = None) -> None:
+    """tiny_q35 with its drafting head; `over` replaces config fields (a test's model at a real model's widths)"""
+    cfg, m = _q35_model(seed, over)
     os.makedirs(out_dir, exist_ok=True)
-    m.save_pretrained(out_dir, max_shard_size="100KB", safe_serialization=True)  # config + generation_config
+    m.save_pretrained(out_dir, max_shard_size="100KB" if over is None else "2GB", safe_serialization=True)
     sd = {k: v.detach().contiguous() for k, v in m.state_dict().items()}
     sd.update(_mtp_head(cfg))  # the speculative drafter head, appended to the trunk (not a transformers module)
-    _reshard(out_dir, sd)
+    _reshard(out_dir, sd, cap=100_000 if over is None else 1 << 30)
 
 
 def _mtp_head(cfg: PretrainedConfig) -> dict[str, torch.Tensor]:
@@ -613,8 +800,7 @@ GPT_OSS = {"H": 64, "HEADS": 4, "KV_HEADS": 2, "HEAD_DIM": 64, "INTER": 64, "EXP
            "LAYERS": 4, "VOCAB": 512, "WINDOW": 4}  # fmt: skip
 
 
-def _gpt_oss_config() -> Json:
-    g = GPT_OSS
+def _gpt_oss_config(g: Json = GPT_OSS) -> Json:
     return {
         "architectures": ["GptOssForCausalLM"], "attention_bias": True, "attention_dropout": 0.0,
         "dtype": "bfloat16", "eos_token_id": 1, "experts_per_token": g["TOP_K"], "head_dim": g["HEAD_DIM"],
@@ -634,11 +820,10 @@ def _gpt_oss_config() -> Json:
 GPT_OSS_SEED = 20260926
 
 
-def _gpt_oss_tensors(seed: int = GPT_OSS_SEED) -> dict[str, torch.Tensor]:
+def _gpt_oss_tensors(seed: int = GPT_OSS_SEED, g: Json = GPT_OSS) -> dict[str, torch.Tensor]:
     import numpy as np
     import torch
 
-    g = GPT_OSS
     rng = np.random.default_rng(seed)
     # the matrices at transformers' init scale, as the other families' fixtures are drawn: hotter projections
     # compound a layer's rounding into a token flip by the last layer, so bf16 and fp32 paths could not agree.
@@ -685,11 +870,13 @@ def _gpt_oss_tensors(seed: int = GPT_OSS_SEED) -> dict[str, torch.Tensor]:
     return t
 
 
-def build_gpt_oss(out_dir: str, seed: int = GPT_OSS_SEED) -> None:
+def build_gpt_oss(out_dir: str, seed: int = GPT_OSS_SEED, over: Json | None = None) -> None:
+    """tiny_gpt_oss; `over` replaces entries of the GPT_OSS shape table (a test's model at a real model's widths)"""
+    g = {**GPT_OSS, **(over or {})}
     os.makedirs(out_dir, exist_ok=True)
-    _reshard(out_dir, _gpt_oss_tensors(seed))
+    _reshard(out_dir, _gpt_oss_tensors(seed, g), cap=100_000 if over is None else 1 << 30)
     with open(os.path.join(out_dir, "config.json"), "w", encoding="utf-8") as f:
-        json.dump(_gpt_oss_config(), f, indent=2)
+        json.dump(_gpt_oss_config(g), f, indent=2)
     gen = {"_from_model_config": True, "bos_token_id": 0, "eos_token_id": 1, "pad_token_id": 1}
     with open(os.path.join(out_dir, "generation_config.json"), "w", encoding="utf-8") as f:
         json.dump(gen, f, indent=2)
@@ -707,7 +894,8 @@ def fp8_state(state: dict[str, torch.Tensor]) -> tuple[dict[str, torch.Tensor], 
     """`state` as a fine-grained FP8 checkpoint stores it, and the modules left at bf16: every decoder matrix
     (a projection, a fused expert tensor) whose shape splits into `FP8_BLOCK` in e4m3 with its `_scale_inv` grid,
     an n-gram table with one per-tensor `weight_scale` (`FP8Embedding`), and the rest (embeddings, norms, the
-    head, the routers, a matrix too small to block) as they are"""
+    head, the routers, a matrix too small to block) as they are. A packed integer tensor stays as stored too:
+    gpt-oss's MXFP4 expert blocks, so its twin is an FP8 trunk over MXFP4 experts (spec.expert_tag)"""
     from btb import fp8
 
     out: dict[str, torch.Tensor] = {}
@@ -775,7 +963,10 @@ def write_twins(base: str) -> None:
                     json.dump(cfg, f, indent=2)
             else:
                 shutil.copyfile(os.path.join(base, name), os.path.join(out, name))
-        _reshard(out, tensors)
+        trunk, head = _mtp_split(base, tensors)
+        _reshard(out, trunk)
+        if head:
+            write_mtp(out, head)
         print(f"[fixture] {os.path.basename(out)} written ({info.fp})")
 
 
@@ -1007,6 +1198,9 @@ def make(name: str) -> None:
         return
     if name == "gguf_q35":
         make_gguf_q35()
+        return
+    if name == "q4_mtp":
+        add_q4_mtp()
         return
     base = os.path.join(FIXTURES, f"tiny_{name}")
     build = BUILDERS.get(name)

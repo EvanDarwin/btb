@@ -601,7 +601,7 @@
     },
     "qwen4": {
       "fixture": "tiny_q4",
-      "fixture_hash": "sha256:93a633c022ef2bf178ef35d4f956a9bc1f847d5a0faa19c5bf5a0b3b2087505c",
+      "fixture_hash": "sha256:fc3a19d38126cbbbfcf640ff15a0221ce3f1f3899f7f156f53b1e5c4bc84b81b",
       "margins": {
         "single": [
           0.161734,
@@ -614,7 +614,7 @@
         "standard": [
           0.14037,
           0.132907,
-          0.032012,
+          0.032011,
           0.043191,
           0.153944,
           0.101914
@@ -641,18 +641,18 @@
       "storages": {
         "safetensors-fp8": {
           "fixture": "tiny_q4-f8_e4m3",
-          "fixture_hash": "sha256:f968688883600c4bf0b94bd7cd9656a258927c24d77538b03a43f8f09f088109",
+          "fixture_hash": "sha256:7837d4d9d92cd5983e9279a17ee7691be4ee17c1e20d4fb5a053346ed56da558",
           "margins": {
             "single": [
               0.170808,
-              0.168143,
+              0.168144,
               0.037159,
               0.028696,
               0.038361,
-              0.093854
+              0.093853
             ],
             "standard": [
-              0.166251,
+              0.166252,
               0.128519,
               0.036994,
               0.049938,

@@ -11,7 +11,7 @@ import sys
 import types
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 import torch
@@ -116,9 +116,270 @@ def test_a_widened_module_computes_in_float32_and_answers_in_the_callers_dtype()
     logits, idx = router(x.bfloat16())
     assert logits.dtype == torch.bfloat16 and torch.equal(logits, want_bf16[0].bfloat16())
     assert idx.dtype == torch.int64 and torch.equal(idx, want_bf16[1])
+    from btb.engine.host import _cast_floats
+
+    # what is neither a floating tensor nor a sequence of them (an int, None, an index tensor) passes through
+    t, n, i = torch.ones(2), 3, torch.tensor([1, 2])
+    out = _cast_floats((t, n, None, [i, t]), torch.bfloat16)
+    assert isinstance(out, tuple) and out[0].dtype == torch.bfloat16 and out[1:3] == (3, None)
+    assert out[3][0] is i and out[3][1].dtype == torch.bfloat16
+
+
+def test_a_reader_thread_writes_an_inference_buffer_and_widens_it_in_place() -> None:
+    """`copy_bytes` and `bf16_in_place` from a thread outside inference mode, into a buffer made inside it (a
+    bind, or the store's slot, then a reader writing it): torch refuses that write to a plain `copy_`; through
+    them it lands, and the float32 or float16 values are rewritten as their bf16 from the buffer's start"""
+    import threading
+
+    from btb.engine.host import bf16_in_place, copy_bytes
+
+    for dt in (torch.float32, torch.float16):
+        vals = torch.randn(64, generator=torch.Generator().manual_seed(5)).to(dt)
+        with torch.inference_mode():
+            buf = torch.zeros(vals.numel() * dt.itemsize, dtype=torch.uint8)
+        errors: list[BaseException] = []
+
+        def reader(
+            vals: torch.Tensor = vals,
+            buf: torch.Tensor = buf,
+            dt: torch.dtype = dt,
+            errors: list[BaseException] = errors,
+        ) -> None:
+            try:
+                with pytest.raises(RuntimeError, match=r"[Ii]nference"):
+                    buf.copy_(vals.view(torch.uint8))
+                copy_bytes(buf, vals)
+                assert torch.equal(buf.view(dt), vals)
+                bf16_in_place(buf, dt)
+            except BaseException as e:  # carried back to the test's thread
+                errors.append(e)
+
+        th = threading.Thread(target=reader)
+        th.start()
+        th.join()
+        assert not errors, errors
+        assert torch.equal(buf[: vals.numel() * 2].view(torch.bfloat16), vals.to(torch.bfloat16)), dt
+
+
+def test_stored_parts_are_the_bytes_the_card_takes_of_each_form() -> None:
+    """`stored_parts`: a bf16 expert's two matrices, an MXFP4 one in the checkpoint's layout as its blocks and
+    scales, an FP8 one as its bytes and scale grids; nothing for ggml's MXFP4 (no card path takes it), a pair of
+    two forms, or an expert already off the host"""
+    from btb.engine.host import stored_parts
+    from btb.fp8 import F8Weight, quantize
+    from btb.mxfp4 import MxWeight, hf_to_ggml
+    from tests.helpers import mxfp4_random
+
+    gu, dn = torch.zeros(8, 4, dtype=torch.bfloat16), torch.zeros(4, 4, dtype=torch.bfloat16)
+    assert stored_parts(gu, dn) == (gu, dn)
+    b, s = mxfp4_random(1, 8, 64)
+    mx = MxWeight(torch.from_numpy(b).reshape(-1), torch.from_numpy(s).reshape(-1), 8, 64)
+    assert stored_parts(mx, mx) == (mx.blocks, mx.scales, mx.blocks, mx.scales)
+    gg = MxWeight.from_ggml(torch.from_numpy(hf_to_ggml(b, s)).reshape(-1), 8, 64)
+    assert stored_parts(gg, gg) is None
+    q, sc = quantize(torch.randn(32, 32), (16, 16))
+    f8 = F8Weight(q, sc, 32, 32)
+    assert stored_parts(f8, f8) == (f8.w, f8.scales, f8.w, f8.scales)
+    assert stored_parts(gu, mx) is None and stored_parts(f8, mx) is None
+    meta = torch.empty(8, 4, dtype=torch.bfloat16, device="meta")
+    assert stored_parts(meta, dn) is None, "an expert off the host is the card's already"
+
+
+def test_the_experts_linear_widens_what_no_kernel_multiplies(monkeypatch: MonkeyPatch) -> None:
+    """`_Experts._linear` without the kernel for a form (a native library built without it): MXFP4 in either layout,
+    a GGUF's gate and up apart, and FP8 are widened and multiplied in float32 - the dequantized matrix's product,
+    and the kernel's to its float32 sums - each call tagged so; a bf16 matrix goes to torch's float32 product at
+    `gemm_rows` rows or past, and without the library, which the gemv's rows equal to its sums"""
+    import torch.nn.functional as F
+
+    from btb.engine.host import _Experts
+    from btb.engine.native import Native
+    from btb.fp8 import F8Weight, quantize
+    from btb.kinds import PassTag
+    from btb.mxfp4 import MxGateUp, MxWeight, hf_to_ggml
+    from tests.helpers import mxfp4_random
+
+    native_library()
+    tags: set[object] = set()
+    ex = _Experts(types.SimpleNamespace(_tag=lambda *t: tags.update(t)), "x.", 2, F.silu)
+    g = torch.Generator().manual_seed(3)
+    x = torch.randn(3, 64, generator=g)
+    b, s = mxfp4_random(5, 32, 64, lo=118, hi=130)
+    mx = MxWeight(torch.from_numpy(b).reshape(-1), torch.from_numpy(s).reshape(-1), 32, 64)
+    gg = MxWeight.from_ggml(torch.from_numpy(hf_to_ggml(b, s)).reshape(-1), 32, 64)
+    q, sc = quantize(torch.randn(32, 64, generator=g), (16, 16))
+    f8 = F8Weight(q, sc, 32, 64)
+    forms: dict[str, Any] = {"mxfp4": mx, "ggml": gg, "fp8": f8, "gate_up": MxGateUp(gg, gg)}
+    kernel = {name: ex._linear(x, w) for name, w in forms.items()}
+    assert tags == {PassTag.EXPERT_MXFP4_ASSTORED, PassTag.EXPERT_FP8_ASSTORED}
+    for name in ("gemv_mx4", "gemv_mx4_ggml", "gemv_fp8"):
+        monkeypatch.setattr(Native, name, None)
+    tags.clear()
+    for name, w in forms.items():
+        got = ex._linear(x, w)
+        if isinstance(w, MxGateUp):
+            # the gate and the up are each their own widened product, joined: one product of the two stacked is
+            # not the same bits on every host's BLAS (arm64's sums a row of a taller matrix otherwise)
+            half = F.linear(x, mx.dequantize(torch.float32))
+            want = torch.cat([half, half], dim=-1)
+        else:
+            want = F.linear(x, w.dequantize(torch.float32))
+        assert torch.equal(got, want), f"{name}: not the widened matrix's product"
+        torch.testing.assert_close(got, kernel[name], rtol=1e-5, atol=1e-5, msg=f"{name}: parts from the kernel")
+    assert tags == {PassTag.EXPERT_MXFP4_DEQUANT, PassTag.EXPERT_FP8_WIDENED}
+    w = torch.randn(32, 64, generator=g).bfloat16()
+    gemv = ex._linear(x, w)
+    monkeypatch.setattr(Native, "gemm_rows", 2)
+    wide = ex._linear(x, w)
+    monkeypatch.setattr(Native, "gemv", None)
+    assert torch.equal(ex._linear(x, w), wide) and torch.equal(wide, F.linear(x, w.float()))
+    torch.testing.assert_close(gemv, wide, rtol=1e-5, atol=1e-5)
 
 
 # --- the scheduler (btb/engine/scheduler.py) ---------------------------------------------------------------
+
+
+def test_gpt_oss_experts_give_a_row_the_same_bits_alone_or_among_others() -> None:
+    """gpt-oss's MXFP4 experts with their two biases and clamped gate: a row's routed sum is the same bits in a pass
+    of one row (the greedy step's path, `_one_row`) as in a pass of several (a verify's or a prompt's, the per-expert
+    loop) - the row invariance speculation stands on. It did not hold: the one-row path added the down bias to the
+    float32 product before rounding, the loop (and transformers' reference) to the bf16 product, and gpt-oss-120b's
+    speculative answer parted from its greedy one. Compared as bits: a token test on a tiny random model misses an
+    ulp that a real model's argmax finds dozens of tokens in."""
+    from btb.engine.host import _Experts
+    from btb.mxfp4 import BLOCK
+    from tests.helpers import mxfp4_random
+
+    native_library()
+    E, H, inter, k = 8, 64, 64, 4
+    blocks, scales = {}, {}
+    for name, (rows, cols) in (("gate_up_proj", (2 * inter, H)), ("down_proj", (H, inter))):
+        b, s = mxfp4_random(11 + rows, (E, rows), cols, lo=118, hi=130)
+        blocks[name], scales[name] = torch.from_numpy(b), torch.from_numpy(s)
+    tensors = {f"x.{n}_blocks": blocks[n] for n in blocks} | {f"x.{n}_scales": scales[n] for n in scales}
+    sm = types.SimpleNamespace(
+        _tag=lambda *t: None,
+        _get=lambda key, *a, **kw: tensors[key],
+        expert_store=None,
+        expert_probe=None,
+        expert_profile=None,
+        expert_trace=None,
+        mlx=None,
+        expert_stat={"experts": 0, "bytes": 0, "calls": 0, "s": 0.0},
+    )
+    ex = _Experts(sm, "x.", E, None, layer=0, mx=True, biases=True, gate=_Experts.gpt_oss_gate)
+    g = torch.Generator().manual_seed(5)
+    ex.gate_up_proj_bias = torch.nn.Parameter(torch.randn(E, 2 * inter, generator=g).bfloat16(), requires_grad=False)
+    ex.down_proj_bias = torch.nn.Parameter(torch.randn(E, H, generator=g).bfloat16(), requires_grad=False)
+    assert blocks["down_proj"].shape[-2] * BLOCK == inter
+    T = 6
+    x = (torch.randn(T, H, generator=g) * 2).bfloat16()
+    top = torch.stack([torch.randperm(E, generator=g)[:k] for _ in range(T)])
+    w = torch.softmax(torch.randn(T, k, generator=g), dim=-1).bfloat16()
+    with torch.no_grad():
+        together = ex(x, top, w)
+        for r in range(T):
+            alone = ex(x[r : r + 1], top[r : r + 1], w[r : r + 1])
+            assert torch.equal(alone[0].view(torch.int16), together[r].view(torch.int16)), (
+                f"row {r}: {int((alone[0] != together[r]).sum())} of {H} values part alone from among {T} rows"
+            )
+
+
+def test_the_step_tuner_engages_the_deep_queue_releases_it_and_engages_it_again() -> None:
+    """the step loop's tuner (`_Tuner`) over synthetic replay times on its two lanes: alone on the card the usual
+    replays are faster and it stays there, saying nothing; when another program's load makes the deep queue faster
+    by more than its margin it moves there and says the card is shared, holds while the deep queue stays faster by
+    less than the margin, moves back and says so as soon as the usual lane is as fast, and engages again after; a
+    free card's drift inside the margin moves nothing; each lane still tried a window in every `explore`; the
+    switches written only when the arm changes"""
+    from btb.engine.cuda import _Tuner
+
+    arms = [("usual", [1, 0, 0], ("usual", False)), ("queued deep", [2, 0, 0], ("deep", False))]
+    tu = _Tuner(arms, torch.device("cpu"), window=2, rounds=2, explore=4, keep=5, margin=0.10, least=3, dwell=6)
+    switch = torch.zeros(3, dtype=torch.int32)
+    speed = {0: 4.2, 1: 4.4}  # ms a token: alone, the usual lane a little faster
+    said: list[str] = []
+    writes, runs = 0, [0, 0]
+
+    def run(n: int) -> None:
+        nonlocal writes
+        for _ in range(n):
+            before = tu.cur
+            arm = tu.before_replay(switch)
+            writes += before != arm
+            assert int(switch[0]) == arms[arm][1][0]  # the arm's switches stand on the card
+            runs[arm] += 1
+            s = tu.after_replay(arm, speed[arm] * 1e-3)
+            if s:
+                assert s[1]  # a move of the queue is the console's
+                said.append(s[0])
+
+    run(80)
+    assert tu.chosen == 0 and not said and runs[1] >= 8  # alone: usual, the deep lane still tried
+    assert writes < 40  # a switch write at a change of arm, not at every replay
+    # a deep lane that loses clearly is explored less and less, and as often as at first when it comes close
+    before = runs[1]
+    speed.update({1: 6.0})
+    run(400)
+    assert tu.chosen == 0 and tu.every == 64 and runs[1] - before < 400 // 8
+    speed.update({0: 4.6, 1: 4.35})  # a free card's drift: the deep lane 6% ahead, inside the margin - no move
+    run(120)
+    assert tu.chosen == 0 and not said
+    speed.update({0: 9.0, 1: 7.8})  # a game on the card: the deep queue runs in its gaps
+    run(80)
+    assert tu.chosen == 1 and len(said) == 1 and "shared" in said[0]
+    speed.update({0: 8.0})  # the deep lane still faster, by less than the margin: the choice holds
+    run(80)
+    assert tu.chosen == 1 and len(said) == 1
+    speed.update({0: 4.2, 1: 4.4})  # the game gone
+    run(120)
+    assert tu.chosen == 0 and len(said) == 2 and "no longer pays" in said[1]
+    speed.update({0: 9.0, 1: 7.8})  # and back
+    run(120)
+    assert tu.chosen == 1 and len(said) == 3 and "shared" in said[2]
+    assert "*queued deep 7.80" in tu.report()
+    # an answer over another length: windows timed at one prefix never meet another's. A short prompt's deep
+    # windows against a long one's usual ones read as a shared card on a free one
+    speed.update({0: 4.2, 1: 4.4})
+    tu.at_context(100)
+    run(120)
+    assert tu.chosen == 0 and len(said) == 4
+    tu.at_context(4000)
+    assert all(not m for m in tu.meds)  # the short prompt's windows are gone
+    speed.update({0: 5.5, 1: 5.6})  # a free card at 4k: every step slower, the usual lane still the faster
+    run(120)
+    assert tu.chosen == 0 and len(said) == 4
+    tu.at_context(4050)
+    assert any(tu.meds)  # the same power of two: the windows stand
+
+
+def test_the_step_tuner_takes_the_fused_kernels_where_they_win_and_only_logs_it() -> None:
+    """the tuner over four lanes - the usual and the deep queue, each in the plain and the fused kernels: alone on
+    the card the usual plain lane stands; where another program's load makes the fused kernels the faster (fewer
+    edges where it takes the card), it takes the usual fused lane and says so to the log alone; where the deep queue
+    in the fused kernels wins, it moves there and the console hears of the queue"""
+    from btb.engine.cuda import _Tuner
+
+    lanes = [("usual", False), ("usual", True), ("deep", False), ("deep", True)]
+    tu = _Tuner(
+        [(str(ln), [0, 0], ln) for ln in lanes], torch.device("cpu"), window=2, rounds=2, explore=4, least=3, dwell=6
+    )
+    switch = torch.zeros(2, dtype=torch.int32)
+    said: list[tuple[str, bool]] = []
+
+    def run(n: int, speed: list[float]) -> None:
+        for _ in range(n):
+            arm = tu.before_replay(switch)
+            s = tu.after_replay(arm, speed[arm] * 1e-3)
+            if s:
+                said.append(s)
+
+    run(200, [4.2, 4.3, 4.4, 4.5])  # alone
+    assert tu.chosen == 0 and not said
+    run(200, [9.0, 7.6, 8.8, 8.0])  # beside a game: the fused kernels win, on the usual queue
+    assert tu.chosen == 1 and len(said) == 1 and not said[0][1] and "fused kernels run" in said[0][0]
+    run(300, [9.0, 7.6, 8.8, 6.5])  # and then the deep queue in them
+    assert tu.chosen == 3 and len(said) == 2 and said[1][1] and "shared" in said[1][0] and "fused" in said[1][0]
 
 
 def test_scheduler_kv_bytes_count_the_attention_layers_only() -> None:
@@ -186,6 +447,261 @@ def test_native_refuses_misaligned_buffers() -> None:
     assert rc == -6
     assert f(0, 4, 8, raw.data_ptr(), 1, y.data_ptr(), 1) == -1, "ERR_NULL"
     assert f(w.data_ptr(), 0, 8, raw.data_ptr(), 1, y.data_ptr(), 1) == -6, "a zero dimension"
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_native_attn_nodes_rows_are_the_one_row_steps(dtype: torch.dtype) -> None:
+    """a verify pass's tree nodes through `Native.attn_nodes`: each node over its list of cache rows (the prefix,
+    its ancestors, itself) is `Native.attn_decode` over those rows copied out, bit for bit, on a cache sliced out
+    of a longer one as the engine slices it; a list of the first n rows is the decode step itself; and a list
+    naming a row past the cache is refused with ERR_DOMAIN before anything is written"""
+    from btb.engine.native import Native, NativeError
+
+    native_library()
+    hq, hk, d, cap, prefix = 24, 2, 256, 96, 70
+    g = torch.Generator().manual_seed(7)
+    parents = [-1, 0, 1, -1, 3, 1]  # two branches off the prefix, one of them forked
+    n_rows = prefix + len(parents)
+    kc = torch.randn(hk, cap, d, generator=g).to(dtype)
+    vc = torch.randn(hk, cap, d, generator=g).to(dtype)
+    k, v = kc[:, :n_rows], vc[:, :n_rows]
+    lists = []
+    for j in range(len(parents)):
+        path, at = [], j
+        while at >= 0:
+            path.append(prefix + at)
+            at = parents[at]
+        lists.append(list(range(prefix)) + path[::-1])
+    lists.append(list(range(n_rows)))  # the identity list
+    T = len(lists)
+    q = torch.randn(T, hq, d, generator=g)
+    offs = torch.tensor([0] + [sum(len(li) for li in lists[: i + 1]) for i in range(T)], dtype=torch.int32)
+    idx = torch.tensor([r for li in lists for r in li], dtype=torch.int32)
+    out = torch.full((T, hq, d), float("nan"))
+    Native.attn_nodes(q, k, v, offs, idx, 0.0625, out)
+    for t, li in enumerate(lists):
+        rows = torch.tensor(li)
+        step = torch.empty(hq, d)
+        Native.attn_decode(q[t], k[:, rows].contiguous(), v[:, rows].contiguous(), 0.0625, step)
+        assert torch.equal(out[t], step), f"node {t} is not its one-row step"
+    whole = torch.empty(hq, d)
+    Native.attn_decode(q[T - 1], k, v, 0.0625, whole)
+    assert torch.equal(out[T - 1], whole), "a list of the first n rows is not the decode step over n rows"
+
+    bad = idx.clone()
+    bad[-1] = n_rows
+    kept = torch.full((T, hq, d), 7.0)
+    with pytest.raises(NativeError) as e:
+        Native.attn_nodes(q, k, v, offs, bad, 0.0625, kept)
+    assert e.value.rc == -6, "a row past the cache is ERR_DOMAIN"
+    assert bool((kept == 7.0).all()), "a refused call wrote its output"
+
+
+@pytest.mark.parametrize("norm_topk_prob", [True, False])
+def test_qwen4_router_rows_are_the_one_row_calls(norm_topk_prob: bool) -> None:
+    """Qwen4's host router (families/qwen4/router.py): a row's logits, weights and experts from a call of many rows
+    are the one-row call's bit for bit - the verify pass's rows route as their one-token steps do - and they are
+    the reference router's over the widened matrix, its routing to the expert and its numbers to float32's
+    rounding"""
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextTopKRouter
+
+    from btb.engine.families.qwen4.router import Qwen4Router, install
+
+    native_library()
+    E, H, k, T = 24, 192, 4, 17
+    g = torch.Generator().manual_seed(11)
+    cfg = types.SimpleNamespace(num_experts_per_tok=k, num_experts=E, norm_topk_prob=norm_topk_prob, hidden_size=H)
+    ref = Qwen4ExpTextTopKRouter(cfg)
+    ref.weight.data = torch.randn(E, H, generator=g).bfloat16()
+    mlp = types.SimpleNamespace(gate=ref)
+    install(mlp, "model.layers.0.mlp.gate.weight")
+    ours = mlp.gate
+    assert isinstance(ours, Qwen4Router) and ours.lin.weight.dtype == torch.bfloat16, "the matrix is kept as stored"
+    x = torch.randn(T, H, generator=g)
+    logits, weights, experts = ours(x)
+    for t in range(T):
+        lg1, w1, e1 = ours(x[t : t + 1])
+        assert torch.equal(logits[t], lg1[0]) and torch.equal(weights[t], w1[0]) and torch.equal(experts[t], e1[0]), (
+            f"row {t} of a {T}-row call is not its one-row call"
+        )
+    install(mlp, "model.layers.0.mlp.gate.weight")
+    assert mlp.gate is ours, "a router installed twice is the first one"
+    ref.weight.data = ref.weight.data.float()
+    r_logits, r_weights, r_experts = ref(x)
+    assert torch.equal(experts, r_experts), "the reference router picks other experts"
+    torch.testing.assert_close(logits, r_logits, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(weights, r_weights, rtol=1e-5, atol=1e-6)
+    # a router held at float32 (a GGUF keeps its routers so) stays the reference's module, computing in float32 and
+    # answering in the rows' dtype
+    wide = types.SimpleNamespace(gate=ref)
+    install(wide, "model.layers.0.mlp.gate.weight")
+    assert wide.gate is ref and ref.weight.dtype == torch.float32
+    b_logits, b_weights, b_experts = ref(x.bfloat16())
+    f_logits, f_weights, f_experts = ref(x.bfloat16().float())
+    assert b_logits.dtype == torch.bfloat16 and torch.equal(b_logits, f_logits.bfloat16())
+    assert torch.equal(b_weights, f_weights.bfloat16()) and torch.equal(b_experts, f_experts)
+
+
+def test_the_indexers_masks_are_told_apart_by_shape() -> None:
+    """qsa.py: a plain causal mask is every row its prefix, a speculative pass's tree every row the whole prefix
+    and its ancestors; a mask of another rank, of rows other than the pass's, or narrower than its rows is
+    neither, and a tree whose prefix a row cannot see is no tree - each takes the reference indexer"""
+    from btb.engine.families.qwen4.qsa import _plain_causal, _prefix_tree
+
+    S, off = 3, 4
+    causal = torch.ones(1, 1, S, off + S, dtype=torch.bool).tril(off)
+    assert _plain_causal(causal, S) and _prefix_tree(causal, S) is not None
+    tree = causal.clone()
+    tree[0, 0, 2, off + 1] = False  # row 2 a sibling of row 1: both under row 0
+    assert not _plain_causal(tree, S)
+    rows = _prefix_tree(tree, S)
+    assert rows is not None and [r.tolist() for r in rows[0]] == [[0], [0, 1], [0, 2]]
+    for bad in (causal[0], causal[:, :, :2], torch.ones(1, 1, S, S - 1, dtype=torch.bool)):
+        assert not _plain_causal(bad, S) and _prefix_tree(bad, S) is None, tuple(bad.shape)
+    hidden = tree.clone()
+    hidden[0, 0, 1, 0] = False  # row 1 misses a prefix row
+    assert _prefix_tree(hidden, S) is None
+
+
+def test_the_shared_drafter_leaves_its_steps_to_each_family() -> None:
+    """btb/engine/drafter.py's base: no MLX graph of its own, and the step and the MLX graph's parts each family's
+    drafter supplies - asked of the base, they refuse"""
+    from btb.engine.drafter import MTPDrafter
+
+    dr = MTPDrafter(types.SimpleNamespace(dev=torch.device("cpu")))
+    assert not dr._mlx_ready() and not dr._tree_kernel()
+    for call in (
+        lambda: dr._step(torch.zeros(1, 1, dtype=torch.long), torch.zeros(1, 1, 4), 0),
+        dr._mx_dtype,
+        lambda: dr._mlx_body(None, None, 0, None),
+        lambda: dr._mlx_draw(None, 1, None, ()),
+        lambda: dr._mlx_topk(None, 1),
+    ):
+        with pytest.raises(NotImplementedError):
+            call()
+
+
+def test_a_verify_pass_kept_for_an_engine_that_is_gone_restores_nothing() -> None:
+    """the DeltaNet's kept inputs of a verify pass hold the engine weakly: after the engine is gone the commit's
+    restore is a no-op, not an error"""
+    import gc
+
+    from btb.engine.families.qwen4.verify import _PathStep
+
+    class Engine:
+        pass
+
+    sm = Engine()
+    t = torch.zeros(2, 4)
+    step = _PathStep(sm, None, None, t, t, t, t, {})
+    del sm
+    gc.collect()
+    assert step.sm() is None
+    step.restore([0, 1])  # nothing to step, and nothing raised
+
+
+def test_a_deltanet_template_refilled_for_another_layer_rebuilds_its_operands() -> None:
+    """a streamed template or a float32 shadow is refilled in place with the next layer's weights and pointed at it
+    (`layer_idx`), its storage unchanged: the step's float32 operands are that layer's, rebuilt, never the first
+    layer's kept (bf16 weights, copied), and a float32 weight is its own operand, following the refill"""
+    from btb.engine.families.qwen4.verify import _consts
+
+    def module(dt: torch.dtype) -> Any:
+        ns = types.SimpleNamespace
+        t = lambda *s: torch.randn(*s).to(dt)
+        return ns(
+            layer_idx=3,
+            conv1d=ns(weight=t(8, 1, 4), bias=None),
+            A_log=t(2),
+            dt_bias=t(2),
+            norm=ns(weight=t(4), variance_epsilon=1e-6, activation="silu"),
+        )
+
+    cpu = torch.device("cpu")
+    for dt in (torch.bfloat16, torch.float32):
+        la = module(dt)
+        first = _consts(la, cpu)["conv_w"].clone()
+        other = module(dt)
+        for mine, theirs in ((la.conv1d.weight, other.conv1d.weight), (la.A_log, other.A_log)):
+            mine.copy_(theirs)
+        la.norm.weight.copy_(other.norm.weight)
+        la.layer_idx = 11  # `_retarget`
+        c = _consts(la, cpu)
+        assert torch.equal(c["conv_w"], other.conv1d.weight.squeeze(1).float()), dt
+        assert torch.equal(c["a_log"], other.A_log.float()) and torch.equal(c["norm_w"], other.norm.weight.float())
+        assert not torch.equal(c["conv_w"], first), dt
+
+
+def test_the_family_table_and_the_plain_blocks_answers() -> None:
+    """families/: a model type btb does not serve is refused by name, and one the kinds declare but no class here
+    builds is the table's fault, said so; the activation's name under either key; the plain block's own answers -
+    no build of its own, its name, the fused paths its flags give, no drafter, the tensors read with a layer (not
+    an FP8 scale, not an expert) and no sweep to open"""
+    from btb.engine import families
+    from btb.engine.families import FAMILIES, Family, act_name, family
+    from btb.kinds import FAMILY_NAMES, FamilyKind
+    from btb.options import UnsupportedModelType
+
+    with pytest.raises(UnsupportedModelType):
+        family(types.SimpleNamespace(model_type="not_a_model"))
+    with pytest.raises(UnsupportedModelType):
+        family(types.SimpleNamespace())
+    kept = dict(FAMILIES)
+    try:
+        del families.FAMILIES[FamilyKind.QWEN3]
+        with pytest.raises(RuntimeError, match="no Family subclass in families/ builds it"):
+            family(types.SimpleNamespace(model_type="qwen3"))
+    finally:
+        families.FAMILIES.clear()
+        families.FAMILIES.update(kept)
+    assert act_name(types.SimpleNamespace(hidden_activation="gelu_pytorch_tanh", hidden_act="silu")) == (
+        "gelu_pytorch_tanh"
+    )
+    assert act_name(types.SimpleNamespace(hidden_act="relu")) == "relu"
+    assert act_name(types.SimpleNamespace()) == "silu"
+    base = Family(kind=FamilyKind.QWEN3)
+    with pytest.raises(NotImplementedError):
+        Family.build(types.SimpleNamespace())
+    assert base.name == FAMILY_NAMES[FamilyKind.QWEN3]
+    assert not base.fused_step and not base.card_graph and not base.mega
+    assert Family(kind=FamilyKind.QWEN3, kernel_layout=True).fused_step
+    assert Family(kind=FamilyKind.QWEN3, sandwich=True, own=True).fused_step
+    assert not Family(kind=FamilyKind.QWEN3, sandwich=True, own=True).card_graph
+    assert Family(kind=FamilyKind.QWEN3, kernel_layout=True).mega
+    assert not Family(kind=FamilyKind.QWEN3, kernel_layout=True, sandwich=True).mega
+    from btb.kinds import PassTag
+
+    assert Family(kind=FamilyKind.QWEN3, dense=True).mlx_path is PassTag.MLX_STEP
+    assert Family(kind=FamilyKind.QWEN3, sandwich=True).mlx_path is PassTag.MLX_STEP
+    assert Family(kind=FamilyKind.QWEN3, hybrid=True).mlx_path is PassTag.MLX_HYBRID
+    assert base.mlx_path is PassTag.MLX_PEROP, "a mixture's layers: the per-op path"
+    assert base.drafter_cls() is None and base.open_sweep(None, 1, 1, 1) is False  # type: ignore[arg-type]
+    assert base.verify_exact(None, None)  # type: ignore[arg-type]
+    assert base.dense_key("model.layers.0.self_attn.q_proj.weight")
+    for key in (
+        "model.layers.0.self_attn.q_proj.weight_scale_inv",
+        "model.ngram.shard_0.weight_scale",
+        "model.layers.0.mlp.experts.gate_up_proj",
+    ):
+        assert not base.dense_key(key), key
+
+
+@pytest.mark.parametrize("width", [1, 4, 8, 20, 64])
+def test_qwen4_activations_row_by_row_are_the_one_row_calls(width: int) -> None:
+    """families/qwen4/rows.py `each`: a verify pass's activations a token row at a time, every row the one-row call
+    bit for bit - torch's sigmoid and silu take a vector body or a scalar tail by how many elements travel
+    together, which a row among many and a row alone need not share"""
+    import torch.nn.functional as F
+
+    from btb.engine.families.qwen4.rows import each
+
+    T = 16
+    x = torch.randn(1, T, width, generator=torch.Generator().manual_seed(width)) * 3
+    for fn in (torch.sigmoid, F.silu):
+        rows = each(fn, x, T)
+        assert rows.shape == x.shape
+        for t in range(T):
+            assert torch.equal(rows[0, t], fn(x[:, t : t + 1].clone())[0, 0]), f"{fn.__name__} row {t} of {width}"
 
 
 # --- the wheel's package list (pyproject.toml) --------------------------------------------------------------
@@ -333,12 +849,16 @@ def _probe(L: int = 8, layer_bytes: int = 64 * 2**20, hk: int = 2, hd: int = 64)
     """a model opened on the CPU as the planner sees it: sizes off the headers, nothing loaded"""
     import types
 
+    from btb.engine.families import Family
+    from btb.kinds import FamilyKind
+
     cfg = types.SimpleNamespace(
         vocab_size=1000, hidden_size=256, num_attention_heads=4, num_key_value_heads=hk, head_dim=hd
     )
     return types.SimpleNamespace(
         L=L,
         cfg=cfg,
+        fam=Family(kind=FamilyKind.QWEN3),  # the plain block's flags: no mixture, no attention index
         layer_types=["full_attention"] * L,
         weight_map={},
         _layer_bytes=lambda i: layer_bytes,
@@ -381,6 +901,70 @@ def test_plan_prices_the_cache_for_the_context() -> None:
     assert out["kv_read_ms"] == 8 * 64 * MB / RAM_BPS * 1e3 and budget()["kv_read_ms"] == 0.0
 
 
+def test_plan_keeps_a_sparse_attentions_pooled_keys_on_the_card_with_the_rows_in_ram() -> None:
+    """Qwen4's sparse attention indexes its rows: a raw key a row, which lives with the rows, and a pooled key a
+    block, which every pass scores whole and so stays on the card - under `kv_host` too, where nothing else of the
+    cache is the card's. At a million positions the pooled keys are the card's share of the context"""
+    from btb.engine.families.base import _flags
+    from btb.engine.families.qwen4.family import Qwen4Family
+    from btb.engine.tiers import _TiersMixin
+    from btb.kinds import FamilyKind, LayerKind
+
+    MB = 2**20
+    p = _probe()
+    p.fam = Qwen4Family(kind=FamilyKind.QWEN4, streams=4, **_flags(FamilyKind.QWEN4))
+    p.layer_types = [LayerKind.QWEN_SPARSE, LayerKind.LINEAR] * 4
+    p.cfg.indexer_compress_ratio, p.cfg.indexer_head_dim, p.cfg.indexer_budget = 4, 128, 2048
+    rows = 1 << 20
+    pooled, raw = (rows // 4 + 1) * 128 * 2, rows * 128 * 2
+    assert p.fam.attn_index_bytes(p.cfg, rows) == (pooled, raw)
+    out = _TiersMixin.plan_budget(
+        cast("_TiersMixin", p),
+        ram_gb=256.0,
+        vram_gb=64.0,
+        packed=False,
+        fp32=False,
+        drafter=False,
+        prefill_card=False,
+        os_reserve_gb=1.0,
+        vram_reserve_gb=0.5,
+        context=rows,
+        kv_host=True,
+    )
+    kv_row = 2 * 2 * 64 * 2 * rows  # keys and values: 2 heads of 64, bf16
+    assert len(out["resident"]) == 8
+    assert out["bytes"]["kv_card"] == 4 * pooled, "the four sparse layers' pooled keys, and nothing else"
+    assert out["bytes"]["kv_host"] == 4 * (kv_row + raw), "their rows and raw keys in RAM; DeltaNet keeps none"
+    # the card's share: 64 MiB a layer at a million positions, a twelfth of what the layer keeps in RAM
+    assert pooled == 64 * MB + 256 and (kv_row + raw) / pooled == pytest.approx(12.0, rel=1e-4)
+    # a token reads the indexer's budget of those rows and a block's tail - 2052 of a million - not every one
+    from btb.engine.tiers import RAM_BPS
+
+    assert p.fam.attn_read_rows(p.cfg, rows) == 2048 + 4
+    assert out["kv_read_ms"] == pytest.approx(4 * (kv_row + raw) * 2052 / rows / RAM_BPS * 1e3)
+    assert out["kv_read_ms"] < 0.2, "a million positions in RAM priced as a whole read a token"
+    # a sparse layer on the host reads every one of its rows (its path grows and re-pools them whole): the budget's
+    # discount is the card program's, for the resident layers' rows alone
+    few = _TiersMixin.plan_budget(
+        cast("_TiersMixin", p),
+        ram_gb=256.0,
+        vram_gb=1.5 + 0.5 + 0.55,
+        packed=False,
+        fp32=False,
+        drafter=False,
+        prefill_card=False,
+        os_reserve_gb=1.0,
+        vram_reserve_gb=0.5,
+        context=rows,
+        kv_host=True,
+    )
+    on_host = [i for i in range(8) if i not in few["resident"] and i % 2 == 0]
+    on_card = [i for i in few["resident"] if i % 2 == 0]
+    assert on_host and on_card, few["resident"]
+    whole, read = len(on_host) * (kv_row + raw), len(on_card) * (kv_row + raw) * 2052 / rows
+    assert few["kv_read_ms"] == pytest.approx((whole + read) / RAM_BPS * 1e3)
+
+
 def test_an_mlx_plan_prices_the_gpu_and_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
     """on Apple silicon a pass reads its layers and the head on the GPU from the one memory: the prediction is those
     bytes at the GPU's measured read rate (not the host tier's CPU price and its host head), and the summary puts
@@ -393,7 +977,6 @@ def test_an_mlx_plan_prices_the_gpu_and_says_so(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(btb.mlx, "read_bps", lambda: 100e9)
     p = _probe()
     p.plan_budget = lambda *a, **kw: _TiersMixin.plan_budget(cast("_TiersMixin", p), *a, **kw)
-    p.fam = types.SimpleNamespace(moe=False)
     hb = HostBudget(total=64 * GB, available=48 * GB, commit=64 * GB, footprint=0, os_floor=0, growth=0, floor=4 * GB)
     pl = BatchScheduler.plan_placement(p, "mlx", 0.0, packed=False, fp32=False, vram_reserve_gb=0.0, budget=hb)
     assert len(pl.warm) == 8 and not pl.cold and pl.gpu_bps == 100e9
@@ -402,6 +985,104 @@ def test_an_mlx_plan_prices_the_gpu_and_says_so(monkeypatch: pytest.MonkeyPatch)
     assert "8 on the GPU" in s and "head on the GPU" in s and "the GPU reads 100 GB/s" in s and "host" not in s
     cpu = BatchScheduler.plan_placement(p, "cpu", 0.0, packed=False, fp32=False, vram_reserve_gb=0.0, budget=hb)
     assert cpu.gpu_bps is None and "8 host" in str(cpu) and "head host" in str(cpu)
+
+
+# Qwen3.8-Flash-Next's drafting head as its headers give it (H 2560, four streams, 512 experts): the experts are
+# 4.69 GiB of its 4.86, the dense rest 0.17
+_Q4_MTP = {
+    "mtp.fc_embedding.weight": [2560, 2560],
+    "mtp.fc_hidden.weight": [2560, 2560],
+    "mtp.hyper_connection_mixer.hc_norm.weight": [10240],
+    "mtp.hyper_connection_mixer.input_mix_weight_down.weight": [320, 10240],
+    "mtp.hyper_connection_mixer.input_mix_weight_up.weight": [10240, 320],
+    "mtp.layers.0.attn_hyper_connection.block_inject_weight.weight": [4, 10240],
+    "mtp.layers.0.attn_hyper_connection.hc_norm.weight": [10240],
+    "mtp.layers.0.attn_hyper_connection.input_mix_weight_down.weight": [320, 10240],
+    "mtp.layers.0.attn_hyper_connection.input_mix_weight_up.weight": [10240, 320],
+    "mtp.layers.0.mlp.experts.down_proj": [512, 2560, 640],
+    "mtp.layers.0.mlp.experts.gate_up_proj": [512, 1280, 2560],
+    "mtp.layers.0.mlp.gate.weight": [512, 2560],
+    "mtp.layers.0.mlp.shared_expert.down_proj.weight": [2560, 640],
+    "mtp.layers.0.mlp.shared_expert.gate_proj.weight": [640, 2560],
+    "mtp.layers.0.mlp.shared_expert.up_proj.weight": [640, 2560],
+    "mtp.layers.0.mlp.shared_expert_gate.weight": [1, 2560],
+    "mtp.layers.0.mlp_hyper_connection.block_inject_weight.weight": [4, 10240],
+    "mtp.layers.0.mlp_hyper_connection.hc_norm.weight": [10240],
+    "mtp.layers.0.mlp_hyper_connection.input_mix_weight_down.weight": [320, 10240],
+    "mtp.layers.0.mlp_hyper_connection.input_mix_weight_up.weight": [10240, 320],
+    "mtp.layers.0.self_attn.indexer.index_qk_proj.weight": [640, 2560],
+    "mtp.layers.0.self_attn.indexer.k_layernorm.weight": [128],
+    "mtp.layers.0.self_attn.indexer.q_layernorm.weight": [128],
+    "mtp.layers.0.self_attn.k_norm.weight": [256],
+    "mtp.layers.0.self_attn.k_proj.weight": [512, 2560],
+    "mtp.layers.0.self_attn.o_proj.weight": [2560, 6144],
+    "mtp.layers.0.self_attn.q_norm.weight": [256],
+    "mtp.layers.0.self_attn.q_proj.weight": [12288, 2560],
+    "mtp.layers.0.self_attn.v_proj.weight": [512, 2560],
+    "mtp.pre_fc_norm_embedding.weight": [2560],
+    "mtp.pre_fc_norm_hidden.weight": [10240],
+}
+
+
+def test_the_plan_prices_only_the_drafter_it_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """a drafting head whose layer is a mixture is priced at its dense tensors alone (the experts are the expert
+    store's, as every MoE layer's are): the 180B's 0.17 GB, not its 4.86; and it is priced only where the load runs
+    it - speculation on, with a family that drafts and verifies on the tier - else nowhere, and the plan says none"""
+    import btb.mlx
+    from btb.engine.families.base import _flags
+    from btb.engine.families.qwen4.family import Qwen4Family
+    from btb.engine.scheduler import BatchScheduler, HostBudget
+    from btb.engine.state import DRAFT_VOCAB
+    from btb.engine.tiers import _TiersMixin
+    from btb.kinds import FamilyKind
+
+    GB = 2**30
+    monkeypatch.setattr(btb.mlx, "read_bps", lambda: 100e9)
+    p = _probe()
+    p.cfg.hidden_size = 2560
+    p.fam = Qwen4Family(kind=FamilyKind.QWEN4, streams=4, **_flags(FamilyKind.QWEN4))
+    hdr = {k: {"shape": shp, "dtype": "BF16"} for k, shp in _Q4_MTP.items()}
+    p.weight_map = dict.fromkeys(hdr, "mtp.safetensors")
+    p._shard = lambda _f: (None, hdr, 0)
+    p._drafter_bytes = lambda: _TiersMixin._drafter_bytes(cast("_TiersMixin", p))
+    p.plan_budget = lambda *a, **kw: _TiersMixin.plan_budget(cast("_TiersMixin", p), *a, **kw)
+    whole = sum(2 * int(torch.Size(s).numel()) for s in _Q4_MTP.values())
+    dense = sum(2 * int(torch.Size(s).numel()) for k, s in _Q4_MTP.items() if ".mlp.experts." not in k)
+    assert (round(whole / GB, 2), round(dense / GB, 2)) == (4.86, 0.17)
+    assert p._drafter_bytes() == dense == 181_136_896
+    slice_b = min(DRAFT_VOCAB, int(p.cfg.vocab_size)) * 2560 * 2
+    hb = HostBudget(total=64 * GB, available=48 * GB, commit=64 * GB, footprint=0, os_floor=0, growth=0, floor=4 * GB)
+    plan = lambda dev, **kw: BatchScheduler.plan_placement(
+        p,
+        dev,
+        11.0 if dev == "cuda" else 0.0,
+        packed=False,
+        fp32=False,
+        vram_reserve_gb=0.5,
+        budget=hb,
+        settle_s=0.0,
+        **kw,
+    )
+    on = plan("cuda")
+    assert on.has_mtp and on.drafter_on_card and on.bytes.drafter == dense + slice_b
+    assert "drafter card" in str(on)
+    # the room it leaves is the room the card's layers get: a head priced at its whole 4.86 GB would take it
+    assert on.bytes.drafter < 0.2 * GB
+    for off in (plan("cuda", speculate=False), plan("mlx"), plan("cpu", speculate=False)):
+        assert not off.has_mtp and not off.drafter_on_card and off.bytes.drafter == 0
+        assert "drafter none" in str(off)
+    host = plan("cpu")
+    assert host.has_mtp and not host.drafter_on_card and host.bytes.drafter == dense + slice_b
+    assert "drafter host" in str(host)
+    # what the card can give up (`memory()`'s sheddable) counts the same head on the card: its dense tensors off the
+    # headers, never every `mtp.*` tensor read through `_get` (the store's experts too, an FP8 one widened each call)
+    from btb.engine.memory import _MemoryMixin
+
+    card = torch.device("cuda")
+    p.dev, p.compute_dtype, p.resident, p.head, p.resident_head = card, None, {}, None, False
+    p.aj = types.SimpleNamespace(dev=card)
+    p._get = lambda k, *a, **kw: pytest.fail(f"the sheddable bytes read {k}")
+    assert _MemoryMixin._sheddable(cast("_MemoryMixin", p), card) == dense
 
 
 def test_the_report_line_puts_mlx_layers_the_head_and_the_cache_on_the_gpu() -> None:
@@ -582,16 +1263,22 @@ def test_session_reuses_the_shared_prefix_and_learns_the_tail() -> None:
 
 
 def test_the_engine_vocabularies_are_spelled_once() -> None:
-    """the layer kinds are transformers' own `layer_types` names, the whole of its ALLOWED_ATTN_LAYER_TYPES, so
-    any config it accepts reads into the enum; the family kinds and tiers equal their strings, so a report
-    reads as before"""
+    """the layer kinds are transformers' own `layer_types` names, the whole of its ALLOWED_ATTN_LAYER_TYPES read
+    through their legacy names, so any config it accepts - under the names of transformers 5.16-5.17 or 5.18 on -
+    reads into the enum, and a kind handed back to it is the installed version's name; the family kinds and tiers
+    equal their strings, so a report reads as before"""
     import json
 
     from transformers.configuration_utils import ALLOWED_ATTN_LAYER_TYPES
 
-    from btb.kinds import FamilyKind, LayerKind, LayerTier, Tier, UnknownKind
+    from btb.kinds import LEGACY, FamilyKind, LayerKind, LayerTier, Tier, UnknownKind
 
-    assert set(LayerKind) == set(ALLOWED_ATTN_LAYER_TYPES), "transformers' list moved: add the new kinds"
+    assert {LayerKind.of(t) for t in ALLOWED_ATTN_LAYER_TYPES} == set(LayerKind), (
+        "transformers' list moved: add the new kinds"
+    )
+    assert all(LayerKind.of(old) is LayerKind(new) for old, new in LEGACY.items())
+    assert LayerKind.of("qwen_sparse_attention") is LayerKind.of("indexed_attention") is LayerKind.QWEN_SPARSE
+    assert LayerKind.QWEN_SPARSE.hf_name() in ALLOWED_ATTN_LAYER_TYPES, "a drafter's config named its layer unknown"
     assert LayerKind.of("full_attention") is LayerKind.FULL and LayerKind.of("conv") is LayerKind.CONV
     with pytest.raises(UnknownKind) as e:
         LayerKind.of("not_a_kind")
@@ -615,6 +1302,39 @@ def test_the_package_root_and_the_cli_stay_torch_free() -> None:
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=ROOT, check=True)
     assert out.stdout.strip() == "False", out.stdout + out.stderr
+
+
+def test_the_host_memory_a_call_frees_goes_back_to_the_machine() -> None:
+    """`import btb` has torch's CPU allocator give freed memory back as it goes (`MIMALLOC_PURGE_DELAY`, set before
+    torch loads): by default mimalloc kept it committed to the process for good, and a 40k prompt's 2.5 GB of host
+    rows outlived the answer, refusing the next call's prefill on a machine short of commit. A value the caller set
+    stands. On Windows, where torch's allocator is mimalloc, 1 GB freed is back in the machine's commit at once"""
+    import subprocess
+
+    env = {k: v for k, v in os.environ.items() if k != "MIMALLOC_PURGE_DELAY"}
+    env["CUDA_VISIBLE_DEVICES"] = "-1"
+    code = (
+        "import gc, os, btb, torch; from btb.sysinfo import host_commit_bytes as c; "
+        "a = c(); t = torch.ones(1 << 28); held = c(); del t; gc.collect(); "
+        "print(os.environ['MIMALLOC_PURGE_DELAY'], a - held, a - c())"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=ROOT, env=env, check=True)
+    delay, took, kept = out.stdout.split()
+    assert delay == "0", out.stdout + out.stderr
+    if sys.platform == "win32":
+        GB = 1 << 30
+        assert int(took) > GB // 2, "the 1 GB tensor was never committed: the reading cannot tell"
+        assert int(kept) < GB // 4, f"{int(kept) / GB:.2f} GB of the freed tensor stayed committed"
+    env["MIMALLOC_PURGE_DELAY"] = "7"
+    out = subprocess.run(
+        [sys.executable, "-c", "import os, btb; print(os.environ['MIMALLOC_PURGE_DELAY'])"],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        env=env,
+        check=True,
+    )
+    assert out.stdout.strip() == "7", "a value the caller set was overridden"
 
 
 def test_the_span_bank_keeps_the_index_and_a_proposer_looks_it_up() -> None:

@@ -430,8 +430,9 @@ NGRAM = ".ple.ple_embedding.ngram_embedding.shard_"
 
 
 def _q4_state() -> dict[str, torch.Tensor]:
-    """tiny_q4's tensors with its n-gram shards as the one table the GGUF stores (`shard_0`)"""
-    state = safetensors_state(Q4)
+    """tiny_q4's trunk with its n-gram shards as the one table the GGUF stores (`shard_0`): the drafting head
+    (`mtp.*`) left out, as llama.cpp's converter leaves it (make_fixtures strips it before converting)"""
+    state = {k: v for k, v in safetensors_state(Q4).items() if not k.startswith("mtp.")}
     for pre in sorted({k.partition(NGRAM)[0] for k in state if NGRAM in k}):
         parts = sorted((k for k in state if k.startswith(pre + NGRAM)), key=lambda k: (len(k), k))
         state[pre + NGRAM + "0.weight"] = torch.cat([state.pop(k) for k in parts])
@@ -439,7 +440,9 @@ def _q4_state() -> dict[str, torch.Tensor]:
 
 
 def _q4_names(g: "GGUFModel") -> dict[str, str]:
-    names, _ = g.weight_map(list(safetensors_state(Q4)), g.config().num_hidden_layers)
+    names, _ = g.weight_map(
+        [k for k in safetensors_state(Q4) if not k.startswith("mtp.")], g.config().num_hidden_layers
+    )
     return names
 
 

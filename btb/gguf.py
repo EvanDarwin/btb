@@ -300,6 +300,11 @@ class GGUFModel:
             fields.update(self._qwen35_fields())
         if self.arch == QWEN4EXP:
             fields.update(self._qwen4exp_config())
+        if "token_embd.weight" in self.tensors:
+            # the model's vocabulary is its embedding table's rows - what its head can emit, as a checkpoint's config
+            # counts it (Qwen's padded 151936, not its tokenizer's 151669). A file whose tokenizer lists fewer tokens
+            # took the tokenizer's count, and the engine refused the ids past it that the model itself predicted
+            fields["vocab_size"] = self._shape("token_embd.weight")[0]
         cfg = AutoConfig.for_model(fields.pop("model_type"), **fields)
         # the head size is in the file (attention.key_length) but not in transformers' table for these families,
         # which leaves the family's default: read it off the typed key when the file carries it
@@ -373,7 +378,10 @@ class GGUFModel:
                 "mrope_section": [int(x) for x in m("Rope.DIMENSION_SECTIONS")[:3]],
                 "mrope_interleaved": True,
             },
-            "layer_types": ["linear_attention" if r else "qwen_sparse_attention" for r in recurrent],
+            # the attention layers as Qwen's checkpoints name them: every transformers btb takes maps `full_attention`
+            # to its own name for Qwen4's indexed attention (5.16-5.17 `qwen_sparse_attention`, 5.18 on
+            # `indexed_attention`)
+            "layer_types": ["linear_attention" if r else "full_attention" for r in recurrent],
             "linear_conv_kernel_dim": int(m("SSM.CONV_KERNEL")),
             "linear_key_head_dim": int(m("SSM.STATE_SIZE")),
             "linear_num_key_heads": int(m("SSM.GROUP_COUNT")),
@@ -417,17 +425,25 @@ class GGUFModel:
         """the tokenizer transformers rebuilds from the metadata, with every token the file types as a control
         or user-defined token marked special (transformers marks three of Qwen's; the file names them all, and
         an unmarked one - <think>, a tool tag - would tokenize as text)"""
+        import importlib
+
         from tokenizers import AddedToken
         from transformers import PreTrainedTokenizerFast
-        from transformers.integrations.ggml import GGUF_TO_FAST_CONVERTERS, convert_gguf_tokenizer
 
         g = gguf_lib()
         parsed = self._parsed()
-        # transformers keys its converters by architecture and has none for gpt-oss (its "gpt2" one does not
-        # build): the byte-level BPE is Qwen's converter's, the pre-tokenizer the file's `pre` type names
-        mt = self.model_type
-        name = mt if mt in GGUF_TO_FAST_CONVERTERS else "qwen2"
-        fast, extra = convert_gguf_tokenizer(name, parsed["tokenizer"])
+        try:
+            # transformers 5.18 builds a file's tokenizer from its stated type (`tokenizer.ggml.model`), the split
+            # its `pre` type names applied; its converters keyed by architecture are gone
+            mapping: Any = importlib.import_module("transformers.integrations.gguf.gguf_tokenizer_mapping")
+            fast, extra = mapping.convert_gguf_tokenizer(self.arch, parsed["tokenizer"])
+        except ModuleNotFoundError:
+            # 5.16 and 5.17 key their converters by architecture and have none for gpt-oss (their "gpt2" one does
+            # not build): the byte-level BPE is Qwen's converter's, the pre-tokenizer the file's `pre` type names
+            ggml: Any = importlib.import_module("transformers.integrations.ggml")
+            mt = self.model_type
+            name = mt if mt in ggml.GGUF_TO_FAST_CONVERTERS else "qwen2"
+            fast, extra = ggml.convert_gguf_tokenizer(name, parsed["tokenizer"])
         pre = self.reader.get_field(g.Keys.Tokenizer.PRE)
         if pre is not None and str(pre.contents()) in O200K_PRE_TYPES:
             fast.pre_tokenizer = o200k_pre_tokenizer()

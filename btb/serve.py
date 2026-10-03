@@ -322,16 +322,25 @@ class ModelRegistry:
                 torch.cuda.empty_cache()
 
     def _card_free(self) -> int | None:
-        """VRAM free on the serving device right now, or None off a CUDA card (host/unified memory is bounded by
-        the RAM budget instead, not this)."""
+        """VRAM free on the serving device for the next model's load, or None off a CUDA card (host/unified memory
+        is bounded by the RAM budget instead, not this): the card's free memory above its margin, less what every
+        loaded model has spoken for there - its rooms, its epoch's KV. Each loaded model keeps a ledger of its own,
+        and the next load must not take what one of them has promised."""
         if not self.card:
             return None
         import torch
 
         from .engine.device import free_bytes
+        from .engine.scheduler import BatchScheduler
 
         try:
-            return free_bytes(torch.device(str(self.device)))
+            dev = torch.device(str(self.device))
+            margin = int(BatchScheduler.vram_margin_gb(torch.cuda.get_device_properties(dev).total_memory) * 2**30)
+            # free-read: the next model's load, priced across every loaded model's ledger (each keeps its own)
+            free = free_bytes(dev, margin)
+            if free is None:
+                return None
+            return max(0, int(free) - sum(int(e.sm.device.reserved(dev)) for e in self.loaded.values()))
         except Exception:
             return None
 

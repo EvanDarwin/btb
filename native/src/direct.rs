@@ -31,6 +31,7 @@ mod sys {
     const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
 
     const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+    const FILE_FLAG_RANDOM_ACCESS: u32 = 0x1000_0000;
     const ERROR_HANDLE_EOF: u32 = 38;
 
     #[link(name = "kernel32")]
@@ -76,15 +77,27 @@ mod sys {
 
     impl File {
         pub unsafe fn open(path: *const u16) -> Option<File> {
-            unsafe { File::open_shared(path, FILE_SHARE_READ | FILE_SHARE_WRITE) }
+            unsafe { File::open_shared(path, FILE_SHARE_READ | FILE_SHARE_WRITE, false) }
         }
 
         // no other process may write to or delete the file while this handle is held
         pub unsafe fn open_share_read(path: *const u16) -> Option<File> {
-            unsafe { File::open_shared(path, FILE_SHARE_READ) }
+            unsafe { File::open_shared(path, FILE_SHARE_READ, false) }
         }
 
-        unsafe fn open_shared(path: *const u16, share: u32) -> Option<File> {
+        // the same, through the system's file cache: a read fills it, and a read of the same bytes while the
+        // cache holds them is a copy out of RAM that no commit is charged for. Random access: the reads are
+        // scattered experts, and the cache manager's read-ahead would only be bytes nobody asked for
+        pub unsafe fn open_share_read_cached(path: *const u16) -> Option<File> {
+            unsafe { File::open_shared(path, FILE_SHARE_READ, true) }
+        }
+
+        unsafe fn open_shared(path: *const u16, share: u32, cached: bool) -> Option<File> {
+            let flags = if cached {
+                FILE_FLAG_RANDOM_ACCESS
+            } else {
+                FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN
+            };
             let h = unsafe {
                 CreateFileW(
                     path,
@@ -92,7 +105,7 @@ mod sys {
                     share,
                     std::ptr::null_mut(),
                     OPEN_EXISTING,
-                    FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN,
+                    flags,
                     std::ptr::null_mut(),
                 )
             };
@@ -221,6 +234,18 @@ mod sys {
         // is kept off the file while this handle is held. Nothing else changes if the lock is refused.
         pub unsafe fn open_share_read(path: *const u16) -> Option<File> {
             let f = unsafe { File::open(path) }?;
+            Some(f.share_read())
+        }
+
+        // the same, through the page cache (no O_DIRECT, no F_NOCACHE): a read fills it, and a read of the same
+        // bytes while the cache holds them is a copy out of RAM
+        pub unsafe fn open_share_read_cached(path: *const u16) -> Option<File> {
+            let s = unsafe { super::utf16_to_string(path) }?;
+            let f = std::fs::OpenOptions::new().read(true).open(&s).ok()?;
+            Some(File(f).share_read())
+        }
+
+        fn share_read(self) -> File {
             #[cfg(target_os = "linux")]
             {
                 use std::os::unix::io::AsRawFd;
@@ -230,10 +255,10 @@ mod sys {
                     fn flock(fd: i32, op: i32) -> i32;
                 }
                 unsafe {
-                    let _ = flock(f.0.as_raw_fd(), LOCK_SH | LOCK_NB);
+                    let _ = flock(self.0.as_raw_fd(), LOCK_SH | LOCK_NB);
                 }
             }
-            Some(f)
+            self
         }
 
         pub fn size(&self) -> Option<u64> {
@@ -550,10 +575,27 @@ fn table() -> MutexGuard<'static, HashMap<i64, Arc<Open>>> {
 /// # Safety
 /// `path` NUL-terminated UTF-16.
 pub unsafe fn open(path: *const u16) -> i64 {
+    unsafe { open_with(path, false) }
+}
+
+/// [`open`] through the system's file cache (see `sys::File::open_share_read_cached`).
+///
+/// # Safety
+/// `path` NUL-terminated UTF-16.
+pub unsafe fn open_cached(path: *const u16) -> i64 {
+    unsafe { open_with(path, true) }
+}
+
+unsafe fn open_with(path: *const u16, cached: bool) -> i64 {
     if path.is_null() {
         return ERR_NULL as i64;
     }
-    let file = match unsafe { sys::File::open_share_read(path) } {
+    let opened = if cached {
+        unsafe { sys::File::open_share_read_cached(path) }
+    } else {
+        unsafe { sys::File::open_share_read(path) }
+    };
+    let file = match opened {
         Some(f) => f,
         None => return ERR_IO as i64,
     };
@@ -638,5 +680,40 @@ mod tests {
              FILE_FLAG_NO_BUFFERING is not in effect and every read is going \
              through the page cache"
         );
+    }
+
+    #[test]
+    fn a_cached_handle_reads_any_span_through_the_cache() {
+        // the handle the file cache serves: the misaligned read an unbuffered handle refuses is taken, bytes
+        // right, and a whole read through `read_at` gives the file back
+        let dir = std::env::var_os("BTB_DIRECT_TEST_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let path = dir.join(format!("btb_direct_cached_{}.bin", std::process::id()));
+        let data: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).expect("write probe file");
+        let w = wide(&path);
+
+        let f = unsafe { sys::File::open_share_read_cached(w.as_ptr()) }.expect("open cached");
+        let scratch = Scratch::new(64 * 1024).expect("scratch");
+        let got = unsafe { f.read_at(scratch.ptr, 4095, 1) };
+        let bytes = unsafe { std::slice::from_raw_parts(scratch.ptr, 4095) }.to_vec();
+        drop(f);
+
+        let h = unsafe { open_cached(w.as_ptr()) };
+        assert!(h >= 0, "open_cached failed: {h}");
+        let mut all = vec![0u8; data.len()];
+        let rc = unsafe { read_at(h, 0, data.len() as u64, all.as_mut_ptr(), 0, 0) };
+        close(h);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            got,
+            Some(4095),
+            "a misaligned read through the cache was refused"
+        );
+        assert_eq!(bytes, data[1..4096], "the misaligned read's bytes");
+        assert_eq!(rc, OK, "a whole read on the cached handle");
+        assert_eq!(all, data, "the whole file back through the cached handle");
     }
 }

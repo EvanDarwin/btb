@@ -3,14 +3,17 @@
 
 from __future__ import annotations
 
+import enum
 import os
 import sys
 import threading
 import time
+import weakref
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Callable, Container, Sequence
 from concurrent.futures import FIRST_COMPLETED
 from concurrent.futures import wait as wait_for
+from dataclasses import dataclass
 from itertools import pairwise
 from typing import TYPE_CHECKING, Any
 
@@ -18,13 +21,15 @@ import numpy as np
 import torch
 
 from .. import mlx as mlxdev
+from .. import trace
 from ..fp8 import F8Weight
 from ..kinds import PassTag
 from ..mxfp4 import BLOCK, MxGateUp, MxWeight, stored_mxfp4
 from ..options import Device
-from ..sysinfo import host_free_bytes
-from .host import bf16_in_place
+from .device import where
+from .host import bf16_in_place, stored_parts
 from .native import Native
+from .scheduler import MemoryGrantError, _size
 
 if TYPE_CHECKING:
     from concurrent.futures import ThreadPoolExecutor
@@ -34,8 +39,10 @@ if TYPE_CHECKING:
 class ExpertProfile:
     """Everything the store did, one row per event in an append-only int64 array: no allocation on the path
     (the array doubles when full), one lock shared with the reader threads, saved by `save` as an .npz with
-    `events` [n, 11], `kinds` and `shards` (a path per shard id). Columns: t_ns from the first event, step
-    (layer 0's call starts a pass), kind, layer, expert, bytes, shard, offset, dur_ns, slot, aux. By kind:
+    `events` [n, 11], `kinds`, `shards` (a path per shard id) and `picks` [m, k] int16, every call's picks row by
+    row - which experts each of its rows asked, in the router's order - kept the same way in an array of their own.
+    Columns: t_ns from the first event, step (layer 0's call starts a pass), kind, layer, expert, bytes, shard,
+    offset, dur_ns, slot, aux. By kind:
 
         hit      the expert served from its slot
         miss     one read of a missing expert's part: bytes, shard, offset, dur_ns of that read, slot, aux the
@@ -45,7 +52,8 @@ class ExpertProfile:
         evict    the expert a slot was taken from: aux 0 for the call's need, 1 for the machine's memory
         grow     a block added: expert the slots, bytes, aux the host's free bytes after
         release  a block given back for the machine: expert the slots, bytes, aux the host's free bytes after
-        call     one layer's call done: expert the rows, bytes the hits, shard the misses, dur_ns the wait
+        call     one layer's call done: expert the rows, bytes the hits, shard the misses, dur_ns the wait, offset
+                 the call's first row in `picks` (its rows the next `expert` of them)
         ahead    the lookahead predicted the expert and queued its reads into a ring slot: aux the depth (1 the
                  next layer, 2 the one after); a hit with aux 1 later is that prediction used
         gil      the watchdog's wake (`watch`): dur_ns how late it woke; aux 1 when the threads' frames were kept
@@ -59,6 +67,10 @@ class ExpertProfile:
         self.path = str(path)
         self.a = np.zeros((int(cap), 11), dtype=np.int64)
         self.n = 0
+        # the calls' picks: sized by the first call (its k), each row an int16 per pick, -1 past a narrower call's k
+        self.p = np.full((0, 0), -1, dtype=np.int16)
+        self._pt = torch.from_numpy(self.p)  # the same memory, for a copy straight from the router's tensor
+        self.m = 0
         self.step = 0
         self.t0 = time.perf_counter_ns()
         self.shards: dict[str, int] = {}
@@ -131,13 +143,38 @@ class ExpertProfile:
             self.a[self.n] = (t, self.step, kind, layer, expert, nbytes, shard, offset, dur_ns, slot, aux)
             self.n += 1
 
+    def keep_picks(self, top: torch.Tensor) -> int:
+        """A call's picks [rows, k] (on the host) copied into `picks`, returned as the offset of its first row: the
+        `call` event's offset. The array doubles when full, as the events' does, and widens once for a call of more
+        picks than the first; the copy is torch's into the array's own memory, the int64 indices narrowed in place,
+        with nothing allocated for it."""
+        rows, k = int(top.shape[0]), int(top.shape[-1])
+        with self._lock:
+            cap, width = self.p.shape
+            if self.m + rows > cap or k > width:
+                grown = np.full((max(2 * cap, self.m + rows, 1 << 14), max(width, k)), -1, dtype=np.int16)
+                grown[: self.m, :width] = self.p[: self.m]
+                self.p, self._pt = grown, torch.from_numpy(grown)
+            off = self.m
+            self._pt[off : off + rows, :k].copy_(top.reshape(rows, k))
+            self.m += rows
+        return off
+
     def save(self) -> str:
         self._watching = False
         with self._lock:
             ev = self.a[: self.n].copy()
+            picks = self.p[: self.m].copy()
             snaps = list(self.snapshots)
         shards = [p for p, _ in sorted(self.shards.items(), key=lambda kv: kv[1])]
-        np.savez(self.path, events=ev, kinds=np.array(self.KINDS), shards=np.array(shards), snapshots=np.array(snaps))
+        np.savez(
+            self.path,
+            events=ev,
+            kinds=np.array(self.KINDS),
+            shards=np.array(shards),
+            snapshots=np.array(snaps),
+            picks=picks,
+        )
         text = self.summary(ev) + f"\n[profile] {ev.shape[0]} events -> {self.path}"
         sys.stderr.write(text + "\n")
         sys.stderr.flush()
@@ -176,6 +213,15 @@ class Parts:
         for f in self.futs:
             f.result()
 
+    def settle(self) -> None:
+        """every part finished, landed or withdrawn: a part in flight is waited for even after another was
+        cancelled (`result` stops at the first cancelled one, while the rest still write into the slot). A
+        withdrawn part never runs (only queued reads withdraw), and `concurrent.futures.wait` never counts a future
+        cancelled by hand as done: each part not withdrawn is waited on itself, its failure left to its reader"""
+        for f in self.futs:
+            if not f.cancelled():
+                f.exception()
+
     def done(self) -> bool:
         return all(f.done() for f in self.futs)
 
@@ -205,6 +251,10 @@ class Riders:
 
     def admit(self, key: Any, slot: Any) -> None:
         self.t1[key] = slot
+
+    def peek(self, key: Any) -> Any:
+        """the rider's slot if seated, no ride noted; None otherwise"""
+        return self.t1.get(key)
 
     def victim(self, skip: Any = ()) -> tuple[Any, Any] | None:
         """the rider who gives up a seat, removed: the oldest ride; a rider whose slot is in `skip` (the call's
@@ -274,6 +324,10 @@ class BusPass(Riders):
             self.t2.move_to_end(key)
         return s
 
+    def peek(self, key: Any) -> Any:
+        s = self.t1.get(key)
+        return s if s is not None else self.t2.get(key)
+
     def admit(self, key: Any, slot: Any) -> None:
         """a returning ghost is seated as a regular and moves the split its way; a stranger is a day rider"""
         if key in self.b1:
@@ -330,17 +384,358 @@ class BusPass(Riders):
         yield from self.t2.items()
 
 
+class LayerDepot:
+    """A layer's experts held on the card while a prefill sweeps its chunks through it (`_prefill_by_layer`): each
+    expert crosses the bus once for the whole prompt, not once a chunk. An expert is seated the first time the
+    layer asks for it, its copy queued on a stream of its own so the next expert's bytes move under this one's
+    matmuls; the compute waits on that expert's copy alone. A new layer takes the seats over once the card is
+    done with the last one's. The weights are the store's bytes as they are - bf16, or MXFP4 or FP8 as stored
+    (`stored_parts`) - a slot holding one expert's parts; a product over a seated bf16 expert is the one the call's
+    own upload (`w.to(card).to(x.dtype)`) gives.
+
+    The depot grows as the layers ask of it and no further. It opens with the scratch slots alone, and a layer
+    asking for an expert it has no seat for grows a block of `BLOCK` seats, out of what the device's ledger has
+    free that nothing has spoken for - the pass's own working set and the cache's growth are - counted there as it
+    is made and given back with the depot (`close`). Where the ledger has no block to give, an expert rides one of
+    the scratch slots, on the same copy stream: uploaded again by every chunk that asks, but under the matmuls
+    rather than as a pageable copy that waits for the card to drain; where it has not even the scratch, the call
+    takes the loop. The blocks come from a pool of their own in torch's allocator, so they never split, or are
+    split out of, the blocks the pass's own buffers are cut from.
+
+    A call's experts go to the card in waves (`place`), each wave multiplied as one grouped matmul a block it
+    touched: a slot's rows its expert's, an idle slot none.
+
+    The store's pages are pageable (and on Windows a pinned store is refused), so a copy from them holds the host
+    until it lands, at the driver's pageable rate. Each upload goes through a small ring of pinned buffers instead:
+    the host copies the expert into one (a memcpy torch spreads over the cores), and the bus takes it from there at
+    the pinned rate while the host moves on; a buffer is filled again once its last copy out has landed. The
+    buffers are lent through the ledger too. `BTB_PREFILL_STAGE=0`, or a machine that will not pin the ring, uploads
+    from the store's pages."""
+
+    SCRATCH = 32
+    BLOCK = 16
+    STAGE = 4
+    # a ceiling on the seats, below the ledger's (the tests' small depots)
+    MAX_SEATS: int | None = None
+
+    def __init__(self, dev: torch.device, ledger: Any, sched: Any = None) -> None:
+        # the card by its index: a pool of torch's allocator is a device's own
+        self.dev = where(dev)
+        self.ledger = ledger
+        self.sched = sched
+        self.pool: torch.cuda.MemPool | None = torch.cuda.MemPool()
+        self.copy = torch.cuda.Stream(device=dev)
+        self.layer = -1
+        self.seat: dict[int, int] = {}
+        # the slots' blocks, each one stack a stored part: block 0 the scratch slots, the rest the seats as grown
+        self.blocks: list[list[torch.Tensor]] = []
+        self.where: list[tuple[int, int]] = []  # a slot's (block, row)
+        # the stored form the first expert showed, every expert after the same: each part's shape and dtype
+        self.form: tuple[tuple[torch.Size, torch.dtype], ...] | None = None
+        self.per = 0
+        # scratch j is free once the matmuls handed it are done: the event recorded at the next `get`, after
+        # the caller queued them
+        self.turn = 0
+        self.lent: int | None = None
+        self.free: list[torch.cuda.Event | None] = [None] * self.SCRATCH
+        self.stat: dict[str, float] = {
+            "seated": 0,
+            "reused": 0,
+            "scratch": 0,
+            "passed": 0,
+            "bytes": 0,
+            "upload_s": 0.0,
+            "blocks": 0,
+            "held": 0,
+            # calls the depot could not open for (no room for its scratch slots): the loop took them
+            "refused": 0,
+        }
+        # a wave took the scratch slots over: the next `get` to take one waits for the card to finish what came before
+        self.fence_scratch = False
+        self.stage: list[tuple[torch.Tensor, ...]] | None = None
+        self.stage_done: list[torch.cuda.Event | None] = [None] * self.STAGE
+        self.stage_turn = 0
+        self.staged = os.environ.get("BTB_PREFILL_STAGE", "1") != "0"
+
+    @property
+    def n_seats(self) -> int:
+        """the seats grown so far"""
+        return max(0, len(self.where) - self.SCRATCH)
+
+    def _block(self, n: int) -> list[torch.Tensor] | None:
+        """`n` slots of the depot's form, out of what the ledger has free that nothing has spoken for, asked of the
+        scheduler as a large allocation is; None where there is not that much"""
+        assert self.form is not None
+        nbytes = n * self.per
+        if self.pool is None:  # closed: nothing asked of the scheduler for a block never made
+            return None
+        # from the depot's own pool, which reuses none of torch's cached blocks: the card's free memory alone
+        if nbytes > int(self.ledger.free(self.dev, unreserved=True, pooled=True) or 0):
+            return None
+        if self.sched is not None:
+            try:
+                self.sched.grant(nbytes, "depot", requester="LayerDepot", device=self.dev)
+            except MemoryGrantError:
+                return None
+        try:
+            with torch.cuda.use_mem_pool(self.pool, device=self.dev):
+                block = [torch.empty((n, *shape), dtype=dt, device=self.dev) for shape, dt in self.form]
+        except torch.OutOfMemoryError:
+            return None
+        for t in block:
+            self.ledger.lend(lambda t=t: t, t.numel() * t.element_size(), self.dev, counted=False)
+        self.stat["blocks"] += 1
+        self.stat["held"] += nbytes
+        return block
+
+    def _fits(self, parts: tuple[torch.Tensor, ...]) -> bool:
+        """whether `parts` has the depot's form, opened by the first expert: every expert after the same"""
+        form = tuple((p.shape, p.dtype) for p in parts)
+        if self.form is None:
+            return self._open(form)
+        return bool(self.blocks) and form == self.form
+
+    def open_at(self, form: tuple[tuple[torch.Size, torch.dtype], ...], seats: int) -> int:
+        """The depot opened at the store's `form` before the sweep's first call and grown to `seats` seats (a
+        layer's experts), as far as the ledger has room: its blocks taken before the pass's own buffers are cut, so
+        the card's free memory is theirs to take - a depot opened mid-sweep finds it inside the one block the pass's
+        buffers split, which its own pool cannot use. Returns the seats it holds; 0 and closed where not even its
+        scratch fits (the first call then asks again)."""
+        if self.form is not None or not self._open(form):
+            return self.n_seats
+        while self.n_seats < int(seats) and (self.MAX_SEATS is None or self.n_seats < self.MAX_SEATS):
+            block = self._block(self.BLOCK)
+            if block is None:
+                break
+            b = len(self.blocks)
+            self.blocks.append(block)
+            self.where += [(b, j) for j in range(self.BLOCK)]
+        return self.n_seats
+
+    def _open(self, form: tuple[tuple[torch.Size, torch.dtype], ...]) -> bool:
+        """the depot opened at `form`, each stored part's shape and dtype: its scratch slots, where the ledger has
+        them"""
+        self.form = form
+        self.per = sum(int(torch.Size(shape).numel()) * torch.empty(0, dtype=dt).element_size() for shape, dt in form)
+        scratch = self._block(self.SCRATCH)
+        if scratch is None:
+            # not open: the next call asks again, and may find the room this one did not
+            self.form, self.per = None, 0
+            self.stat["refused"] += 1
+            return False
+        self.blocks = [scratch]
+        self.where = [(0, j) for j in range(self.SCRATCH)]
+        if self.staged:
+            cpu = torch.device("cpu")
+            try:
+                self.stage = [
+                    tuple(
+                        self.ledger.lend(
+                            lambda shape=shape, dt=dt: torch.empty(shape, dtype=dt).pin_memory(),
+                            int(torch.Size(shape).numel()) * torch.empty(0, dtype=dt).element_size(),
+                            cpu,
+                            counted=False,
+                        )
+                        for shape, dt in form
+                    )
+                    for _ in range(self.STAGE)
+                ]
+            except RuntimeError:  # the machine would not pin even these: the store's pages it is
+                self.stage = None
+        return True
+
+    def takes(self, parts: tuple[torch.Tensor, ...] | None) -> bool:
+        """whether the depot takes experts stored as `parts`: open at that form (the first call opens it), with
+        its scratch slots at least"""
+        return parts is not None and self._fits(parts)
+
+    def _seat(self, e: int) -> int | None:
+        """a seat for expert `e` of this layer: the next of the seats grown, or one of a block grown for it now;
+        None where the ledger has no block to give"""
+        k = len(self.seat)
+        if self.MAX_SEATS is not None and k >= self.MAX_SEATS:
+            return None
+        if k >= self.n_seats:
+            block = self._block(self.BLOCK)
+            if block is None:
+                return None
+            b = len(self.blocks)
+            self.blocks.append(block)
+            self.where += [(b, j) for j in range(self.BLOCK)]
+        s = self.seat[e] = self.SCRATCH + k
+        return s
+
+    def at(self, s: int) -> tuple[list[torch.Tensor], int]:
+        """slot `s`'s block (one stack a part) and its row there"""
+        b, j = self.where[s]
+        return self.blocks[b], j
+
+    def _upload(self, s: int, parts: tuple[torch.Tensor, ...], main: torch.cuda.Stream) -> None:
+        stacks, row = self.at(s)
+        t0 = time.perf_counter()
+        ready = torch.cuda.Event()
+        src: tuple[torch.Tensor, ...] = parts
+        j = -1
+        if self.stage is not None:
+            # into the next pinned buffer once its last copy out has landed, then from there over the bus
+            j = self.stage_turn
+            self.stage_turn = (j + 1) % self.STAGE
+            done = self.stage_done[j]
+            if done is not None:
+                done.synchronize()
+            src = self.stage[j]
+            for buf, p in zip(src, parts, strict=True):
+                buf.copy_(p)
+        with torch.cuda.stream(self.copy):
+            for st, p in zip(stacks, src, strict=True):
+                st[row].copy_(p, non_blocking=True)
+            ready.record(self.copy)
+        if j >= 0:
+            self.stage_done[j] = ready
+        main.wait_event(ready)
+        self.stat["bytes"] += sum(p.numel() * p.element_size() for p in parts)
+        # the host's share of the upload: the pageable copy until it lands, or the copy into a pinned buffer
+        self.stat["upload_s"] += time.perf_counter() - t0
+
+    def _slot(self, s: int) -> tuple[torch.Tensor, torch.Tensor]:
+        stacks, row = self.at(s)
+        return stacks[0][row], stacks[1][row]
+
+    def get(self, layer: int, e: int, gu: Any, dn: Any) -> tuple[Any, Any]:
+        """bf16 expert `e` of `layer` on the card, for the per-expert loop: its seat, seated now, or a scratch slot;
+        the host's views back for any other form (the loop takes those on the host's kernels)"""
+        parts = stored_parts(gu, dn)
+        if parts is None or len(parts) != 2:
+            self.stat["passed"] += 1
+            return gu, dn
+        main = torch.cuda.current_stream(self.dev)
+        if self.lent is not None:
+            done = torch.cuda.Event()
+            done.record(main)
+            self.free[self.lent], self.lent = done, None
+        if layer != self.layer:
+            # the last layer's slots are the card's until its queued matmuls have read them
+            done = torch.cuda.Event()
+            done.record(main)
+            self.copy.wait_event(done)
+            self.layer, self.seat = layer, {}
+        s = self.seat.get(e)
+        if s is not None:
+            self.stat["reused"] += 1
+            return self._slot(s)
+        if not self._fits(parts):
+            self.stat["passed"] += 1
+            return gu, dn
+        s = self._seat(e)
+        if s is not None:
+            self._upload(s, parts, main)
+            self.stat["seated"] += 1
+            return self._slot(s)
+        j = self.turn
+        self.turn = (j + 1) % self.SCRATCH
+        ev = self.free[j]
+        if ev is not None:
+            self.copy.wait_event(ev)
+        if self.fence_scratch:
+            done = torch.cuda.Event()
+            done.record(main)
+            self.copy.wait_event(done)
+            self.fence_scratch = False
+        self._upload(j, parts, main)
+        self.lent = j
+        self.stat["scratch"] += 1
+        return self._slot(j)
+
+    def place(self, layer: int, items: Sequence[tuple[int, Any, Any]]) -> list[int | None]:
+        """A wave of a call's experts on the card together, for grouped matmuls over the slots: each expert's slot
+        - its seat, seated now, or a scratch slot - in the order given, or None where it has no place this wave (the
+        scratch is taken, or the stored form is not one the card path takes). The uploads are queued, the card's
+        compute waits on each; the scratch is this wave's once the card is done with everything queued before it."""
+        main = torch.cuda.current_stream(self.dev)
+        before = torch.cuda.Event()
+        before.record(main)
+        if layer != self.layer:
+            # the last layer's slots are the card's until its queued matmuls have read them
+            self.copy.wait_event(before)
+            self.layer, self.seat = layer, {}
+        out: list[int | None] = []
+        scratch = 0
+        fenced = False
+        for e, gu, dn in items:
+            # a seat of this layer's first: an expert seated by an earlier chunk comes without its bytes in RAM
+            s = self.seat.get(e)
+            if s is not None:
+                self.stat["reused"] += 1
+                out.append(s)
+                continue
+            parts = stored_parts(gu, dn)
+            if parts is None:
+                self.stat["passed"] += 1
+                out.append(None)
+                continue
+            if not self._fits(parts):
+                self.stat["passed"] += 1
+                out.append(None)
+                continue
+            s = self._seat(e)
+            if s is not None:
+                self._upload(s, parts, main)
+                self.stat["seated"] += 1
+                out.append(s)
+                continue
+            if scratch < self.SCRATCH:
+                if not fenced:
+                    self.copy.wait_event(before)
+                    fenced = True
+                s = scratch
+                scratch += 1
+                self._upload(s, parts, main)
+                self.stat["scratch"] += 1
+                out.append(s)
+                continue
+            out.append(None)
+        if scratch:
+            self.fence_scratch = True
+        return out
+
+    def seated(self, layer: int) -> set[int]:
+        """the experts of `layer` with a seat on the card, copied by an earlier chunk of the layer: a chunk after
+        it multiplies them from their seats, and needs nothing of them in RAM"""
+        return set(self.seat) if layer == self.layer else set()
+
+    def settle(self) -> None:
+        """every queued copy landed: the store may hand the host bytes behind them to another expert after this"""
+        self.copy.synchronize()
+
+    def close(self) -> None:
+        """the depot given back: its copies landed, its blocks and their pool let go"""
+        self.settle()
+        self.blocks, self.where, self.seat, self.stage = [], [], {}, None
+        self.pool = None
+
+
 class VramSeats:
     """The first-class seats: the regulars with the most rides copied onto the card, where an expert costs no
     host memory traffic and no read. A rider earns a seat with `min_rides` rides; the seats are given up by
     last ride; at most `per_pass` promotions a pass keep the copies off the token's time. The RAM copy stays
-    (a seat given up falls back to it), so a seat costs the store nothing but the copy. bf16 experts only (an
-    fp16/fp32 one is seated as the bf16 its slot holds): the card multiplies the stored tensors as they are."""
+    (a seat given up falls back to it), so a seat costs the store nothing but the copy. bf16 experts (an fp16/fp32
+    one is seated as the bf16 its slot holds), or MXFP4 ones in the checkpoint's layout (`make`: a seat's bytes to
+    its two MxWeights): the card multiplies the stored bytes as they are."""
 
-    def __init__(self, n_seats: int, per: int, shapes: Any, device: Any, min_rides: int = 8, per_pass: int = 4) -> None:
+    def __init__(
+        self,
+        n_seats: int,
+        per: int,
+        shapes: Any,
+        device: Any,
+        min_rides: int = 8,
+        per_pass: int = 4,
+        make: Callable[[torch.Tensor], tuple[Any, Any]] | None = None,
+    ) -> None:
         self.n = int(n_seats)
         self.per = int(per)
         self.shapes = shapes
+        self.make = make
         self.device = device
         self.min_rides = int(min_rides)
         self.per_pass = int(per_pass)
@@ -358,6 +753,8 @@ class VramSeats:
         self.seat_of.move_to_end(key)
         assert self.buf is not None  # a seated key implies the depot buffer was allocated
         region = self.buf[j * self.per : (j + 1) * self.per]
+        if self.make is not None:
+            return self.make(region)
         gu_n, gu_shape, dn_shape = self.shapes
         return (
             region[:gu_n].view(torch.bfloat16).view(*gu_shape),
@@ -382,10 +779,85 @@ class VramSeats:
         self.copies += 1
         return True
 
-    def drop(self, key: Any) -> None:
-        j = self.seat_of.pop(key, None)
-        if j is not None:
-            self.free.append(j)
+
+class SlotState(enum.Enum):
+    """what a slot of the store holds, and who it is for"""
+
+    FREE = "free"  # nothing: the next seat taken
+    RING = "ring"  # the lookahead ring's, holding nothing (its prediction was used, lapsed, or taken back)
+    PREDICTED = "predicted"  # the ring's, a prediction for `key` read into it, landed or landing
+    RESIDENT = "resident"  # the line's (`res`): `key`'s expert, landed or landing for a call that waits on it
+
+
+@dataclass(slots=True, eq=False)
+class Slot:
+    """one slot of the store: where its bytes sit, what it holds, and the reads still writing them"""
+
+    sid: int
+    block: int
+    row: int
+    state: SlotState = SlotState.FREE
+    key: tuple[int, int] | None = None
+    parts: Parts | None = None  # the expert's reads into the slot, until they are settled or the slot is reused
+    delta: tuple[int, ...] = ()  # where a padded direct read left each part in its region (the file's misalignment)
+    bf16: bool = False  # an fp16/fp32 expert rewritten as bf16 in place since it was read
+    depth: int = 0  # a prediction's lookahead depth
+
+    def landing(self) -> bool:
+        return self.parts is not None and not self.parts.done()
+
+
+class _Either:
+    """two slot sets asked as one - a wave's own slots and those of the call's experts still to come - without the
+    union a seat at a time would copy"""
+
+    __slots__ = ("a", "b")
+
+    def __init__(self, a: Any, b: Any) -> None:
+        self.a, self.b = a, b
+
+    def __contains__(self, s: object) -> bool:
+        return s in self.a or s in self.b
+
+
+class StoreCall:
+    """One MoE layer call's experts as the store serves them. `wave()` seats the longest prefix of what is left
+    that the store can hold now - ascending, as a call lists them, so a row's experts are multiplied and summed in
+    ascending order across the waves - and the caller multiplies it before asking for the next: a store held below
+    a call's experts (the machine's commit can hold it near one layer's, and a long prompt's call asks for all of
+    one) serves the call in turn instead of refusing it. `whole()` seats every one at once or raises: the paths
+    that multiply a call's experts together."""
+
+    __slots__ = ("base", "keep", "layer", "read", "rest", "rows", "store")
+
+    def __init__(self, store: _ExpertStore, layer: int, base: str, ids: list[int], keep: bool, rows: int) -> None:
+        self.store, self.layer, self.base, self.keep, self.rows = store, layer, base, keep, rows
+        self.rest = ids
+        self.read = 0  # the call's experts not in hand when their wave was seated: read, or still landing
+
+    @property
+    def done(self) -> bool:
+        return not self.rest
+
+    def wave(self) -> tuple[dict[int, Any], list[Any]]:
+        """the next wave: (ready, pending), and `rest` what is left after it; nothing once the call is done"""
+        if not self.rest:
+            return {}, []
+        ready, pending, self.rest = self.store._wave(self.layer, self.base, self.rest, self.keep, self.rows, False)
+        self.read += len(pending)
+        return ready, pending
+
+    def whole(self) -> tuple[dict[int, Any], list[Any]]:
+        ready, pending, _ = self.store._wave(self.layer, self.base, self.rest, self.keep, self.rows, True)
+        self.rest = []
+        self.read += len(pending)
+        return ready, pending
+
+
+def _line_size(store: _ExpertStore | None) -> int:
+    """the store's line as its residency policy sizes it: the live slots less the lookahead's ring (none once the
+    store is gone)"""
+    return 0 if store is None else store.live() - len(store.ring)
 
 
 class _ExpertStore:
@@ -399,9 +871,8 @@ class _ExpertStore:
     blocks: dict[int, tuple[torch.Tensor, list[int]]]
     budget: int
     dt: torch.dtype  # a bf16-layout checkpoint's expert element type as stored (an fp16/fp32 one is cast once read)
-    as_bf16: set[Any]  # the slots whose fp16/fp32 expert has been rewritten as bf16 since it was read
-    free: Any
-    last_slots: Any
+    free: list[int]  # the slots in FREE, the next seat taken from the end
+    last_slots: dict[int, int]  # the current wave's experts and their slots: the call is multiplying them
     lru: Any
     max_call: int
     mx: bool
@@ -418,7 +889,7 @@ class _ExpertStore:
     shapes: Any
     shared: Any
     sizes: Any
-    slot_of: dict[int, tuple[int, int]]
+    slots: dict[int, Slot]  # every live slot's record: its state changes only through the transitions below
     sm: Any
     stat: Any
 
@@ -431,7 +902,6 @@ class _ExpertStore:
         self.shapes = None
         self.sizes = None
         self.dt = torch.bfloat16
-        self.as_bf16 = set()
         self.mx = stored_mxfp4(sm.fam.mxfp4, getattr(sm, "gguf", None))
         # an FP8 checkpoint's experts: each projection's e4m3 bytes and its scale grid, multiplied as stored
         self.f8 = bool(getattr(sm, "fp8_experts", False))
@@ -453,7 +923,10 @@ class _ExpertStore:
         # the model with no default of its own: a model built without a policy must fail, not run the wrong one
         bp = os.environ.get("BTB_BUS_PASS")
         bus_pass = bool(int(bp)) if bp not in (None, "") else bool(sm.bus_pass)
-        self.res = (BusPass if bus_pass else Riders)(lambda: self.live() - len(self.ring))
+        # the line's size read through a weak reference: a closure holding the store would make it a cycle, left
+        # with its gigabytes to the collector's next full pass once the engine lets it go
+        me = weakref.ref(self)
+        self.res = (BusPass if bus_pass else Riders)(lambda: _line_size(me()))
         self.res_tag = PassTag.EXPERT_BUS_PASS if bus_pass else PassTag.EXPERT_LINE
         self.lru = self.res.t1
         # the depot's pages held in RAM (`store_pin`, BTB_STORE_PIN over it: 0 pageable, 1 pinned, "auto" pinned
@@ -463,15 +936,17 @@ class _ExpertStore:
         dev = getattr(sm, "dev", None)
         on_card = dev is not None and getattr(dev, "type", "") == Device.CUDA
         self.pin = on_card if str(sp).strip().lower() == "auto" else bool(int(sp or 0)) and on_card
+        self.cached_reads = self._read_mode()
         self.free = []
         self.parked = []
         self.blocks = {}
         self.shared = {}
         self.last_slots = {}
-        self.slot_of = {}
+        self.slots = {}
         self.next_slot = 0
         self.max_call = 0
         self.pool = ThreadPoolExecutor(max_workers=int(readers))
+        self.readers = int(readers)
         # hit/miss per expert asked; bytes the misses' bytes; s the store's own time in get/wait; wait_s the
         # time a layer's forward blocked on its reads; read_s/read_n/read_max_s each expert read as the reader
         # saw it; calls and miss_calls per layer call; adjacent the misses next to another miss of the same
@@ -498,20 +973,25 @@ class _ExpertStore:
         self._lock = threading.Lock()
         self._os = os
         # the Timetable's ring: slots that hold the lookahead's predictions until a layer asks for one (it is
-        # promoted into the store) or the ring wraps (the slot is reused); never the store's own slots
+        # promoted into the store) or the ring wraps (the slot is reused); never the store's own slots. Oldest
+        # first, a set in order: a slot leaves it from anywhere in one step
         self.ring_n = 64
-        self.ring: list[int] = []
-        self.ahead: dict[tuple[int, int], dict[str, Any]] = {}
+        self.ring: OrderedDict[int, None] = OrderedDict()
+        # the layer a layer-by-layer prefill last read ahead from: one lookahead a layer, at its first chunk
+        self.sweep_layer = -1
+        # the predictions: (layer, expert) to the ring slot being read for it (a PREDICTED slot's key)
+        self.ahead: dict[tuple[int, int], int] = {}
+        # the model's first layer with experts, where a pass's first call is (`_first_layer`)
+        self._first_moe: int | None = None
         self._routers: dict[int, Any] = {}
         # the slot's layout: `stride` bytes a slot, each part's region starting at `part_at[p]`. Padded (the
         # torch path with the positional reader), every region starts on a sector and holds two sectors of
         # slack, so a read of the aligned span around the expert's bytes lands straight in the slot with no
-        # bounce; the expert then sits `slot_delta[slot][p]` bytes into its region, its file offset's own
+        # bounce; the expert then sits `slots[slot].delta[p]` bytes into its region, its file offset's own
         # misalignment. Unpadded (MLX's shared blocks, the reader without handles): the parts back to back
         self.stride: Any = None
         self.part_at: tuple[int, ...] = ()
         self.padded = False
-        self.slot_delta: dict[Any, tuple[int, ...]] = {}
         self._sizes_of: dict[str, int] = {}
         # the first-class seats on the card (`vram_experts_gb`: 0 none, "auto" what the card has to spare, a
         # figure in GB), made on the first recipe; `rides` counts every ask per (layer, expert) for the seating
@@ -529,18 +1009,164 @@ class _ExpertStore:
     def live(self) -> int:
         return sum(len(ids) for _, ids in self.blocks.values())
 
+    @staticmethod
+    def _read_mode() -> bool:
+        """Whether a miss is read through the system's file cache. Where the host's commit, not its RAM, is what
+        the store can grow into (Windows charges commit for every allocation and the page file bounds it, while
+        the file cache's pages are RAM that no commit is charged for), the cache is a second RAM tier the store
+        cannot otherwise have: a miss read through it fills it, and the same expert missed again while it holds
+        the bytes is a copy out of RAM - 2 ms against the drive's 25 for a 120B's expert on an SSD. Elsewhere the
+        cache and the store draw on the same RAM (on unified memory, the RAM the model runs in), so a miss reads
+        around it. `BTB_EXPERT_READS` (cached, direct) decides where it is set."""
+        env = (os.environ.get("BTB_EXPERT_READS") or "").strip().lower()
+        if env in ("cached", "direct"):
+            return env == "cached"
+        from ..sysinfo import host_commit_bytes, host_free_bytes
+
+        # free-read: which of the host's limits binds chooses how a miss is read, never what fits
+        return int(host_commit_bytes()) < int(host_free_bytes())
+
+    def close(self) -> None:
+        """The store given back whole: its readers stopped, every read still writing into a slot settled, then its
+        blocks, its card seats and every record of what sat where let go. The engine's `close` calls it after the
+        drive's readers are stopped; the store is unusable afterwards."""
+        self.pool.shutdown(wait=True)
+        for sl in self.slots.values():
+            if sl.parts is not None:
+                sl.parts.settle()  # a read in flight still writes into its slot
+        self.blocks.clear()
+        self.shared.clear()
+        self.vram = None
+        self.res = (type(self.res))(lambda: 0)
+        self.lru = self.res.t1
+        self.ring.clear()
+        self.ahead.clear()
+        self.free, self.parked = [], []
+        self.slots.clear()
+        self.last_slots.clear()
+        self.n_slots = 0
+
+    # -- the slot table's transitions: the one way a slot changes hands --------------------------------------------
+
+    def check(self) -> None:
+        """The slot table's invariants, raised as an AssertionError where one fails (the store's tests run it after
+        every wave and lookahead): every live slot recorded once; the free list exactly the FREE slots; the ring
+        only its own (RING or PREDICTED); every prediction's slot PREDICTED under its key, in the ring; every seat
+        on the line RESIDENT under its key."""
+        live = {s for _b, ids in self.blocks.values() for s in ids}
+        if set(self.slots) != live:
+            raise AssertionError(f"slots recorded {sorted(set(self.slots) ^ live)} differ from the blocks' live ones")
+        if len(set(self.free)) != len(self.free):
+            raise AssertionError(f"a slot twice in the free list: {self.free}")
+        free = set(self.free)
+        for sl in self.slots.values():
+            if (sl.state is SlotState.FREE) != (sl.sid in free):
+                raise AssertionError(f"slot {sl.sid} is {sl.state.value} but {'' if sl.sid in free else 'not '}free")
+            if (sl.state in (SlotState.RING, SlotState.PREDICTED)) != (sl.sid in self.ring):
+                raise AssertionError(
+                    f"slot {sl.sid} is {sl.state.value} but {'' if sl.sid in self.ring else 'not '}in the ring"
+                )
+        for key, s in self.ahead.items():
+            sl = self.slots[s]
+            if sl.state is not SlotState.PREDICTED or sl.key != key:
+                raise AssertionError(f"prediction {key} names slot {s}, which is {sl.state.value} for {sl.key}")
+        for key, s in self.res.items():
+            sl = self.slots[s]
+            if sl.state is not SlotState.RESIDENT or sl.key != key:
+                raise AssertionError(f"line seat {key} names slot {s}, which is {sl.state.value} for {sl.key}")
+        counts = dict.fromkeys(SlotState, 0)
+        for sl in self.slots.values():
+            counts[sl.state] += 1
+        if counts[SlotState.PREDICTED] != len(self.ahead) or counts[SlotState.RESIDENT] != len(self.res):
+            raise AssertionError(
+                f"{counts[SlotState.PREDICTED]} predicted slots for {len(self.ahead)} predictions, "
+                f"{counts[SlotState.RESIDENT]} resident for {len(self.res)} seats on the line"
+            )
+
+    def _taken(self, s: int) -> Slot:
+        """slot `s` out of whatever held it, empty and nobody's, for its taker to fill: a prediction or a line's
+        seat given up, its reads settled first - a part still in flight writes into the slot, and the slot is
+        never handed on while it does"""
+        sl = self.slots[s]
+        if sl.parts is not None:
+            sl.parts.settle()
+        if sl.state is SlotState.PREDICTED and sl.key is not None:
+            self.ahead.pop(sl.key, None)
+        self.ring.pop(s, None)
+        sl.state, sl.key, sl.parts, sl.depth, sl.bf16, sl.delta = SlotState.FREE, None, None, 0, False, ()
+        return sl
+
+    def _resident(self, s: int, key: tuple[int, int], parts: Parts | None = None) -> None:
+        """slot `s` the line's seat for `key`: a miss about to be read into it (`parts` set once queued), or a
+        prediction promoted with the reads it already has"""
+        sl = self.slots[s]
+        self.ring.pop(s, None)
+        if sl.state is SlotState.PREDICTED:
+            self.ahead.pop(key, None)
+        else:
+            sl.parts = parts
+        sl.state, sl.key = SlotState.RESIDENT, key
+        self.res.admit(key, s)
+
+    def _predicted(self, s: int, key: tuple[int, int], parts: Parts, depth: int) -> None:
+        """ring slot `s` read for the prediction `key`"""
+        sl = self.slots[s]
+        sl.state, sl.key, sl.parts, sl.depth = SlotState.PREDICTED, key, parts, depth
+        self.ahead[key] = s
+
+    def _to_ring(self, s: int, first: bool = False) -> None:
+        """slot `s` the ring's, empty (settled by `_taken`): newest, or with `first` the next reused"""
+        self._taken(s).state = SlotState.RING
+        self.ring[s] = None
+        if first:
+            self.ring.move_to_end(s, last=False)
+
+    def _to_free(self, s: int) -> None:
+        """slot `s` back among the free, its reads settled"""
+        self._taken(s)
+        self.free.append(s)
+
+    def _seat_for(
+        self, skip: set[int], protect: Container[int] = frozenset(), ring: bool = False, last: bool = False
+    ) -> int | None:
+        """A slot for an expert about to be read, by the one order every taker keeps: a free one; one the store
+        grows (the host's ledger allowing - a whole block while the room holds one); the line's oldest seat whose
+        slot is not in `skip` (a wave's own, being multiplied) nor `protect` (the call's experts still to come);
+        with `ring`, a prediction taken back - the call before a guess - whose reads have landed or can be
+        withdrawn whole; and with `last`, one of `protect` after all (a wave's first expert: a wave must seat one
+        to go on, and any later one gains nothing by unseating an expert the call still wants). None when none of
+        these has one."""
+        if not self.free and self.live() < self.n_slots:
+            self._grow(1)
+        if self.free:
+            s = self.free.pop()
+            self.slots[s].state = SlotState.FREE
+            return s
+        v = self.res.victim(_Either(skip, protect))
+        if v is None and ring:
+            got = self._ring_take(skip)
+            if got is not None:
+                return got
+        if v is None and last:
+            v = self.res.victim(skip)
+        if v is None:
+            return None
+        key, s = v
+        prof = getattr(self.sm, "expert_profile", None)
+        if prof is not None:
+            prof.add(prof.EVICT, key[0], key[1], self.per, slot=s, aux=0)
+        self._taken(s)
+        return s
+
     def _grow(self, need: int) -> Any:
         assert self.per is not None  # the store is sized before this runs
         room = self.n_slots - self.live()
         if room <= 0:
             return 0
-        if self.sm.mlx is not None:
-            # the engine's ledger: what the load started with, less the reserve, less everything MLX holds (exact
-            # whether or not the pages are touched)
-            headroom = self.sm.mem_start - self.reserve - self.sm.mlx.held_bytes()
-        else:
-            headroom = host_free_bytes() - self.reserve
-        usable = headroom - self.margin
+        # the device's ledger on the host: above the reserve, less what is spoken for (on MLX its own count of what
+        # the load started with less what MLX holds, exact whether or not the pages are touched), less what another
+        # program was just given back (`hold_for`): the store does not grow straight back into it
+        usable = self._host_free() - self.margin - self.held()
         # a whole block while the room above the margin holds one, then what is left of it (the fill is a few
         # blocks, never a trickle of ever smaller ones), at least what the call needs
         k = max(int(need), int(min(usable - 2 * self.per, self.block_max) // self.per))
@@ -578,16 +1204,19 @@ class _ExpertStore:
                     )
             if raw is None:
                 raw = torch.empty(k * stride + 4096, dtype=torch.uint8)
+                # a byte a page written now: the OS counts a page only once it is touched, and a block it cannot see
+                # would read as free to the ledger until the reads fill it, spent again by the next growth
+                raw[::4096].zero_()
             skew = (-raw.data_ptr()) % 4096
             buf = raw[skew : skew + k * stride]
         self.blocks[b] = (buf, ids)
         for j, s in enumerate(ids):
-            self.slot_of[s] = (b, j)
+            self.slots[s] = Slot(s, b, j)
         self.free.extend(ids)
-        free_now = host_free_bytes()
+        free_now = self._host_free()
         self.sm.log(
             f"[experts] store +{k} slots ({k * self.per / 2**30:.2f} GB), {self.live()} of {self.n_slots} live, "
-            f"{free_now / 2**30:.1f} GB free"
+            f"{self._host_line()}"
         )
         prof = getattr(self.sm, "expert_profile", None)
         if prof is not None:
@@ -595,37 +1224,88 @@ class _ExpertStore:
         return k
 
     def _release_block(self, b: Any) -> None:
+        """block `b` back to the machine, and every slot in it off its line, out of the ring and out of the free: a
+        prediction's queued reads withdrawn (drive time for nothing), one still in flight left to its reader, whose
+        view of the block keeps its bytes alive until it lands"""
         assert self.per is not None  # the store is sized before this runs
         buf, ids = self.blocks.pop(b)
         self.shared.pop(b, None)
         gone = set(ids)
         prof = getattr(self.sm, "expert_profile", None)
-        for key, s in [(k, s) for k, s in self.res.items() if s in gone]:
-            if prof is not None:
-                prof.add(prof.EVICT, key[0], key[1], self.per, slot=s, aux=1)
-            self.res.pop(key)
         sched = getattr(self.sm, "scheduler", None)
-        for key in [k for k, a in self.ahead.items() if a["slot"] in gone]:
-            if sched is not None and hasattr(sched, "disk_drop"):
-                sched.disk_drop(key)  # a read not yet issued into a block given back is drive time for nothing
-            del self.ahead[key]
-        self.ring = [s for s in self.ring if s not in gone]
-        self.free = [s for s in self.free if s not in gone]
         for s in ids:
-            del self.slot_of[s]
+            sl = self.slots.pop(s)
+            if sl.state is SlotState.RESIDENT and sl.key is not None:
+                if prof is not None:
+                    prof.add(prof.EVICT, sl.key[0], sl.key[1], self.per, slot=s, aux=1)
+                self.res.pop(sl.key)
+            elif sl.state is SlotState.PREDICTED and sl.key is not None:
+                if sched is not None and hasattr(sched, "disk_drop"):
+                    sched.disk_drop(sl.key)
+                self.ahead.pop(sl.key, None)
+            self.ring.pop(s, None)
+        self.free = [s for s in self.free if s not in gone]
         self.parked.extend(ids)
         self.stat["released"] += len(ids)
         del buf
         if prof is not None:
-            prof.add(prof.RELEASE, expert=len(ids), nbytes=len(ids) * self.per, aux=int(host_free_bytes()))
+            prof.add(prof.RELEASE, expert=len(ids), nbytes=len(ids) * self.per, aux=int(self._host_free()))
 
-    def release(self) -> Any:
+    def _host_free(self) -> int:
+        """what the device's ledger has free on the host: above the reserve, less what is spoken for"""
+        return int(self.sm.device.free(torch.device("cpu"), unreserved=True) or 0)
+
+    def _host_line(self) -> str:
+        """the host's figure and what it is made of: the RAM the OS has available, the commit it has left (the
+        tighter of the two is the ledger's), the reserve, and what the ledger holds spoken for there"""
+        from ..sysinfo import host_commit_bytes, host_free_bytes
+
+        cpu = torch.device("cpu")
+        held = self.sm.device.spoken_for(cpu)
+        G = 2**30
+        # free-read: the log's breakdown of the ledger's host figure, never a decision
+        ram = host_free_bytes()
+        # free-read: the same breakdown's commit
+        commit = host_commit_bytes()
+        return (
+            f"{self._host_free() / G:.1f} GB free to btb: {ram / G:.1f} GB of RAM available, "
+            f"{commit / G:.1f} GB of commit left, less the {self.reserve / G:.1f} GB reserve"
+            + ("".join(f", {k} {n / G:.2f} GB" for k, n in held.items()) if held else "")
+        )
+
+    def hold_for(self, nbytes: int, seconds: float) -> None:
+        """keep `nbytes` free above the reserve for another program for `seconds`: every call gives blocks back until
+        the host has that much (`call`'s release) and the store grows into none of it meanwhile (`_grow`). The RAM
+        watcher's, from its own thread - two plain stores the calls read"""
+        if trace.ON and not self.held():  # a hold begun, said once: the watcher renews it four times a second
+            trace.event(
+                "experts: the store holds %s free for another program for %.0f s", _size(int(nbytes)), float(seconds)
+            )
+        self._hold = (int(nbytes), time.monotonic() + float(seconds))  # a clock set back holds no longer
+
+    def held(self) -> int:
+        """the bytes kept free for another program now (`hold_for`); 0 once the hold has run out"""
+        n, until = getattr(self, "_hold", (0, 0.0))
+        return int(n) if time.monotonic() < until else 0
+
+    def releasable(self) -> int:
+        """the host bytes `release` could give the machine: the blocks above the slots the largest call served
+        needs, at what a slot holds on average (blocks go whole) - a bound for sizing, not a promise"""
+        live = self.live()
+        if live <= self.max_call or not self.blocks:
+            return 0
+        held = sum(int(getattr(buf, "nbytes", 0)) for buf, _ids in self.blocks.values())
+        return held * (live - self.max_call) // live
+
+    def release(self, want: int = 1) -> Any:
+        """blocks given back, oldest residents' first, until the ledger has `want` bytes free on the host above the
+        reserve (by default: while it has none), never below the largest call the store has served"""
         freed = 0
-        while self.blocks and host_free_bytes() < self.reserve:
+        while self.blocks and self._host_free() < want:
             victim = None
             s = self.res.oldest_slot()
             if s is not None:
-                victim = self.slot_of[s][0]
+                victim = self.slots[s].block
             if victim is None:
                 victim = next(iter(self.blocks))
             if self.live() - len(self.blocks[victim][1]) < self.max_call:
@@ -635,8 +1315,8 @@ class _ExpertStore:
                     self.stat["floor"] = 1
                     self.sm.log(
                         f"[experts] store holds {self.live()} slots for calls of {self.max_call}: "
-                        f"{host_free_bytes() / 2**30:.1f} GB free is under the "
-                        f"{self.reserve / 2**30:.1f} GB reserve"
+                        f"{self._host_free() / 2**30:.1f} GB free above the reserve, "
+                        f"{want / 2**30:.1f} GB asked"
                     )
                 break
             freed += len(self.blocks[victim][1])
@@ -644,7 +1324,7 @@ class _ExpertStore:
         if freed:
             self.sm.log(
                 f"[experts] store -{freed} slots for the machine, {self.live()} live, "
-                f"{host_free_bytes() / 2**30:.1f} GB free"
+                f"{self._host_free() / 2**30:.1f} GB free above the reserve"
             )
         return freed
 
@@ -702,7 +1382,13 @@ class _ExpertStore:
                     and os.environ.get("BTB_STORE_PADDED", "1") != "0"
                 )
                 self.stride, self.part_at = self._layout(self.sizes, self.padded)
-                total = int(self.sm.L) * int(self.sm.n_experts)
+                # every layer's experts: the trunk's, and a drafting layer's (Qwen4's MTP layer is the store's layer L)
+                drafting = {
+                    k.split(".mlp.experts.")[0]
+                    for k in self.sm.weight_map
+                    if k.startswith("mtp.") and ".mlp.experts." in k
+                }
+                total = (int(self.sm.L) + len(drafting)) * int(self.sm.n_experts)
                 self.n_slots = min(total, max(self.scratch_n + 1, int(self.budget // self.stride)))
                 # the ring is carved out of the store: an eighth of it at most, none of a store too small to spare
                 self.ring_n = min(self.ring_n, self.n_slots // 8)
@@ -712,7 +1398,12 @@ class _ExpertStore:
                     f"{self.n_slots * per / 2**30:.1f} GB in RAM, allocated as needed in blocks of at most "
                     f"{self.block_max / 2**30:.1f} GB, {self.margin / 2**30:.1f} GB above a "
                     f"{self.reserve / 2**30:.1f} GB reserve, {'pinned' if self.pin else 'pageable'}, "
-                    f"{self.pool._max_workers} readers"
+                    f"{self.pool._max_workers} readers, "
+                    + (
+                        "misses read through the file cache (RAM past the commit limit holds them for a re-read)"
+                        if self.cached_reads
+                        else "misses read around the file cache"
+                    )
                 )
                 if self.drive is not None:
                     self.sm.log(self.drive_report(self.drive, self.n_slots, total, per))
@@ -721,16 +1412,21 @@ class _ExpertStore:
         return r
 
     def _open_vram(self) -> None:
-        """the card's seats for the bf16 experts, sized by `sm.vram_experts_gb`: a figure, or "auto" for the
-        card's free memory less its margin and a gigabyte kept for the cache to grow into"""
+        """the card's seats for the bf16 experts, or the MXFP4 ones in the checkpoint's layout as stored, sized by
+        `sm.vram_experts_gb`: a figure, or "auto" for the card's free memory less its margin and a gigabyte kept for
+        the cache to grow into"""
         assert self.per is not None  # the store is sized before this runs
         want = getattr(self.sm, "vram_experts_gb", 0)
         dev = getattr(self.sm, "dev", None)
-        if self.mx or self.f8 or dev is None or dev.type != Device.CUDA or not want or self.stride is None:
+        if self.ggml or self.f8 or dev is None or dev.type != Device.CUDA or not want or self.stride is None:
             return
+        if self.mx and Native.card_kernels() is None:
+            return  # an MXFP4 seat is multiplied by the card's MXFP4 gemv alone (bf16 seats have torch's matmuls too)
         if want == "auto":
             sched = getattr(self.sm, "scheduler", None)
-            free = sched.free_vram() if sched is not None else None
+            # free as the grant below reads it: less every reservation, an epoch's KV too (its room is the cache's,
+            # not the seats'), so the seats sized here are seats the grant gives
+            free = sched.free_for(dev, draws="") if sched is not None else None
             room = (free or 0) - (1 << 30)
         else:
             room = int(float(want) * 2**30)
@@ -738,9 +1434,30 @@ class _ExpertStore:
         n = max(0, int(room // per))
         if n <= 0:
             return
-        gu_n, gu_shape, dn_shape = self.shapes
-        self.vram = VramSeats(n, per, (self._held(gu_n), gu_shape, dn_shape), dev)
-        self.sm.log(f"[experts] {n} seats on the card ({n * per / 2**30:.2f} GB) for the most ridden experts")
+        # the seats asked of the scheduler before they are made, and lent through the ledger while they live
+        sched = getattr(self.sm, "scheduler", None)
+        if sched is not None:
+            try:
+                sched.grant(n * per, "experts", requester="the expert store's seats on the card", device=dev)
+            except MemoryGrantError as e:
+                self.sm.log(f"[experts] no seats on the card: {e}")
+                return
+        if self.mx:
+            # the seat holds the four parts back to back (`_seat` packs them): gate_up's blocks and scales, down's
+            (gu_r, gu_k), (dn_r, dn_k) = self.mx_shapes()
+            a, b, c = self.sizes[0], self.sizes[0] + self.sizes[1], self.sizes[0] + self.sizes[1] + self.sizes[2]
+
+            def make(region: torch.Tensor) -> tuple[MxWeight, MxWeight]:
+                return MxWeight(region[:a], region[a:b], gu_r, gu_k), MxWeight(region[b:c], region[c:per], dn_r, dn_k)
+
+            self.vram = VramSeats(n, per, None, dev, make=make)
+        else:
+            gu_n, gu_shape, dn_shape = self.shapes
+            self.vram = VramSeats(n, per, (self._held(gu_n), gu_shape, dn_shape), dev)
+        buf, ledger = self.vram.buf, getattr(self.sm, "device", None)
+        if ledger is not None and buf is not None:
+            ledger.lend(lambda: buf, n * per, dev, counted=False)
+        self.sm.log(f"[experts] {n} seats on {dev} ({n * per / 2**30:.2f} GB) for the most ridden experts")
 
     @staticmethod
     def expert_s(drive: dict[str, Any], per: int) -> float:
@@ -763,6 +1480,26 @@ class _ExpertStore:
             f"[experts] this drive: a missed expert costs {cost * 1e3:.1f} ms; the store seats {n_slots} of {total} "
             f"experts ({100.0 * n_slots / max(1, total):.0f}%), and a token waits about its misses times that"
         )
+
+    def reads(self) -> int:
+        """the expert reads the store has put to the drive so far: its misses and the lookahead's predictions not
+        withdrawn - a pass's count, taken before and after it, is what the speculative pricing charges its rows"""
+        st = self.stat
+        return int(st["miss"] + st["ahead"] - st["ahead_dropped"])
+
+    def waited(self) -> float:
+        """the seconds the forwards have waited on the store's reads so far (`wait_s`): a pass's, taken before and
+        after it, is what the speculative pricing takes out of its seconds to leave the rows' compute"""
+        return float(self.stat["wait_s"])
+
+    def miss_s(self) -> float:
+        """a missed expert's seconds: the drive's probe (`expert_s`); without one, the reads timed so far spread
+        over the readers that ran them side by side; 0 before either"""
+        cost = self.expert_s(self.drive or {}, int(self.per or 0))
+        if cost > 0:
+            return cost
+        n = int(self.stat["read_n"])
+        return float(self.stat["read_s"]) / n / max(1, self.readers) if n else 0.0
 
     PASS_SAMPLES = 16
 
@@ -804,9 +1541,13 @@ class _ExpertStore:
         key = (layer, e)
         if key in v.seat_of or self.rides.get(key, 0) < v.min_rides or v.left <= 0:
             return
-        self._to_bf16(slot)
         region = self._region(slot)
-        d = self.slot_delta.get(slot) or (0,) * len(self.sizes)
+        if self.mx:
+            # the four parts back to back, as the seat's `make` splits them, wherever the read left each
+            v.offer(key, self.rides.get(key, 0), torch.cat([self._part(slot, region, p) for p in range(4)]))
+            return
+        self._to_bf16(slot)
+        d = self.slots[slot].delta or (0,) * len(self.sizes)
         at0 = (self.part_at[0] if self.part_at else 0) + d[0]
         at1 = (self.part_at[1] if self.part_at else self.sizes[0]) + d[1]
         if self.padded or self.dt != torch.bfloat16:
@@ -836,14 +1577,21 @@ class _ExpertStore:
 
     def _region(self, slot: Any) -> Any:
         assert self.per is not None  # the store is sized before this runs
-        b, j = self.slot_of[slot]
+        sl = self.slots[slot]
         stride = int(self.stride or self.per)
-        return self.blocks[b][0][j * stride : (j + 1) * stride]
+        return self.blocks[sl.block][0][sl.row * stride : (sl.row + 1) * stride]
 
     def _part(self, slot: Any, region: Any, p: int) -> Any:
         """part `p` of the expert in `slot`, as the bytes sit in the region"""
-        at = (self.part_at[p] if self.part_at else sum(self.sizes[:p])) + (self.slot_delta.get(slot) or (0,) * 8)[p]
+        sl = self.slots.get(slot) if slot is not None else None
+        at = (self.part_at[p] if self.part_at else sum(self.sizes[:p])) + (
+            (sl.delta if sl is not None else ()) or (0,) * 8
+        )[p]
         return region[at : at + self.sizes[p]]
+
+    def f8_shapes(self) -> tuple[tuple[int, int], tuple[int, int]]:
+        """the FP8 experts' shapes, (gate_up [2I, H], down [H, I])"""
+        return (int(self.shapes[0][0]), int(self.shapes[0][1])), (int(self.shapes[2][0]), int(self.shapes[2][1]))
 
     def mx_shapes(self) -> tuple[tuple[int, int], tuple[int, int]]:
         """the MXFP4 experts' logical shapes, (gate_up [2I, H], down [H, I]), in either layout"""
@@ -853,8 +1601,29 @@ class _ExpertStore:
         gu, dn = self.shapes[0], self.shapes[2]
         return (int(gu[0]), int(gu[1]) * BLOCK), (int(dn[0]), int(dn[1]) * BLOCK)
 
+    def form(self) -> tuple[tuple[torch.Size, torch.dtype], ...] | None:
+        """an expert's parts as the card takes them (`stored_parts`), each part's shape and dtype, off the store's
+        layout alone - no expert read: what a prefill's depot opens at before its first call. The layout is read off
+        the first layer with experts where no call has read it yet (headers only); None where the card takes no
+        expert of this form"""
+        if self.shapes is None:
+            for i in range(int(self.sm.L)):
+                try:
+                    self._recipe(i, f"{self.sm.prefix}layers.{i}.mlp.experts.")
+                    break
+                except KeyError:  # a dense layer: no experts to read the layout off
+                    continue
+            else:
+                return None
+        region = torch.zeros(int(self.stride or self.per or 0), dtype=torch.uint8)
+        parts = stored_parts(*self._views_in(region))
+        return None if parts is None else tuple((p.shape, p.dtype) for p in parts)
+
     def _views(self, slot: Any) -> Any:
-        region = self._region(slot)
+        return self._views_in(self._region(slot), slot)
+
+    def _views_in(self, region: Any, slot: Any = None) -> Any:
+        """an expert's views over `region`, its slot's bytes (`slot` for where a direct read left them)"""
         if self.ggml:
             (rows, k), _, (drows, dk) = self.shapes
             gate = MxWeight.from_ggml(self._part(slot, region, 0), int(rows), int(k))
@@ -895,18 +1664,21 @@ class _ExpertStore:
     def _to_bf16(self, slot: Any) -> None:
         """a landed fp16/fp32 expert rewritten as bf16 in its slot, once per read, so every use after reads it as
         a bf16 expert's bytes"""
-        if self.dt == torch.bfloat16 or slot in self.as_bf16:
+        if self.dt == torch.bfloat16:
+            return
+        sl = self.slots[slot]
+        if sl.bf16:
             return
         region = self._region(slot)
         for p in (0, 1):
             bf16_in_place(self._part(slot, region, p), self.dt)
-        self.as_bf16.add(slot)
+        sl.bf16 = True
 
     def _views_mx(self, slot: Any) -> Any:
         assert self.per is not None  # the store is sized before this runs
-        b, j = self.slot_of[slot]
-        sh = self.shared[b]
-        off = j * int(self.stride or self.per)
+        sl = self.slots[slot]
+        sh = self.shared[sl.block]
+        off = sl.row * int(self.stride or self.per)
         be = self.sm.mlx
         if self.mx:
             # the slot as the GPU's MXFP4 matvec reads it: gate_up's blocks then scales, then down's (a GGUF's:
@@ -943,10 +1715,10 @@ class _ExpertStore:
 
     def _read(self, parts: Any, e: Any, slot: Any, layer: int = -1) -> None:
         """the expert's parts read on this thread (the path without a scheduler's Route)"""
-        self.as_bf16.discard(slot)
+        sl = self.slots[slot]
+        sl.bf16, sl.delta = False, (0,) * len(parts)
         region = self._region(slot)
         prof = getattr(self.sm, "expert_profile", None)
-        self.slot_delta[slot] = (0,) * len(parts)
         for j, (path, off, n_e, _) in enumerate(parts):
             at = self.part_at[j] if self.part_at else sum(self.sizes[:j])
             tp = time.perf_counter_ns()
@@ -962,7 +1734,7 @@ class _ExpertStore:
         taken as each lands; returns what `wait` and the layer's forward call `.result()` on. In a padded slot
         the read is the sector-aligned span around the part, straight into its region. A dequantized expert is
         no drive read: the store's own readers fill it."""
-        self.as_bf16.discard(slot)
+        self.slots[slot].bf16 = False
         if self.dequant:
             return Parts([self.pool.submit(self._read, parts, e, slot, layer)])
         region = self._region(slot)
@@ -996,15 +1768,17 @@ class _ExpertStore:
                     key=(layer, e),
                     on_done=landed,
                     chunk=self.sm.cold_chunk,
+                    cached=self.cached_reads,
                 )
             )
-        self.slot_delta[slot] = tuple(deltas)
+        self.slots[slot].delta = tuple(deltas)
         return Parts(futs)
 
     # -- the Timetable: the next layers' routers run on this layer's input, their picks read ahead into the ring --
 
     def _router(self, layer: int) -> Any:
-        """the router weight of `layer` where the layer's module lives (the card, or the host), None without one"""
+        """the router of `layer` where the layer's module lives (the card, or the host), as (weight, bias or None);
+        None without one. Qwen's is `mlp.gate`, gpt-oss's `mlp.router` (with a bias its logits add)"""
         mod = None
         for tier in ("resident", "host"):
             mod = (getattr(self.sm, tier, None) or {}).get(layer)
@@ -1013,73 +1787,105 @@ class _ExpertStore:
         hit = self._routers.get(layer)
         if hit is not None and hit[0] is mod:  # the layer's module as of the last call (a shed layer moves)
             return hit[1]
-        gate = getattr(getattr(mod, "mlp", None), "gate", None) if mod is not None else None
-        w = getattr(gate, "weight", None)
-        self._routers[layer] = (mod, w)
-        return w
+        mlp = getattr(mod, "mlp", None) if mod is not None else None
+        gate = getattr(mlp, "gate", None) or getattr(mlp, "router", None)
+        # the router's own linear: the module itself (Qwen's), or the one btb wraps it around (gpt-oss's `_Router`)
+        lin = gate if isinstance(getattr(gate, "weight", None), torch.Tensor) else None
+        if lin is None and isinstance(gate, torch.nn.Module):
+            lin = next((m for m in gate.modules() if isinstance(getattr(m, "weight", None), torch.Tensor)), None)
+        w = getattr(lin, "weight", None)
+        b = getattr(lin, "bias", None)
+        wb = (w, b if isinstance(b, torch.Tensor) and b.numel() else None) if isinstance(w, torch.Tensor) else None
+        self._routers[layer] = (mod, wb)
+        return wb
 
-    def _ring_slot(self, sched: Any) -> Any:
-        """a slot for a new prediction: the ring grows to `ring_n` slots out of the store's free ones (a grown
-        block, or the oldest resident's slot), then reuses its oldest entry - unless that one is still in flight,
-        in which case the ring is full and the prediction is not made"""
-        if len(self.ring) < self.ring_n:
-            if not self.free and self.live() < self.n_slots:
-                self._grow(1)
-            if self.free:
-                s = self.free.pop()
-            else:
-                v = self.res.victim()
-                if v is None:
-                    return None
-                key, s = v
-                prof = getattr(self.sm, "expert_profile", None)
-                if prof is not None:
-                    prof.add(prof.EVICT, key[0], key[1], self.per, slot=s, aux=0)
-            self.ring.append(s)
-            return s
-        s = self.ring[0]
-        old = next((k for k, a in self.ahead.items() if a["slot"] == s), None)
-        if old is not None:
-            a = self.ahead[old]
-            if not a["parts"].done():
+    def _ring_slot(self, cap: int | None = None, skip: Any = ()) -> int | None:
+        """a slot for a new prediction: the ring grows to `ring_n` slots (a sweep's `cap`) out of the store's own
+        (`_seat_for`, never another prediction's), then reuses its oldest - unless that one is still being read, in
+        which case the ring is full and the prediction is not made"""
+        if len(self.ring) < (self.ring_n if cap is None else cap):
+            s = self._seat_for(set(skip))
+            if s is None:
                 return None
-            del self.ahead[old]
+            self._to_ring(s)
+            return s
+        s = next(iter(self.ring))
+        sl = self.slots[s]
+        if sl.state is SlotState.PREDICTED:
+            if sl.landing():
+                return None
             self.stat["ahead_recycled"] += 1
-        self.ring.pop(0)
-        self.ring.append(s)
+        self._to_ring(s)
         return s
 
-    def lookahead(self, layer: int, h: torch.Tensor) -> int:
+    def _ring_take(self, skip: Any = ()) -> int | None:
+        """a slot of the ring's given back to a call that has no other: the oldest one empty, or whose prediction
+        has landed or can still be withdrawn whole, is the call's; None when every one is still being written"""
+        sched = getattr(self.sm, "scheduler", None)
+        for s in list(self.ring):
+            if s in skip:
+                continue
+            sl = self.slots[s]
+            if sl.state is SlotState.PREDICTED:
+                if sl.landing() and sl.key is not None and sched is not None and hasattr(sched, "disk_drop"):
+                    sched.disk_drop(sl.key, whole=True)  # withdrawn whole, or left to land whole (`_lapsed`)
+                if sl.landing():
+                    continue
+                self.stat["ahead_dropped"] += 1
+            self._taken(s)
+            return s
+        return None
+
+    def lookahead(self, layer: int, h: torch.Tensor, sweep: int = 0) -> int:
         """Run the routers of the layers after `layer` on its MoE input `h` [T, hidden] and queue the reads of
         their top picks that are neither resident nor already predicted, the next layer's first: `sm.lookahead`
         gives the picks per depth ((10, 6): the next layer's top-10, the one after's top-6; measured on the
         180B, the next layer's top-10 holds 57% of its misses, top-20 78%). Over several rows (a verify
         pass) the picks are the union of each row's top-k, at most 2k of them by their best logit across the
-        rows. Returns the reads queued."""
+        rows. Returns the reads queued.
+
+        `sweep` (a layer-by-layer prefill, at a layer's first chunk; the experts that chunk asked): the next layer
+        only, every expert some row's routing picks - a prefill layer asks for most of them - read into a ring as
+        large as the store's room past this layer's own experts, while this layer's chunks compute. The decode's
+        verdicts (a saturated drive, a slow one) do not hold it back: its reads queue behind every demand read
+        and issue in the gaps between them; a drive that allows no prediction in flight still gets none."""
         # one row: few picks - measured on the 180B, a prediction past the third pick is right one time in four
         # and costs a read the layer waiting now then queues behind; a pass of several rows (a prefill, a tree):
         # more, the union of the rows' picks is right nine times in ten there
         rows = int(h.shape[0]) if h.dim() > 1 else 1
         ks = getattr(self.sm, "lookahead", ()) if rows == 1 else getattr(self.sm, "lookahead_rows", (10, 6))
+        if sweep:
+            ks = (int(getattr(self.sm.cfg, "num_experts_per_tok", 10) or 10),)
         sched = getattr(self.sm, "scheduler", None)
         if not ks or sched is None or not hasattr(sched, "disk_read") or self.per is None:
             return 0
-        if self.saturated or (self.drive is not None and int(self.drive.get("ahead", 1)) == 0):
-            # a drive with no idle time (its misses outlast the compute, or one read outlasts the window the
-            # rule allows): a prediction is a read taken from the layer waiting now, right or wrong
+        if self.drive is not None and int(self.drive.get("ahead", 1)) == 0:
+            # one read outlasts the window the rule allows: a prediction is a read taken from the layer waiting now
+            return 0
+        if not sweep and self.saturated:
+            # a drive with no idle time (its misses outlast the compute): the same, right or wrong
             return 0
         slow = getattr(sched, "disk_slow", None)
-        if slow is not None and slow():
+        if not sweep and slow is not None and slow():
             # the drive is delivering under half the probe's rate right now: the same arithmetic, live
             return 0
+        cap = None
+        if sweep:
+            # the seats the store can hold now - its live ones and what the host's ledger would still let it grow
+            # (commit, not only RAM, can stop it well short of its ceiling) - less the layer's own and a margin
+            can = min(int(self.n_slots), self.live() + max(0, self._host_free() - self.margin) // int(self.per))
+            cap = max(self.ring_n, can - int(sweep) - 64)
+        # a sweep reads ahead after the layer's own call was handed its slots and before the call has read them: the
+        # ring must not take one, or a prediction lands in the bytes the call is about to multiply
+        skip = set(self.last_slots.values()) if sweep else ()
         n = 0
         prof = getattr(self.sm, "expert_profile", None)
         for d, k in enumerate(ks, start=1):
             target = layer + d
             if k <= 0 or target >= int(self.sm.L):
                 break
-            w = self._router(target)
-            if w is None:
+            wb = self._router(target)
+            if wb is None:
                 continue
             base = self.recipes.get(target)
             if base is None:
@@ -1093,62 +1899,85 @@ class _ExpertStore:
             else:
                 parts = base
             with torch.no_grad():
-                logits = torch.matmul(h.reshape(-1, h.shape[-1]).to(w.device, w.dtype), w.T)
+                w, bias = wb
+                logits = torch.nn.functional.linear(
+                    h.reshape(-1, h.shape[-1]).to(w.device, w.dtype), w, None if bias is None else bias.to(w.dtype)
+                )
                 kk = min(int(k), logits.shape[-1])
                 if logits.shape[0] == 1:
                     picks = torch.topk(logits[0], kk).indices.tolist()
                 else:
                     best = logits.max(dim=0).values
                     cand = torch.unique(torch.topk(logits, kk, dim=-1).indices)
-                    keep = torch.topk(best[cand], min(2 * kk, cand.shape[0])).indices
-                    picks = cand[keep].tolist()
+                    if cap is not None:
+                        # every expert some row picks, the strongest first, as many as the ring can take
+                        picks = cand[torch.argsort(best[cand], descending=True)].tolist()[:cap]
+                    else:
+                        keep = torch.topk(best[cand], min(2 * kk, cand.shape[0])).indices
+                        picks = cand[keep].tolist()
             for e in picks:
                 key = (target, int(e))
                 if key in self.res or key in self.ahead or (self.vram is not None and key in self.vram):
                     continue
-                s = self._ring_slot(sched)
+                s = self._ring_slot(cap, skip)
                 if s is None:
                     return n
-                parts_f = self._submit(sched, parts, int(e), s, target, sched.DISK_AHEAD + d - 1)
-                self.ahead[key] = {"slot": s, "parts": parts_f, "d": d}
+                self._predicted(s, key, self._submit(sched, parts, int(e), s, target, sched.DISK_AHEAD + d - 1), d)
                 self.stat["ahead"] += 1
                 n += 1
                 if prof is not None:
                     prof.add(prof.AHEAD, target, int(e), self.per, slot=s, aux=d)
         return n
 
+    def sweep_end(self) -> None:
+        """a layer-by-layer prefill done: the ring back to `ring_n` slots, the rest the store's again - a
+        prediction still reading is withdrawn or let land (its slot is being written), then forgotten"""
+        self.sweep_layer = -1
+        sched = getattr(self.sm, "scheduler", None)
+        while len(self.ring) > self.ring_n:
+            s = next(reversed(self.ring))
+            sl = self.slots[s]
+            if sl.state is SlotState.PREDICTED and sl.key is not None:
+                if sched is not None and hasattr(sched, "disk_drop"):
+                    sched.disk_drop(sl.key)
+                self.stat["ahead_dropped"] += 1
+            self._to_free(s)
+
     def _lapsed(self, layer: int, asked: Any, sched: Any) -> None:
         """the predictions for `layer` it did not ask for: reads not yet issued are withdrawn and their slots put
         first in line for reuse; bytes that already landed stay in the ring until it wraps (the same expert at
         the same layer a token later is a third of the traffic)"""
         for key in [k for k in self.ahead if k[0] == layer and k[1] not in asked]:
-            a = self.ahead[key]
-            if a["parts"].done():
+            s = self.ahead[key]
+            sl = self.slots[s]
+            if not sl.landing():
                 continue
             if sched is not None and hasattr(sched, "disk_drop"):
-                sched.disk_drop(key)
-            if not a["parts"].done():
-                # a part is in flight (only queued reads withdraw): the record stays, so `_ring_slot` sees the
-                # slot is still being written and passes it over until the read lands
+                # withdrawn whole or not at all: an expert with a part in flight is left to land entire - it stays
+                # predicted, promoted whole if a later call asks for it, and `_ring_slot` passes its slot over until
+                # then; a part withdrawn beside one that lands would leave the slot a mix of two experts that reads
+                # as landed
+                sched.disk_drop(key, whole=True)
+            if sl.landing():
                 continue
-            del self.ahead[key]
             self.stat["ahead_dropped"] += 1
-            s = a["slot"]
-            if s in self.ring:
-                self.ring.remove(s)
-                self.ring.insert(0, s)
+            self._to_ring(s, first=True)
 
-    def get(self, layer: int, base: str, ids: Sequence[int], keep: bool = True, rows: int = 1) -> Any:
+    def call(self, layer: int, base: str, ids: Sequence[int], keep: bool = True, rows: int = 1) -> StoreCall:
+        """A MoE layer call's experts `ids` of `layer` (ascending, as a call lists them), to be seated in waves
+        (`StoreCall.wave`) or whole (`StoreCall.whole`). The call at the model's first MoE layer starts a pass: the
+        profile's step, the card seats' promotions, and the one-row pass's verdict on the drive are taken here,
+        once a call, never once a wave. `keep` off, a prefill's experts give their seats up first; `rows` the
+        call's rows."""
         t0 = time.perf_counter()
-        parts = self._recipe(layer, base)
+        self._recipe(layer, base)
         assert self.per is not None  # _recipe sizes the store on the first call
-        prof = getattr(self.sm, "expert_profile", None)
-        if prof is not None and layer == 0:
-            prof.step += 1
-        sched = getattr(self.sm, "scheduler", None)
-        if layer == 0 and self.vram is not None:
-            self.vram.new_pass()
-        if layer == 0:
+        if layer == self._first_layer():
+            prof = getattr(self.sm, "expert_profile", None)
+            if prof is not None:
+                prof.step += 1
+            if self.vram is not None:
+                self.vram.new_pass()
             # the one-row passes, as each closes, say whether this drive has room for predictions, live
             ps = self._pass
             if ps is not None and ps["rows"] == 1:
@@ -1156,16 +1985,71 @@ class _ExpertStore:
                 if line:
                     self.sm.log(line)
             self._pass = {"t0": t0, "w0": self.stat["wait_s"], "m0": self.stat["miss"], "rows": int(rows)}
-        out = {}
-        todo = []
-        waiting = []
-        on_card = {}
-        for e in ids:
+        self.stat["calls"] += 1
+        return StoreCall(self, layer, base, [int(e) for e in ids], keep, rows)
+
+    def get(self, layer: int, base: str, ids: Sequence[int], keep: bool = True, rows: int = 1) -> Any:
+        """a call's experts, every one seated at once (`StoreCall.whole`): (ready, pending)"""
+        return self.call(layer, base, ids, keep, rows).whole()
+
+    def _first_layer(self) -> int:
+        """the model's first layer with experts: where a pass's first call is"""
+        if self._first_moe is None:
+            self._first_moe = 0
+            for i in range(int(self.sm.L)):
+                if i in self.recipes:
+                    self._first_moe = i
+                    break
+                try:
+                    self._recipe(i, f"{getattr(self.sm, 'prefix', '')}layers.{i}.mlp.experts.")
+                except KeyError:  # a dense layer: no experts
+                    continue
+                self._first_moe = i
+                break
+        return self._first_moe
+
+    def _wave(self, layer: int, base: str, ids: list[int], keep: bool, rows: int, whole: bool) -> Any:
+        """The longest prefix of `ids` the store can seat now, in one ascending pass: each expert a card seat, a
+        resident, a prediction promoted, or a miss seated by `_seat_for` and read; the pass stops before the first
+        expert with no seat (with `whole`, it raises), and nothing past it is touched - no seat taken, no ride
+        counted, no read queued. Returns (ready, pending, rest): the views of the experts in hand, the (expert,
+        reads, slot) of those still landing, and the experts left for the next wave."""
+        t0 = time.perf_counter()
+        parts = self._recipe(layer, base)
+        assert self.per is not None  # sized by the recipe before any call
+        prof = getattr(self.sm, "expert_profile", None)
+        sched = getattr(self.sm, "scheduler", None)
+        # the blocks the machine asks back given back first, so the seats counted are the seats there are - and never
+        # during the pass, where a block given back could take a hit already handed out. The call's misses count first
+        # toward the seats release keeps, so it never gives back the ones this call is about to read into
+        misses = sum(
+            1
+            for e in ids
+            if self.res.peek((layer, e)) is None
+            and (layer, e) not in self.ahead
+            and not (self.vram is not None and (layer, e) in self.vram)
+        )
+        self.max_call = max(self.max_call, misses)
+        # what another program asked back (`hold_for`, the RAM watcher's) as well as the reserve
+        self.release(want=max(1, self.held()))
+        if self.ahead:
+            # every expert the call still wants, a later wave's too: a prediction one of them will want is kept
+            self._lapsed(layer, set(ids), sched)
+        out: dict[int, int] = {}
+        todo: list[int] = []
+        waiting: list[tuple[int, Parts, int]] = []
+        on_card: dict[int, Any] = {}
+        taken: set[int] = set()
+        # the seats of the call's residents still to come, which a miss before them does not take while anything
+        # else gives way: found once, and each let go of as the pass reaches its expert
+        protect = {p for e in ids if (p := self.res.peek((layer, e))) is not None}
+        stop = len(ids)
+        for n, e in enumerate(ids):
             key = (layer, e)
-            self.rides[key] = self.rides.get(key, 0) + 1
             if self.vram is not None and key in self.vram:
                 # a first-class seat: the card multiplies it, no bytes move
                 self.sm._tag(PassTag.EXPERT_VRAM_SEAT)
+                self.rides[key] = self.rides.get(key, 0) + 1
                 on_card[e] = self.vram.views(key)
                 self.stat["hit"] += 1
                 if prof is not None:
@@ -1173,78 +2057,61 @@ class _ExpertStore:
                 continue
             s = self.res.get(key)
             if s is not None:
+                self.rides[key] = self.rides.get(key, 0) + 1
+                protect.discard(s)
                 out[e] = s
+                taken.add(s)
                 self.stat["hit"] += 1
                 if prof is not None:
                     prof.add(prof.HIT, layer, e, self.per, slot=s)
                 self._seat(layer, e, s)
                 continue
-            a = self.ahead.pop(key, None)
-            if a is not None:
+            s = self.ahead.get(key)
+            if s is not None:
                 # the lookahead read it (or is reading it): promoted out of the ring into the store
-                s = a["slot"]
-                if s in self.ring:
-                    self.ring.remove(s)
-                self.res.admit(key, s)
+                self.rides[key] = self.rides.get(key, 0) + 1
+                self._resident(s, key)
                 out[e] = s
+                taken.add(s)
                 self.stat["hit"] += 1
                 self.stat["ahead_used"] += 1
                 if prof is not None:
                     prof.add(prof.HIT, layer, e, self.per, slot=s, aux=1)
-                if not a["parts"].done():
-                    waiting.append((e, a["parts"], s))
+                sl = self.slots[s]
+                if sl.landing() and sl.parts is not None:
+                    waiting.append((e, sl.parts, s))
                 continue
-            self.stat["miss"] += 1
+            s = self._seat_for(taken, protect, ring=True, last=n == 0)
+            if s is None:
+                if whole or n == 0:
+                    # refused whole: the misses this pass seated have no reads queued, so they leave the line and
+                    # their slots go back free - left seated, a later call would take their unread bytes as a hit
+                    for m in todo:
+                        self.res.pop((layer, m))
+                        self._to_free(out[m])
+                    raise RuntimeError(
+                        f"[experts] one call needs {len(ids)} experts and the store seats {n} of them: "
+                        f"{len(taken)} of {self.live()} live seats the call's, {len(self.ring)} the lookahead's "
+                        f"({self._host_line()})"
+                    )
+                stop = n  # no seat for this one: the wave ends before it
+                break
+            protect.discard(s)  # a later resident's seat the first expert had to take
+            self.rides[key] = self.rides.get(key, 0) + 1
+            self._resident(s, key)
+            out[e] = s
+            taken.add(s)
             todo.append(e)
-        if self.ahead:
-            self._lapsed(layer, {int(x) for x in ids}, sched)
-        if len(todo) > self.n_slots:
-            raise RuntimeError(f"[experts] one call needs {len(todo)} experts, the store holds {self.n_slots} slots")
-        self.stat["calls"] += 1
+            self.stat["miss"] += 1
         if todo:
             self.stat["miss_calls"] += 1
-            srt = sorted(todo)
-            self.stat["adjacent"] += sum(1 for a, b in pairwise(srt) if b == a + 1)
+            self.stat["adjacent"] += sum(1 for a, b in pairwise(todo) if b == a + 1)
         self.max_call = max(self.max_call, len(todo))
-        self.release()
-        # release() frees whole blocks by LRU age; a hit collected above can share a block with the
-        # evicted slot and be freed as collateral. Re-read any hit whose slot release() took.
-        for e in [e for e, s in out.items() if s not in self.slot_of]:
-            self.res.pop((layer, e))
-            self.stat["hit"] -= 1
-            self.stat["miss"] += 1
-            del out[e]
-            todo.append(e)
-            if prof is not None:
-                prof.add(prof.REREAD, layer, e, self.per)
-        waiting = [w for w in waiting if w[0] in out]  # a promoted read whose slot went is re-read like a hit
-        if len(self.free) < len(todo):
-            self._grow(len(todo) - len(self.free))
-        while self.live() < len(todo):
-            if not self._grow(len(todo) - self.live()):
-                raise RuntimeError(
-                    f"[experts] one call needs {len(todo)} experts and the machine has no room "
-                    f"above the {self.reserve / 2**30:.1f} GB reserve"
-                )
-        taken = set(out.values())
-        for e in todo:
-            if self.free:
-                s = self.free.pop()
-            else:
-                v = self.res.victim(taken)
-                if v is None:
-                    raise RuntimeError(f"[experts] one call needs {len(todo)} experts and every seat is the call's own")
-                key, s = v
-                if prof is not None:
-                    prof.add(prof.EVICT, key[0], key[1], self.per, slot=s, aux=0)
-            taken.add(s)
-            self.res.admit((layer, e), s)
-            out[e] = s
         if not keep:
             for e in todo:
                 self.res.demote((layer, e))
         self.last_slots = dict(out)
-        if rows > 1 and layer == 0 and todo and not self._warned_prefill and self.drive is not None:
+        if rows > 1 and layer == self._first_layer() and todo and not self._warned_prefill and self.drive is not None:
             # a prompt on a drive that seeks is minutes to its first token: said once, before the wait, so the
             # user knows what was bought rather than that the engine hung
             est = len(todo) * int(self.sm.L) * self.expert_s(self.drive, self.per)
@@ -1260,6 +2127,8 @@ class _ExpertStore:
             futs = {e: self._submit(sched, parts, e, out[e], layer, pri) for e in todo}
         else:
             futs = {e: Parts([self.pool.submit(self._read, parts, e, out[e], layer)]) for e in todo}
+        for e, f in futs.items():
+            self.slots[out[e]].parts = f
         self.stat["bytes"] += len(todo) * self.per
         self.stat["s"] += time.perf_counter() - t0
         still = {e for e, _, _ in waiting}
@@ -1270,7 +2139,7 @@ class _ExpertStore:
         ready = {e: self._views(s) for e, s in out.items() if e not in futs and e not in still}
         ready.update(on_card)
         pending = [(e, futs[e], out[e]) for e in todo] + waiting
-        return ready, pending
+        return ready, pending, ids[stop:]
 
     def wait(self, pending: Any) -> Any:
         """every pending read landed, as `landed` would yield them, in one call: e -> views"""

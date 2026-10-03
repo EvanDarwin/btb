@@ -9,7 +9,10 @@ e2e.json. Each run is compared with the baseline's run of the same name - two pa
 cancels a drift across the job - and without a baseline every row lists as new.
 
 The comment flags a change only when its whole 95% CI clears the noise floor in every pair. `--gate` adds the
-perf-gate exit code (1 when a benchmark's whole CI clears the regression threshold in every pair).
+perf-gate exit code (1 when a benchmark's whole CI clears the regression threshold in every pair). Where the PR's
+run holds e2e_bench's placement group (a CUDA box), the comment ends with its crossover: each op's lanes by rows
+from the run's own times, and where the winner changes - a lane winning a row by the same rule (its lead's whole CI
+clear of the noise floor in every run), a tie otherwise.
 
     python -m bench.report PR_ROOT [--baseline BASE_ROOT] [--noise FRAC] [--out comment.md] [--gate [--gate-threshold FRAC]]
 """
@@ -24,7 +27,7 @@ import re
 import sys
 from typing import NotRequired, TypedDict, cast
 
-from bench.e2e_delta import Doc, Timing
+from bench.e2e_delta import Doc, Timing, band, rel_se
 from bench.e2e_delta import deltas as e2e_deltas
 from bench.e2e_delta import timings as e2e_timings
 from btb.kinds import Json
@@ -323,6 +326,126 @@ def render(
     return "\n".join(lines) + "\n", any_reg
 
 
+PLACEMENT = "placement"  # e2e_bench's group whose own times the crossover reads
+CPU_LANE, HELD_LANE, FED_LANE = "cpu/ram", "cuda/vram", "cuda/ram"  # e2e_bench.LANES: device / where the weights sit
+# a lane's time at a row count in each run it ran in: {run: (median seconds, the median's relative standard error)}
+Runs = dict[str | None, tuple[float, float]]
+Placement = dict[tuple[str, str], dict[tuple[int, str], dict[str, Runs]]]
+
+
+def _placement(root: str) -> Placement:
+    """the placement group on a result root, {(op, shape): {(rows, row label): {lane: {run: (median, rel se)}}}},
+    read off each bench's `extra_info`, every run kept apart so a winner is held to each of them"""
+    got: Placement = {}
+    for run in runs(root):
+        for b in _doc(_read_json(_e2e_path(root, run))).get("benchmarks", []):
+            x = b.get("extra_info") or {}
+            op, shape, lane, row, rows = (x.get(k) for k in ("op", "shape", "lane", "row", "rows"))
+            median = _num(b, "stats", "median")
+            if b.get("group") != PLACEMENT or median <= 0 or not isinstance(rows, int):
+                continue
+            if not (isinstance(op, str) and isinstance(shape, str) and isinstance(lane, str) and isinstance(row, str)):
+                continue
+            lanes = got.setdefault((op, shape), {}).setdefault((rows, row), {})
+            lanes.setdefault(lane, {})[run] = (median, rel_se(b.get("stats", {})))
+    return got
+
+
+def _mean(t: Runs) -> float:
+    """a lane's time as the table shows it: the mean of its runs' medians, as `timings` folds the runs"""
+    return sum(m for m, _se in t.values()) / len(t)
+
+
+def _lead(lanes: dict[str, Runs], noise: float) -> tuple[str, list[str]]:
+    """a row's fastest lane (by its runs' mean median) and the lanes it does not beat: those whose median it does not
+    undercut by more than `noise` with the whole 95% band of the difference, in every run of the row - the rule the
+    comment holds a change to. A lane that did not run in every run the row has (a cell that failed, a lane skipped)
+    cannot be told from: beating it in the runs it has proves nothing of the one it lacks. An empty list is a win;
+    otherwise the row is a tie among the fastest and those"""
+    every = {r for t in lanes.values() for r in t}
+    best = min(lanes, key=lambda ln: _mean(lanes[ln]))
+    tied = []
+    for ln, t in lanes.items():
+        if ln == best:
+            continue
+        clears = set(t) == every and set(lanes[best]) == every
+        for r in every if clears else ():
+            (mb, sb), (mo, so) = lanes[best][r], t[r]
+            if (mb - mo) / mo + band(sb, so) >= -noise:
+                clears = False
+        if not clears:
+            tied.append(ln)
+    return best, sorted(tied, key=_lane_key)
+
+
+def _outcome(lanes: dict[str, Runs], noise: float) -> str:
+    """a row's outcome as markdown-safe text: the winning lane, `≈ a, b` for the lanes it cannot be told from (each
+    lane's name made safe on its own, the marks between them the report's), or `a alone` where only one lane was
+    timed - nothing it could have won against"""
+    if len(lanes) < 2:
+        return f"{_safe(next(iter(lanes)))} alone"
+    best, tied = _lead(lanes, noise)
+    names = [_safe(ln) for ln in sorted([best, *tied], key=_lane_key)]
+    return names[0] if not tied else "≈ " + ", ".join(names)
+
+
+def _lane_key(lane: str) -> tuple[int, int, str]:
+    """the lanes in a table's order: the CPU, the card over held weights, over shipped ones, then the rest by the
+    number they carry (the routing replay's cuts)"""
+    known = (CPU_LANE, HELD_LANE, FED_LANE)
+    if lane in known:
+        return known.index(lane), 0, lane
+    digits = "".join(c for c in lane if c.isdigit())
+    return len(known), int(digits) if digits else 0, lane
+
+
+def _winners(by_rows: dict[tuple[int, str], dict[str, Runs]], noise: float) -> list[str]:
+    """each row's outcome in runs along the rows, markdown-safe - where the crossover is, and where it is too close
+    to call: `cpu/ram r1 to r8, ≈ cpu/ram, cuda/vram at r16, cuda/vram r24 to r4096`"""
+    spans: list[tuple[str, str, str]] = []  # the outcome, its first row, its last
+    for (_rows, row), lanes in sorted(by_rows.items()):
+        v, row = _outcome(lanes, noise), _safe(row)
+        if spans and spans[-1][0] == v:
+            spans[-1] = (v, spans[-1][1], row)
+        else:
+            spans.append((v, row, row))
+    return [f"{v} at {a}" if a == b else f"{v} {a} to {b}" for v, a, b in spans]
+
+
+def crossover(root: str, noise: float = 0.05) -> str:
+    """The placement group's section of the comment: for each op and shape, its lanes' times by rows (ms, the mean of
+    the runs' medians), the row's outcome, and the card's best against the CPU with the weights shipped from RAM (fed)
+    and held in VRAM (held) - above 1 the CPU wins - under a line naming the outcomes along the rows. A lane wins a row
+    only when it beats every other by more than `noise` with the whole 95% band of the difference, in every run, as
+    the comment holds a change; otherwise the row is a tie (`≈`) among the lanes it cannot be told from. '' where the
+    run has no placement."""
+    pts = _placement(root)
+    if not pts:
+        return ""
+    lines = [f"<details><summary>placement · where each op wins, by rows · {len(pts)} ops</summary>", ""]
+    lines.append(
+        f"A lane wins a row only when its lead clears ±{noise * 100:.0f}% with its whole 95% CI in every run; "
+        "`≈` marks the lanes a row cannot tell apart.\n"
+    )
+    for (op, shape), by_rows in sorted(pts.items()):
+        lanes = sorted({ln for v in by_rows.values() for ln in v}, key=_lane_key)
+        ratios = [(name, ln) for name, ln in (("fed ÷ cpu", FED_LANE), ("held ÷ cpu", HELD_LANE)) if ln in lanes]
+        ratios = ratios if CPU_LANE in lanes else []
+        lines += [f"**{_safe(op)} {_safe(shape)}**: " + ", ".join(_winners(by_rows, noise)), ""]
+        lines.append("| rows | " + " | ".join(f"`{_safe(ln)}` ms" for ln in lanes) + " | best |")
+        lines[-1] += "".join(f" {name} |" for name, _ln in ratios)
+        lines.append("|---" + "|---:" * len(lanes) + "|:--|" + "---:|" * len(ratios))
+        for (_rows, row), runs_of in sorted(by_rows.items()):
+            t = {ln: _mean(r) for ln, r in runs_of.items()}
+            cells = [f"{t[ln] * 1e3:.3f}" if ln in t else "" for ln in lanes]
+            v = _outcome(runs_of, noise)
+            vs = [f"{t[ln] / t[CPU_LANE]:.2f}x" if ln in t and CPU_LANE in t else "" for _name, ln in ratios]
+            lines.append(f"| {_safe(row)} | " + " | ".join(cells) + f" | `{v}` |" + "".join(f" {x} |" for x in vs))
+        lines.append("")
+    lines.append("</details>\n")
+    return "\n".join(lines) + "\n"
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("pr_root", help="this run's result root (the repo, after the benches ran)")
@@ -353,6 +476,7 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     entries = compare(a.pr_root, a.baseline)
     body, regressed = render(entries, a.noise, len(runs(a.pr_root)), a.base_ref, a.base_sha)
+    body += crossover(a.pr_root, a.noise)
     sys.stdout.write(body)
     if a.out:
         with open(a.out, "w", encoding="utf-8") as f:

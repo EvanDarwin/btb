@@ -32,21 +32,27 @@ def _mlx_src() -> str:
 
 _METAL_NAME = re.compile(r'metal_kernel\(\s*name=f?"([^"]+)"')
 _METAL_HELPER = re.compile(r'\b_kernel\(\s*"(btb_\w+)"')  # fused.py builds through one cached helper
-_CUDA_NAME = re.compile(r"__global__\s+void\s+(?:__launch_bounds__\s*\([^)]*\)\s*)?(\w+?)(##\w+)?\s*\(")
+# a name stamped by a macro may carry several `##` parts (`btb_attn_split_gqa##G##_d##D`)
+_CUDA_NAME = re.compile(r"__global__\s+void\s+(?:__launch_bounds__\s*\([^)]*\)\s*)?(\w+?)((?:##\w+)*)\s*\(")
 
 # op category -> the stem pattern that claims it, first match wins
 CATEGORIES: tuple[tuple[str, str], ...] = (
-    ("Matrix-vector: bf16", r"gemv_(bf16|silu|gelu|mma)|gemm16"),
+    ("Matrix-vector: MXFP4", r"mxfp4|mx4_widen|lane16_mx4"),
+    ("Matrix-vector: bf16", r"gemv_(bf16|silu|gelu|mma|sgate|lane16)|gemm16"),
     ("Matrix-vector: 12-bit", r"p12"),
-    ("Matrix-vector: MXFP4", r"mxfp4"),
     ("Matrix-vector: GGUF quants", r"<kind>|q\dk|iq4nl"),
     ("Attention", r"attn"),
+    ("Sparse attention indexer", r"qsa_"),
     ("Norm and RoPE", r"norm|rope|sandwich"),
-    ("Activation", r"silu_mul|gelu_mul"),
-    ("DeltaNet", r"delta"),
+    ("Hyper-connections", r"hc_"),
+    ("Mixture routing", r"moe_"),
+    ("Per-layer embedding", r"ple_"),
+    ("Activation", r"silu_mul|gelu_mul|sigmoid_mul"),
+    ("DeltaNet", r"delta|conv_window"),
     ("Sampling", r"sample"),
     ("KV cache", r"kv_store"),
     ("Whole-pass kernels", r"mega|publish"),
+    ("Cache warming", r"l2_warm"),
 )
 
 

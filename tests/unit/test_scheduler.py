@@ -9,7 +9,10 @@ readings are three patched functions. The suite runs in seconds on any machine, 
 from __future__ import annotations
 
 import contextlib
+import os
+import sys
 import threading
+import time
 import types
 import weakref
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -25,13 +28,13 @@ from pytest import MonkeyPatch
 from btb.engine import BatchScheduler
 from btb.engine import device as device_mod
 from btb.engine import memory as memory_mod
-from btb.engine.device import Device
+from btb.engine.device import Device, Where
 from btb.engine.families import Family
 from btb.engine.forward import _ForwardMixin
 from btb.engine.generate import _GenerateMixin
 from btb.engine.memory import RamPolicyState, VramPolicyState, _MemoryMixin
 from btb.engine.scheduler import MemoryGrantError
-from btb.kinds import FamilyKind, Json, Log, TokenRows, Tokens
+from btb.kinds import FamilyKind, Json, LayerKind, Log, TokenRows, Tokens
 from tests.helpers import (
     ABSENT,
     GB,
@@ -43,8 +46,10 @@ from tests.helpers import (
     bare_registry,
     expert_store,
     model_config,
+    seat,
     slot_size,
     stub_engine,
+    stub_ledger,
 )
 
 if TYPE_CHECKING:
@@ -57,6 +62,13 @@ TOTAL_VRAM = 12 * GB
 # --- the stubs ----------------------------------------------------------------------------------------------
 
 
+def _where(dev: str) -> Where:
+    """`dev` as the engine names its device (`device.where`): a card always by its index - the card 0, no card here
+    to ask which is current"""
+    d = torch.device(dev)
+    return Where(torch.device("cuda", 0) if d.type == "cuda" and d.index is None else d)
+
+
 @contextlib.contextmanager
 def cuda_stats(
     free: int | list[int] = 8 * GB,
@@ -64,13 +76,14 @@ def cuda_stats(
     allocated: int = 0,
     raises: BaseException | None = None,
     physical: int | None = 1 << 62,
+    budget: int | None = None,
 ) -> Iterator[dict[str, int]]:
     """`torch.cuda`'s three memory readings, patched, plus the cross-process physical free (`free_bytes` clamps
     the per-process reading to it; a huge default makes the clamp a no-op so these price the mem_get_info
-    arithmetic alone). `free` may be a list: one reading per call, the last repeating, staging a run whose free
-    memory moves between plans."""
+    arithmetic alone) and the WDDM budget's room (None: no budget, as off Windows). `free` may be a list: one
+    reading per call, the last repeating, staging a run whose free memory moves between plans."""
     saved = (torch.cuda.mem_get_info, torch.cuda.memory_reserved, torch.cuda.memory_allocated)
-    saved_phys = device_mod._physical_free_bytes
+    saved_phys, saved_budget = device_mod._physical_free_bytes, device_mod._wddm_room
     seen = {"mem_get_info": 0}
     seq = list(free) if isinstance(free, (list, tuple)) else None
 
@@ -86,11 +99,12 @@ def cuda_stats(
     torch.cuda.memory_reserved = lambda *a, **k: int(reserved)
     torch.cuda.memory_allocated = lambda *a, **k: int(allocated)
     device_mod._physical_free_bytes = lambda dev: None if physical is None else int(physical)
+    device_mod._wddm_room = lambda dev: None if budget is None else int(budget)
     try:
         yield seen
     finally:
         torch.cuda.mem_get_info, torch.cuda.memory_reserved, torch.cuda.memory_allocated = saved
-        device_mod._physical_free_bytes = saved_phys
+        device_mod._physical_free_bytes, device_mod._wddm_room = saved_phys, saved_budget
 
 
 V = 64  # the toy vocabulary
@@ -129,7 +143,7 @@ class _StubEngine(_GenerateMixin):
         self.layer_types = list(layer_types)
         self.compute_dtype = None
         self.kv_bits = None
-        self.dev = torch.device(dev)
+        self.dev = _where(dev)
         self.mlx = None
         self.mem_start = 0
         self.ram_reserve = 0
@@ -213,6 +227,51 @@ class _StubEngine(_GenerateMixin):
         assert int(ids.shape[0]) == len(cache.rows), "the batch never resizes mid-decode"
         cache.step += 1
         return self._logits(cache.rows, cache.step)
+
+
+def test_the_epochs_kv_on_a_card_is_only_the_resident_layers() -> None:
+    """the epoch's KV is reserved on the card, so it is priced for the layers whose rows live there: a host layer's
+    rows are on the host, and `kv_host` keeps even a resident layer's there. Priced for every layer it was a
+    phantom reservation that shrank the depot and the chunk on a card holding a few layers"""
+    m = SchedulerModel(
+        dev="cuda", layer_types=("full_attention", "linear_attention", "full_attention", "full_attention")
+    )
+    every = BatchScheduler(m)._kv_bytes_per_row_token()
+    m.resident = {2: None}  # type: ignore[attr-defined]
+    assert BatchScheduler(m)._kv_bytes_per_row_token() * 3 == every, "one of the three attention layers on the card"
+    m.kv_host = True  # type: ignore[attr-defined]
+    assert BatchScheduler(m)._kv_bytes_per_row_token() == 0, "every layer's rows on the host"
+    host = SchedulerModel(dev="cpu", layer_types=m.layer_types)
+    host.resident = {2: None}  # type: ignore[attr-defined]
+    assert BatchScheduler(host)._kv_bytes_per_row_token() == every, "one device: every layer's rows are its own"
+
+
+def test_a_batchs_host_rows_count_what_the_store_would_give_back() -> None:
+    """on a card whose attention rows live on the host, a batch is held to the host's room for them: its free memory
+    and what the expert store - a cache grown into free RAM, which gives blocks back as rows grow - would release.
+    A warm store at its margin no longer sizes every epoch at one row; and the epoch reserves those rows there"""
+    from btb.engine.scheduler import EPOCH
+
+    m = SchedulerModel(dev="cuda", layer_types=("full_attention",) * 4)
+    m.resident = {}  # type: ignore[attr-defined]  # every attention layer's rows on the host, float32
+    reserved: dict[tuple[str, str], int] = {}
+
+    class _Ledger:
+        def free(self, device: Any = None, unreserved: bool = False, own: Any = None, pooled: bool = False) -> int:
+            return 1 * GB if device is not None and torch.device(device).type == "cpu" else 64 * GB
+
+        def reserve(self, tag: str, nbytes: int, device: Any = None, used: Any = None) -> None:
+            reserved[(tag, "cpu" if device is not None else "card")] = int(nbytes)
+
+    m.device = _Ledger()  # type: ignore[attr-defined]
+    s = BatchScheduler(m)
+    host = s.host_kv_row_bytes(4096)
+    assert host > 0 and s.kv_row_bytes(4096) == 0, "no row on the card, every one on the host"
+    assert s.max_batch(4096) == GB // host, "the store's margin alone"
+    m.expert_store = types.SimpleNamespace(releasable=lambda: 8 * GB)  # type: ignore[attr-defined]
+    assert s.max_batch(4096) == 9 * GB // host, "and what the store would give back for them"
+    batch, _ = s.plan(10**6, 4096)
+    assert reserved[(EPOCH, "cpu")] == host * batch, "the host's rows reserved on the host"
 
 
 def _counting_max_batch(engine: _StubEngine, values: Sequence[int]) -> dict[str, int]:
@@ -809,7 +868,7 @@ class _PolicyEngine(_MemoryMixin):
     """the policy's state, with the two actions it can take recorded instead of run"""
 
     def __init__(self, vram_margin: int = 1 * GB, shed: Sequence[str] = (), watch: bool = True) -> None:
-        self.dev = torch.device("cuda")
+        self.dev = _where("cuda")
         self.vram_watch = watch
         self.vram_margin = int(vram_margin)
         # the policy reads free memory and applies its moves through the engine's device, as the real one does
@@ -917,13 +976,678 @@ def test_vram_policy_does_not_stand_aside_for_a_single_row_cache() -> None:
     assert len(e.shed_calls) == 1
 
 
+@contextlib.contextmanager
+def budget_room(start: int, freed_per_shed: int, e: _PolicyEngine, trim_frees: int = 0) -> Iterator[list[int]]:
+    """the WDDM budget's room for this process, `start` bytes (negative: past the budget), rising by
+    `freed_per_shed` with every layer the stub engine sheds and by `trim_frees` with every emptying of torch's cache
+    (the trim tried before any shed); the PDH sensor made to fail the test if read"""
+    room = [int(start)]
+    saved_room, saved_pdh, saved_info = device_mod._wddm_room, memory_mod.vram_pressure, device_mod._wddm_info
+    saved_cuda = (
+        torch.cuda.synchronize,
+        torch.cuda.empty_cache,
+        torch.cuda.memory_reserved,
+        torch.cuda.memory_allocated,
+    )
+    real_shed = e.vram_shed
+
+    def shed(cache: Any = None, log: Log | None = None) -> str:
+        room[0] += int(freed_per_shed)
+        return real_shed(cache, log)
+
+    def no_pdh(pid: int | None = None) -> Json:
+        raise AssertionError("the budget's answer needs no PDH read")
+
+    device_mod._wddm_room = lambda dev: room[0]
+    # the budget and the usage apart, the budget 11 GB as the engine came up: a room below zero is a smaller budget
+    device_mod._wddm_info = lambda dev: (11 * GB + min(0, room[0]), 11 * GB - max(0, room[0]))
+    e.vram_state.budget_hi = 11 * GB
+    memory_mod.vram_pressure = no_pdh
+    e.vram_shed = shed  # type: ignore[method-assign]
+    # the trim's own torch calls: no card here (CUDA hidden), its cache a figure the budget answers to
+    torch.cuda.synchronize = lambda *a, **k: None
+    torch.cuda.empty_cache = lambda: room.__setitem__(0, room[0] + int(trim_frees))
+    torch.cuda.memory_reserved = lambda *a, **k: 0
+    torch.cuda.memory_allocated = lambda *a, **k: 0
+    try:
+        yield room
+    finally:
+        device_mod._wddm_room, memory_mod.vram_pressure, device_mod._wddm_info = saved_room, saved_pdh, saved_info
+        (torch.cuda.synchronize, torch.cuda.empty_cache, torch.cuda.memory_reserved, torch.cuda.memory_allocated) = (
+            saved_cuda
+        )
+
+
+def test_vram_policy_gives_the_card_back_the_moment_its_budget_shrinks() -> None:
+    """a game started beside btb: Windows cuts this process's budget below what it holds, and the next pass gives
+    back as much as the budget asks - four layers in one call, not a layer a second, and with no PDH read - leaving
+    the margin kept for other programs; adapt never reacted to this before (it waited for its memory to be paged
+    out, or its step to slow, and even then shed one layer a second: the game failed to start meanwhile)"""
+    e = _PolicyEngine(vram_margin=GB // 2)
+    e.L = 8
+    with budget_room(-3 * GB // 2, 600 * MB, e) as room:
+        e.vram_policy(_batched_cache(1))
+        assert len(e.shed_calls) == 4, f"{len(e.shed_calls)} layers given back"
+        assert room[0] >= e.vram_margin, "the margin for other programs is not kept"
+        e.vram_state.last_t = time.time()  # the PDH read is not due: only the budget is read this pass
+        e.vram_policy(_batched_cache(1))
+    assert len(e.shed_calls) == 4, "a budget with room sheds nothing more"
+    assert any("another program took 1.50 GiB of the card" in ln for ln in e.lines), e.lines
+
+
+def test_vram_yield_names_its_own_growth_past_the_budget_apart_from_another_programs() -> None:
+    """the budget as it was when the engine came up, the process's own use past it: the log says the plan fell short,
+    not that another program took the card (Qwen3-4B alone on the card read as a game for hours)"""
+    e = _PolicyEngine(vram_margin=GB // 2)
+    e.L = 8
+    with budget_room(-GB, 600 * MB, e):
+        device_mod._wddm_info = lambda dev: (11 * GB, 12 * GB)  # the budget unmoved, the process past it
+        e.vram_yield(_batched_cache(1))
+    assert any("grew past its own budget" in ln for ln in e.lines), e.lines
+    assert not any("another program" in ln for ln in e.lines), e.lines
+
+
+def test_vram_policy_within_its_budget_gives_nothing_back() -> None:
+    e = _PolicyEngine(vram_margin=GB // 2)
+    e.L = 8
+    e.vram_state.last_t = time.time()  # the PDH read is not due: only the budget is read this pass
+    with budget_room(2 * GB, 600 * MB, e):
+        e.vram_policy(_batched_cache(1))
+    assert e.shed_calls == [] and e.lines == []
+
+
+def test_vram_yield_gives_all_it_can_and_asks_again_only_when_the_budget_moves() -> None:
+    """a game taking the card as it frees (Windows cuts the budget with every layer given back): the card graphs let
+    go first, then every layer the engine holds; with nothing left, the next passes do not ask again (the log is not
+    flooded) until the budget is cut deeper or recovers"""
+    e = _PolicyEngine(vram_margin=GB // 2)
+    e.L = 36
+    left = [3]  # layers the stub still holds
+    real_shed = e.vram_shed
+
+    def shed(cache: Any = None, log: Log | None = None) -> str | None:
+        if not left[0]:
+            return None
+        left[0] -= 1
+        return real_shed(cache, log)
+
+    let_go: list[bool] = []
+    e._card_let_go = lambda: let_go.append(True)  # type: ignore[method-assign]
+    with budget_room(-GB, 0, e) as room:  # the game takes each freed chunk: the budget does not move
+        e.vram_shed = shed  # type: ignore[method-assign,assignment]
+        e.vram_policy(_batched_cache(1))
+        assert len(e.shed_calls) == 3 and left[0] == 0, f"{len(e.shed_calls)} layers given back of 3"
+        assert let_go, "the card graphs were not let go before the sheds"
+        e.vram_state.last_t = time.time()
+        e.vram_policy(_batched_cache(1))
+        said = [ln for ln in e.lines if "past this process's budget" in ln]
+        assert len(said) == 1, "asked again with nothing more to give"
+        room[0] = -2 * GB  # the game takes more
+        e.vram_policy(_batched_cache(1))
+        said = [ln for ln in e.lines if "past this process's budget" in ln]
+        assert len(said) == 2, "a deeper cut was not answered"
+        room[0] = GB  # the game gone: inside the budget again
+        e.vram_state.last_t = time.time()
+        e.vram_policy(_batched_cache(1))
+        assert e.vram_state.spent == 0
+
+
+def test_torchs_cached_blocks_answer_a_budget_before_any_placement_change() -> None:
+    """a warm-up's 1.5 GB of freed blocks still in torch's cache when another program asks (Qwen3-4B, measured by
+    the -vv trace): emptying the cache is enough - no layer leaves the card, no card graph is let go, and the
+    placement's version does not move (a request moves it, and every card graph and card program is rebuilt for
+    the new one: for nothing, where the cache was enough)"""
+    e = _PolicyEngine(vram_margin=GB // 2)
+    e.L = 8
+    let_go: list[bool] = []
+    e._card_let_go = lambda: let_go.append(True)  # type: ignore[method-assign]
+    with budget_room(-GB, 600 * MB, e, trim_frees=2 * GB):
+        v0 = e.device.version
+        e.vram_policy(_batched_cache(1))
+        assert e.device.version == v0, "the placement moved for torch's own cache"
+    assert e.shed_calls == [] and not let_go, "a layer or the graphs given up for torch's own cache"
+    assert e.vram_state.spent == 0
+    assert any("torch's cached blocks" in ln for ln in e.lines), e.lines
+
+
+def test_a_budget_past_again_soon_after_a_trim_is_answered_by_a_shed() -> None:
+    """a pass's own transients refilling the cache: the trim answers the first time; past the budget again within
+    TRIM_AGAIN_S the policy yields and sheds a layer at least - lasting room, where a trim a pass had emptied the
+    cache and moved the placement on every pass without ever making any"""
+    e = _PolicyEngine(vram_margin=GB // 2)
+    e.L = 8
+    e._card_let_go = lambda: None  # type: ignore[method-assign]
+    with budget_room(-GB, 600 * MB, e, trim_frees=2 * GB) as room:
+        e.vram_policy(_batched_cache(1))
+        assert e.shed_calls == [], "the first trim was enough"
+        room[0] = -GB // 4  # the next pass's transients: past the budget again
+        e.vram_policy(_batched_cache(1))
+    assert len(e.shed_calls) >= 1, "past again within TRIM_AGAIN_S and no layer shed"
+
+
+def test_a_cut_back_to_the_budget_at_load_is_another_programs_once_the_budget_rose() -> None:
+    """btb loaded beside a game (its budget then 5.8 GB), the game gone (11 GB given, the watcher noting it), then
+    back: the cut is the game's - read against the largest budget given, where the budget at load called it btb's
+    own growth past its plan"""
+    e = _PolicyEngine(vram_margin=GB // 2)
+    e.vram_state.budget_hi = 11 * GB
+    saved = device_mod._wddm_info
+    device_mod._wddm_info = lambda dev: (int(5.8 * GB), int(6.2 * GB))
+    try:
+        why = e._vram_why()
+    finally:
+        device_mod._wddm_info = saved
+    assert why.startswith("another program took"), why
+
+
+def test_the_memory_policies_stand_aside_for_the_warm_up_and_answer_once_it_is_done() -> None:
+    """the load's warm-up times passes: a yield between two of its captures let the card graphs go and moved the
+    placement (its kernel choice written into a state no pass read). The watchers' try at the decode lock fails during
+    it, the warm-up's own passes' policies stand aside (`warming`), and once it is done each policy reads its budget
+    - the watcher's try then succeeds"""
+    from btb.engine import StreamedTextModel
+
+    seen: list[bool] = []
+    policies: list[tuple[str, bool]] = []
+    stub = types.SimpleNamespace(
+        dev=torch.device("cuda"), mlx=None, _decode_lock=threading.RLock(), vram_trim=lambda tag="": None
+    )
+    stub.warming = False
+    stub.vram_policy = lambda cache=None, log=None: policies.append(("vram", stub.warming))
+    stub.ram_policy = lambda log=None: policies.append(("ram", stub.warming))
+    stub._warming = lambda: StreamedTextModel._warming(cast(Any, stub))
+
+    def watcher_try() -> None:
+        got = stub._decode_lock.acquire(blocking=False)
+        seen.append(got)
+        if got:
+            stub._decode_lock.release()
+
+    def card_warm(ids: Tokens) -> int:
+        assert stub.warming, "the warm-up's passes ran with the policies acting"
+        t = threading.Thread(target=watcher_try)
+        t.start()
+        t.join()
+        return 3
+
+    stub.card_warm = card_warm
+    assert StreamedTextModel.warm(cast(Any, stub)) == 3
+    watcher_try()
+    assert seen == [False, True], f"the watcher's tries during and after the warm-up: {seen}"
+    assert policies == [("vram", False), ("ram", False)], f"the policies once the warm-up is done: {policies}"
+    assert not stub.warming
+
+
+def test_a_warm_up_pass_gives_nothing_back_however_short_the_budget() -> None:
+    """a pass of the warm-up (`warming`) past its budget: nothing shed, trimmed or requested - the placement stays
+    as the warm-up is timing it; the budget is answered once it is done (`_warming`)"""
+    e = _PolicyEngine(vram_margin=GB // 2)
+    e.L = 8
+    e.warming = True
+    with budget_room(-2 * GB, 600 * MB, e):
+        v0 = e.device.version
+        e.vram_policy(_batched_cache(1))
+        assert e.device.version == v0 and e.shed_calls == [] and e.vram_state.trim_t == 0.0
+
+
+def test_vram_yield_stops_when_nothing_is_left_to_shed() -> None:
+    e = _PolicyEngine(vram_margin=GB // 2)
+    e.L = 8
+    with budget_room(-GB, 0, e):
+        e.vram_shed = lambda cache=None, log=None: None  # type: ignore[method-assign,assignment,return-value]
+        assert e.vram_yield(_batched_cache(1)) == []
+    assert any("nothing left to shed" in ln for ln in e.lines), e.lines
+
+
+class _YieldEngine(_MemoryMixin):
+    """the RAM yield's view of an engine: a machine whose free RAM and commit the test sets (commit as RAM unless
+    staged apart), an expert store and host layers whose giving-back moves them - a shed by `gain` (RAM, commit), the
+    OS's figures moved by it unless `lag` (the pages not yet taken back)"""
+
+    def __init__(self, free: int, reserve: int, per_block: int, blocks: int, host: int, per_layer: int) -> None:
+        self.dev = _where("cuda")
+        self.adapt, self.mlx, self.L, self.ram_reserve = True, None, 8, int(reserve)
+        self.machine = {"free": int(free), "low": False}
+        self.lines: list[str] = []
+        self.host = dict.fromkeys(range(host))
+        self.cold: set[int] = set()
+        self.shed: list[int] = []
+        self.gain = (int(per_layer), int(per_layer))
+        self.lag = False
+        self.warming = False
+        self.ram_state = RamPolicyState()
+        self.requests: list[str] = []
+        eng = self
+
+        class Store:
+            n, hold = int(blocks), (0, 0.0)
+
+            def hold_for(self, nbytes: int, seconds: float) -> None:
+                self.hold = (int(nbytes), float(seconds))
+
+            def release(self, want: int = 1) -> int:
+                freed = 0
+                while self.n and eng.machine["free"] - eng.ram_reserve < want:
+                    self.n -= 1
+                    eng.machine["free"] += per_block
+                    if "commit" in eng.machine:
+                        eng.machine["commit"] += per_block
+                    freed += 1
+                return freed
+
+        class Dev:
+            version = 0
+
+            def request(self, what: str, fn: Callable[[], Any]) -> Any:
+                self.version += 1
+                eng.requests.append(what)
+                return fn()
+
+        self.store = Store()
+        self.expert_store = cast(Any, self.store)
+        self.device = cast(Any, Dev())
+
+    def log(self, *a: object, **k: object) -> None:
+        self.lines.append(" ".join(str(x) for x in a))
+
+    def _shed_gain(self, i: int) -> tuple[int, int]:
+        return self.gain
+
+    def _shed_warm(self, why: str = "", log: Log | None = None) -> tuple[int, int, int] | None:
+        i = self._next_warm()
+        if i is None:
+            return None
+        self.cold.add(i)
+        self.shed.append(i)
+        if not self.lag:
+            self.machine["free"] += self.gain[0]
+            if "commit" in self.machine:
+                self.machine["commit"] += self.gain[1]
+        return i, *self.gain
+
+
+@contextlib.contextmanager
+def machine(e: _YieldEngine, total: int = 64 * GB) -> Iterator[None]:
+    """the OS's memory reads the RAM yield takes, answered from the engine's staged machine"""
+    names = ("host_free_bytes", "host_commit_bytes", "memory_pressure", "host_total_bytes")
+    saved = {n: getattr(memory_mod, n) for n in names}
+    memory_mod.host_free_bytes = lambda: e.machine["free"]
+    memory_mod.host_commit_bytes = lambda: e.machine.get("commit", e.machine["free"])
+    memory_mod.memory_pressure = lambda: {"low": e.machine["low"], "level": 1.0 if e.machine["low"] else 0.0}
+    memory_mod.host_total_bytes = lambda: int(total)
+    try:
+        yield
+    finally:
+        for n, f in saved.items():
+            setattr(memory_mod, n, f)
+
+
+def test_ram_short_is_the_reserve_and_a_launchs_headroom_once_another_program_takes_memory() -> None:
+    e = _YieldEngine(free=10 * GB, reserve=4 * GB, per_block=GB, blocks=8, host=0, per_layer=GB)
+    with machine(e):
+        assert e._ram_headroom() == 4 * GB, "a sixteenth of 64 GB"
+        assert e._ram_short() == 0, "plenty above the reserve: nothing is short"
+        e.machine["free"] = 3 * GB  # a game took 7 GB: 1 GB into the reserve
+        assert e._ram_short() == 5 * GB, "the reserve's gigabyte back, and a launch's headroom"
+        e.machine["free"] = 5 * GB  # above the reserve, but the OS says memory is low
+        assert e._ram_short() == 0
+        e.machine["low"] = True
+        assert e._ram_short() == 3 * GB, "the OS's word counts: the headroom above what is left"
+        e.adapt = False
+        assert e._ram_short() == 0, "adapt off: nothing is ever given back"
+
+
+def test_ram_yield_gives_the_store_back_first_then_host_layers_and_holds_the_store() -> None:
+    """a game took RAM into the reserve: the store's blocks go back until the reserve and a launch's headroom are
+    free, and the store is held off growing back; host layers go to the drive only past what the store could give"""
+    e = _YieldEngine(free=3 * GB, reserve=4 * GB, per_block=GB, blocks=3, host=4, per_layer=GB)
+    with machine(e):
+        gained = e.ram_yield()
+        assert e.store.n == 0, "the store's blocks were not given back first"
+        assert e.shed == [3, 2], f"host layers to the drive past the store: {e.shed}"
+        assert e._ram_left() == e._ram_headroom() and gained == 5 * GB, "the reserve and the headroom are free"
+        assert e.store.hold == (e._ram_headroom(), e.RAM_HOLD_S), "the store is not held off growing back"
+    assert any("another program wants memory" in ln for ln in e.lines), e.lines
+
+
+def test_ram_yield_stops_when_nothing_is_left_to_give() -> None:
+    e = _YieldEngine(free=1 * GB, reserve=4 * GB, per_block=GB, blocks=1, host=0, per_layer=GB)
+    with machine(e):
+        e.ram_yield()
+    assert any("short of the headroom, nothing more a shed frees" in ln for ln in e.lines), e.lines
+
+
+def test_ram_yield_counts_what_each_shed_frees_not_the_lagging_os_figure() -> None:
+    """the OS takes a shed layer's pages back only as it gets round to them: read again after each shed, the figure
+    did not move and one yield sent every warm layer to the drive. Counted by what each shed let go, the yield stops
+    once the reserve and the headroom are covered"""
+    e = _YieldEngine(free=3 * GB, reserve=4 * GB, per_block=GB, blocks=0, host=8, per_layer=GB)
+    e.lag = True
+    with machine(e):
+        e.ram_yield()
+    assert e.shed == [7, 6, 5, 4, 3], f"5 GB short, 1 GB a layer: {e.shed}"
+
+
+def test_ram_yield_sheds_no_mapped_layer_for_a_commit_shortfall() -> None:
+    """a layer on the checkpoint's mapping holds RAM and no commit, and its ring slot takes both: with commit short
+    and RAM to spare a shed of it only makes things worse, and none is made; a layer of its own copies frees both"""
+    e = _YieldEngine(free=20 * GB, reserve=4 * GB, per_block=GB, blocks=0, host=8, per_layer=GB)
+    e.machine["commit"] = 3 * GB
+    e.gain = (GB, -GB // 4)  # mapped: its pages back, the ring's slot taken
+    with machine(e):
+        e.ram_yield()
+        assert e.shed == [], f"a mapped layer shed for commit: {e.shed}"
+        e.ram_state.spent = 0
+        e.gain = (GB, GB)  # its own copies: RAM and commit both freed
+        e.ram_yield()
+    assert e.shed == [7, 6, 5, 4, 3], e.shed
+
+
+def test_a_shortfall_a_yield_cannot_answer_is_asked_once_not_every_pass() -> None:
+    """with nothing left to give and another program still in the reserve, every pass asked again - a request
+    moves the placement's version (the card graphs rebuilt) and the yield logged two lines - and the watcher four
+    times a second. Asked once; again only when the other program wants RAM_AGAIN more, or after the host was clear"""
+    e = _YieldEngine(free=1 * GB, reserve=4 * GB, per_block=GB, blocks=0, host=0, per_layer=GB)
+    e._decode_lock = threading.RLock()
+    abort = threading.Event()
+    with machine(e):
+        for _ in range(3):
+            e.ram_policy()
+            e._ram_watch_once(abort)
+        assert e.requests == ["ram-yield"], e.requests
+        assert sum("another program wants memory" in ln for ln in e.lines) == 1, e.lines
+        e.machine["free"] -= GB  # the other program takes a gigabyte more
+        e.ram_policy()
+        e._ram_watch_once(abort)
+        assert e.requests == ["ram-yield"] * 2, "a deeper shortfall was not answered"
+        e.machine["free"] = 20 * GB  # gone: clear again
+        e.ram_policy()
+        assert e.ram_state.spent == 0 and e.requests == ["ram-yield"] * 2
+        e.machine["free"] = 1 * GB  # back: a fresh shortfall is answered
+        e._ram_watch_once(abort)
+        assert e.requests == ["ram-yield"] * 3, e.requests
+
+
+def test_the_adapt_watchers_outlive_an_exception(monkeypatch: MonkeyPatch) -> None:
+    """a read or a yield that raised ended a watcher's thread, and adapt was off for the engine's life, unsaid: each
+    watcher says the error once and keeps watching"""
+    e = _YieldEngine(free=20 * GB, reserve=4 * GB, per_block=GB, blocks=0, host=0, per_layer=GB)
+    e.abort = threading.Event()
+    e.vram_watch = True
+    calls = {"ram": 0, "vram": 0}
+    again = {"ram": threading.Event(), "vram": threading.Event()}
+
+    def once(kind: str) -> Callable[..., Any]:
+        def f(*a: object) -> bool:
+            calls[kind] += 1
+            if calls[kind] <= 2:
+                raise RuntimeError(f"{kind} read failed")
+            again[kind].set()
+            return False
+
+        return f
+
+    e._ram_watch_once = once("ram")  # type: ignore[method-assign]
+    e._vram_watch_once = once("vram")  # type: ignore[method-assign]
+    reg = types.SimpleNamespace(event=0)
+    monkeypatch.setattr(memory_mod, "wddm_budget_event", lambda *a: reg)
+    monkeypatch.setattr(memory_mod, "wddm_budget_unregister", lambda r: None)
+
+    def wait_event(handle: int, timeout_s: float) -> bool:
+        time.sleep(0.01)
+        return False
+
+    monkeypatch.setattr(memory_mod, "wait_event", wait_event)
+    monkeypatch.setattr(device_mod, "_wddm_info", lambda dev: None)
+    monkeypatch.setattr(device_mod, "card_ids", lambda dev: ("card", GB, 0))
+    try:
+        e.watch_ram()
+        e.watch_vram_budget()
+        assert again["ram"].wait(5.0) and again["vram"].wait(5.0), f"a watcher stopped after raising: {calls}"
+    finally:
+        e.abort.set()
+        # ended before the patched OS calls are put back
+        for t in threading.enumerate():
+            if t.name in ("btb-ram-watch", "btb-vram-budget"):
+                t.join(5.0)
+    assert sum("the memory watcher: RuntimeError" in ln for ln in e.lines) == 1, e.lines
+    assert sum("the budget watcher: RuntimeError" in ln for ln in e.lines) == 1, e.lines
+
+
+def test_a_shed_whose_host_copy_is_refused_leaves_the_layer_on_the_card() -> None:
+    """the host's copy is made before the card's leaves: refused, the layer stays resident, never in neither tier"""
+
+    def refuse(i: int) -> Any:
+        raise MemoryGrantError("no room on the host")
+
+    stub = types.SimpleNamespace(
+        aj=None,
+        resident={3: object()},
+        host={},
+        dev=torch.device("cpu"),
+        resident_head=False,
+        _shed=[],
+        log=lambda *a: None,
+        _layer_bytes=lambda i: GB,
+        _card_let_go=lambda: None,
+        _make_host_layer=refuse,
+    )
+    with pytest.raises(MemoryGrantError):
+        _MemoryMixin.vram_shed(cast(Any, stub))
+    assert 3 in stub.resident and not stub.host
+
+
+def test_the_widest_speculative_pass_is_held_to_what_the_family_verifies() -> None:
+    """a tree budget past what the family verifies exactly (Qwen4's card program: 32 rows) is held to it - a wider
+    pass took the torch path, and its pricing raised past the program's widths - and a pass the pricer is handed past
+    them is priced at its own rows"""
+    from btb.engine.cuda import _CudaMixin
+
+    stub = types.SimpleNamespace(v_max=4, tree_budget=40, fam=types.SimpleNamespace(verify_rows=lambda sm: 32))
+    assert _CudaMixin._spec_full(cast(Any, stub)) == 32
+    stub.fam = types.SimpleNamespace(verify_rows=lambda sm: None)
+    assert _CudaMixin._spec_full(cast(Any, stub)) == 41
+    w = types.SimpleNamespace(CARD_T_MAX=32, _card_m=_CudaMixin._card_m)
+    assert _CudaMixin._card_width(cast(Any, w), 3) == 4 and _CudaMixin._card_width(cast(Any, w), 41) == 41
+
+
+def test_one_burst_does_not_price_a_width_out_for_good() -> None:
+    """a width's first pass caught in another program's burst is taken as twice what the curve says of it at most,
+    and a width not run since takes the warm-up's figure again after LIVE_STALE passes: measured once at ten times
+    its cost, it was priced out and never run again. With a store priced, one burst no longer drives the rows'
+    compute exponent to its ceiling"""
+    from btb.engine.spec_cost import SpecCost
+
+    curve = {1: 0.010, 2: 0.011, 4: 0.012, 8: 0.015}
+    pc = SpecCost()
+    pc.price(9, curve, 0.0)
+    pc.record_pass(4, 0.12, 0.0, None)
+    assert pc.curve_now()[4] == pytest.approx(0.024), pc.curve_now()
+    for _ in range(pc.LIVE_STALE + 1):
+        pc.record_pass(1, 0.010, 0.0, None)
+    assert pc.curve_now()[4] == pytest.approx(0.012), pc.curve_now()
+    priced = SpecCost()
+    priced.price(9, curve, 0.001)
+    for _ in range(priced.WARM):
+        priced.record_pass(1, 0.010, 10.0, None)
+    priced.record_pass(2, 0.080, 12.0, None)  # eight steps' time for two rows: a burst
+    assert priced.h < 1.0, f"one burst drove the exponent to {priced.h}"
+
+
+def test_a_card_graph_the_card_had_no_room_for_is_tried_again(monkeypatch: MonkeyPatch) -> None:
+    """an out-of-memory build turned the card graph off until the placement moved - for the engine's life where none
+    did (adapt off, a budget a trim answered, a model wholly on the card). It is tried again after CARD_RETRY_S,
+    doubling with each refusal at one placement; the driver's own out-of-memory errors count as torch's do"""
+    from btb.engine import cuda as cuda_mod
+    from btb.engine.cuda import _CudaMixin
+
+    now = [100.0]
+    # cuda.py's clock alone: frozen for the whole process, every wait on it elsewhere stood still
+    monkeypatch.setattr(cuda_mod, "time", types.SimpleNamespace(monotonic=lambda: now[0]))
+    dev = types.SimpleNamespace(version=3)
+    dev.snapshot = lambda: types.SimpleNamespace(version=dev.version)
+    stub = types.SimpleNamespace(
+        device=dev, CARD_RETRY_S=10.0, CARD_RETRY_MAX_S=300.0, _card_let_go=lambda: None, log=lambda *a: None
+    )
+    e = cast(Any, stub)
+    oom = RuntimeError("CUDA error: out of memory (cudaGraphInstantiate)")
+    assert _CudaMixin._is_card_oom(oom) and _CudaMixin._is_card_oom(torch.OutOfMemoryError("x"))
+    assert not _CudaMixin._is_card_oom(RuntimeError("an index out of range"))
+    _CudaMixin._card_oom(e, oom)
+    assert _CudaMixin._card_off_now(e)
+    now[0] += 11
+    assert not _CudaMixin._card_off_now(e), "not tried again once its retry was due"
+    _CudaMixin._card_oom(e, oom)
+    now[0] += 11
+    assert _CudaMixin._card_off_now(e), "a second refusal at one placement waits twice as long"
+    dev.version += 1
+    assert not _CudaMixin._card_off_now(e), "a placement moved: tried at once"
+
+
+def test_a_let_go_drops_the_step_graphs_embedding_table(monkeypatch: MonkeyPatch) -> None:
+    """the step graph's table - a granted copy, or a tied head's weight - went with nothing: a yield measured with it
+    held shed layers past what the budget asked, and a tied head's shed freed nothing"""
+    from btb.engine.cuda import _CudaMixin
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    st = {"graphs": {}, "layers": {"x": 1}, "table": torch.zeros(4)}
+    stub = types.SimpleNamespace(_cg=st, _cp=None, dev=torch.device("cpu"), _trace_mem=lambda: (0, 0))
+    _CudaMixin._card_let_go(cast(Any, stub))
+    assert "table" not in st and not st["layers"]
+
+
+def test_a_layers_rows_stay_in_ram_when_it_comes_to_the_card_under_kv_host() -> None:
+    """under `kv_host` a layer regrown onto the card leaves its attention rows in RAM (a DeltaNet's states come
+    with it), and its regrowth is priced without them; the card pass's move of the host layers' rows is the plain
+    move (`_rows_to`), refused whole before a row moves"""
+    from btb.engine.tiers import _TiersMixin
+
+    moved: list[Any] = []
+    stub = types.SimpleNamespace(
+        kv_host=True,
+        layer_types=[LayerKind.LINEAR, LayerKind.QWEN_SPARSE, LayerKind.FULL],
+        _rows_to=lambda caches, layers, dev: moved.append(list(layers)),
+        __dict__={},
+    )
+    e = cast(Any, stub)
+    stub._rows_stay = types.MethodType(_TiersMixin._rows_stay, stub)
+    assert _TiersMixin._rows_stay(e, 1, "cuda") and _TiersMixin._rows_stay(e, 2, "cuda")
+    assert not _TiersMixin._rows_stay(e, 0, "cuda") and not _TiersMixin._rows_stay(e, 1, "cpu")
+    _TiersMixin._caches_to(e, 1, "cuda")
+    _TiersMixin._caches_to(e, 0, "cuda")
+    assert moved == [[0]], moved
+
+
+def test_a_float32_chunk_is_not_priced_under_the_chunk_rule() -> None:
+    """the rule's sweep priced a card chunk with neither the mask nor the keys widened to every head; under --fp32
+    (or a head wider than 256) the attention builds both after all, a gigabyte a layer at 32k unpriced"""
+    from btb.engine.forward import _ForwardMixin
+
+    cfg = types.SimpleNamespace(num_attention_heads=8, head_dim=128, hidden_size=1024, _attn_implementation="btb_sdpa")
+    stub = types.SimpleNamespace(
+        cfg=cfg,
+        fam=types.SimpleNamespace(chunk_causal=True),
+        layer_types=[LayerKind.FULL] * 2,
+        dev=torch.device("cuda"),
+        compute_dtype=torch.float32,
+    )
+    assert not _ForwardMixin._chunk_rule(cast(Any, stub), 1)
+    stub.compute_dtype, cfg.head_dim = torch.bfloat16, 512
+    assert not _ForwardMixin._chunk_rule(cast(Any, stub), 1)
+
+
+def test_a_drafting_engines_passes_hold_its_decode_lock() -> None:
+    """a --draft-model engine runs its own adapt watchers, which take a free decode lock for an idle engine: its
+    passes, driven by the proposer, hold the lock as a decode does, so a yield waits for them"""
+    from btb.engine.propose import ModelProposer
+
+    lock = threading.RLock()
+    seen: list[bool] = []
+
+    class Eng:
+        _decode_lock, _mega = lock, None
+        layer_types: list[str] = []
+
+        def new_cache(self) -> Any:
+            return types.SimpleNamespace(layers=[])
+
+        def _prefill(self, ids: Any, cache: Any) -> None:
+            seen.append(lock._is_owned())  # type: ignore[attr-defined]
+
+        def aa(self, parents: Any) -> None:
+            pass
+
+        def ab(self) -> None:
+            pass
+
+        def forward(self, ids: Any, cache: Any = None, last_only: bool = True, **kw: Any) -> torch.Tensor:
+            seen.append(lock._is_owned())  # type: ignore[attr-defined]
+            return torch.zeros(1, len(ids[0]), 8)
+
+    p = ModelProposer(cast(Any, Eng()), [1, 2, 3])
+    p._topk([4], [-1], 2)
+    assert seen == [True, True], seen
+
+
+def test_the_cuda_runtime_to_pin_with_is_found() -> None:
+    """the RAM arena's pinning needs the runtime torch loaded: found beside torch, where the process maps it, or in
+    the nvidia-cuda-runtime package (a Linux wheel keeps it there); with none, the program declines kv_host rather
+    than failing the load"""
+    from btb.engine import hostmem
+
+    if torch.version.cuda is None:
+        pytest.skip("a torch without CUDA")
+    path = hostmem._runtime_path()
+    assert path is not None and "cudart" in os.path.basename(path), path
+    assert hostmem.can_pin()
+
+
+def test_a_budget_event_registered_on_a_lost_adapter_is_stale(monkeypatch: MonkeyPatch) -> None:
+    """after a driver reset the card is found afresh as another adapter: the event registered on the old one
+    signals nothing, and the watcher registers again"""
+    import ctypes
+
+    from btb import sysinfo
+
+    if sys.platform != "win32":
+        pytest.skip("Windows' budget events")
+    key = ("a card", GB, 0)
+    reg = sysinfo.BudgetEvent(0, 0, ctypes.c_void_p(4))
+    monkeypatch.setitem(sysinfo._WDDM, key, (ctypes.c_void_p(4), 0.0))
+    assert not sysinfo.wddm_budget_stale(reg, *key)
+    monkeypatch.setitem(sysinfo._WDDM, key, (ctypes.c_void_p(5), 0.0))
+    assert sysinfo.wddm_budget_stale(reg, *key)
+
+
+def test_a_failed_dxgi_lookup_is_tried_again_after_the_retry_not_every_read(monkeypatch: MonkeyPatch) -> None:
+    """a lookup DXGI raised for was never kept, so it ran again on every read - every pass and every watcher second -
+    each one leaking the factory and adapters it enumerated"""
+    from btb import sysinfo
+
+    n = [0]
+
+    def lookup(*a: object) -> Any:
+        n[0] += 1
+        raise OSError("GetDesc1 failed")
+
+    monkeypatch.setattr(sysinfo, "_wddm_adapter", lookup)
+    key = ("no such card", GB, None)
+    try:
+        for _ in range(3):
+            assert sysinfo._wddm_for("no such card", GB, None) is None
+        assert n[0] == 1, f"looked up {n[0]} times within the retry"
+    finally:
+        sysinfo._WDDM.pop(key, None)
+
+
 def test_vram_policy_is_off_when_it_is_not_watching_or_not_on_a_card() -> None:
     e = _PolicyEngine(watch=False)
     with pressure(512), cuda_stats(free=0):
         e.vram_policy(_batched_cache(1))
     assert e.shed_calls == [] and e.lines == []
     host = _PolicyEngine()
-    host.dev = torch.device("cpu")
+    host.dev = _where("cpu")
     with pressure(512), cuda_stats(free=0):
         host.vram_policy(_batched_cache(1))
     assert host.shed_calls == []
@@ -977,6 +1701,41 @@ def test_grant_warns_past_the_warn_fraction_of_free() -> None:
         assert len(sm.lines) == n, "a small request is granted quietly"
 
 
+def test_a_host_grant_takes_room_back_from_the_expert_store_only_when_the_caller_lets_it(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The expert store grows into whatever RAM the ledger shows free, so a host request made after it has is short.
+    Without `reclaim` the request is refused and the store left alone (a caller mid-call could lose experts it is
+    multiplying); with it the store gives blocks back for the request - asked once, for what the request needs -
+    and the grant goes through. A request that fits never asks."""
+    from btb.engine import scheduler as S
+
+    _sched, err = _grant_api()
+    free = {"now": 64 * MB}
+    monkeypatch.setattr(S, "host_free_bytes", lambda: free["now"])
+
+    class Store:
+        def __init__(self) -> None:
+            self.asked: list[int] = []
+
+        def release(self, want: int = 1) -> int:
+            self.asked.append(int(want))
+            free["now"] += 256 * MB
+            return 1
+
+    sm = SchedulerModel(dev="cpu")
+    store = Store()
+    monkeypatch.setattr(sm, "expert_store", store, raising=False)
+    s = BatchScheduler(sm)
+    with pytest.raises(err):
+        s.grant(128 * MB, "scratch", requester="test", device="cpu")
+    assert store.asked == [], "a grant that may not reclaim leaves the store alone"
+    s.grant(128 * MB, "scratch", requester="test", device="cpu", reclaim=True)
+    assert store.asked == [128 * MB]
+    s.grant(MB, "scratch", requester="test", device="cpu", reclaim=True)
+    assert store.asked == [128 * MB], "a request the room holds asks nothing back"
+
+
 def test_grant_allows_a_plausible_request() -> None:
     _sched, _err = _grant_api()
     s, free = _grant_scheduler()
@@ -996,8 +1755,13 @@ def _store(
     from btb.engine import experts as experts_mod
 
     state = {"free": int(free)}
-    monkeypatch.setattr(experts_mod, "host_free_bytes", lambda: state["free"])
-    sm = stub_engine(mlx=None, fam=Family(kind=FamilyKind.QWEN3), cold_chunk=0, expert_profile=None)
+    sm = stub_engine(
+        mlx=None,
+        fam=Family(kind=FamilyKind.QWEN3),
+        cold_chunk=0,
+        expert_profile=None,
+        device=stub_ledger(lambda: state["free"], reserve),
+    )
     st = experts_mod._ExpertStore(sm, budget_bytes=(1 << 16) * per, reserve_bytes=reserve)
     st.per, st.n_slots = per, 1 << 16
     st.block_max = int(block_max)
@@ -1038,9 +1802,8 @@ def test_store_does_not_thrash_at_the_reserve(monkeypatch: MonkeyPatch) -> None:
         assert st._grow(1) > 0
     grown = st.live()
     # every slot in use, the oldest first
-    for i, s in enumerate(range(grown)):
-        st.lru[(0, i)] = s
-    st.free = []
+    for i in range(grown):
+        seat(st, (0, i))
     st.max_call = 1
     # the machine takes memory: free RAM dips under the reserve
     state["free"] = st.reserve - slot_size(st)
@@ -1066,8 +1829,7 @@ def test_store_release_holds_the_floor_for_the_largest_call(monkeypatch: MonkeyP
         assert st._grow(1) > 0
     n = st.live()
     for i in range(n):
-        st.lru[(0, i)] = i
-    st.free = []
+        seat(st, (0, i))
     st.max_call = n - 1  # freeing any block would leave fewer slots than the largest call served
     state["free"] = st.reserve - slot_size(st)
     assert st.release() == 0, "the store holds rather than fall below what a call needs"
@@ -1191,6 +1953,61 @@ def test_route_merges_adjacent_reads_only_where_the_drive_seeks(monkeypatch: Mon
     assert t is not None and t[0]["off"] == 528 and [q["off"] for q in t[1]] == [536]
 
 
+def test_route_never_merges_a_cached_read_with_a_direct_one(monkeypatch: MonkeyPatch) -> None:
+    """a merged run is read through one handle: reads through the file cache and reads around it (an expert and a
+    cold layer can share a shard) never go as one, while each kind still merges with its own"""
+    reads: list[tuple[str, int, int]] = []
+    s, st = _route(monkeypatch, reads)
+    st["workers"] = [None]
+    st["merge"] = True
+    dst = torch.empty(8, dtype=torch.uint8)
+    s.disk_read("a.st", 0, 8, dst, s.DISK_DEMAND, cached=True)
+    s.disk_read("a.st", 8, 8, dst, s.DISK_DEMAND)
+    t = s._disk_take(st)
+    assert t is not None and t[1] == [], "a cached read and a direct one went as one"
+    assert s._disk_take(st) is not None
+    s.disk_read("a.st", 16, 8, dst, s.DISK_DEMAND, cached=True)
+    s.disk_read("a.st", 24, 8, dst, s.DISK_DEMAND, cached=True)
+    t = s._disk_take(st)
+    assert t is not None and [q["off"] for q in t[1]] == [24], "two adjacent cached reads go as one"
+
+
+def test_route_reads_a_cached_request_through_a_cached_handle(monkeypatch: MonkeyPatch) -> None:
+    """a reader keeps a handle a file and a mode: a read through the file cache on one opened by `open_cached`, a
+    read around it on one opened by `open`, never the one for the other"""
+    from btb.engine import native as native_mod
+
+    reads: list[tuple[str, int, int]] = []
+    s, _st = _route(monkeypatch, reads)
+    opened: list[tuple[str, str]] = []
+    used: list[int] = []
+    ids = iter(range(1, 100))
+
+    def opener(kind: str) -> Callable[[str], int]:
+        def open_(path: str) -> int:
+            opened.append((kind, path))
+            return next(ids)
+
+        return open_
+
+    monkeypatch.setattr(native_mod.Native, "open", staticmethod(opener("direct")))
+    monkeypatch.setattr(native_mod.Native, "open_cached", staticmethod(opener("cached")))
+    monkeypatch.setattr(
+        native_mod.Native, "read_at", staticmethod(lambda h, off, n, dst, chunk, depth: used.append(int(h)))
+    )
+    monkeypatch.setattr(native_mod.Native, "close", staticmethod(lambda h: None))
+    dst = torch.empty(8, dtype=torch.uint8)
+    try:
+        s.disk_read("a.st", 0, 8, dst, s.DISK_DEMAND, cached=True).result(timeout=10)
+        s.disk_read("a.st", 4096, 8, dst, s.DISK_DEMAND).result(timeout=10)
+        s.disk_read("a.st", 8192, 8, dst, s.DISK_DEMAND, cached=True).result(timeout=10)
+    finally:
+        s.disk_close()
+    handle = {kind: i + 1 for i, (kind, _p) in enumerate(opened)}
+    assert sorted(opened) == [("cached", "a.st"), ("direct", "a.st")], opened
+    assert used == [handle["cached"], handle["direct"], handle["cached"]], (used, handle)
+
+
 def test_route_merged_read_lands_each_destination_from_the_union(monkeypatch: MonkeyPatch) -> None:
     reads: list[tuple[str, int, int]] = []
     s, st = _route(monkeypatch, reads)
@@ -1209,7 +2026,7 @@ def test_route_merged_read_lands_each_destination_from_the_union(monkeypatch: Mo
     f3 = s.disk_read("a.st", 76, 8, d3, s.DISK_DEMAND)
     t = s._disk_take(st)
     assert t is not None and len(t[1]) == 2
-    s._disk_serve(st, t, lambda path, off, n, dst, chunk, depth: fake_read(path, off, n, dst, chunk))
+    s._disk_serve(st, t, lambda path, off, n, dst, chunk, depth, cached: fake_read(path, off, n, dst, chunk))
     assert reads == [("a.st", 64, 20)], "one read of the union"
     assert d1.tolist() == list(range(64, 72)) and d2.tolist() == list(range(68, 76))
     assert d3.tolist() == list(range(76, 84))
@@ -1262,6 +2079,8 @@ def test_route_rule_from_the_profile() -> None:
     assert rule(sata) == {"depth": 16, "merge": False, "ahead": 3}
     assert rule({}) == {"depth": 4, "merge": False, "ahead": 2}
     assert rule({"rates": {4: (1.0, 0.0)}}) == {"depth": 4, "merge": False, "ahead": 2}
+    # a profile that stopped short of sixteen readers keeps the deepest it measured
+    assert rule({"rates": {1: (1.0, 0.0), 4: (1.1, 0.0)}}) == {"depth": 4, "merge": False, "ahead": 2}
 
 
 def test_route_queue_keeps_one_reader_for_the_prediction_class_where_the_rule_allows_none(
@@ -1397,6 +2216,137 @@ def test_route_reads_land_with_their_duration_and_callbacks(monkeypatch: MonkeyP
     assert st["workers"] == []
 
 
+def test_route_settles_a_failed_read_and_a_failing_callback_and_keeps_both_callers(monkeypatch: MonkeyPatch) -> None:
+    """the same bytes asked twice while queued are one read that runs both callers' `on_done`; a callback that
+    raises is logged and its read's future still lands; a read that raises settles every future of its merged run
+    - a prediction's pair here - with the error, and the in-flight counts go back to nothing"""
+    reads: list[tuple[str, int, int]] = []
+    s, st = _route(monkeypatch, reads)
+    lines: list[str] = []
+    s.sm.log = lines.append
+    st["workers"] = [None]
+    st["ahead_cap"] = 4
+    dst = torch.empty(8, dtype=torch.uint8)
+    seen: list[str] = []
+    f = s.disk_read("a.st", 0, 8, dst, s.DISK_DEMAND, on_done=lambda d: seen.append("first"))
+    g = s.disk_read("a.st", 0, 8, dst, s.DISK_DEMAND, on_done=lambda d: seen.append("second"))
+    assert f is g and len(st["reqs"]) == 1
+    s._disk_serve(st, s._disk_take(st), lambda *a: None)
+    assert f.result() >= 0 and seen == ["first", "second"]
+
+    def boom(dur: int) -> None:
+        raise ValueError("boom")
+
+    h = s.disk_read("a.st", 4096, 8, dst, s.DISK_DEMAND, on_done=boom)
+    s._disk_serve(st, s._disk_take(st), lambda *a: None)
+    assert h.result() >= 0 and any("a read's on_done raised: ValueError('boom')" in x for x in lines), lines
+    st["merge"] = True
+    a = s.disk_read("a.st", 64, 8, dst, s.DISK_AHEAD, key=(1, 2))
+    b = s.disk_read("a.st", 72, 8, dst, s.DISK_AHEAD, key=(1, 3))
+    t = s._disk_take(st)
+    assert t is not None and [q["off"] for q in t[1]] == [72] and st["inflight_ahead"] == 2
+
+    def gone(*args: object) -> None:
+        raise OSError("the drive went away")
+
+    s._disk_serve(st, t, gone)
+    for fut in (a, b):
+        with pytest.raises(OSError, match="the drive went away"):
+            fut.result()
+    assert st["inflight"] == st["inflight_ahead"] == st["inflight_demand"] == 0 and not st["reqs"]
+
+
+def test_route_pulse_reads_the_drives_busy_time_and_profiles_its_turns(tmp_path: Path) -> None:
+    """the live rate: reads that took no time rate nothing; the last reads' bytes over their busy time under half
+    the probe's rate is a slowed drive and above four fifths a recovered one, each turn logged and profiled"""
+    from btb.engine.experts import ExpertProfile
+
+    s = BatchScheduler(stub_engine())
+    lines: list[str] = []
+    s.sm.log = lines.append
+    prof = s.sm.expert_profile = ExpertProfile(str(tmp_path / "p.npz"))
+    st = s._disk_state()
+    st["live"] = [(t, t, MB) for t in range(32)]
+    assert s._disk_pulse(st) is None, "no busy time, no rate"
+    st["expect_gbs"] = 10.0
+    for busy_ns, what, aux in ((500_000, "slowed", 1), (100_000, "recovered", 0)):
+        st["live"] = [(i * 1_000_000, i * 1_000_000 + busy_ns, MB) for i in range(32)]
+        turn = s._disk_pulse(st)
+        assert turn is not None and turn[0] == what and turn[1] == pytest.approx(MB / busy_ns)
+        s._disk_turned(st, turn)
+        assert f"the drive {what}" in lines[-1] and (("predictions withheld" in lines[-1]) == (what == "slowed"))
+        row = prof.a[prof.n - 1]
+        assert int(row[2]) == prof.DRIVE and int(row[10]) == aux and int(row[8]) == int(turn[1] * 1e9)
+    assert s._disk_pulse(st) is None, "no turn while the rate holds"
+
+
+def test_route_depth_forced_and_a_reader_that_outlives_the_close(monkeypatch: MonkeyPatch) -> None:
+    """`BTB_ROUTE_DEPTH` forces the readers in flight over the probe's rule, the predictions capped at half of them;
+    a reader still in a read when the queue closes is said so and kept, and the queue stays stopped for it"""
+    reads: list[tuple[str, int, int]] = []
+    s, st = _route(monkeypatch, reads)
+    lines: list[str] = []
+    s.sm.log = lines.append
+    nvme = {
+        "measured": True,
+        "fixed_ms": 0.15,
+        "single_ms": 1.3,
+        "single_gbs": 4.8,
+        "copy_ms": 0.4,
+        "reps": 3,
+        "rates": {1: (4.8, 0.1), 4: (5.6, 0.1), 16: (6.2, 0.3)},
+        "seq_gbs": 6.0,
+        "big_mb": 6.25,
+        "cost_s": 1.0,
+    }
+    monkeypatch.setattr(BatchScheduler, "measure_drive", staticmethod(lambda path, clock=None: dict(nvme)))
+    monkeypatch.setattr(s, "_volume", lambda path: "Y:")
+    monkeypatch.setenv("BTB_ROUTE_DEPTH", "2")
+    p = s.disk("y.st")
+    assert p["depth"] == 2 and p["ahead"] == 1 and st["depth"] == 2, p
+    assert any("2 in flight (forced)" in x for x in lines), lines
+
+    class Stuck:
+        """a reader deep in a read: the join's timeout passes and it is still there"""
+
+        def join(self, timeout: float | None = None) -> None:
+            return None
+
+        def is_alive(self) -> bool:
+            return True
+
+    stuck = Stuck()
+    st["workers"] = [stuck]
+    s.disk_close()
+    assert any("1 reader(s) still in a read at close" in x for x in lines)
+    assert st["workers"] == [stuck] and st["stop"]
+    st["workers"], st["stop"] = [], False
+
+
+def test_the_schedulers_small_arithmetic() -> None:
+    """a size at the unit that shows it; a card's recovery pauses doubling with a streak, capped, and a streak
+    forgotten after a clean stretch; the drive file the probe reads is the largest weight file that is there"""
+    import time as _time
+
+    from btb.engine.scheduler import _size
+
+    assert (_size(1000), _size(3 * MB), _size(5 * GB)) == ("1.0 KiB", "3.00 MiB", "5.00 GiB")
+    s = BatchScheduler(stub_engine())
+    assert [s.gpu_recovered() for _ in range(6)] == pytest.approx([0.1, 0.2, 0.4, 0.8, 1.6, 2.0])
+    s._gpu_cool_until = _time.monotonic() - 6.0
+    assert s.gpu_recovered() == pytest.approx(0.1), "a clean stretch clears the streak"
+
+
+def test_the_probe_reads_the_largest_weight_file_there_is(tmp_path: Path) -> None:
+    """`_drive_file`: the largest of the model's weight files on disk, a file the map names but the disk lacks
+    passed over; nothing for a probe with no files"""
+    (tmp_path / "a.st").write_bytes(b"x" * 10)
+    (tmp_path / "c.st").write_bytes(b"x" * 20)
+    probe = types.SimpleNamespace(dir=str(tmp_path), weight_map={"a": "a.st", "b": "gone.st", "c": "c.st"})
+    assert BatchScheduler._drive_file(probe) == os.path.join(str(tmp_path), "c.st")
+    assert BatchScheduler._drive_file(types.SimpleNamespace(dir="", weight_map={})) is None
+
+
 # -- the Timetable: the next layers' picks read ahead into the ring, promoted on use, withdrawn when lapsed --
 
 
@@ -1454,6 +2404,34 @@ def test_profile_watch_sees_a_thread_holding_the_gil_and_names_it(tmp_path: Path
     assert sorted(q.name for q in tmp_path.iterdir()) == ["p.npz"], "nothing beside the trace"
 
 
+def test_profile_keeps_each_calls_picks_and_saves_them(tmp_path: Path) -> None:
+    """a call's picks copied row by row into the profile's own array, the offset of its first row returned (the
+    `call` event's offset); the array doubles past its rows and widens once for a call of more picks, a narrower
+    call's rows -1 past its k; and `save` writes them beside the events"""
+    import numpy as np
+
+    from btb.engine.experts import ExpertProfile
+
+    prof = ExpertProfile(str(tmp_path / "p.npz"))
+    a = torch.randint(0, 128, (5, 8))
+    offs = [prof.keep_picks(a)]
+    cap = prof.p.shape[0]
+    b = torch.randint(0, 128, (cap, 10), dtype=torch.int32)  # past the rows, and wider: one growth covers both
+    offs.append(prof.keep_picks(b))
+    c = torch.randint(0, 128, (3, 8))
+    offs.append(prof.keep_picks(c))
+    assert offs == [0, 5, 5 + cap] and prof.m == 8 + cap and prof.p.shape == (2 * cap, 10)
+    prof.add(prof.CALL, 3, expert=3, offset=offs[2])
+    prof.save()
+    z = np.load(tmp_path / "p.npz")
+    picks, (call,) = z["picks"], z["events"]
+    assert picks.shape == (8 + cap, 10) and picks.dtype == np.int16
+    assert (picks[:5, :8] == a.numpy()).all() and (picks[:5, 8:] == -1).all()
+    assert (picks[5 : 5 + cap] == b.numpy()).all()
+    off, rows = int(call[7]), int(call[4])
+    assert (picks[off : off + rows, :8] == c.numpy()).all() and (picks[off : off + rows, 8:] == -1).all()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 def test_store_pins_its_blocks_on_a_page_boundary_beside_a_card(monkeypatch: MonkeyPatch) -> None:
     st, _state = _store(monkeypatch, free=64 * GB)
@@ -1480,8 +2458,7 @@ def test_lookahead_reads_the_next_layers_top_picks_that_are_not_resident(monkeyp
     h = torch.ones(1, 4)
     # expert 7 of layer 1 is resident already: it is not read again
     st._grow(1)
-    s = st.free.pop()
-    st.lru[(1, 7)] = s
+    seat(st, (1, 7))
     n = st.lookahead(0, h)
     assert n == 2, "layer 1's top-2 less the resident one, and layer 2's top-1"
     keys = [r["key"] for r in route.reads]
@@ -1535,7 +2512,186 @@ def test_ring_wraps_over_landed_predictions_and_holds_at_in_flight_ones(monkeypa
     assert len(st.ring) == 2
 
 
-# -- the Bus Pass: day riders, regulars and the ghosts that move the split --
+def test_a_store_below_a_calls_experts_serves_it_in_waves(monkeypatch: MonkeyPatch) -> None:
+    """a store held below one call's experts (the machine's commit can hold it near a layer's, and a long prompt's
+    call asks for all of one) serves the call in turn - the longest prefix it can seat, then the rest once those
+    are done with - instead of refusing it; every expert once, in ascending order, never more seats than it has"""
+    route = FakeRoute()
+    st, _sm = expert_store(monkeypatch, route, n_layers=2, n_experts=8)
+    assert st.per is not None
+    st.block_max = 3 * st.per
+    st._grow(3)
+    st.n_slots = st.live()  # three seats, no growth
+    assert st.live() == 3
+    ids = list(range(8))
+    served: list[int] = []
+    call = st.call(0, "layers.0.mlp.experts.", ids, rows=4)
+    while not call.done:
+        rest = list(call.rest)
+        ready, pending = call.wave()
+        wave = sorted([*ready, *(e for e, _f, _s in pending)])
+        assert wave == rest[: len(wave)] and wave, f"a wave is a prefix of what is left: {wave} of {rest}"
+        assert len({s for _e, _f, s in pending} | set(st.last_slots.values())) <= 3
+        for e in wave:
+            route.land((0, e))  # the wave's reads in; the call multiplies it and asks for the rest
+        served += wave
+    assert served == ids, "every expert once, in ascending order"
+
+
+def test_a_cold_store_on_a_tight_machine_serves_a_call_in_waves(monkeypatch: MonkeyPatch) -> None:
+    """a store that has grown nothing yet, on a machine with room for a few slots, serves a long prompt's call in
+    waves of what it can seat. Its first wave was sized to what the room holds without the two slots' slack a
+    growth keeps, the growth for the whole wave failed, and the call was refused with the room for most of it
+    free: a 120B's cold 4096-token prefill died at its first layer"""
+    route = FakeRoute()
+    st, _sm = expert_store(monkeypatch, route, n_layers=2, n_experts=16)
+    per = st.per
+    assert per is not None
+    room = 5  # slots the machine holds above the margin, the store's own included
+    monkeypatch.setattr(st, "_host_free", lambda: st.margin + (room - st.live()) * per)
+    assert st.live() == 0
+    ids = list(range(14))
+    served: list[int] = []
+    call = st.call(0, "layers.0.mlp.experts.", ids, rows=4096)
+    while not call.done:
+        rest = list(call.rest)
+        ready, pending = call.wave()
+        wave = sorted([*ready, *(e for e, _f, _s in pending)])
+        assert wave == rest[: len(wave)] and wave, f"a wave is a prefix of what is left: {wave} of {rest}"
+        assert st.live() <= room
+        for e in wave:
+            route.land((0, e))
+        served += wave
+    assert served == ids, "every expert once, in ascending order"
+
+
+def test_residents_whose_block_goes_back_are_read_again_in_the_calls_order(monkeypatch: MonkeyPatch) -> None:
+    """a release at a wave's start takes back the block the call's residents sit in: they are misses of that wave,
+    read again where they fall in the call's order, and the wave is the prefix before the first expert without a
+    seat. (A release once ran inside the call, after its hits were handed out: re-read and appended after the
+    misses, they were left unseated before the cut, or seated after misses the cut dropped, which stayed in the
+    line with no read behind them.) Every expert of every wave is read, none taken for resident"""
+    route = FakeRoute()
+    st, _sm = expert_store(monkeypatch, route, n_layers=2, n_experts=8)
+    base = "layers.0.mlp.experts."
+    assert st.per is not None
+    st.block_max = 2 * st.per
+    for _ in range(3):
+        st._grow(2)
+    st.n_slots = st.live()  # six seats
+    _ready, pending = st.get(0, base, [0, 1], rows=1)  # 0 and 1 resident, together in one block
+    for e, _f, _s in pending:
+        route.land((0, e))
+    route.reads.clear()
+    monkeypatch.setattr(st, "_grow", lambda need: 0)  # nothing grows back: the call has the seats left
+    real, calls = st.release, [0]
+
+    def release(want: int = 1) -> Any:
+        calls[0] += 1
+        if calls[0] == 1:  # the first wave's start: the block 0 and 1 sit in goes back
+            st._release_block(st.slots[dict(st.res.items())[(0, 0)]].block)
+            return 0
+        return real(want)
+
+    monkeypatch.setattr(st, "release", release)
+    ids = list(range(8))
+    served: list[int] = []
+    call = st.call(0, base, ids, rows=64)
+    while not call.done:
+        rest = list(call.rest)
+        ready, pending = call.wave()
+        wave = sorted([*ready, *(e for e, _f, _s in pending)])
+        assert wave == rest[: len(wave)] and wave, f"a wave is a prefix of what is left: {wave} of {rest}"
+        read = {r["key"][1] for r in route.reads if r["key"][0] == 0}
+        assert all(e in read for e in wave), f"every expert of the wave read, none taken for resident: {wave}"
+        for e in wave:
+            route.land((0, e))
+        route.reads.clear()
+        served += wave
+    assert served == ids, "every expert once, in ascending order"
+
+
+def test_closing_a_store_lets_every_block_go(monkeypatch: MonkeyPatch) -> None:
+    """`close` gives the store's blocks back whole - residents, free seats and the lookahead's ring alike - once
+    every read into them has landed; the store holds no slot afterwards"""
+    route = FakeRoute()
+    st, _sm = expert_store(monkeypatch, route, n_layers=2, n_experts=8)
+    assert st.per is not None
+    st.block_max = 3 * st.per
+    st._grow(3)
+    st._grow(3)
+    _ready, pending = st.get(0, "layers.0.mlp.experts.", [0, 1, 2], rows=1)
+    for e, _f, _s in pending:
+        route.land((0, e))
+    bufs = [weakref.ref(buf) for buf, _ids in st.blocks.values()]
+    assert len(bufs) == 2
+    st.close()
+    assert st.live() == 0 and not st.res and not st.slots and not st.free
+    assert all(b() is None for b in bufs), "a closed store's block is still held"
+
+
+def test_a_prediction_with_a_part_in_flight_is_never_withdrawn_in_part(monkeypatch: MonkeyPatch) -> None:
+    """an expert is read as several parts: a prediction that lapses with one of them already in flight is left to
+    land whole - no part withdrawn - and a later call that asks for it waits for every part. Withdrawn in part, the
+    slot was a mix of two experts that read as landed: a 120B's routing collapsed on it"""
+    st, route, _sm = _store_with_routers(monkeypatch, lookahead=(2, 0))
+    h = torch.ones(1, 4)
+    assert st.lookahead(0, h) == 2  # (1, 7) and (1, 6), two reads each
+    route.land((1, 7))
+    route.start((1, 6), parts=1)  # a reader has taken its first part; the second is still queued
+    st.get(1, "layers.1.mlp.experts.", [7, 3])  # layer 1 asks for 7 and 3: 6 lapses
+    six = [r["future"] for r in route.reads if r["key"] == (1, 6)]
+    assert not any(f.cancelled() for f in six), "a part of an expert in flight was withdrawn"
+    assert (1, 6) in st.ahead, "its record stays until it lands"
+    ready, pending = st.get(1, "layers.1.mlp.experts.", [6])
+    assert 6 not in ready and [e for e, _f, _s in pending] == [6], "asked for, it is waited for: every part"
+    route.land((1, 6))
+    assert all(f.done() and not f.cancelled() for f in six)
+
+
+def test_the_lookahead_gives_a_call_no_slot_still_being_written(monkeypatch: MonkeyPatch) -> None:
+    """a call with no seat left takes a prediction's slot back only whole: one with a part in flight keeps its
+    slot (and every part), and the call takes the next"""
+    st, route, _sm = _store_with_routers(monkeypatch, lookahead=(2, 0), ring_n=2)
+    assert st.lookahead(0, torch.ones(1, 4)) == 2  # (1, 7), (1, 6) in the ring
+    route.start((1, 7), parts=1)
+    s7 = st.ahead[(1, 7)]
+    got = st._ring_take()
+    assert got is not None and got != s7, "the slot being written was given away"
+    assert (1, 7) in st.ahead and not any(
+        f.cancelled() for r in route.reads if r["key"] == (1, 7) for f in [r["future"]]
+    )
+
+
+def test_an_experts_reads_are_settled_before_its_slot_goes_back() -> None:
+    """withdrawing a prediction cancels its queued parts; a part in flight still writes into the slot, so the slot
+    is given back once that one has finished too - not at the first cancelled part"""
+    from btb.engine.experts import Parts
+
+    queued: Future[float] = Future()
+    flying: Future[float] = Future()
+    queued.cancel()
+    threading.Timer(0.05, lambda: flying.set_result(1.0)).start()
+    Parts([queued, flying]).settle()
+    assert flying.done()
+
+
+def test_a_call_with_no_seat_left_takes_one_back_from_the_lookahead(monkeypatch: MonkeyPatch) -> None:
+    """a store that cannot grow (the host's commit ran out long before its ceiling) and whose every seat is the
+    call's own: the call takes the lookahead's slots back, landed predictions and queued ones alike, instead of
+    failing - the call before a guess"""
+    st, route, _sm = _store_with_routers(monkeypatch, lookahead=(2, 0), ring_n=2)
+    assert st.per is not None
+    st.block_max = 2 * st.per  # a store of two seats, grown by the lookahead: every one the ring's
+    h = torch.ones(1, 4)
+    assert st.lookahead(0, h) == 2  # layer 1's (1, 7) and (1, 6) in the ring
+    route.land((1, 7))  # one landed; (1, 6) still queued
+    st.n_slots = st.live()  # no growth past the seats it has
+    assert not st.free and len(st.ring) == st.live() == 2
+    ready, pending = st.get(2, "layers.2.mlp.experts.", [0, 1])
+    assert sorted(e for e, _f, _s in pending) == [0, 1], "both of the call's experts have a seat"
+    assert not st.ring and st.ahead == {} and st.stat["ahead_dropped"] == 2
+    assert (1, 6) in route.dropped, "the queued prediction's reads were withdrawn, not left to land in a used slot"
 
 
 def test_riders_store_line_bumps_the_oldest_and_a_ride_renews() -> None:
@@ -1651,7 +2807,7 @@ def test_padded_slots_read_the_aligned_span_straight_in_and_the_views_find_the_b
     st._sizes_of = {"gu.st": GB, "dn.st": GB}
     monkeypatch.setattr(st, "_recipe", lambda layer, base: parts)
     assert st._grow(1) > 0
-    s = st.free.pop()
+    s = seat(st, (0, 1))
     st._submit(route, parts, 1, s, 0, route.DISK_DEMAND)
     r0, r1 = route.reads[-2], route.reads[-1]
     for r in (r0, r1):
@@ -1659,7 +2815,7 @@ def test_padded_slots_read_the_aligned_span_straight_in_and_the_views_find_the_b
         assert r["dst"].data_ptr() % 4096 == 0, "and lands on a sector of the slot"
     # the file offset of expert 1's gate_up is 1000 + per // 2: its delta is that modulo 4096
     delta0 = (1000 + per // 2) % 4096
-    assert r0["off"] == 1000 + per // 2 - delta0 and st.slot_delta[s][0] == delta0
+    assert r0["off"] == 1000 + per // 2 - delta0 and st.slots[s].delta[0] == delta0
     assert r0["n"] >= per // 2 and r0["n"] - per // 2 < 8192
     # the bytes the drive would write: a pattern at the expert's place inside the span
     r0["dst"].fill_(0)
@@ -1683,8 +2839,7 @@ def test_vram_seats_hold_the_most_ridden_experts_and_serve_them_from_the_card(mo
     per = slot_size(st)
     st.vram = VramSeats(2, per, st.shapes, torch.device("cuda"), min_rides=3, per_pass=1)
     assert st._grow(1) > 0
-    s = st.free.pop()
-    st.res.admit((0, 5), s)
+    s = seat(st, (0, 5))
     st._region(s).fill_(7)
     for _ in range(2):
         ready, _pending = st.get(0, "layers.0.mlp.experts.", [5])
@@ -1694,13 +2849,7 @@ def test_vram_seats_hold_the_most_ridden_experts_and_serve_them_from_the_card(mo
     assert ready[5][0].device.type == "cpu", "the ride that earned it is still served from RAM"
     # a second rider, a third, at layer 1: one promotion a pass (a pass turns at layer 0), the seats by last ride
     for e in (6, 7):
-        if st.free:
-            s2 = st.free.pop()
-        else:
-            victim = st.res.victim()
-            assert victim is not None
-            s2 = victim[1]
-        st.res.admit((1, e), s2)
+        seat(st, (1, e))  # through the store's own transitions: its slot table checks after every wave
         st.rides[(1, e)] = 5
     st.get(1, "layers.1.mlp.experts.", [6])
     assert (1, 6) not in st.vram, "the pass's one promotion was spent on 5"
@@ -1718,7 +2867,8 @@ def test_vram_seats_hold_the_most_ridden_experts_and_serve_them_from_the_card(mo
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 def test_a_seated_expert_serves_a_multi_row_call_from_the_card(monkeypatch: MonkeyPatch) -> None:
     """the prefill's path (several rows, the host kernel) met a seated expert's card views and handed the host
-    kernel a card pointer; the rows of a seated expert go to the card and come back with the same answer"""
+    kernel a card pointer; the rows of a seated expert go to the card and come back with the same answer - the same
+    bits, where the card has btb's kernels: the host's gemv on the card (`gemv_lane16`), the activation on the host"""
     from btb.engine.experts import VramSeats
     from btb.engine.host import _Experts
 
@@ -1730,8 +2880,7 @@ def test_a_seated_expert_serves_a_multi_row_call_from_the_card(monkeypatch: Monk
     assert st._grow(2) > 0
     torch.manual_seed(3)
     for e in (5, 6):
-        s = st.free.pop()
-        st.res.admit((0, e), s)
+        s = seat(st, (0, e))
         st._region(s).view(torch.bfloat16).copy_((torch.randn(st.per // 2) * 0.2).bfloat16())
     st.vram = VramSeats(2, st.per, st.shapes, torch.device("cuda"), min_rides=1, per_pass=4)
     sm.expert_store = st
@@ -1745,6 +2894,10 @@ def test_a_seated_expert_serves_a_multi_row_call_from_the_card(monkeypatch: Monk
     assert (0, 5) in st.vram and (0, 6) in st.vram, "the first ride earned the seats"
     y1 = mod(x, top, w)
     assert y1.shape == x.shape
+    from btb.engine.native import Native
+
+    if Native.card_kernels() is not None:
+        assert torch.equal(y1, y0), "a seated expert's rows part from its rows off the card"
     torch.testing.assert_close(y1.float().cpu(), y0.float().cpu(), rtol=2e-2, atol=2e-2)
 
 
@@ -1775,6 +2928,76 @@ def test_grant_keeps_a_ledger_of_what_it_gave() -> None:
         with pytest.raises(MemoryGrantError):
             e.scheduler.grant(9 * GB, "kv", device="cuda")
     assert e.scheduler.granted == {"kv@cuda": GB + GB // 2, "table@cuda": GB // 4}
+
+
+def test_the_card_reading_is_nvmls_own_for_the_card_at_this_pci_address(monkeypatch: MonkeyPatch) -> None:
+    """NVML read in the process, every reading fresh, for the card at CUDA's card's PCI address: NVML numbers the
+    cards in its own order, so under CUDA_VISIBLE_DEVICES=1 CUDA's card 0 is NVML's 1 - by index the free memory read
+    was another card's"""
+    reads = iter([4 * GB, 3 * GB])
+    asked: list[str] = []
+
+    def nvml(bus_id: str) -> int:
+        asked.append(bus_id)
+        return next(reads)
+
+    monkeypatch.setattr(device_mod, "nvml_free_bytes", nvml)
+    props = types.SimpleNamespace(pci_domain_id=0, pci_bus_id=0x2B, pci_device_id=0)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda dev=None: props)
+    dev = torch.device("cuda", 0)
+    assert device_mod._physical_free_bytes(dev) == 4 * GB
+    assert device_mod._physical_free_bytes(dev) == 3 * GB, "a second reading is NVML's own, not the first one cached"
+    assert asked == ["00000000:2B:00.0"] * 2, asked
+
+
+def test_a_reservation_allocated_out_of_piecemeal_holds_only_what_is_not_in_use() -> None:
+    """a pass's working set is allocated by its own ops, which the ledger never sees one by one: its reservation,
+    given a measure of what is live, holds only the rest - the device's free reading counts the live part already,
+    and counting it twice once refused a cache's growth mid-chunk the room the card had"""
+    e = _StubEngine()
+    e.device = Device(e)  # the stub's ledger
+    live = [0]
+    with cuda_stats(free=8 * GB):
+        e.device.reserve("pass", 4 * GB, "cuda", used=lambda: live[0])
+        assert e.device.reserved("cuda") == 4 * GB
+        live[0] = GB  # a GB of its activations allocated: the free reading has them, the reservation the other 3
+        assert e.device.reserved("cuda") == 3 * GB and e.device.spoken_for("cuda") == {"pass": 3 * GB}
+        live[0] = 5 * GB  # past what it reserved: it holds nothing, never less
+        assert e.device.reserved("cuda") == 0 and e.device.spoken_for("cuda") == {}
+        live[0] = -GB  # less than at its start: all of it, never more
+        assert e.device.reserved("cuda") == 4 * GB
+        e.device.reserve("pass", 4 * GB, "cuda")  # reserved again with no measure: whole, whatever is live
+        live[0] = GB
+        assert e.device.reserved("cuda") == 4 * GB
+        e.device.reserve("pass", 4 * GB, "cuda", used=lambda: live[0])
+        e.device.release("pass")
+        assert e.device.reserved("cuda") == 0 and not e.device._uses, "a released tag's measure goes with it"
+
+
+def test_a_grant_draws_on_the_reservation_it_names() -> None:
+    """a reservation is room nothing else may take, and the allocation it was made for draws on it: its room the
+    caller's own, and what the allocation adds spent from it, so the memory is counted once. A `kv` grant draws on
+    the epoch's KV unless it names another, `""` on none (a copy of rows the epoch counted already); one tag holds
+    room on the card and the host at once, and lets both go together"""
+    from btb.engine.scheduler import EPOCH, MemoryGrantError
+
+    e = _StubEngine()
+    e.device = Device(e)  # the stub's ledger, the one the grant reads
+    with cuda_stats(free=8 * GB):
+        e.device.reserve("sweep", 6 * GB, "cuda")
+        e.device.reserve("sweep", GB, "cpu")
+        assert e.device.reserved("cuda") == 6 * GB and e.device.reserved("cpu") == GB
+        with pytest.raises(MemoryGrantError, match=r"spoken for there: sweep 6.00 GiB"):
+            e.scheduler.grant(3 * GB, "table", device="cuda")  # 2 GB free past the sweep's room, named in the refusal
+        e.scheduler.grant(3 * GB, "work", device="cuda", draws="sweep")
+        assert e.device.reserved("cuda") == 3 * GB, "what it adds comes off the room it drew on"
+        e.device.reserve(EPOCH, 4 * GB, "cuda")
+        with pytest.raises(MemoryGrantError):
+            e.scheduler.grant(3 * GB, "kv", device="cuda", draws="")  # 8 less the sweep's 3 and the epoch's 4
+        e.scheduler.grant(3 * GB, "kv", device="cuda", held=GB)  # the epoch's own: 2 GB added, spent from it
+        assert e.device.reserved("cuda", but="sweep") == 2 * GB
+        e.device.release("sweep")
+        assert e.device.reserved("cpu") == 0 and e.device.reserved("cuda") == 2 * GB
 
 
 def test_the_cold_ring_survives_a_pass_of_the_same_order() -> None:
@@ -2137,7 +3360,7 @@ class _RamEngine(_MemoryMixin):
         self.mlx = None
         self.ram_watch = True
         self.ram_state = RamPolicyState(period=0.0)
-        self.host = {0: None, 1: None, 2: None}
+        self.host = {i: torch.nn.Module() for i in range(3)}
         self.cold = set()
         self._packed = None
         self.device = _RamDevice(free=free)
@@ -2344,6 +3567,20 @@ def test_free_bytes_adds_this_processs_own_reclaimable_pool_over_the_physical_fr
         assert device_mod.free_bytes(torch.device("cuda:0")) == 5 * GB + 2 * GB
 
 
+def test_free_bytes_holds_the_card_to_what_the_wddm_budget_leaves_this_process() -> None:
+    # a game in the foreground: the physical free still reads 5 GB, but Windows keeps only 1 GB more of this
+    # process resident before paging (it, or the game) out - the budget's room, this process's own reusable pool on
+    # top (the budget's usage counts it whole)
+    with cuda_stats(free=10 * GB, reserved=3 * GB, allocated=1 * GB, physical=5 * GB, budget=1 * GB):
+        assert device_mod.free_bytes(torch.device("cuda:0")) == 1 * GB + 2 * GB
+    # past its budget already: nothing more, but what it holds unused it can still reuse
+    with cuda_stats(free=10 * GB, reserved=3 * GB, allocated=1 * GB, physical=5 * GB, budget=-2 * GB):
+        assert device_mod.free_bytes(torch.device("cuda:0")) == 2 * GB
+    # a budget with more room than the card has free: the physical free stands
+    with cuda_stats(free=10 * GB, physical=5 * GB, budget=9 * GB):
+        assert device_mod.free_bytes(torch.device("cuda:0")) == 5 * GB
+
+
 def test_free_bytes_falls_back_to_mem_get_info_when_the_physical_free_is_unreadable() -> None:
     with cuda_stats(free=4 * GB, physical=None):  # no nvidia-smi / not NVIDIA: keep the per-process reading
         assert device_mod.free_bytes(torch.device("cuda:0")) == 4 * GB
@@ -2364,6 +3601,27 @@ def test_a_foreign_model_on_mlx_is_priced_against_the_ram_the_gpu_shares() -> No
     assert sched.kv_row_bytes(64) > 0
 
 
+def test_a_foreign_model_on_the_host_is_priced_in_its_own_dtype_and_prices_no_card() -> None:
+    """`for_model` over a torch module on the CPU: its compute dtype is its parameters', no card margin; asked for
+    room on a card it has none to price, so the request is not refused; the memory hierarchy is the host's alone
+    (the card's levels 0) and read once, and nothing is pinned in a card's L2"""
+
+    class Tiny(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = model_config(num_hidden_layers=2, vocab_size=1000)
+            self.w = torch.nn.Parameter(torch.zeros(2, dtype=torch.float16))
+
+    sched = BatchScheduler.for_model(Tiny(), device="cpu")
+    assert sched.sm.compute_dtype == torch.float16 and sched.sm.vram_margin == 0
+    assert sched.free_for("cuda") is None
+    sched.grant(GB, "kv", requester="a row", device="cuda")
+    assert sched.granted == {}, "a request nothing here can price is let through, not counted"
+    cs = sched.caches()
+    assert cs["gpu_l2"] == cs["gpu_l2_persist"] == cs["gpu_l2_window"] == 0 and sched.caches() is cs
+    assert sched.pin_bytes(MB) == 0
+
+
 def test_a_foreign_model_on_a_device_btb_cannot_run_is_an_option_error() -> None:
     """a name that is no device, or a card this machine lacks, is refused as `btb.load` refuses it - naming the
     device and what runs here - never a torch error from inside the pricing"""
@@ -2375,3 +3633,366 @@ def test_a_foreign_model_on_a_device_btb_cannot_run_is_an_option_error() -> None
     if not torch.cuda.is_available():
         with pytest.raises(BadDevice, match="runs here"):
             BatchScheduler.for_model(cfg, device="cuda")
+
+
+def test_the_store_knows_an_experts_form_before_reading_one(monkeypatch: MonkeyPatch) -> None:
+    """a prefill's depot opens before the sweep's first call, at the form of the experts the store will read: the
+    store gives it off its layout alone, the same shapes and dtypes a read expert's views have"""
+    from btb.engine.host import stored_parts
+
+    st, _sm = expert_store(monkeypatch, object(), n_layers=2, n_experts=4)
+    form = st.form()
+    assert form is not None
+    st._grow(1)
+    s = st.free.pop()
+    read = stored_parts(*st._views(s))
+    assert read is not None and form == tuple((p.shape, p.dtype) for p in read)
+
+
+# --- the store's rarer transitions ----------------------------------------------------------------------------
+
+
+def test_the_lines_demote_pop_and_name_their_oldest_seat() -> None:
+    """either residency policy: a demoted rider is the next to go, a popped one leaves no trace, `oldest_slot` is
+    the next victim's slot (None on an empty line), `items` every seat; a line whose every seat is the call's own
+    bumps nobody. A regular demoted goes before the other regulars."""
+    from btb.engine.experts import BusPass, Riders
+
+    for cls in (Riders, BusPass):
+        line = cls(lambda: 8)
+        assert line.oldest_slot() is None, cls.__name__
+        for key, s in (("a", 0), ("b", 1), ("c", 2)):
+            line.admit(key, s)
+        line.demote("c")
+        line.demote("nobody")  # not seated: nothing moves
+        assert line.oldest_slot() == 2, cls.__name__
+        assert dict(line.items()) == {"a": 0, "b": 1, "c": 2}, cls.__name__
+        assert line.pop("b") == 1 and "b" not in line and line.pop("b") is None, cls.__name__
+        assert line.victim(skip={0, 2}) is None, f"{cls.__name__}: every seat the call's own, yet one was bumped"
+        assert line.victim() == ("c", 2), cls.__name__
+    bp = BusPass(lambda: 8)
+    for key, s in (("x", 5), ("y", 6)):
+        bp.admit(key, s)
+        assert bp.get(key) == s  # a second ride: a regular
+    bp.demote("y")
+    assert bp.oldest_slot() == 6 and bp.victim() == ("y", 6), "the demoted regular goes first"
+
+
+def test_the_slot_tables_check_names_each_broken_invariant(monkeypatch: MonkeyPatch) -> None:
+    """`check` over a store holding seats on the line, predictions in the ring and free slots: each invariant
+    broken on its own is refused by name, and the table put back passes again"""
+    from btb.engine.experts import SlotState
+
+    st, route, _sm = _store_with_routers(monkeypatch, lookahead=(2, 0))
+    assert st.lookahead(0, torch.ones(1, 4)) == 2  # (1, 7) and (1, 6) predicted
+    _ready, pending = st.get(0, "layers.0.mlp.experts.", [0, 1])
+    for e, _f, _s in pending:
+        route.land((0, e))
+    st.check()
+    seat0, seat1 = st.ahead[(1, 7)], dict(st.res.items())[(0, 0)]
+    free = st.free[0]
+
+    def refused(match: str) -> None:
+        with pytest.raises(AssertionError, match=match):
+            st.check()
+
+    rec = st.slots.pop(free)
+    refused(r"slots recorded \[\d+\] differ from the blocks' live ones")
+    st.slots[free] = rec
+    st.free.append(free)
+    refused("a slot twice in the free list")
+    st.free.pop()
+    rec.state = SlotState.RESIDENT
+    refused(f"slot {free} is resident but free")
+    rec.state = SlotState.FREE
+    st.ring[free] = None
+    refused(f"slot {free} is free but in the ring")
+    del st.ring[free]
+    st.ahead[(1, 6)], was = seat1, st.ahead[(1, 6)]
+    refused(r"prediction \(1, 6\) names slot \d+, which is resident for \(0, 0\)")
+    st.ahead[(1, 6)] = was
+    st.res.admit((0, 5), seat0)
+    refused(r"line seat \(0, 5\) names slot \d+, which is predicted for \(1, 7\)")
+    st.res.pop((0, 5))
+    st.res.pop((0, 0))
+    refused(r"2 predicted slots for 2 predictions, 2 resident for 1 seats on the line")
+    st.res.admit((0, 0), seat1)
+    st.check()
+
+
+def test_a_seat_given_up_is_profiled_to_the_call_or_to_the_machine(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    """a block given back to the machine takes every seat and prediction in it off its line - an eviction for the
+    machine (aux 1) each seat, a prediction's queued reads withdrawn - and is one release in the profile; a seat
+    the line gives a later call's miss is that call's eviction (aux 0)"""
+    from btb.engine.experts import ExpertProfile
+
+    st, route, sm = _store_with_routers(monkeypatch, lookahead=(2, 0))
+    prof = sm.expert_profile = ExpertProfile(str(tmp_path / "p.npz"))
+    assert st.lookahead(0, torch.ones(1, 4)) == 2
+    _ready, pending = st.get(0, "layers.0.mlp.experts.", [0, 1])
+    for e, _f, _s in pending:
+        route.land((0, e))
+    (b, (_buf, ids)), *more = st.blocks.items()
+    assert not more, "the store grew one block"
+    st._release_block(b)
+    assert not st.slots and not st.res and not st.ahead and not st.ring and not st.free
+    assert {(1, 7), (1, 6)} <= set(route.dropped), "a prediction's queued reads outlived its block"
+    ev = prof.a[: prof.n]
+    assert {(int(r[3]), int(r[4])) for r in ev if r[2] == prof.EVICT and r[10] == 1} == {(0, 0), (0, 1)}
+    rel = [r for r in ev if r[2] == prof.RELEASE]
+    assert len(rel) == 1 and int(rel[0][4]) == len(ids) and int(rel[0][5]) == len(ids) * slot_size(st)
+    # two seats and three experts: the third's miss takes the oldest seat, an eviction for the call
+    st.block_max = 2 * slot_size(st)
+    assert st._grow(2) == 2
+    st.n_slots = st.live()
+    for e in (0, 1, 2):
+        _ready, pending = st.get(0, "layers.0.mlp.experts.", [e])
+        for pe, _f, _s in pending:
+            route.land((0, pe))
+    ev = prof.a[: prof.n]
+    assert [(int(r[3]), int(r[4])) for r in ev if r[2] == prof.EVICT and r[10] == 0] == [(0, 0)]
+
+
+def test_a_store_with_nobody_seated_gives_back_its_first_block(monkeypatch: MonkeyPatch) -> None:
+    """a release under the reserve with the line empty (nothing but free seats) gives back the store's first block,
+    and stops once the machine has the bytes"""
+    st, state = _store(monkeypatch, free=0)
+    state["free"] = st.reserve + st.margin + 10 * st.block_max
+    k0, k1 = st._grow(1), st._grow(1)
+    assert k0 > 0 and k1 > 0 and list(st.blocks) == [0, 1] and not st.res
+    state["free"] = st.reserve  # nothing above the reserve
+    assert st.release() == k0
+    assert list(st.blocks) == [1], "the first block went back, and only it"
+
+
+def test_a_missed_experts_price_is_the_probes_else_the_reads_timed(monkeypatch: MonkeyPatch) -> None:
+    """`miss_s`: nothing before a read or a probe; the reads timed so far spread over the readers that ran them;
+    the drive's probe over both, once there is one"""
+    st, _sm = expert_store(monkeypatch, FakeRoute(), n_layers=2, n_experts=4)
+    assert st.miss_s() == 0.0
+    st.stat["read_s"], st.stat["read_n"] = 0.8, 4
+    assert st.miss_s() == pytest.approx(0.8 / 4 / st.readers)
+    st.drive = {"big_mb": 6.25, "single_ms": 40.0, "fixed_ms": 5.0}
+    assert st.miss_s() == pytest.approx(2 * 0.005 + slot_size(st) * 0.040 / (6.25 * MB))
+
+
+def test_the_lookahead_passes_over_a_layer_whose_experts_it_cannot_read(monkeypatch: MonkeyPatch) -> None:
+    """a layer after this one with a router but no experts the store can read (no checkpoint prefix): its picks
+    are skipped and the layer after it is still read ahead"""
+    st, route, sm = _store_with_routers(monkeypatch, lookahead=(2, 1))
+    del sm.resident[1].mlp.experts.base
+    assert st.lookahead(0, torch.ones(1, 4)) == 1
+    assert {r["key"] for r in route.reads} == {(2, 7)} and set(st.ahead) == {(2, 7)}
+
+
+def test_a_ring_slot_the_call_holds_is_never_taken_back(monkeypatch: MonkeyPatch) -> None:
+    """`_ring_take` with a ring slot in `skip` (the wave's own): that one is passed over and the next landed
+    prediction's slot is given, its prediction forgotten"""
+    st, route, _sm = _store_with_routers(monkeypatch, lookahead=(2, 0), ring_n=2)
+    assert st.lookahead(0, torch.ones(1, 4)) == 2
+    route.land((1, 7))
+    route.land((1, 6))
+    held, other = list(st.ring)
+    other_key = st.slots[other].key
+    assert st._ring_take(skip={held}) == other
+    assert held in st.ring and other not in st.ring and other_key not in st.ahead
+    assert st.stat["ahead_dropped"] == 1
+    st._resident(other, (0, 3))  # the call seats its expert there
+    st.check()
+
+
+def test_a_sweeps_end_gives_the_rings_extra_slots_back_and_withdraws_their_reads(monkeypatch: MonkeyPatch) -> None:
+    """a layer-by-layer prefill's lookahead grows the ring past `ring_n`, one slot a prediction; the sweep's end
+    shrinks it back, newest first: a prediction still queued is withdrawn and forgotten, its slot free again"""
+    st, route, sm = _store_with_routers(monkeypatch, lookahead=(1, 0), ring_n=2)
+    sm.cfg = types.SimpleNamespace(num_experts_per_tok=6)
+    st.sweep_layer = 0
+    assert st.lookahead(0, torch.ones(3, 4), sweep=2) == 6, "a sweep reads every expert some row picks"
+    assert len(st.ring) == 6
+    newest = [st.slots[s].key for s in list(st.ring)[2:]]
+    free0 = len(st.free)
+    st.sweep_end()
+    assert st.sweep_layer == -1 and len(st.ring) == 2
+    assert route.dropped == newest[::-1], "the newest predictions withdrawn, newest first"
+    assert not any(k in st.ahead for k in newest) and len(st.ahead) == 2
+    assert st.stat["ahead_dropped"] == 4 and len(st.free) == free0 + 4
+    st.check()
+
+
+def test_a_call_the_store_cannot_seat_is_refused_whole_or_at_its_first_expert(monkeypatch: MonkeyPatch) -> None:
+    """a store of three seats that cannot grow: a call that must be seated whole (the paths that multiply its
+    experts together) asking five is refused, naming the count; a store with no seat at all refuses a wave's first
+    expert, since a wave must seat one to go on"""
+    route = FakeRoute()
+    st, _sm = expert_store(monkeypatch, route, n_layers=2, n_experts=8)
+    st.block_max = 3 * slot_size(st)
+    assert st._grow(3) == 3
+    st.n_slots = st.live()
+    with pytest.raises(RuntimeError, match="one call needs 5 experts and the store seats 3 of them"):
+        st.call(0, "layers.0.mlp.experts.", [0, 1, 2, 3, 4], rows=4).whole()
+    empty, _sm2 = expert_store(monkeypatch, FakeRoute(), n_layers=2, n_experts=8)
+    empty.n_slots = 0
+    with pytest.raises(RuntimeError, match="one call needs 2 experts and the store seats 0 of them"):
+        empty.call(0, "layers.0.mlp.experts.", [0, 1], rows=4).wave()
+    done = st.call(1, "layers.1.mlp.experts.", [], rows=1)
+    assert done.done and done.wave() == ({}, []), "a call with nothing left seats nothing"
+
+
+def _layered_store(tmp_path: Path, experts_at: Sequence[int]) -> _ExpertStore:
+    """a store over a stub model of two layers whose experts (bf16, four of them) are in the checkpoint's header at
+    `experts_at` only - a dense layer has none - read through the store's own recipe"""
+    from btb.engine import StreamedTextModel
+    from btb.engine import experts as experts_mod
+    from btb.engine.experts import ExpertProfile
+
+    E, inter, H = 4, 8, 16
+    gu, dn = 2 * inter * H * 2, H * inter * 2
+    hdr: dict[str, Json] = {}
+    for i in experts_at:
+        hdr[f"layers.{i}.mlp.experts.gate_up_proj"] = {
+            "dtype": "BF16",
+            "shape": [E, 2 * inter, H],
+            "data_offsets": [0, E * gu],
+        }
+        hdr[f"layers.{i}.mlp.experts.down_proj"] = {
+            "dtype": "BF16",
+            "shape": [E, H, inter],
+            "data_offsets": [E * gu, E * (gu + dn)],
+        }
+    sm = stub_engine(
+        mlx=None,
+        fam=Family(kind=FamilyKind.QWEN3),
+        cold_chunk=0,
+        expert_profile=ExpertProfile(str(tmp_path / "p.npz")),
+        L=2,
+        n_experts=E,
+        prefix="",
+        dir=str(tmp_path),
+        weight_map=dict.fromkeys(hdr, "experts.safetensors"),
+        _shard=lambda shard: (None, hdr, 8),
+        ST_DTYPES=StreamedTextModel.ST_DTYPES,
+        scheduler=None,
+        resident={},
+        host={},
+        device=stub_ledger(lambda: 64 * GB, GB),
+    )
+    return experts_mod._ExpertStore(sm, budget_bytes=64 * MB, reserve_bytes=GB)
+
+
+def test_a_model_whose_first_layer_is_dense_starts_its_pass_at_the_first_with_experts(tmp_path: Path) -> None:
+    """a dense first layer has no experts in the checkpoint: the pass starts at the first layer that has them (the
+    profile's step taken there, once a pass), and the experts' form is read off that layer before any call; a model
+    with none at all has no form to give"""
+    from btb.engine.host import stored_parts
+
+    st = _layered_store(tmp_path, experts_at=[1])
+    form = st.form()
+    assert form == ((torch.Size([16, 16]), torch.bfloat16), (torch.Size([16, 8]), torch.bfloat16))
+    assert st._first_layer() == 1
+    prof = st.sm.expert_profile
+    st.call(1, "layers.1.mlp.experts.", [0])
+    st.call(1, "layers.1.mlp.experts.", [2])
+    assert prof.step == 2, "every call at the first layer with experts starts a pass"
+    st._grow(1)
+    read = stored_parts(*st._views(st.free[-1]))
+    assert read is not None and form == tuple((p.shape, p.dtype) for p in read)
+    assert _layered_store(tmp_path, experts_at=[]).form() is None
+
+
+def test_the_expert_shapes_the_card_multiplies_are_read_off_each_layout(monkeypatch: MonkeyPatch) -> None:
+    """`mx_shapes` and `f8_shapes`: the logical [2I, H] and [H, I] of an MXFP4 expert in the checkpoint's layout
+    (blocks of 32) and in ggml's (gate and up apart), and of an FP8 one beside its scale grids"""
+    st, _sm = expert_store(monkeypatch, FakeRoute(), n_layers=1, n_experts=4)
+    st.mx, st.ggml = True, False
+    st.shapes = ((64, 2, 16), (64, 2), (32, 1, 16), (32, 1))
+    assert st.mx_shapes() == ((64, 64), (32, 32))
+    st.ggml = True
+    st.shapes = ((32, 64), (32, 64), (32, 32))
+    assert st.mx_shapes() == ((64, 64), (32, 32))
+    st.mx, st.ggml, st.f8 = False, False, True
+    st.shapes = ((64, 32), (4, 2), (32, 32), (2, 2))
+    assert st.f8_shapes() == ((64, 32), (32, 32))
+
+
+def test_an_fp8_scale_left_off_its_alignment_reads_the_same_scales(monkeypatch: MonkeyPatch) -> None:
+    """an FP8 expert's scale grid sitting a byte off its float32 alignment in the slot (where a direct read's
+    padding would leave a misaligned file's bytes): the view reads it through an aligned copy, the same values"""
+    from btb.engine.experts import _ExpertStore
+
+    st, _sm = expert_store(monkeypatch, FakeRoute(), n_layers=1, n_experts=4)
+    st.mx, st.f8, st.f8_sdt = False, True, torch.float32
+    st.shapes = ((32, 16), (2, 1), (16, 16), (1, 1))
+    st.sizes = (32 * 16, 2 * 4, 16 * 16, 1 * 4)
+    st.padded = True
+    st.stride, st.part_at = _ExpertStore._layout(st.sizes, True)
+    assert st._grow(1) > 0
+    s = st.free[-1]
+    st.slots[s].delta = (0, 1, 0, 1)
+    region = st._region(s)
+    want_gu, want_dn = torch.tensor([[0.5], [2.0]]), torch.tensor([[0.25]])
+    for p, w in ((1, want_gu), (3, want_dn)):
+        at = st.part_at[p] + 1
+        region[at : at + w.numel() * 4] = w.reshape(-1).view(torch.uint8)
+    gu, dn = st._views(s)
+    assert torch.equal(gu.scales, want_gu) and torch.equal(dn.scales, want_dn)
+    assert gu.shape == (32, 16) and dn.shape == (16, 16)
+
+
+@pytest.mark.parametrize("dt", [torch.float32, torch.float16])
+def test_a_store_without_a_route_reads_on_its_own_readers_and_holds_a_wide_expert_as_bf16(
+    monkeypatch: MonkeyPatch, tmp_path: Path, dt: torch.dtype
+) -> None:
+    """A store over a checkpoint whose experts are float32 or float16 and a scheduler with no Route: its own
+    readers read each miss off the drive, and every use reads the expert as the bf16 of its values - a waited-for
+    read rewritten as it is collected, and a landed one a later call hits rewritten there, once"""
+    from btb.engine.native import Native
+    from tests.helpers import native_library
+
+    native_library()
+    assert Native.read_direct is not None
+    st, _sm = expert_store(monkeypatch, object(), n_layers=1, n_experts=4, files=str(tmp_path) + os.sep)
+    per = slot_size(st)
+    n = per // 2 // dt.itemsize  # a part's values
+    st.dt = dt
+    st.shapes = (per // 2, (n,), (n,))
+    torch.manual_seed(7)
+    parts = {}
+    for name in ("gu0", "dn0"):
+        vals = torch.randn(4 * n).to(dt)
+        (tmp_path / f"{name}.st").write_bytes(vals.view(torch.uint8).numpy().tobytes())
+        parts[name] = vals.view(4, n).to(torch.bfloat16)
+    base = "layers.0.mlp.experts."
+    ready, pending = st.get(0, base, [1, 3])
+    assert not ready and [e for e, _f, _s in pending] == [1, 3]
+    got = st.wait(pending)
+    for e in (1, 3):
+        assert torch.equal(got[e][0], parts["gu0"][e]) and torch.equal(got[e][1], parts["dn0"][e]), e
+    _ready, pending = st.get(0, base, [2])
+    pending[0][1].result()  # landed; nobody has collected it
+    assert not st.slots[pending[0][2]].bf16
+    ready, again = st.get(0, base, [2])
+    assert not again and torch.equal(ready[2][0], parts["gu0"][2]) and torch.equal(ready[2][1], parts["dn0"][2])
+    assert st.slots[pending[0][2]].bf16, "the hit rewrote its expert as bf16"
+    st.close()
+
+
+def test_the_profile_grows_its_event_array_and_watches_once(tmp_path: Path) -> None:
+    """the profile's array doubles when full and keeps every event in order; a second `watch` starts no second
+    watchdog"""
+    from btb.engine.experts import ExpertProfile
+
+    prof = ExpertProfile(str(tmp_path / "p.npz"), cap=2)
+    for i in range(5):
+        prof.add(prof.HIT, layer=i)
+    assert prof.n == 5 and prof.a.shape[0] >= 5 and [int(x) for x in prof.a[:5, 3]] == [0, 1, 2, 3, 4]
+
+    def watchers() -> int:
+        return sum(1 for t in threading.enumerate() if t.name == "gil-watch")
+
+    try:
+        prof.watch(every_s=0.05)
+        n = watchers()
+        prof.watch(every_s=0.05)
+        assert watchers() == n
+    finally:
+        prof._watching = False

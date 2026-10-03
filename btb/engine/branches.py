@@ -20,6 +20,7 @@ from ..kinds import LayerKind, PassReport, PassTag, Tokens
 from ..sampling import GREEDY, Sampling
 from ..session import Step
 from .cache import (
+    ArenaIndexedLayer,
     CardRowsLayer,
     ForkIndexedLayer,
     ForkLayer,
@@ -256,12 +257,13 @@ class _Rows:
 
                 undo.append(states)
             elif isinstance(cl, ForkLayer):
-                t0, ti0 = cl._t, getattr(cl, "_ti", None)
+                t0, it0 = cl._t, getattr(cl, "_it", 0)
 
-                def cut(cl: ForkLayer = cl, t0: int = t0, ti0: torch.Tensor | None = ti0) -> None:
-                    cl._t, cl._cat = t0, None
+                def cut(cl: ForkLayer = cl, t0: int = t0, it0: int = it0) -> None:
+                    # the rows past the counts are the step's own, written over by the next
+                    cl._t = t0
                     if isinstance(cl, ForkIndexedLayer):
-                        cl._ti = ti0
+                        cl._it = it0
 
                 undo.append(cut)
             elif isinstance(cl, CardRowsLayer):
@@ -465,7 +467,8 @@ class _Rows:
             self._pend = [self._pend[b] for b in slots]
 
     def _take(self, b: int) -> _Row:
-        """the batch's row b, copied out: its own rows and its recurrent states"""
+        """the batch's row b: its own rows (views of the batch's buffers, which the caller copies into the row's
+        session before the batch steps again, or `_compact`s to keep) and its recurrent states"""
         out = _Row()
         for i, cl in enumerate(self._check().layers):
             if isinstance(cl, (ForkLayer, CardRowsLayer)):
@@ -481,8 +484,8 @@ class _Rows:
             elif self.eng.layer_types[i] == LayerKind.LINEAR:
                 lin = linear_layer(cl)
                 out.lin[i] = (
-                    {k: v[b : b + 1].clone() for k, v in lin.conv_states.items() if v is not None},
-                    {k: v[b : b + 1].clone() for k, v in lin.recurrent_states.items() if v is not None},
+                    {k: v[b : b + 1] for k, v in lin.conv_states.items() if v is not None},
+                    {k: v[b : b + 1] for k, v in lin.recurrent_states.items() if v is not None},
                 )
         if self._pend is not None:
             out.pending = self._pend[b]
@@ -604,8 +607,9 @@ class Branches(_Rows):
             elif card_ok:
                 continue  # every layer formed below, together, over the session's rows in the card's arena
             else:
-                if isinstance(pl, GrowLayer) and pl._buf is not None:
-                    # rows in the card's arena move out, or the next cache to take it would write over them
+                if (isinstance(pl, GrowLayer) and pl._buf is not None) or isinstance(pl, ArenaIndexedLayer):
+                    # rows in the card's arena (the card graph's, or a card program's) move out - a copy of their own,
+                    # granted - or the next cache to take it would write over them before the fork's first step
                     pl.detach()
                 k, v = attention_rows(pl)
                 cache.layers[i] = _fork_layer(pl, k, v, indexer_keys(pl), B, i)
@@ -635,7 +639,34 @@ class Branches(_Rows):
         return cl
 
     def _left(self, r: int, row: _Row) -> None:
-        self._out[r] = row
+        self._out[r] = self._compact(row)
+
+    def _compact(self, row: _Row) -> _Row:
+        """a row kept while the rest step on: its views copied into tensors of their own (the fork's buffers are
+        re-formed without it), the copies granted first"""
+        ts = [x for kv in row.kv.values() if not isinstance(kv, list) for x in kv]
+        ts += [
+            x
+            for conv, rec in row.lin.values()
+            if isinstance(conv, dict) and isinstance(rec, dict)
+            for x in (*conv.values(), *rec.values())
+        ]
+        sched = getattr(self.eng, "scheduler", None)
+        if sched is not None:
+            by: dict[torch.device, int] = {}
+            for x in ts:
+                by[x.device] = by.get(x.device, 0) + x.numel() * x.element_size()
+            for dev, nbytes in by.items():
+                sched.grant(nbytes, "kv", requester="Branches: a stopped row's own rows, kept", device=dev, draws="")
+        out = _Row(pending=row.pending, logits=row.logits)
+        out.kv = {i: kv if isinstance(kv, list) else tuple(x.clone() for x in kv) for i, kv in row.kv.items()}
+        out.lin = {
+            i: ({k: v.clone() for k, v in conv.items()}, {k: v.clone() for k, v in rec.items()})
+            if isinstance(conv, dict) and isinstance(rec, dict)
+            else (conv, rec)
+            for i, (conv, rec) in row.lin.items()
+        }
+        return out
 
     def reorder(self, rows: Sequence[int]) -> None:
         """Re-form the batch as copies of `rows` (a beam's survivors, with repeats): row j becomes a copy of row
@@ -865,6 +896,8 @@ def _fork_layer(pl: CacheLayer, k: torch.Tensor, v: torch.Tensor, ik: torch.Tens
     if not isinstance(pl, _DynamicLayer) or getattr(pl, "is_sliding", False):
         # a layer that evicts rows (a sliding window's) cannot be joined to rows grown after it
         raise NotImplementedError(f"a fork of a {type(pl).__name__} cache layer (layer {i})")
+    # the parent's gate (the scheduler's), asked as the fork's own rows grow
+    grant = getattr(pl, "grant", None)
     if ik is not None:
-        return ForkIndexedLayer(k, v, ik, B)
-    return ForkLayer(k, v, B)
+        return ForkIndexedLayer(k, v, ik, B, grant)
+    return ForkLayer(k, v, B, grant)

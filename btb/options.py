@@ -18,6 +18,7 @@ from .kinds import Json
 ENV_KNOBS: dict[str, str] = {
     "BTB_API_KEY": "the servers' key (the --api-key default)",
     "BTB_CONFIRM": "1: answer yes to prompts, as --confirm (fetch a model in a non-interactive run)",
+    "BTB_TRACE": "1: trace every automatic decision on stderr as -vv does (placement moves, memory given back, paths)",
     "BTB_POOL": "0: no MLX memory pool seeded at load",
     "BTB_CPU_GEMM": "0: a Mac's CPU tier keeps float32 prefill matmuls (else bf16 on MLX's CPU stream)",
     "BTB_HEAD_GEMV": "0: the head multiplies through a float32 copy instead of the native bf16 gemv",
@@ -180,6 +181,7 @@ FLAGS = (
     "prefetch",
     "store_pin",
     "bus_pass",
+    "sparse",
 )
 COUNTS = {  # whole numbers, with the least each allows
     "context": 0,
@@ -191,6 +193,7 @@ COUNTS = {  # whole numbers, with the least each allows
     "draft_vocab": 0,
     "top_k": 0,
     "prefill_card_min": 0,
+    "prefill_chunk": 1,
     "original_max_position_embeddings": 1,
 }
 UNIT = ("tree_min_prob", "tree_step_mass", "ngram_p", "top_p")  # 0 to 1

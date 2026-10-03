@@ -4,7 +4,8 @@ into its device sections: the ratio of the two medians and a 95% band from the t
 median. Each entry carries the PR run's ISA tier.
 
 A benchmark the baseline lacks lists with delta None (new); one only the baseline has is dropped. Output ids are
-`<device>/<model>`, taken from each benchmark's params so they land in the right device section.
+`<device>/<model>`, taken from each benchmark's params so they land in the right device section - or the id a
+bench names itself in its `extra_info` (the placement group's `<lane>/<op>/<shape>/<rows>`).
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ class Bench(TypedDict, total=False):
     params: dict[str, str]
     group: str
     stats: Stats
+    extra_info: dict[str, object]
 
 
 class Doc(TypedDict, total=False):
@@ -46,6 +48,20 @@ class _Entry(TypedDict):
 _MEDIAN_SE = math.sqrt(math.pi / 2)
 
 
+def rel_se(st: Stats) -> float:
+    """a run's standard error of its median over the median itself: stddev / sqrt(rounds), scaled to the median - a
+    standard error of the statistic, not the raw per-sample stddev, which does not shrink with n (a 15k-round bench
+    read +-100% on it when its centre was pinned to +-0.3%)"""
+    median = float(st.get("median", 0.0))
+    return (float(st.get("stddev", 0.0)) / math.sqrt(max(1, int(st.get("rounds", 1))))) / median if median else 0.0
+
+
+def band(se_a: float, se_b: float) -> float:
+    """the 95% half-width of the relative difference of two independent medians with relative standard errors
+    `se_a` and `se_b` (quadrature, the median's standard error sqrt(pi/2) times the mean's)"""
+    return 1.96 * _MEDIAN_SE * math.sqrt(se_a * se_a + se_b * se_b)
+
+
 class _Delta(TypedDict):
     id: str
     section: str
@@ -63,12 +79,16 @@ def isa_of(doc: Doc) -> str:
 def _entries(doc: Doc) -> dict[str, _Entry]:
     """each benchmark keyed by its stable fullname, carrying a readable label, its section (the group the bench
     set - `cpu`/`mlx` for e2e, `mlx-quant`/`mlx-attn` for the MLX ops) and its stats. The label reads
-    `<device>/<model>` for the e2e paths, else the param values joined."""
+    `<device>/<model>` for the e2e paths, the bench's own `extra_info` id where it names one, else the param values
+    joined."""
     out: dict[str, _Entry] = {}
     for b in doc.get("benchmarks", []):
         key = b.get("fullname") or b.get("name", "")
         params = b.get("params") or {}
-        if {"device", "model"} <= params.keys():
+        own = (b.get("extra_info") or {}).get("id")
+        if isinstance(own, str) and own:
+            label = own
+        elif {"device", "model"} <= params.keys():
             label = f"{params['device']}/{params['model']}"
         elif params:
             label = "-".join(str(v) for v in params.values())
@@ -128,14 +148,8 @@ def deltas(base: Doc, pr: Doc) -> list[_Delta]:
             )
             continue
         delta = (pm - bm) / bm
-        # the band is a standard error of the statistic (stddev / sqrt(rounds), scaled to the median), not the raw
-        # per-sample stddev: the raw spread does not shrink with n - it is a per-sample prediction band, not a CI -
-        # so using it made a 15k-round bench read ±100% when its centre was pinned to ±0.3%. Quadrature over the
-        # two runs, since base and PR are independent samples.
-        bn, pn = max(1, int(bs.get("rounds", 1))), max(1, int(ps.get("rounds", 1)))
-        bse = (float(bs.get("stddev", 0.0)) / math.sqrt(bn)) / bm if bm else 0.0
-        pse = (float(ps.get("stddev", 0.0)) / math.sqrt(pn)) / pm if pm else 0.0
-        half = 1.96 * _MEDIAN_SE * math.sqrt(bse * bse + pse * pse)
+        # base and PR are independent samples: their medians' standard errors in quadrature
+        half = band(rel_se(bs), rel_se(ps))
         out.append(
             {
                 "id": entry_id,

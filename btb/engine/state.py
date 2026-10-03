@@ -13,7 +13,9 @@ from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 import torch
 
+from .. import trace
 from ..kinds import LayerTier, PassReport, PassTag, Proposer
+from .device import Where
 
 # rows of the lm_head the drafter proposes from
 DRAFT_VOCAB = 32768
@@ -71,6 +73,8 @@ if TYPE_CHECKING:
     from .mlx_forward import MlxState
     from .model import StreamedTextModel
     from .scheduler import BatchScheduler, Plan
+    from .scratch import Scratch
+    from .spec_cost import SpecCost
     from .tiers import ColdRing
 
 
@@ -83,7 +87,14 @@ class _State:
     cfg: Any
     compute_dtype: torch.dtype | None
     context: int | None
-    dev: torch.device
+    if TYPE_CHECKING:
+
+        def __init__(self) -> None:
+            # the engine's device, as its tensors name it (`where`). Declared on the instance, for the checker
+            # alone: torch's stub gives `device` a `__get__`, so a class-level `dev: Where` would read back as a
+            # bare torch.device and the type would be lost
+            self.dev: Where
+
     device: Device
     dir: str
     fam: Family
@@ -122,13 +133,28 @@ class _State:
     prefetch: bool
     prefill_card: bool
     prefill_card_min: int
+    prefill_layers: bool
+    grouped_experts: bool
+    sparse: bool
     resident: dict[int, Any]
     resident_fp32: bool
     resident_head: bool
     rotary: Any
     shadow: dict[str, Any]
     templates: dict[str, Any]
-    _attn_ctx: Any
+
+    @property
+    def _attn_ctx(self) -> Any:
+        """the cache the running pass attends over, for the module-run attention to read (gpt-oss's sinks): held
+        weakly, so a pass's cache goes with its caller. Held strongly, the last call's cache lived on into the next
+        one - a 40k prompt's 2.6 GB of host rows still there while the next prefill priced its own, refused"""
+        ref = self.__dict__.get("_attn_ref")
+        return ref() if ref is not None else None
+
+    @_attn_ctx.setter
+    def _attn_ctx(self, cache: Any) -> None:
+        self.__dict__["_attn_ref"] = weakref.ref(cache) if cache is not None else None
+
     _batched_cont: bool
     _worker: ThreadPoolExecutor | None
     _worker_thread: threading.Thread
@@ -145,6 +171,10 @@ class _State:
     _staging: dict[Any, Any]
     _streamed_any: bool
     _sweep_keep: bool
+    # the drive layer whose ring slot a layer-by-layer prefill holds across the layer's chunks (`_prefill_by_layer`)
+    _cold_held: int | None = None
+    _depot: Any
+    _sweep_ahead: bool
     _thread_mod: ModuleType
     _toggle: dict[str, int]
 
@@ -180,6 +210,10 @@ class _State:
     _in_epoch: bool
     _pass_rec: _PassRecorder | None = None  # the provenance accumulator, created on first tag or reset
     _calls: frozenset[PassTag] = frozenset()  # every API call made on the model (btb.api), never reset
+    warming: bool = False  # the load's warm-up is timing: the memory policies stand aside (model.py `_warming`)
+    # the card's one GEMV, by the warm-up (cuda.py `card_warm`): per width timed, and the engine's kernel past them
+    _mma_for: dict[int, bool]
+    _mma_one: bool
     _cancel: threading.Event | None = None  # the running decode's own stop (a Stream's), set under the lock
 
     # -- the card graph (cuda.py); the mechanism keeps its letters --
@@ -191,7 +225,10 @@ class _State:
     an: dict[int, Any]
     ap: Parents | None
     aq: bool
-    ay: dict[int, tuple[torch.Tensor, torch.Tensor]]
+    # what a family's own layers hold back from a speculative pass until its path is known: each run with the
+    # accepted path at the commit (`ad`), and dropped at the next pass's start (`aa`)
+    spec_commits: list[Callable[[NodePath], None]]
+    scratch: Scratch
     _fmlp: bool
     _frope: bool
     _g: dict[str, Any]
@@ -221,6 +258,8 @@ class _State:
     ngram_p: float
     ngram_tree: bool
     proposer: Proposer
+    _spec_cost: SpecCost | None  # the passes' pricing (`_spec_pricer`), kept across calls
+    spec_price: bool  # the passes sized by their rows' expert reads (on by default; off: as with no store)
     sampling: Sampling  # the engine's default: greedy unless loaded with temperature/top_p/top_k/seed
     tree_budget: int
     tree_min_prob: float
@@ -257,6 +296,9 @@ class _State:
         raise NotImplementedError
 
     def _caches_to(self, i: int, dev: str | torch.device, cache: KvCache | None = None) -> None:
+        raise NotImplementedError
+
+    def _rows_to(self, caches: Sequence[Any], layers: Sequence[int], dev: str | torch.device) -> None:
         raise NotImplementedError
 
     def _cold_release(self, i: int) -> None:
@@ -322,6 +364,9 @@ class _State:
     def _regrow_bytes(self) -> int:
         raise NotImplementedError
 
+    def _drafter_bytes(self) -> int:
+        raise NotImplementedError
+
     @staticmethod
     def _set_param(module: Any, dotted: str, t: torch.Tensor, buffer: bool = False) -> None:
         raise NotImplementedError
@@ -366,6 +411,59 @@ class _State:
     def _card_segment_at(self, i: int, n_layers: int) -> tuple[int, int] | None:
         raise NotImplementedError
 
+    def _card_ready(self) -> bool:  # an engine without the card mixin runs no card graph
+        return False
+
+    def _card_let_go(self) -> None:  # an engine without the card mixin holds no card graph
+        return None
+
+    def _card_oom(self, e: BaseException) -> None:  # an engine without the card mixin builds no card graph
+        return None
+
+    @staticmethod
+    def _is_card_oom(e: BaseException) -> bool:  # an engine without the card mixin builds no card graph to refuse
+        return False
+
+    def _card_arena_holds(self, cache: Any, T: int) -> bool:  # an engine without the card mixin has no arena
+        return False
+
+    def _card_arena_take(self, cache: Any, T: int) -> bool:
+        return False
+
+    def _card_program(
+        self, cache: Any, B: int, T: int, past: int, am: Any, stop_after: int | None, positions: Any
+    ) -> Any:  # an engine built without the card mixin runs no card program
+        return None
+
+    def _card_graph_run(self, holder: Any, key: Any, body: Callable[[], None]) -> None:
+        raise NotImplementedError
+
+    def _forward_card_program(
+        self,
+        prog: Any,
+        ids: Any,
+        h: torch.Tensor,
+        cache: Any,
+        past: int,
+        positions: Any,
+        last_only: bool,
+        head: bool,
+        on_layer: Callable[[int, torch.Tensor], Any] | None,
+        place: Any = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+    def _host_frame(
+        self,
+        h: torch.Tensor,
+        ids: list[int],
+        cache: Any,
+        past: int,
+        positions: Any,
+        on_layer: Callable[[int, torch.Tensor], Any] | None,
+    ) -> Any:
+        raise NotImplementedError
+
     def _delta_nodes(
         self,
         layer: Any,
@@ -398,6 +496,9 @@ class _State:
         raise NotImplementedError
 
     def _spec_full(self, v_max: int | None = None) -> int:
+        raise NotImplementedError
+
+    def _spec_pricer(self, v_max: int | None = None) -> SpecCost:
         raise NotImplementedError
 
     def _rope_fn(self) -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
@@ -507,6 +608,9 @@ class _State:
     def _apply_head(self, hf: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
+    def _sinks_bytes(self) -> int:
+        raise NotImplementedError
+
     def _prefill(
         self,
         ids: torch.Tensor,
@@ -601,19 +705,12 @@ class _State:
     ) -> tuple[Any, Any]:
         raise NotImplementedError
 
-    # -- families.py --
-    @staticmethod
-    def _dense_key(key: str) -> bool:
-        raise NotImplementedError
-
+    # -- families/__init__.py --
     def _make_host_layer(self, i: int) -> Any:
         raise NotImplementedError
 
     @staticmethod
     def _named_tensors(module: Any) -> Iterable[tuple[str, torch.Tensor, bool]]:
-        raise NotImplementedError
-
-    def _shape_layer(self, layer: Any, i: int) -> Any:
         raise NotImplementedError
 
     # -- model.py --
@@ -631,6 +728,18 @@ class _State:
         raise NotImplementedError
 
     def cache_room(self, cache: KvCache | None, B: int, T: int) -> None:
+        raise NotImplementedError
+
+    def cache_growth(self, cache: KvCache | None, B: int, T: int, peak: bool = False) -> dict[Where, int]:
+        raise NotImplementedError
+
+    def _make_room(self, dev: torch.device, nbytes: int, what: str, own: str | None = None) -> set[str]:
+        raise NotImplementedError
+
+    def _give_up_one(self, dev: torch.device, short: int, tried: set[str]) -> bool:
+        raise NotImplementedError
+
+    def host_kv_dtype(self) -> torch.dtype:
         raise NotImplementedError
 
     def room(self, nbytes: int, device: DeviceSpec | None = None, name: str = "room") -> Room:
@@ -660,6 +769,10 @@ class _State:
         rec = self._pass_rec
         if rec is None:
             rec = self._pass_rec = _PassRecorder()
+        if trace.ON:  # a fork this request had not taken yet: the path it runs, said as it first runs it
+            for t in tags:
+                if t not in rec.tags:
+                    trace.event("path: %s (first this request)", t.value)
         rec.tags.update(tags)
 
     def _tag_tiers(self, n_layers: int) -> None:

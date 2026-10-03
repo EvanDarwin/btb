@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import os
 from collections.abc import Iterator, Sequence
 from typing import Unpack
 
@@ -23,7 +24,7 @@ from btb.sampling import Sampling
 from btb.session import Session, State
 from btb.text import template
 from tests.cert import spec
-from tests.helpers import fixture, loaded_model, need_mlx
+from tests.helpers import FIXTURES, fixture, need_mlx, shared_key, shared_model
 
 STEMS = sorted(set(spec.FIXTURE_STEM.values()))
 DEVICES = ["cpu", "mlx"]
@@ -36,25 +37,19 @@ SMP = Sampling(temperature=0.9, seed=11)
 # and a step's gemv sum in fp32 in different orders; on MLX a batched pass and a single-row one do in bf16
 TOL = {"cpu": 1e-4, "mlx": 0.05}
 
-_models: dict[tuple[str, str], StreamedTextModel] = {}
-_open = contextlib.ExitStack()
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _close_models() -> Iterator[None]:
-    yield
-    _open.close()
-    _models.clear()
-
 
 def model(stem: str, device: str) -> StreamedTextModel:
-    """the fixture loaded once for the module on `device`"""
+    """the fixture on `device`, loaded once for the tests on it (tests.helpers.shared_model)"""
     if device == "mlx":
         need_mlx()
-    key = (stem, device)
-    if key not in _models:
-        _models[key] = _open.enter_context(loaded_model(fixture(stem), device=device))
-    return _models[key]
+    return shared_model(fixture(stem), device=device)
+
+
+def shared_model_keys(item: pytest.Item) -> list[tuple[object, ...]]:
+    """every test here takes one model: its cell's fixture on its cell's device, the first stem on the CPU where it
+    names neither"""
+    p = getattr(getattr(item, "callspec", None), "params", {})
+    return [shared_key(os.path.join(FIXTURES, p.get("stem", STEMS[0])), {"device": p.get("device", "cpu")})]
 
 
 def solo(

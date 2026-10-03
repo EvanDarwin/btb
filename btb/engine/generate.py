@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 import torch
 
 from .. import mlx as mlxdev
+from .. import trace
 from ..draft import NGramProposer, SpanBank, Spans
 from ..kinds import PROPOSER_TAG, Json, LayerKind, PassTag, Proposer, TokenRows, Tokens
 from ..options import Device
@@ -28,6 +29,9 @@ if TYPE_CHECKING:
 LinState = torch.Tensor | dict[int, torch.Tensor]
 # a DeltaNet layer's (conv, recurrent) states copied, for a later `_lin_restore`
 LinSnap = tuple[LinState, LinState]
+# the committed rows a run of plain steps leaves the MTP drafter at most: past them it takes them without drafting,
+# so a long run neither regathers its hidden rows every step nor hands the next draft one outsized step
+PEND_ROWS = 16
 
 
 class LinLayer(Protocol):
@@ -96,6 +100,46 @@ def _chains_tree(
     return guesses, parents, depth, children, tags
 
 
+class PassClock:
+    """A speculative pass's seconds, as the pricer takes them. On a card, the time the card spends between two events
+    on the stream the pass is launched on (the card graph's side streams join it): the pass's own work and the gaps
+    while the host launches it, not the work queued before it. Timed from the host, a pass's figure took whatever the
+    card still had in hand - the last commit's writes, the drafter's - so a one-row step read slow and a wide pass
+    fast or slow by what preceded it: 0.17 to 3.3 one-row steps between answers on one card, and where no width came
+    within a quarter over a step the answers took plain steps throughout. Elsewhere the wall clock: the host computes
+    as it goes. Read after the pass's results reached the host, when both events have completed."""
+
+    def __init__(self, dev: torch.device) -> None:
+        self.dev = dev
+        self.card = dev.type == "cuda"
+        self.ev = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) if self.card else None
+        self.t0 = self.t1 = 0.0
+
+    def start(self) -> None:
+        if self.ev is not None:
+            self.ev[0].record(torch.cuda.current_stream(self.dev))
+        self.t0 = time.perf_counter()
+
+    def stop(self) -> None:
+        if self.ev is not None:
+            self.ev[1].record(torch.cuda.current_stream(self.dev))
+        self.t1 = time.perf_counter()
+
+    def seconds(self) -> float:
+        if self.ev is not None:
+            self.ev[1].synchronize()  # done already where the results were read; a wait otherwise
+            return self.ev[0].elapsed_time(self.ev[1]) / 1e3
+        return self.t1 - self.t0
+
+
+def _children(parents: Sequence[int]) -> dict[int, list[int]]:
+    """each tree node's children in node order, from the nodes' parents (node 0 the root)"""
+    children: dict[int, list[int]] = {}
+    for j in range(1, len(parents)):
+        children.setdefault(parents[j], []).append(j)
+    return children
+
+
 class _GenerateMixin(_State):
     _lin = staticmethod(_lin)
 
@@ -112,10 +156,15 @@ class _GenerateMixin(_State):
     def _lin_restore(cl: LinLayer, snap: LinSnap) -> None:
         conv, rec = snap
         if isinstance(conv, dict) and isinstance(rec, dict):
-            for k, v in conv.items():
-                cl.conv_states[k].copy_(v)
-            for k, v in rec.items():
-                cl.recurrent_states[k].copy_(v)
+            for have, snap_states in ((cl.conv_states, conv), (cl.recurrent_states, rec)):
+                assert isinstance(have, dict)  # a layer keeps its states as its snapshot does
+                for k, v in snap_states.items():
+                    if have.get(k) is None:
+                        # a slot the layer has not filled yet (a host prefill leaves some to the first step): the
+                        # state becomes a copy of its own, never a view of the rows it came from
+                        have[k] = v.clone()
+                    else:
+                        have[k].copy_(v)
             return
         assert isinstance(conv, torch.Tensor) and isinstance(rec, torch.Tensor)  # _lin_snap copies both alike
         c, r = _lin(cl)
@@ -207,11 +256,15 @@ class _GenerateMixin(_State):
             cl.recurrent_states = rec
 
     def mtp_drafter(self) -> MTPDrafter:
+        """the family's drafter over the checkpoint's drafting head, built on first use and kept"""
         if getattr(self, "aj", None) is None:
+            cls = self.fam.drafter_cls()
+            if cls is None:
+                raise NotImplementedError(
+                    f"btb has no MTP drafter for {self.fam.name}: speculate with the n-gram proposer"
+                )
             t0 = time.time()
-            self.aj = MTPDrafter(
-                self, weights=getattr(self, "drafter_weights", None), dev=getattr(self, "drafter_dev", None)
-            )
+            self.aj = cls(self, weights=getattr(self, "drafter_weights", None), dev=getattr(self, "drafter_dev", None))
             self.aj.build_s = time.time() - t0
         assert self.aj is not None  # set above whenever it was unset or None
         return self.aj
@@ -268,7 +321,10 @@ class _GenerateMixin(_State):
         whole = not (use_mtp or tapped)
         cache, reuse, anchored = session._begin_decode(self, prompt, whole) if session is not None else (None, 0, None)
         if cache is None:
-            cache = self.new_cache()
+            # as long as the call reaches - the prompt, the answer and the widest verify pass past its last token - as
+            # the greedy loop's is, so the two hold the same rows: where no reach is named a host layer takes the whole
+            # context window's
+            cache = self.new_cache(max_len=n + int(max_new) + self._spec_full(v_max))
         logits: Any
         logits, anchors = self._session_prefill(
             ids, cache, reuse, session, on_layer=aw if (use_mtp or tapped) else None
@@ -318,14 +374,22 @@ class _GenerateMixin(_State):
             prop = UnionProposer(ModelProposer(draft, prompt, ks=ks), prop)
         self._tag(PassTag.SPEC_DRAFT if draft is not None and not use_mtp else PROPOSER_TAG[prop_kind])
         by_src: dict[str, dict[str, int]] = {"drafted": {}, "accepted": {}}
-        last_base = n
         if use_mtp:
             dr = self.mtp_drafter()
             h_new = last["h"]
             h_prev = (anchored.get("h_last") if anchored else session.pend_h) if (reuse and session) else None
-            if reuse and session is not None and session.dr is dr and h_prev is not None:
+            if (
+                reuse
+                and session is not None
+                and session.dr is dr
+                and h_prev is not None
+                and (anchored or reuse > int(session.dr_len))
+            ):
                 dr_len = reuse - 1 if anchored else int(session.dr_len)
                 dr.crop(dr_len)
+                # the held rows from the drafter's end up to the rows kept (a prompt parting from the session inside
+                # the rows the drafter had yet to take keeps fewer than it held)
+                h_prev = h_prev[:, : reuse - dr_len]
                 h_cat = torch.cat([h_prev.to(h_new.device, h_new.dtype), h_new], dim=1)
                 if n - 1 > dr_len:
                     dr.extend(prompt[dr_len + 1 : n], h_cat[:, : n - 1 - dr_len], dr_len)
@@ -335,6 +399,9 @@ class _GenerateMixin(_State):
                     dr.extend(prompt[reuse + 1 : n], h_new[:, : n - 1 - reuse], reuse)
             else:
                 dr.prefill(prompt, h_new)
+            # the committed rows the drafter has yet to take: their tokens, and the target's last hidden rows under
+            # them and under `cur` (one more). The drafter holds every row before them - the target's rows less
+            # 1 + len(pend_toks) - and a pass that drafts takes them first; a plain step leaves them to the next
             pend_toks: list[Any] = []
             pend_h = h_new[:, -1:]
         self.vram_trim("prefill")
@@ -344,8 +411,9 @@ class _GenerateMixin(_State):
             if session is None:
                 return
             if use_mtp:
+                # the drafter's rows: the target's (the prompt and the answer but its last token) less the pending
                 session._commit_decode(
-                    prompt, committed, cache, anchors, dr, last_base if len(committed) > 1 else n - 1, pend_h
+                    prompt, committed, cache, anchors, dr, n + len(committed) - 2 - len(pend_toks), pend_h
                 )
             else:
                 session._commit_decode(prompt, committed, cache, anchors)
@@ -379,13 +447,49 @@ class _GenerateMixin(_State):
         # the drafter's steps and time of this call's passes (its prefill excluded)
         dr_steps0 = int(getattr(getattr(self, "aj", None), "steps", 0) or 0)
         dr_step_s0 = float(getattr(getattr(self, "aj", None), "step_s", 0.0) or 0.0)
+        # the passes priced by what their rows cost (`SpecCost`): the base curve's width narrowed where the rows'
+        # expert reads outweigh what their drafts return, a plain step where no width pays
+        pricer = self._spec_pricer(v_max)
+        pricer.begin()
+        clock = PassClock(self.dev)
+        store = getattr(self, "expert_store", None)
+        store_reads = getattr(store, "reads", None)
+        store_waited = getattr(store, "waited", None)
+        if not (callable(store_reads) and callable(store_waited)):
+            store_reads = store_waited = None
         while len(committed) < max_new and not self._stop_asked():
             tp = time.perf_counter()
             v = min(v_max, max_new - len(committed) - 1)
             budget = self._spec_budget(ema_tokens, census["forwards"], v_max, cache.get_seq_length())
-            v = max(0, min(v, budget - 1))
+            rows, probe = pricer.plan(budget, census["forwards"])
+            if trace.ON:  # every pass: nothing built for the trace when it is off
+                trace.changed(
+                    (trace.token(self), "spec rows"),
+                    rows,
+                    "speculation: passes %d rows wide as priced (%s)",
+                    rows,
+                    "a plain step - no width pays" if rows <= 1 else f"the budget {budget}",
+                )
+            v = max(0, min(v, rows - 1))
+            if v > 0:
+                exact = self.fam.verify_exact(self, cache)
+                if trace.ON:
+                    trace.changed(
+                        (trace.token(self), "spec exact"),
+                        exact,
+                        "speculation: %s",
+                        "the paths verify exactly - drafting"
+                        if exact
+                        else "the paths would not verify exactly as they stand - plain one-row passes",
+                    )
+                if not exact:
+                    # a pass the family's paths would not verify exactly as they stand now (Qwen4's off its kernels)
+                    # is a plain one-row pass: nothing drafted
+                    v = 0
+            # each draft's path probability (1 for a chain's), and the width the drafter was asked for
+            node_p: list[float] = []
+            asked = v
             base_len = cache.get_seq_length()
-            last_base = base_len
             src = "mtp"
             node_tags = None
             tree_now = use_tree
@@ -396,7 +500,9 @@ class _GenerateMixin(_State):
                 guesses, parents, depth = [], [-1], [0]
                 children: dict[Any, Any] = {}
             elif use_dyn:
-                dr.crop(base_len)
+                # the drafter back to the rows before the pending ones: its last draft's steps past them were over
+                # its own guesses
+                dr.crop(base_len - 1 - len(pend_toks))
                 extra = []
                 ng_p = float(getattr(self, "ngram_p", 0.0))
                 if ng_p > 0:
@@ -406,11 +512,18 @@ class _GenerateMixin(_State):
                         extra.append((ng, ng_p, "ngram"))
                 for sp_toks, sp_p, sp_tag in getattr(self, "extra_chains", ()):
                     extra.append((sp_toks, sp_p, sp_tag))
+                # the tree's nodes, the root's row beside them within the widest pass (`_spec_full`: a family's exact
+                # verify bounds it)
+                n_draft = min(int(getattr(self, "tree_budget", 0) or v), self._spec_full(v_max) - 1)
+                if pricer.active() and rows < pricer.full:
+                    # the pricing sized the pass short of the whole tree: one node past its plan, so the prune
+                    # below has a choice
+                    n_draft = min(n_draft, rows)
                 drawn = dr.au(
                     [*pend_toks, cur],
                     pend_h,
                     base_len - 1 - len(pend_toks),
-                    int(getattr(self, "tree_budget", 0) or v),
+                    n_draft,
                     min_prob=float(getattr(self, "tree_min_prob", 0.0)),
                     extra_chains=extra,
                     with_tags=True,
@@ -420,28 +533,33 @@ class _GenerateMixin(_State):
                 # nodes' distributions: the verify pass accepts against them
                 tk, par, dep, tg = drawn[:4]
                 qrows, draws = (drawn[4], drawn[5]) if len(drawn) > 4 else (None, None)
+                node_p = [float(x) for x in getattr(dr, "last_p", ())]
                 guesses = [int(t) for t in tk]
                 parents = [-1] + [0 if p < 0 else p + 1 for p in par]
                 depth = [0] + [int(d) for d in dep]
                 node_tags = ["root", *list(tg)]
-                children = {}
-                for j in range(1, len(guesses) + 1):
-                    children.setdefault(parents[j], []).append(j)
+                children = _children(parents)
                 src = "union" if extra else "mtp"
+                asked = n_draft
             elif use_tree:
                 if tree_fn is not None:
                     g1, ca, cb = tree_fn(committed)
                 else:
-                    dr.crop(base_len)
+                    dr.crop(base_len - 1 - len(pend_toks))
                     g1, ca, cb = dr.at([*pend_toks, cur], pend_h, base_len - 1 - len(pend_toks), v)
                 guesses = [g1, *ca, *cb]
-                parents = [-1, 0, 1, *list(range(2, 1 + len(ca))), 1, *list(range(2 + len(ca), 1 + len(ca) + len(cb)))]
+                # each chain hangs off the first guess (row 1), its rows one after another; a pass with room for one
+                # guess (v 1, near the end of a decode) has no chains, so no row hangs off it
+                parents = [
+                    -1,
+                    0,
+                    *([1, *range(2, 1 + len(ca))] if ca else []),
+                    *([1, *range(2 + len(ca), 1 + len(ca) + len(cb))] if cb else []),
+                ]
                 depth = [0, 1, *list(range(2, 2 + len(ca))), *list(range(2, 2 + len(cb)))]
-                children = {}
-                for j in range(1, len(guesses) + 1):
-                    children.setdefault(parents[j], []).append(j)
+                children = _children(parents)
             elif use_mtp:
-                dr.crop(base_len)
+                dr.crop(base_len - 1 - len(pend_toks))
                 guesses = dr.ar([*pend_toks, cur], pend_h, base_len - 1 - len(pend_toks), v)
             else:
                 chains = prop.propose_chains(v) if (ngram_tree and v > 0) else []
@@ -450,13 +568,37 @@ class _GenerateMixin(_State):
                     # matvec kernel's tile: up to 15 drafted rows verify at the cost of one); on the card the
                     # tree's budget
                     cap = 14 if getattr(self, "mlx", None) is not None else int(getattr(self, "tree_budget", 0) or 14)
-                    cap = max(1, min(cap, budget - 1))
+                    cap = max(1, min(cap, rows - 1))
                     guesses, parents, depth, children, node_tags = _chains_tree(chains, cap)
                     src, tree_now = "ngram_tree", True
                 else:
                     guesses, where = prop.propose_with_source(v)
                     guesses = [int(g) for g in guesses]
                     src = where[0] if isinstance(where, tuple) else "self"
+            # the drafts made before the pricing kept a prefix
+            drafted = len(guesses)
+            if len(node_p) != drafted:
+                node_p = [1.0] * drafted  # a chain or an unweighted tree: each node's gain its source's acceptance
+            # the drafter's tree is priced always - an empty one too, saying nothing wider gained - the other drafts
+            # where the pricing sizes the pass
+            if use_dyn or (drafted and pricer.active()):
+                # the drafts priced node by node in the drafter's order, and verified as far as they pay (`prune`):
+                # a probe drafts the whole width and verifies one draft at least - unpriced, a chain verified every
+                # one of them, 15 rows of a mixture's experts for drafts accepted one time in ten (gpt-oss-120b,
+                # n-gram chains). A prefix keeps every node's parent (a node follows its parent in the chain, the
+                # merged tree and the drafter's); a row's draws under a temperature stay whole, so a pruned child
+                # ends the walk as one the tree never held. Size only, never a token
+                tags_ = node_tags[1:] if node_tags else [src] * drafted
+                deps_ = depth[1:] if tree_now else list(range(1, drafted + 1))
+                gains_ = [pricer.gain(str(t_), int(d_), node_p[j]) for j, (t_, d_) in enumerate(zip(tags_, deps_))]
+                pricer.record_tree(gains_, capped=drafted >= asked)
+                keep = pricer.prune(gains_, probe)
+                if keep < drafted:
+                    guesses, node_p = guesses[:keep], node_p[:keep]
+                    if tree_now:
+                        parents, depth = parents[: keep + 1], depth[: keep + 1]
+                        node_tags = node_tags[: keep + 1] if node_tags else node_tags
+                        children = _children(parents)
             self.aa(parents if tree_now else None)
             pick: Any = smp
             if tree_now and qrows is not None:
@@ -464,6 +606,9 @@ class _GenerateMixin(_State):
             tf = time.perf_counter()
             phase["propose"] += tf - tp
             taps.clear()
+            reads0 = store_reads() if store_reads is not None else 0
+            wait0 = store_waited() if store_waited is not None else 0.0
+            clock.start()
             try:
                 out = self.forward(
                     [[cur, *guesses]],
@@ -485,7 +630,7 @@ class _GenerateMixin(_State):
             # the fused MLX path hands back the picks itself; the other paths the logits, picked here under the
             # same keys (a node's cache position)
             if out.dtype in (torch.int32, torch.int64):
-                am_all = out.tolist()
+                picked = out
             else:
                 if hk is not None and hk.needs_logits:
                     # each node's row read with the ids that reach it: the committed ones and its drafts
@@ -495,7 +640,9 @@ class _GenerateMixin(_State):
                     ]
                     out = hk.process(ctx, out.float())
                 keys = [smp.key_for(base_len + (depth[j] if tree_now else j)) for j in range(len(guesses) + 1)]
-                am_all = pick.pick_torch(out, keys).tolist()
+                picked = pick.pick_torch(out, keys)
+            clock.stop()
+            am_all = picked.tolist()
             tc = time.perf_counter()
             phase["forward"] += tc - tf
             if tree_now:
@@ -553,13 +700,35 @@ class _GenerateMixin(_State):
                         census["accepted_by_pos"][j] += 1
             census["accepted"] += a
             self._tag_spec(len(guesses), a)
+            n_rows = len(guesses) + 1
+            tags_all = node_tags if node_tags else ["root", *([src] * len(guesses))]
+            deps_all = depth if tree_now else list(range(n_rows))
+            pricer.record_pass(
+                n_rows,
+                clock.seconds(),
+                (store_reads() - reads0) if store_reads is not None else 0,
+                (tf - tp) if drafted else None,
+                [(str(tags_all[j]), int(deps_all[j]), node_p[j - 1]) for j in range(1, n_rows)],
+                [str(tags_all[path[d]]) for d in range(1, len(path))],
+                (store_waited() - wait0) if store_waited is not None else 0.0,
+            )
             ema_tokens = 0.85 * ema_tokens + 0.15 * (1 + a)
             if guesses:
                 by_src["drafted"][src] = by_src["drafted"].get(src, 0) + len(guesses)
                 by_src["accepted"][src] = by_src["accepted"].get(src, 0) + a
             self.ad(cache, base_len, path)
-            if use_mtp or use_tree:
+            if (use_mtp or use_tree) and v > 0:
+                # the drafter took the pending rows and `cur`'s at the root: the pass's accepted rows wait next
                 pend_toks, pend_h = new[:a], last["h"][:, path]
+            elif use_mtp or use_tree:
+                # a plain step drafted nothing, so the drafter took nothing: `cur` and its row join the pending, which
+                # a run too long for one step goes in without drafting (its cache is every committed row either way)
+                pend_toks, pend_h = [*pend_toks, cur], torch.cat([pend_h, last["h"][:, path]], dim=1)
+                if len(pend_toks) >= PEND_ROWS:
+                    dr_rows = cache.get_seq_length() - 1 - len(pend_toks)
+                    dr.crop(dr_rows)
+                    dr.extend(pend_toks, pend_h[:, :-1], dr_rows)
+                    pend_toks, pend_h = [], pend_h[:, -1:]
             phase["commit"] += time.perf_counter() - tc
             if hk is not None and hk.on_pass is not None:
                 hk.on_pass(
@@ -579,6 +748,7 @@ class _GenerateMixin(_State):
         census["tokens_per_pass"] = round(len(committed) / max(1, census["forwards"]), 3)
         census["by_source"] = by_src
         census["phase_s"] = {k: round(x, 3) for k, x in phase.items()}
+        census["priced"] = pricer.report()
         if use_mtp:
             census["mtp_build_s"] = round(dr.build_s, 2)
             census["mtp_steps"] = dr.steps - dr_steps0
@@ -592,13 +762,16 @@ class _GenerateMixin(_State):
             f"{phase['forward'] / max(1, census['forwards'] - 1) * 1e3:.1f} + commit "
             f"{phase['commit'] / max(1, census['forwards'] - 1) * 1e3:.1f}"
             + (
-                f" (the drafter {dr.step_s / max(1, census['forwards'] - 1) * 1e3:.1f} of the propose, "
-                f"{dr.steps / max(1, census['forwards'] - 1):.1f} steps a pass)"
+                # this call's steps (`mtp_steps`): the drafter's own totals ran from its first call, and read as
+                # 409 ms of a 128 ms propose on Qwen3.8-flash-next's second prompt
+                f" (the drafter {census['mtp_step_s'] / max(1, census['forwards'] - 1) * 1e3:.1f} of the propose, "
+                f"{census['mtp_steps'] / max(1, census['forwards'] - 1):.1f} steps a pass)"
                 if use_mtp
                 else ""
             )
             + "; accepted by depth "
             + " ".join(f"{a_}/{d_}" for a_, d_ in zip(census["accepted_by_pos"], census["drafted_by_pos"]) if d_)
+            + pricer.line()
         )
         return committed, census
 
@@ -781,21 +954,25 @@ class _GenerateMixin(_State):
         while i < len(prompts):
             longest = max(len(prompts[j]) for j in range(i, len(prompts)))
             B, _ = self.scheduler.plan(len(prompts) - i, longest + int(max_new))
-            rows = prompts[i : i + B]
-            part = hooks.child() if hooks is not None else None
-            if len(rows) == 1:
-                outs = [self.generate_greedy([rows[0]], max_new, eos_ids=eos_ids, sampling=sampling, hooks=part)]
-            else:
-                ids, mask = self.pad_left(rows, pad_id)
-                o = self.generate_greedy(
-                    ids, max_new, eos_ids=eos_ids, attention_mask=mask, sampling=sampling, hooks=part
-                )
-                outs = o if isinstance(o[0], (list, tuple)) else [o]
-            if hooks is not None and part is not None:
-                part.rows(len(rows))
-                hooks.extend(part)
-            for k in range(len(rows)):
-                results[i + k] = outs[k]
-            i += len(rows)
-            self.scheduler.release()
+            # the epoch's KV reservation is let go however the epoch ends, a refusal or an abort included: left
+            # standing, every reading of the device's free memory would count it until the next epoch's plan
+            try:
+                rows = prompts[i : i + B]
+                part = hooks.child() if hooks is not None else None
+                if len(rows) == 1:
+                    outs = [self.generate_greedy([rows[0]], max_new, eos_ids=eos_ids, sampling=sampling, hooks=part)]
+                else:
+                    ids, mask = self.pad_left(rows, pad_id)
+                    o = self.generate_greedy(
+                        ids, max_new, eos_ids=eos_ids, attention_mask=mask, sampling=sampling, hooks=part
+                    )
+                    outs = o if isinstance(o[0], (list, tuple)) else [o]
+                if hooks is not None and part is not None:
+                    part.rows(len(rows))
+                    hooks.extend(part)
+                for k in range(len(rows)):
+                    results[i + k] = outs[k]
+                i += len(rows)
+            finally:
+                self.scheduler.release()
         return results

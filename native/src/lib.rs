@@ -370,12 +370,113 @@ pub unsafe extern "C" fn btb_attn_decode_f32(
     })
 }
 
+/// [`btb_attn_decode_bf16`] for `t` queries at once, each over its own list of cache rows instead of the
+/// first `n`: a verify pass's tree nodes, each attending the rows its committed one-token step would, with
+/// no prefix copied per node. `q` and `out` are `[t, hq, d]` f32; `k` and `v` hold `n_rows` rows per kv head
+/// as the decode kernel reads them (`k_head_stride >= n_rows * d`). Query `i` attends the cache rows
+/// `idx[offs[i]..offs[i + 1]]` (`offs` `u32[t + 1]`, strictly increasing, so every list holds a row; `idx`
+/// `u32`, each below `n_rows`) in list order. Each list splits into the pieces a decode step over that many
+/// rows splits into, so row `i` is bit-identical to [`btb_attn_decode_bf16`] at the same `threads` over the
+/// listed rows copied out in order - and a list of `0..n` is that decode step itself. No row's bits depend
+/// on `t` or on the other lists; like the decode step, they do depend on `threads` in the last bits.
+///
+/// # Safety
+/// `q` readable for `t * hq * d` f32, `k` for `hk * k_head_stride` and `v` for `hk * v_head_stride` u16,
+/// `offs` for `t + 1` u32 and `idx` for `offs[t]`, `out` writable for `t * hq * d` f32; `out` must not
+/// overlap an input.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn btb_attn_nodes_bf16(
+    q: *const f32,
+    k: *const u16,
+    v: *const u16,
+    offs: *const u32,
+    idx: *const u32,
+    t: usize,
+    n_rows: usize,
+    hq: usize,
+    hk: usize,
+    d: usize,
+    k_head_stride: usize,
+    v_head_stride: usize,
+    scale: f32,
+    out: *mut f32,
+    threads: usize,
+) -> i32 {
+    guard(|| unsafe {
+        attn::nodes_core_bf16(
+            q,
+            k,
+            v,
+            offs,
+            idx,
+            t,
+            n_rows,
+            hq,
+            hk,
+            d,
+            k_head_stride,
+            v_head_stride,
+            scale,
+            out,
+            threads,
+        )
+    })
+}
+
+/// [`btb_attn_nodes_bf16`] over an f32 cache: same lists, shapes and strides, bit-identical to
+/// [`btb_attn_decode_f32`] as the bf16 form is to its decode step, `k` and `v` readable for
+/// `hk * k_head_stride` and `hk * v_head_stride` f32 instead of u16.
+///
+/// # Safety
+/// As [`btb_attn_nodes_bf16`], `k` and `v` f32.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn btb_attn_nodes_f32(
+    q: *const f32,
+    k: *const f32,
+    v: *const f32,
+    offs: *const u32,
+    idx: *const u32,
+    t: usize,
+    n_rows: usize,
+    hq: usize,
+    hk: usize,
+    d: usize,
+    k_head_stride: usize,
+    v_head_stride: usize,
+    scale: f32,
+    out: *mut f32,
+    threads: usize,
+) -> i32 {
+    guard(|| unsafe {
+        attn::nodes_core_f32(
+            q,
+            k,
+            v,
+            offs,
+            idx,
+            t,
+            n_rows,
+            hq,
+            hk,
+            d,
+            k_head_stride,
+            v_head_stride,
+            scale,
+            out,
+            threads,
+        )
+    })
+}
+
 /// One gated DeltaNet position for every head, f32 throughout: the causal conv update (`conv_state`
 /// `[C, K]`, `conv_w` `[C, K]`, `conv_b` `[C]` or null) with silu, the `q | k | v` split of `mixed_qkv`
 /// `[C]` (`C = 2 * hk * dk + hv * dv`), q/k l2-normalised, the gated delta rule on `state` `[hv, dk, dv]`
 /// (`a`, `b` `[hv]`; `a_log`, `dt_bias` `[hv]`), and the gated RMSNorm (`z` `[hv * dv]`, `norm_w` `[dv]`,
-/// `eps`) into `out` `[hv * dv]`. `mixed_qkv`, `conv_state` and `state` are updated in place. `hv` must be
-/// a multiple of `hk`. Bit-identical for every `threads`.
+/// `eps`, `gate` its activation on `z`: 0 silu, as Qwen3.5's, 1 sigmoid, as Qwen4's) into `out` `[hv * dv]`.
+/// `mixed_qkv`, `conv_state` and `state` are updated in place. `hv` must be a multiple of `hk`.
+/// Bit-identical for every `threads`.
 ///
 /// # Safety
 /// Every array valid for the length above; `out` must not overlap an input.
@@ -400,13 +501,14 @@ pub unsafe extern "C" fn btb_delta_step(
     dv: usize,
     norm_w: *const f32,
     eps: f32,
+    gate: u32,
     out: *mut f32,
     threads: usize,
 ) -> i32 {
     guard(|| unsafe {
         delta::delta_step(
             mixed_qkv, conv_state, conv_w, conv_b, c_dim, k_size, z, a, b, a_log, dt_bias, state,
-            hk, hv, dk, dv, norm_w, eps, out, 1, threads,
+            hk, hv, dk, dv, norm_w, eps, gate, out, 1, threads,
         )
     })
 }
@@ -465,6 +567,20 @@ pub unsafe extern "C" fn btb_read_direct(
 pub unsafe extern "C" fn btb_open(path: *const u16) -> i64 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         direct::open(path)
+    }))
+    .unwrap_or(ERR_PANIC as i64)
+}
+
+/// [`btb_open`], the file read through the system's file cache instead of around it: a read fills the cache,
+/// and a read of bytes it still holds is a copy out of RAM (no commit is charged for the cache's pages). For
+/// reads that come back - an expert missed again - where the cache is RAM the process cannot otherwise hold.
+///
+/// # Safety
+/// `path` NUL-terminated UTF-16.
+#[no_mangle]
+pub unsafe extern "C" fn btb_open_cached(path: *const u16) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        direct::open_cached(path)
     }))
     .unwrap_or(ERR_PANIC as i64)
 }

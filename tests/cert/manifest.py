@@ -49,6 +49,11 @@ GGUF_DIR = spec.GGUF_DIR
 CARD_HEAD_DIMS: tuple[int, ...] = (64, 128, 256)
 MEGA_HEAD_MULTIPLE = 64
 MLX_ATTN_HEAD_DIMS: tuple[int, ...] = (128, 256)
+# a family that brings its own layer (Qwen4) verifies a speculative pass exactly through btb's own kernels for the
+# layers that carry state - the host's node steps, the card's DeltaNet node kernel - and the rest row-invariant
+# wherever it runs: on a card the card program, or where it declines (a float32 compute, a fixture shaped below its
+# kernels) the torch path's fixed-row layers and its attention a row at a time (`Family.verify_exact`, which asks only
+# for the card's kernels there - test_manifest holds it). Never MLX, whose layers have no node steps
 
 
 class Verdict(StrEnum):
@@ -164,10 +169,11 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "in the twins write_gguf writes, and the MTP cells run on the GGUF storages",
     ),
     Missing.SPEC_OWN_LAYER: (
-        "the engine turns speculation off for a family that brings its own layer (`sm.fam.own` sets v_max and "
-        "tree_budget to 0 at load, btb/__init__.py), so no proposer ever drafts for it",
-        "teach the family's own layer the verify pass (several rows, and the tree mask where the tier verifies "
-        "trees), drop the load's refusal, and its speculation cells run like any other family's",
+        "a family that brings its own layer (Qwen4) verifies a speculative pass only through btb's own node steps "
+        "for its DeltaNet and attention - the host's, and the card's DeltaNet node kernel - so on MLX, whose layers "
+        "have none (`Family.speculates` off at load), no proposer drafts and every pass is plain",
+        "give the family's layers the node steps on MLX (the DeltaNet's per node from its parent's state, the "
+        "attention over each row's own rows), and these cells run like the host's and the card's",
     ),
     Missing.FP16_FIXTURE: (
         "this family has no fp16 safetensors twin (`<stem>-f16`, every float tensor stored F16), so its fp16 "
@@ -247,11 +253,6 @@ FORK_NOTES: dict[PassTag, str] = {
         "the head held where the model runs, which is what every cell but cpu-headstream takes (or not - the "
         "planner's `head_on_card` decides where `resident_head` is unset); none asserts it"
     ),
-    PassTag.PREFILL_CARD: (
-        "a prefill's host layers on the card (forward.py:324): the planner decides `prefill_card` and the "
-        "`prefill_card_min` option only sets the rows it takes, so a cell would need a card, a cpu/card split "
-        "and a prompt that long - none of which the tiny fixtures reach here"
-    ),
     PassTag.EXPERT_TABLES: (
         "the MoE experts with no store (host.py:434), which needs expert_cache_gb=0 - and that option takes a "
         "figure above 0, so nothing a caller may pass selects this arm; it is the no-native-read_direct path"
@@ -264,9 +265,11 @@ FORK_NOTES: dict[PassTag, str] = {
         "an expert seated in VRAM (`vram_experts_gb`, experts.py:1093) needs a card, which this grid's MoE "
         "fixtures have no cell for"
     ),
-    PassTag.EXPERT_MXFP4_DEQUANT: (
-        "MXFP4 experts widened instead of multiplied as stored (host.py:376) happens only where the native "
-        "library was built without the mx4 matvec, which the cert's own machines are not"
+    PassTag.EXPERT_FP8_WIDENED: (
+        "FP8 experts widened instead of multiplied as stored: on the host only where the native library was built "
+        "without the FP8 matvec, which the cert's own machines are not; on the card by a layer-by-layer prefill's "
+        "grouped call, which the long-prompt axis runs on the base fixtures alone (cuda-prefill), and no base "
+        "fixture's experts are FP8; tests/integration/test_prefill_layers.py holds tiny_q4-f8_e4m3's to the loop"
     ),
     PassTag.SPEC_ACCEPT: (
         "a draft's outcome, not a path a cell selects: a speculative cell requires drafts and holds its tokens to "
@@ -424,6 +427,11 @@ def dnr(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath, decode
             f"not a distinct cell: {dev.key}'s knob is a no-op on a family without {dev.needs.value} "
             f"(identical to the plain {dev.hardware.value} run)"
         )
+    if dev.long_prompt:
+        return (
+            f"not a distinct cell: {dev.key}'s knobs act on a prompt past one prefill chunk, and a storage cell's "
+            f"prompt fits one (identical to the plain {dev.hardware.value} run); it runs on the long-prompt axis"
+        )
     # a family with no GGUF path has no MXFP4 file to repeat another; its cells are GGUF_LOAD gaps
     if spec.quant_class(storage) is QuantClass.MXFP4 and Cap.MOE not in core.flags(kind) and kind in core.gguf_kinds():
         return (
@@ -478,6 +486,13 @@ def subpath_gap(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath
     return None
 
 
+def own_layer_verifies(dev: spec.DeviceSubpath) -> bool:
+    """whether a family that brings its own layer verifies a speculative pass exactly on this sub-path, so its
+    passes draft: the host's node steps, and every card sub-path - the card program, or the torch path's
+    row-invariant layers where it declines; never MLX"""
+    return dev.hardware in (spec.Hardware.CPU, spec.Hardware.CUDA)
+
+
 def gap_reason(
     kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath, decode: spec.DecodePath
 ) -> Missing | None:
@@ -518,7 +533,7 @@ def gap_reason(
     if absent:
         return Missing.QUANT_FIXTURE
     # 4. a decode path the engine does not take for this family
-    if spec.DECODE_KIND[decode] is not spec.DecodeKind.PLAIN and Cap.OWN in fl:
+    if spec.DECODE_KIND[decode] is not spec.DecodeKind.PLAIN and Cap.OWN in fl and not own_layer_verifies(dev):
         return Missing.SPEC_OWN_LAYER
     proposer = spec.DECODE_PROPOSER[decode]
     if proposer is not None and proposer.mtp:

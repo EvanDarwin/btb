@@ -136,6 +136,23 @@ def test_resolve_device_refuses_a_device_that_is_not_here() -> None:
     assert resolve_device(None).kind in Device
 
 
+def test_a_device_is_named_as_its_tensors_name_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`where`: torch's bare 'cuda' is not equal to the 'cuda:0' every tensor on that card reports, so a figure
+    keyed by one is missed under the other - a card is named by its index, the current one where none is given;
+    the host and a named card pass as they are"""
+    import torch
+
+    from btb.engine.device import where
+
+    assert torch.device("cuda") != torch.device("cuda:0")  # the trap `where` exists for
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    for spelled in ("cuda", Device.CUDA, torch.device("cuda")):
+        assert where(spelled) == torch.device("cuda:1")
+        assert {where(spelled): 7}.get(where("cuda:1")) == 7
+    assert where("cuda:0") == torch.device("cuda:0")
+    assert where("cpu") == torch.device("cpu")
+
+
 def test_load_refuses_a_bad_override_before_it_loads() -> None:
     """the check runs before the pool, torch and the weights: a bad value on the fixture fails at once"""
     import btb

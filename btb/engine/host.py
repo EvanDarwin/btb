@@ -5,6 +5,7 @@ the MoE router and experts, and the n-gram proposer's row table."""
 from __future__ import annotations
 
 import time
+from itertools import accumulate
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -14,12 +15,13 @@ from .. import mlx as mlxdev
 from ..fp8 import F8Weight
 from ..kinds import PassTag
 from ..mxfp4 import BLOCK, MxGateUp, MxWeight
+from ..mxfp4_torch import dequant_blocks
 from ..options import Device
 from .native import Native
 from .pack import unpack_bf16
 
 if TYPE_CHECKING:
-    pass
+    from .experts import StoreCall
 
 
 def copy_bytes(dst: torch.Tensor, t: torch.Tensor) -> None:
@@ -58,7 +60,7 @@ class _HostLinear(torch.nn.Module):
         self.key = key
         self.packed = None
         self.mx = None
-        # an FP8 checkpoint's matrix as stored (families.py binds it); `weight` is then its shape and no bytes
+        # an FP8 checkpoint's matrix as stored (families/__init__.py binds it); `weight` is then its shape and no bytes
         self.f8 = None
         # on a Mac's CPU tier: the same bytes as an MLX bf16 array, for the prefill's GEMM on MLX's CPU
         # stream (`bind_cpu_gemm`); the one-row step keeps the native kernel
@@ -147,7 +149,90 @@ def compute_fp32(module: torch.nn.Module) -> None:
     object.__setattr__(module, "forward", forward)
 
 
+def widen_scratch(store: Any, n: int, inter: int, hidden: int) -> int:
+    """the card memory a grouped call's widening holds at its peak, `n` experts at a time (`_card_grouped`), each
+    expert gate_up [2 * `inter`, `hidden`] and down [`hidden`, `inter`], gate_up's, then down's beside gate_up's
+    bf16: MXFP4's bf16 alone where the card's kernel widens it from the depot's bytes (`mx4_widen`), 2 bytes a
+    weight, else torch's gathered bytes, their int32 lookup index, the value pairs and the bf16 out, 4.5; FP8's bytes
+    widened to float32, scaled and made bf16, 11 bytes a weight; 0 for bf16 experts, multiplied as they sit"""
+    if store is None or getattr(store, "ggml", False) or not (store.mx or store.f8):
+        return 0
+    per = (2.0 if Native.card_kernels() is not None else 4.5) if store.mx else 11.0
+    gu = dn = inter * hidden
+    gu *= 2
+    return int(n * max(per * gu, 2 * gu + per * dn))
+
+
+def stored_parts(gu: Any, dn: Any) -> tuple[torch.Tensor, ...] | None:
+    """an expert's bytes as the store holds them, for the card: bf16 (gate_up, down), MXFP4 in the checkpoint's
+    layout (gate_up's blocks and scales, down's blocks and scales), or FP8 (gate_up's e4m3 bytes and scale grid,
+    down's); None for a form the card path does not take (ggml's MXFP4) or an expert already on the card"""
+    if isinstance(gu, torch.Tensor) and isinstance(dn, torch.Tensor):
+        parts: tuple[torch.Tensor, ...] = (gu, dn)
+    elif (
+        isinstance(gu, MxWeight)
+        and isinstance(dn, MxWeight)
+        and not gu.ggml
+        and not dn.ggml
+        and gu.scales is not None
+        and dn.scales is not None
+    ):
+        parts = (gu.blocks, gu.scales, dn.blocks, dn.scales)
+    elif isinstance(gu, F8Weight) and isinstance(dn, F8Weight):
+        parts = (gu.w, gu.scales, dn.w, dn.scales)
+    else:
+        return None
+    return parts if all(p.device.type == "cpu" for p in parts) else None
+
+
+def on_card_device(w: Any) -> torch.device | None:
+    """the card an expert's weight is seated on - a bf16 tensor there, or an MxWeight whose blocks are - else None"""
+    t = w.blocks if isinstance(w, MxWeight) else w
+    return t.device if isinstance(t, torch.Tensor) and t.device.type != "cpu" else None
+
+
+def lane16(kern: Any, w: Any, x: torch.Tensor) -> torch.Tensor:
+    """the host's gemv on the card over `x` [n, C] float32 there: `w` bf16 (`gemv_lane16`) or MXFP4 in the
+    checkpoint's layout (`gemv_lane16_mx4`), [n, R] float32 on the card. The kernels' widths are 1..32 rows: a longer
+    call goes 32 rows at a time, each row's value its own whatever travels with it"""
+    dev = on_card_device(w)
+    R = int(w.shape[0])
+    gemv = kern.gemv_lane16_mx4 if isinstance(w, MxWeight) else kern.gemv_lane16
+    n = int(x.shape[0])
+    y = torch.empty(n, R, dtype=torch.float32, device=dev)
+    for a in range(0, n, 32):
+        m = min(32, n - a)
+        M = next(r for r in kern.GEMV_ROWS if r >= m)
+        if M == m and a == 0 and n == m and x.is_contiguous():
+            gemv(w, x, y)
+            continue
+        xin = torch.zeros(M, int(x.shape[1]), dtype=torch.float32, device=dev)
+        xin[:m].copy_(x[a : a + m])
+        yo = torch.empty(M, R, dtype=torch.float32, device=dev)
+        gemv(w, xin, yo)
+        y[a : a + m].copy_(yo[:m])
+    return y
+
+
+def group_picks(top_k_index: torch.Tensor, num_experts: int) -> tuple[torch.Tensor, torch.Tensor, list[int], list[int]]:
+    """A call's (pick, row) pairs grouped by expert in one sort on the picks' own device: (top_k_pos, token_idx)
+    of every pair sorted by expert, and each expert's offset and count into them. An expert's pairs come pick-major,
+    then row - the order `torch.where(one_hot(top_k_index).permute(2, 1, 0)[e])` lists them - so a product over its
+    slice is the per-expert lookup's, bit for bit. The counts are the one read back to the host."""
+    T = int(top_k_index.shape[0])
+    flat = top_k_index.t().reshape(-1)
+    order = torch.argsort(flat, stable=True)
+    counts = torch.bincount(flat, minlength=int(num_experts)).tolist()
+    offs, a = [], 0
+    for n in counts:
+        offs.append(a)
+        a += int(n)
+    return order // T, order % T, offs, [int(n) for n in counts]
+
+
 class _Experts(torch.nn.Module):
+    # MXFP4 or FP8 experts widened on the card at a time in a grouped call: gpt-oss-120b's are 50 MB a piece widened
+    WIDEN_BATCH = 16
     sm: Any
     _mx_bias: Any
     act_fn: Any
@@ -243,6 +328,13 @@ class _Experts(torch.nn.Module):
         halves, the other families concatenate them"""
         return MxGateUp.interleave(gate, up) if self.gate is not None else torch.cat([gate, up], dim=-1)
 
+    def _down(self, y: torch.Tensor, e: int, dt: torch.dtype) -> torch.Tensor:
+        """expert `e`'s down product `y` (float32, from the matvec) as the row's dtype, its bias added after the
+        rounding - as the per-expert loop and transformers' GptOssExperts add it (the bf16 product, then the bf16
+        bias) - so a one-row pass's row is a many-row pass's bit for bit"""
+        o = y.to(dt)
+        return o + self._bias(self.down_proj_bias, e, o) if self.biased else o
+
     @staticmethod
     def _bias(param: Any, rows: Any, like: torch.Tensor) -> torch.Tensor:
         # the layer may sit on the card while the experts are multiplied on the CPU, and a resident
@@ -286,6 +378,35 @@ class _Experts(torch.nn.Module):
         for j, i in enumerate(pos):
             gu_buf[i] = self._join(tg[j], tu[j])
 
+    def _seated(
+        self,
+        xs: list[torch.Tensor],
+        pairs: list[tuple[Any, Any]],
+        dt: torch.dtype,
+        es: list[int] | None = None,
+    ) -> list[torch.Tensor]:
+        """Experts seated on the card (`pairs` of gate_up and down there: bf16, or MXFP4 as stored), each over its
+        own rows `xs[j]` [n, H], computed as the host computes them: gate_up and down through the host's gemv on the
+        card (`gemv_lane16`, `gemv_lane16_mx4`: the host kernels' bits), the activation between them on the host in
+        `dt` as `_act` takes it there, expert `es[j]`'s gate/up bias with it - so an expert's rows do not depend on
+        which side of the bus it is seated. Returns each expert's rows [n, H] float32 on the host, before the down
+        bias and the routing weight. Without the card's kernels the float32 matmuls on the card (bf16 seats only:
+        MXFP4 ones are made only where the kernels are)."""
+        kern = Native.card_kernels()
+        dev = on_card_device(pairs[0][0])
+        rows = es if es is not None else [None] * len(pairs)
+        with torch.no_grad():
+            if kern is None:
+                outs = []
+                for x, (w_gu, w_dn), e in zip(xs, pairs, rows, strict=True):
+                    xc = x.to(dev).float()
+                    hmid = self._act(torch.nn.functional.linear(xc, w_gu.float()).to(dt), e)
+                    outs.append(torch.nn.functional.linear(hmid.float(), w_dn.float()).cpu())
+                return outs
+            gus = [lane16(kern, w_gu, x.to(dev).float()) for x, (w_gu, _dn) in zip(xs, pairs, strict=True)]
+            mids = [self._act(g.cpu().to(dt), e).float() for g, e in zip(gus, rows, strict=True)]
+            return [lane16(kern, w_dn, h.to(dev)).cpu() for h, (_gu, w_dn) in zip(mids, pairs, strict=True)]
+
     def _one_row(
         self,
         x: torch.Tensor,
@@ -302,7 +423,7 @@ class _Experts(torch.nn.Module):
         if self.mx:
             self.sm._tag(PassTag.EXPERT_MXFP4_ASSTORED)  # `_group()` is the mx4 matvec over the stored blocks
         if self.f8:
-            self.sm._tag(PassTag.FP8_ASSTORED)
+            self.sm._tag(PassTag.EXPERT_FP8_ASSTORED)  # `_group()` is the FP8 matvec over the stored bytes
         k = len(hit)
         xf = x.float().contiguous()
         slot = {e: top_k_index[0].tolist().index(e) for e in hit}
@@ -312,23 +433,13 @@ class _Experts(torch.nn.Module):
         gu_buf = torch.empty(k, first[0].shape[0], dtype=torch.float32)
         dn_buf = torch.empty(k, first[1].shape[0], dtype=torch.float32)
         out = torch.empty(k, first[1].shape[0], dtype=dt)
-        # the experts seated on the card: multiplied there in float32 over the stored bf16, the row brought back
-        card = [
-            i
-            for i, e in enumerate(hit)
-            if e in views and isinstance(views[e][0], torch.Tensor) and views[e][0].device.type != "cpu"
-        ]
-        if card and x_card is not None:
-            with torch.no_grad():
-                xc = x_card.reshape(1, -1).float()
-                rows = []
-                for i in card:
-                    w_gu, w_dn = views[hit[i]]
-                    hmid = self._act(torch.nn.functional.linear(xc, w_gu.float()), None)
-                    rows.append(torch.nn.functional.linear(hmid.float(), w_dn.float()))
-                back = torch.cat(rows, 0).cpu()
+        # the experts seated on the card: multiplied there as the host multiplies them (`_seated`), the row back
+        card = [i for i, e in enumerate(hit) if e in views and on_card_device(views[e][0]) is not None]
+        if card:
+            xc = (x if x_card is None else x_card).reshape(1, -1)
+            back = self._seated([xc] * len(card), [views[hit[i]] for i in card], dt, [hit[i] for i in card])
             for r, i in enumerate(card):
-                out[i] = back[r].to(dt) * weights[slot[hit[i]]]
+                out[i] = self._down(back[r][0], hit[i], dt) * weights[slot[hit[i]]]
 
         def stage(pos: Any, ws: Any) -> None:
             if not pos:
@@ -338,8 +449,7 @@ class _Experts(torch.nn.Module):
             h = self._act(gu_buf[pos].to(dt), rows).float().contiguous()
             gemv_group([w[1] for w in ws], [h[j : j + 1] for j in range(len(pos))], [dn_buf[i : i + 1] for i in pos])
             for _j, i in enumerate(pos):
-                o = dn_buf[i] + self._bias(self.down_proj_bias, hit[i], dn_buf) if self.biased else dn_buf[i]
-                out[i] = o.to(dt) * weights[slot[hit[i]]]
+                out[i] = self._down(dn_buf[i], hit[i], dt) * weights[slot[hit[i]]]
 
         ready = [i for i, e in enumerate(hit) if e in views and i not in card]
         stage(ready, [views[hit[i]] for i in ready])
@@ -440,6 +550,12 @@ class _Experts(torch.nn.Module):
         if isinstance(w, MxGateUp):
             return self._join(self._linear(x, w.gate), self._linear(x, w.up))
         if isinstance(w, MxWeight):
+            seat = on_card_device(w)
+            kern = Native.card_kernels() if seat is not None else None
+            if kern is not None:
+                # seated on the card: the host kernel's bits there (`gemv_lane16_mx4`), the rows brought to it
+                self.sm._tag(PassTag.EXPERT_MXFP4_ASSTORED)
+                return lane16(kern, w, x.float().to(seat).contiguous()).to(x.device).to(x.dtype)
             # the MXFP4 kernel widens a column tile once and reuses it over the batch tile, so it is the
             # path at every batch size and a row's value does not depend on how many rows travel with it
             kernel = Native.gemv_mx4_ggml if w.ggml else Native.gemv_mx4
@@ -450,7 +566,7 @@ class _Experts(torch.nn.Module):
                 return y.to(x.device).to(x.dtype)
             return torch.nn.functional.linear(x.float().cpu(), w.dequantize(torch.float32)).to(x.device).to(x.dtype)
         if isinstance(w, F8Weight):
-            self.sm._tag(PassTag.FP8_ASSTORED if Native.gemv_fp8 is not None else PassTag.FP8_WIDENED)
+            self.sm._tag(PassTag.EXPERT_FP8_ASSTORED if Native.gemv_fp8 is not None else PassTag.EXPERT_FP8_WIDENED)
             if Native.gemv_fp8 is not None:
                 y = torch.empty(x.shape[0], w.shape[0], dtype=torch.float32)
                 Native.gemv_fp8(w, x.float().contiguous().cpu(), y)
@@ -464,9 +580,291 @@ class _Experts(torch.nn.Module):
             return torch.nn.functional.linear(x.float(), w.float()).to(x.dtype)
         return torch.nn.functional.linear(x, w.to(x.device, non_blocking=True).to(x.dtype))
 
-    def forward(
-        self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
+    def _depot_for(self, x: torch.Tensor, on_host: bool) -> Any:
+        """the depot of a layer-by-layer prefill on the card, where this call's rows are on the card"""
+        return getattr(self.sm, "_depot", None) if (not on_host and x.device.type == "cuda") else None
+
+    def _grouped_ok(self, x: torch.Tensor) -> bool:
+        """whether a call's experts can go as grouped matmuls on the card: bf16 experts, MXFP4 ones in the
+        checkpoint's layout (gpt-oss's, their biases and gate with them) or FP8 ones, over bf16 rows, where the torch
+        build has the grouped matmul (`BTB_GROUPED_EXPERTS=0` keeps the per-expert loop)"""
+        return (
+            x.dtype == torch.bfloat16
+            and not self.ggml
+            and bool(getattr(self.sm, "grouped_experts", False))
+            and hasattr(torch, "_grouped_mm")
+        )
+
+    def _card_grouped(
+        self,
+        x: torch.Tensor,
+        w_top: torch.Tensor,
+        top_k_index: torch.Tensor,
+        hit: Any,
+        views: Any,
+        pending: Any,
+        store: Any,
+        depot: Any,
+        final: torch.Tensor,
+        seated: set[int] | None = None,
+        buf: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """A call's experts on the card as grouped matmuls over the depot's stacked slots, a wave at a time: the
+        experts already in RAM, then each batch as it lands from the drive, each wave placed on the card
+        (`LayerDepot.place`) and multiplied as one gate_up, one gate and one down over the slots it took - a few
+        launches a wave where the per-expert loop took ~10 an expert. A slot's rows are its expert's in the order
+        `torch.where` lists them, and the grouped matmul's product over them is the per-expert one bit for bit on
+        the card, so each (row, pick) contribution is the loop's. They are summed as the loop sums them: each row's
+        in ascending expert order, from zero, one add at a time (a row's picks are distinct, so its k
+        contributions fill `k` places, ranked by expert). The places are `buf`, returned unsummed: a call the store
+        serves in waves passes the one buffer to each, and sums it once they are all in (`_waves`), so the experts a
+        depot seat brings with the first wave are still added in their rank among the later waves'. An expert already
+        on the card (a VRAM seat, no bytes the depot could place) is multiplied where it is, as the loop multiplies it.
+
+        MXFP4 experts (gpt-oss's) and FP8 ones cross the bus as stored and are widened to bf16 on the card
+        `WIDEN_BATCH` at a time - MXFP4 by `dequant_blocks` (exact: every value times its power-of-two scale is a
+        bf16), FP8 by `fp8.held` (the nearest bf16 to e4m3 times its scale, the weight every tier reads) - their biases
+        added and their gate taken per row. The per-expert loop multiplies them on the host's kernels in float32 and
+        hands the card the bf16 of it, so the steps are the loop's, dtype for dtype; only the order of the float32
+        sums inside a product differs, and with it now and then a bf16's last bit."""
+        self.sm._tag(PassTag.EXPERT_CARD_GROUPED)
+        if self.mx:
+            self.sm._tag(PassTag.EXPERT_MXFP4_DEQUANT)  # widened on the card, `dequant_blocks`
+        elif self.f8:
+            self.sm._tag(PassTag.EXPERT_FP8_WIDENED)  # widened on the card, `fp8.held`
+        T, k = int(top_k_index.shape[0]), int(top_k_index.shape[1])
+        pos_s, row_s, offs, counts = group_picks(top_k_index, self.num_experts)
+        ranks = torch.argsort(torch.argsort(top_k_index, dim=1), dim=1)
+        # zeros: a call served in waves (`StoreCall.wave`) fills here only its wave's picks, the others' adding nothing
+        if buf is None:
+            buf = torch.zeros(T, k, x.shape[-1], dtype=final.dtype, device=x.device)
+        places = buf
+
+        def on_card(e: int, w_gu: Any, w_dn: Any) -> None:
+            """expert `e` from weights already on the card, as `_loop` multiplies it, into its rows' places"""
+            a, n = offs[e], counts[e]
+            rows, poss = row_s[a : a + n], pos_s[a : a + n]
+            h = self._linear(self._act(self._linear(x.index_select(0, rows), w_gu), e), w_dn)
+            if self.biased:
+                h = h + self._bias(self.down_proj_bias, e, h)
+            places[rows, ranks[rows, poss]] = (h * w_top[rows, poss, None]).to(places.dtype)
+
+        def wave(items: list[tuple[int, Any, Any]]) -> None:
+            for e, gu, dn in items:
+                if gu is not None and stored_parts(gu, dn) is None:
+                    on_card(e, gu, dn)
+            items = [it for it in items if it[1] is None or stored_parts(it[1], it[2]) is not None]
+            while items:
+                slots = depot.place(self.layer, items)
+                if not any(sl is not None for sl in slots):
+                    raise RuntimeError(f"[experts] layer {self.layer}: no expert of the wave has a place on the card")
+                # one grouped matmul a block the wave touched, its experts in their rows' order there
+                by_block: dict[int, list[tuple[int, int]]] = {}
+                for (e, _gu, _dn), sl in zip(items, slots, strict=True):
+                    if sl is not None:
+                        b, row = depot.where[sl]
+                        by_block.setdefault(b, []).append((row, e))
+                for b, local in sorted(by_block.items()):
+                    local.sort()
+                    if self.mx or self.f8:
+                        for a in range(0, len(local), self.WIDEN_BATCH):
+                            multiply(depot.blocks[b], local[a : a + self.WIDEN_BATCH])
+                    else:
+                        multiply(depot.blocks[b], local)
+                items = [it for it, sl in zip(items, slots, strict=True) if sl is None]
+
+        def multiply(stacks: list[torch.Tensor], placed: list[tuple[int, int]]) -> None:
+            """the grouped products of `placed` (row, expert) of one block's `stacks`, in row order, into their
+            rows' places"""
+            if self.mx or self.f8:
+                # the batch's bytes widened: one group an expert, in the batch's order
+                idx = torch.tensor([sl for sl, _e in placed], dtype=torch.int32, device=x.device)
+                n = len(placed)
+                kern = Native.card_kernels() if self.mx else None
+                if kern is not None:
+                    # straight from the depot's stacks in one pass, no gathered copy of the bytes
+                    gu_w, dn_w = (
+                        kern.mx4_widen(stacks[2 * i], stacks[2 * i + 1], idx).view(n, rows, cols)
+                        for i, (rows, cols) in enumerate(store.mx_shapes())
+                    )
+                elif self.mx:
+                    gu_w, dn_w = (
+                        dequant_blocks(
+                            stacks[2 * i].index_select(0, idx).view(n, rows, cols // 32, 16),
+                            stacks[2 * i + 1].index_select(0, idx).view(n, rows, cols // 32),
+                        ).reshape(n, rows, cols)
+                        for i, (rows, cols) in enumerate(store.mx_shapes())
+                    )
+                else:
+                    gu_w, dn_w = (
+                        fp8.held(
+                            stacks[2 * i].index_select(0, idx).view(n, rows, cols),
+                            stacks[2 * i + 1].index_select(0, idx),
+                        )
+                        for i, (rows, cols) in enumerate(store.f8_shapes())
+                    )
+                per = [counts[e] for _sl, e in placed]
+            else:
+                gu_w, dn_w = stacks[0], stacks[1]
+                per = [0] * int(gu_w.shape[0])
+                for sl, e in placed:
+                    per[sl] = counts[e]
+            rows_l, poss_l = [], []
+            for _sl, e in placed:
+                a, n = offs[e], counts[e]
+                rows_l.append(row_s[a : a + n])
+                poss_l.append(pos_s[a : a + n])
+            rows, poss = torch.cat(rows_l), torch.cat(poss_l)
+            ends = torch.tensor(list(accumulate(per)), dtype=torch.int32).to(x.device, non_blocking=True)
+            # each row's expert: the biases' rows, and what `_act` reads them by
+            who = top_k_index[rows, poss]
+            h = torch._grouped_mm(x.index_select(0, rows), gu_w.transpose(1, 2), offs=ends)
+            h = self._act(h, who)
+            y = torch._grouped_mm(h, dn_w.transpose(1, 2), offs=ends)
+            if self.biased:
+                y = y + self._bias(self.down_proj_bias, who, y)
+            places[rows, ranks[rows, poss]] = (y * w_top[rows, poss, None]).to(places.dtype)
+
+        # the experts seated on the card by an earlier chunk (no bytes in RAM: `place` finds their seats) and
+        # those in RAM, then each batch as it lands
+        wave([(e, *views[e]) if e in views else (e, None, None) for e in hit if e in views or e in (seated or ())])
+        for batch in store.landed(pending) if pending else ():
+            wave([(e, *store._views(s)) for e, _f, s in batch])
+        depot.settle()
+        return places
+
+    def _waves(
+        self,
+        x: torch.Tensor,
+        w_top: torch.Tensor,
+        top_k_index: torch.Tensor,
+        expert_mask: torch.Tensor,
+        hidden_states: torch.Tensor,
+        now: list[int],
+        views: Any,
+        pending: Any,
+        call: StoreCall | None,
+        store: Any,
+        final: torch.Tensor,
+        seated: set[int] | None = None,
+        x_card: torch.Tensor | None = None,
+    ) -> None:
+        """A call of many rows over its experts, in the waves the store serves it (`StoreCall.wave`): each wave's experts
+        multiplied - as grouped matmuls on the card through the depot, or the per-expert loop - and added into
+        `final`, the next wave asked for once these are done with. Each wave is a prefix of the call's ascending
+        experts, so a row's contributions are added in ascending expert order across the waves, as in one pass.
+        `seated`: the experts the depot holds on the card for this layer already, not asked of the store - the
+        grouped path's, placed from their seats with the first wave"""
+        on_host = x.device.type == "cpu" and hidden_states.device.type != "cpu"
+        # experts seated on the card: the depot took this layer's form in an earlier chunk, so the path is grouped
+        grouped: bool | None = True if seated else None
+        # the grouped waves' places, one buffer for the call: summed once every wave is in
+        buf: torch.Tensor | None = None
+        while True:
+            depot = self._depot_for(x, on_host)
+            if grouped is None:
+                # the depot takes this form at all (its scratch slots, where the ledger has them): the loop where it
+                # cannot - the form read off an expert in RAM, or off the first one still coming from the drive
+                grouped = bool(
+                    depot is not None
+                    and self._grouped_ok(x)
+                    and all(stored_parts(*v) is not None for v in views.values())
+                    and (bool(views) or bool(pending))
+                    and depot.takes(
+                        stored_parts(*(next(iter(views.values())) if views else store._views(pending[0][2])))
+                    )
+                )
+            if grouped:
+                buf = self._card_grouped(x, w_top, top_k_index, now, views, pending, store, depot, final, seated, buf)
+                seated = None  # placed with the first wave
+            else:
+                self._loop(x, w_top, top_k_index, expert_mask, hidden_states, now, views, pending, store, final, x_card)
+            if call is None or call.done:
+                if buf is not None:
+                    # each row's contributions in ascending expert order, from zero, one add at a time
+                    for j in range(int(buf.shape[1])):
+                        final.add_(buf[:, j])
+                return
+            # this wave's experts are done with (the depot's copies out of their slots landed): the store may seat
+            # the next wave in their slots
+            asked = list(call.rest)
+            views, pending = call.wave()
+            left = set(call.rest)
+            now = [e for e in asked if e not in left]
+
+    def _loop(
+        self,
+        x: torch.Tensor,
+        w_top: torch.Tensor,
+        top_k_index: torch.Tensor,
+        expert_mask: torch.Tensor,
+        hidden_states: torch.Tensor,
+        hit: list[int],
+        views: Any,
+        pending: Any,
+        store: Any,
+        final: torch.Tensor,
+        x_card: torch.Tensor | None = None,
+    ) -> None:
+        """the per-expert loop over `hit`: each expert's rows multiplied on its own and added into `final` in
+        ascending expert order; `x_card` the rows where they are on the card too (a seated expert reads them there)"""
+        dev = hidden_states.device
+        on_host = x.device.type == "cpu" and dev.type != "cpu"
+        contrib = {}
+        # a prefill sweeping this layer's chunks on the card: the layer's experts cross the bus once for them all
+        depot = self._depot_for(x, on_host)
+        # rows on the card: every expert's rows found by one sort there, not a host lookup and a copy an expert,
+        # each of which waited for the card to finish what was queued before it
+        groups = group_picks(top_k_index, self.num_experts) if x.device.type != "cpu" else None
+
+        def run(e: int, w_gu: Any, w_dn: Any) -> None:
+            if groups is not None:
+                pos_s, row_s, offs, counts = groups
+                a, n = offs[e], counts[e]
+                top_k_pos, token_idx = pos_s[a : a + n], row_s[a : a + n]
+            else:
+                top_k_pos, token_idx = torch.where(expert_mask[e])
+                if not on_host:
+                    top_k_pos, token_idx = top_k_pos.to(dev), token_idx.to(dev)
+            if depot is not None:
+                w_gu, w_dn = depot.get(self.layer, e, w_gu, w_dn)
+            seat = on_card_device(w_gu)
+            if seat is not None and x.device != seat:
+                # an expert seated on the card while the rows are on the host: its rows multiplied there as the host
+                # multiplies them (`_seated`), as the one-row path does
+                src = x_card if x_card is not None else hidden_states
+                cur = src[token_idx.to(src.device)]
+                h = self._seated([cur], [(w_gu, w_dn)], x.dtype, [e])[0].to(x.device).to(x.dtype)
+            else:
+                cur = x[token_idx]
+                h = self._act(self._linear(cur, w_gu), e)
+                h = self._linear(h, w_dn)
+            if self.biased:
+                h = h + self._bias(self.down_proj_bias, e, h)
+            contrib[e] = (token_idx, h * w_top[token_idx, top_k_pos, None])
+
+        for e in hit:
+            if e in views:
+                run(e, *views[e])
+        for batch in store.landed(pending) if pending else ():
+            for e, _f, s in batch:
+                run(e, *store._views(s))
+        if depot is not None:
+            depot.settle()
+        for e in hit:
+            token_idx, h = contrib[e]
+            final.index_add_(0, token_idx, h.to(final.dtype))
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+        x_card: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """the call's routed experts over its rows: [T, H] in the rows' dtype, summed in ascending expert order.
+        `x_card`: the rows on the card too, where the caller holds them there (a card program's) - an expert seated
+        on the card reads them there"""
         t0 = time.perf_counter()
         dev = hidden_states.device
         probe = getattr(self.sm, "expert_probe", None)
@@ -490,31 +888,15 @@ class _Experts(torch.nn.Module):
         x = hidden_states.cpu() if on_host else hidden_states
         w_top = top_k_weights.cpu() if on_host else top_k_weights
         final = torch.zeros_like(x)
+        top_host = top_k_index.cpu()  # the picks on the host: the mask's, and the profile's record of the call
         with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(top_k_index.cpu(), num_classes=self.num_experts).permute(2, 1, 0)
+            expert_mask = torch.nn.functional.one_hot(top_host, num_classes=self.num_experts).permute(2, 1, 0)
             expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
         hit = [int(e[0]) for e in expert_hit]
         store = self.sm.expert_store
         pending = []
         w0 = 0.0
-        if store is not None:
-            self.sm._tag(PassTag.EXPERT_STORE, store.res_tag)  # the slots, under the policy the store was built on
-            keep = hidden_states.shape[0] < Native.gemm_rows or bool(getattr(self.sm, "_sweep_keep", False))
-            if hidden_states.shape[0] < Native.gemm_rows:
-                # the Timetable: the next layers' picks from this layer's input (one row, or a verify pass's few),
-                # read ahead while this layer runs
-                store.lookahead(self.layer, hidden_states)
-            views, pending = store.get(self.layer, self.base, hit, keep=keep, rows=int(hidden_states.shape[0]))
-            per_expert = store.per
-            w0 = store.stat["wait_s"]
-        else:
-            self.sm._tag(PassTag.EXPERT_TABLES)  # no store: the checkpoint's expert tables, held whole
-            gu, dn = self._tables()
-            views = {e: (gu[e], dn[e]) for e in hit}
-            if self.mx or self.f8:
-                per_expert = gu[0].nbytes + dn[0].nbytes
-            else:
-                per_expert = (gu.shape[1] * gu.shape[2] + dn.shape[1] * dn.shape[2]) * gu.element_size()
+        keep = True
         # FP8 experts have no MLX matvec: they stay on the host's FP8 kernels
         use_mlx = (
             self.sm.mlx is not None
@@ -533,40 +915,54 @@ class _Experts(torch.nn.Module):
             and hit
             and len(hit) == top_k_index.shape[1]
         )
+        if store is not None:
+            self.sm._tag(PassTag.EXPERT_STORE, store.res_tag)  # the slots, under the policy the store was built on
+            keep = hidden_states.shape[0] < Native.gemm_rows or bool(getattr(self.sm, "_sweep_keep", False))
+            if hidden_states.shape[0] < Native.gemm_rows:
+                # the Timetable: the next layers' picks from this layer's input (one row, or a verify pass's few),
+                # read ahead while this layer runs
+                store.lookahead(self.layer, hidden_states)
+            # the depot as the tier the call asks first: a chunk of a layer-by-layer prefill after the layer's first
+            # multiplies the experts an earlier chunk seated on the card from their seats, so the store is asked only
+            # for the rest - held in RAM chunk after chunk too, a store below the layer's experts read the whole layer
+            # from the drive again every chunk. Only where the grouped path is certain (the loop needs every view)
+            depot = self._depot_for(x, on_host) if not (use_mlx or grouped) and self._grouped_ok(x) else None
+            seated = depot.seated(self.layer) & set(hit) if depot is not None else set()
+            ask = [e for e in hit if e not in seated] if seated else hit
+            call = store.call(self.layer, self.base, ask, keep=keep, rows=int(hidden_states.shape[0]))
+            # the MLX and one-row paths multiply the call's experts together: all of them seated at once, or the call
+            # refused; the rest in the waves the store can seat
+            views, pending = call.whole() if (use_mlx or grouped) else call.wave()
+            if getattr(self.sm, "_sweep_ahead", False) and store.sweep_layer != self.layer:
+                # a layer-by-layer prefill at this layer's first chunk: its reads are queued, and the next layer's
+                # experts are read ahead behind them while this layer's chunks compute
+                store.sweep_layer = self.layer
+                store.lookahead(self.layer, hidden_states, sweep=len(hit))
+            per_expert = store.per
+            w0 = store.stat["wait_s"]
+        else:
+            self.sm._tag(PassTag.EXPERT_TABLES)  # no store: the checkpoint's expert tables, held whole
+            gu, dn = self._tables()
+            views = {e: (gu[e], dn[e]) for e in hit}
+            call = None
+            seated = set()
+            if self.mx or self.f8:
+                per_expert = gu[0].nbytes + dn[0].nbytes
+            else:
+                per_expert = (gu.shape[1] * gu.shape[2] + dn.shape[1] * dn.shape[2]) * gu.element_size()
+        # the experts of this wave (the call's whole, unless the store serves it in turn)
+        left = set(call.rest) if call is not None else set()
+        now = [e for e in hit if e not in left]
         if use_mlx:
             self._mlx_forward(x, w_top, expert_mask, hit, views, pending, store, final)
         elif grouped:
-            self._one_row(x, w_top, top_k_index, hit, views, pending, store, final, hidden_states if on_host else None)
+            card_rows = x_card if x_card is not None else (hidden_states if on_host else None)
+            self._one_row(x, w_top, top_k_index, hit, views, pending, store, final, card_rows)
         else:
-            contrib = {}
-
-            def run(e: int, w_gu: Any, w_dn: Any) -> None:
-                top_k_pos, token_idx = torch.where(expert_mask[e])
-                if not on_host:
-                    top_k_pos, token_idx = top_k_pos.to(dev), token_idx.to(dev)
-                if isinstance(w_gu, torch.Tensor) and w_gu.device.type != "cpu" and x.device != w_gu.device:
-                    # an expert seated on the card while the rows are on the host: its rows go to the card and
-                    # are multiplied there in float32 over the stored bf16, as the one-row path does
-                    cur = hidden_states[token_idx.to(hidden_states.device)].float()
-                    h = self._act(torch.nn.functional.linear(cur, w_gu.float()), None)
-                    h = torch.nn.functional.linear(h.float(), w_dn.float()).to(x.device).to(x.dtype)
-                else:
-                    cur = x[token_idx]
-                    h = self._act(self._linear(cur, w_gu), e)
-                    h = self._linear(h, w_dn)
-                if self.biased:
-                    h = h + self._bias(self.down_proj_bias, e, h)
-                contrib[e] = (token_idx, h * w_top[token_idx, top_k_pos, None])
-
-            for e in hit:
-                if e in views:
-                    run(e, *views[e])
-            for batch in store.landed(pending) if pending else ():
-                for e, _f, s in batch:
-                    run(e, *store._views(s))
-            for e in hit:
-                token_idx, h = contrib[e]
-                final.index_add_(0, token_idx, h.to(final.dtype))
+            self._waves(
+                x, w_top, top_k_index, expert_mask, hidden_states, now, views, pending, call, store, final, seated,
+                x_card,
+            )  # fmt: skip
         st = self.sm.expert_stat
         st["experts"] += len(hit)
         st["bytes"] += len(hit) * per_expert
@@ -578,8 +974,9 @@ class _Experts(torch.nn.Module):
                 prof.CALL,
                 self.layer,
                 expert=int(hidden_states.shape[0]),
-                nbytes=len(hit) - len(pending),
-                shard=len(pending),
+                nbytes=len(hit) - (call.read if call is not None else len(pending)),
+                shard=call.read if call is not None else len(pending),
+                offset=prof.keep_picks(top_host),
                 dur_ns=int((store.stat["wait_s"] - w0) * 1e9),
             )
         if self.sm.expert_trace is not None:

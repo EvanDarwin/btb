@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 import torch
 
-from .. import pool
+from .. import pool, trace
 from ..kinds import LayerKind, Log, Tier
 from ..options import Device, DeviceName
 from ..sysinfo import (
@@ -58,6 +58,16 @@ class PlanError(MemoryGrantError):
     """A placement the host cannot carry: the memory above the floor does not hold the smallest working set a
     plan needs - the ring's slots, the head and the drafter where they run on the host, the cache's first rows,
     the staging a streamed layer crosses through. Raised before anything is loaded, naming the shortfall."""
+
+
+def drafts(probe: Any, mlx: bool, speculate: bool = True) -> bool:
+    """whether a load of `probe` runs the checkpoint's drafting head, the only case its bytes are placed anywhere:
+    speculation asked for with it as the proposer (`speculate`), `mtp.*` weights in the checkpoint, a drafter the
+    family builds over them, and a verify pass the family runs on this tier (`Family.speculates`)"""
+    if not speculate or not any(k.startswith("mtp.") for k in probe.weight_map):
+        return False
+    fam: Any = getattr(probe, "fam", None)
+    return callable(getattr(fam, "drafter_cls", None)) and fam.drafter_cls() is not None and bool(fam.speculates(mlx))
 
 
 @dataclass(frozen=True)
@@ -176,7 +186,7 @@ class Plan:
     drafter_on_card: bool
     prefill_card: bool
     kv_host: bool
-    has_mtp: bool
+    has_mtp: bool  # the load runs the drafting head (`drafts`): only then is it priced, on the card or the host
     moe: bool
     predicted_ms_per_token: float
     bytes: PlanBytes
@@ -185,6 +195,8 @@ class Plan:
     budget: HostBudget | None = None
     drive: DriveBenchmark | None = None  # the drive's measurement where layers stream from it
     gpu_bps: float | None = None  # Apple silicon's GPU read rate (`btb.mlx.read_bps`) an MLX plan is priced at
+    # the card has room for the prefill's templates, whether or not this plan leaves any host layer to prefill
+    prefill_card_room: bool = False
 
     def __str__(self) -> str:
         b = self.bytes
@@ -328,6 +340,7 @@ class BatchScheduler:
         else the larger of `RAM_FLOOR_SHARE` of the available RAM and the OS's figure plus the run's `growth`.
         The floor moves the plan's bottom line only; the run still gives memory back under pressure."""
         os_floor = int(os_memory_floor())
+        # free-read: the plan's host budget, measured before the model and its ledger exist
         available = int(host_free_bytes()) + int(pool.POOL.free_bytes())
         floor = (
             int(float(floor_gb) * 2**30)
@@ -337,6 +350,7 @@ class BatchScheduler:
         return HostBudget(
             total=int(host_total_bytes()),
             available=available,
+            # free-read: the plan's host budget, measured before the model and its ledger exist
             commit=int(host_commit_bytes()),
             footprint=int(process_working_set_bytes()),
             os_floor=os_floor,
@@ -440,7 +454,13 @@ class BatchScheduler:
         hq = int(c.num_attention_heads)
         hk = int(getattr(c, "num_key_value_heads", None) or hq)
         d = int(getattr(c, "head_dim", None) or c.hidden_size // hq)
-        n_attn = sum(1 for lt in self.sm.layer_types if lt != LayerKind.LINEAR)
+        attn = [i for i, lt in enumerate(self.sm.layer_types) if lt != LayerKind.LINEAR]
+        resident = getattr(self.sm, "resident", None)
+        if self.sm.dev.type == Device.CUDA and resident is not None:
+            # the epoch's KV is reserved on the card: only the layers whose rows live there - the resident ones,
+            # unless `kv_host` keeps even theirs on the host. A host layer's rows live on the host (`_kv_home`); priced on the card they were a phantom reservation (about 1.2 GB for a 120B at 16k)
+            attn = [] if getattr(self.sm, "kv_host", False) else [i for i in attn if i in resident]
+        n_attn = len(attn)
         dt = self.sm.compute_dtype if self.sm.compute_dtype is not None else torch.bfloat16
         el = torch.empty(0, dtype=dt).element_size()
         if getattr(self.sm, "kv_bits", None) == 8:
@@ -451,6 +471,28 @@ class BatchScheduler:
         """The KV one sequence holds when it has run to `target_len` positions."""
         return self._kv_bytes_per_row_token() * max(1, int(target_len))
 
+    def host_kv_row_bytes(self, target_len: int) -> int:
+        """On a card, the KV one sequence holds on the host at `target_len` positions: the rows of the attention
+        layers that live there (`_kv_home`) - a host layer's in the engine's `host_kv_dtype`, a resident one's under
+        `kv_host` in the compute dtype. Nothing off the card, where `kv_row_bytes` counts every layer already."""
+        sm = self.sm
+        resident = getattr(sm, "resident", None)
+        if sm.dev.type != Device.CUDA or resident is None:
+            return 0
+        c = sm.cfg
+        hq = int(c.num_attention_heads)
+        hk = int(getattr(c, "num_key_value_heads", None) or hq)
+        d = int(getattr(c, "head_dim", None) or c.hidden_size // hq)
+        cd = torch.empty(0, dtype=sm.compute_dtype if sm.compute_dtype is not None else torch.bfloat16).element_size()
+        kv_host = bool(getattr(sm, "kv_host", False))
+        hkd = getattr(sm, "host_kv_dtype", None)
+        hel = torch.empty(0, dtype=hkd()).element_size() if callable(hkd) else 4
+        el = 0
+        for i, lt in enumerate(sm.layer_types):
+            if lt != LayerKind.LINEAR:
+                el += (cd if kv_host else 0) if i in resident else hel
+        return 2 * hk * d * el * max(1, int(target_len))
+
     def free_vram(self) -> int | None:
         """VRAM free right now above the engine's reserve, or None off the card (the host tier is bound by
         CPU throughput, not KV memory, so it does not size a batch this way)."""
@@ -458,27 +500,30 @@ class BatchScheduler:
             return None
         return self.free_for(None)
 
-    def free_for(self, device: Any = None) -> int | None:
+    def free_for(self, device: Any = None, draws: str | None = EPOCH) -> int | None:
         """What an allocation on `device` (the engine's own when None) may take: the card's free VRAM above
         the engine's margin, MLX's ledger on the unified device (the host and the GPU spend one pool), or the
         host's free RAM above the engine's RAM reserve. None when nothing here can price the device. The
         arithmetic is the device's (`Device.free`), the one ledger the plan and the memory policy read too:
-        less what rooms and loans are promised, all but the epoch's own KV, which its cache's growth spends. An
-        engine built without one (a stub under test) is priced the same way directly."""
+        less what rooms and loans are promised, all but the reservation `draws` (the epoch's KV by default, which
+        its cache's growth spends). An engine built without one (a stub under test) is priced the same way
+        directly."""
         dv = getattr(self.sm, "device", None)
         if dv is not None:
-            return dv.free(device, unreserved=True, own=EPOCH)
+            return dv.free(device, unreserved=True, own=draws or None)
         from .device import free_bytes, torch_device
 
         dev = self.sm.dev if device is None else torch_device(device)
         if dev.type == Device.CUDA:
             if self.sm.dev.type != Device.CUDA:
                 return None
+            # free-read: a scheduler over a model that is not btb's (`for_model`): it has no ledger to read
             return free_bytes(dev, int(getattr(self.sm, "vram_margin", 0) or 0))
         if getattr(self.sm, "mlx", None) is not None:
             # unified memory: the engine's own ledger - the RAM the load started with, less the reserve, less
             # everything MLX holds (exact whether or not the pages are touched; see the expert store)
             return max(0, int(self.sm.mem_start) - int(self.sm.ram_reserve) - int(self.sm.mlx.held_bytes()))
+        # free-read: a scheduler over a model that is not btb's (`for_model`): it has no ledger to read
         return max(0, host_free_bytes() - int(getattr(self.sm, "ram_reserve", 0) or 0))
 
     def grant(
@@ -491,34 +536,79 @@ class BatchScheduler:
         cap: int | None = None,
         bound: int | None = None,
         device: Any = None,
+        held: int = 0,
+        draws: str | None = None,
+        reclaim: bool = False,
     ) -> None:
         """Ask before allocating: returns on a request the engine can afford, raises `MemoryGrantError` on one
         it cannot. One free-memory read: for an allocation path (a growth, a tier load), never a per-token one.
+        `reclaim`: a host request the room does not hold has the expert store give blocks back for it first (it
+        grows into whatever RAM is free, as a cache); only for a caller outside any store call, since a block given
+        back mid-call could take experts the call is still multiplying.
         A `kv` request whose per-row capacity `cap` is past `bound` (the length the sequence itself can reach)
-        is refused whatever its size: a growth bug, not a need. A large but affordable request is logged."""
+        is refused whatever its size: a growth bug, not a need. A large but affordable request is logged.
+
+        `draws` names the reservation the allocation is made out of: its room is the caller's own to take, and
+        what the allocation adds - `nbytes` less the `held` bytes of the buffer it replaces, freed once it is
+        filled - comes off it, so the memory is counted once. A `kv` request draws on the epoch's KV unless it names
+        another; `""` draws on none (a copy or a move of rows the epoch already counted). A request that fits only
+        by counting torch's cached blocks has them given back to the driver first: the allocation is then made from
+        free memory, not by torch's allocator failing and emptying its cache to retry."""
         nbytes = int(nbytes)
         who = requester or kind
+        tag = (EPOCH if kind == "kv" else None) if draws is None else (draws or None)
         if kind == "kv" and cap and bound and int(cap) > int(bound):
             raise MemoryGrantError(
                 f"[grant] REFUSED {who}: kv cap {int(cap)} rows past the sequence ceiling {int(bound)} "
                 f"(B={int(B)}, {_size(nbytes)}) - the buffer is growing past anything these rows reach"
             )
-        free = self.free_for(device)
+        free = self.free_for(device, tag)
         if free is None:
             return
         from .device import torch_device
 
         dev = self.sm.dev if device is None else torch_device(device)
+        store = getattr(self.sm, "expert_store", None)
+        if reclaim and nbytes > free and dev.type == Device.CPU and store is not None:
+            store.release(nbytes)
+            free = self.free_for(device, tag) or 0
         # the card's margin is its OOM guard and the host's floor is the OS's own (or the one --ram-reserve
         # names): a request past either is refused
         if nbytes > free:
+            # the refusal's words travel with it: whoever catches it says them (a trace here said them twice)
             raise MemoryGrantError(
-                f"[grant] REFUSED {who}: {kind} {_size(nbytes)} on {dev}, only {_size(free)} free{self._ledger_line()}"
+                f"[grant] REFUSED {who}: {kind} {_size(nbytes)} on {dev}, only {_size(free)} free"
+                f"{self._held_line(dev, tag)}{self._ledger_line()}"
             )
-        tag = f"{kind}@{dev.type}"
-        self.granted[tag] = self.granted.get(tag, 0) + nbytes
+        seen = f"{kind}@{dev.type}"
+        self.granted[seen] = self.granted.get(seen, 0) + nbytes
         if free and nbytes >= self.warn_fraction * free:
             self.sm.log(f"[grant] LARGE {who}: {kind} {_size(nbytes)} of {_size(free)} free")
+        elif trace.ON and nbytes >= 16 << 20:  # the trace's floor: the scratch's small takes would bury the rest
+            trace.event(
+                "grant: %s %s on %s for %s (%s free)%s",
+                kind,
+                _size(nbytes),
+                dev,
+                who,
+                _size(free),
+                f", replacing {_size(int(held))}" if held else "",
+            )
+        dv = getattr(self.sm, "device", None)
+        if dv is None:
+            return
+        if tag is not None:
+            dv.spend(tag, max(0, nbytes - int(held)), dev)
+        if dev.type == Device.CUDA and nbytes > int(dv.free(dev, unreserved=True, own=tag, pooled=True) or 0):
+            trim = getattr(self.sm, "vram_trim", None)
+            if trim is not None:
+                trim("grant")
+
+    def _held_line(self, dev: Any, draws: str | None) -> str:
+        """what the ledger holds spoken for on `dev` past the room the request draws on: who took the room"""
+        dv = getattr(self.sm, "device", None)
+        held = {k: n for k, n in dv.spoken_for(dev).items() if k != draws} if dv is not None else {}
+        return (" (spoken for there: " + ", ".join(f"{k} {_size(n)}" for k, n in held.items()) + ")") if held else ""
 
     def _ledger_line(self) -> str:
         """on MLX, the arithmetic behind the free figure, which the OS's own count does not show: the RAM at
@@ -534,12 +624,23 @@ class BatchScheduler:
         return ""
 
     def max_batch(self, target_len: int) -> int | None:
-        """Sequences to decode together: what the free VRAM holds for `target_len` positions of KV. None off the
-        card (the host tier scales by its own kernels)."""
+        """Sequences to decode together: what the free VRAM holds for `target_len` positions of KV, and on a card
+        whose layers keep some rows on the host (a host layer's, or every one's under `kv_host`), what the host
+        holds of those - its free memory and what the expert store would give back for them, the store being a cache
+        that grows into whatever RAM is free (`cache_room` has it release blocks for the rows as they grow). None off
+        the card (the host tier scales by its own kernels)."""
         free = self.free_vram()
         if free is None:
             return None
-        return max(1, int(free // max(1, self.kv_row_bytes(target_len))))
+        mb = max(1, int(free // max(1, self.kv_row_bytes(target_len))))
+        host = self.host_kv_row_bytes(target_len)
+        dv = getattr(self.sm, "device", None)
+        if host and dv is not None:
+            store = getattr(self.sm, "expert_store", None)
+            room = int(dv.free(torch.device("cpu"), unreserved=True) or 0)
+            room += int(store.releasable()) if store is not None else 0
+            mb = min(mb, max(1, room // host))
+        return mb
 
     def plan(self, n_pending: int, target_len: int) -> tuple[int, int]:
         """Size the next epoch: at most `n_pending` sequences, at most what the free VRAM holds for
@@ -551,8 +652,12 @@ class BatchScheduler:
         dv = getattr(self.sm, "device", None)
         if dv is not None and mb is not None:
             # the epoch's KV is spoken for from here to `release()`, ahead of the cache allocating it: the
-            # memory policies must not read that room as free and grow a shed layer back into it
+            # memory policies must not read that room as free and grow a shed layer back into it - on the card, and
+            # on the host for the rows that live there, which the store would otherwise grow into
             dv.reserve(EPOCH, self.kv_row_bytes(target_len) * batch)
+            host = self.host_kv_row_bytes(target_len)
+            if host:
+                dv.reserve(EPOCH, host * batch, torch.device("cpu"))
         return batch, target_len
 
     def release(self) -> None:
@@ -576,6 +681,7 @@ class BatchScheduler:
         kv_host: bool | None = None,
         settle_s: float = 30.0,
         drive: DriveBenchmark | None = None,
+        speculate: bool = True,
     ) -> Plan:
         """The placement for `probe` (an engine opened on the CPU to price its layers) against the host budget
         (`budget`, else `measure_host` now, with `os_reserve_gb` as the floor where one is named) and
@@ -587,14 +693,20 @@ class BatchScheduler:
         and keeps RAM only where the layers the cache would evict stream at more a token than the host's
         attention reads at the full context; True or False is the placement asked for. `drive` is the drive's
         measurement to price the cold tier from; None measures it on the model's largest file when the
-        placement streams layers, once per volume for the process (the engine's Route reuses it)."""
+        placement streams layers, once per volume for the process (the engine's Route reuses it). `speculate`: the
+        load decodes speculatively with the drafting head as its proposer (a positive `v_max` and tree budget); off,
+        the drafter is priced nowhere (`drafts`)."""
         name = DeviceName.parse(device)
         card = name is not None and name.kind.card
-        has_mtp = any(k.startswith("mtp.") for k in probe.weight_map)
+        has_mtp = drafts(probe, mlx=name is not None and name.kind is Device.MLX, speculate=speculate)
         if budget is None:
             budget = BatchScheduler.measure_host(os_reserve_gb, BatchScheduler.growth_estimate(probe))
         hb = budget
         ram_gb = hb.available / 2**30
+        from .tiers import card_bps
+
+        # the card's reads priced at its own memory rate (`card_bps`): its layers, the head and the cache it holds
+        gpu = card_bps(str(device)) if name is not None and name.kind is Device.CUDA else None
         price = lambda ram, kv, bps: probe.plan_budget(
             ram,
             vram_gb,
@@ -608,6 +720,7 @@ class BatchScheduler:
             context=int(context or 0),
             kv_host=kv,
             drive_bps=bps,
+            gpu_bps=gpu,
         )
 
         def choose(ram: float, bps: float | None = None) -> tuple[dict[str, Any], bool]:
@@ -679,6 +792,7 @@ class BatchScheduler:
             head_on_card=bool(out["head_on_card"]),
             drafter_on_card=bool(out["drafter_on_card"]),
             prefill_card=bool(out["prefill_card"]),
+            prefill_card_room=bool(out.get("prefill_card_room", out["prefill_card"])),
             kv_host=kv_chosen,
             has_mtp=has_mtp,
             moe=bool(probe.fam.moe),
@@ -984,6 +1098,7 @@ class BatchScheduler:
         on_done: Any = None,
         chunk: int = 0,
         depth: int = 0,
+        cached: bool = False,
     ) -> Future[float]:
         """Queue one read of `n` bytes at `off` of `path` into `dst` and return its future (the read's seconds
         as the result). A read already queued or in flight for the same bytes is not queued twice: its
@@ -991,7 +1106,8 @@ class BatchScheduler:
         `key` names the requester (a layer and expert) so `disk_drop` can withdraw its reads before they are
         issued; `on_done(dur_ns)` runs on the reader thread as the bytes land. `depth` is the reader's own
         parallelism inside the one read (1 for a request that is one of many, the default for a lone big
-        one)."""
+        one). `cached`: read through the system's file cache (`Native.open_cached`), for bytes that come back -
+        an expert missed again - where the cache is RAM the process cannot otherwise hold; else around it."""
         st = self._disk_state()
         # the same bytes into the same place: two experts whose padded spans share a sector are two reads
         k = (path, int(off), int(n), int(dst.data_ptr()))
@@ -1017,6 +1133,7 @@ class BatchScheduler:
                 "key": key,
                 "chunk": int(chunk),
                 "depth": int(depth),
+                "cached": bool(cached),
                 "on_done": [on_done] if on_done is not None else [],
                 "future": Future(),
                 "state": "queued",
@@ -1028,12 +1145,17 @@ class BatchScheduler:
             st["cv"].notify()
         return r["future"]
 
-    def disk_drop(self, key: Any) -> int:
+    def disk_drop(self, key: Any, whole: bool = False) -> int:
         """Withdraw every queued read of `key` (a prediction that lapsed): their futures are cancelled; a read
-        already in flight completes. Returns how many were withdrawn."""
+        already in flight completes. With `whole`, only where none of the key's reads has started - an expert
+        read as several parts is withdrawn entire or not at all, never left with parts that will never land
+        beside ones that do, which its slot's next reader would take for the expert. Returns how many were
+        withdrawn."""
         st = self._disk_state()
         n = 0
         with st["cv"]:
+            if whole and any(r["key"] == key and r["state"] == "inflight" for r in st["reqs"].values()):
+                return 0
             for r in list(st["reqs"].values()):
                 if r["key"] == key and r["state"] == "queued":
                     r["state"] = "dropped"
@@ -1112,6 +1234,7 @@ class BatchScheduler:
                     or r2["state"] != "queued"
                     or r2["ver"] != ver2
                     or path2 != path
+                    or r2["cached"] != r["cached"]
                     or p2 != pri
                     or not (r["off"] < off2 <= end < off2 + r2["n"])
                     or off2 + r2["n"] - r["off"] > self.DISK_MERGE_MAX
@@ -1133,15 +1256,16 @@ class BatchScheduler:
 
         # this reader's own handle per file, share-read, held for the run: an open handle halves a read's cost,
         # and it is one handle a thread because a synchronous handle serializes the reads that share it
-        handles: dict[str, int] = {}
+        handles: dict[tuple[str, bool], int] = {}
 
-        def read(path: str, off: int, n: int, dst: torch.Tensor, chunk: int, depth: int) -> None:
+        def read(path: str, off: int, n: int, dst: torch.Tensor, chunk: int, depth: int, cached: bool) -> None:
             if Native.read_at is None or Native.open is None:
                 Native.read_direct(path, off, n, dst, chunk)
                 return
-            h = handles.get(path)
+            cached = cached and Native.open_cached is not None
+            h = handles.get((path, cached))
             if h is None:
-                h = handles[path] = Native.open(path)
+                h = handles[(path, cached)] = (Native.open_cached if cached else Native.open)(path)
             Native.read_at(h, off, n, dst, chunk, depth)
 
         try:
@@ -1171,11 +1295,11 @@ class BatchScheduler:
         t0 = time.perf_counter_ns()
         try:
             if not partners:
-                read(r["path"], r["off"], r["n"], r["dst"], r["chunk"], r["depth"])
+                read(r["path"], r["off"], r["n"], r["dst"], r["chunk"], r["depth"], r["cached"])
             else:
                 span = partners[-1]["off"] + partners[-1]["n"] - r["off"]
                 run = torch.empty(span, dtype=torch.uint8)
-                read(r["path"], r["off"], span, run, r["chunk"], r["depth"])
+                read(r["path"], r["off"], span, run, r["chunk"], r["depth"], r["cached"])
                 for q in reqs:
                     at = q["off"] - r["off"]
                     q["dst"].copy_(run[at : at + q["n"]])

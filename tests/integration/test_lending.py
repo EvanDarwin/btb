@@ -10,14 +10,14 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Iterator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
 
 from btb.engine import StreamedTextModel
 from btb.engine import device as device_mod
-from btb.engine.cache import ForkLayer, GrowLayer
+from btb.engine.cache import ForkLayer, GrantedIndexedLayer, GrowLayer
 from btb.engine.device import Device
 from btb.engine.host import _HostLinear
 from btb.engine.memory import Room
@@ -40,14 +40,16 @@ def sm(request: pytest.FixtureRequest) -> Iterator[StreamedTextModel]:
 
 
 def squeeze(sm: StreamedTextModel, left: int, mp: pytest.MonkeyPatch) -> None:
-    """leave `left` bytes free on the host, as btb counts it: the host's free RAM pinned at its reading here, as
-    MLX's ledger is its own already - measured against a live reading, any other process's allocation took the
-    last bytes and a decode the test expects to run was refused"""
+    """leave `left` bytes free on the host, as btb counts it: the host's free RAM and the commit left (the ledger's
+    host figure is the smaller of the two) pinned at their readings here, as MLX's ledger is its own already -
+    measured against a live reading, any other process's allocation took the last bytes, or gave some back, and a
+    decode the test expects to run was refused, or one it expects refused ran"""
     if sm.mlx is not None:
         sm.ram_reserve = int(sm.mem_start) - int(sm.mlx.held_bytes()) - left
     else:
-        now = device_mod.host_free_bytes()
+        now, commit = device_mod.host_free_bytes(), device_mod.host_commit_bytes()
         mp.setattr(device_mod, "host_free_bytes", lambda: now)
+        mp.setattr(device_mod, "host_commit_bytes", lambda: commit)
         sm.ram_reserve += max(0, sm.memory()["cpu"].free - left)
 
 
@@ -131,6 +133,50 @@ def test_a_cache_growth_is_priced_before_the_pass(sm: StreamedTextModel, monkeyp
     before = len(asked)
     s.feed([1, 2])
     assert len(asked) == before
+
+
+def test_a_sparse_layers_growth_is_priced_before_the_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """a sparse-attention layer grown by concatenation (Qwen4's) asks the grant inside the pass once a doubling: the
+    room for that ask is made before the pass, as the grant prices it, and what comes off the epoch is what the rows
+    take, never the doubling's room ahead"""
+    with loaded_model(fixture("tiny_q4"), device="cpu") as sm:
+        asked: list[int] = []
+        granted: list[tuple[int, int]] = []  # (bytes asked, bytes of the room they replace)
+        make, real = sm._make_room, sm.scheduler.grant
+
+        def record(dev: torch.device, nbytes: int, what: str, own: str | None = None) -> set[str]:
+            asked.append(nbytes)
+            return make(dev, nbytes, what, own)
+
+        def grant(nbytes: int, kind: str, **kw: Any) -> None:
+            if "sparse-attention layer's cache" in str(kw.get("requester", "")):
+                granted.append((nbytes, int(kw.get("held") or 0)))
+            real(nbytes, kind, **kw)
+
+        monkeypatch.setattr(sm, "_make_room", record)
+        monkeypatch.setattr(sm.scheduler, "grant", grant)
+        s = sm.session(PROMPT)
+        assert granted, "the sparse layers' prefill asked the grant nothing"
+        grew = 0
+        for _ in range(4):
+            asked.clear()
+            n = len(granted)
+            s.feed(PROMPT)
+            if len(granted) > n:
+                grew += 1
+                ask = sum(g for g, _held in granted[n:])
+                assert sum(asked) >= ask, f"{sum(asked)} bytes made room for before the pass, {ask} granted in it"
+        assert grew, "no pass took the sparse layers past their room"
+        assert s.cache is not None
+        rows = sum(
+            t.numel() * t.element_size()
+            for cl in s.cache.layers
+            if isinstance(cl, GrantedIndexedLayer)
+            for t in (cl.keys, cl.values, cl.indexer_keys)
+            if isinstance(t, torch.Tensor)
+        )
+        drawn = sum(g - held for g, held in granted)
+        assert 0 < drawn <= rows, f"the growths drew {drawn} bytes on the epoch; the rows hold {rows}"
 
 
 def test_a_cache_growth_makes_room_instead_of_refusing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -402,8 +448,8 @@ def test_a_layer_move_reaches_every_live_cache() -> None:
         sm._caches_to(0, "meta")
         assert idle.rows(0)[0].device.type == "meta"
         fl = br._check().layers[0]
-        assert isinstance(fl, ForkLayer) and fl.keys.device.type == "meta" and fl._tk is not None
-        assert fl._tk.device.type == "meta"
+        assert isinstance(fl, ForkLayer) and fl.keys.device.type == "meta" and fl._kv is not None
+        assert fl._kv[0].device.type == "meta"
         assert idle.rows(1)[0].device.type == "cpu"
         br.close()
 

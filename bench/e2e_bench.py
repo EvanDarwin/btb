@@ -3,17 +3,21 @@
 
     pytest bench/e2e_bench.py --benchmark-json=e2e.json -q      # (needs the tiny fixtures + a built btb)
 
-Two kinds of timing, all through pytest-benchmark (a stable, statistically-sound utility - no hand-rolled loop):
+Three kinds of timing, all through pytest-benchmark (a stable, statistically-sound utility - no hand-rolled loop):
 
   * the end-to-end generate loop per family (dense, hybrid, the two MoE layouts, Gemma's sandwich/dual-rope,
     gpt-oss sinks) on each device the box has - cpu always, mlx on Apple silicon, cuda on a card;
   * the per-op kernels: the MLX Metal quant matvecs and attention decode (Apple silicon) and the CUDA card
-    gemv (a CUDA box). A kernel's runtime does not depend on the weight VALUES, so these use random inputs - no
-    fixture or real model needed.
+    gemv, attention and grouped expert call (a CUDA box). A kernel's runtime does not depend on the weight
+    VALUES, so these use random inputs - no fixture or real model needed;
+  * the placement group (a CUDA box): each op at the engine's shapes and row counts on the CPU, on the card over
+    weights held in VRAM, and on the card over weights shipped from RAM each call - where an op wins - and, with
+    `--routing DIR/events.npz` (a `--profile DIR` run's), a MoE prefill's recorded expert calls replayed split
+    between the two sides.
 
 The native CPU ops live in Rust criterion (`native/benches/*.rs`, `cargo bench`) - a different toolchain, not
 pytest. `python -m bench.report` compares two runs of both (the base-vs-PR deltas the PR comment renders),
-grouped by each entry's bench group.
+grouped by each entry's bench group, and renders the placement group's crossover from a run's own times.
 
 Not part of `pytest tests` (bench/ is outside testpaths); the bench workflow runs it explicitly.
 """
@@ -21,18 +25,24 @@ Not part of `pytest tests` (bench/ is outside testpaths); the bench workflow run
 from __future__ import annotations
 
 import ctypes
+import gc
 import os
+import threading
 from collections.abc import Callable
-from typing import TYPE_CHECKING, cast
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 import btb
 from btb import mlx as mlxdev
 from btb.engine.native import Native
 from btb.kinds import Quant, QuantClass, latt_backend_key, quants_of
+from btb.mxfp4 import MxWeight
+from btb.mxfp4_torch import dequant_blocks
 from tests.cert.spec import FIXTURE_STEM, Hardware
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -301,6 +311,110 @@ def test_cuda_gemv_bf16(benchmark: object, m: int) -> None:
     benchmark(run)  # type: ignore[operator]
 
 
+# the decode's weight shapes, [R, C], on Qwen3-0.6B: q/k/v as one, the attention's output, gate/up as one, down
+MMA_SHAPES = {"qkv": (4096, 1024), "o": (1024, 2048), "gu": (6144, 1024), "down": (1024, 3072)}
+
+
+@cuda_only
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("rows", [16, 8])
+@pytest.mark.parametrize("warps", [2, 4, 8])
+@pytest.mark.parametrize("shape", list(MMA_SHAPES))
+def test_cuda_gemv_mma(benchmark: object, shape: str, warps: int, rows: int) -> None:
+    """the tensor-core matvec at one row over a decode's weight shapes, by warps and rows a block
+    (`btb_gemv_mma_bf16` at 16, `btb_gemv_mma8_bf16` at 8 - the same bits): a round streams distinct weights past
+    the card's L2 back to back, as a step reads its layers, and the rate is the weights' bytes over the round
+    (`gbps`). A short weight (1024 rows: 64 groups of 16 on a 60-SM card) streams at its best with more warps to a
+    group than a tall one, or more groups"""
+    k = _cuda_kernels()
+    name = "btb_gemv_mma_bf16" if rows == 16 else "btb_gemv_mma8_bf16"
+    if name not in k.fn:
+        pytest.skip(f"{name} is not in this build")
+    R, C = MMA_SHAPES[shape]
+    n = -(-(160 << 20) // (R * C * 2))  # past a 48 MB L2 several times, so every read is the DRAM's
+    ws = [torch.randn(R, C, dtype=torch.bfloat16, device="cuda") for _ in range(n)]
+    x = torch.randn(32, C, dtype=torch.bfloat16, device="cuda")
+    y = torch.empty(32, R, dtype=torch.bfloat16, device="cuda")
+    grid, block = ((R + rows - 1) // rows, 1, 1), (32 * warps, 1, 1)
+    args = [[k.ptr(w), k.ptr(x), k.ptr(y), ctypes.c_int(R), ctypes.c_int(C), ctypes.c_int(1)] for w in ws]
+
+    def body() -> None:
+        for a in args:
+            k.launch(name, grid, block, a)
+
+    # the round as one captured graph, as a step replays its layers: the host's launches out of the time
+    body()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        body()
+
+    def run() -> None:
+        g.replay()
+        torch.cuda.synchronize()
+
+    benchmark.group = f"cuda-gemv-mma-{shape}"  # type: ignore[attr-defined]
+    benchmark(run)  # type: ignore[operator]
+    mean = float(benchmark.stats.stats.mean)  # type: ignore[attr-defined]
+    benchmark.extra_info["gbps"] = round(n * R * C * 2 / mean / 1e9, 1)  # type: ignore[attr-defined]
+
+
+@cuda_only
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("how", ["split", "gqa", "gqa-off"])
+@pytest.mark.parametrize("T", [1, 5])  # the one-row step, a speculative tree's verify
+@pytest.mark.parametrize("n", [128, 512, 1024, 2048, 4096, 8192, 16384, 40960])  # the context the rows attend over
+def test_cuda_attn_gqa(benchmark: object, n: int, T: int, how: str) -> None:
+    """a decode step's attention at Qwen3-0.6B's heads (16 q, 8 kv, d 128): `btb_attn_split_d128`, a block a query
+    head, against `btb_attn_split_gqa2_d128`, a block a KV group reading each key once for its two heads - the same
+    bits (tests/kernels) - and against that kernel below its threshold (`gqa-off`: a block a head, what its
+    registers cost the one-head walk). A round runs one launch a layer over distinct caches past the L2, as a step does, and the
+    rate is the caches' live K/V bytes over the round (`gbps`)."""
+    k = _cuda_kernels()
+    if "btb_attn_split_gqa2_d128" not in k.fn:
+        pytest.skip("the grouped-query attention is not in this build")
+    Hq, Hk, D = 16, 8, 128
+    cap = (n + T + 1023) // 1024 * 1024
+    S = cap // 1024
+    live = 2 * Hk * (n + T) * D * 2
+    layers = min(28, -(-(160 << 20) // live))
+    KV = [torch.randn(2, Hk, cap, D, dtype=torch.bfloat16, device="cuda") for _ in range(layers)]
+    q = torch.randn(T, Hq, D, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty(T, Hq, D, dtype=torch.bfloat16, device="cuda")
+    pm = torch.zeros(S * T * Hq, device="cuda")
+    pl = torch.zeros(S * T * Hq, device="cuda")
+    pa = torch.zeros(S * T * Hq * D, device="cuda")
+    cnt = torch.zeros(T * Hq, dtype=torch.int32, device="cuda")
+    n0 = torch.tensor([n], dtype=torch.int32, device="cuda")
+    par = torch.tensor([-1, 0, 1, 0, 3][:T], dtype=torch.int32, device="cuda")
+    P, I, F = k.ptr, ctypes.c_int, ctypes.c_float
+    name = "btb_attn_split_d128" if how == "split" else "btb_attn_split_gqa2_d128"
+    tail = [I(T), I(Hq), I(Hk), I(cap), F(D**-0.5), P(pm), P(pl), P(pa), P(cnt), I(S), I(0)]
+    # the grouped form's threshold, read on the card as the passes' switch holds it
+    shared = torch.tensor([0 if how == "gqa" else 1 << 30], dtype=torch.int32, device="cuda")
+    tail += [] if how == "split" else [P(shared)]
+    args = [[P(q), P(kv[0]), P(kv[1]), P(out), P(n0), P(par), *tail] for kv in KV]
+
+    def body() -> None:
+        for a in args:
+            k.launch(name, (Hq, T, S), (256, 1, 1), a)
+
+    body()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        body()
+
+    def run() -> None:
+        g.replay()
+        torch.cuda.synchronize()
+
+    benchmark.group = f"cuda-attn-gqa-n{n}-t{T}"  # type: ignore[attr-defined]
+    benchmark(run)  # type: ignore[operator]
+    mean = float(benchmark.stats.stats.mean)  # type: ignore[attr-defined]
+    benchmark.extra_info["gbps"] = round(layers * live / mean / 1e9, 1)  # type: ignore[attr-defined]
+
+
 @cuda_only
 @pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
 @pytest.mark.parametrize("how", ["rows", "per-row"])
@@ -349,4 +463,572 @@ def test_cuda_attn_rows(benchmark: object, rows: int, n: int, how: str) -> None:
         torch.cuda.synchronize()
 
     benchmark.group = f"cuda-attn-rows/n{n}/rows{rows}"  # type: ignore[attr-defined]
+    benchmark(run)  # type: ignore[operator]
+
+
+@cuda_only
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("form", ["bf16", "mxfp4"])
+@pytest.mark.parametrize("rows", [8, 32, 128])  # each expert's rows: a prefill chunk's spread over its experts
+def test_cuda_grouped_experts(benchmark: object, rows: int, form: str) -> None:
+    """One wave of a grouped expert call on the card (`_Experts._card_grouped`) at gpt-oss-120b's expert shape: 16
+    experts of `rows` rows each, gate_up and down as `torch._grouped_mm` over the experts' rows in slot order - the
+    MXFP4 form first widened from the depot's stacks in one pass (`btb_mx4_widen`), as a wave's batch is."""
+    if not hasattr(torch, "_grouped_mm"):
+        pytest.skip("this torch has no _grouped_mm: the engine keeps the per-expert loop")
+    n, H, I = 16, 2880, 2880
+    x = torch.randn(n * rows, H, dtype=torch.bfloat16, device=CUDA)
+    ends = torch.arange(1, n + 1, dtype=torch.int32, device=CUDA) * rows
+    shapes = ((2 * I, H), (H, I))
+    if form == "mxfp4":
+        k = _cuda_kernels()
+        seats = torch.arange(n, dtype=torch.int32, device=CUDA)
+        stacks = [
+            (
+                torch.randint(0, 256, (n, r, c // 32, 16), dtype=torch.uint8, device=CUDA),
+                torch.randint(118, 124, (n, r, c // 32), dtype=torch.uint8, device=CUDA),
+            )
+            for r, c in shapes
+        ]
+        wide = [torch.empty(n, r * c, dtype=torch.bfloat16, device=CUDA) for r, c in shapes]
+
+        def weights() -> list[torch.Tensor]:
+            return [
+                k.mx4_widen(b, s, seats, out=w).view(n, r, c)
+                for (b, s), w, (r, c) in zip(stacks, wide, shapes, strict=True)
+            ]
+
+    else:
+        held = [torch.randn(n, r, c, device=CUDA).mul_(c**-0.5).bfloat16() for r, c in shapes]
+
+        def weights() -> list[torch.Tensor]:
+            return held
+
+    def run() -> None:
+        gu, dn = weights()
+        h = torch._grouped_mm(x, gu.transpose(1, 2), offs=ends)
+        torch._grouped_mm(_act(h), dn.transpose(1, 2), offs=ends)
+        torch.cuda.synchronize()
+
+    benchmark.group = "cuda-grouped"  # type: ignore[attr-defined]
+    benchmark(run)  # type: ignore[operator]
+
+
+# -- where an op wins ------------------------------------------------------------------------------------------
+#
+# The placement group: each op at the engine's shapes and row counts, timed where it could run - the CPU over its
+# weights in RAM (the engine's host path: the native kernels, torch's float32 GEMM from `Native.gemm_rows` rows),
+# the card over weights held in VRAM, and the card over weights shipped from RAM each call. The question is the
+# placement, not the kernel: every lane is wall time as the engine would pay it, the crossing of the tier's edge
+# included - a card lane takes its rows from the host and hands its answer back. Weights rotate through pools past
+# the CPU's L3 and the card's L2, so every call reads memory as a decode's layers do, and each lane's output is held
+# against a float32 reference before it is timed. `python -m bench.report` renders the crossover - where each op's
+# winner changes with the rows - from the run's JSON (each bench's `extra_info`).
+
+CUDA = "cuda"
+CPU_POOL = 384 << 20  # past a desktop CPU's L3 many times over
+CARD_POOL = 256 << 20  # past the card's L2 (48 MB on an AD104)
+TOLERANCE = 0.03  # a lane's largest error against the float32 reference, relative to the reference's largest value
+LANES = ("cpu/ram", "cuda/vram", "cuda/ram")  # where the op computes / where its weights sit
+ROWS = (1, 2, 4, 8, 16, 24, 32, 48, 64, 128, 256, 512, 1024, 2048, 4096)
+GLUE_ROWS = (1, 16, 256, 4096)
+
+
+@dataclass(frozen=True)
+class Point:
+    """one op at one shape: its dims, the row counts it is timed at and the lanes it runs in. `per_rows`: its
+    operands are the rows' own (attention's cache is `rows` long), so they are built afresh for each count."""
+
+    op: str
+    shape: str
+    dims: tuple[int, ...]
+    rows: tuple[int, ...]
+    lanes: tuple[str, ...] = LANES
+    per_rows: bool = False
+
+
+POINTS: dict[tuple[str, str], Point] = {
+    (p.op, p.shape): p
+    for p in (
+        Point("linear", "qkv-6144x2560", (6144, 2560), ROWS),
+        Point("linear", "down-2560x9728", (2560, 9728), ROWS),
+        Point("linear", "down-5120x25600", (5120, 25600), tuple(r for r in ROWS if r <= 1024)),
+        Point("linear", "head-151936x2560", (151936, 2560), (1, 4, 16)),
+        Point("expert", "moe-2560x640", (2560, 640), tuple(r for r in ROWS if r <= 512)),
+        Point("expert_mx4", "oss-2880x2880", (2880, 2880), tuple(r for r in ROWS if r <= 512)),
+        # one row's attention over a cache of `rows` rows
+        Point("attn", "q32-kv8-d128", (32, 8, 128), (1024, 4096, 16384, 65536, 131072), per_rows=True),
+        # the glue between the matmuls: its weights are small, so they are held where it runs; the rows still cross
+        Point("rmsnorm", "2560", (2560,), GLUE_ROWS, LANES[:2]),
+        Point("router", "512x2560-top10", (512, 2560, 10), GLUE_ROWS, LANES[:2]),
+        Point("silu_mul", "2560", (2560,), GLUE_ROWS, LANES[:2]),
+        Point("pick", "151936-t0.8-p0.9", (151936,), (1, 16), LANES[:2]),
+    )
+}
+
+
+class Pool:
+    """copies of one operand, enough to pass `nbytes`, handed out in turn: a call reads its weights from memory,
+    never from a cache the last call filled"""
+
+    def __init__(self, make: Callable[[], Any], each: int, nbytes: int, cap: int = 64) -> None:
+        n = max(2, min(cap, -(-nbytes // max(1, each))))
+        self.items = [make() for _ in range(n)]
+        self.i = 0
+
+    @classmethod
+    def one(cls, item: Any) -> Pool:
+        """one operand handed out every call: the glue's small weights, which a cache holds whatever the bench does"""
+        return cls(lambda: item, 0, 0, cap=1)
+
+    def next(self) -> Any:
+        self.i = (self.i + 1) % len(self.items)
+        return self.items[self.i]
+
+    @property
+    def first(self) -> Any:
+        return self.items[0]
+
+
+class _Operands:
+    """A point's operands in each tier, built on first use and shared by its row counts and lanes; one point's at a
+    time - the last point's are let go (and the allocators' cached blocks given back) before the next one's."""
+
+    held: ClassVar[_Operands | None] = None
+
+    def __init__(self, key: tuple[object, ...]) -> None:
+        self.key = key
+        self.parts: dict[str, Any] = {}
+
+    @classmethod
+    def of(cls, *key: object) -> _Operands:
+        if cls.held is None or cls.held.key != key:
+            cls.held = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                host_empty = getattr(torch._C, "_host_emptyCache", None)
+                if host_empty is not None:
+                    host_empty()  # the pinned pools' blocks, which the host allocator keeps otherwise
+            cls.held = cls(key)
+        return cls.held
+
+    def get(self, name: str, make: Callable[[], Any]) -> Any:
+        if name not in self.parts:
+            self.parts[name] = make()
+        return self.parts[name]
+
+
+# a lane: the pool its weights rotate through, the call over one of them, and the float32 answer (None: unchecked)
+Lane = tuple[Pool, Callable[[Any], Any], torch.Tensor | None]
+
+
+def _rows(n: int, width: int) -> torch.Tensor:
+    """`n` rows of activations, float32 on the host, the same in every lane of a point"""
+    return torch.randn(n, width, generator=torch.Generator().manual_seed(n))
+
+
+def _act(gu: torch.Tensor) -> torch.Tensor:
+    g, u = gu.chunk(2, dim=-1)
+    return F.silu(g) * u
+
+
+def _host_linear(w: torch.Tensor, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """the engine's host matmul (`_HostLinear`): the native kernel under `Native.gemm_rows` rows, else torch's
+    float32 GEMM over the weight widened"""
+    if Native.gemv is not None and x.shape[0] < Native.gemm_rows:
+        Native.gemv(w, x, y)
+        return y
+    return F.linear(x, w.float())
+
+
+def _to_card(x: torch.Tensor) -> torch.Tensor:
+    return x.to(CUDA, torch.bfloat16)
+
+
+def _card(
+    ops: _Operands, cpu: Pool, each: int, lane: str, caps: tuple[int, int], on_card: Callable[[Any], Any]
+) -> tuple[Pool, Callable[[Any], Any]]:
+    """a card lane over `cpu.first`'s tensors: held in VRAM (`cuda/vram`), a pool of copies there; or shipped from
+    RAM each call (`cuda/ram`), a pool of pinned copies, each landing in one set of card buffers"""
+    if lane == "cuda/vram":
+        return ops.get(
+            "card", lambda: Pool(lambda: tuple(t.to(CUDA) for t in cpu.first), each, CARD_POOL, caps[0])
+        ), on_card
+    pin = ops.get("pin", lambda: Pool(lambda: tuple(t.pin_memory() for t in cpu.first), each, CARD_POOL, caps[1]))
+    bufs = ops.get("buf", lambda: tuple(torch.empty_like(t, device=CUDA) for t in cpu.first))
+
+    def fed(w: tuple[torch.Tensor, ...]) -> Any:
+        for b, t in zip(bufs, w, strict=True):
+            b.copy_(t, non_blocking=True)
+        return on_card(bufs)
+
+    return pin, fed
+
+
+def _linear(p: Point, ops: _Operands, rows: int, lane: str) -> Lane:
+    R, C = p.dims
+    each = R * C * 2
+    cpu = ops.get("cpu", lambda: Pool(lambda: (torch.randn(R, C).mul_(C**-0.5).bfloat16(),), each, CPU_POOL))
+    x = _rows(rows, C)
+    ref = F.linear(x, cpu.first[0].float())
+    if lane == "cpu/ram":
+        y = torch.empty(rows, R)
+        return cpu, lambda w: _host_linear(w[0], x, y), ref
+    return (*_card(ops, cpu, each, lane, (64, 8), lambda w: F.linear(_to_card(x), w[0]).float().cpu()), ref)
+
+
+def _expert(p: Point, ops: _Operands, rows: int, lane: str) -> Lane:
+    """one expert of a bf16 mixture: gate_up, the gate, down"""
+    H, I = p.dims
+    each = 3 * H * I * 2
+
+    def make() -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.randn(2 * I, H).mul_(H**-0.5).bfloat16(), torch.randn(H, I).mul_(I**-0.5).bfloat16()
+
+    cpu = ops.get("cpu", lambda: Pool(make, each, CPU_POOL, cap=128))
+    x = _rows(rows, H)
+    gu0, dn0 = cpu.first
+    ref = F.linear(_act(F.linear(x, gu0.float())), dn0.float())
+    if lane == "cpu/ram":
+        gy, dy = torch.empty(rows, 2 * I), torch.empty(rows, H)
+        return cpu, lambda w: _host_linear(w[1], _act(_host_linear(w[0], x, gy)).contiguous(), dy), ref
+
+    def on_card(w: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        return F.linear(_act(F.linear(_to_card(x), w[0])), w[1]).float().cpu()
+
+    return (*_card(ops, cpu, each, lane, (64, 32), on_card), ref)
+
+
+def _stack(w: MxWeight) -> tuple[torch.Tensor, torch.Tensor]:
+    """an MXFP4 matrix as a depot's stack of one seat: blocks [1, rows, groups, 16], scales [1, rows, groups]"""
+    assert w.scales is not None  # the checkpoint's layout, as the bench builds it
+    return w.blocks.view(1, w.shape[0], -1, 16), w.scales.view(1, w.shape[0], -1)
+
+
+def _expert_mx4(p: Point, ops: _Operands, rows: int, lane: str) -> Lane:
+    """one expert of an MXFP4 mixture as stored: the CPU's own matvec over the blocks, against the card widening
+    them (`btb_mx4_widen`; torch's `dequant_blocks` without the card kernels) from VRAM or from the bytes shipped -
+    a quarter of bf16's over the bus"""
+    if lane == "cpu/ram" and Native.gemv_mx4 is None:
+        pytest.skip("this library has no MXFP4 matvec")
+    H, I = p.dims
+    shapes = ((2 * I, H), (H, I))
+
+    def mat(r: int, k: int) -> MxWeight:
+        g = k // 32
+        blocks = torch.randint(0, 256, (r * g * 16,), dtype=torch.uint8)
+        return MxWeight(blocks, torch.randint(118, 124, (r * g,), dtype=torch.uint8), r, k)
+
+    each = sum(r * k // 32 * 17 for r, k in shapes)
+    cpu = ops.get("cpu", lambda: Pool(lambda: tuple(mat(r, k) for r, k in shapes), each, CPU_POOL, cap=128))
+    x = _rows(rows, H)
+    gu0, dn0 = (w.dequantize(torch.float32) for w in cpu.first)
+    ref = F.linear(_act(F.linear(x, gu0)), dn0)
+    if lane == "cpu/ram":
+        gy, dy = torch.empty(rows, 2 * I), torch.empty(rows, H)
+
+        def host(w: tuple[MxWeight, ...]) -> torch.Tensor:
+            Native.gemv_mx4(w[0], x, gy)
+            Native.gemv_mx4(w[1], _act(gy).contiguous(), dy)
+            return dy
+
+        return cpu, host, ref
+    stacks = ops.get("stacks", lambda: Pool.one(tuple(t for w in cpu.first for t in _stack(w))))
+    wide = ops.get("wide", lambda: [torch.empty(1, r * k, dtype=torch.bfloat16, device=CUDA) for r, k in shapes])
+    seat = ops.get("seat", lambda: torch.zeros(1, dtype=torch.int32, device=CUDA))
+    kern = Native.card_kernels()
+
+    def widen(j: int, w: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        r, k = shapes[j]
+        b, s = w[2 * j], w[2 * j + 1]
+        return (kern.mx4_widen(b, s, seat, out=wide[j]) if kern is not None else dequant_blocks(b, s)).view(r, k)
+
+    def on_card(w: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        return F.linear(_act(F.linear(_to_card(x), widen(0, w))), widen(1, w)).float().cpu()
+
+    return (*_card(ops, stacks, each, lane, (64, 64), on_card), ref)
+
+
+def _attn(p: Point, ops: _Operands, n: int, lane: str) -> Lane:
+    """one row's decode attention over a cache of `n` rows (K and V [Hk, n, d] bf16): the host's kernel, against
+    torch's SDPA on the card over the cache held there or shipped"""
+    if lane == "cpu/ram" and Native.attn_decode is None:
+        pytest.skip("this library has no attention kernel")
+    Hq, Hk, d = p.dims
+    each = 2 * Hk * n * d * 2
+
+    def make() -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.randn(Hk, n, d).bfloat16(), torch.randn(Hk, n, d).bfloat16()
+
+    cpu = ops.get("cpu", lambda: Pool(make, each, CPU_POOL, cap=32))
+    q = _rows(Hq, d)
+    scale = d**-0.5
+    k0, v0 = cpu.first
+    ref = F.scaled_dot_product_attention(
+        q.view(1, Hq, 1, d), k0.float().unsqueeze(0), v0.float().unsqueeze(0), scale=scale, enable_gqa=True
+    ).view(Hq, d)
+    if lane == "cpu/ram":
+        out = torch.empty(Hq, d)
+
+        def host(kv: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+            Native.attn_decode(q, kv[0], kv[1], scale, out)
+            return out
+
+        return cpu, host, ref
+
+    def on_card(kv: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        qd = _to_card(q).view(1, Hq, 1, d)
+        y = F.scaled_dot_product_attention(qd, kv[0].unsqueeze(0), kv[1].unsqueeze(0), scale=scale, enable_gqa=True)
+        return y.float().cpu().view(Hq, d)
+
+    return (*_card(ops, cpu, each, lane, (16, 4), on_card), ref)
+
+
+def _norm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    v = x.float().pow(2).mean(-1, keepdim=True)
+    return (x.float() * torch.rsqrt(v + 1e-6)).to(x.dtype) * w
+
+
+def _glue(p: Point, ops: _Operands, rows: int, lane: str) -> Lane:
+    """the small ops between the matmuls, their weights held where they run; the card lane's rows still cross"""
+    host = lane == "cpu/ram"
+    if p.op == "pick":
+        (V,) = p.dims
+        lg = torch.randn(rows, V, generator=torch.Generator().manual_seed(rows))
+        keys = list(range(rows))
+        if host:
+            if Native.sample_pick is None:
+                pytest.skip("this library has no sampler")
+            return Pool.one(lg), lambda t: Native.sample_pick(t, keys, 0.8, 0, 0.9), None
+        k = _cuda_kernels()  # the logits are the card's own there: only the picks come back
+        return Pool.one(lg.to(CUDA)), lambda t: k.pick(t, keys, 0.8, 0, 0.9).cpu(), None
+    H = p.dims[1] if p.op == "router" else p.dims[0]
+    x = _rows(rows, 2 * H if p.op == "silu_mul" else H)
+
+    def fn(a: torch.Tensor, w: Any) -> torch.Tensor:
+        if p.op == "rmsnorm":
+            return _norm(a, w)
+        if p.op == "router":  # the softmax over the experts' logits, its k largest
+            return torch.topk(torch.softmax(F.linear(a, w).float(), -1), p.dims[2], dim=-1).values
+        return _act(a)
+
+    w: torch.Tensor | None = None
+    if p.op == "rmsnorm":
+        w = ops.get("w", lambda: torch.rand(H) + 0.5)
+    elif p.op == "router":
+        w = ops.get("w", lambda: torch.randn(p.dims[0], H).mul_(H**-0.5))
+    ref = fn(x, w)
+    if host:
+        return Pool.one(w), lambda wt: fn(x, wt), ref
+    wd = None if w is None else w.to(CUDA, torch.bfloat16)
+    return Pool.one(wd), lambda wt: fn(_to_card(x), wt).float().cpu(), ref
+
+
+BUILD: dict[str, Callable[[Point, _Operands, int, str], Lane]] = {
+    "linear": _linear, "expert": _expert, "expert_mx4": _expert_mx4, "attn": _attn,
+    "rmsnorm": _glue, "router": _glue, "silu_mul": _glue, "pick": _glue,
+}  # fmt: skip
+
+
+def _check(what: str, y: Any, ref: torch.Tensor | None) -> float | None:
+    """a lane's answer against the float32 reference: its largest error relative to the reference's largest value,
+    refused past `TOLERANCE`; None for a lane with nothing to hold it to (a sampled pick)"""
+    if ref is None:
+        return None
+    y, ref = y.detach().float().cpu(), ref.detach().float().cpu()
+    err = float((y - ref).abs().max() / ref.abs().max().clamp(min=1e-30))
+    assert err < TOLERANCE, f"{what}: {err:.3g} of the reference's largest value off it"
+    return err
+
+
+def _placed(benchmark: Any, lane: str, op: str, shape: str, rows: int, err: float | None, row: str = "") -> None:
+    """the bench's group and id (`<lane>/<op>/<shape>/<row>`, the lane naming its device first), and what the
+    report's crossover reads back out of the JSON"""
+    row = row or f"r{rows}"
+    bid = f"{lane}/{op}/{shape}/{row}"
+    benchmark.group = "placement"
+    benchmark.name = bid
+    benchmark.extra_info.update(id=bid, op=op, shape=shape, rows=rows, row=row, lane=lane, err=err)
+
+
+@cuda_only
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize(
+    "op,shape,rows,lane",
+    [
+        pytest.param(p.op, p.shape, r, lane, id=f"{p.op}-{p.shape}-r{r}-{lane.replace('/', '-')}")
+        for p in POINTS.values()
+        for r in p.rows
+        for lane in p.lanes
+    ],
+)
+def test_placement(benchmark: object, op: str, shape: str, rows: int, lane: str) -> None:
+    """one op at one shape and row count, in one lane: its answer checked on its pool's first weight, then each
+    call timed on the next"""
+    p = POINTS[(op, shape)]
+    ops = _Operands.of(op, shape, rows if p.per_rows else None)
+    pool, run, ref = BUILD[op](p, ops, rows, lane)
+    err = _check(f"{lane} {op} {shape} at {rows} rows", run(pool.first), ref)
+    _placed(benchmark, lane, op, shape, rows, err)
+    benchmark(lambda: run(pool.next()))  # type: ignore[operator]
+
+
+# -- a recorded prefill's expert calls, replayed ------------------------------------------------------------------
+#
+# The Express's question over real routing: a MoE layer's prefill call with its crowded experts on the card and its
+# sparse ones on the CPU at once. A `--profile DIR` run records every call's picks (its `call` events and `picks`,
+# btb/engine/experts.py `ExpertProfile`); `--routing DIR/events.npz` replays every sixth layer's calls over stand-in
+# weights of the model's expert shape (`--routing-expert`): every expert on the CPU (grouped native matvecs), every
+# expert fed to the card through pinned double buffers, and the split at each cut (the experts with at least `cut`
+# rows on the card, the rest on the CPU in a thread beside it). Every lane leaves the call's answer on the card.
+
+ROUTING_EVERY = 6  # every sixth layer's calls: the layers route alike, and all of them is hours of bench
+ROUTING_CUTS = (4, 8, 12, 16, 20, 24, 32, 48, 64)
+ROUTING_POOL = 128  # distinct experts held pinned (1.26 GB at 2560x640), past the caches: expert e reads pool[e % 128]
+ROUTING_GROUP = 16  # experts one native grouped matvec takes: a pool barrier each, not one an expert
+
+
+class _Routing:
+    """a profile's expert calls as the replay reads them: each `call` event's (layer, rows, offset), its rows'
+    picks the profile's `picks` rows from the offset on (-1 past a narrower call's k)"""
+
+    loaded: ClassVar[dict[str, _Routing]] = {}
+
+    def __init__(self, path: str) -> None:
+        from btb.engine.experts import ExpertProfile
+
+        with np.load(path) as z:
+            if "picks" not in z.files:
+                raise ValueError(f"{path} predates the profile's picks: record it again with `--profile`")
+            ev, self.picks = z["events"], z["picks"]
+        self.calls = [(int(c[3]), int(c[4]), int(c[7])) for c in ev[ev[:, 2] == ExpertProfile.CALL]]
+
+    @classmethod
+    def of(cls, path: str) -> _Routing:
+        if path not in cls.loaded:
+            cls.loaded[path] = cls(path)
+        return cls.loaded[path]
+
+    def top(self, i: int) -> torch.Tensor:
+        _layer, rows, off = self.calls[i]
+        return torch.from_numpy(self.picks[off : off + rows].astype(np.int64))
+
+    def most(self, i: int) -> int:
+        """the rows of the call's most crowded expert"""
+        e, n = np.unique(self.top(i).numpy(), return_counts=True)
+        return int(n[e >= 0].max(initial=0))
+
+
+def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
+    """the routing replay's cases, one a (recorded call, lane), from `--routing`'s profile; a skip without one"""
+    if metafunc.function.__name__ != "test_placement_routing":
+        return
+    path = metafunc.config.getoption("routing")
+    if not path:
+        why = "no --routing profile (a `--profile DIR` run's DIR/events.npz)"
+        metafunc.parametrize("call,lane", [pytest.param(-1, "", marks=pytest.mark.skip(reason=why), id="no-routing")])
+        return
+    rt = _Routing.of(str(path))
+    cases = []
+    for i, (layer, rows, _off) in enumerate(rt.calls):
+        if layer % ROUTING_EVERY:
+            continue
+        cuts = [f"split/c{c}" for c in ROUTING_CUTS if 1 < c <= rt.most(i)]
+        for lane in ("cpu/ram", "cuda/ram", *cuts):
+            cases.append(pytest.param(i, lane, id=f"L{layer}-c{i}-r{rows}-{lane.replace('/', '-')}"))
+    metafunc.parametrize("call,lane", cases)
+
+
+@cuda_only
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+def test_placement_routing(benchmark: object, request: pytest.FixtureRequest, call: int, lane: str) -> None:
+    """one recorded call in one lane: its answer checked against the float32 sum of its experts' products, then
+    timed"""
+    if Native.gemv_group is None and lane != "cuda/ram":
+        pytest.skip("this library has no grouped matvec")
+    rt = _Routing.of(str(request.config.getoption("routing")))
+    H, I = (int(v) for v in str(request.config.getoption("routing_expert")).lower().split("x"))
+    layer, T, _off = rt.calls[call]
+    top = rt.top(call)
+    ops = _Operands.of("express", H, I)
+
+    def expert() -> tuple[torch.Tensor, torch.Tensor]:
+        gu = torch.randn(2 * I, H).mul_(H**-0.5).bfloat16().pin_memory()
+        return gu, torch.randn(H, I).mul_(I**-0.5).bfloat16().pin_memory()
+
+    def buffers() -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.empty(2 * I, H, dtype=torch.bfloat16, device=CUDA), torch.empty(
+            H, I, dtype=torch.bfloat16, device=CUDA
+        )
+
+    pin = ops.get("pin", lambda: [expert() for _ in range(ROUTING_POOL)])
+    bufs = ops.get("buf", lambda: [buffers() for _ in range(2)])
+    free = ops.get("free", lambda: [torch.cuda.Event() for _ in range(2)])
+    copy = ops.get("copy", torch.cuda.Stream)
+    x = _rows(T, H)
+    xd = _to_card(x)
+    calls = []  # (expert, its rows on the host, on the card), the most rows first
+    for e in torch.unique(top).tolist():
+        if e >= 0:
+            idx = (top == e).any(-1).nonzero().flatten()
+            calls.append((e, idx, idx.to(CUDA)))
+    calls.sort(key=lambda c: -len(c[1]))
+    ref = torch.zeros(T, H)
+    for e, idx, _ in calls:
+        gu, dn = pin[e % ROUTING_POOL]
+        ref.index_add_(0, idx, F.linear(_act(F.linear(x[idx], gu.float())), dn.float()))
+    out_cpu = torch.zeros(T, H)
+
+    def cpu_side(part: list[Any]) -> None:
+        # grouped: a pool barrier a matvec for every ROUTING_GROUP experts, and one scatter for the call
+        out_cpu.zero_()
+        idxs, ys = [], []
+        for s in range(0, len(part), ROUTING_GROUP):
+            grp = part[s : s + ROUTING_GROUP]
+            gys = [torch.empty(len(idx), 2 * I) for _, idx, _ in grp]
+            Native.gemv_group([pin[e % ROUTING_POOL][0] for e, _, _ in grp], [x[idx] for _, idx, _ in grp], gys)
+            dys = [torch.empty(len(idx), H) for _, idx, _ in grp]
+            Native.gemv_group([pin[e % ROUTING_POOL][1] for e, _, _ in grp], [_act(g).contiguous() for g in gys], dys)
+            idxs += [idx for _, idx, _ in grp]
+            ys += dys
+        if idxs:
+            out_cpu.index_add_(0, torch.cat(idxs), torch.cat(ys))
+
+    def card_side(part: list[Any], out: torch.Tensor) -> None:
+        # the next expert's copy under the current one's products: two buffers, a copy stream, an event each way
+        main = torch.cuda.current_stream()
+        for j, (e, _, idd) in enumerate(part):
+            b = j % 2
+            ready = torch.cuda.Event()
+            with torch.cuda.stream(copy):
+                copy.wait_event(free[b])
+                bufs[b][0].copy_(pin[e % ROUTING_POOL][0], non_blocking=True)
+                bufs[b][1].copy_(pin[e % ROUTING_POOL][1], non_blocking=True)
+                ready.record(copy)
+            main.wait_event(ready)
+            out.index_add_(0, idd, F.linear(_act(F.linear(xd[idd], bufs[b][0])), bufs[b][1]))
+            free[b].record(main)
+
+    cut = {"cpu/ram": 1 << 30, "cuda/ram": 0}.get(lane)
+    cut = int(lane.split("/c", 1)[1]) if cut is None else cut
+    on_card = [c for c in calls if len(c[1]) >= cut]
+    on_host = [c for c in calls if len(c[1]) < cut]
+
+    def run() -> torch.Tensor:
+        out = torch.zeros(T, H, dtype=torch.bfloat16, device=CUDA)
+        th = threading.Thread(target=cpu_side, args=(on_host,)) if on_host else None
+        if th is not None:
+            th.start()
+        card_side(on_card, out)
+        if th is not None:
+            th.join()
+            out += out_cpu.to(CUDA, torch.bfloat16)
+        torch.cuda.synchronize()
+        return out
+
+    err = _check(f"{lane} L{layer} call {call}", run(), ref)
+    _placed(benchmark, lane, "express", f"{H}x{I}", T, err, row=f"L{layer}-c{call}-r{T}")
+    rows_max = len(calls[0][1]) if calls else 0
+    benchmark.extra_info.update(experts=len(calls), on_card=len(on_card), rows_max=rows_max)  # type: ignore[attr-defined]
     benchmark(run)  # type: ignore[operator]

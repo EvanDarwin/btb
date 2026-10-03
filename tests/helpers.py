@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import dataclasses
 import http.client
 import json
 import os
@@ -175,9 +176,11 @@ def host_model(
     expert_cache_gb: float | None = None,
     prefill_chunk: int | None = None,
     kv_bits: int | None = None,
+    kv_host: bool = False,
+    context: int | None = None,
 ) -> StreamedTextModel:
     """the engine as the receipts run it: the head resident, every layer on the host tier unless placed
-    otherwise, quiet; `packed` binds the 12-bit store"""
+    otherwise, quiet; `packed` binds the 12-bit store; `kv_host` keeps a resident layer's attention rows in RAM"""
     from btb.engine import StreamedTextModel
 
     sm = StreamedTextModel(
@@ -192,6 +195,8 @@ def host_model(
         expert_cache_gb=expert_cache_gb,
         prefill_chunk=prefill_chunk,
         kv_bits=kv_bits,
+        kv_host=kv_host,
+        context=context,
     )
     if packed:
         sm.open_packed()
@@ -207,9 +212,11 @@ def speculation(
     ngram_p: float | None = None,
     tree_read: str | None = None,
     v_max: int | None = None,
+    price: bool | None = None,
 ) -> None:
     """the speculative loop's knobs a test pins, each left alone when not given; the drafter never read from
-    beside the model"""
+    beside the model. `price` False sizes the passes as with no store (`spec_price`): a test of the verify pass
+    drafts what it asks for, whatever earlier calls taught the pricer"""
     if tree_budget is not None:
         sm.tree_budget = tree_budget
     if tree_min_prob is not None:
@@ -220,6 +227,8 @@ def speculation(
         sm.tree_read = tree_read
     if v_max is not None:
         sm.v_max = v_max
+    if price is not None:
+        sm.spec_price = price
     sm.drafter_weights = None
 
 
@@ -362,6 +371,16 @@ class SchedulerModel:
         self.lines.append(" ".join(str(x) for x in a))
 
 
+def stub_ledger(free: Callable[[], int], reserve: int) -> types.SimpleNamespace:
+    """a stub engine's device ledger on the host: what `free()` reads, above `reserve`, nothing spoken for - the
+    figure the expert store grows and gives back against, as `Device.free` gives it"""
+    return types.SimpleNamespace(
+        free=lambda device=None, unreserved=False, own=None, pooled=False: max(0, int(free()) - int(reserve)),
+        reserved=lambda device=None, but=None: 0,
+        spoken_for=lambda device=None: {},
+    )
+
+
 def stub_engine(**attrs: object) -> types.SimpleNamespace:
     """the least an engine the scheduler or the expert store is built over: a quiet log, the CPU, and the store's
     residency policy at the model's own defaults (it reads `bus_pass`/`store_pin` directly - a stub without them
@@ -390,6 +409,7 @@ class FakeRoute:
         self.reads: list[Json] = []
         self.dropped: list[object] = []
         self.slow = False  # what `disk_slow` reports: a test turns it on and off
+        self.started: set[int] = set()  # the reads a reader has taken: in flight, past withdrawing
 
     def disk(self, path: str) -> Json:
         return {}
@@ -407,6 +427,7 @@ class FakeRoute:
         key: object = None,
         on_done: Any = None,
         chunk: int = 0,
+        cached: bool = False,
     ) -> Future[float]:
         f: Future[float] = Future()
         self.reads.append(
@@ -423,11 +444,19 @@ class FakeRoute:
         )
         return f
 
-    def disk_drop(self, key: object) -> int:
+    def start(self, key: object, parts: int = 1) -> None:
+        """the first `parts` reads of `key` taken by a reader: in flight, a withdrawal leaves them to land"""
+        mine = [i for i, r in enumerate(self.reads) if r["key"] == key and not r["future"].done()]
+        self.started.update(mine[:parts])
+
+    def disk_drop(self, key: object, whole: bool = False) -> int:
+        mine = [i for i, r in enumerate(self.reads) if r["key"] == key and not r["future"].done()]
+        if whole and any(i in self.started for i in mine):
+            return 0
         n = 0
-        for r in self.reads:
-            if r["key"] == key and not r["future"].done():
-                r["future"].cancel()
+        for i in mine:
+            if i not in self.started:
+                self.reads[i]["future"].cancel()
                 n += 1
         self.dropped.append(key)
         return n
@@ -466,7 +495,6 @@ def expert_store(
     from btb.engine.families import Family
     from btb.kinds import FamilyKind
 
-    monkeypatch.setattr(experts_mod, "host_free_bytes", lambda: 64 * GB)
     per = 64 * KB
     resident: dict[int, types.SimpleNamespace] = {}
     if routers:
@@ -489,6 +517,7 @@ def expert_store(
         n_experts=n_experts,
         lookahead=lookahead,
         scheduler=scheduler,
+        device=stub_ledger(lambda: 64 * GB, GB),
         **attrs,
     )
     st = experts_mod._ExpertStore(sm, budget_bytes=4096 * per, reserve_bytes=GB)
@@ -508,7 +537,31 @@ def expert_store(
         return r
 
     monkeypatch.setattr(st, "_recipe", recipe)
+    # the slot table's invariants after every wave and lookahead the test drives
+    wave, look = st._wave, st.lookahead
+
+    def checked_wave(*a: Any, **k: Any) -> Any:
+        out = wave(*a, **k)
+        st.check()
+        return out
+
+    def checked_look(*a: Any, **k: Any) -> Any:
+        out = look(*a, **k)
+        st.check()
+        return out
+
+    monkeypatch.setattr(st, "_wave", checked_wave)
+    monkeypatch.setattr(st, "lookahead", checked_look)
     return st, sm
+
+
+def seat(st: Any, key: tuple[int, int]) -> int:
+    """a slot of the store's made `key`'s seat on the line through the store's own transitions (`_seat_for`,
+    `_resident`): a test's stand-in for an expert read and landed, its slot's record kept true"""
+    s = st._seat_for(set())
+    assert s is not None, "the store has no seat to give"
+    st._resident(s, key)
+    return int(s)
 
 
 def bare_registry(device: str = "cuda:0", budget: int = 1 << 60) -> ModelRegistry:
@@ -667,6 +720,82 @@ def loaded_model(path: str, **load_kw: Any) -> Iterator[StreamedTextModel]:
         yield sm
     finally:
         sm.close()
+
+
+# --- models shared by the tests that load the same file with the same options -------------------------------
+#
+# A test module that loads one model file with one set of options in many tests declares each test's models in a
+# module-level `shared_model_keys(item) -> list[key]` (keys from `shared_key`) and takes them with `shared_model`.
+# The suite then runs the tests sharing a model one after another (conftest's `pytest_collection_modifyitems`) and
+# loads it once, when the first of them asks, closing it as soon as the next test to run does not declare it
+# (conftest's `pytest_runtest_teardown`) - before that test's leak check, which then covers it. `slot` tells apart
+# the independent loads of one file a test compares (a cert cell's two).
+
+
+@dataclasses.dataclass
+class _Shared:
+    sm: StreamedTextModel
+    knobs: dict[str, Any]  # the engine knobs a test may set, as the load left them
+    at: int  # the placement version as it loaded
+
+
+_SHARED: dict[tuple[Any, ...], _Shared] = {}
+_KNOBS = ("proposer", "_host_cost", "_mlx_cost", "_card_cost")
+
+
+def shared_key(path: str, knobs: dict[str, Any], slot: int = 0) -> tuple[Any, ...]:
+    """the key of one load: the file, its options, and which of a test's independent loads it is"""
+    return (os.path.normpath(path), tuple(sorted((str(k), repr(v)) for k, v in knobs.items())), int(slot))
+
+
+def shared_model(path: str, slot: int = 0, **knobs: Any) -> StreamedTextModel:
+    """the model at `path` loaded with `knobs` (`slot`: which of a test's independent loads), shared with every test
+    declaring the same key. What one test would see of another's on it is put back as the load left it: the API
+    calls the model records (never reset by a decode - a later test's 'every call engaged' would pass on a call it
+    never made), the speculation pricer's learning, and the knobs a test sets on the engine (the proposer, the pass
+    cost curves a speculation cell empties)"""
+    import btb
+
+    key = shared_key(path, knobs, slot)
+    held = _SHARED.get(key)
+    if held is not None and (
+        held.sm.device.snapshot().version != held.at or getattr(held.sm, "_card_off", None) is not None
+    ):
+        # the model is not as it loaded: a layer moved by adapt (another program took the card), the card graph off
+        # after it found no room - this test takes a fresh load, not what befell an earlier one
+        errors = _close(key)
+        if errors:
+            raise ExceptionGroup("a shared model would not close", errors)  # type: ignore[type-var]
+        held = None
+    if held is None:
+        sm = btb.load(path, **{"log": NO_LOG, **knobs})
+        _SHARED[key] = _Shared(sm, {name: getattr(sm, name, None) for name in _KNOBS}, sm.device.snapshot().version)
+        return sm
+    sm = held.sm
+    sm._calls = frozenset()
+    sm._spec_cost = None
+    for name, value in held.knobs.items():
+        setattr(sm, name, value)
+    return sm
+
+
+def _close(key: tuple[Any, ...]) -> list[BaseException]:
+    """the shared model under `key` dropped from the pool and closed; what its close raised"""
+    sm = _SHARED.pop(key).sm
+    try:
+        sm.close()
+    except Exception as e:  # a close that raised is still gone from the pool: never handed to a test again
+        return [e]
+    return []
+
+
+def release_shared(keep: Iterable[tuple[Any, ...]] = ()) -> list[BaseException]:
+    """every shared model but those in `keep` closed - each of them, whatever one's close raised; what they raised"""
+    keep = set(keep)
+    errors: list[BaseException] = []
+    for key in [k for k in _SHARED if k not in keep]:
+        errors += _close(key)
+    return errors
 
 
 def need_cached(spec: str, why: str | None = None) -> str:

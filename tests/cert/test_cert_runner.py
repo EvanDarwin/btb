@@ -21,14 +21,14 @@ import os
 import subprocess
 import sys
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
 
 import btb
 from btb.kinds import FamilyKind, LayerKind, PassTag
-from tests.helpers import FIXTURES, GGUF_FIXTURES, assert_same_tokens, loaded_model
+from tests.helpers import FIXTURES, GGUF_FIXTURES, assert_same_tokens, shared_key, shared_model
 
 if TYPE_CHECKING:
     from _pytest.mark.structures import ParameterSet
@@ -103,12 +103,77 @@ def _run_twice(
     """two independent loads of one fixture, each decoding PROMPT greedily; `check` runs against the first
     model, where the pass report still describes this cell's own decode."""
     runs: list[list[int]] = []
-    for i in range(2):
-        with loaded_model(path, **knobs) as sm:
-            runs.append([int(t) for t in sm.generate(list(PROMPT), N, speculate=False).tokens])
-            if i == 0 and check is not None:
-                check(sm)
+    for i in TWO:
+        sm = shared_model(path, i, **knobs)
+        runs.append([int(t) for t in sm.generate(list(PROMPT), N, speculate=False).tokens])
+        if i == 0 and check is not None:
+            check(sm)
     return runs
+
+
+Load = tuple[str, dict[str, object]]  # a fixture's path and the knobs a cell loads it with
+
+
+def _stem_load(stem: str, dev: spec.DeviceSubpath) -> Load:
+    return os.path.join(FIXTURES, stem), dict(dev.knobs)
+
+
+def _gguf_load(fname: str, dev: spec.DeviceSubpath) -> Load:
+    return os.path.join(GGUF_FIXTURES, fname), dict(dev.knobs)
+
+
+def _pack12_load(stem: str, dev: spec.DeviceSubpath) -> Load:
+    return os.path.join(FIXTURES, stem + "-pack12"), {**PACK12_KNOBS, **dev.knobs}
+
+
+def _spec_load(path: str, dev: spec.DeviceSubpath, decode: spec.DecodePath) -> Load:
+    """a speculation cell's load: its sub-path's knobs, its decode path's, and the fixture again as its draft model"""
+    setup = spec.SPEC_SETUP[decode]
+    return path, {**dev.knobs, **setup.knobs, **({"draft_model": path} if setup.draft else {})}
+
+
+# the two independent loads a determinism cell compares; a speculation cell's one load in a slot of its own - where
+# its decode path adds no knob it would be a determinism cell's first load, left with what drafting did to it (the
+# drafter's state, the pricer's learning, the experts it held) and compared against a fresh second
+TWO = (0, 1)
+SPEC_SLOT = 2
+
+# every test taking shared models: its load from the cell's parameters, and its slots - the one place the loads are
+# named, the tests taking theirs from the same helpers
+_LOADS: dict[str, tuple[Callable[[dict[str, Any]], Load], tuple[int, ...]]] = {
+    "test_cell_loads_and_is_deterministic": (lambda a: (a["path"], dict(a["dev"].knobs)), TWO),
+    "test_gguf_cell_loads_and_is_deterministic": (lambda a: _gguf_load(a["fname"], a["dev"]), TWO),
+    "test_pack12_cell_loads_and_is_deterministic": (lambda a: _pack12_load(a["stem"], a["dev"]), TWO),
+    "test_speculation_decodes_as_the_plain_loop": (
+        lambda a: _spec_load(a["path"], a["dev"], a["decode"]),
+        (SPEC_SLOT,),
+    ),
+    **{
+        name: ((lambda a: _stem_load(a["stem"], a["dev"])), TWO)
+        for name in (
+            "test_batch_is_deterministic",
+            "test_context_growth_is_deterministic",
+            "test_hooked_decode_is_the_plain_one",
+            "test_fork_and_batch_are_deterministic",
+            "test_the_models_calls_are_deterministic",
+            "test_a_sessions_calls_are_deterministic",
+        )
+    },
+}
+
+
+def shared_model_keys(item: pytest.Item) -> list[tuple[object, ...]]:
+    """the loads a cell makes (tests.helpers.shared_model): a fixture with one sub-path's knobs is loaded twice - the
+    two independent loads each cell compares - for every cell on it, greedy and sampled, the batch, the long prompt,
+    the hooks, the forks, the model's and a session's calls; a speculation cell's once, apart. The conftest runs a
+    load's cells one after another and loads it once for them all"""
+    p = getattr(item, "callspec", None)
+    load = _LOADS.get(getattr(item, "originalname", item.name))
+    if p is None or load is None:
+        return []
+    where, slots = load
+    path, knobs = where(p.params)
+    return [shared_key(path, knobs, s) for s in slots]
 
 
 def _cells() -> list[ParameterSet]:
@@ -146,13 +211,13 @@ def test_cell_loads_and_is_deterministic(
     sampled = decode is spec.Decode.SAMPLED
     runs: list[list[int]] = []
     held: list[int] | None = None  # the greedy decode a bf16 sampled cell holds to the oracle instead of its draw
-    for i in range(2):  # two independent loads: catches load nondeterminism too, not just decode
-        with loaded_model(path, **dev.knobs) as sm:
-            runs.append(oracle.decode(sm, PROMPT, oracle.sampling("sampled" if sampled else "tokens")))
-            if i == 0:
-                _assert_path_engaged(sm, kind, storage, dev, decode, stem)
-                if sampled and not oracle.holds_sampled(sm):
-                    held = oracle.decode(sm, PROMPT)
+    for i in TWO:  # two independent loads: catches load nondeterminism too, not just decode
+        sm = shared_model(path, i, **dev.knobs)
+        runs.append(oracle.decode(sm, PROMPT, oracle.sampling("sampled" if sampled else "tokens")))
+        if i == 0:
+            _assert_path_engaged(sm, kind, storage, dev, decode, stem)
+            if sampled and not oracle.holds_sampled(sm):
+                held = oracle.decode(sm, PROMPT)
     assert_same_tokens(runs[0], runs[1], f"{stem} on {dev.key}/{decode.value} decoded differently across two loads")
     # correctness, not just determinism: a deterministically-WRONG path fails against the banked reference
     if held is not None:
@@ -219,8 +284,7 @@ def _gguf_cells() -> list[ParameterSet]:
 def test_gguf_cell_loads_and_is_deterministic(
     kind: FamilyKind, storage: spec.Storage, fname: str, dev: spec.DeviceSubpath
 ) -> None:
-    path = os.path.join(GGUF_FIXTURES, fname)
-    runs = _run_twice(path, dict(dev.knobs), lambda sm: _assert_path_engaged(sm, kind, storage, dev, None, fname))
+    runs = _run_twice(*_gguf_load(fname, dev), lambda sm: _assert_path_engaged(sm, kind, storage, dev, None, fname))
     assert_same_tokens(runs[0], runs[1], f"{fname} on {dev.key} decoded differently across two loads")
     receipt.record(manifest.gguf_id(fname, dev.key))
 
@@ -250,18 +314,18 @@ def test_speculation_decodes_as_the_plain_loop(
     kind: FamilyKind, storage: spec.Storage, path: str, dev: spec.DeviceSubpath, decode: spec.DecodePath
 ) -> None:
     name = os.path.basename(path)
+    _, knobs = _spec_load(path, dev, decode)
+    sm = shared_model(path, SPEC_SLOT, **knobs)
     setup = spec.SPEC_SETUP[decode]
-    knobs = {**dev.knobs, **setup.knobs, **({"draft_model": path} if setup.draft else {})}
-    with loaded_model(path, **knobs) as sm:
-        sm.proposer = setup.proposer
-        # the pass-cost curves the load times size a pass to what drafts have been yielding, which on a tiny random
-        # fixture is one row: no draft at all. The cell certifies the drafting path, so it takes the configured budget
-        sm._host_cost, sm._mlx_cost, sm._card_cost = {}, {}, {}
-        plain = [int(t) for t in sm.generate(list(PROMPT), N, speculate=False).tokens]
-        spans = [("plain", [*PROMPT, *plain])] if setup.echo else []
-        drafted = [int(t) for t in sm.generate(list(PROMPT), N, speculate=True, spans=spans).tokens]
-        _assert_path_engaged(sm, kind, storage, dev, None, name, decode)
-        proposed = sm.last_pass_report().spec_proposed
+    sm.proposer = setup.proposer
+    # the pass-cost curves the load times size a pass to what drafts have been yielding, which on a tiny random
+    # fixture is one row: no draft at all. The cell certifies the drafting path, so it takes the configured budget
+    sm._host_cost, sm._mlx_cost, sm._card_cost = {}, {}, {}
+    plain = [int(t) for t in sm.generate(list(PROMPT), N, speculate=False).tokens]
+    spans = [("plain", [*PROMPT, *plain])] if setup.echo else []
+    drafted = [int(t) for t in sm.generate(list(PROMPT), N, speculate=True, spans=spans).tokens]
+    _assert_path_engaged(sm, kind, storage, dev, None, name, decode)
+    proposed = sm.last_pass_report().spec_proposed
     assert proposed > 0, f"{name} on {dev.key}/{decode.value} proposed no draft: nothing was verified"
     assert_same_tokens(drafted, plain, f"{name} on {dev.key}/{decode.value} drafted other tokens than the plain loop")
     receipt.record(manifest.spec_id(kind, storage, path, dev.key, decode))
@@ -288,12 +352,9 @@ def _pack12_cells() -> list[ParameterSet]:
 
 @pytest.mark.parametrize("kind,stem,dev", _pack12_cells())
 def test_pack12_cell_loads_and_is_deterministic(kind: FamilyKind, stem: str, dev: spec.DeviceSubpath) -> None:
-    path = os.path.join(FIXTURES, stem + "-pack12")
     storage = spec.Storage.PACK12
     runs = _run_twice(
-        path,
-        {**PACK12_KNOBS, **dev.knobs},
-        lambda sm: _assert_path_engaged(sm, kind, storage, dev, None, f"{stem}-pack12"),
+        *_pack12_load(stem, dev), lambda sm: _assert_path_engaged(sm, kind, storage, dev, None, f"{stem}-pack12")
     )
     assert_same_tokens(runs[0], runs[1], f"{stem}-pack12 on {dev.key} decoded differently across two loads")
     receipt.record(manifest.stem_id(spec.Surface.PACK12, stem, dev.key))
@@ -304,7 +365,8 @@ def test_pack12_cell_loads_and_is_deterministic(kind: FamilyKind, stem: str, dev
 # is device-specific, family-orthogonal enough that a representative device per backend exercises it. The 1024+
 # attention split (ATTN_SPLIT) still needs a real model: tiny fixtures cap at max_position_embeddings=512.
 BATCH_ROWS = [[1, 2, 3, 4], [5, 6, 7, 8]]  # two rows through the batched loop (rectangular: one tensor)
-LONG_PROMPT = list(range(1, 65))  # 64 tokens: past gemma3's sliding_window (32), and real cache growth
+# 96 tokens: past gemma3's sliding_window (32), real cache growth, and two of cuda-prefill's 64-row chunks
+LONG_PROMPT = list(range(1, 97))
 
 
 def _shape_cells(surface: spec.Surface) -> list[ParameterSet]:
@@ -322,26 +384,28 @@ def _shape_cells(surface: spec.Surface) -> list[ParameterSet]:
 @pytest.mark.parametrize("stem,dev", _shape_cells(spec.Surface.BATCH))
 def test_batch_is_deterministic(stem: str, dev: spec.DeviceSubpath) -> None:
     """the batched decode loop (several rows at once) is reproducible per row across two independent loads."""
-    path = os.path.join(FIXTURES, stem)
+    path, knobs = _stem_load(stem, dev)
     runs = []
-    for _ in range(2):
-        with loaded_model(path, **dev.knobs) as sm:
-            runs.append(
-                [list(r) for r in sm.generate([list(r) for r in BATCH_ROWS], N, speculate=False).tokens]
-            )  # per-row
+    for i in TWO:
+        sm = shared_model(path, i, **knobs)
+        runs.append([list(r) for r in sm.generate([list(r) for r in BATCH_ROWS], N, speculate=False).tokens])
     assert runs[0] == runs[1], f"{stem} on {dev.key}: batched decode differed across two loads: {runs[0]} != {runs[1]}"
     receipt.record(manifest.stem_id(spec.Surface.BATCH, stem, dev.key))
 
 
 @pytest.mark.parametrize("stem,dev", _shape_cells(spec.Surface.CONTEXT))
 def test_context_growth_is_deterministic(stem: str, dev: spec.DeviceSubpath) -> None:
-    """a longer prompt (past gemma3's sliding window, and real cache growth) decodes reproducibly across two loads.
-    Does NOT reach the 1024 attention split - tiny fixtures cap at 512; that path needs a cached real model."""
-    path = os.path.join(FIXTURES, stem)
+    """a longer prompt (past gemma3's sliding window, and real cache growth) decodes reproducibly across two loads,
+    and on a sub-path made for it the prefill takes its forks (`spec.prefill_tags`: the card's prefill, a mixture's
+    grouped experts). Does NOT reach the 1024 attention split - tiny fixtures cap at 512; that path needs a cached
+    real model."""
+    path, knobs = _stem_load(stem, dev)
     runs = []
-    for _ in range(2):
-        with loaded_model(path, **dev.knobs) as sm:
-            runs.append(list(sm.generate(list(LONG_PROMPT), N, speculate=False).tokens))
+    for i in TWO:
+        sm = shared_model(path, i, **knobs)
+        runs.append(list(sm.generate(list(LONG_PROMPT), N, speculate=False).tokens))
+        if i == 0:
+            _axis_tags(sm, spec.Surface.CONTEXT, stem, dev, calls=False)
     assert_same_tokens(runs[0], runs[1], f"{stem} on {dev.key}: long-context decode differed across two loads")
     receipt.record(manifest.stem_id(spec.Surface.CONTEXT, stem, dev.key))
 
@@ -365,22 +429,22 @@ def test_hooked_decode_is_the_plain_one(stem: str, dev: spec.DeviceSubpath) -> N
     in-graph picks standing aside, and draws the plain decode's tokens - reproducibly across two loads"""
     if not _hardware_here(dev.hardware):
         pytest.skip(f"{dev.hardware.value} not available on this machine")
-    path = os.path.join(FIXTURES, stem)
+    path, knobs = _stem_load(stem, dev)
     if not os.path.isdir(path):
         pytest.skip(f"fixture {stem} not built")
     runs = []
-    for i in range(2):
-        with loaded_model(path, **dev.knobs) as sm:
-            plain = oracle.decode(sm, PROMPT)
-            g = sm.generate(list(PROMPT), N, speculate=False, processors=[lambda ids, lg: lg], logprobs=2, taps=[-1])
-            if i == 0:
-                _axis_tags(sm, spec.Surface.HOOKED, stem, dev)
-            toks = list(g.tokens)
-            assert_same_tokens(plain, toks, f"{stem} on {dev.key}: the hooked decode left the plain one")
-            assert g.logprobs is not None and g.hidden is not None
-            assert [t.token for t in g.logprobs] == toks and all(len(t.top) == 2 for t in g.logprobs)
-            assert int(next(iter(g.hidden.values())).shape[0]) == len(toks)
-            runs.append(toks)
+    for i in TWO:
+        sm = shared_model(path, i, **knobs)
+        plain = oracle.decode(sm, PROMPT)
+        g = sm.generate(list(PROMPT), N, speculate=False, processors=[lambda ids, lg: lg], logprobs=2, taps=[-1])
+        if i == 0:
+            _axis_tags(sm, spec.Surface.HOOKED, stem, dev)
+        toks = list(g.tokens)
+        assert_same_tokens(plain, toks, f"{stem} on {dev.key}: the hooked decode left the plain one")
+        assert g.logprobs is not None and g.hidden is not None
+        assert [t.token for t in g.logprobs] == toks and all(len(t.top) == 2 for t in g.logprobs)
+        assert int(next(iter(g.hidden.values())).shape[0]) == len(toks)
+        runs.append(toks)
     assert_same_tokens(runs[0], runs[1], f"{stem} on {dev.key}: hooked decode differed across two loads")
     receipt.record(manifest.stem_id(spec.Surface.HOOKED, stem, dev.key))
 
@@ -395,37 +459,37 @@ def test_fork_and_batch_are_deterministic(stem: str, dev: spec.DeviceSubpath) ->
     a fork and a batch declare is made (spec.SURFACE_TAGS)."""
     if not _hardware_here(dev.hardware):
         pytest.skip(f"{dev.hardware.value} not available on this machine")
-    path = os.path.join(FIXTURES, stem)
+    path, knobs = _stem_load(stem, dev)
     if not os.path.isdir(path):
         pytest.skip(f"fixture {stem} not built")
     runs = []
-    for i in range(2):
-        with loaded_model(path, **dev.knobs) as sm:
-            br = sm.session(list(PROMPT)).fork(3)
-            rows = br.generate(N, eos=(), sampling=oracle.sampling("sampled")).tokens
-            if i == 0:
-                _axis_tags(sm, spec.Surface.FORK, stem, dev, calls=False)
-            br.advance()
-            br.reorder([0, 0, 2])
-            assert br.logits is not None
-            tapped = br.step([int(t) for t in br.logits.argmax(-1)], taps=[-1]).hidden
-            br.leave(2)
-            forked = [br.tokens(r) for r in range(br.n)]
-            more = list(br.keep(1).generate(4, eos=(), speculate=False).tokens)
-            # a fork let go: the session stands where it was forked (`keep` closes its fork too, but a call made
-            # inside another is not the caller's, so the close is made here as a caller makes it)
-            held = sm.session(list(PROMPT))
-            held.fork(2).close()
-            assert held.tokens == list(PROMPT) and held.forked is None
-            with sm.batch([sm.session(r) for r in RAGGED[:2]]) as bt:
-                batched = bt.generate(N, eos=()).tokens
-                joined = bt.join(sm.session(RAGGED[2]))
-                bt.step([int(t) for t in bt.next_logits().argmax(-1)])
-                bt.leave(0)
-                rejoined = [bt.tokens(r) for r in range(joined + 1)]
-            if i == 0:
-                _axis_tags(sm, spec.Surface.FORK, stem, dev)
-            runs.append((rows, forked, more, batched, rejoined, sorted(tapped)))
+    for i in TWO:
+        sm = shared_model(path, i, **knobs)
+        br = sm.session(list(PROMPT)).fork(3)
+        rows = br.generate(N, eos=(), sampling=oracle.sampling("sampled")).tokens
+        if i == 0:
+            _axis_tags(sm, spec.Surface.FORK, stem, dev, calls=False)
+        br.advance()
+        br.reorder([0, 0, 2])
+        assert br.logits is not None
+        tapped = br.step([int(t) for t in br.logits.argmax(-1)], taps=[-1]).hidden
+        br.leave(2)
+        forked = [br.tokens(r) for r in range(br.n)]
+        more = list(br.keep(1).generate(4, eos=(), speculate=False).tokens)
+        # a fork let go: the session stands where it was forked (`keep` closes its fork too, but a call made
+        # inside another is not the caller's, so the close is made here as a caller makes it)
+        held = sm.session(list(PROMPT))
+        held.fork(2).close()
+        assert held.tokens == list(PROMPT) and held.forked is None
+        with sm.batch([sm.session(r) for r in RAGGED[:2]]) as bt:
+            batched = bt.generate(N, eos=()).tokens
+            joined = bt.join(sm.session(RAGGED[2]))
+            bt.step([int(t) for t in bt.next_logits().argmax(-1)])
+            bt.leave(0)
+            rejoined = [bt.tokens(r) for r in range(joined + 1)]
+        if i == 0:
+            _axis_tags(sm, spec.Surface.FORK, stem, dev)
+        runs.append((rows, forked, more, batched, rejoined, sorted(tapped)))
     assert runs[0] == runs[1], f"{stem} on {dev.key}: a fork or a batch differed across two loads"
     receipt.record(manifest.stem_id(spec.Surface.FORK, stem, dev.key))
 
@@ -440,33 +504,33 @@ def test_the_models_calls_are_deterministic(stem: str, dev: spec.DeviceSubpath) 
     answers the same across two"""
     if not _hardware_here(dev.hardware):
         pytest.skip(f"{dev.hardware.value} not available on this machine")
-    path = os.path.join(FIXTURES, stem)
+    path, knobs = _stem_load(stem, dev)
     if not os.path.isdir(path):
         pytest.skip(f"fixture {stem} not built")
     runs = []
-    for i in range(2):
-        with loaded_model(path, **dev.knobs) as sm:
-            ids = sm.prompt_ids("hello")
-            toks = list(sm.generate(list(PROMPT), N, eos=(), speculate=False).tokens)
-            pick = int(sm.project(sm.hidden(list(PROMPT), layers=(-1,))[sm.L - 1][-1]).argmax())
-            vec = sm.encode(["hello", "there"])
-            assert torch.allclose(vec.norm(dim=-1), torch.ones(2), atol=1e-3)
-            said = sm.ask("hello", max_new=4)
-            streamed = "".join(sm.stream("hello", 4))
-            chatted = sm.chat(max_new=4).ask("hello")
-            many = sm.ask_many(["hello", "there"], max_new=4)
-            with sm.batch([sm.session(list(PROMPT))]) as bt:
-                batched = bt.generate(4, eos=()).tokens
-            with sm.reserve("cert", MiB):
-                pass
-            lent = [sm.empty(64).numel(), float(sm.zeros(64).sum()), float(sm.full(64, 2.0).sum())]
-            assert "cpu" in sm.memory()
-            with sm.room(MiB, name="cert") as room:
-                held = [room.empty(16).numel(), float(room.zeros(16).sum()), float(room.full(16, 3.0).sum())]
-            sm.peak_memory()
-            if i == 0:
-                _axis_tags(sm, spec.Surface.MODEL, stem, dev)
-            runs.append((ids, toks, pick, said, streamed, chatted, many, batched, lent, held))
+    for i in TWO:
+        sm = shared_model(path, i, **knobs)
+        ids = sm.prompt_ids("hello")
+        toks = list(sm.generate(list(PROMPT), N, eos=(), speculate=False).tokens)
+        pick = int(sm.project(sm.hidden(list(PROMPT), layers=(-1,))[sm.L - 1][-1]).argmax())
+        vec = sm.encode(["hello", "there"])
+        assert torch.allclose(vec.norm(dim=-1), torch.ones(2), atol=1e-3)
+        said = sm.ask("hello", max_new=4)
+        streamed = "".join(sm.stream("hello", 4))
+        chatted = sm.chat(max_new=4).ask("hello")
+        many = sm.ask_many(["hello", "there"], max_new=4)
+        with sm.batch([sm.session(list(PROMPT))]) as bt:
+            batched = bt.generate(4, eos=()).tokens
+        with sm.reserve("cert", MiB):
+            pass
+        lent = [sm.empty(64).numel(), float(sm.zeros(64).sum()), float(sm.full(64, 2.0).sum())]
+        assert "cpu" in sm.memory()
+        with sm.room(MiB, name="cert") as room:
+            held = [room.empty(16).numel(), float(room.zeros(16).sum()), float(room.full(16, 3.0).sum())]
+        sm.peak_memory()
+        if i == 0:
+            _axis_tags(sm, spec.Surface.MODEL, stem, dev)
+        runs.append((ids, toks, pick, said, streamed, chatted, many, batched, lent, held))
     assert runs[0] == runs[1], f"{stem} on {dev.key}: the model's calls answered differently across two loads"
     receipt.record(manifest.stem_id(spec.Surface.MODEL, stem, dev.key))
 
@@ -477,43 +541,43 @@ def test_a_sessions_calls_are_deterministic(stem: str, dev: spec.DeviceSubpath) 
     a hybrid refuses a crop, and the answers are the same across two loads"""
     if not _hardware_here(dev.hardware):
         pytest.skip(f"{dev.hardware.value} not available on this machine")
-    path = os.path.join(FIXTURES, stem)
+    path, knobs = _stem_load(stem, dev)
     if not os.path.isdir(path):
         pytest.skip(f"fixture {stem} not built")
     runs = []
-    for i in range(2):
-        with loaded_model(path, **dev.knobs) as sm:
-            hybrid = LayerKind.LINEAR in sm.layer_types
-            s = sm.session(list(PROMPT))
-            m = s.mark()
-            fed = s.feed(OTHER).logits
-            step = s.feed([4], last_only=True, taps=[-1])
-            last, tapped = step.logits, step.hidden
-            s.rewind(m)
-            assert torch.equal(s.feed(OTHER).logits, fed), f"{stem} on {dev.key}: a rewind left the mark's logits"
-            k, _v = s.rows(next(j for j, kind in enumerate(sm.layer_types) if kind != LayerKind.LINEAR))
-            if hybrid:
-                with pytest.raises(ValueError, match="mark the point"):
-                    s.crop(len(PROMPT))
-            else:
+    for i in TWO:
+        sm = shared_model(path, i, **knobs)
+        hybrid = LayerKind.LINEAR in sm.layer_types
+        s = sm.session(list(PROMPT))
+        m = s.mark()
+        fed = s.feed(OTHER).logits
+        step = s.feed([4], last_only=True, taps=[-1])
+        last, tapped = step.logits, step.hidden
+        s.rewind(m)
+        assert torch.equal(s.feed(OTHER).logits, fed), f"{stem} on {dev.key}: a rewind left the mark's logits"
+        k, _v = s.rows(next(j for j, kind in enumerate(sm.layer_types) if kind != LayerKind.LINEAR))
+        if hybrid:
+            with pytest.raises(ValueError, match="mark the point"):
                 s.crop(len(PROMPT))
-            synced = s.sync(list(PROMPT) + OTHER)
-            s.fork(2).close()
-            toks = list(s.generate(N, eos=(), speculate=False).tokens)
-            after = int(s.next_logits().argmax())  # the decode's last token fed first
-            if i == 0:
-                _axis_tags(sm, spec.Surface.SESSION, stem, dev)
-            runs.append(
-                (
-                    fed.argmax(-1).tolist(),
-                    int(last.argmax()),
-                    sorted(tapped),
-                    list(k.shape),
-                    int(synced.argmax()),
-                    toks,
-                    after,
-                )
+        else:
+            s.crop(len(PROMPT))
+        synced = s.sync(list(PROMPT) + OTHER)
+        s.fork(2).close()
+        toks = list(s.generate(N, eos=(), speculate=False).tokens)
+        after = int(s.next_logits().argmax())  # the decode's last token fed first
+        if i == 0:
+            _axis_tags(sm, spec.Surface.SESSION, stem, dev)
+        runs.append(
+            (
+                fed.argmax(-1).tolist(),
+                int(last.argmax()),
+                sorted(tapped),
+                list(k.shape),
+                int(synced.argmax()),
+                toks,
+                after,
             )
+        )
     assert runs[0] == runs[1], f"{stem} on {dev.key}: a session's calls answered differently across two loads"
     receipt.record(manifest.stem_id(spec.Surface.SESSION, stem, dev.key))
 

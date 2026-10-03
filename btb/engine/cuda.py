@@ -4,26 +4,36 @@ pass over the host-side attention cache."""
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
+import functools
+import gc
 import itertools
 import os
 import sys
 import time
-from collections.abc import Callable
+import weakref
+from collections.abc import Callable, Iterable, Iterator
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn.functional as F
 
 from .. import mlx as mlxdev
+from .. import trace
 from ..kinds import LayerKind, NodePath, Parents, PassTag, Tokens
 from ..options import Device
 from ..sampling import GREEDY
-from .cache import CardRowsLayer, GrowLayer, attention_rows, forked, set_rows
+from . import device as device_mod
+from .arena import KvArena
+from .cache import CardRowsLayer, GrowLayer, attention_rows, forked, indexer_keys, set_rows
 from .families import act_name
-from .forward import layer_window, node_mask, pe_for
+from .fixed_rows import KeyRows
+from .forward import chain_of, layer_window, node_mask, pe_for
 from .fused import _fused_rope
 from .native import Native, kernels_path
+from .scheduler import _size
+from .spec_cost import SpecCost
 from .state import _State
 
 if TYPE_CHECKING:
@@ -56,17 +66,276 @@ def _card_warning(reason: str) -> None:
     sys.stderr.flush()
 
 
+def _graphs_in(o: Any, seen: set[int] | None = None) -> Iterator[Any]:
+    """every CUDA graph in a graph state's dicts, lists and tuples, once each"""
+    seen = set() if seen is None else seen
+    if id(o) in seen:
+        return
+    seen.add(id(o))
+    if isinstance(o, torch.cuda.CUDAGraph):
+        yield o
+    elif isinstance(o, dict):
+        for v in o.values():
+            yield from _graphs_in(v, seen)
+    elif isinstance(o, (list, tuple)):
+        for v in o:
+            yield from _graphs_in(v, seen)
+
+
+def _captured(exec_id: int) -> None:
+    """the body of a step graph already captured: never run, the graph is replayed instead"""
+    raise RuntimeError(f"[card] the step graph is captured; its body ({exec_id}) does not run again")
+
+
+class _Warm:
+    """a pass's L2 warming (`_CudaMixin._card_warm`): called after each matvec is launched, it forks `side` from
+    the chain there and warms the next weight of `seq` - (weight, rows, cols, the warps its matvec cuts k into) -
+    with `btb_l2_warm`, the share of each warp's slice read on the card from `share` (the card state's switch,
+    moved between replays), so the warming runs beside the kernels between the two matvecs; `join()` brings `side`
+    back into the chain at the pass's end, which a capture needs. It holds the pass's weights and pointers and
+    nothing of the card's state, so nothing outlives the pass through it"""
+
+    __slots__ = ("blocks", "i", "k", "seq", "share", "side", "sink")
+
+    def __init__(
+        self,
+        k: Any,
+        side: torch.cuda.Stream | None,
+        sink: torch.Tensor | None,
+        seq: list[tuple[torch.Tensor, int, int, int]],
+        blocks: int,
+        share: ctypes.c_void_p | None = None,
+    ) -> None:
+        self.k, self.side, self.sink, self.seq, self.blocks, self.share, self.i = k, side, sink, seq, blocks, share, 0
+
+    def __call__(self) -> None:
+        if self.side is None or self.i >= len(self.seq):
+            return
+        W, R, C, nw = self.seq[self.i]
+        self.i += 1
+        self.side.wait_stream(torch.cuda.current_stream())
+        c = ctypes.c_int
+        self.k.launch(
+            "btb_l2_warm",
+            (self.blocks, 1, 1),
+            (256, 1, 1),
+            [self.k.ptr(W), c(R), c(C), c(nw), self.share, self.k.ptr(self.sink)],
+            stream=self.side,
+        )
+
+    def join(self) -> None:
+        if self.side is not None:
+            torch.cuda.current_stream().wait_stream(self.side)
+
+
+class _Tuner:
+    """the step loop's choice among ways to run the step that give the same bits and differ only in speed, by their
+    speed as measured, interleaved with each other so every way meets the same load on the card. An arm is a
+    setting of the card state's switches (`SW_*`, written on the card between replays, in stream order) and a lane,
+    (its queue, its kernels): the step graph at the platform's unroll with one replay queued ahead ("usual"), or at
+    one step a replay queued as deep as its execs allow ("deep"); in the plain kernels or the fused ones. Alone on
+    the card the usual lane is the faster (fewer submissions); beside a program the driver time-slices the card
+    with, the deep lane's short replays, waiting when a gap opens, run in the gaps it leaves where a longer replay
+    spans them - so choosing the deep lane is noticing the card is shared. The fused kernels leave fewer edges where
+    that program takes the card and btb's L2 with it.
+    Replays are timed in windows of `window` (each replay's time a token on the card's clock), a window's median kept
+    for its arm (the last `keep`); every arm is tried `rounds` times first, then the chosen arm runs, a window in
+    every `explore` spent on the others in turn. The choice moves only on `least` windows of each arm and holds for
+    `dwell` windows after it moves - beside a game a few lucky windows of the deep lane once moved it there and the
+    next few moved it back, five times in three answers - and away from the usual lane only to one `margin` faster:
+    beside a game the deep lane won by 15-20% where it paid, on a free card the two drifted up to 7% apart as their
+    windows fell at different moments, and a 5% margin read that drift as a shared card twice in six answers; a move
+    between lanes is said"""
+
+    def __init__(
+        self,
+        arms: list[tuple[str, list[int], tuple[str, bool]]],
+        dev: torch.device,
+        window: int = 4,
+        rounds: int = 2,
+        explore: int = 8,
+        keep: int = 9,
+        margin: float = 0.10,
+        least: int = 5,
+        dwell: int = 12,
+    ) -> None:
+        self.labels = [a for a, _, _ in arms]
+        self.lanes = [ln for _, _, ln in arms]
+        self.table = torch.tensor([v for _, v, _ in arms], dtype=torch.int32, device=dev)
+        self.window, self.rounds, self.explore, self.keep, self.margin = window, rounds, explore, keep, margin
+        self.least, self.dwell = least, dwell
+        self.moved = 0  # the window the choice last moved at
+        # the windows between two exploring ones: doubled (to 64) each time the arm explored loses by more than twice
+        # the margin, back to `explore` when one comes close - beside a game the deep lane ran 20-40% slower for a
+        # whole run, and a window in eight spent on it cost the answer 5% - or when the chosen arm's own time moves
+        # as far from where it stood then (`ref`): a change of load shows there first, and a stale median of an arm
+        # explored once in 64 windows would hold the choice long after the load that made it
+        self.every = explore
+        self.ref: float | None = None
+        self.ctx: int | None = None  # the power of two of the prefix the windows were timed over (`at_context`)
+        self.shift = 0  # the chosen arm's windows in a row far from its own median: the load moving (`after_replay`)
+        self.meds: list[list[float]] = [[] for _ in arms]
+        self.windows = 0  # windows completed, over every generate call
+        self.other = 0  # the next arm an exploring window tries
+        self.chosen = 0  # the arm run outside the exploring windows
+        self.arm = 0  # the arm the current window runs
+        self.cur: int | None = None  # the arm the switches hold on the card
+        self.acc: list[float] = []  # the current window's per-token seconds
+
+    def at_context(self, past: int) -> None:
+        """an answer starting over `past` rows: a step's time grows with the prefix its attention reads, so windows
+        timed at another length compare nothing - a free card once read a 4k answer's usual lane (5.48 ms) against
+        the deep lane's short-prompt windows (4.45) and said it was shared. Where the length's power of two moves, the
+        windows go and both lanes are tried again; the choice stands until they say otherwise"""
+        key = max(0, int(past)).bit_length()
+        if self.ctx == key:
+            return
+        self.ctx = key
+        self._afresh()
+
+    def _afresh(self) -> None:
+        """every arm's windows let go and every arm tried again, the choice standing until they say otherwise"""
+        self.meds = [[] for _ in self.labels]
+        self.acc = []
+        self.windows, self.moved, self.every, self.ref, self.shift = 0, 0, self.explore, None, 0
+        self.arm = 0
+
+    def median(self, i: int) -> float | None:
+        m = self.meds[i]
+        return sorted(m)[len(m) // 2] if m else None
+
+    def best(self) -> int:
+        return self.chosen
+
+    def _choose(self) -> tuple[str, bool] | None:
+        """the chosen arm moved to the fastest: away from the first arm (the usual way, the one alone on the card
+        takes) only where another is `margin` faster, back to it as soon as it is as fast - alone, the lanes differ by
+        the deep one's submissions, less than the margin, so a margin both ways would keep the deep queue after the
+        other program left; the line to say where the choice moved, and whether the console hears it (a move of the
+        queue) or only the log (of the kernels)"""
+        if any(len(m) < self.least for m in self.meds) or self.windows - self.moved < self.dwell:
+            return None
+        meds = [self.median(i) or 0.0 for i in range(len(self.meds))]
+        if self.chosen != 0 and meds[0] <= meds[self.chosen]:
+            b = 0
+        else:
+            b = min(range(len(meds)), key=lambda i: meds[i])
+            if b == self.chosen or meds[b] >= meds[self.chosen] * (1.0 - self.margin):
+                return None
+        was, self.chosen, self.moved = self.chosen, b, self.windows
+        (qb, fb), (qw, fw) = self.lanes[b], self.lanes[was]
+        kern = " in the fused kernels" if fb else ""
+        if qb != qw and qb == "deep":
+            return (
+                f"the card is shared: one-step replays queued deep{kern} run at {1e3 * meds[b]:.2f} ms a token "
+                f"against {1e3 * meds[was]:.2f} - queuing deep, so btb runs in the gaps the other program leaves",
+                True,
+            )
+        if qb != qw:
+            return (
+                f"queuing deep no longer pays: the usual replays{kern} run at {1e3 * meds[b]:.2f} ms a token against "
+                f"{1e3 * meds[was]:.2f} queued deep - back to one replay queued ahead",
+                True,
+            )
+        if fb != fw:
+            return (
+                f"the step's {'fused' if fb else 'plain'} kernels run at {1e3 * meds[b]:.2f} ms a token against "
+                f"{1e3 * meds[was]:.2f} for the {'plain' if fb else 'fused'} ones - taking them",
+                False,
+            )
+        return None
+
+    def _next_arm(self) -> int:
+        n = len(self.labels)
+        if self.windows < n * self.rounds:
+            return self.windows % n
+        if n > 1 and self.windows % self.every == 0:
+            self.other = (self.other + 1) % n
+            if self.other == self.chosen:
+                self.other = (self.other + 1) % n
+            return self.other
+        return self.chosen
+
+    def before_replay(self, switch: torch.Tensor) -> int:
+        """the arm the next replay runs, its switches written on the card where they change"""
+        if self.cur != self.arm:
+            switch.copy_(self.table[self.arm], non_blocking=True)
+            self.cur = self.arm
+        return self.arm
+
+    def after_replay(self, arm: int, seconds_per_token: float) -> tuple[str, bool] | None:
+        """a replay run by `arm` took `seconds_per_token` a token: kept, the window closed when full, and the choice
+        made again; the line to say where the choice moved, and whether the console hears it (`_choose`)"""
+        if arm != self.arm:
+            return None
+        self.acc.append(seconds_per_token)
+        if len(self.acc) < self.window:
+            return None
+        m = self.meds[self.arm]
+        w = sorted(self.acc)[len(self.acc) // 2]
+        self.acc = []
+        if self.arm == self.chosen and len(m) >= self.least:
+            # the chosen arm far from its own median two windows running: the load moved (another program came or
+            # went), and the other arms' windows, taken rarely and under the old load, would misname the fastest -
+            # a game once read the deep fused lane's calm windows (4.5 ms) against the others' under it (7.6)
+            mid = sorted(m)[len(m) // 2]
+            self.shift = self.shift + 1 if abs(w - mid) > 2.0 * self.margin * mid else 0
+            if self.shift >= 2:
+                trace.event(
+                    "tuner: the load on the card moved (%s at %.2f ms a token, its median %.2f) - measuring every "
+                    "lane afresh",
+                    self.labels[self.chosen],
+                    1e3 * w,
+                    1e3 * mid,
+                )
+                self._afresh()
+                self.meds[self.chosen].append(w)
+                self.arm = self._next_arm()
+                return None
+        m.append(w)
+        del m[: -self.keep]
+        self.windows += 1
+        if self.arm != self.chosen and self.windows > len(self.labels) * self.rounds:
+            # an exploring window closed: explore less while the other arms lose clearly, as often as at first when
+            # one comes close
+            mine, theirs = self.median(self.arm), self.median(self.chosen)
+            if mine is not None and theirs is not None and mine > theirs * (1.0 + 2.0 * self.margin):
+                self.every, self.ref = min(64, self.every * 2), theirs
+            else:
+                self.every, self.ref = self.explore, None
+        elif self.arm == self.chosen and self.ref is not None and abs(m[-1] - self.ref) > 2.0 * self.margin * self.ref:
+            # the chosen arm's own time moved: the load changed, and the others are worth a look again
+            self.every, self.ref = self.explore, None
+        said = self._choose()
+        self.arm = self._next_arm()
+        return said
+
+    def report(self) -> str:
+        parts = []
+        for i, lab in enumerate(self.labels):
+            md = self.median(i)
+            parts.append(f"{'*' if i == self.chosen else ''}{lab} " + (f"{1e3 * md:.2f}" if md is not None else "-"))
+        return f"ms a token by setting, {self.windows} windows: " + ", ".join(parts)
+
+
 class _CudaMixin(_State):
     def aa(self, parents: Parents | None = None) -> None:
         self.al = {}
         self.am = {}
         self.an = {}
+        self.spec_commits = []
         self.ap = parents
         self.aq = True
 
     def ab(self) -> None:
         self.aq = False
         self.ap = None
+
+    def _drop_spec_state(self) -> None:
+        """a verify pass's per-node checkpoints of the recurrent layers' states and its commits let go: `ad` reads them
+        after the pass, and the next pass's `aa` replaces them, so after the last pass they were held until the
+        engine was - 32 MB a DeltaNet layer on Qwen3.5's widths, past `close`"""
+        self.al, self.am, self.an, self.spec_commits = {}, {}, {}, []
 
     def ac(self, tmpl: Any, i: int, h: torch.Tensor, pe: PassRope, text_pos: Any, cache: Any) -> torch.Tensor:
         T = h.shape[1]
@@ -91,7 +360,7 @@ class _CudaMixin(_State):
             hp = h[:, p : p + 1]
             pos_p = text_pos[:, p : p + 1]
             pe_p = (rope[0][:, p : p + 1], rope[1][:, p : p + 1])
-            mask_p = None
+            mask_p: KeyRows | torch.Tensor | None = None
             branch = tree and parents[p] != p - 1
             dev = h.device
             if lt == LayerKind.LINEAR and branch:
@@ -101,7 +370,16 @@ class _CudaMixin(_State):
                 r.copy_(rec)
             if base is not None:
                 rows = node_mask(base, p, parents, win)
-                mask_p = None if rows is None else rows.view(1, 1, 1, -1).to(dev)
+                # the node's rows by index, in the order its committed step would read them (a parent's row precedes
+                # its children's): its attention then makes the step's own call (`attend_one`), not a masked one
+                if rows is None:
+                    mask_p = None
+                elif dev.type == Device.CUDA or not self.fam.fast:
+                    # on the card, and wherever the attention is the family's own module (gpt-oss's sinks take
+                    # `KeyRows` on the host too; the host sdpa of the others takes the bool row)
+                    mask_p = KeyRows(rows.nonzero()[:, 0].to(dev, non_blocking=True))
+                else:
+                    mask_p = rows.view(1, 1, 1, -1).to(dev)
             outs.append(
                 tmpl(
                     hp,
@@ -269,6 +547,7 @@ class _CudaMixin(_State):
     _cg: Any
     CARD_T_MAX = 32
     ATTN_SPLIT = 1024  # keys per attention block along the sequence (ATTN_SPLIT in btb_kernels.cu)
+    PROGRAM_SAMPLES = 5  # the timed replays of each width a card program's warm-up keeps the fastest of
 
     def _card_kernels(self) -> Any:
         """the card's kernels, else None once `_card_warning` has said why the card runs through torch alone"""
@@ -291,9 +570,8 @@ class _CudaMixin(_State):
             # the family first: another family's config need not carry the fields the shapes are read from
             # (a mixture of experts names its width moe_intermediate_size)
             ok = (
-                (self.fam.kernel_layout or self.fam.sandwich)
+                self.fam.card_graph
                 and act_name(self.cfg) in ("silu", "swish", "gelu_pytorch_tanh")  # the kernels' activations
-                and not self.fam.own
                 and self.mlx is None
                 and not getattr(self, "resident_fp32", False)
                 and self.compute_dtype in (None, torch.bfloat16)
@@ -315,7 +593,23 @@ class _CudaMixin(_State):
             and getattr(self, "_probe", None) is None
             and self._card_family_ok()
             and self._card_kernels() is not None
+            # a build the card had no room for, at this placement and not long ago (`_card_oom`)
+            and not self._card_off_now()
         )
+
+    # a card graph a build found no room for is tried again this long after, doubling with each refusal at one
+    # placement up to CARD_RETRY_MAX_S: the program that took the card may have gone, with no placement move to say so
+    CARD_RETRY_S = 10.0
+    CARD_RETRY_MAX_S = 300.0
+
+    def _card_off_now(self) -> bool:
+        """whether the card graph is off for a build the card had no room for (`_card_oom`): at the placement it
+        failed at, until its retry is due"""
+        off = getattr(self, "_card_off", None)
+        if off is None:
+            return False
+        ver, until, _wait = off
+        return ver == self.device.snapshot().version and time.monotonic() < until
 
     def _card_pass_ok(
         self, cache: Any, B: int, T: int, past: int, am: torch.Tensor | None, on_layer: Any, stop_after: int | None
@@ -348,6 +642,99 @@ class _CudaMixin(_State):
             segs.append((a, self.L))
         return segs
 
+    def _graphs_close(self) -> None:
+        """The captured graphs let go, and every buffer they replay into: the single-token decode's (`_g`), the
+        card path's (`_cg`: its graphs, arena and tables) and a family's card program's (`_cp`). A graph keeps its
+        pool's memory until it is reset, so each is reset before the state goes; and the arena's persisting L2
+        window is cleared on the streams it was set on - left, it names freed memory and keeps the card's L2 set
+        aside for it."""
+        cp = vars(self).pop("_cp", None)
+        if cp is not None:
+            cp.close()
+        g, cg = getattr(self, "_g", None), getattr(self, "_cg", None)
+        if g is None and cg is None:
+            return
+        torch.cuda.synchronize(self.dev)  # nothing still replaying into what goes
+        for st in (g, cg):
+            if st is not None:
+                for graph in _graphs_in(st):
+                    graph.reset()
+        if cg is not None and cg.get("arena") is not None and cg.get("k") is not None:
+            cg["k"].persist(0, 0, stream=cg["stream"])
+            cg["k"].persist(0, 0)
+        if cg is not None and cg.get("arena") is not None:
+            # the arena's hold on its memory: what no cache still views goes back to the card now
+            cg["arena"]["A"].close()
+        vars(self).pop("_g", None)
+        vars(self).pop("_cg", None)
+
+    def _card_let_go(self) -> None:
+        """The card graphs reset and the layer blocks they read let go (`_card_weights`' merged q/k/v and gate/up,
+        which the modules only view), keeping the arena and the rope tables the cache and the next state carry over;
+        and the kv_host step's graphs (`_g`), which read the modules' weights by pointer. A layer shed while these
+        hold its blocks frees nothing on the card - a yield once shed every layer for nothing - and a graph kept past
+        its layer's regrowth would replay freed memory. A family's card program (`_cp`) the same: its merged blocks
+        and graphs (`let_go`), which held every resident layer's weights through Qwen4's sheds. The next pass builds
+        what it needs again"""
+        st = getattr(self, "_cg", None)
+        g = vars(self).pop("_g", None)
+        cp = getattr(self, "_cp", None)
+        if st is None and g is None and cp is None:
+            return
+        torch.cuda.synchronize(self.dev)  # nothing still replaying into what goes
+        before = self._trace_mem()
+        if st is not None:
+            for graph in _graphs_in(st["graphs"]):
+                graph.reset()
+            st["graphs"].clear()
+            st["layers"].clear()
+            # the step graph's embedding table too - a granted copy, or a tied head's weight a shed would free
+            # otherwise for nothing: made again by the next step graph (`_card_table`)
+            st.pop("table", None)
+        if g is not None:
+            for graph in _graphs_in(g):
+                graph.reset()
+        if cp is not None:
+            cp.let_go()
+        torch.cuda.empty_cache()
+        if trace.ON:  # no log line says this: the trace does
+            trace.event("card graph: let go, the next pass builds it again%s", self._trace_grew(before))
+
+    @staticmethod
+    def _is_card_oom(e: BaseException) -> bool:
+        """whether `e` is the card out of memory: torch's allocator's error, or the driver's from a graph's
+        instantiation or launch (raised as another RuntimeError, an AcceleratorError)"""
+        return isinstance(e, torch.OutOfMemoryError) or (
+            isinstance(e, RuntimeError) and "out of memory" in str(e).lower()
+        )
+
+    def _card_oom(self, e: BaseException) -> None:
+        """a card-graph build the card had no room for (another program took it mid-pass): the graphs let go, the
+        card graph off - the pass runs the torch path - until the placement moves or its retry is due (CARD_RETRY_S,
+        doubling at one placement): a program that took the card and left moved no placement"""
+        self._card_let_go()
+        ver = self.device.snapshot().version
+        off = getattr(self, "_card_off", None)
+        wait = min(self.CARD_RETRY_MAX_S, off[2] * 2) if off is not None and off[0] == ver else self.CARD_RETRY_S
+        self._card_off = (ver, time.monotonic() + wait, wait)
+        self.log(
+            f"[card] no room on the card for the card graph ({str(e).splitlines()[0][:120]}): the torch path until "
+            f"the placement moves (version {ver}), or {wait:.0f} s"
+        )
+
+    @staticmethod
+    def _capture(cg: torch.cuda.CUDAGraph, pool: Any, stream: torch.cuda.Stream, body: Callable[[], Any]) -> None:
+        """`body` captured into `cg` on `stream`: the stream current before restored however the capture ends - a
+        capture whose end raised (the card out of memory at the graph's instantiation) skipped torch's own restore,
+        and every later kernel of the thread queued on the capture's stream"""
+        s0 = torch.cuda.current_stream()
+        try:
+            with torch.cuda.graph(cg, pool=pool, stream=stream):
+                body()
+        except BaseException:
+            torch.cuda.set_stream(s0)
+            raise
+
     def _card_state(self) -> dict[str, Any]:
         ver = self.device.snapshot().version
         st = getattr(self, "_cg", None)
@@ -364,6 +751,10 @@ class _CudaMixin(_State):
             "stream": torch.cuda.Stream(device=self.dev) if st is None else st["stream"],
             "arena": None if st is None else st["arena"],
             "tables": None if st is None else st["tables"],
+            # the passes' switches, read on the card by the kernels they steer, so the host moves them between
+            # replays without a capture (`SW_*`, `_Tuner`): every setting gives the same bits
+            "switch": self._card_switch_init() if st is None else st["switch"],
+            "tuners": {} if st is None else st.get("tuners", {}),
         }
         self._cg = st
         return st
@@ -442,64 +833,103 @@ class _CudaMixin(_State):
         st["tables"] = tb
         return tb
 
-    def _card_arena(self, st: dict[str, Any], need: int) -> dict[str, Any]:
-        """the arena holding every run layer's cache rows, one tensor [runs' layers, 2, Hk, cap, d] the caches
-        attach to (a cache attached elsewhere copies its rows in), at least `need` rows deep; grown by
-        reallocation (rows copied over, graphs dropped) when a context outruns it. Its front lies in a
+    def _card_arena(self, st: dict[str, Any], need: int, reach: int = 0) -> dict[str, Any]:
+        """The arena holding every run layer's cache rows (`KvArena`, position-major: a layer's rows grow at the end
+        of its own region) the caches attach to - a cache attached elsewhere copies its rows in - at least `need` rows
+        deep, and `reach` deep when it grows (`_card_reach`: a growth step past the rows). A growth maps memory onto
+        the rows' end where the card's driver can (nothing moves), else regrows the layers one at a time; only a
+        change of the layers on the card makes a new arena, the common layers' rows copied over. Its front lies in a
         persisting-L2 window, so a short context's attention reads hit L2 under the weights' evict-first loads"""
         ar = st["arena"]
         if ar is not None and ar["cap"] >= need:
             return ar
         H, Hq, Hk, D, I = self._card_dims()
         layers = [i for a, b in st["segments"] for i in range(a, b)]
-        cap = max(int(need), 4096)
-        cap = (cap + 1023) // 1024 * 1024
-        nbytes = len(layers) * 2 * Hk * cap * D * 2
+        slot = {i: j for j, i in enumerate(layers)}
+        same = ar is not None and ar["slot"] == slot
+        store = ar["A"] if same else KvArena(len(layers), Hk, D, self.dev, self._card_ceiling())
+        cap = store.rows_for((max(int(need), int(reach), 4096) + 1023) // 1024 * 1024)
         sched = getattr(self, "scheduler", None)
         if sched is not None:
             sched.grant(
-                nbytes,
+                store.nbytes(cap),
                 "kv",
                 requester=f"card arena {len(layers)} layers x {cap} rows",
                 B=1,
                 cap=cap,
                 bound=None,
                 device=self.dev,
+                # what the arena holds now: grown in place it stays (only the growth is new), else it is let go
+                # once its rows are copied over
+                held=ar["A"].nbytes(ar["cap"]) if ar is not None else 0,
             )
-        A = torch.empty(len(layers), 2, Hk, cap, D, dtype=torch.bfloat16, device=self.dev)
-        slot = {i: j for j, i in enumerate(layers)}
-        new = {"A": A, "cap": cap, "slot": slot, "owner": ar["owner"] if ar is not None else None}
-        if ar is not None:
-            owner = ar["owner"]() if ar["owner"] is not None else None
-            for i, j in ar["slot"].items():
-                if i in slot:
-                    A[slot[i], :, :, : ar["cap"]].copy_(ar["A"][j])
-                    if owner is not None and isinstance(owner.layers[i], CardRowsLayer):
-                        # a fork's or a batch's rows keep their slots: only the slices move
-                        if owner.layers[i]._buf is not None:
-                            owner.layers[i]._buf = (A[slot[i], 0], A[slot[i], 1])
-                    elif owner is not None:
-                        layer = owner.layers[i]
-                        n = int(layer.keys.shape[-2]) if (layer.is_initialized and layer.keys is not None) else 0
-                        layer._buf = (A[slot[i], 0][None], A[slot[i], 1][None])
-                        if n:
-                            layer._set_rows(layer._buf[0][..., :n, :], layer._buf[1][..., :n, :])
+        owner = ar["owner"]() if ar is not None and ar["owner"] is not None else None
+
+        def moved(j: int) -> None:
+            """layer layers[j]'s holder takes the arena's views of it (the rows are in them already)"""
+            i = layers[j]
+            if owner is None:
+                return
+            if isinstance(owner.layers[i], CardRowsLayer):
+                # a fork's or a batch's rows keep their slots: only the slices move
+                if owner.layers[i]._buf is not None:
+                    owner.layers[i]._buf = (store[j, 0], store[j, 1])
+                return
+            layer = owner.layers[i]
+            n = int(layer.keys.shape[-2]) if (layer.is_initialized and layer.keys is not None) else 0
+            layer._buf = (store[j, 0][None], store[j, 1][None])
+            if n:
+                layer._set_rows(layer._buf[0][..., :n, :], layer._buf[1][..., :n, :])
+
+        if same:
+            store.grow(cap, moved=moved)
+            if store.in_place:
+                for j in range(len(layers)):
+                    moved(j)  # the same addresses, longer views
+        else:
+            store.grow(cap)
+            if ar is not None:
+                for i, j in ar["slot"].items():
+                    if i in slot:
+                        for w in (0, 1):
+                            store[slot[i], w][:, : ar["cap"]].copy_(ar["A"][j, w])
+                        moved(slot[i])
+                ar["A"].close()
+        new = {"A": store, "cap": store.cap, "slot": slot, "owner": ar["owner"] if ar is not None else None}
         st["arena"] = new
         st["graphs"].clear()
         # how much of the arena's front sits in persisting L2 is the scheduler's call (it holds the
         # hierarchy's sizes); the driver call is only the mechanism
         k = st["k"]
-        pinned = self.scheduler.pin_bytes(A.numel() * 2) if getattr(self, "scheduler", None) is not None else 0
-        k.persist(A.data_ptr(), pinned, stream=st["stream"])
-        k.persist(A.data_ptr(), pinned)
+        pinned = self.scheduler.pin_bytes(store.nbytes(store.cap)) if sched is not None else 0
+        k.persist(store.front(), pinned, stream=st["stream"])
+        k.persist(store.front(), pinned)
         self.log(
-            f"[card] arena {len(layers)} layers x {cap} rows ({nbytes / 2**20:.0f} MB), {pinned / 2**20:.0f} MB "
-            f"of it pinned in L2"
+            f"[card] arena {len(layers)} layers x {store.cap} rows ({store.nbytes(store.cap) / 2**20:.0f} MB, "
+            f"{'mapped in place' if store.in_place else 'regrown layer by layer'}), {pinned / 2**20:.0f} MB of it "
+            f"pinned in L2"
         )
         return new
 
+    def _card_ceiling(self) -> int:
+        """the rows a sequence of this model reaches: its context where one is set, else its own position limit -
+        the addresses an arena reserves up front where the driver maps in place (none of it memory until used)"""
+        return max(int(self.context or 0), int(getattr(self.cfg, "max_position_embeddings", 0) or 0), 4096)
+
+    @staticmethod
+    def _card_reach(cache: Any, layers: Iterable[int], rows: int) -> int:
+        """the rows the arena takes for `cache` holding `rows`: a growth step past them (an eighth, at least 4096),
+        held to the most its layers reach where the caller named it (`cap_hint`) - a ceiling, never a reservation:
+        an answer left uncapped names the whole window, and an arena that deep was asked of the card up front"""
+        step = rows + max(4096, rows // 8)
+        hint = max((int(getattr(cache.layers[i], "cap_hint", 0) or 0) for i in layers), default=0)
+        return min(step, max(rows, hint)) if hint else step
+
     def _card_adopt_cache(self, cache: Any) -> None:
-        """a new cache takes the arena when no live cache holds it, so its prefill writes straight in"""
+        """a new cache takes the arena when no live cache holds it and it reaches as far as the cache will, so its
+        prefill writes straight in. An arena the cache would grow is left to the prefill's sweep (`_card_arena_take`),
+        which grows it once the room is made: grown here, before any, the room it took could only be looked for by
+        shedding layers - which free nothing of the one arena - and the whole model went to the host for it"""
         st = getattr(self, "_cg", None)
         if st is None or st["arena"] is None or st["version"] != self.device.snapshot().version:
             return
@@ -507,7 +937,39 @@ class _CudaMixin(_State):
         owner = ar["owner"]() if ar["owner"] is not None else None
         if owner is not None and owner is not cache:
             return
-        self._card_bind(cache, st, 0)
+        if self._card_reach(cache, ar["slot"], 0) > int(ar["cap"]):
+            return
+        self._card_arena_holds(cache, 0)
+
+    def _card_arena_holds(self, cache: Any, T: int) -> bool:
+        """whether `cache` sits in the card graph's arena for a pass of `T` more rows - bound now where it is not,
+        the arena grown to the cache's reach as the ledger grants it. Refused, the cache keeps its rows in buffers of
+        its own (a long prompt's, presized before the arena could take them, would need a second whole copy there)
+        and its passes take the torch layers over them: the arena is the graphs' speed, never a pass's condition.
+        A refused cache is not asked again - its rows only grow"""
+        from .scheduler import MemoryGrantError
+
+        refused = self.__dict__.setdefault("_arena_refused", weakref.WeakSet())
+        if cache in refused:
+            return False
+        try:
+            self._card_bind(cache, self._card_state(), T)
+            return True
+        except MemoryGrantError as e:
+            refused.add(cache)
+            self.log(f"[card] the arena cannot take this cache's rows ({e}); its passes take the torch layers")
+            return False
+
+    def _card_arena_take(self, cache: Any, T: int) -> bool:
+        """a prefill's cache into the card graph's arena before its rows are made, where no other live cache holds
+        the arena: grown to the sequence's reach, the rows are made once, in it - presized in buffers of the cache's
+        own, the first decode step asked a second whole copy to move them in (3.3 GB of a 40k prompt, refused)"""
+        st = self._card_state()
+        ar = st["arena"]
+        owner = ar["owner"]() if ar is not None and ar["owner"] is not None else None
+        if owner is not None and owner is not cache:
+            return False
+        return self._card_arena_holds(cache, T)
 
     def _card_bind(self, cache: Any, st: dict[str, Any], T: int) -> dict[str, Any]:
         import weakref
@@ -526,8 +988,8 @@ class _CudaMixin(_State):
         for i in layers:
             layer = cache.layers[i]
             n = layer.get_seq_length() if layer.is_initialized else 0
-            need = max(need, n + T, int(getattr(layer, "cap_hint", 0) or 0))
-        ar = self._card_arena(st, need)
+            need = max(need, n + T)
+        ar = self._card_arena(st, need, self._card_reach(cache, layers, need))
         owner = ar["owner"]() if ar["owner"] is not None else None
         if owner is not cache:
             self._card_evict(ar)
@@ -561,33 +1023,93 @@ class _CudaMixin(_State):
         """Which GEMV a T-row pass runs: the fp32 chain (`gemv_rows`) or the tensor-core kernel
         (`btb_gemv_mma.cuh`); `card_mma` / BTB_CARD_MMA force it, else `card_warm`'s measurement. One kernel
         for every width: the two sum a row in different orders, and a step on one with a pass on the other
-        would part at a bf16 near-tie."""
+        would part at a bf16 near-tie. The warm-up's choice is the engine's (`_mma_for`, `_mma_one`): the card's and
+        the model's, not the placement's, so no card state carries it and none left behind holds it."""
+        on, why = self._card_mma_pick(T)
+        if trace.ON:  # a pass's path: nothing built for the trace when it is off
+            trace.changed(
+                (trace.token(self), "card gemv", T),
+                on,
+                "card gemv: %d-row passes take the %s kernel (%s)",
+                T,
+                "tensor-core" if on else "fp32-chain",
+                why,
+            )
+        return on
+
+    def _card_mma_pick(self, T: int) -> tuple[bool, str]:
+        """`_card_mma_for`'s answer and what gave it"""
         if not self._card_mma_avail():
-            return False
+            return False, "no tensor-core kernel in this build"
         on = getattr(self, "card_mma", None)
         if on is None:
             env = os.environ.get("BTB_CARD_MMA")
             if env in ("0", "1"):
-                on = env == "1"
+                return env == "1", "BTB_CARD_MMA"
         if on is not None:
-            return bool(on)
-        st = getattr(self, "_cg", None)
-        choice = st.get("mma_for") if st is not None else None
+            return bool(on), "card_mma"
+        choice: dict[int, bool] | None = vars(self).get("_mma_for")
         if choice is not None and T in choice:
-            return bool(choice[T])
-        one = st.get("mma_one") if st is not None else None
+            return bool(choice[T]), "the warm-up measured it at this width"
+        one = vars(self).get("_mma_one")
         if one is not None:
             # a width past the timed ones (a long prompt's prefill) takes the engine's kernel
-            return bool(one)
-        return False
-
-    MMA_BLOCK = 64  # btb_gemv_mma_bf16: two warps over one group of 16 weight rows
+            return bool(one), "past the widths the warm-up timed: the engine's kernel"
+        return False, "not measured yet"
 
     @staticmethod
     def _card_mma_grid(R: int, C: int) -> int:
         """the launch of btb_gemv_mma_bf16 for a [R, C] weight: one block per group of 16 rows (a shorter grid
         strides the groups and is only slower, never wrong)"""
         return (R + 15) // 16
+
+    # the row groups at which two warps a group keep the card's DRAM streaming (`_card_mma_warps`)
+    MMA_WIDE_GROUPS = 512
+
+    @classmethod
+    def _card_mma_warps(cls, R: int, C: int) -> int:
+        """the warps over one group of 16 weight rows in btb_gemv_mma_bf16, k split between them: two where the
+        groups fill the card, four on a weight too short to (Qwen3-0.6B's 1024-row o and down, 64 groups over 60
+        SMs, streamed at 350 GB/s against its head's 441). A function of the weight's shape alone - never of the
+        pass's rows - so a shape's one-row step and its verify pass sum alike, bit for bit"""
+        return 2 if (R + 15) // 16 >= cls.MMA_WIDE_GROUPS else 4
+
+    def _card_mma_narrow(self, R: int) -> bool:
+        """a [R, C] weight's tensor-core matvec at 8 rows a block (`btb_gemv_mma8_bf16`) rather than 16: where 16
+        would not give each of the card's SMs two blocks, a few SMs took a second block while the rest idled
+        through it (Qwen3-0.6B's 1024-row o and down, 64 groups over 60 SMs). The same bits either way"""
+        sms = int(torch.cuda.get_device_properties(self.dev).multi_processor_count)
+        return (R + 15) // 16 < 2 * sms
+
+    # the prefix from which a tree pass's attention reads each KV group's keys once for its heads
+    # (`_card_attn_shared`)
+    ATTN_SHARED_FROM = 8192
+
+    @classmethod
+    def _card_attn_shared(cls, T: int) -> int:
+        """the prefix length from which btb_attn_split_gqa{G} runs a block a KV group - each key read once for
+        the group's heads - where below it a block a head: a tree pass's T rows each re-read the group's keys,
+        which the L2 stops absorbing past a few thousand (Qwen3-0.6B, 5 rows: even at 4k, 11% off the attention
+        at 8k, 26% at 16k, 27% at 40k); a one-row step's re-reads it absorbs, and there the fewer blocks lose.
+        Read on the card from the live prefix, so one graph serves every length; both give the same bits"""
+        return cls.ATTN_SHARED_FROM if T > 1 else 1 << 30
+
+    # the card state's switches (`st["switch"]`, int32 on the card): the prefix from which a one-row step's
+    # attention reads each KV group's keys once, and a tree pass's (`_card_attn_shared`), and the share of each
+    # matvec slice warmed into L2 ahead of it, in 256ths (`CARD_WARM`)
+    SW_ATTN_ONE, SW_ATTN_TREE, SW_WARM = 0, 1, 2
+
+    def _card_switch_init(self) -> torch.Tensor:
+        return torch.tensor(
+            [self._card_attn_shared(1), self._card_attn_shared(2), round(256 * float(self.CARD_WARM))],
+            dtype=torch.int32,
+            device=self.dev,
+        )
+
+    @staticmethod
+    def _card_switch_ptr(st: dict[str, Any], i: int) -> ctypes.c_void_p:
+        """a kernel's pointer to switch `i` of the card state"""
+        return ctypes.c_void_p(int(st["switch"].data_ptr()) + 4 * i)
 
     def _card_buffers(
         self, st: dict[str, Any], a: int, b: int, T: int, tail: bool, mma: bool | None = None, rows: bool = False
@@ -665,27 +1187,59 @@ class _CudaMixin(_State):
         nrk = f"btb_norm_rope_kv_rows_d{D}" if rows else f"btb_norm_rope_kv_d{D}"
         if attn not in k.fn or nrk not in k.fn:
             raise RuntimeError(f"[card] no kernel for head_dim {D}")
+        # the attention in its grouped-query form where the build has one for the model's group width, from the
+        # prefix the card state's switch names for this pass's width (a one-row step's, or a tree's)
+        shared: list[Any] = []
+        gqa = f"btb_attn_split_gqa{Hq // Hk}_d{D}"
+        if not rows and Hq // Hk > 1 and gqa in k.fn:
+            attn, shared = gqa, [self._card_switch_ptr(st, self.SW_ATTN_ONE if T == 1 else self.SW_ATTN_TREE)]
         S = int(g["S"])
         # where each row's keys lie: the tree's (its prefix length, the rows' depths and parents), or the rows'
         # layout, one array for every rows graph
         where = [P(st["rw"])] if rows else [P(g["n0"]), P(g["depth"])]
         walk = [P(st["rw"])] if rows else [P(g["n0"]), P(g["par"])]
 
+        # the pass's matvec weights in launch order, each warmed into L2 on the side stream once the one before it is
+        # launched (`_card_warm`): through the kernels between them the chain leaves the DRAM idle
+        seq: list[tuple[torch.Tensor, int, int]] = []
+        for L in Ls:
+            seq += [(L["qkv"], (Hq + 2 * Hk) * D, H), (L["o"], H, Hq * D), (L["gu"], 2 * I, H), (L["down"], H, I)]
+        if tail and self.head is not None:
+            seq.append((self.head.weight, int(self.head.weight.shape[0]), H))
+        warm = self._card_warm(st, mma, seq)
+        # the graph's kernel variant (`g["fused"]`, the step lanes' own): the gate, up and activation as one kernel
+        # and a short weight's matvec at 8 rows a block - fewer kernels, so fewer edges where another program on the
+        # card takes it and btb's L2 with it. The same bits as the plain ones; which is faster is the tuner's to find
+        fused = bool(g.get("fused")) and mma
+        glu = f"btb_gemv_mma_glu_{act}"
+        glu_on = fused and glu in k.fn
+
         def matvec(W: torch.Tensor, xin: torch.Tensor, yout: torch.Tensor, R: int, C: int) -> None:
-            if mma:
+            if fused and "btb_gemv_mma8_bf16" in k.fn and self._card_mma_narrow(R):
+                k.launch(
+                    "btb_gemv_mma8_bf16",
+                    ((R + 7) // 8, 1, 1),
+                    (32 * self._card_mma_warps(R, C), 1, 1),
+                    [P(W), P(xin), P(yout), ci(R), ci(C), ci(T)],
+                )
+            elif mma:
                 k.launch(
                     "btb_gemv_mma_bf16",
                     (self._card_mma_grid(R, C), 1, 1),
-                    (self.MMA_BLOCK, 1, 1),
+                    (32 * self._card_mma_warps(R, C), 1, 1),
                     [P(W), P(xin), P(yout), ci(R), ci(C), ci(T)],
                 )
             else:
                 k.launch(gemv, ((R + 3) // 4, 1, 1), (128, 1, 1), [P(W), P(xin), P(yout), ci(R), ci(C)])
+            warm()
 
+        warm()
         y_prev = None
         for n, L in enumerate(Ls):
             j = ar["slot"][a + n]
             kb, vb = ar["A"][j, 0], ar["A"][j, 1]
+            # where head g's row r lies (elements): g * hs + r * rs, read off the arena's [Hk, cap, D] view
+            kv_strides = (ci(int(kb.stride(0))), ci(int(kb.stride(1))))
             cos_t, sin_t = tables[self.layer_types[a + n]]
             # the last layer's MLP output folded into this input norm's add (a sandwich layer added its own)
             k.launch(
@@ -713,7 +1267,7 @@ class _CudaMixin(_State):
                     ci(T),
                     ci(Hq),
                     ci(Hk),
-                    ci(ar["cap"]),
+                    *kv_strides,
                     cen,
                 ],
             )
@@ -730,7 +1284,7 @@ class _CudaMixin(_State):
                     ci(T),
                     ci(Hq),
                     ci(Hk),
-                    ci(ar["cap"]),
+                    *kv_strides,
                     cf(L["scale"]),
                     P(g["part_m"]),
                     P(g["part_l"]),
@@ -738,6 +1292,7 @@ class _CudaMixin(_State):
                     P(g["cnt"]),
                     ci(S),
                     ci(L["win"]),
+                    *shared,
                 ],
             )
             matvec(L["o"], g["att"], g["y"], H, Hq * D)
@@ -762,21 +1317,35 @@ class _CudaMixin(_State):
                     (256, 1, 1),
                     [P(g["h"]), P(g["y"]), P(L["ln2"]), cf(L["eps"]), P(g["x"]), ci(H), cen],
                 )
-            matvec(L["gu"], g["x"], g["gu"], 2 * I, H)
-            if mma:
-                # the tensor-core kernel has no activation fold: the two kernels, the same bits
+            if glu_on:
+                # gate, up and the activation in one kernel, the activation in its epilogue - the plain matvec's
+                # and btb_{act}_mul's bits at the plain kernel's warps for the merged weight (folded into the down
+                # projection's x load instead, each row group recomputed the whole row's act(gate) * up before
+                # its loads and stalled the stream: Qwen3-0.6B's down 21.6 us against 1.7 + its GEMV apart)
                 k.launch(
-                    f"btb_{act}_mul",
-                    (min(4096, (M * I + 255) // 256), 1, 1),
-                    (256, 1, 1),
-                    [P(g["gu"]), P(g["m"]), ci(M), ci(I)],
+                    glu,
+                    ((I + 15) // 16, 1, 1),
+                    (32 * self._card_mma_warps(2 * I, H), 1, 1),
+                    [P(L["gu"]), P(g["x"]), P(g["m"]), ci(I), ci(H), ci(T)],
                 )
+                warm()
+            else:
+                matvec(L["gu"], g["x"], g["gu"], 2 * I, H)
+            if mma:
+                if not glu_on:
+                    k.launch(
+                        f"btb_{act}_mul",
+                        (min(4096, (M * I + 255) // 256), 1, 1),
+                        (256, 1, 1),
+                        [P(g["gu"]), P(g["m"]), ci(M), ci(I)],
+                    )
                 matvec(L["down"], g["m"], g["y"], H, I)
             else:
                 # act(gate) * up folded into the down projection's x load: the same bits as the two kernels
                 k.launch(
                     gemv_act, ((H + 3) // 4, 1, 1), (128, 1, 1), [P(L["down"]), P(g["gu"]), P(g["y"]), ci(H), ci(I)]
                 )
+                warm()
             if sandwich:
                 # the MLP output normed, then added: the residual is whole, nothing carries into the next norm
                 k.launch(
@@ -803,6 +1372,67 @@ class _CudaMixin(_State):
             matvec(head_w, g["x"], g["logits"], V, H)
         elif y_prev is not None:
             g["h"][:T].add_(y_prev[:T])
+        warm.join()
+
+    # the share of each warp's k slice of a matvec's weights warmed into L2 ahead of it (`_card_warm`); 0: none
+    CARD_WARM = 0.0
+    # the step loop picks among the switches' settings as it runs, by their measured speed (`_Tuner`)
+    CARD_TUNE = True
+
+    # the step lanes come in the fused kernels too, for the tuner to weigh against the plain ones (`_card_fuse_ok`)
+    CARD_FUSE = True
+
+    def _card_fuse_ok(self, st: dict[str, Any]) -> bool:
+        """the step lanes in the fused kernels as well as the plain: where the tuner runs (`CARD_TUNE`), the build
+        has them and the step takes the tensor-core matvec they are variants of"""
+        k = st["k"]
+        return (
+            self.CARD_FUSE
+            and self.CARD_TUNE
+            and self._card_mma_for(1)
+            and ("btb_gemv_mma8_bf16" in k.fn or any(f"btb_gemv_mma_glu_{a}" in k.fn for a in ("silu", "gelu")))
+        )
+
+    def _card_tuner(self, st: dict[str, Any], lanes: list[tuple[str, bool]]) -> _Tuner | None:
+        """the card state's tuner over the step's `lanes` - (the usual or the deep queue, the plain or the fused
+        kernels) - at the switches' settings as they stand, the usual plain lane first, the one alone on the card
+        takes (`_Tuner`). Kept with the card state, one for each set of lanes, so an answer starts from what the last
+        one over the same lanes found - an answer of one step has no deep lane, and a tuner made again for it cost
+        the next answer its windows: half of it spent trying four arms afresh"""
+        if not self.CARD_TUNE:
+            return None
+        tuners: dict[tuple[tuple[str, bool], ...], _Tuner] = st.setdefault("tuners", {})
+        tu = tuners.get(tuple(lanes))
+        if tu is not None:
+            return tu
+        base = [int(v) for v in st["switch"].tolist()]
+        label = lambda ln: ("queued deep" if ln[0] == "deep" else "usual") + (", fused" if ln[1] else "")
+        tu = tuners[tuple(lanes)] = _Tuner([(label(ln), base, ln) for ln in lanes], self.dev)
+        return tu
+
+    # the warming kernel's blocks beside the chain's: four loads standing a thread keep the DRAM fed at 24
+    WARM_BLOCKS = 24
+
+    def _card_warm(self, st: dict[str, Any], mma: bool, seq: list[tuple[torch.Tensor, int, int]]) -> _Warm:
+        """the pass's L2 warming (`_Warm`, `btb_l2_warm`) over its matvec weights `seq` in launch order, on the card
+        state's side stream: the share of every warp's slice of every row the switch names (`SW_WARM`), the slices as
+        each weight's matvec cuts them. Captured only where warming is on (`CARD_WARM`): at a share of 0 each warming
+        kernel leaves at once, but a launch still costs its node. Nothing it does reaches a result: the bits are the
+        chain's alone"""
+        k = st["k"]
+        if self.CARD_WARM <= 0 or "btb_l2_warm" not in k.fn:
+            return _Warm(k, None, None, [], 0)
+        w = st.get("warm")
+        if w is None:
+            dev = st["stream"].device
+            w = st["warm"] = {
+                "stream": torch.cuda.Stream(device=dev),
+                "sink": torch.zeros(1, dtype=torch.int32, device=dev),
+            }
+        # the tensor-core kernel's warps each take a k slice of whole 32-element super-tiles; the fp32 kernel's one
+        # warp a row walks it from its start
+        plan = [(W, R, C, self._card_mma_warps(R, C) if mma else 1) for W, R, C in seq]
+        return _Warm(k, w["stream"], w["sink"], plan, self.WARM_BLOCKS, self._card_switch_ptr(st, self.SW_WARM))
 
     def _card_record(self, st: dict[str, Any], g: dict[str, Any], body: Any, what: str) -> None:
         """`body` once eagerly on the arena's stream (the warm-up), then captured there, so the captured
@@ -813,11 +1443,34 @@ class _CudaMixin(_State):
             body()
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
+        before = self._trace_mem()
         cg = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(cg, pool=st["pool"], stream=s):
-            body()
+        self._capture(cg, st["pool"], s, body)
         g["graph"] = cg
-        self.log(f"[card] {what}")
+        self.log(f"[card] {what}{self._trace_grew(before)}")
+
+    def _trace_mem(self) -> tuple[int, int]:
+        """-vv: torch's reserved bytes on the card and the bytes Windows counts this process using there, to say
+        what a step took on the card and where it sits (0s with the trace off)"""
+        if not trace.ON:
+            return 0, 0
+        torch.cuda.synchronize(self.dev)
+        info = device_mod._wddm_info(self.dev)
+        # free-read: the trace's figure, never a decision
+        return int(torch.cuda.memory_reserved(self.dev)), (info[1] if info is not None else 0)
+
+    def _trace_grew(self, before: tuple[int, int]) -> str:
+        """-vv: the card memory taken since `before` (`_trace_mem`), as the tail of the line that says what took it -
+        in torch's pools, and past them (the driver's graph execs, the context); '' with the trace off"""
+        if not trace.ON:
+            return ""
+        res, used = self._trace_mem()
+        d_res = res - before[0]
+        d_out = (used - before[1]) - d_res if used and before[1] else 0
+        # signed: a capture starts by emptying torch's cache (torch.cuda.graph), so the blocks it held show as given
+        return f" ({'+' if d_res >= 0 else '-'}{_size(abs(d_res))} in torch's pools, " + (
+            f"{'+' if d_out >= 0 else '-'}{_size(abs(d_out))} outside them)"
+        )
 
     def _card_capture(self, st: dict[str, Any], g: dict[str, Any]) -> None:
         """Capture the pass graph over `g`'s buffers. The sequence runs once eagerly first (the module's
@@ -895,7 +1548,90 @@ class _CudaMixin(_State):
             return 2
         return 4
 
-    def _card_step_graph(self, st: dict[str, Any], table: torch.Tensor, U: int, sampling: Any = None) -> dict[str, Any]:
+    # the step graph's execs: the most replays the card can hold ahead of the host (`_card_depth`); how many it
+    # holds is the lane's (`_Tuner`)
+    CARD_DEPTH = 6
+
+    # the step loop moves to one-step replays queued deep where they measure faster: while another program shares
+    # the card (`_Tuner`)
+    CARD_CONTEND = True
+
+    def _card_step_lane(
+        self, st: dict[str, Any], table: torch.Tensor, U: int, smp: Any, past: int, first: int, fused: bool = False
+    ) -> dict[str, Any]:
+        """the step graph at `U` steps a replay as a lane of the step loop: captured on first use - `_card_depth()`
+        execs of the same steps, launched in turn (an exec launched again while its last launch still runs waits
+        for it), each writing its own pinned token slots - its length and token set to the answer's start, its
+        sampling configured, and its execs' bookkeeping for this answer fresh"""
+        g, body = self._card_step_graph(st, table, U, smp, fused)
+        g["n0"].fill_(past)
+        g["ids"].fill_(first)
+        if g["graph"] is None:
+            # the warm-up run consumes tokens and advances the length: both are reset after it
+            self._card_record(
+                st,
+                g,
+                lambda: body(0),
+                f"{U} one-row step{'s' if U > 1 else ''} captured as a self-advancing graph"
+                f"{' (the fused kernels)' if fused else ''}",
+            )
+            g["execs"] = [g["graph"]]
+            before = self._trace_mem()
+            for e in range(1, len(g["pin_tok"]) // U):
+                cg = torch.cuda.CUDAGraph()
+                self._capture(cg, st["pool"], st["stream"], functools.partial(body, e))
+                g["execs"].append(cg)
+            if trace.ON:  # no log line says this: the trace does
+                trace.event(
+                    "card graph: %d more execs of the %d-step lane%s%s",
+                    len(g["execs"]) - 1,
+                    U,
+                    " (fused)" if fused else "",
+                    self._trace_grew(before),
+                )
+            g["n0"].fill_(past)
+            g["ids"].fill_(first)
+        if not smp.greedy:
+            # the pipeline's config, filled before the replays: the temperature and top-p, and the seed as two
+            # int32 halves (the pick derives each step's key from it and the length, so a run repeats on a seed)
+            g["fp"][0] = 1.0 / smp.temperature
+            g["fp"][1] = float(smp.top_p)
+            sd = int(smp.seed or 0)
+            u32 = lambda v: v - (1 << 32) if v >= (1 << 31) else v
+            g["seed"].copy_(torch.tensor([u32(sd & 0xFFFFFFFF), u32((sd >> 32) & 0xFFFFFFFF)], dtype=torch.int32))
+        g["pin_n0"].fill_(past)
+        E = len(g["execs"])
+        return {
+            "U": U,
+            "g": g,
+            "execs": g["execs"],
+            "E": E,
+            "pin_tok": g["pin_tok"],
+            "pin_n0": g["pin_n0"],
+            "pin_ts": g["pin_ts"],
+            "uses": [None] * E,  # the replay each exec last ran, this answer
+            "next": 0,
+        }
+
+    def _card_say(self, line: str) -> None:
+        """a change in how btb runs the card that the person at the console should see (the contention's queue):
+        on the console whatever the log's verbosity, where there is one (no stderr under pythonw or a service), and in
+        the log"""
+        err = sys.stderr
+        if err is not None:
+            with contextlib.suppress(OSError, ValueError):  # a console closed under the process
+                err.write(f"  btb: {line}\n")
+                err.flush()
+        self.log(f"[card] {line}")
+
+    def _card_depth(self) -> int:
+        """the step graph's execs, each writing its own pinned token slots: the replays the card can hold queued
+        while the host reads the oldest's tokens (2 to 8)"""
+        return max(2, min(8, int(self.CARD_DEPTH)))
+
+    def _card_step_graph(
+        self, st: dict[str, Any], table: torch.Tensor, U: int, sampling: Any = None, fused: bool = False
+    ) -> tuple[dict[str, Any], Callable[[int], None]]:
         """U one-row steps as one graph: each step's token embedding, every layer, the head, the pick (the argmax,
         or the sample drawn inside the replay from the card's generator, its temperature and top-p read off
         device buffers, its top-k part of the key) written back as the next token, the cache's length advanced
@@ -906,14 +1642,15 @@ class _CudaMixin(_State):
         sampled = sampling is not None and not sampling.greedy
         top_k = int(sampling.top_k) if sampled else 0
         top_p_on = bool(sampled and sampling.top_p < 1.0)
-        key = (0, self.L, 1, True, mma, "step", U, sampled, top_k, top_p_on)
+        key = (0, self.L, 1, True, mma, "step", U, sampled, top_k, top_p_on, bool(fused))
         g = st["graphs"].get(key)
-        if g is not None:
-            return g
+        if g is not None and g["graph"] is not None:
+            return g, _captured  # replayed as captured: the body is never run again
         g = dict(self._card_buffers(st, 0, self.L, 1, True, mma))
         g["key"] = key
         g["graph"] = None
         g["U"] = U
+        g["fused"] = bool(fused)  # the kernel variant `_card_body` runs (`fused` there)
         g["ids"] = torch.zeros(1, dtype=torch.long, device=self.dev)
         if sampled:
             # the fused pick's scratch and its config off device buffers (filled before the replay, so one capture
@@ -933,8 +1670,10 @@ class _CudaMixin(_State):
         # 0.3-0.45 ms a step on this platform, where the host polling a pinned counter costs nothing the card
         # sees. Each exec writes its own U token slots; the host reads a replay's slots one replay behind,
         # before the exec that owns them is launched again
-        g["pin_tok"] = torch.zeros(2 * U, dtype=torch.long, pin_memory=True)
+        g["pin_tok"] = torch.zeros(self._card_depth() * U, dtype=torch.long, pin_memory=True)
         g["pin_n0"] = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+        # each step's end on the card's clock (ns), beside its token: a replay's time as the card ran it
+        g["pin_ts"] = torch.zeros(self._card_depth() * U, dtype=torch.long, pin_memory=True)
         st["graphs"][key] = g
 
         k = st["k"]
@@ -982,10 +1721,17 @@ class _CudaMixin(_State):
             )
             g["ids"].copy_((~g["gbest"]) & 0xFFFFFFFF)  # the packed winner's inverted low 32 bits = the token
 
+        scale = self.embed_scale
+
         def body(exec_id: int) -> None:
             for i in range(U):
                 slot = exec_id * U + i
                 torch.index_select(table, 0, g["ids"], out=g["h"][:1])
+                if scale is not None:
+                    # the family's embedding scale (Gemma 3's sqrt(hidden)) as `embed` applies it - the bf16 rows times
+                    # the float, one rounding - so a step's rows are the forward's: the step graph took the table's
+                    # rows unscaled, and Gemma's greedy answer on the card parted from every other path's at once
+                    g["h"][:1].mul_(scale)
                 self._card_body(st, g)
                 if sampled:
                     pick_nodes()
@@ -996,11 +1742,18 @@ class _CudaMixin(_State):
                     "btb_publish",
                     (1, 1, 1),
                     (32, 1, 1),
-                    [P(g["n0"]), P(g["ids"]), P(g["pin_tok"][slot : slot + 1]), P(g["pin_n0"])],
+                    [
+                        P(g["n0"]),
+                        P(g["ids"]),
+                        P(g["pin_tok"][slot : slot + 1]),
+                        P(g["pin_n0"]),
+                        P(g["pin_ts"][slot : slot + 1]),
+                    ],
                 )
 
-        g["body"] = body
-        return g
+        # handed back beside the graph, never kept in it: the capture is its only caller, and a closure over `g`
+        # kept in `g` is a cycle that holds the graph, its buffers and the table past the graph's drop
+        return g, body
 
     def _card_generate_greedy(
         self,
@@ -1032,91 +1785,160 @@ class _CudaMixin(_State):
             return out
         st = self._card_state()
         steps = max_new - 1  # tokens still to produce
+
+        def torch_steps() -> list[int]:
+            """the answer on through the torch layers over the cache, token by token"""
+            pos0 = int(ids.shape[1]) - 1
+            for k in range(len(out), max_new):
+                if self._stop_asked():
+                    break
+                lg = self.forward(torch.tensor([[out[-1]]], device=self.dev), cache=cache)
+                tok = int(smp.pick_torch(lg[0, -1:], [smp.key_for(pos0 + k)])[0])
+                out.append(tok)
+                if on_token:
+                    on_token(tok)
+                if tok in eos:
+                    break
+            return out
+
         U = max(1, min(self._card_unroll(), steps))
-        # the arena must hold every row the replays may write: whole replays, one past the last token
-        ar = self._card_bind(cache, st, ((steps + U - 1) // U + 1) * U + 1)
+        # the arena must hold every row the replays may write: whole replays, one past the last token. Where it
+        # cannot take the cache's rows - or the card no longer has the room for the step graph's table - the answer
+        # goes on through the torch layers
+        if not self._card_arena_holds(cache, ((steps + U - 1) // U + 1) * U + 1):
+            return torch_steps()
+        ar = st["arena"]
         table = self._card_table(st)
         if table is None:
-            # the gate granted the table moments ago; the card lost the room since. Named, not an attribute
-            # error from inside the graph's first lookup
-            from .scheduler import MemoryGrantError
-
-            raise MemoryGrantError("[card] the embedding table for the step graph was refused after the gate passed")
-        g = self._card_step_graph(st, table, U, smp)
+            return torch_steps()
         past = cache.get_seq_length()
-        g["n0"].fill_(past)
-        g["ids"].fill_(first)
-        if g["graph"] is None:
-            # the warm-up run consumes tokens and advances the length: both are reset after it. Two execs of
-            # the same steps, launched in turn (a graph exec launched again while its last launch still runs
-            # waits for it), each writing its own pinned token slots
-            self._card_record(
-                st,
-                g,
-                lambda: g["body"](0),
-                f"{U} one-row step{'s' if U > 1 else ''} captured as a self-advancing graph",
-            )
-            cg2 = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(cg2, pool=st["pool"], stream=st["stream"]):
-                g["body"](1)
-            g["graph2"] = cg2
-            g["n0"].fill_(past)
-            g["ids"].fill_(first)
-        if not smp.greedy:
-            # the pipeline's config, filled before the replays: the temperature and top-p, and the seed as two
-            # int32 halves (the pick derives each step's key from it and the length, so a run repeats on a seed)
-            g["fp"][0] = 1.0 / smp.temperature
-            g["fp"][1] = float(smp.top_p)
-            sd = int(smp.seed or 0)
-            u32 = lambda v: v - (1 << 32) if v >= (1 << 31) else v
-            g["seed"].copy_(torch.tensor([u32(sd & 0xFFFFFFFF), u32((sd >> 32) & 0xFFFFFFFF)], dtype=torch.int32))
-        graphs = (g["graph"], g["graph2"])
-        pin_tok, pin_n0 = g["pin_tok"], g["pin_n0"]
-        pin_n0.fill_(past)
+        # the step graph at the unroll the platform's submissions call for, and - where contention may engage
+        # (`CARD_CONTEND`) - at one step a replay: beside another program on the card, short replays queued deep
+        # run in the gaps it leaves, where a longer replay spans them (Qwen3-0.6B at 4k beside a game: 7.7-8.1 ms a
+        # token at one step queued five deep, 9-12 at one queued one deep, 8.2-8.8 at four steps either way). The
+        # lanes share the model's buffers and the length; the answer moves between them at a replay's edge. Each
+        # comes in the plain kernels and - where the build has them and the tuner may choose (`CARD_FUSE`) - the fused
+        # ones (`_card_body`'s `fused`): fewer kernels a step, so fewer edges where another program takes the card
+        # and btb's L2; which pays is measured, as the lanes are
+        kinds = [("usual", U)] + ([("deep", 1)] if self.CARD_TUNE and self.CARD_CONTEND and U > 1 else [])
+        variants = [False] + ([True] if self._card_fuse_ok(st) else [])
+        # the usual lane first: one the card has no room to capture (another program took it) sends the answer down
+        # the torch path, as a pass's graph build does (`_card_oom`); the others are the tuner's choices, and one the
+        # card has no room for is left out
+        lanes: dict[tuple[str, bool], dict[str, Any]] = {}
+        for kind, Uk in kinds:
+            for fz in variants:
+                try:
+                    lanes[(kind, fz)] = {**self._card_step_lane(st, table, Uk, smp, past, first, fz), "kind": kind}
+                except RuntimeError as err:
+                    if not self._is_card_oom(err):
+                        raise
+                    if (kind, fz) == ("usual", False):
+                        self._card_oom(err)
+                        return torch_steps()
+                    self.log(f"[card] the {kind}{' fused' if fz else ''} lane left out: no room on the card for it")
+        base_lane = lanes[("usual", False)]
         done = 0  # tokens the host has read off the replays
         stop = False
+        # each replay's arm (`_Tuner`): its switches and its lane - the usual, one replay queued ahead of the one
+        # the host reads; the deep, one step a replay and the lane's execs less one queued; plain or fused. A
+        # replay's time is its last step's stamp on the card's clock less the replay before it's, a token's share of
+        # that what the tuner compares
+        tu = self._card_tuner(st, list(lanes)) if len(lanes) > 1 else None
+        if tu is not None:
+            tu.at_context(past)
+        arms: list[int] = []
+        recs: list[tuple[dict[str, Any], int, int, bool]] = []  # each replay: its lane, exec, first step, timed
+        nxt = 0  # the next replay whose tokens the host reads
+        prev_ts: int | None = None
 
-        def token_of(k: int) -> int:
-            # step k has finished when the graph's own copy of the length reads past + k + 1; its token sits
-            # in the slot of its exec and its place within the replay
-            target = past + k + 1
-            waited = time.perf_counter()
-            while int(pin_n0[0]) < target:
-                if time.perf_counter() - waited > 30.0:
-                    raise RuntimeError(f"[card] the step graph did not advance past {target} within 30 s")
-            j, i = divmod(k, U)
-            return int(pin_tok[(j & 1) * U + i])
-
-        n_replays = (steps + U - 1) // U
-        for j in range(n_replays):
-            if self._stop_asked():
-                stop = True
-                break
-            graphs[j & 1].replay()
-            if j >= 1:
-                # the previous replay's tokens, streamed as each step lands
-                for i in range(U):
-                    k = (j - 1) * U + i
-                    if k >= steps:
-                        break
-                    tok = token_of(k)
-                    out.append(tok)
-                    done = k + 1
-                    if on_token:
-                        on_token(tok)
-                    if tok in eos:
-                        stop = True
-                        break
-                if stop:
-                    break
-        if not stop:
-            for k in range((n_replays - 1) * U, steps):
-                tok = token_of(k)
+        def read(r: int) -> bool:
+            """replay r's tokens, streamed as each step lands, and its time; True at an end token"""
+            nonlocal done, prev_ts
+            ln, e, k0, timed = recs[r]
+            Ul = int(ln["U"])
+            for i in range(Ul):
+                k = k0 + i
+                if k >= steps:
+                    return False  # a replay cut short by the answer's end: its last stamp is not waited for
+                # step k has finished when the lane's own copy of the length reads past + k + 1; its token sits in
+                # the slot of its exec and its place within the replay
+                target = past + k + 1
+                waited = time.perf_counter()
+                while int(ln["pin_n0"][0]) < target:
+                    if time.perf_counter() - waited > 30.0:
+                        raise RuntimeError(f"[card] the step graph did not advance past {target} within 30 s")
+                tok = int(ln["pin_tok"][e * Ul + i])
                 out.append(tok)
                 done = k + 1
                 if on_token:
                     on_token(tok)
                 if tok in eos:
+                    return True
+            ts = int(ln["pin_ts"][e * Ul + Ul - 1])
+            if prev_ts is not None and timed and tu is not None:
+                said = tu.after_replay(arms[r], (ts - prev_ts) / Ul / 1e9)
+                if said is not None:
+                    line, loud = said
+                    if loud:
+                        self._card_say(line)
+                    else:
+                        self.log(f"[card] {line}")
+            prev_ts = ts
+            return False
+
+        cur = base_lane
+        k_next = 0  # the next step a replay takes
+        vs = getattr(self, "vram_state", None)
+        budget = False  # another program asked for the card meanwhile: the rest of the answer on the passes
+        while k_next < steps:
+            if self._stop_asked():
+                stop = True
+                break
+            if vs is not None and vs.asked:
+                # the budget watcher found the card past its budget with this answer holding the engine: the replays
+                # read no budget, so the answer goes on through the passes, whose policy gives the card back now
+                # rather than once the answer ends
+                budget = True
+                break
+            arm = tu.before_replay(st["switch"]) if tu is not None else 0
+            want = lanes[tu.lanes[arm]] if tu is not None else base_lane
+            switched = want is not cur
+            if switched:
+                # every replay read before the answer moves lanes, so the lane taken up starts from a length the
+                # host knows; it takes the last replay's token from the card, in stream order
+                while nxt < len(recs) and not stop:
+                    stop, nxt = read(nxt), nxt + 1
+                if stop:
+                    break
+                want["g"]["ids"].copy_(cur["g"]["ids"])
+                want["pin_n0"].fill_(past + k_next)
+                cur = want
+            e = cur["next"]
+            cur["next"] = (e + 1) % cur["E"]
+            # the exec's last replay read before it runs again: its token slots are the ones this replay writes
+            last = cur["uses"][e]
+            while last is not None and nxt <= last and not stop:
+                stop, nxt = read(nxt), nxt + 1
+            if stop:
+                break
+            arms.append(arm)
+            cur["execs"][e].replay()
+            recs.append((cur, e, k_next, not switched))
+            cur["uses"][e] = len(recs) - 1
+            k_next += int(cur["U"])
+            # the replays past the lookahead are read now: one ahead on the usual lane, the execs less one deep
+            ahead = cur["E"] - 1 if cur["kind"] == "deep" else 1
+            while nxt <= len(recs) - 1 - ahead and not stop:
+                stop, nxt = read(nxt), nxt + 1
+            if stop:
+                break
+        ended = stop
+        if not stop:
+            while nxt < len(recs):
+                end, nxt = read(nxt), nxt + 1
+                if end:
+                    ended = True
                     break
         torch.cuda.current_stream().synchronize()
         # the rows the sequence's processed tokens occupy: the prompt and every token fed to a replay whose
@@ -1128,6 +1950,11 @@ class _CudaMixin(_State):
             f"[stream] generated {len(out)} tokens over 1 rows in {time.time() - t0:.1f}s "
             f"({(time.time() - t0) / max(1, len(out)):.3f} s/step incl. prefill; the step graph, host {done} behind by one)"
         )
+        if tu is not None:
+            self.log(f"[card] step settings: {tu.report()}")
+        if budget and not ended and len(out) < max_new:
+            self.log("[card] another program asked for the card: the answer goes on through the passes")
+            return torch_steps()
         return out
 
     def card_warm(self, ids: Tokens, t_max: int | None = None) -> int:
@@ -1136,6 +1963,11 @@ class _CudaMixin(_State):
         timed answer pays a capture. Returns the number of graphs captured; 0 where the card graph does not
         apply."""
         ids_t = torch.as_tensor(list(ids), dtype=torch.long).view(1, -1)
+        if self.dev.type == Device.CUDA and self.fam.card_program() is not None:
+            if not self._card_program_on():
+                return 0  # switched off: nothing of the program made, held or timed
+            t_max = int(t_max or (int(getattr(self, "tree_budget", 0) or 0) + 1))
+            return self._card_program_warm(ids_t, max(1, min(t_max, self.CARD_T_MAX)))
         if self.dev.type != Device.CUDA or self._card_kernels() is None or not self._card_ready():
             return 0
         t_max = int(t_max or (int(getattr(self, "tree_budget", 0) or 0) + 1))
@@ -1156,8 +1988,11 @@ class _CudaMixin(_State):
             if forced is None and os.environ.get("BTB_CARD_MMA") in ("0", "1"):
                 forced = os.environ["BTB_CARD_MMA"] == "1"
             variants = [bool(forced)] if forced is not None else ([False, True] if self._card_mma_avail() else [False])
-            choice: dict[int, bool] = st.setdefault("mma_for", {})
+            # the engine's one kernel is the card's and the model's (`_card_mma_pick`); each variant set per width while
+            # it is timed, the choice made after
+            choice: dict[int, bool] = self.__dict__.setdefault("_mma_for", {})
             timed_all: dict[int, dict[bool, float]] = {}
+            moved = False
             for T in range(1, t_max + 1):
                 if not self._card_pass_ok(cache, 1, T, cache.get_seq_length(), None, None, None):
                     break
@@ -1172,8 +2007,24 @@ class _CudaMixin(_State):
                     finally:
                         self.ab()
                     self.ad(cache, base, [0])
+                if self._card_state() is not st:
+                    # the placement moved during the warm-up (room made on demand for its passes): these graphs are
+                    # another placement's, and the widths timed so far choose
+                    self.log(f"[card] the warm-up stops at {T}-row passes: the placement moved under it")
+                    moved = True
+                    break
                 timed: dict[bool, float] = {m: float("inf") for m in variants}
-                graphs = {m: [st["graphs"][(*sg, T, tails[sg], m)]["graph"] for sg in segs] for m in variants}
+                keys = {m: [(*sg, T, tails[sg], m) for sg in segs] for m in variants}
+                if any(
+                    key not in st["graphs"] or st["graphs"][key].get("graph") is None
+                    for ks in keys.values()
+                    for key in ks
+                ):
+                    # a build found no room (`_card_oom`: another program took the card during the load): nothing to
+                    # time at this width, and no wider pass fits either - the widths timed so far choose
+                    self.log(f"[card] the warm-up stops at {T}-row passes: the card graph found no room to build")
+                    break
+                graphs = {m: [st["graphs"][key]["graph"] for key in keys[m]] for m in variants}
                 torch.cuda.synchronize()
                 for _rep in range(4):
                     for m in variants:
@@ -1192,6 +2043,11 @@ class _CudaMixin(_State):
                         f"[card] {T}-row pass: fp32 chain {timed[False] * 1e3:.2f} ms, tensor cores "
                         f"{timed[True] * 1e3:.2f} ms"
                     )
+            # a width set for a variant and never timed (the build found no room, the loop broke) holds the last
+            # variant tried, not the engine's one kernel: let go, it takes `_mma_one` like any width past the timed
+            # ones - kept, a later placement's passes of that width ran the other kernel than the step
+            for T in [t for t in choice if t not in timed_all]:
+                del choice[T]
             if timed_all:
                 # one kernel for every width: the two sum a row in different orders, and a step on one with a
                 # pass on the other parted at bf16 near-ties (0/8 identical at 256 tokens on the 0.6B). The
@@ -1199,7 +2055,7 @@ class _CudaMixin(_State):
                 # a speculative engine, the one-row step for a greedy one - and the other's graphs are dropped
                 w = max(timed_all) if int(getattr(self, "v_max", 0) or 0) > 0 else 1
                 pick = min(variants, key=lambda m: timed_all[w][m])
-                st["mma_one"] = pick
+                self._mma_one = pick
                 for T, timed in timed_all.items():
                     choice[T] = pick
                     cost[T] = timed[pick]
@@ -1215,8 +2071,9 @@ class _CudaMixin(_State):
                         f"{timed_all[1][not pick] * 1e3:.2f} ms)"
                     )
             n = len(st["graphs"]) - before
-            # the cost curve covers the whole model only; with a layer on the CPU the timing above is partial
-            if cost and segs == [(0, self.L)] and tails[segs[0]]:
+            # the cost curve covers the whole model only; with a layer on the CPU the timing above is partial, and
+            # with the placement moved under it another placement's
+            if cost and not moved and segs == [(0, self.L)] and tails[segs[0]]:
                 self._card_cost = cost
                 c1 = cost[1]
                 self.log(
@@ -1226,32 +2083,138 @@ class _CudaMixin(_State):
                 )
         return n
 
+    def _card_program_warm(self, ids_t: torch.Tensor, t_max: int) -> int:
+        """a family's card program's cost curve, measured up front with no cache and no expert read: for each graph
+        width M the passes of 1 .. `t_max` rows take, the program's verify graphs replayed (captured on the first
+        one, timed on the card's clock over PROGRAM_SAMPLES after it, the fastest counted) at the context of `ids_t`'s
+        length, plus the host's handshake between the layers - the wait for each router's publish - once, the
+        cleanest pass's (`_card_program_time`). The curve (`_card_prog_cost`) is
+        the card's compute a pass of T rows costs - the rows' experts and the host layers are not in it - so it is
+        the engine's pass cost (`_card_cost`, which sizes a pass the pricer does not) only where the program runs the
+        whole model on the card, as `card_warm`'s curve is. Every other graph (the step's, a tap's, a commit's) is
+        captured on its first use. Returns the graphs captured; 0 where the program does not run the model."""
+        cls = self.fam.card_program()
+        if cls is None or self._card_kernels() is None or not self._card_program_on():
+            return 0
+        if getattr(self, "_cp", None) is None:
+            self._cp = cls(self)
+        prog = self._cp
+        if not prog.ok():
+            return 0
+        n0 = max(1, int(ids_t.shape[-1]))
+        before = len(prog.graphs)
+        widths = sorted({self._card_m(T) for T in range(1, t_max + 1)})
+        with torch.inference_mode(), self.device.hold() as place:
+            if place.version != prog.version:
+                return 0
+            for M in widths:
+                self._card_program_time(prog, M, n0)  # the first replay of a width captures its graphs: untimed
+            # each width timed PROGRAM_SAMPLES times, the widths in turns
+            samples: dict[int, list[tuple[float, float]]] = {M: [] for M in widths}
+            for _rep in range(self.PROGRAM_SAMPLES):
+                for M in widths:
+                    samples[M].append(self._card_program_time(prog, M, n0))
+        # a width's compute is its graphs' time on the card's clock, the fastest sample's; the host's handshake (the
+        # launches, the wait for each router's publish past the card's own work) is the same whatever the rows, so
+        # one figure for every width - the cleanest pass's. By the host's clock alone, the wait carried every delay
+        # the card's queue saw: 0.4 to 200 ms a pass beside another program, the 2-row pass priced at 6, 21 and 53
+        # one-row ones where its samples caught the bursts and the 1-row ones did not - and speculation with it
+        card = {M: min(c for _w, c in got) for M, got in samples.items()}
+        handoff = min(max(0.0, w - c) for got in samples.values() for w, c in got)
+        if trace.ON:
+            for M, got in samples.items():
+                trace.event(
+                    "card program warm-up: %d-row passes on the card %s ms, by the host's clock %s",
+                    M,
+                    " ".join(f"{c * 1e3:.2f}" for _w, c in got),
+                    " ".join(f"{w * 1e3:.2f}" for w, _c in got),
+                )
+        cost = {T: card[self._card_m(T)] + handoff for T in range(1, t_max + 1)}
+        self._card_prog_cost = cost
+        if not self.host:
+            self._card_cost = cost
+        c1 = cost[1]
+        self.log(
+            f"[card] {self.fam.name}'s card program: {len(prog.graphs) - before} graphs captured; its compute by "
+            "rows (no expert reads, no host layers): "
+            + ", ".join(f"{T}:{c / c1:.2f}x" for T, c in cost.items() if T in (1, 2, 4, 8, 16, t_max))
+            + f" (one row {c1 * 1e3:.2f} ms)"
+        )
+        return len(prog.graphs) - before
+
+    def _card_program_time(self, prog: Any, T: int, n0: int) -> tuple[float, float]:
+        """(seconds by the host's clock, seconds of the graphs on the card's): one T-row verify pass of the
+        program's resident layers on the card at `n0` rows of context - its segments' graphs, closes and tail
+        replayed in turn with the host's part rehearsed (`between(i, dry=True)`: the publish waited for, no expert
+        read) and the host layers left out - the card's compute a pass of T rows costs, over the program's own
+        buffers and no cache (`rehearse`)"""
+        M = prog.rehearse(T, n0)
+        L = int(prog.L)
+        mode, tap = "tree", False
+        spans: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+
+        def run(key: Any, body: Callable[[], None]) -> None:
+            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            e0.record()
+            self._card_graph_run(prog, key, body)
+            e1.record()
+            spans.append((e0, e1))
+
+        collecting = gc.isenabled()
+        # the sample named for a profiler (nsys -t nvtx): its kernels apart from the passes' and the other widths'
+        torch.cuda.nvtx.range_push(f"card program warm-up: {M}-row pass")
+        try:
+            torch.cuda.synchronize(self.dev)
+            # a collection the replays' small allocations set off is the host's time, not the pass's
+            gc.disable()
+            t0 = time.perf_counter()
+            for a, b in prog.segs:
+                for j in range(a, b):
+                    run((j, M, mode, tap), functools.partial(prog.layer_body, j, M, mode, tap))
+                    prog.between(j, dry=True)
+                if b < L:
+                    run(("close", b - 1, M, mode, tap), functools.partial(prog.close_body, b - 1, M, mode, tap))
+            run((L, M, mode, tap), functools.partial(prog.tail_body, M, mode, tap))
+            torch.cuda.synchronize(self.dev)
+            wall = time.perf_counter() - t0
+            return wall, sum(e0.elapsed_time(e1) for e0, e1 in spans) / 1e3
+        finally:
+            torch.cuda.nvtx.range_pop()
+            if collecting:
+                gc.enable()
+            prog.rehearsed()
+
     def _spec_full(self, v_max: int | None = None) -> int:
         """The widest speculative pass, the root included: the tree's rows, or a chain's `v_max` drafts (the
-        call's, else the model's) and the root, whichever is wider."""
+        call's, else the model's) and the root, whichever is wider - held to the widest the family verifies exactly as
+        placed (`verify_rows`: Qwen4's card program, whose wider passes took the torch path)."""
         v = int((getattr(self, "v_max", 0) if v_max is None else v_max) or 0)
-        return max(int(getattr(self, "tree_budget", 0) or 0), v) + 1
+        full = max(int(getattr(self, "tree_budget", 0) or 0), v) + 1
+        bound = self.fam.verify_rows(self)
+        return full if bound is None else max(1, min(full, int(bound)))
 
     def _spec_budget(self, ema_tokens: float, passes: int, v_max: int | None = None, past: int = 0) -> int:
-        """Rows a speculative pass may carry, the root included, from the warm-up's cost curve of the card
-        graph's passes and the running acceptance: the widest pass costing at most a quarter more than the
+        """Rows a speculative pass may carry, the root included, from the cost curve of the card graph's passes -
+        the warm-up's, as the passes measure it now (`_spec_curve`) - and the running acceptance: the widest pass
+        costing at most a quarter more than the
         one-row step, and only while the tokens a pass yields pay for its width - otherwise one-row passes,
         with a wide probe every sixteenth pass so a stretch of accepted drafts can reopen the tree. Without a
         cost curve (the MLX and host paths) the configured budget stands: the tree's rows, or a chain's
         `v_max` drafts and the root, whichever is wider."""
         full = self._spec_full(v_max)
-        cost = (
-            getattr(self, "_card_cost", None) or getattr(self, "_mlx_cost", None) or getattr(self, "_host_cost", None)
-        )
+        cost = self._spec_curve()
         if not cost or 1 not in cost or len(cost) <= 1 or full <= 1:
             return full
         slope = getattr(self, "_mlx_attn_slope", None)
         if slope and getattr(self, "_card_cost", None) is None and past > 0:
             # a pass over `past` rows: every node past the first reads the prefix again, at the warm-up's cost
-            # per node and row (the slope at the nearest timed length above, the last one beyond it)
+            # per node and row (the slope at the nearest timed length above, the last one beyond it) - added to the
+            # widths the warm-up's short context prices, not to those the passes measured here, whose seconds hold it
             b = next((s for r, s in slope if past <= r), slope[-1][1])
             n_attn = sum(1 for lt in self.layer_types if lt in (LayerKind.FULL, LayerKind.SLIDING))
-            cost = {T: c + n_attn * (T - 1) * past * b for T, c in cost.items()}
+            pc: SpecCost | None = getattr(self, "_spec_cost", None)
+            measured = pc.measured() if pc is not None else set()
+            cost = {T: c + (0 if T in measured else n_attn * (T - 1) * past * b) for T, c in cost.items()}
         c1 = cost[1]
         # a pass may cost what it yields: the widest pass whose cost, in one-row steps, is within the tokens
         # a pass has been returning (a quarter over a step is always allowed, so a tree can start)
@@ -1263,6 +2226,43 @@ class _CudaMixin(_State):
             probe = [T for T, c in cost.items() if T <= full and c <= 1.25 * c1]
             cap = max(cap, max(probe) if probe else 1)
         return max(1, cap)
+
+    def _spec_pricer(self, v_max: int | None = None) -> SpecCost:
+        """The engine's pricing of its speculative passes (`SpecCost`): made on first use and kept across calls,
+        so what a call learned of the drafter's acceptance and the rows' expert reads sizes the next call's first
+        passes; handed the widest pass, the base cost curve `_spec_budget` reads and a missed expert's seconds."""
+        pc: SpecCost | None = getattr(self, "_spec_cost", None)
+        if pc is None:
+            top_k = int(getattr(getattr(self, "cfg", None), "num_experts_per_tok", 0) or 0)
+            pc = SpecCost(SpecCost.gamma_of(int(getattr(self, "n_experts", 0) or 0), top_k))
+            self._spec_cost = pc
+        cost = (
+            getattr(self, "_card_cost", None) or getattr(self, "_mlx_cost", None) or getattr(self, "_host_cost", None)
+        )
+        store = getattr(self, "expert_store", None)
+        miss = getattr(store, "miss_s", None)
+        # `spec_price` off prices no read (the pricer inactive): the passes sized as with no store to read from - what a
+        # test of the verify pass pins, so what earlier calls taught the pricer cannot choose to draft nothing
+        miss_s = miss() if callable(miss) and bool(getattr(self, "spec_price", True)) else 0.0
+        # a card program's passes run at its graphs' widths, its rows padded to them: a 3-row pass is a 4-row one
+        prog = cost is not None and cost is getattr(self, "_card_prog_cost", None)
+        pc.price(self._spec_full(v_max), cost, miss_s, self._card_width if prog else None)
+        return pc
+
+    def _card_width(self, T: int) -> int:
+        """the rows a card program's pass of `T` runs at (its graphs' widths); a pass past them took the torch path,
+        at its own"""
+        return self._card_m(T) if T <= self.CARD_T_MAX else int(T)
+
+    def _spec_curve(self) -> dict[int, float] | None:
+        """the pass-cost curve the budget sizes a pass by: the warm-up's as the passes measure it now (the pricer's
+        `curve_now`), the warm-up's own before a pricer is made"""
+        pc: SpecCost | None = getattr(self, "_spec_cost", None)
+        if pc is not None and pc.curve:
+            return pc.curve_now()
+        return (
+            getattr(self, "_card_cost", None) or getattr(self, "_mlx_cost", None) or getattr(self, "_host_cost", None)
+        )
 
     def _forward_card_segment(
         self, a: int, b: int, h: torch.Tensor, pas: Any, tail: bool
@@ -1302,6 +2302,149 @@ class _CudaMixin(_State):
             return None, g["logits"][:T].view(1, T, -1)
         return g["h"][:T].view(1, T, -1), None
 
+    # -- a family's card program: its layers as graphs replayed in turn, the host between them ------------------
+
+    def _card_program_on(self) -> bool:
+        """the family's card program not switched off (`card_programs`, `BTB_CARD_PROGRAM=0`): the one gate its
+        passes and its warm-up both ask, so a program switched off is never made, held or timed"""
+        return bool(getattr(self, "card_programs", True)) and os.environ.get("BTB_CARD_PROGRAM", "1") != "0"
+
+    def _card_program(
+        self, cache: Any, B: int, T: int, past: int, am: Any, stop_after: int | None, positions: Any
+    ) -> Any:
+        """the family's card program for this pass, or None where it takes the torch path: a family with one
+        (`Family.card_program`), a one-row step or a speculative pass of up to CARD_T_MAX rows over one sequence's
+        cache, on the card with its kernels, and a model the program runs as placed (`ok`)"""
+        cls = self.fam.card_program()
+        if cls is None:
+            return None
+        spec = bool(getattr(self, "aq", False))
+        if not (
+            B == 1
+            and 1 <= T <= self.CARD_T_MAX
+            and (T == 1 or spec)
+            and (positions is None or spec)
+            and past > 0
+            and am is None
+            and stop_after is None
+            and cache is not None
+            and not forked(cache)
+            and self.dev.type == Device.CUDA
+            and self._card_program_on()
+            and getattr(self, "_probe", None) is None
+        ):
+            return None
+        prog = getattr(self, "_cp", None)
+        if prog is None:
+            if self._card_kernels() is None:
+                return None
+            prog = self._cp = cls(self)
+        return prog if prog.ok() else None
+
+    def _card_program_for_rows(self) -> Any:
+        """the family's card program where it keeps the attention's rows in RAM (`kv_host`: a context the card has no
+        room for) and reads them as the model is placed (`rows_ok`: its attention's own gates - a head shed to the host
+        declines the program's passes, not this) - a torch-path pass's sparse attention then reads the rows through its
+        kernels (Qwen4's `attend_rows`), so they never come to the card - else None"""
+        if not getattr(self, "kv_host", False) or self.dev.type != Device.CUDA or not self._card_program_on():
+            return None
+        cls = self.fam.card_program()
+        if cls is None or self._card_kernels() is None:
+            return None
+        prog = getattr(self, "_cp", None)
+        if prog is None:
+            prog = self._cp = cls(self)
+        return prog if prog.rows_ok() else None
+
+    def _card_graph_run(self, holder: Any, key: Any, body: Callable[[], None]) -> None:
+        """`body`'s kernels as the graph `holder.graphs[key]`, captured on first use on the holder's stream and
+        replayed on the current one; the engine's `card_program_eager` (a test's check) runs the body itself. The
+        capture only records: nothing a body writes (a step's states) runs twice."""
+        if getattr(self, "card_program_eager", False):
+            body()
+            return
+        g = holder.graphs.get(key)
+        if g is None:
+            s = holder.stream
+            s.wait_stream(torch.cuda.current_stream())
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, pool=holder.pool, stream=s, capture_error_mode="thread_local"):
+                body()
+            torch.cuda.current_stream().wait_stream(s)
+            holder.graphs[key] = g
+        g.replay()
+
+    def _forward_card_program(
+        self,
+        prog: Any,
+        ids: Any,
+        h: torch.Tensor,
+        cache: Any,
+        past: int,
+        positions: Any,
+        last_only: bool,
+        head: bool,
+        on_layer: Callable[[int, torch.Tensor], Any] | None,
+        place: Any = None,
+    ) -> torch.Tensor:
+        """One pass through a family's card program over the model as placed (`place`, the pass's held
+        placement): each segment of resident layers its graphs in turn - after each layer i the host's part
+        (`between(i)`: a mixture's routed experts through the store) - closed into the streams where a host layer
+        follows; a host layer between segments through the host path (`run_layer`, the streams crossing the edge
+        through the program's pinned rows); the tail last. A one-row pass outside speculation is a step (it commits
+        as it goes); a speculative one verifies its chain or tree (`ap`) at its rows' positions, its commit handed
+        to `ad`, a host layer's with its own. Returns the logits [1, T, V] bf16 (the final rows without `head`), a
+        view of the program's buffer read before the next pass."""
+        self._tag(PassTag.CUDA_GRAPH)
+        T = int(h.shape[1])
+        spec = bool(getattr(self, "aq", False))
+        mode = "tree" if spec else "step"
+        parents = chain_of(getattr(self, "ap", None) if spec else None, T)
+        ids_l = [int(t) for t in torch.as_tensor(ids).reshape(-1).tolist()]
+        if positions is not None:
+            depth = [int(p) - past for p in torch.as_tensor(positions).reshape(-1).tolist()]
+        else:
+            depth = list(range(T))
+        tap = on_layer is not None
+        taps: dict[int, torch.Tensor] = {}
+        pas = None
+        if prog.host_layers:
+            # the host layers' frame, as the torch path's pass makes it: the rope, the mask (the tree through it),
+            # the ids; made before any layer writes the cache
+            pas = self._host_frame(h, ids_l, cache, past, positions, taps.__setitem__ if tap else None)
+            pas.place = place if place is not None else self.device.snapshot()
+            if self.cold:
+                self._cold_start(self.L)
+        M = prog.begin(cache, h, ids_l, past, parents, depth, mode, tap)
+        L = int(prog.L)
+        run = self._card_graph_run
+        hf: torch.Tensor | None = None  # the streams on the host, between host layers
+        i = 0
+        while i < L:
+            if i not in prog.at:
+                if hf is None:
+                    hf = prog.leave()
+                hf = self.device.run_layer(i, hf, pas)
+                i += 1
+                continue
+            b = prog.seg_end(i)
+            prog.enter(i, hf)
+            hf = None
+            for j in range(i, b):
+                run(prog, (j, M, mode, tap), functools.partial(prog.layer_body, j, M, mode, tap))
+                prog.between(j)
+            if b < L:
+                run(prog, ("close", b - 1, M, mode, tap), functools.partial(prog.close_body, b - 1, M, mode, tap))
+            i = b
+        prog.enter(L, hf)
+        run(prog, (L, M, mode, tap), functools.partial(prog.tail_body, M, mode, tap))
+        prog.end()
+        if on_layer is not None:
+            for i in range(L):
+                on_layer(i, taps[i] if i in taps else prog.tap_rows(i, T))
+        out = prog.logits(T) if head else prog.hidden(T)
+        return out[:, -1:] if last_only else out
+
     # -- rows: a fork's or a batch's rows stepped together, a token each at its own position -------------------
 
     ROWS_ROOM = 256  # steps of room a regrowth of the arena makes for the rows (a regrowth drops the graphs)
@@ -1329,9 +2472,17 @@ class _CudaMixin(_State):
         """the arena's holder lets it go: the rows it has become copies of their own"""
         owner = ar["owner"]() if ar["owner"] is not None else None
         if owner is not None:
-            for i in ar["slot"]:
-                if isinstance(owner.layers[i], (GrowLayer, CardRowsLayer)):
-                    owner.layers[i].detach()
+            held = [owner.layers[i] for i in ar["slot"] if isinstance(owner.layers[i], (GrowLayer, CardRowsLayer))]
+            # the copies granted before any is made: an eviction the card cannot take is refused whole, the arena
+            # still its holder's
+            nbytes = sum(cl.detach_bytes() for cl in held)
+            sched = getattr(self, "scheduler", None)
+            if nbytes and sched is not None:
+                sched.grant(
+                    nbytes, "kv", requester="card arena: the rows it lets go, copied out", device=self.dev, draws=""
+                )
+            for cl in held:
+                cl.detach()
         ar["owner"] = None
 
     def _card_rows_form(self, cache: Any, srcs: list[Any], rows: list[int]) -> list[int]:
@@ -1359,6 +2510,8 @@ class _CudaMixin(_State):
         self._card_evict(ar)
         ar["owner"] = weakref.ref(cache)
         A = ar["A"]
+        sched = getattr(self, "scheduler", None)
+        grant = sched.grant if sched is not None else None
         for i in layers:
             kb, vb = A[ar["slot"][i], 0], A[ar["slot"][i], 1]
             for j, c in enumerate(srcs):
@@ -1371,7 +2524,9 @@ class _CudaMixin(_State):
                     )
                 kb[:, offs[j] : offs[j] + lens[j]].copy_(k[0])
                 vb[:, offs[j] : offs[j] + lens[j]].copy_(v[0])
-            cache.layers[i] = CardRowsLayer(kb, vb, [offs[r] for r in rows], [lens[r] for r in rows], base, W)
+            cache.layers[i] = CardRowsLayer(
+                kb, vb, [offs[r] for r in rows], [lens[r] for r in rows], base, W, grant=grant
+            )
         return [lens[r] for r in rows]
 
     def _card_rows_bind(self, cache: Any, st: dict[str, Any], need: int = 0) -> dict[str, Any]:
@@ -1496,8 +2651,21 @@ class _CudaMixin(_State):
         flags: list[Any] = []
         for i, layer in enumerate(cache.layers):
             # every attention layer's keys and values are cropped to the accepted path; a sliding layer
-            # keeps the whole cache (its window is a mask, not a shorter cache), so it is cropped too
-            if self.layer_types[i] in (LayerKind.FULL, LayerKind.SLIDING):
+            # keeps the whole cache (its window is a mask, not a shorter cache), so it is cropped too, and a
+            # sparse layer's indexer keys with its rows
+            if self.layer_types[i] in (LayerKind.FULL, LayerKind.SLIDING, LayerKind.QWEN_SPARSE):
+                keep_path = getattr(layer, "keep_path", None)
+                if keep_path is not None:
+                    # a layer keeping its rows where a card program's kernels read them moves the path into place
+                    # itself (`ArenaIndexedLayer`)
+                    keep_path(base_len, path)
+                    continue
+                ik = indexer_keys(layer)
+                if ik is not None and ik.numel():
+                    if path == list(range(len(path))):
+                        layer.indexer_keys = ik[:, : len(keep)]
+                    else:
+                        layer.indexer_keys = ik.index_select(1, torch.tensor(keep, device=ik.device))
                 if isinstance(layer, GrowLayer) and not layer.shared and layer._buf is not None and layer._attached():
                     # a layer living in its buffer (the card's arena): the accepted path's rows move into
                     # place inside the buffer and the views are re-cut - nothing leaves the buffer
@@ -1535,8 +2703,11 @@ class _CudaMixin(_State):
                         self.ah(layer, i, inp, path)
                     continue
                 if path and hasattr(st, "restore"):
-                    conv, rec = st.restore(path)
-                    lazy.append((layer, conv, rec))
+                    # MLX's checkpoints hand back lazy states, evaluated together below; a restore that wrote the
+                    # accepted path's states into the layer itself hands back nothing
+                    got = st.restore(path)
+                    if got is not None:
+                        lazy.append((layer, *got))
                     continue
                 conv, rec = st[path[-1]] if path else self.am[i]
                 c, r = self._lin(layer)
@@ -1553,20 +2724,19 @@ class _CudaMixin(_State):
             for layer, conv, _rec in lazy:
                 c, _r = self._lin(layer)
                 c.copy_(conv)
+        # a family's own states (Qwen4's n-gram embedding) put where the accepted path left them
+        for commit in getattr(self, "spec_commits", ()):
+            commit(path)
 
     def af(self, i: int, T: int, cl: Any) -> Any:
-        slots = getattr(self, "ay", None)
-        if slots is None:
-            slots = self.ay = {}
-        s = slots.get(i)
-        if s is None or s[0].shape[0] < T:
-            c, r = self._lin(cl)
-            s = (
-                torch.empty((T, *tuple(c.shape)), dtype=c.dtype, device=c.device),
-                torch.empty((T, *tuple(r.shape)), dtype=r.dtype, device=r.device),
-            )
-            slots[i] = s
-        return s
+        """layer i's per-node (conv, recurrent) states for a speculative pass of T nodes: its own, since the pass's
+        commit reads them after every later layer has run; granted and held as the engine's scratch"""
+        c, r = self._lin(cl)
+        who = f"the speculative pass's per-node DeltaNet states, layer {i}"
+        return (
+            self.scratch.take(f"delta nodes {i} conv", (T, *tuple(c.shape)), c.dtype, c.device, who),
+            self.scratch.take(f"delta nodes {i} state", (T, *tuple(r.shape)), r.dtype, r.device, who),
+        )
 
     def ag(
         self,
@@ -1673,6 +2843,7 @@ class _CudaMixin(_State):
                     la._k_norm_w,
                     la._k_eps,
                     out,
+                    la._k_gate,
                 )
             return
         mod = self.fam.mod
@@ -1758,6 +2929,8 @@ class _CudaMixin(_State):
             la._k_dt_bias = la.dt_bias.detach().float().contiguous()
             la._k_norm_w = la.norm.weight.detach().float().contiguous()
             la._k_eps = float(getattr(la.norm, "variance_epsilon", getattr(la.norm, "eps", 1e-6)))
+            # the gated norm's activation: Qwen3.5's silu, Qwen4's sigmoid (its norm carries the name)
+            la._k_gate = 1 if getattr(la.norm, "activation", "silu") == "sigmoid" else 0
         pre: Any = self._lin(cl)
         if step_fn is not None and not (pre[0].is_contiguous() and pre[1].is_contiguous()):
             pre = (pre[0].contiguous(), pre[1].contiguous())
@@ -1799,6 +2972,7 @@ class _CudaMixin(_State):
                     la._k_norm_w,
                     la._k_eps,
                     out,
+                    la._k_gate,
                 )
                 outs.append(out.view(1, 1, -1))
                 if spec_on:
@@ -1887,11 +3061,8 @@ class _CudaMixin(_State):
         attn_fn = ALL_ATTENTION_FUNCTIONS.get_interface(self.cfg._attn_implementation, eager_attention_forward)
         q_rot, k_rot = apply_rotary_pos_emb(q_all.transpose(1, 2), k_all.transpose(1, 2), pe[0], pe[1])
         k_full, v_full = cache.update(k_rot, v_all.transpose(1, 2), i)
-        kernel = (
-            T == 1
-            and not tree
-            and Native.attn_decode is not None
-            and k_full.shape[0] == 1
+        native = (
+            k_full.shape[0] == 1
             and k_full.device.type == "cpu"
             and k_full.dtype in (torch.bfloat16, torch.float32)
             and v_full.dtype == k_full.dtype
@@ -1900,6 +3071,12 @@ class _CudaMixin(_State):
             and v_full.stride(-1) == 1
             and v_full.stride(-2) == hd
         )
+        kernel = native and T == 1 and not tree and Native.attn_decode is not None
+        # a verify pass's rows (a chain's or a tree's) through the step's own arithmetic: each row over the cache rows
+        # its committed step will read, in the order it reads them (`attn_nodes`, row for row `attn_decode` bit for
+        # bit). Through sdpa a row at a time, a verify rounded a bf16 tie apart from the step - Qwen3-0.6B with
+        # eleven host layers took ':' where its greedy step took '.', speculation then no longer the greedy answer
+        nodes = native and not kernel and Native.attn_nodes is not None
         if kernel:
             qf = q_rot[0, :, 0].float().contiguous()
             out = torch.empty(qf.shape, dtype=torch.float32)
@@ -1907,7 +3084,21 @@ class _CudaMixin(_State):
             Native.attn_decode(qf, k_full[0][:, first:], v_full[0][:, first:], at.scaling, out)
             a1 = out.view(1, 1, -1).to(h.dtype)
             outs.append(a1 if gate_all is None else a1 * torch.sigmoid(gate_all[:, 0:1]))
-        for p in range(T) if not kernel else range(0):
+        elif nodes:
+            lists = []
+            for p in range(T):
+                rows = node_mask(base, p, parents, win)
+                lists.append(torch.arange(base + p + 1) if rows is None else rows.nonzero()[:, 0])
+            idx = torch.cat(lists).to(torch.int32).contiguous()
+            offs = torch.zeros(T + 1, dtype=torch.int32)
+            offs[1:] = torch.tensor([len(x) for x in lists]).cumsum(0).to(torch.int32)
+            qf = q_rot[0].transpose(0, 1).float().contiguous()  # [T, hq, d]
+            out = torch.empty(qf.shape, dtype=torch.float32)
+            Native.attn_nodes(qf, k_full[0], v_full[0], offs, idx, float(at.scaling), out)
+            for p in range(T):  # a row at a time, as each step casts and gates its one
+                a1 = out[p].view(1, 1, -1).to(h.dtype)
+                outs.append(a1 if gate_all is None else a1 * torch.sigmoid(gate_all[:, p : p + 1]))
+        for p in range(T) if not (kernel or nodes) else range(0):
             qs = q_rot[:, :, p : p + 1]
             ks = k_full[..., : base + p + 1, :]
             vs = v_full[..., : base + p + 1, :]

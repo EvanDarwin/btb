@@ -163,6 +163,14 @@ OPS: tuple[Op, ...] = (
         "guard_attn.rs",
         "attn.rs",
     ),
+    Op(
+        "attn_nodes",
+        (Stored.BF16, Stored.F32),
+        ("btb_attn_nodes_bf16", "btb_attn_nodes_f32"),
+        "attn_nodes.rs",
+        "guard_attn_nodes.rs",
+        "attn.rs",
+    ),
     Op("delta_step", (Stored.F32,), ("btb_delta_step",), "delta.rs", "guard_delta.rs", "delta.rs"),
     Op("sample_pick", (Stored.F32,), ("btb_sample_pick",), "sample.rs", "guard_sample.rs", "sample.rs"),
     Op(
@@ -173,7 +181,7 @@ OPS: tuple[Op, ...] = (
         "guard_direct.rs",
         "direct.rs",
     ),
-    Op("read_at", (Stored.BYTES,), ("btb_read_at",), "handle.rs", "guard_direct.rs", "direct.rs"),
+    Op("read_at", (Stored.BYTES,), ("btb_read_at", "btb_open_cached"), "handle.rs", "guard_direct.rs", "direct.rs"),
 )
 
 # crate exports that are not kernels, so no Op claims them: the tier probe the bench records its numbers under

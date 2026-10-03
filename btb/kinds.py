@@ -34,14 +34,17 @@ class UnknownKind(ValueError):
 
 class LayerKind(StrEnum):
     """A decoder layer's kind, as transformers' `layer_types` names it: every entry of its
-    ALLOWED_ATTN_LAYER_TYPES (a test holds the two lists equal), so any config transformers accepts reads into
-    the enum. The engine runs FULL, SLIDING, LINEAR and QWEN_SPARSE; a family the engine does not drive is
-    refused at the family table, never here."""
+    ALLOWED_ATTN_LAYER_TYPES, read through its legacy names (`LEGACY`; a test holds the lists equal), so any config
+    transformers accepts reads into the enum. The engine runs FULL, SLIDING, LINEAR and QWEN_SPARSE (Qwen4's
+    indexed sparse attention); a family the engine does not drive is refused at the family table, never here."""
 
     FULL = "full_attention"
     SLIDING = "sliding_attention"
     CHUNKED = "chunked_attention"
     WINDOW = "window_attention"
+    # an indexer's attention: Qwen4's QSA, DeepSeek's DSA. transformers 5.18 names it so; 5.16-5.17 named each its own
+    # (`LEGACY`), and a config read under them, or saved by them, carries those
+    QWEN_SPARSE = "indexed_attention"
     COMPRESSED_SPARSE = "compressed_sparse_attention"
     HEAVILY_COMPRESSED = "heavily_compressed_attention"
     MINIMAX_M3_SPARSE = "minimax_m3_sparse"
@@ -49,21 +52,42 @@ class LayerKind(StrEnum):
     MOE = "moe"
     HYBRID = "hybrid"
     HYBRID_SLIDING = "hybrid_sliding"
-    DEEPSEEK_SPARSE = "deepseek_sparse_attention"
-    QWEN_SPARSE = "qwen_sparse_attention"
     LINEAR = "linear_attention"
 
     @classmethod
     def of(cls, text: str) -> LayerKind:
-        """the kind of a config's entry; a name transformers itself does not allow is an UnknownKind naming it"""
+        """the kind of a config's entry, its legacy names too (`LEGACY`); a name transformers itself does not allow
+        is an UnknownKind naming it"""
+        text = str(text)
         try:
-            return cls(str(text))
+            return cls(LEGACY.get(text, text))
         except ValueError:
             raise UnknownKind(text, cls) from None
 
+    def hf_name(self) -> str:
+        """the kind as the installed transformers spells it in a config it is handed (a drafter's config built
+        here): its cache picks the layer's form by that name - under another spelling Qwen4's attention got a plain
+        cache layer, with no indexer keys. btb takes transformers 5.16 on, which named Qwen4's indexed attention
+        `qwen_sparse_attention` until 5.18"""
+        if self is LayerKind.QWEN_SPARSE:
+            from transformers.configuration_utils import ALLOWED_ATTN_LAYER_TYPES
+
+            if self.value not in ALLOWED_ATTN_LAYER_TYPES:
+                return "qwen_sparse_attention"
+        return self.value
+
+
+# a config's layer type by a name transformers used before (and still reads, mapping it on): its kind's name now
+LEGACY: dict[str, str] = {
+    "qwen_sparse_attention": "indexed_attention",  # transformers <= 5.17: Qwen4's QSA
+    "deepseek_sparse_attention": "indexed_attention",  # transformers <= 5.17: DeepSeek's DSA
+    "mamba": "linear_attention",
+    "attention": "full_attention",
+}
+
 
 class FamilyKind(StrEnum):
-    """the model families btb drives, keyed from the config's model_type (btb/engine/families.py)"""
+    """the model families btb drives, keyed from the config's model_type (a class each in btb/engine/families/)"""
 
     QWEN3 = "qwen3"
     QWEN3_5 = "qwen3_5"
@@ -102,7 +126,7 @@ class ModelType(StrEnum):
 
 class Cap(StrEnum):
     """a family capability - a boolean on `Family` that selects a code path. Spelled once here (the value is the
-    field name); `families.family()` builds a Family's flags from `CAPS`, so this table is the single truth for
+    field name); each family's `build` takes its Family's flags from `CAPS`, so this table is the single truth for
     what a family does, torch-free, readable without the engine."""
 
     DENSE = "dense"
@@ -306,6 +330,10 @@ class PassTag(StrEnum):
     EXPERT_VRAM_SEAT = "expert_vram_seat"  # an expert multiplied from its seat on the card (`vram_experts_gb`)
     EXPERT_MXFP4_ASSTORED = "expert_mxfp4_asstored"  # MXFP4 experts multiplied in their stored blocks
     EXPERT_MXFP4_DEQUANT = "expert_mxfp4_dequant"  # MXFP4 experts widened to float before the matmul
+    EXPERT_FP8_ASSTORED = "expert_fp8_asstored"  # FP8 experts multiplied as stored, e4m3 bytes and scale grid
+    EXPERT_FP8_WIDENED = "expert_fp8_widened"  # FP8 experts widened by their scales to bf16 before the matmul
+    # a prefill's expert call as grouped matmuls over the depot's slots on the card (`_card_grouped`)
+    EXPERT_CARD_GROUPED = "expert_card_grouped"
     # the head, and the route a long prefill took (btb/engine/forward.py)
     HEAD_RESIDENT = "head_resident"  # the head multiplied where the model runs
     HEAD_STREAMED = "head_streamed"  # the head read from the checkpoint for the pass (`resident_head` off)

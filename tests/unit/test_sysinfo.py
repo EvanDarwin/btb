@@ -4,6 +4,8 @@ the OS's own word on its memory floor and pressure. Reads this process and the O
 
 import os
 import sys
+from collections.abc import Iterator
+from typing import Any
 
 import pytest
 
@@ -70,6 +72,56 @@ def test_the_os_speaks_for_its_own_memory() -> None:
     p = memory_pressure()
     assert set(p) == {"low", "level"} and isinstance(p["low"], bool) and isinstance(p["level"], float)
     assert p["level"] >= 0.0
+
+
+@pytest.fixture
+def wddm_cache(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[Any, Any]]:
+    """sysinfo's adapter cache, the test's own: the lookups it makes - a card not found, the card's adapter - are let
+    go after it, not left in the process for another test's lookup of the same card to find"""
+    from btb import sysinfo
+
+    cache: dict[Any, Any] = {}
+    monkeypatch.setattr(sysinfo, "_WDDM", cache)
+    yield cache
+    for adapter, _at in cache.values():
+        sysinfo._com_release(adapter)
+
+
+def test_the_wddm_budget_is_read_for_the_card_dxgi_names_and_none_elsewhere(wddm_cache: dict[Any, Any]) -> None:
+    """this process's WDDM budget room: None off Windows and for a card DXGI does not list; on Windows beside an
+    NVIDIA card nvidia-smi names, a figure no larger than the card (the budget is at most the card, less what this
+    torch-free process uses there: nothing)"""
+    import shutil
+    import subprocess
+
+    from btb.sysinfo import _com_release, _wddm_matches, cuda_luid, wddm_info
+
+    def wddm_room(name: str, total: int, ordinal: int | None = None) -> int | None:
+        info = wddm_info(name, total, ordinal)
+        return None if info is None else info[0] - info[1]
+
+    assert wddm_room("no such card", 1 << 30) is None
+    if sys.platform != "win32" or shutil.which("nvidia-smi") is None:
+        return
+    out = subprocess.run(
+        ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    ).stdout.strip()
+    rows = [r.rsplit(",", 1) for r in out.splitlines() if "," in r]
+    if len(rows) != 1:
+        return  # several cards of one name are not named uniquely, and read None
+    name, mib = rows[0][0].strip(), int(rows[0][1])
+    # the one card, CUDA's ordinal 0: its LUID names it where DXGI lists it twice (after a driver reset it did)
+    room = wddm_room(name, mib << 20, 0)
+    if room is None and cuda_luid(0) is None:
+        hits = _wddm_matches(name, mib << 20)
+        for ad, _luid in hits:
+            _com_release(ad)
+        if len(hits) > 1:
+            return  # CUDA hidden (CUDA_VISIBLE_DEVICES=-1) and the card listed twice: no LUID here to name it by
+    assert room is not None and 0 < room <= (mib << 20), (name, mib, room)
 
 
 def test_raise_file_limit_lifts_a_low_soft_limit() -> None:

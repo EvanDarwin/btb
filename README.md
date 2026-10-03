@@ -168,13 +168,14 @@ Every command that loads a model takes these. The placement is planned from the 
 | `--adapt 0\|1`<br/><sub>This option enables/disables `btb`'s behavior under contention, for RAM and VRAM together. When true, it aims for no apps OOMing. When false, it plans once and sticks to it - making other apps take the OOM. | `1`: free RAM/VRAM under contention, reclaim it when available again<br/>`0`: fit the model to the hardware once and don't readjust | `1` |
 | `--no-spec` | disables speculative decoding | _disabled_ |
 | `--tree-budget N` | the draft tree's size per pass; `0` turns the tree off | with drafting head: mlx = `14`, cuda = `15`, cpu = `16`<br/>without: on a card holding every layer, `15`; otherwise `0` |
-| `--v-max N` | drafted tokens verified per pass; `0` decodes one token at a time | `4`; `0` for a mixture of experts |
+| `--v-max N` | drafted tokens verified per pass; `0` decodes one token at a time | `4` |
 | `--tree-min-prob P` | minimum draft path probability kept in the tree | `0.15` |
 | `--tree-step-mass P` | a drafting step runs only when the nodes it would extend carry this much path probability; `0` always steps | `0.5` |
 | `--ngram-p P` | acceptance threshold of the n-gram drafter | `0.9` |
 | `--draft-vocab N` | the drafting head scores only the first $N$ token ids (the frequent part of a BPE vocabulary); `0` scores all | `32768` with a drafting head, else all |
 | `--draft-bits 4\|8\|16`<br/><sub>This option is only recognized when running under MLX.</sub> | the drafting head's weights packed in memory at first use to N bits | `8` on MLX only, otherwise ignored |
 | `--mlx-mega 0\|1`<br/><sub>When enabled, requires ~600MB of arena/scratch space | MLX: the dense pass as one Metal dispatch (the megakernel; bit-exact w/ fused path) | `1` where it builds (dense Qwen3, every layer resident) |
+| `--sparse 0\|1`<br/><sub>Opt-in, and not the certified path: a near-tie at the budget's edge may keep a different block than the reference's indexer | Qwen4's sparse attention scores every row's blocks in one pass instead of one row at a time: a faster prefill of a long prompt (a 16k prompt on the 180B: 131 s to 105 s) | `0`: the selection is the reference indexer's, bit for bit |
 | `--temperature T` | `0` takes the likeliest token; above `0`, each logit is divided by $T$, deterministic noise keyed by the seed and the token's position is added, and the argmax is taken, so higher $T$ draws more widely and one seed repeats its answer. | `0` |
 | `--top-p P` | draw from the fewest likeliest tokens whose probability reaches $P$ | `1` (every token) |
 | `--top-k K` | draw from the $K$ likeliest tokens | `0` (every token) |

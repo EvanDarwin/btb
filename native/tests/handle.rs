@@ -5,7 +5,7 @@
 
 use btb_native::codes::*;
 use btb_native::direct::{self, wide, SECTOR};
-use btb_native::{btb_close, btb_open, btb_read_at, btb_read_direct};
+use btb_native::{btb_close, btb_open, btb_open_cached, btb_read_at, btb_read_direct};
 use std::path::Path;
 
 #[path = "common/fixture.rs"]
@@ -112,6 +112,35 @@ fn ranges_match_read_direct() {
         check(&f, h, FILE_LEN - len, len, 4096, 3, 1);
     }
     assert_eq!(btb_close(h), OK);
+}
+
+/// A handle that reads through the system's file cache (`btb_open_cached`) delivers the bytes the direct
+/// read does, at any offset, length and destination alignment, a second read of a span (from the cache)
+/// as the first; a missing file and a null path are the same codes `btb_open` gives.
+#[test]
+fn a_cached_handle_reads_what_a_direct_one_does() {
+    const FILE_LEN: u64 = 12 * MIB + 555;
+    let f = Fixture::new("handle_cached", FILE_LEN);
+    let h = unsafe { btb_open_cached(f.wide.as_ptr()) };
+    assert!(h >= 0, "btb_open_cached -> {h}");
+    for _ in 0..2 {
+        for &off in &[0u64, 1, 4095, 4096, MIB + 7, FILE_LEN - 555] {
+            for &len in &[1u64, 555, 4096, MIB + 3] {
+                if off + len <= FILE_LEN {
+                    for skew in [0usize, 1, 512] {
+                        check(&f, h, off, len, 0, 0, skew);
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(btb_close(h), OK);
+    let missing = wide(Path::new("btb_handle_cached_missing.bin"));
+    assert_eq!(unsafe { btb_open_cached(missing.as_ptr()) }, ERR_IO as i64);
+    assert_eq!(
+        unsafe { btb_open_cached(std::ptr::null()) },
+        ERR_NULL as i64
+    );
 }
 
 /// The chunk size and the worker depth are scheduling choices: every combination delivers the same

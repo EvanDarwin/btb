@@ -330,15 +330,33 @@ def test_the_option_selected_forks_have_cells() -> None:
 
 
 def test_card_family_predicate_matches_cuda_source() -> None:
-    """core.card_family_ok replicates cuda.py's family clause (the manifest is torch-free, so it cannot call
-    it). This holds the two together: the capabilities named in `_card_family_ok` are exactly the ones here."""
-    src = _source("engine", "cuda.py")
-    body = src.split("def _card_family_ok", 1)[1].split("\n    def ", 1)[0]
-    named = {c for c in Cap if f"self.fam.{c.value}" in body}
-    assert named == core.CARD_FAMILY_CAPS, f"cuda.py's family clause names {sorted(c.value for c in named)}"
+    """core.card_family_ok replicates the family's card clause (the manifest is torch-free, so it cannot call it):
+    `Family.card_graph` (families/base.py) names the capabilities, cuda.py `_card_family_ok` asks the family for it
+    and gates the head widths. This holds them together: the capabilities named there are exactly the ones here."""
+    base = _source("engine", "families", "base.py")
+    clause = base.split("def card_graph", 1)[1].split("\n    def ", 1)[0].split("\n    @", 1)[0]
+    named = {c for c in Cap if f"self.{c.value}" in clause}
+    assert named == core.CARD_FAMILY_CAPS, f"the family's card clause names {sorted(c.value for c in named)}"
+    body = _source("engine", "cuda.py").split("def _card_family_ok", 1)[1].split("\n    def ", 1)[0]
+    assert "self.fam.card_graph" in body, "cuda.py's card gate no longer asks the family"
     assert f"D in {manifest.CARD_HEAD_DIMS}" in body, "the card's head widths moved; CARD_HEAD_DIMS is stale"
     rejected = sorted(k.value for k in core.served_kinds() if not core.card_family_ok(k))
     assert rejected == ["gpt_oss", "phi3", "qwen3_5", "qwen4"]
+
+
+def test_own_layer_speculation_gate_matches_its_source() -> None:
+    """a family that brings its own layer drafts where its passes verify exactly: every host and card sub-path -
+    on a card through the card program or, where it declines, the torch path's row-invariant layers, so
+    `verify_exact` asks only for the card's kernels there, not the program - never MLX, where `speculates` is off"""
+    family = _source("engine", "families", "qwen4", "family.py")
+    exact = family.split("def verify_exact", 1)[1].split("\n    def ", 1)[0]
+    assert "Native.card_kernels()" in exact and "_card_program(" not in exact, (
+        "verify_exact's card gate moved: own_layer_verifies is stale"
+    )
+    assert "return not mlx" in family.split("def speculates", 1)[1].split("\n    def ", 1)[0]
+    verifies = {d.key for d in spec.DEVICE_SUBPATHS if manifest.own_layer_verifies(d)}
+    cuda = {d.key for d in spec.DEVICE_SUBPATHS if d.hardware is spec.Hardware.CUDA}
+    assert "cpu" in verifies and cuda <= verifies and "mlx-step" not in verifies, verifies
 
 
 def test_mega_head_multiple_matches_its_source() -> None:
