@@ -184,6 +184,9 @@ class StreamedTextModel(
                 else {int(x) for x in cpu_layers} | {int(x) for x in cold_layers}
             )
             devname = DeviceName(DeviceKind.CPU)  # MLX's tensors on the torch side are host tensors
+        # a Mac's CPU tier binds its weights into the pool too (`bind_cpu_gemm`); owned before the weights, so
+        # released after them
+        self.holdings.own(Stage.MEMORY, "the pool's blocks", self._pool_give)
         # the card by its index, as its tensors name it (a bare 'cuda' is the current card)
         self.dev = where(str(devname))
         if self.dev.type == DeviceKind.CUDA:
@@ -766,21 +769,24 @@ class StreamedTextModel(
             prof.save()
 
     def _mlx_teardown(self) -> None:
-        """MLX's arrays let go - the host layers' packed weights, the head's, the cold ring's shared slots - before
-        the store's blocks they sit over, then the tier itself; the pool's blocks go back whole, so the next model
-        this process loads reads into touched memory"""
+        """MLX's arrays let go - the host layers' packed weights, the head's, the embedding's, the cold ring's
+        shared slots - before the store's blocks they sit over, then the tier itself"""
         for layer in self.host.values():
             for m in layer.modules():
                 if isinstance(m, _HostLinear):
                     m.mx = None
         self.head_host = None
         self.cold_ring.slots, self.cold_ring.shared = [], None
-        self.mlx_state.weights = {}
+        st = self.mlx_state
+        st.weights = {}
+        st.embed_w = st.embed_lin = st.rope_cache = st.ahead = None
         if self.mlx is not None:
             self.mlx.close()
-        for sh in self.mlx_state.pool_blocks:
-            _pool.POOL.give(sh)
-        self.mlx_state.pool_blocks = set()
+
+    def _pool_give(self) -> None:
+        """the pool's blocks this engine read its weights into back, whole, once the weights over them are gone:
+        the next model this process loads reads into touched memory"""
+        _pool.POOL.give(self)
 
     def _close_store(self) -> None:
         """the expert store's blocks let go now, not when its last reference goes: a caller's `with` leaves the

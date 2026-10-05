@@ -50,8 +50,8 @@ ATTN_KERNEL_HEADS = (128, 256)
 @dataclass
 class MlxState:
     """The MLX path's own state: its switches (shipped at these defaults; a caller may set one on the engine's
-    `mlx_state`), what it holds in unified memory, the read-ahead buffer, the pool blocks it took, and the
-    caches it fills on first use (the fused weights, the family check, the rope table, the embedding)."""
+    `mlx_state`), what it holds in unified memory, the read-ahead buffer, and the caches it fills on first use
+    (the fused weights, the family check, the rope table, the embedding)."""
 
     batch: bool = True
     pipeline: bool = True
@@ -62,7 +62,6 @@ class MlxState:
     delta_mode: str = "recurrent"
     bytes: int = 0
     ahead: Shared | None = None
-    pool_blocks: set[Any] = field(default_factory=set)
     weights: dict[Any, Any] | None = None
     family_ok: bool | None = None
     affine: bool = False  # linears bound as a GGUF's own quant blocks (their kernels): no megakernel, no fused step
@@ -136,9 +135,8 @@ class _MlxMixin(_State):
         """A `Shared` of `nbytes` for a layer's linears, filled on MLX's CPU stream with the next layer's buffer
         started before this layer's weights are read (one touch of fresh memory, overlapped with the read);
         a slice of a pool block when the pool has one. Returns (Shared, offset)."""
-        got = pool.POOL.take(nbytes)
+        got = pool.POOL.take(nbytes, self)
         if got is not None:
-            self.mlx_state.pool_blocks.add(got[0])
             return got
         m = mlxdev.mx()
         sh = self.mlx_state.ahead

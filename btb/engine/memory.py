@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from .. import trace
+from .. import pool, trace
 from ..api import api
 from ..kinds import Log, PassTag
 from ..options import Device
@@ -1133,14 +1133,16 @@ class _MemoryMixin(_State):
 
     def _give_up_one(self, dev: torch.device, short: int, tried: set[str]) -> bool:
         """the cheapest thing btb holds on `dev`, given up toward `short` bytes: on a card the drafter, then layers
-        from the top, then the head (each live cache following its layer); on the host MLX's cached buffers, the
-        expert store's blocks, then a warm layer to the drive. False when nothing is left"""
+        from the top, then the head (each live cache following its layer); on the host the pool's idle blocks,
+        MLX's cached buffers, the expert store's blocks, then a warm layer to the drive. False when nothing is left"""
         log = self.log
         if dev.type == Device.CUDA:
             if self.dev.type != Device.CUDA or self.device.request("lend", lambda: self.vram_shed(None, log)) is None:
                 return False
             if not self.vram_watch:  # a running policy regrows what it sheds; none runs to regrow this
                 self._lent_shed("card")
+            return True
+        if pool.POOL.trim():
             return True
         mlx = getattr(self, "mlx", None)
         if mlx is not None and mlx.held_bytes() > mlx.active_bytes():
