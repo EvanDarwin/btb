@@ -10,7 +10,7 @@ The step and the verify pass run the same code - the host's `btb_delta_step` or 
 DeltaNet, the same gathered window for PLE's convolution - so a node computes as the one-token step of its path.
 A verify pass leaves the cache's states as they were; the accepted path is stepped into them at the commit
 (`ad`), which spares a state kept per node for every layer until then. A prefill (or any pass of several rows
-outside speculation) takes the module's own forward."""
+outside speculation) takes the module's own forward, or on the MLX tier the DeltaNet's MLX prefill."""
 
 from __future__ import annotations
 
@@ -62,6 +62,7 @@ def install(layer: Any, sm: Any) -> None:
     if ple is not None:
         ple._btb_sm = ref
         bind_forward(ple, _ple_forward)
+        bind_forward(ple.conv1d, _ple_conv)
 
 
 def _consts(la: Any, dev: torch.device) -> dict[str, Any]:
@@ -108,22 +109,83 @@ def _delta_forward(
     sm = self._btb_sm()
     B, T, _ = hidden_states.shape
     i = int(self.layer_idx)
-    stepping = (
-        sm is not None and cache_params is not None and B == 1 and cache_params.has_previous_state(i, state_idx=0)
-    )
-    spec = stepping and bool(getattr(sm, "aq", False))
+    stepping = sm is not None and cache_params is not None and cache_params.has_previous_state(i, state_idx=0)
+    spec = stepping and B == 1 and bool(getattr(sm, "aq", False))
+    if T > 1 and B == 1 and not spec and cache_params is not None and _on_mlx(sm, i):
+        return _mlx_feed(sm, self, hidden_states, cache_params)
     if not stepping or (T > 1 and not spec) or not _kernels_for(hidden_states.device):
         return type(self).forward(self, hidden_states, cache_params, attention_mask, **kw)
+    # a fork's rows (B > 1, a token each) each stepped as a single row is, over its own states: a row's state and
+    # output the same whichever rows step beside it
     x = hidden_states
-    mixed = self.in_proj_qkv(x)[0].float().contiguous()
-    z = self.in_proj_z(x)[0].float().contiguous()
-    b = self.in_proj_b(x)[0].float().contiguous()
-    a = self.in_proj_a(x)[0].float().contiguous()
+    mixed_b, z_b, b_b, a_b = (p(x).float() for p in (self.in_proj_qkv, self.in_proj_z, self.in_proj_b, self.in_proj_a))
     cl = cache_params.layers[i]
-    core = _nodes(sm, self, cl, mixed, z, a, b, chain_of(sm.ap, T) if spec else None)
-    if spec:
-        sm.al[i] = _PathStep(sm, self, cl, mixed, z, a, b, _kept(sm, self, i, _consts(self, x.device)))
-    return self.out_proj(core.view(1, T, -1).to(x.dtype))
+    cores = []
+    for r in range(B):
+        mixed, z, b, a = (t[r].contiguous() for t in (mixed_b, z_b, b_b, a_b))
+        cores.append(_nodes(sm, self, cl, mixed, z, a, b, chain_of(sm.ap, T) if spec else None, row=r))
+        if spec:
+            sm.al[i] = _PathStep(sm, self, cl, mixed, z, a, b, _kept(sm, self, i, _consts(self, x.device)))
+    return self.out_proj(torch.stack(cores).view(B, T, -1).to(x.dtype))
+
+
+def _on_mlx(sm: Any, i: int) -> bool:
+    return sm is not None and getattr(sm, "mlx", None) is not None and i in sm.mlx_layers
+
+
+def _mlx_feed(sm: Any, la: Any, x: torch.Tensor, cache: Any) -> torch.Tensor:
+    """A pass of several positions on the MLX tier: the conv and the exact recurrent rule over them all in one
+    dispatch in float32 (the hybrid family's `delta_prefill`) instead of the module's chunked rule in torch, the
+    states left through the cache's own setters as the module leaves them"""
+    from .... import mlx as mlxdev
+
+    m = mlxdev.mx()
+    T = int(x.shape[1])
+    cl = cache.layers[int(la.layer_idx)]
+    c = _consts(la, x.device)
+    mx_c = c.get("mx")
+    if mx_c is None:
+        mx_c = c["mx"] = {k: None if c[k] is None else mlxdev.to_mx(c[k]) for k in _OPERANDS}
+    mixed, z, b, a = (
+        mlxdev.to_mx(p(x)[0].float().contiguous()) for p in (la.in_proj_qkv, la.in_proj_z, la.in_proj_b, la.in_proj_a)
+    )
+    hk, hv, dk, dv = int(la.num_k_heads), int(la.num_v_heads), int(la.head_k_dim), int(la.head_v_dim)
+    K = int(c["conv_w"].shape[1])
+    live = cache.has_previous_state(int(la.layer_idx), state_idx=0)
+    if live:
+        conv, rec = sm._lin(cl)
+        conv_prev, state0 = mlxdev.to_mx(conv[0].float().contiguous()), mlxdev.to_mx(rec[0].float().contiguous())
+    else:
+        conv_prev, state0 = m.zeros((int(c["conv_w"].shape[0]), K - 1), dtype=m.float32), None
+    core, conv_new, rec_new = mlxdev.delta_prefill(
+        mixed,
+        z,
+        a,
+        b,
+        conv_prev,
+        state0,
+        mx_c["conv_w"],
+        mx_c["conv_b"],
+        mx_c["a_log"],
+        mx_c["dt_bias"],
+        mx_c["norm_w"],
+        c["eps"],
+        hk,
+        hv,
+        dk,
+        dv,
+        hk * dk,
+        mode=sm.mlx_state.delta_mode,
+        sigmoid_gate=c["gate"] == 1,
+    )
+    m.eval(core, conv_new, rec_new)
+    if live:  # into the layer's own tensors, as the module's path writes them
+        conv[0].copy_(mlxdev.from_mx(conv_new))
+        rec[0].copy_(mlxdev.from_mx(rec_new))
+    else:  # the cache's setters initialize a fresh layer
+        cl.update_conv_state(mlxdev.from_mx(conv_new)[None].clone(), 0, conv_kernel_size=K)
+        cl.update_recurrent_state(mlxdev.from_mx(rec_new)[None].clone())
+    return la.out_proj(mlxdev.from_mx(core).view(1, T, -1).to(x.dtype))
 
 
 _OPERANDS = ("conv_w", "conv_b", "a_log", "dt_bias", "norm_w")
@@ -173,10 +235,12 @@ def _nodes(
     b: torch.Tensor,
     parents: list[int] | None,
     c: dict[str, Any] | None = None,
+    row: int = 0,
 ) -> torch.Tensor:
     """the DeltaNet's gated-normed output [T, Hv * dv] float32 for T nodes: a chain stepped into the cache's states
     (`parents` None: the one-token step, or a commit), or a tree stepped in scratch from them (a verify pass); over
-    the operands `c` (a commit's, kept at its pass: `_kept`), else the module's now"""
+    the operands `c` (a commit's, kept at its pass: `_kept`), else the module's now. `row`: whose states, in a
+    cache of several (a fork's)"""
     dev = mixed.device
     c = _consts(la, dev) if c is None else c
     conv, rec = _states(sm, cl)
@@ -197,7 +261,7 @@ def _nodes(
             for j in range(T):
                 step(
                     mixed[j].clone(),
-                    conv[0],
+                    conv[row],
                     w,
                     cb,
                     z[j],
@@ -205,7 +269,7 @@ def _nodes(
                     b[j],
                     a_log,
                     dt,
-                    rec[0],
+                    rec[row],
                     hk,
                     hv,
                     dk,
@@ -223,8 +287,8 @@ def _nodes(
         for j, p in enumerate(parents):
             s = slot[j]
             if fresh[j]:
-                conv_s[s].copy_(conv[0] if p < 0 else conv_s[slot[p]])
-                rec_s[s].copy_(rec[0] if p < 0 else rec_s[slot[p]])
+                conv_s[s].copy_(conv[row] if p < 0 else conv_s[slot[p]])
+                rec_s[s].copy_(rec[row] if p < 0 else rec_s[slot[p]])
             step(
                 mixed[j].clone(),
                 conv_s[s],
@@ -248,7 +312,7 @@ def _nodes(
         return out
     kern = Native.card_kernels()
     assert kern is not None  # `_kernels_for` held
-    conv0 = conv[0].float().contiguous()
+    conv0 = conv[row].float().contiguous()
     scratch = par = None
     if parents is not None:
         scratch = sm.scratch.take("qwen4 delta nodes", (T, hv, dk, dv), torch.float32, dev, who)
@@ -261,7 +325,7 @@ def _nodes(
         conv_w=c["conv_w"],
         conv_b=c["conv_b"],
         conv0=conv0,
-        state=rec[0],
+        state=rec[row],
         scratch=scratch,
         parents=par,
         a_log=c["a_log"],
@@ -278,7 +342,7 @@ def _nodes(
     if parents is None:
         # a chain stepped the cache's state in place: its window's last K rows, the starting window's then the chain's
         # inputs
-        conv[0].copy_(torch.cat([conv0, mixed.t()], dim=1)[:, -K:])
+        conv[row].copy_(torch.cat([conv0, mixed.t()], dim=1)[:, -K:])
     return out
 
 
@@ -374,6 +438,19 @@ def _ple_forward(
     else:
         _ple_keep(cl, ids, normed, n - 1, L)
     return out
+
+
+def _ple_conv(self: Any, x: torch.Tensor) -> torch.Tensor:
+    """PLE's dilated depthwise convolution over x [B, 4H, L] (no bias) as the step computes it: tap k's weight times
+    the input dilation * k along, the taps summed in index order. torch's depthwise conv1d took 166 ms of a
+    512-position prefill at a real model's widths, the taps a few"""
+    w = self.weight[:, 0, :].to(x.dtype)  # [4H, K]
+    K, dil = int(w.shape[1]), int(self.dilation[0])
+    n = int(x.shape[-1]) - dil * (K - 1)
+    acc = w[:, :1] * x[..., :n]
+    for k in range(1, K):
+        acc = acc + w[:, k : k + 1] * x[..., dil * k : dil * k + n]
+    return acc
 
 
 def _ple_keep(cl: Any, ids: torch.Tensor, rows: torch.Tensor, n_ids: int, n_rows: int) -> None:

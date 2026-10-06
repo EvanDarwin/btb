@@ -72,6 +72,8 @@ class _HostLinear(torch.nn.Module):
 
     def _matmul(self, x: torch.Tensor) -> torch.Tensor:
         if self.mx is not None:
+            if getattr(self.mx, "sh", None) is not None and Native.gemv is not None and _rows(x) < Native.gemm_rows:
+                return self._slot_gemv(x)
             return Native.mlx.linear(x, self.mx)
         rows, cols = self.weight.shape
         if self.f8 is not None:
@@ -104,6 +106,25 @@ class _HostLinear(torch.nn.Module):
                 Native.gemv(self.weight, x2, y)
             return y.view(*shp[:-1], rows)
         return torch.nn.functional.linear(x, self.weight.to(x.dtype))
+
+    def _slot_gemv(self, x: torch.Tensor) -> torch.Tensor:
+        """A few rows (a step, a verify pass) over an MLX slot's bf16 bytes through the host's gemv, each row as it
+        computes alone: a GPU round trip a linear costs more than a step's matvec (Qwen4's per-op step ran 2.3x
+        slower on MLX than on the CPU). A pass of `gemm_rows` or more stays on MLX"""
+        w = self.mx
+        host = getattr(w, "host", None)
+        if host is None:
+            rows, cols = (int(s) for s in w.shape)
+            host = w.host = w.sh.view_torch(w.off, w.nb, torch.bfloat16, (rows, cols))
+        shp = x.shape
+        x2 = x.reshape(-1, host.shape[1]).float().contiguous()
+        y = torch.empty(x2.shape[0], host.shape[0], dtype=torch.float32)
+        Native.gemv(host, x2, y)
+        return y.view(*shp[:-1], host.shape[0]).to(x.dtype)
+
+
+def _rows(x: torch.Tensor) -> int:
+    return x.numel() // max(1, int(x.shape[-1]))
 
 
 class _Router(torch.nn.Module):
@@ -897,10 +918,12 @@ class _Experts(torch.nn.Module):
         pending = []
         w0 = 0.0
         keep = True
-        # FP8 experts have no MLX matvec: they stay on the host's FP8 kernels
+        # FP8 experts have no MLX matvec: they stay on the host's FP8 kernels. A step's few rows stay on the host's
+        # kernels too, as its linears do (`_HostLinear._slot_gemv`): the GPU round trip costs more than the rows
         use_mlx = (
             self.sm.mlx is not None
             and x.device.type == "cpu"
+            and x.shape[0] >= Native.gemm_rows
             and bool(hit)
             and not self.f8
             and self.layer in self.sm.mlx_layers

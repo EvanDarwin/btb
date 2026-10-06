@@ -483,14 +483,16 @@ def _delta_prep(
     return q, k, v, g, beta, conv_new
 
 
-def _delta_post(core: mx_.array, z: mx_.array, norm_w: mx_.array, eps: float, hv: int, dv: int) -> mx_.array:
+def _delta_post(
+    core: mx_.array, z: mx_.array, norm_w: mx_.array, eps: float, hv: int, dv: int, sigmoid: bool = False
+) -> mx_.array:
     """The gated RMSNorm: core [T, Hv, dv] normed per head (the fused rms_norm: one kernel, the same per row
-    at any row count), scaled, gated by silu(z)."""
+    at any row count), scaled, gated by silu(z) - or sigmoid(z), Qwen4's gate."""
     m = mx()
     T = int(core.shape[0])
     core = m.fast.rms_norm(core.reshape(T * hv, dv), norm_w, float(eps)).reshape(T, hv, dv)
     zz = z.reshape(T, hv, dv)
-    return (core * (zz * m.sigmoid(zz))).reshape(T, hv * dv)
+    return (core * (m.sigmoid(zz) if sigmoid else zz * m.sigmoid(zz))).reshape(T, hv * dv)
 
 
 def delta_prefill(
@@ -499,7 +501,7 @@ def delta_prefill(
     a: mx_.array,
     b: mx_.array,
     conv_prev: mx_.array,
-    state0: mx_.array,
+    state0: mx_.array | None,
     conv_w: mx_.array,
     conv_b: mx_.array | None,
     a_log: mx_.array,
@@ -515,10 +517,12 @@ def delta_prefill(
     chunk: int = 64,
     window: int = 512,
     inplace: bool = False,
+    sigmoid_gate: bool = False,
 ) -> Any:
     """A DeltaNet layer over T positions in MLX (float32) from `conv_prev` [C, K] and `state0`: `recurrent`
     the exact rule as one dispatch, `chunk` the module's chunked rule. Returns (core [T, Hv*dv], conv_new,
-    state_new), lazily; `inplace` (recurrent, T <= window) writes the state into `state0` and returns None."""
+    state_new), lazily; `inplace` (recurrent, T <= window) writes the state into `state0` and returns None.
+    `sigmoid_gate`: the norm gated by sigmoid(z) (Qwen4), not silu(z)"""
     m = mx()
     recurrent = mode == "recurrent" and dk % 32 == 0
     q, k, v, g, beta, conv_new = _delta_prep(
@@ -532,7 +536,7 @@ def delta_prefill(
         W = int(window)
         if T <= W:
             core, state_out = delta_recurrent(q, k, v, g, beta, state, inplace=inplace)
-            return _delta_post(core, z, norm_w, eps, hv, dv), conv_new, state_out
+            return _delta_post(core, z, norm_w, eps, hv, dv, sigmoid_gate), conv_new, state_out
         outs = []
         for s0 in range(0, T, W):
             o, snew = delta_recurrent(
@@ -542,7 +546,7 @@ def delta_prefill(
             state = snew
             outs.append(o)
         core = m.concatenate(outs, axis=0)
-        return _delta_post(core, z, norm_w, eps, hv, dv), conv_new, state
+        return _delta_post(core, z, norm_w, eps, hv, dv, sigmoid_gate), conv_new, state
     # heads first: [H, T, d]
     q = q.transpose(1, 0, 2)
     k = k.transpose(1, 0, 2)
@@ -581,7 +585,7 @@ def delta_prefill(
         out_i, state = body(q[:, i], k[:, i], value[:, i], g[:, i], decay[:, i], k_cumdecay[:, i], state)
         outs.append(out_i)
     core = m.concatenate(outs, axis=1)[:, :T].transpose(1, 0, 2)
-    return _delta_post(core, z, norm_w, eps, hv, dv), conv_new, state
+    return _delta_post(core, z, norm_w, eps, hv, dv, sigmoid_gate), conv_new, state
 
 
 delta_chunk_prefill = delta_prefill

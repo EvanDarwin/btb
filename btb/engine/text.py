@@ -531,12 +531,11 @@ class _TextMixin(_State):
 
         def run() -> torch.Tensor:
             x = h if h.dim() == 3 else h.reshape(1, -1, h.shape[-1])
-            # `hidden` hands its states back on the host; the final norm (a mixer's, where the model has one in its
-            # place) runs where its weights live
-            last = self.norm if self.norm is not None else self.mixer
-            assert last is not None  # a model carries a norm or a mixer, never neither
-            x = x.to(next(last.parameters()).device)
-            out = self._apply_head(self._final_norm(x)).float().cpu()
+            # `hidden` hands its states back on the host in float32; the final norm (a mixer's, where the model has
+            # one in its place) takes them where its weights live and in their dtype, as the pass hands them over
+            hf = self._final_norm(self._norm_input(x))
+            cd = self.compute_dtype if self.compute_dtype is not None else hf.dtype
+            out = self._apply_head(hf.to(cd)).float().cpu()
             return out.reshape(*h.shape[:-1], out.shape[-1])
 
         return self._serial(run)
