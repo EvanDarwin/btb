@@ -14,7 +14,6 @@ from typing import Any
 
 import torch
 
-from .. import mlx as mlxdev
 from ..native_files import kernels_path, native_path
 from ..sysinfo import raise_file_limit
 
@@ -242,10 +241,6 @@ class Native(metaclass=_Binding):
     mlx: Any = None
     # a matmul of this many rows or more goes to the GEMM; fewer rows take the one-row kernel per row
     gemm_rows = 64
-
-    # a prefill of this many rows or more goes to the CPU-stream GEMM; fewer (one-row steps, verify passes of <= 16
-    # rows) stay on the native kernel, so a verify row computes as the one-row step does
-    cpu_gemm_rows = 17
 
     @classmethod
     def bind_install(cls) -> None:
@@ -808,15 +803,6 @@ class Native(metaclass=_Binding):
         except Exception as e:  # OSError: no driver library; RuntimeError: the driver refused the image
             cls.cuda_reason = f"{type(e).__name__}: {e}"
             return None
-
-    @staticmethod
-    def _cpu_gemm(x2: torch.Tensor, w: Any) -> torch.Tensor:
-        """`x2` [b, cols] float32 times a bf16 weight [rows, cols] on MLX's CPU stream, one bf16 pass with f32
-        accumulation: [b, rows] float32 at half the f32 path's time, no f32 copy of the weight."""
-        m = mlxdev.mx()
-        y = m.matmul(mlxdev.to_mx(x2.bfloat16()), w.T, stream=m.cpu).astype(m.float32)
-        m.eval(y)
-        return mlxdev.from_mx(y).clone()
 
 
 class _AccessPolicyWindow(ctypes.Structure):

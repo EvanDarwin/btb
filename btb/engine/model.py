@@ -102,7 +102,6 @@ class StreamedTextModel(
     MTPDrafter = MTPDrafter
     mlx: Any = None
     gemm_rows = Native.gemm_rows
-    cpu_gemm_rows = Native.cpu_gemm_rows
 
     @classmethod
     def load_gemv(cls, dll_path: str | os.PathLike[str], threads: int = 0) -> Callable[..., Any]:
@@ -184,8 +183,7 @@ class StreamedTextModel(
                 else {int(x) for x in cpu_layers} | {int(x) for x in cold_layers}
             )
             devname = DeviceName(DeviceKind.CPU)  # MLX's tensors on the torch side are host tensors
-        # a Mac's CPU tier binds its weights into the pool too (`bind_cpu_gemm`); owned before the weights, so
-        # released after them
+        # whatever tier read its weights into the pool; owned before the weights, so released after them
         self.holdings.own(Stage.MEMORY, "the pool's blocks", self._pool_give)
         # the card by its index, as its tensors name it (a bare 'cuda' is the current card)
         self.dev = where(str(devname))

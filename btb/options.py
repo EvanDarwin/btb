@@ -20,7 +20,6 @@ ENV_KNOBS: dict[str, str] = {
     "BTB_CONFIRM": "1: answer yes to prompts, as --confirm (fetch a model in a non-interactive run)",
     "BTB_TRACE": "1: trace every automatic decision on stderr as -vv does (placement moves, memory given back, paths)",
     "BTB_POOL": "0: no MLX memory pool seeded at load",
-    "BTB_CPU_GEMM": "0: a Mac's CPU tier keeps float32 prefill matmuls (else bf16 on MLX's CPU stream)",
     "BTB_HEAD_GEMV": "0: the head multiplies through a float32 copy instead of the native bf16 gemv",
     "BTB_FUSED_NORM": "0: the module's RMSNorm on CUDA instead of the fused one",
     "BTB_FUSED_MLP": "0: the module's SwiGLU on CUDA instead of the in-place one",

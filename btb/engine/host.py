@@ -42,9 +42,7 @@ def bf16_in_place(buf: torch.Tensor, dt: torch.dtype) -> None:
 
 
 class _HostLinear(torch.nn.Module):
-    _cpu_shared: Any
     bias: torch.Tensor | None
-    cpu_gemm: Any
     f8: F8Weight | None
     key: str | None
     mx: Any
@@ -62,9 +60,6 @@ class _HostLinear(torch.nn.Module):
         self.mx = None
         # an FP8 checkpoint's matrix as stored (families/__init__.py binds it); `weight` is then its shape and no bytes
         self.f8 = None
-        # on a Mac's CPU tier: the same bytes as an MLX bf16 array, for the prefill's GEMM on MLX's CPU
-        # stream (`bind_cpu_gemm`); the one-row step keeps the native kernel
-        self.cpu_gemm = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self._matmul(x)
@@ -87,8 +82,6 @@ class _HostLinear(torch.nn.Module):
         if x.dtype == torch.float32 and (Native.gemv is not None):
             shp = x.shape
             x2 = x.reshape(-1, cols).contiguous()
-            if self.cpu_gemm is not None and x2.shape[0] >= Native.cpu_gemm_rows:
-                return Native._cpu_gemm(x2, self.cpu_gemm).view(*shp[:-1], rows)
             packed_only = self.packed is not None and Native.gemv_p12 is None  # a library without the 12-bit gemv
             if x2.shape[0] >= Native.gemm_rows or packed_only:
                 if self.packed is not None:

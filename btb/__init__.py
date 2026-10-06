@@ -204,7 +204,7 @@ def load(
     import torch
 
     from .engine import StreamedTextModel
-    from .engine.device import mlx_available, resolve_device
+    from .engine.device import resolve_device
     from .engine.native import Native, quiet_omp
     from .engine.state import DRAFT_VOCAB
     from .native_files import native_path
@@ -405,21 +405,6 @@ def load(
                 sm.bind_host_packed()
             if log:
                 log(f"[store] 12-bit model: the layers from {path}, the rest from {sm.pack['source']}")
-        if (
-            dev.kind is Device.CPU
-            and sys.platform == "darwin"
-            and sm.host
-            and c.get("fp32") != 1
-            and os.environ.get("BTB_CPU_GEMM", "1") != "0"
-            and mlx_available()
-        ):
-            # a Mac's CPU tier: the prefill's matmuls on MLX's CPU stream in bf16 (half the f32 path's time); one-row
-            # steps and verify passes keep the native kernels. --fp32 1 or BTB_CPU_GEMM=0 keeps float32
-            n = sm.bind_cpu_gemm()
-            if log and n:
-                log(
-                    f"[stream] host linears in shared memory ({n / 2**30:.2f} GB): the prefill's GEMM on the CPU stream"
-                )
         # closed before the interpreter tears down, so reader threads and GPU work end while their buffers exist
         ref = weakref.ref(sm)
 
