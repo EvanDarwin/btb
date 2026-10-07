@@ -370,8 +370,11 @@ class _TextMixin(_State):
             with self._decode_lock:  # two first callers would make two "one" workers
                 w = getattr(self, "_worker", None)
                 if w is None:
-                    w = self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="btb-mlx")
+                    # its thread named before the worker is published: a caller that finds the worker outside the
+                    # lock reads the thread next
+                    w = ThreadPoolExecutor(max_workers=1, thread_name_prefix="btb-mlx")
                     self._worker_thread = w.submit(threading.current_thread).result()
+                    self._worker = w
         if threading.current_thread() is self._worker_thread:
             return fn(*args, **kw)
         # at the asking thread's depths: the worker's calls are the asking call's, and a callback's still refused
