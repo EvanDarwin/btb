@@ -282,7 +282,7 @@ def test_the_residency_fork_is_a_cell_per_hardware() -> None:
     no store the knob selects nothing at all - so those cells are a DNR, not a claim of coverage."""
     bf16 = spec.Storage.SAFE_BF16
     for hw, default, riders in (("cpu", "cpu", "cpu-riders"), ("mlx", "mlx-step", "mlx-riders")):
-        assert spec.SUBPATH[riders].knobs == {"device": hw, "bus_pass": 0}
+        assert spec.SUBPATH[riders].knobs == {"device": hw, "bus_pass": 0, "adapt": 0}
         assert PassTag.EXPERT_BUS_PASS in spec.SUBPATH[default].expects(FamilyKind.GPT_OSS, bf16)
         assert PassTag.EXPERT_LINE in spec.SUBPATH[riders].expects(FamilyKind.GPT_OSS, bf16)
         assert spec.SUBPATH[default].expects(FamilyKind.QWEN3, bf16) == {

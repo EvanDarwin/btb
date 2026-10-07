@@ -415,6 +415,12 @@ class DeviceSubpath:
     # and a storage cell's short prompt, which one chunk takes, is the plain run of its hardware
     long_prompt: bool = False
 
+    def __post_init__(self) -> None:
+        # every cell pinned to the placement it loads at (`adapt` off): a cell certifies the path its placement
+        # takes, and another program on the card (a game, a second job) moved it mid-cell - every layer given up to
+        # the host, the card's path never run. How btb yields is test_never_oom's to hold, not a cell's
+        object.__setattr__(self, "knobs", {**self.knobs, "adapt": 0})
+
     def expects(self, kind: FamilyKind, storage: Storage) -> frozenset[PassTag]:
         """every tag a run of this cell must carry: the sub-path's own, the reader its attention takes the cache's
         rows through (`kv_tag`), the residency policy this cell's own knobs select where the family has an expert
