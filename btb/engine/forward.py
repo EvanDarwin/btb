@@ -267,6 +267,7 @@ class _ForwardMixin(_State):
         # the placement tiers this pass runs layers on, and its stored-weight path, recorded whatever branch
         # takes them below (the per-op MLX host path bypasses the fused forwards, so record here too)
         self._tag_tiers(n_layers)
+        self._tag_kv(cache)
         self._tag_quant()
         if (
             attention_mask is None
@@ -1183,6 +1184,7 @@ class _ForwardMixin(_State):
         self.lend_policy()
         self.cache_room(cache, B, T)
         self._tag_tiers(self.L)
+        self._tag_kv(cache)
         self._tag_quant()
         self._attn_ctx = cache
         cd = self.compute_dtype

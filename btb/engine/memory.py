@@ -10,7 +10,7 @@ import math
 import threading
 import time
 import weakref
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any
@@ -1030,36 +1030,56 @@ class _MemoryMixin(_State):
             f"(model.memory() shows the room)"
         )
 
-    def _make_room(self, dev: torch.device, nbytes: int, what: str, own: str | None = None) -> set[str]:
+    def _make_room(
+        self, dev: torch.device, nbytes: int | Callable[[], int], what: str, own: str | None = None
+    ) -> set[str]:
         """room for `nbytes` on `dev` above the margin and what is spoken for (all but the caller's `own`
         reservation), cheapest first; MemoryGrantError when everything btb can give leaves too little. Nothing to
-        make where btb holds nothing (a card it does not run on). Returns the one-off steps taken, for a retry to
-        skip"""
+        make where btb holds nothing (a card it does not run on). `nbytes` a callable: the need priced again after
+        each step given up - a step can take the need off `dev` (a layer shed takes its rows to the host), and a
+        need gone is room made. Returns the one-off steps taken, for a retry to skip"""
         tried: set[str] = set()
         while True:
+            need = int(nbytes() if callable(nbytes) else nbytes)
+            if need <= 0:
+                return tried
             room = self.device.free(dev, unreserved=True, own=own)
-            if room is None or room >= nbytes:
+            if room is None or room >= need:
                 # room there only counting torch's cached blocks: they go back to the driver now, so what is made in
                 # it comes from free memory and not from the allocator failing and emptying its cache to retry
-                if dev.type == Device.CUDA and nbytes > int(
+                if dev.type == Device.CUDA and need > int(
                     self.device.free(dev, unreserved=True, own=own, pooled=True) or 0
                 ):
                     self.vram_trim("room")
                 return tried
-            if not self._give_up_one(dev, nbytes - room, tried):
+            if not self._give_up_one(dev, need - room, tried):
                 self.device.refused()  # what was shed on the way grows back once there is room
-                raise MemoryGrantError(self._short(dev, nbytes, what))
+                raise MemoryGrantError(self._short(dev, need, what))
 
     def cache_room(self, cache: KvCache | None, B: int, T: int) -> None:
         """Room made, before a pass, for the buffers its cache appends will allocate. The scheduler's grant is
         asked for them inside the pass, where nothing may move, so a refusal there could only fail; here btb gives
-        up what it holds, cheapest first, as `empty` does. Priced as the grant prices them. With `adapt` off the
-        placement is pinned: nothing is given up, and the grant refuses what does not fit."""
+        up what it holds, cheapest first, as `empty` does. Priced as the grant prices them, and priced again after
+        each step given up: another program holding the card past btb's margin, every layer shed there takes its
+        rows to the host - the growth is the host's then, and the card has nothing left to make room for (priced once,
+        the card's figure stood after the rows had gone, and a pass of a few rows was refused once the whole model
+        was off the card). With `adapt` off the placement is pinned: nothing is given up, and the grant refuses what
+        does not fit."""
         if cache is None or not getattr(self, "adapt", True):
             return
-        for dev, nbytes in self.cache_growth(cache, B, T).items():
-            if nbytes:
-                self._make_room(dev, nbytes, f"the cache's growth for {B}x{T} rows", own=EPOCH)
+        done: set[Where] = set()
+        while True:
+            # the devices still to make room on: a shed can add the host to them, its rows' growth now there
+            todo = [d for d, n in self.cache_growth(cache, B, T).items() if n and d not in done]
+            if not todo:
+                return
+            dev = todo[0]
+            done.add(dev)
+
+            def need(d: Where = dev) -> int:
+                return self.cache_growth(cache, B, T).get(d, 0)
+
+            self._make_room(dev, need, f"the cache's growth for {B}x{T} rows", own=EPOCH)
 
     def cache_growth(self, cache: KvCache | None, B: int, T: int, peak: bool = False) -> dict[Where, int]:
         """the bytes the cache's appends of `T` rows to `B` sequences will allocate, by the device each layer's

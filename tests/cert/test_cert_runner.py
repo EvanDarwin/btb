@@ -376,7 +376,11 @@ def _shape_cells(surface: spec.Surface) -> list[ParameterSet]:
         if stem is None:
             continue
         for dev in _subpaths(surface):
-            why = _why_not(kind, None, dev, os.path.join(FIXTURES, stem), None)
+            # an axis cell the engine cannot hold as the axis means it never runs: it would bank a receipt for
+            # what it did not do (the manifest's shape_gap, its --check failing on the same cell)
+            gap = manifest.shape_gap(surface, kind, dev)
+            why = f"GAP (manifest --check fails on this): {gap.value}" if gap is not None else None
+            why = why or _why_not(kind, None, dev, os.path.join(FIXTURES, stem), None)
             out.append(_cell(stem, dev, cid=f"{kind.value}-{surface.value}-{dev.key}", why=why))
     return out
 

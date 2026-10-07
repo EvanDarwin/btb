@@ -733,7 +733,9 @@ class _State:
     def cache_growth(self, cache: KvCache | None, B: int, T: int, peak: bool = False) -> dict[Where, int]:
         raise NotImplementedError
 
-    def _make_room(self, dev: torch.device, nbytes: int, what: str, own: str | None = None) -> set[str]:
+    def _make_room(
+        self, dev: torch.device, nbytes: int | Callable[[], int], what: str, own: str | None = None
+    ) -> set[str]:
         raise NotImplementedError
 
     def _give_up_one(self, dev: torch.device, short: int, tried: set[str]) -> bool:
@@ -781,6 +783,12 @@ class _State:
         self._tag(*{_TIER_TAG[place.tier(i)] for i in range(n_layers)})
         if self.fp8_widened:
             self._tag(PassTag.FP8_WIDENED)
+
+    def _tag_kv(self, cache: Any) -> None:
+        """record the reader the pass's attention takes the cache's rows through: today every cache keeps a
+        conversation's rows in buffers of its own, in order from the first (none for a pass with no cache)"""
+        if cache is not None:
+            self._tag(PassTag.KV_CONTIGUOUS)
 
     def _tag_quant(self) -> None:
         """record the stored-weight path on MLX: as-stored quant bytes (`mlx_state.affine`) vs a bf16 slot"""

@@ -129,9 +129,10 @@ def _attn_split(
     split: int = 1024,
     win: int = 0,
     shared: int | None = None,
+    tbl: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """the tree walk `btb_attn_split_d{D}`, or with `shared` its grouped-query form: a block a KV group from a
-    prefix of `shared` keys on, a block a head below"""
+    prefix of `shared` keys on, a block a head below; with `tbl` the walk through that row map (`_tbl_` kernels)"""
     T, Hq, D = q.shape
     Hk, cap = K.shape[0], K.shape[1]
     G = Hq // Hk
@@ -145,8 +146,9 @@ def _attn_split(
     cnt = torch.zeros(T * Hq, dtype=torch.int32, device=dev)
     # the grouped form reads its threshold on the card, as the passes' switch holds it
     sh = torch.tensor([shared if shared is not None else 0], dtype=torch.int32, device=dev)
+    mapped = "_tbl" if tbl is not None else ""
     cu.launch(
-        f"btb_attn_split_d{D}" if shared is None else f"btb_attn_split_gqa{G}_d{D}",
+        f"btb_attn_split{mapped}_d{D}" if shared is None else f"btb_attn_split_gqa{G}{mapped}_d{D}",
         (Hq, T, S),
         (256, 1, 1),
         [
@@ -172,10 +174,94 @@ def _attn_split(
             # argument array past its end - an access violation on Windows
             I(win),
             *([] if shared is None else [P(sh)]),
+            *([] if tbl is None else [P(tbl)]),
         ],
     )
     assert int(cnt.abs().sum()) == 0, "every (head, row) count is reset by its last block"
     return out
+
+
+PAGE = 64  # the prefix cache's page: rows a page of every layer (btb/engine/kvpool.py)
+
+
+def _paged(K: torch.Tensor, V: torch.Tensor, seed: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`K`/`V` [Hk, cap, D]'s rows moved into PAGE-row pages of a position-major buffer twice the size (the pool's
+    layout) in a shuffled order, the rest of it noise: (the row map, the paged K, the paged V)"""
+    g = torch.Generator().manual_seed(seed)
+    Hk, cap, D = K.shape
+    pages = cap // PAGE
+    order = torch.randperm(2 * pages, generator=g)[:pages]
+    tbl = (order[:, None] * PAGE + torch.arange(PAGE)[None]).flatten().to(dev, torch.int32)
+    Kp = _position_major(torch.randn(Hk, 2 * cap, D, device=dev, dtype=bf))
+    Vp = _position_major(torch.randn(Hk, 2 * cap, D, device=dev, dtype=bf))
+    Kp[:, tbl.long()], Vp[:, tbl.long()] = K, V
+    return tbl, Kp, Vp
+
+
+@pytest.mark.parametrize("gqa", [False, True], ids=["one-head", "grouped"])
+@pytest.mark.parametrize("win", [0, 128])
+@pytest.mark.parametrize("n0", [300, 1500, 3000])
+@pytest.mark.parametrize("Hq,Hk,D", [(16, 8, 128), (32, 8, 64), (16, 8, 256)])
+def test_a_row_map_reads_the_rows_where_their_pages_lie_bit_for_bit(
+    cu: _Cuda, Hq: int, Hk: int, D: int, n0: int, win: int, gqa: bool
+) -> None:
+    """the tree walk and its grouped-query form through a cache's row map (`btb_attn_split[_gqa{G}]_tbl_d{D}`): the
+    rows scattered in pages over a position-major pool twice their size, in any order, give the bits the same rows
+    read in place give - one-row steps and trees, across splits, under a window. The map moves addresses only"""
+    torch.manual_seed(13)
+    cap, T = 4096, 5
+    K = torch.randn(Hk, cap, D, device=dev, dtype=bf)
+    V = torch.randn(Hk, cap, D, device=dev, dtype=bf)
+    q = torch.randn(T, Hq, D, device=dev, dtype=bf)
+    scale = 1.0 / math.sqrt(D)
+    tbl, Kp, Vp = _paged(K, V, n0 + win)
+    shared = 0 if gqa else None
+    for par in ([-1, 0, 1, 0, 3], [-1]):
+        q_ = q[: len(par)]
+        want = _attn_split(cu, q_, K, V, n0, par, scale, win=win, shared=shared)
+        assert torch.equal(_attn_split(cu, q_, Kp, Vp, n0, par, scale, win=win, shared=shared, tbl=tbl), want)
+    # an identity map is the plain kernel: no row moved, no bit either
+    ident = torch.arange(cap, dtype=torch.int32, device=dev)
+    want = _attn_split(cu, q, K, V, n0, [-1, 0, 1, 0, 3], scale, win=win, shared=shared)
+    assert torch.equal(_attn_split(cu, q, K, V, n0, [-1, 0, 1, 0, 3], scale, win=win, shared=shared, tbl=ident), want)
+
+
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_a_row_map_writes_each_row_into_its_page(cu: _Cuda, D: int) -> None:
+    """the norm/rope write through a row map (`btb_norm_rope_kv_tbl_d{D}`): each of the pass's rows lands at the
+    slot its map names - the bits the plain write leaves at its logical slot, every other row untouched - and the
+    query rows are the plain write's"""
+    torch.manual_seed(14)
+    Hq, Hk, cap, n0, T, eps = 8, 4, 512, 100, 5, 1e-6
+    wq = torch.rand(D, device=dev, dtype=bf) + 0.5
+    wk = torch.rand(D, device=dev, dtype=bf) + 0.5
+    cos_t, sin_t = _rope_tables(cap, D)
+    qkv = torch.randn(T, (Hq + 2 * Hk) * D, device=dev, dtype=bf)
+    depth = torch.tensor([0, 1, 2, 3, 3], dtype=torch.int32, device=dev)
+    n0t = torch.tensor([n0], dtype=torch.int32, device=dev)
+    zeros = torch.zeros(Hk, cap, D, device=dev, dtype=bf)
+    tbl, Kp, Vp = _paged(zeros, zeros, D)
+    Kp.zero_()
+    Vp.zero_()
+    out: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    for K, V, mapped in ((zeros.clone(), zeros.clone(), None), (Kp, Vp, tbl)):
+        qo = torch.empty(T, Hq, D, device=dev, dtype=bf)
+        cu.launch(
+            f"btb_norm_rope_kv{'_tbl' if mapped is not None else ''}_d{D}",
+            (Hq + 2 * Hk, T, 1),
+            (32, 1, 1),
+            [P(qkv), P(wq), P(wk), Fl(eps), P(cos_t), P(sin_t), P(n0t), P(depth), P(K), P(V), P(qo)]
+            + [I(T), I(Hq), I(Hk), I(K.stride(0)), I(K.stride(1)), I(0)]
+            + ([] if mapped is None else [P(mapped)]),
+        )
+        out.append((K, V, qo))
+    (k0, v0, q0), (k1, v1, q1) = out
+    assert torch.equal(q0, q1)
+    rows = tbl[n0 : n0 + T].long()
+    assert torch.equal(k1[:, rows], k0[:, n0 : n0 + T]) and torch.equal(v1[:, rows], v0[:, n0 : n0 + T])
+    touched = torch.zeros(Kp.shape[1], dtype=torch.bool, device=dev)
+    touched[rows] = True
+    assert bool((k1[:, ~touched] == 0).all()) and bool((v1[:, ~touched] == 0).all()), "no other row is touched"
 
 
 @pytest.mark.parametrize("n0", [300, 1500, 3000])

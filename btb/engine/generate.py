@@ -378,10 +378,15 @@ class _GenerateMixin(_State):
             dr = self.mtp_drafter()
             h_new = last["h"]
             h_prev = (anchored.get("h_last") if anchored else session.pend_h) if (reuse and session) else None
+            # the drafter's rows are this session's only while it follows it: another session's decode since took
+            # it over. Let go before they change, so a call failing part way leaves them no session's
+            ours = session is not None and dr.follows is not None and dr.follows() is session
+            dr.follows = None
             if (
                 reuse
                 and session is not None
                 and session.dr is dr
+                and ours
                 and h_prev is not None
                 and (anchored or reuse > int(session.dr_len))
             ):

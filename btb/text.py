@@ -7,6 +7,8 @@ releases text only once its bytes are whole. Nothing here imports torch.
 
 from __future__ import annotations
 
+import bisect
+import itertools
 import re
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, TypedDict
@@ -50,18 +52,20 @@ def template(
     thinking: bool = False,
     tools: ToolSpecs | None = None,
     continue_final: bool = False,
+    generation: bool = True,
 ) -> str:
     """
     The conversation rendered through the tokenizer's chat template with the generation prompt appended;
     `thinking` reaches the templates that have the switch (Qwen3's) and `tools` the ones that render function
     schemas, both dropped for a template whose signature lacks them. `continue_final` leaves the last message
     (the assistant's, begun) open for the model to go on from, where a new turn would start otherwise.
+    `generation` False renders the messages alone, no generation prompt after them.
     """
     kw: TemplateOptions
     if continue_final and history and history[-1].get("role") == "assistant":
         kw = {"tokenize": False, "add_generation_prompt": False, "continue_final_message": True}
     else:
-        kw = {"tokenize": False, "add_generation_prompt": True}
+        kw = {"tokenize": False, "add_generation_prompt": generation}
     kw["enable_thinking"] = thinking
     if tools:
         kw["tools"] = list(tools)
@@ -93,6 +97,74 @@ def prompt_ids(
     """
     text = template(tok, messages_of(prompt), thinking, tools, continue_final)
     return [int(i) for i in tok(text, add_special_tokens=False)["input_ids"]]
+
+
+def message_bounds(
+    tok: PreTrainedTokenizerBase,
+    prompt: str | Messages,
+    ids: Tokens,
+    thinking: bool = False,
+    tools: ToolSpecs | None = None,
+) -> list[int]:
+    """
+    Where the messages end in `ids`, the tokens `prompt_ids(tok, prompt, thinking, tools)` gave: for each
+    conversation prefix messages[:k], how many of the prompt's tokens its rendering (no generation prompt after it)
+    covers - only as far as the whole prompt's rendering agrees with it, so a template that renders an earlier turn
+    differently once more follow (Qwen3 dropping a reply's think block) ends the bound where the two part. Ascending,
+    each inside the prompt: the points a hybrid's state is kept at, so another conversation through the same
+    messages resumes there. A prefix the template refuses to render alone is no bound.
+    """
+    msgs = messages_of(prompt)
+    full = template(tok, msgs, thinking, tools)
+    ends = []
+    for k in range(1, len(msgs)):
+        try:
+            part = template(tok, msgs[:k], thinking, tools, generation=False)
+        except Exception:  # a template that holds a conversation to a shape its prefix lacks (roles alternating)
+            continue
+        ends.append(_common_chars(part, full))
+    return _token_bounds(tok, full, [int(i) for i in ids], ends)
+
+
+def _common_chars(a: str, b: str) -> int:
+    """the length of the text `a` and `b` start with alike: bisected over slice compares, which run in C, where a
+    character loop over a long conversation's rendering would not"""
+    lo, hi = 0, min(len(a), len(b))
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if a[:mid] == b[:mid]:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def _token_bounds(tok: PreTrainedTokenizerBase, full: str, ids: list[int], ends: list[int]) -> list[int]:
+    """the character positions `ends` of `full` as token counts of `ids` (its tokens): the tokens that end at or
+    before each, a token running past one left out. Read off the tokenizer's offsets where it has them and they
+    are `ids`' own; else each end's text tokenized on its own, as far as its tokens are `ids`'"""
+    stops: list[int] | None = None
+    try:
+        enc = tok(full, add_special_tokens=False, return_offsets_mapping=True)
+        if [int(i) for i in enc["input_ids"]] == ids:
+            # the furthest any token so far reaches: the first token past an end is the first this passes it at,
+            # and it only grows, so each end is one bisection
+            stops = list(itertools.accumulate((int(e) for _s, e in enc["offset_mapping"]), max))
+    except Exception:  # a slow tokenizer has no offsets
+        stops = None
+    n = len(ids)
+    out = set()
+    for c in ends:
+        if stops is not None:
+            b = bisect.bisect_right(stops, c)
+        else:
+            pre = [int(i) for i in tok(full[:c], add_special_tokens=False)["input_ids"]]
+            b = 0
+            while b < min(len(pre), n) and pre[b] == ids[b]:
+                b += 1
+        if 0 < b < n:
+            out.add(b)
+    return sorted(out)
 
 
 def probe_tail(tok: Any) -> int:

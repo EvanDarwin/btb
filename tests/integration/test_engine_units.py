@@ -915,6 +915,48 @@ def test_the_drafter_answers_the_greedy_loop_over_a_head_slice_on_the_card_and_o
                 assert dr.fc is not None and getattr(dr, "fc8", None) is None
 
 
+def test_two_sessions_never_take_each_others_drafter_rows() -> None:
+    """The engine has one drafter. The session that decoded on it last owns its rows and goes on from them
+    (cropped and extended, never reset); a session whose rows another session's decode has taken since starts the
+    drafter afresh instead of cropping the other's rows as its own. A reset by one session leaves the rows another
+    owns alone. Either way the answer is a fresh decode's."""
+    with loaded_model(fixture("tiny_q35"), device="cpu") as sm:
+        assert sm.proposer == "mtp_dyn" and sm.v_max > 0
+        dr = sm.mtp_drafter()
+        resets: list[int] = []
+        real = dr.reset
+
+        def counted() -> None:
+            resets.append(1)
+            real()
+
+        dr.reset = counted  # type: ignore[method-assign]
+        a, b = sm.session(), sm.session()
+        sm.generate(VARIED[0], 6, session=a)
+        assert dr.follows is not None and dr.follows() is a
+        resets.clear()
+        sm.generate([*a.tokens, 7, 11], 6, session=a)
+        assert not resets, "the session that owns the drafter's rows started it afresh"
+        assert dr.follows() is a
+        sm.generate([5, 9, 13, 2, 30, 41, 8, 3], 6, session=b)
+        assert dr.follows() is b
+        resets.clear()
+        nxt = [*a.tokens, 3, 5]
+        out = sm.generate(nxt, 6, session=a).tokens
+        assert resets, "a session cropped another session's drafter rows as its own"
+        assert dr.follows() is a
+        # b's prompt parting from everything it holds lets its rows go: the drafter's are a's, and stay - the one
+        # reset is b's own decode starting the drafter afresh
+        resets.clear()
+        sm.generate([6, 6, 6], 4, session=b)
+        assert dr.follows() is b
+        assert sum(resets) == 1, "b's let-go reset rows it did not own, or its decode did not start afresh"
+        # last, as a decode with no session takes the drafter too (its rows then no session's): the answer is a
+        # fresh decode's
+        assert out == sm.generate(nxt, 6).tokens
+        assert dr.follows is None
+
+
 # --- the two tiers answer alike ------------------------------------------------------------------------------
 
 

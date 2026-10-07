@@ -1200,6 +1200,7 @@ def test_session_reuses_the_shared_prefix_and_learns_the_tail() -> None:
 
     from btb.engine.drafter import MTPDrafter
     from btb.engine.state import _State
+    from btb.kinds import PassTag
     from btb.session import Session, State
 
     class Layer(DynamicLayer):
@@ -1212,7 +1213,9 @@ def test_session_reuses_the_shared_prefix_and_learns_the_tail() -> None:
     def engine_and_cache(n: int) -> tuple[_State, DynamicCache]:
         cache = DynamicCache()
         cache.layers = [Layer(n), Layer(n)]
-        eng = types.SimpleNamespace(layer_types=["full_attention", "full_attention"], L=2)
+        tags: set[PassTag] = set()
+        eng = types.SimpleNamespace(layer_types=["full_attention", "full_attention"], L=2, tags=tags)
+        eng._tag = lambda *t: tags.update(t)  # the pass report a decode's opening records its reuse in
         return cast("_State", eng), cache
 
     def held(cache: DynamicCache, i: int) -> int:
@@ -1230,6 +1233,7 @@ def test_session_reuses_the_shared_prefix_and_learns_the_tail() -> None:
     eng0 = engine_and_cache(1)[0]
     with s._decoding(eng0):
         assert s.fresh and s._begin_decode(eng0, [1, 2, 3]) == (None, 0, None)
+    assert cast("Any", eng0).tags == {PassTag.PREFIX_MISS} and s.last_reuse == 0
     eng, cache = engine_and_cache(6)
     decoded(s, eng, [1, 2, 3, 4], [9, 8, 7], cache)  # the cache holds the prompt and the answer but its last token
     assert s.ids == [1, 2, 3, 4, 9, 8] and s._pending == 7 and s.n_prompt == 4 and s.state is State.PENDING
@@ -1237,6 +1241,7 @@ def test_session_reuses_the_shared_prefix_and_learns_the_tail() -> None:
     with s._decoding(eng):
         c, reuse, anc = s._begin_decode(eng, [1, 2, 3, 4, 9, 8, 7, 5, 6])
         assert c is cache and reuse == 6 and anc is None and held(cache, 0) == 6
+    assert PassTag.PREFIX_HIT in cast("Any", eng).tags and s.last_reuse == 6
     assert s.tokens == [1, 2, 3, 4, 9, 8, 7], "an opening left uncommitted changed the session"
     # a prompt that diverges two tokens before the previous prompt's end: a crop to the shared prefix, tail learned;
     # left uncommitted, the session is the shared prefix with its last token drawn (the rows past it were replaced)

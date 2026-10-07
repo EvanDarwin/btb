@@ -296,6 +296,9 @@ struct RowsLayout {
 #define WALK_ROWS 1
 #define WALK_QSA 2
 
+// `tbl` (null: none) is a cache's row map: the walk's slot j is the cache row tbl[j], wherever its page put it. The
+// walk, its key -> warp map, its splits and its folds are the logical keys' as they are without it - the map moves
+// an address, never a bit (a conversation reads the prefix pages it shares with others in place)
 template <int D, int MODE>
 __device__ __forceinline__ void attn_decode_split(const bf16* __restrict__ q, const bf16* __restrict__ K,
                                                   const bf16* __restrict__ V, bf16* __restrict__ out,
@@ -304,7 +307,8 @@ __device__ __forceinline__ void attn_decode_split(const bf16* __restrict__ q, co
                                                   const int* __restrict__ nsel, int ratio, int ktop, int T, int Hq,
                                                   int Hk, int hs, int rs, float scale, float* __restrict__ part_m,
                                                   float* __restrict__ part_l, float* __restrict__ part_acc,
-                                                  int* __restrict__ cnt, int S, int win) {
+                                                  int* __restrict__ cnt, int S, int win,
+                                                  const int* __restrict__ tbl = nullptr) {
     constexpr int E = D / 32;
     const int h = blockIdx.x, t = blockIdx.y, s = blockIdx.z;
     const int g = h / (Hq / Hk);
@@ -384,6 +388,7 @@ __device__ __forceinline__ void attn_decode_split(const bf16* __restrict__ q, co
                             pos = jj < npk ? selt[jj / ratio] * ratio + jj % ratio : nb * ratio + (jj - npk);
                         slot = pos < n0 ? pos : n0 + anc[pos - n0];
                     }
+                    if (tbl != nullptr) slot = tbl[slot];
                     kv[u].load(Kg + (size_t)slot * rowstride);
                     vv[u].load(Vg + (size_t)slot * rowstride);
                 }
@@ -504,6 +509,14 @@ __device__ __forceinline__ void attn_decode_split(const bf16* __restrict__ q, co
         int* __restrict__ cnt, int S, int win) {                                                             \
         attn_decode_split<D, WALK_ROWS>(q, K, V, out, nullptr, nullptr, rw, nullptr, nullptr, 0, 0, T, Hq,   \
                                         Hk, hs, rs, scale, part_m, part_l, part_acc, cnt, S, win);           \
+    }                                                                                                        \
+    extern "C" __global__ void __launch_bounds__(256) btb_attn_split_tbl_d##D(                               \
+        const bf16* __restrict__ q, const bf16* __restrict__ K, const bf16* __restrict__ V,                  \
+        bf16* __restrict__ out, const int* __restrict__ n0p, const int* __restrict__ par, int T, int Hq,     \
+        int Hk, int hs, int rs, float scale, float* __restrict__ part_m, float* __restrict__ part_l,         \
+        float* __restrict__ part_acc, int* __restrict__ cnt, int S, int win, const int* __restrict__ tbl) {  \
+        attn_decode_split<D, WALK_TREE>(q, K, V, out, n0p, par, nullptr, nullptr, nullptr, 0, 0, T, Hq, Hk,  \
+                                        hs, rs, scale, part_m, part_l, part_acc, cnt, S, win, tbl);          \
     }
 ATTN_SPLIT_K(64)
 ATTN_SPLIT_K(128)
@@ -523,7 +536,8 @@ __device__ __forceinline__ void attn_split_gqa(const bf16* __restrict__ q, const
                                                const bf16* __restrict__ V, bf16* __restrict__ out, int n0,
                                                const int* __restrict__ par, int g, int T, int Hq, int hs, int rs,
                                                float scale, float* __restrict__ part_m, float* __restrict__ part_l,
-                                               float* __restrict__ part_acc, int* __restrict__ cnt, int win) {
+                                               float* __restrict__ part_acc, int* __restrict__ cnt, int win,
+                                               const int* __restrict__ tbl = nullptr) {
     static_assert(G <= 8, "a head's fold is one warp's");
     constexpr int E = D / 32;
     const int t = blockIdx.y, s = blockIdx.z;
@@ -572,7 +586,8 @@ __device__ __forceinline__ void attn_split_gqa(const bf16* __restrict__ q, const
             for (int u = 0; u < B; ++u) {
                 if (u < c4 && j + u >= first) {
                     const int jj = j + u;
-                    const int slot = jj < n0 ? jj : n0 + anc[jj - n0];
+                    int slot = jj < n0 ? jj : n0 + anc[jj - n0];
+                    if (tbl != nullptr) slot = tbl[slot];  // the row map, as the one-head walk reads it
                     kv[u].load(Kg + (size_t)slot * rs);
                     vv[u].load(Vg + (size_t)slot * rs);
                 }
@@ -705,6 +720,23 @@ __device__ __forceinline__ void attn_split_gqa(const bf16* __restrict__ q, const
             attn_decode_split<D, WALK_TREE>(q, K, V, out, n0p, par, nullptr, nullptr, nullptr, 0, 0, T, Hq,  \
                                             Hk, hs, rs, scale, part_m, part_l, part_acc, cnt, S, win);       \
         }                                                                                                    \
+    }                                                                                                        \
+    extern "C" __global__ void __launch_bounds__(256) btb_attn_split_gqa##G##_tbl_d##D(                      \
+        const bf16* __restrict__ q, const bf16* __restrict__ K, const bf16* __restrict__ V,                  \
+        bf16* __restrict__ out, const int* __restrict__ n0p, const int* __restrict__ par, int T, int Hq,     \
+        int Hk, int hs, int rs, float scale, float* __restrict__ part_m, float* __restrict__ part_l,         \
+        float* __restrict__ part_acc, int* __restrict__ cnt, int S, int win, const int* __restrict__ sharedp, \
+        const int* __restrict__ tbl) {                                                                       \
+        const int n0 = *n0p;                                                                                 \
+        if (blockIdx.z * ATTN_SPLIT >= n0 + T) return;                                                       \
+        if (n0 >= *sharedp) {                                                                                \
+            if (blockIdx.x % G) return;                                                                      \
+            attn_split_gqa<D, G>(q, K, V, out, n0, par, blockIdx.x / G, T, Hq, hs, rs, scale, part_m,        \
+                                 part_l, part_acc, cnt, win, tbl);                                           \
+        } else {                                                                                             \
+            attn_decode_split<D, WALK_TREE>(q, K, V, out, n0p, par, nullptr, nullptr, nullptr, 0, 0, T, Hq,  \
+                                            Hk, hs, rs, scale, part_m, part_l, part_acc, cnt, S, win, tbl);  \
+        }                                                                                                    \
     }
 ATTN_SPLIT_GQA_K(2, 64)
 ATTN_SPLIT_GQA_K(2, 128)
@@ -732,7 +764,8 @@ __device__ __forceinline__ void norm_rope_kv(const bf16* __restrict__ qkv, const
                                              const bf16* __restrict__ sin_t, const int* __restrict__ n0p,
                                              const int* __restrict__ depth, const int* __restrict__ rw,
                                              bf16* __restrict__ K, bf16* __restrict__ V, bf16* __restrict__ qo,
-                                             int T, int Hq, int Hk, int hs, int rs, int centered) {
+                                             int T, int Hq, int Hk, int hs, int rs, int centered,
+                                             const int* __restrict__ tbl = nullptr) {
     constexpr int E = D / 32;
     const int head = blockIdx.x, t = blockIdx.y;
     const int lane = threadIdx.x & 31;
@@ -747,6 +780,7 @@ __device__ __forceinline__ void norm_rope_kv(const bf16* __restrict__ qkv, const
         slot = n0 + t;
         pos = n0 + depth[t];
     }
+    if (tbl != nullptr) slot = tbl[slot];  // the cache's row map: the row lands in its page, where the walk reads it
     const int width = (Hq + 2 * Hk) * D;
     const bf16* src = qkv + (size_t)t * width + (size_t)head * D + lane * E;
     if (head >= Hq + Hk) {
@@ -808,6 +842,14 @@ __device__ __forceinline__ void norm_rope_kv(const bf16* __restrict__ qkv, const
         int rs, int centered) {                                                                              \
         norm_rope_kv<D, true>(qkv, wq, wk, eps, cos_t, sin_t, nullptr, nullptr, rw, K, V, qo, T, Hq, Hk, hs, \
                               rs, centered);                                                                 \
+    }                                                                                                        \
+    extern "C" __global__ void __launch_bounds__(32) btb_norm_rope_kv_tbl_d##D(                              \
+        const bf16* __restrict__ qkv, const bf16* __restrict__ wq, const bf16* __restrict__ wk, float eps,   \
+        const bf16* __restrict__ cos_t, const bf16* __restrict__ sin_t, const int* __restrict__ n0p,         \
+        const int* __restrict__ depth, bf16* __restrict__ K, bf16* __restrict__ V, bf16* __restrict__ qo,    \
+        int T, int Hq, int Hk, int hs, int rs, int centered, const int* __restrict__ tbl) {                  \
+        norm_rope_kv<D, false>(qkv, wq, wk, eps, cos_t, sin_t, n0p, depth, nullptr, K, V, qo, T, Hq, Hk, hs, \
+                               rs, centered, tbl);                                                           \
     }
 NORMROPE(64)
 NORMROPE(128)

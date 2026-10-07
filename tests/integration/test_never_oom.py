@@ -306,6 +306,30 @@ def test_a_prefills_rows_are_made_once_in_the_arena_and_a_refused_arena_decodes_
         assert presized, "the arena refused, the prefill's rows were made nowhere of their own"
 
 
+@pytest.mark.parametrize("speculate", [False, True], ids=["plain", "speculative"])
+@pytest.mark.parametrize("fx", ["tiny_qwen3", "tiny_gpt_oss", "tiny_q4"])
+def test_a_card_another_program_holds_past_the_margin_gives_the_layers_up_and_answers(
+    fx: str, speculate: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another program holding the card past btb's margin (a game, a second job filling the card): every layer btb
+    held there is given up to the host, its rows with it, and the answer goes on there. Seen beside the card-kernel
+    suite, whose bench fills the card: the card graph built its arena over no layers - every one shed - and read
+    its front past an empty list; and the cache's growth, priced once on the card, asked the card for four rows
+    after the whole model had left it and refused them, 0.0 MiB free. The margin is the room kept for other
+    programs, so the ledger reading none above it is the card as such a program leaves it"""
+    dev = need_cuda()
+    with loaded_model(fixture(fx), device=dev) as sm:
+        assert len(sm.generate(list(PROMPT), 6, eos=(), speculate=speculate).tokens) == 6  # the card as it is
+        total = int(torch.cuda.get_device_properties(sm.dev).total_memory)
+        monkeypatch.setattr(sm, "vram_margin", 2 * total)
+        assert sm.device.free(sm.dev) == 0
+        got = sm.generate(list(PROMPT), 6, eos=(), speculate=speculate).tokens
+        assert len(got) == 6, "the answer stopped short on a card another program holds"
+        assert not sm.resident, f"layers {sorted(sm.resident)} kept on a card with no room for them"
+        # and again from the host: a second answer on the placement the first one left
+        assert len(sm.generate(list(PROMPT), 6, eos=(), speculate=speculate).tokens) == 6
+
+
 def test_a_conv_state_left_in_float32_by_the_host_takes_the_cards_dtype() -> None:
     """a hybrid's linear-attention conv state is kept in the dtype of the pass that made it: a layer's chunk run on
     the host leaves it float32, and the layer's next run on the card joined its bf16 rows onto it promoted - the

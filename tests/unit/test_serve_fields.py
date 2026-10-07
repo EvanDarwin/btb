@@ -101,6 +101,39 @@ def test_n_answers_stream_by_index(served: tuple[Server, str]) -> None:
     assert [text[0], text[1]] == [c["message"]["content"] for c in whole]
 
 
+def _usage(served: tuple[Server, str], stream: bool, messages: list[Json]) -> tuple[Json, str]:
+    """a request's usage (streamed: OpenAI's include_usage chunk) and its answer"""
+    if not stream:
+        body = chat(served, messages=messages, max_tokens=6)
+        return body["usage"], body["choices"][0]["message"]["content"]
+    chunks = events(served, messages=messages, max_tokens=6, stream_options={"include_usage": True})
+    text = "".join(ch["delta"].get("content", "") for c in chunks for ch in c["choices"])
+    return chunks[-1]["usage"], text
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_usage_counts_the_prompt_tokens_the_cache_held(
+    served: tuple[Server, str], stream: bool, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """OpenAI's usage carries `prompt_tokens_details.cached_tokens`, the prompt's tokens the session's cache held,
+    and the console line says it: a conversation's next turn finds its previous prompt there (all but the template's
+    generation tail), the same request again every token but its last (its logits are the decode's first step)"""
+    server, name = served
+    eng = server.registry.loaded_get(name)
+    assert eng is not None
+    first = [{"role": "user", "content": f"count the {'streamed ' if stream else ''}sheep slowly"}]
+    u1, answer = _usage(served, stream, first)
+    nxt = [*first, {"role": "assistant", "content": answer}, {"role": "user", "content": "and the goats"}]
+    u2, _ = _usage(served, stream, nxt)
+    u3, _ = _usage(served, stream, nxt)
+    for u in (u1, u2, u3):
+        assert 0 <= u["prompt_tokens_details"]["cached_tokens"] <= u["prompt_tokens"], u
+    assert u2["prompt_tokens_details"]["cached_tokens"] >= u1["prompt_tokens"] - eng.session.tail, (u1, u2)
+    assert u3["prompt_tokens_details"]["cached_tokens"] == u3["prompt_tokens"] - 1, u3
+    said = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith(f"[serve] {name}: ")]
+    assert said[-1].split(" | ")[1] == f"prompt {u3['prompt_tokens']}, {u3['prompt_tokens'] - 1} cached", said
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_a_stop_string_ends_the_answer_before_it(served: tuple[Server, str], stream: bool) -> None:
     full = chat(served, max_tokens=24)["choices"][0]["message"]["content"]

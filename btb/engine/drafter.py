@@ -6,6 +6,7 @@ from __future__ import annotations
 import heapq
 import math
 import time
+import weakref
 from collections.abc import Sequence
 from typing import Any
 
@@ -84,6 +85,10 @@ class MTPDrafter:
     step_s: float
     steps: int
     train_mode: bool
+    # the session whose rows the cache holds: set by that session's commit, let go by the next decode that takes the
+    # drafter. A session reuses the drafter's rows only while it is theirs - the engine has one drafter, and two
+    # sessions taking turns on it would each crop the other's rows as their own
+    follows: weakref.ref[Any] | None = None
 
     def __init__(
         self, sm: Any, train: bool = False, weights: str | None = None, dev: str | torch.device | None = None

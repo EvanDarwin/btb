@@ -952,8 +952,14 @@ class _CudaMixin(_State):
         refused = self.__dict__.setdefault("_arena_refused", weakref.WeakSet())
         if cache in refused:
             return False
+        st = self._card_state()
+        if not st["segments"]:
+            # no layer the card graph runs is on the card (another program took it and every one was shed to the
+            # host): no run's rows for an arena to hold, and the passes take the host's layers. An arena over no
+            # layers has no regions, and its front was read past an empty list
+            return False
         try:
-            self._card_bind(cache, self._card_state(), T)
+            self._card_bind(cache, st, T)
             return True
         except MemoryGrantError as e:
             refused.add(cache)

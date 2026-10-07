@@ -98,6 +98,18 @@ def crop(cache: KvCache, engine: _State, n: int) -> None:
             cl.indexer_keys = cl.indexer_keys[:, :n]
 
 
+def _let_go(dr: MTPDrafter | None, s: Session) -> None:
+    """the drafter's rows let go with session `s`'s (their memory back before a new prefill): reset, unless they
+    are another session's now - the engine has one drafter, and the session that took it last owns its rows"""
+    if dr is None or not hasattr(dr, "reset"):
+        return
+    ref = getattr(dr, "follows", None)
+    owner = ref() if ref is not None else None
+    if owner is None or owner is s:
+        dr.follows = None
+        dr.reset()
+
+
 def _cat(hs: list[torch.Tensor]) -> torch.Tensor:
     """a layer's states over a pass that reached it in pieces, joined along the positions"""
     import torch
@@ -158,6 +170,8 @@ class _Txn:
         dr, dr_len, pend_h = drafter
         s.dr, s.dr_len = dr, int(dr_len)
         s.pend_h = pend_h.detach().clone() if pend_h is not None else None
+        if dr is not None:
+            dr.follows = weakref.ref(s)  # the drafter's rows are this session's until another decode takes it
         self.done = True
 
     def rollback(self) -> None:
@@ -166,8 +180,7 @@ class _Txn:
         s, eng, p = self.s, self.eng, self.point
         dr = s.dr
         s.dr, s.dr_len, s.pend_h = None, 0, None
-        if dr is not None and hasattr(dr, "reset"):
-            dr.reset()
+        _let_go(dr, s)
         self.done = True
         if p.n == 0 and p.pending is None and p.logits is None:
             s.cache, s.anchor, s.ids, s.n_prompt, s._pending, s.logits = None, [], [], 0, None, None
@@ -219,6 +232,8 @@ class Session:
         self._active: _Txn | None = None  # the transaction under way, one at a time
         # the next token's logits a decode reusing every row takes in place of a prefill (`_begin_decode`'s whole)
         self._held: torch.Tensor | None = None
+        # the rows the last prompt opened on this session kept (a decode's or a `sync`'s): what it did not prefill
+        self.last_reuse = 0
 
     @property
     def state(self) -> State:
@@ -465,6 +480,7 @@ class Session:
         def run() -> torch.Tensor:
             with self._txn(eng, states=False) as t:
                 _cache, reuse, _anchored = self._reuse(t, ids, whole=False)
+                self.last_reuse = reuse
                 return self._append(t, ids[reuse:], last_only=True)[0][-1]
 
         return eng._serial(run)
@@ -572,8 +588,7 @@ class Session:
         self.cache, self.anchor, self.ids, self.n_prompt = None, [], [], 0
         self._pending, self.logits = None, None
         self.dr, self.dr_len, self.pend_h = None, 0, None
-        if dr is not None and hasattr(dr, "reset"):
-            dr.reset()
+        _let_go(dr, self)
         t.keep(_Point(0, first, None, None, 0))
         return None, 0, None
 
@@ -602,7 +617,12 @@ class Session:
         if self._active is not None:
             raise RuntimeError("a decode over a session begins inside `_decoding`, once")
         t = self._active = _Txn(self, engine, states=False)
-        return self._reuse(t, prompt, whole)
+        opened = self._reuse(t, prompt, whole)
+        self.last_reuse = opened[1]
+        engine._tag(PassTag.PREFIX_HIT if opened[1] else PassTag.PREFIX_MISS)
+        if opened[2] is not None:
+            engine._tag(PassTag.SNAPSHOT_RESUME)
+        return opened
 
     def _commit_decode(
         self,

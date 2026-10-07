@@ -87,6 +87,7 @@ class Missing(StrEnum):
     ROCM_BACKEND = "rocm-backend"
     QUANT_FIXTURE = "quant-fixture"
     NO_FIXTURE = "no-fixture"
+    PREFIX_CACHE = "prefix-cache"
 
 
 # kind -> (what is missing, how to close it), both a full sentence. This is the single natural-language source
@@ -208,6 +209,14 @@ MISSING: dict[Missing, tuple[str, str]] = {
     Missing.NO_FIXTURE: (
         "this family is served but has no tiny fixture for this storage at all",
         "add the family's fixture stem to spec.FIXTURE_STEM and generate the twin in tests/make_fixtures.py",
+    ),
+    Missing.PREFIX_CACHE: (
+        "the engine keeps one conversation's cache a session and drops it whole for a prompt that shares nothing "
+        "with it (btb/session.py `_reuse`): a conversation's next turn after another request is prefilled again from "
+        "its first token, and a prefix two conversations share is computed and held once each",
+        "land the paged prefix cache on this tier (btb/engine/kvpool.py and radix.py: every conversation's rows in "
+        "shared, referenced pages, the tier's attention reading them through the row map); `prefix_gap` then stops "
+        "naming the tier and the runner's prefix cells run there",
     ),
 }
 
@@ -387,18 +396,38 @@ def spec_id(kind: FamilyKind, storage: spec.Storage, path: str, key: str, decode
     return cell_id(surface, subject, key, decode.value)
 
 
-def shape_ids() -> frozenset[str]:
-    """the ids of the axes that sit outside the storage/device grid (every Surface no container records under):
-    one per served family with a fixture, per sub-path the axis takes."""
-    out: set[str] = set()
+def _shape_axes() -> list[tuple[spec.Surface, FamilyKind, str, spec.DeviceSubpath]]:
+    """every cell of the axes that sit outside the storage/device grid (every Surface no container records under):
+    (surface, family, fixture stem, sub-path), one per served family with a fixture, per sub-path the axis takes."""
+    out: list[tuple[spec.Surface, FamilyKind, str, spec.DeviceSubpath]] = []
     axes = [s for s in spec.Surface if s not in spec.CONTAINER_SURFACE.values()]
     for kind in core.served_kinds():
         stem = spec.FIXTURE_STEM.get(kind)
         if stem is None or not os.path.isdir(os.path.join(FIXTURES, stem)):
             continue
         for surface in axes:
-            out |= {stem_id(surface, stem, key) for key in spec.SURFACE_SUBPATHS[surface]}
-    return frozenset(out)
+            out += [(surface, kind, stem, spec.SUBPATH[key]) for key in spec.SURFACE_SUBPATHS[surface]]
+    return out
+
+
+def shape_ids() -> frozenset[str]:
+    """the ids of the axes beside the grid a machine could run: every such cell but its gaps (`shape_gap`)."""
+    return frozenset(
+        stem_id(surface, stem, dev.key)
+        for surface, kind, stem, dev in _shape_axes()
+        if shape_gap(surface, kind, dev) is None
+    )
+
+
+def shape_gaps() -> list[tuple[spec.Surface, FamilyKind, str, Missing]]:
+    """the cells of the axes beside the grid that cannot run as the axis means them: (surface, family, sub-path
+    key, what is missing) - a GAP each, failing --check and counted with the grid's in `missing_items`."""
+    out: list[tuple[spec.Surface, FamilyKind, str, Missing]] = []
+    for surface, kind, _stem, dev in _shape_axes():
+        why = shape_gap(surface, kind, dev)
+        if why is not None:
+            out.append((surface, kind, dev.key, why))
+    return out
 
 
 def runnable_ids() -> frozenset[str]:
@@ -483,6 +512,24 @@ def subpath_gap(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath
         return _mlx_attn_gap(kind)
     if dev.key == "cuda-graph":
         return _card_graph_gap(kind)
+    return None
+
+
+def prefix_gap(kind: FamilyKind, dev: spec.DeviceSubpath) -> Missing | None:
+    """why the prefix axis's conversations cannot hold on this family and sub-path, in the order the engine hits
+    it: a sub-path that does not engage at all (its own gap), then a tier the prefix cache is not on yet. Every
+    tier until its phase lands - this is the rule the engine's own `supported` reasons will mirror."""
+    refused = subpath_gap(kind, spec.Storage.SAFE_BF16, dev)
+    if refused is not None:
+        return refused
+    return Missing.PREFIX_CACHE
+
+
+def shape_gap(surface: spec.Surface, kind: FamilyKind, dev: spec.DeviceSubpath) -> Missing | None:
+    """why a cell of an axis beside the grid cannot run as the axis means it, None where it can: the prefix axis
+    alone has gaps of its own; the others take every served family on their representative sub-paths."""
+    if surface is spec.Surface.PREFIX:
+        return prefix_gap(kind, dev)
     return None
 
 
@@ -798,14 +845,16 @@ def support() -> Json:
 
 
 def missing_items() -> list[tuple[Missing, int, list[str]]]:
-    """the structured 'what is missing': each Missing kind the manifest currently has, how many cells it covers,
-    and the families it affects. The natural-language backing for `--missing`, iterable by a future skill."""
-    gaps = [c for c in compute_cells() if c.verdict is Verdict.GAP]
+    """the structured 'what is missing': each Missing kind the manifest currently has, how many cells it covers -
+    the grid's and the axes' beside it (`shape_gaps`) - and the families it affects. The natural-language backing
+    for `--missing`, iterable by a future skill."""
+    gaps = [(c.reason, c.kind) for c in compute_cells() if c.verdict is Verdict.GAP]
+    gaps += [(why.value, fam) for _surface, fam, _key, why in shape_gaps()]
     out: list[tuple[Missing, int, list[str]]] = []
     for kind in Missing:
-        cs = [c for c in gaps if c.reason == kind.value]
+        cs = [fam for reason, fam in gaps if reason == kind.value]
         if cs:
-            fams = sorted({spec.FIXTURE_STEM.get(c.kind) or c.kind.value for c in cs})
+            fams = sorted({spec.FIXTURE_STEM.get(f) or f.value for f in cs})
             out.append((kind, len(cs), fams))
     return out
 

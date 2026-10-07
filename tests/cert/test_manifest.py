@@ -286,7 +286,8 @@ def test_the_residency_fork_is_a_cell_per_hardware() -> None:
         assert PassTag.EXPERT_BUS_PASS in spec.SUBPATH[default].expects(FamilyKind.GPT_OSS, bf16)
         assert PassTag.EXPERT_LINE in spec.SUBPATH[riders].expects(FamilyKind.GPT_OSS, bf16)
         assert spec.SUBPATH[default].expects(FamilyKind.QWEN3, bf16) == {
-            spec.SUBPATH[default].expect(FamilyKind.QWEN3, bf16)
+            spec.SUBPATH[default].expect(FamilyKind.QWEN3, bf16),
+            spec.kv_tag(FamilyKind.QWEN3, spec.SUBPATH[default].hardware),
         }
     assert {d.hardware for d in spec.DEVICE_SUBPATHS if d.needs is Cap.MOE} == set(spec.Hardware) - spec.NO_BACKEND
     dense = manifest.dnr(FamilyKind.QWEN3, bf16, spec.SUBPATH["cpu-riders"], spec.DecodePath.GREEDY)
@@ -404,6 +405,39 @@ def test_fixture_gaps_sees_an_unbound_gguf_twin(tmp_path: Path, monkeypatch: Mon
         monkeypatch.setattr(mod, "FIXTURES", str(tmp_path))
         monkeypatch.setattr(mod, "GGUF_DIR", str(gguf))
     assert manifest.fixture_gaps() == ["gguf/tiny_qwen3-q9_9.gguf"]
+
+
+def test_every_cell_asserts_the_reader_its_cache_rows_take() -> None:
+    """the KV reader is part of every cell's expectations (`spec.kv_tag`): when a tier's attention moves to the
+    paged reader, the line flips and every receipt banked on the old reader stops proving the cell"""
+    bf16 = spec.Storage.SAFE_BF16
+    for dev in spec.DEVICE_SUBPATHS:
+        for kind in core.served_kinds():
+            assert spec.kv_tag(kind, dev.hardware) in dev.expects(kind, bf16), (dev.key, kind)
+    assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.CPU) is PassTag.KV_CONTIGUOUS
+
+
+def test_the_prefix_axis_is_a_gap_until_a_tier_keeps_every_conversation() -> None:
+    """the prefix axis - a conversation through other requests, prompts sharing a prefix - is a gap of its own on
+    every tier the prefix cache is not on: never a runnable id, a GAP in the gate's missing list and in the delta's
+    findings alike, so each tier's phase shows as closed when it lands. A sub-path that cannot engage at all keeps
+    its own reason; a family with recurrent layers must show a resume from a kept snapshot"""
+    from . import delta
+
+    prefix = [g for g in manifest.shape_gaps() if g[0] is spec.Surface.PREFIX]
+    assert {kind for _s, kind, key, why in prefix if key == "cpu" and why is manifest.Missing.PREFIX_CACHE} == {
+        k for k in core.served_kinds() if k in spec.FIXTURE_STEM
+    }
+    for _s, kind, key, why in prefix:
+        own = manifest.subpath_gap(kind, spec.Storage.SAFE_BF16, spec.SUBPATH[key])
+        assert why is (own or manifest.Missing.PREFIX_CACHE), (kind, key, why)
+    assert not any(i.startswith(f"{spec.Surface.PREFIX.value}/") for i in manifest.runnable_ids())
+    assert manifest.Missing.PREFIX_CACHE in {kind for kind, _n, _f in manifest.missing_items()}
+    assert f"[manifest/prefix-cache] prefix/{FamilyKind.QWEN3.value}/cpu" in delta.findings()
+    assert spec.recurrent(FamilyKind.QWEN3_5) and not spec.recurrent(FamilyKind.QWEN3)
+    cpu = spec.SUBPATH["cpu"]
+    assert PassTag.SNAPSHOT_RESUME in spec.SURFACE_TAGS[spec.Surface.PREFIX](FamilyKind.QWEN3_5, cpu)
+    assert PassTag.SNAPSHOT_RESUME not in spec.SURFACE_TAGS[spec.Surface.PREFIX](FamilyKind.QWEN3, cpu)
 
 
 def test_every_open_gap_is_explained() -> None:
