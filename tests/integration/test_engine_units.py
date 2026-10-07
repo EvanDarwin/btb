@@ -1107,6 +1107,9 @@ def test_a_second_caller_waits_for_the_worker_the_first_is_still_making(monkeypa
     finally:
         go.set()
         sm.close()
+
+
+def test_native_isa_is_a_tier_the_cert_matrix_knows() -> None:
     """the tier the library reports (what bench.yml banks a baseline under) is one of the `Isa` variants
     tests/cert/native_ops reads from the crate, so the two never disagree on a name"""
     from btb.engine.native import isa
