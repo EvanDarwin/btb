@@ -535,10 +535,37 @@ def test_the_models_calls_are_deterministic(stem: str, dev: spec.DeviceSubpath) 
     receipt.record(manifest.stem_id(spec.Surface.MODEL, stem, dev.key))
 
 
+def _wide_as_stepped(sm: Any, stem: str, dev: spec.DeviceSubpath) -> None:
+    """A prompt fed as one pass wider than the engine's GEMM threshold leaves the session where feeding it a token at
+    a time does: the next logits agree within the device's `spec.WIDTH_TOL`. A path whose arithmetic changes with a
+    pass's width fails here on the machine that has it - a Mac's CPU tier once rounded wide passes to bf16, which
+    the 4-token PROMPT never reached and Linux CI never bound"""
+    V = int(sm.cfg.vocab_size)
+    # LongRoPE ropes a pass by its last position, short factors up to the original context and long past it: by the
+    # model's own definition a pass across that point is not its steps, so both sessions start past it alike
+    rp = getattr(sm.cfg, "rope_parameters", None) or {}
+    switch = int(rp.get("original_max_position_embeddings") or 0) if rp.get("rope_type") == "longrope" else 0
+    pre = [(5 * j) % (V - 2) + 2 for j in range(switch + 1)]
+    toks = [(7 * j) % (V - 2) + 2 for j in range(int(sm.gemm_rows) + 8)]
+    w = sm.session(pre)
+    w.feed(toks)
+    whole = w.feed([5]).logits[-1].float()
+    s = sm.session(pre)
+    for t in toks:
+        s.feed([t], last_only=True)
+    stepped = s.feed([5]).logits[-1].float()
+    d = float((whole - stepped).abs().max())
+    tol = spec.WIDTH_TOL[dev.hardware] * max(1.0, float(stepped.abs().max()))
+    assert d <= tol, (
+        f"{stem} on {dev.key}: a {len(toks)}-row pass left logits {d:.2e} from its one-row steps' ({tol:.0e})"
+    )
+
+
 @pytest.mark.parametrize("stem,dev", _shape_cells(spec.Surface.SESSION))
 def test_a_sessions_calls_are_deterministic(stem: str, dev: spec.DeviceSubpath) -> None:
     """every call a session declares (spec.SURFACE_TAGS) made on one load: a rewind gives back the mark's logits,
-    a hybrid refuses a crop, and the answers are the same across two loads"""
+    a hybrid refuses a crop, a pass wider than the GEMM threshold computes as its one-row steps (`_wide_as_stepped`),
+    and the answers are the same across two loads"""
     if not _hardware_here(dev.hardware):
         pytest.skip(f"{dev.hardware.value} not available on this machine")
     path, knobs = _stem_load(stem, dev)
@@ -566,6 +593,7 @@ def test_a_sessions_calls_are_deterministic(stem: str, dev: spec.DeviceSubpath) 
         toks = list(s.generate(N, eos=(), speculate=False).tokens)
         after = int(s.next_logits().argmax())  # the decode's last token fed first
         if i == 0:
+            _wide_as_stepped(sm, stem, dev)
             _axis_tags(sm, spec.Surface.SESSION, stem, dev)
         runs.append(
             (

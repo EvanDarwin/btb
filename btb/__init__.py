@@ -199,8 +199,11 @@ def load(
     path = resolve(path)
     # the pool cuts and faults the model's buffers under the imports, so torch is imported only after it has
     # seeded. That is btb's own order; a caller that imported torch first cannot be stopped, only noticed: the
-    # pool detects it and logs that the RAM baseline is off by torch's footprint
-    pool.seed_for(path, log, gguf_packed=bool(int(c.get("gguf_packed", 1))))
+    # pool detects it and logs that the RAM baseline is off by torch's footprint. Only the MLX tier reads into the
+    # pool: a load named for the CPU or a card samples the baseline and cuts nothing it would leave idle
+    pool.seed_for(
+        path, log, gguf_packed=bool(int(c.get("gguf_packed", 1))), cut=asked is None or asked.kind is Device.MLX
+    )
     import torch
 
     from .engine import StreamedTextModel

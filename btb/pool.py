@@ -274,9 +274,9 @@ POOL = Pool()
 MEM_START = None
 
 
-def seed_for(model_dir: str, log: Log | None = None, gguf_packed: bool = True) -> None:
-    """At the top of a load: cut and fault the model's buffers if it fits in free RAM with a margin; a no-op off
-    Apple silicon or with BTB_POOL=0."""
+def seed_for(model_dir: str, log: Log | None = None, gguf_packed: bool = True, cut: bool = True) -> None:
+    """At the top of a load: the RAM baseline sampled, and - `cut`, a load the MLX tier may run - the model's buffers
+    cut and faulted if it fits in free RAM with a margin; no cutting off Apple silicon or with BTB_POOL=0."""
     global MEM_START
     if sys.platform == "darwin":
         if "torch" in sys.modules and log:
@@ -288,7 +288,7 @@ def seed_for(model_dir: str, log: Log | None = None, gguf_packed: bool = True) -
             )
         # free-read: the MLX pool seeded at import, before any model or ledger exists
         MEM_START = darwin_available_bytes() + POOL.free_bytes()
-    if os.environ.get("BTB_POOL", "1") == "0" or not mlx_ok():
+    if not cut or os.environ.get("BTB_POOL", "1") == "0" or not mlx_ok():
         return
     try:
         sizes = sizes_for(model_dir, gguf_packed)
