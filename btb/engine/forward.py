@@ -676,8 +676,8 @@ class _ForwardMixin(_State):
         if self.dev.type == Device.CUDA:
             e0 = torch.cuda.Event(enable_timing=True)
             e0.record()
-        # the module's attention past a prompt's first rows on btb's kernels (`_card_attention`): a paged cache's
-        # rows through the card's row map, and a contiguous one's alike, so the two caches keep one set of bits
+        # the module's attention on btb's kernels (`_card_attention`), a prompt's first rows too: a paged cache's rows
+        # through the card's row map, and a contiguous one's alike, so the two caches keep one set of bits
         attending = CARD_ATTENTION.set(self if self.dev.type == Device.CUDA else None)
         try:
             if (

@@ -39,6 +39,7 @@ import torch.nn.functional as F
 
 import btb
 from btb import mlx as mlxdev
+from btb.engine.cuda import _CudaMixin
 from btb.engine.native import Native
 from btb.kinds import Quant, QuantClass, latt_backend_key, quants_of
 from btb.mxfp4 import MxWeight
@@ -410,7 +411,7 @@ def test_cuda_gemm(benchmark: object, shape: str, T: int, how: str) -> None:
     x = torch.randn(T, C, dtype=torch.bfloat16, device="cuda")
     y = torch.empty(T, R, dtype=torch.bfloat16, device="cuda")
     P, I = k.ptr, ctypes.c_int
-    nw = 2 if (R + 15) // 16 >= 512 else 4  # `_card_mma_warps`: the step's warps for the shape
+    nw = _CudaMixin._card_mma_warps(R, C)  # the step's warps for the shape
 
     def run() -> None:
         if how == "mma":
@@ -453,7 +454,7 @@ def test_cuda_attn_decode(benchmark: object, n: int, T: int, how: str) -> None:
         pytest.skip("the one attention is not in this build")
     Hq, Hk, D = 16, 8, 128
     cap = (n + T + 1023) // 1024 * 1024
-    S = cap // 512  # the groups the launch covers: 8 tiles of 64 keys each
+    S = cap // _CudaMixin._attn_group(D)  # the groups the launch covers
     live = 2 * Hk * (n + T) * D * 2
     layers = min(28, -(-(160 << 20) // live))
     KV = [torch.randn(2, Hk, cap, D, dtype=torch.bfloat16, device="cuda") for _ in range(layers)]
@@ -469,7 +470,7 @@ def test_cuda_attn_decode(benchmark: object, n: int, T: int, how: str) -> None:
     P, I, Fl = k.ptr, ctypes.c_int, ctypes.c_float
     # head g's row r at g * hs + r * rs: the caches here head-major [Hk, cap, D]; a block 8 rows of a group, a warp a
     # tile
-    grid, block = ((T * (Hq // Hk) + 7) // 8, S, Hk), (256, 1, 1)
+    grid, block = ((T * (Hq // Hk) + 7) // 8, S, Hk), (32 * _CudaMixin._attn_warps(D), 1, 1)
     tail = [I(T), I(Hq), I(Hk), I(cap * D), I(D), Fl(D**-0.5), P(pm), P(pl), P(pa), P(cnt), I(0), P(None)]
     args = [[P(q), P(kv[0]), P(kv[1]), P(out), P(n0), P(par), *tail] for kv in KV]
     # sdpa's rows: each over the prefix, its ancestors and itself
@@ -572,7 +573,7 @@ def test_cuda_attn_rows(benchmark: object, rows: int, n: int, how: str) -> None:
     Hq, Hk, D, steps = 16, 8, 128, 16
     G = Hq // Hk
     cap = (n + (steps + 1) * rows + 1023) // 1024 * 1024
-    S = cap // 512  # the groups the launch covers: 8 tiles of 64 keys each
+    S = cap // _CudaMixin._attn_group(D)  # the groups the launch covers
     K = torch.randn(Hk, cap, D, dtype=torch.bfloat16, device="cuda")
     V = torch.randn(Hk, cap, D, dtype=torch.bfloat16, device="cuda")
     q = torch.randn(rows, Hq, D, dtype=torch.bfloat16, device="cuda")
@@ -609,7 +610,7 @@ def test_cuda_attn_rows(benchmark: object, rows: int, n: int, how: str) -> None:
 
     def run() -> None:
         for name, grid, args in launches:
-            k.launch(name, grid, (256, 1, 1), args)
+            k.launch(name, grid, (32 * _CudaMixin._attn_warps(D), 1, 1), args)
         torch.cuda.synchronize()
 
     benchmark.group = f"cuda-attn-rows/n{n}/rows{rows}"  # type: ignore[attr-defined]

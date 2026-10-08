@@ -40,11 +40,8 @@
 // The weights stream with evict-first loads (read once a step); the cache and the activations take the
 // default policy, so a persisting-L2 window over the cache's front keeps a short context's attention in L2.
 
-#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
-
-namespace cg = cooperative_groups;
 
 typedef __nv_bfloat16 bf16;
 
@@ -54,15 +51,9 @@ __device__ __forceinline__ float bf2f(bf16 v) { return __bfloat162float(v); }
 __device__ __forceinline__ bf16 f2bf(float v) { return __float2bfloat16_rn(v); }
 __device__ __forceinline__ float bfround(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
 
-// a lane's E consecutive bf16 of a row as one vector load (E = 2, 4 or 8: 4, 8 or 16 bytes)
+// a lane's E consecutive bf16 of a row as one vector load (E = 4 or 8: 8 or 16 bytes)
 template <int E>
 struct Vec;
-template <>
-struct Vec<2> {
-    unsigned v;
-    __device__ __forceinline__ void load(const bf16* p) { v = *reinterpret_cast<const unsigned*>(p); }
-    __device__ __forceinline__ float at(int e) const { return bf2f(reinterpret_cast<const bf16*>(&v)[e]); }
-};
 template <>
 struct Vec<4> {
     uint2 v;
@@ -419,6 +410,16 @@ extern "C" __global__ void __launch_bounds__(256) btb_sandwich_add(bf16* __restr
         hr[i] = f2bf(bf2f(hr[i]) + normed);
     }
 }
+
+// the tensor-core kernels' staging: a 16-byte chunk copied global -> shared asynchronously (a chunk not `ok` lands as
+// zeros, nothing read), the copies issued since the last commit one group, a wait until at most N groups are in flight
+__device__ __forceinline__ void cp16(void* smem, const void* gmem, bool ok) {
+    const unsigned sa = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(sa), "l"(gmem), "r"(ok ? 16 : 0));
+}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;"); }
+__device__ __forceinline__ void cp_wait1() { asm volatile("cp.async.wait_group 1;" ::: "memory"); }
+__device__ __forceinline__ void cp_wait0() { asm volatile("cp.async.wait_group 0;" ::: "memory"); }
 
 // the tensor-core matvec for wide passes (one kernel for every row count, so a one-row step and a 32-row
 // verify pass share their bits): btb_gemv_mma.cuh
@@ -1153,6 +1154,18 @@ NORMROPE_PART(256)
 #define QSA_WARPS 16
 #define QSA_MAX_FLIGHT 33  // blocks past the committed ones a node completes: (n0 + 32) / r - n0 / r <= 32 / r + 1
 
+// node t's path among the pass's rows (`par`, -1 at the root) into `anc` (shared), root first, and its depth into `d`:
+// the block's thread 0 walks it, the block reading both past its next barrier
+__device__ __forceinline__ void qsa_path(const int* __restrict__ par, int t, int T, int* anc, int& d) {
+    if (threadIdx.x == 0) {
+        int tmp[32];
+        int len = 0;
+        for (int p = t; p >= 0 && p < T && len < 32; p = par[p]) tmp[len++] = p;
+        for (int e = 0; e < len; ++e) anc[e] = tmp[len - 1 - e];
+        d = len - 1;
+    }
+}
+
 // the cache slot of a node's logical position j: the prefix's own row, then the node's ancestor at depth j - n0
 struct TreeSlot {
     const int* anc;
@@ -1275,13 +1288,7 @@ __device__ __forceinline__ void qsa_select(const bf16* __restrict__ qi, const bf
         return;
     }
     const int n0 = *n0p;
-    if (tid == 0) {
-        int tmp[32];
-        int len = 0;
-        for (int p = t; p >= 0 && p < T && len < 32; p = par[p]) tmp[len++] = p;
-        for (int e = 0; e < len; ++e) anc[e] = tmp[len - 1 - e];
-        s_d = len - 1;
-    }
+    qsa_path(par, t, T, anc, s_d);
     __syncthreads();
     const int n = n0 + s_d + 1, nb = n / r, nc = n0 / r;
     int* selt = sel + (size_t)t * ktop;
@@ -1437,13 +1444,7 @@ __device__ __forceinline__ void qsa_attn(const bf16* __restrict__ q, const bf16*
     __shared__ int s_d;
     const int n0 = *n0p;
     if (par[t] < -1) return;  // a padding row: nothing to attend
-    if (threadIdx.x == 0) {
-        int tmp[32];
-        int len = 0;
-        for (int p = t; p >= 0 && p < T && len < 32; p = par[p]) tmp[len++] = p;
-        for (int e = 0; e < len; ++e) anc[e] = tmp[len - 1 - e];
-        s_d = len - 1;
-    }
+    qsa_path(par, t, T, anc, s_d);
     __syncthreads();
     // the list: the picked blocks' keys in block order, then the partial tail - ascending positions
     const int seq = n0 + s_d + 1;
@@ -1600,9 +1601,9 @@ __device__ __forceinline__ void qsa_attn(const bf16* __restrict__ q, const bf16*
         bf16* __restrict__ out, const int* __restrict__ n0p, const int* __restrict__ par,                    \
         const int* __restrict__ sel, const int* __restrict__ nsel, int r, int ktop, int T, int Hq, int Hk,   \
         int hs, int rs, float scale, float* __restrict__ part_m, float* __restrict__ part_l,                 \
-        float* __restrict__ part_acc, int* __restrict__ cnt, int S) {                                        \
+        float* __restrict__ part_acc, int* __restrict__ cnt) {                                               \
         qsa_attn<D>(q, K, V, out, n0p, par, sel, nsel, r, ktop, T, Hq, Hk, hs, rs, scale, part_m, part_l,    \
-                    part_acc, cnt); /* S: the grid's splits, its z extent */                                 \
+                    part_acc, cnt);                                                                          \
     }
 QSA_K(128)
 QSA_K(256)
@@ -1804,7 +1805,6 @@ extern "C" __global__ void __launch_bounds__(256) btb_ple_gate(const bf16* __res
     }
 }
 
-#define PLE_MAX_K 8
 extern "C" __global__ void __launch_bounds__(256) btb_ple_conv(const bf16* __restrict__ gated,
                                                                const bf16* __restrict__ normed,
                                                                const bf16* __restrict__ w, bf16* pre,

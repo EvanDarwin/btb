@@ -21,11 +21,6 @@
 #define GM_BR 64   // weight rows a block
 #define GM_STAGES 3
 
-__device__ __forceinline__ void gm_cp16(void* smem, const void* gmem, bool ok) {
-    const unsigned sa = static_cast<unsigned>(__cvta_generic_to_shared(smem));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(sa), "l"(gmem), "r"(ok ? 16 : 0));
-}
-
 extern "C" __global__ void __launch_bounds__(128)
     btb_gemm_mma_bf16(const bf16* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ y, int R, int C,
                       int T, int nw) {
@@ -44,16 +39,16 @@ extern "C" __global__ void __launch_bounds__(128)
             const int c = it * 128 + threadIdx.x, row = c >> 2, ch = c & 3;
             const int k = (st << 5) + (ch << 3);
             const bool ok = m0 + row < T && k < C;
-            gm_cp16(&sx[b][row * 32 + ch * 8], x + (size_t)(ok ? m0 + row : 0) * C + (ok ? k : 0), ok);
+            cp16(&sx[b][row * 32 + ch * 8], x + (size_t)(ok ? m0 + row : 0) * C + (ok ? k : 0), ok);
         }
 #pragma unroll
         for (int it = 0; it < GM_BR * 4 / 128; ++it) {
             const int c = it * 128 + threadIdx.x, row = c >> 2, ch = c & 3;
             const int k = (st << 5) + (ch << 3);
             const bool ok = r0 + row < R && k < C;
-            gm_cp16(&sw[b][row * 32 + ch * 8], w + (size_t)(ok ? r0 + row : 0) * C + (ok ? k : 0), ok);
+            cp16(&sw[b][row * 32 + ch * 8], w + (size_t)(ok ? r0 + row : 0) * C + (ok ? k : 0), ok);
         }
-        asm volatile("cp.async.commit_group;");
+        cp_commit();
     };
     float tot[4][4][4], acc[4][4][4];
 #pragma unroll
@@ -66,16 +61,16 @@ extern "C" __global__ void __launch_bounds__(128)
     if (nst > 1) {
         issue(1, 1);
     } else {
-        asm volatile("cp.async.commit_group;");
+        cp_commit();
     }
     int slice = 0;
     for (int st = 0; st < nst; ++st) {
-        asm volatile("cp.async.wait_group 1;" ::: "memory");
+        cp_wait1();
         __syncthreads();  // super-tile st landed for every thread, and st - 1's buffer is free
         if (st + 2 < nst) {
             issue(st + 2, (st + 2) % GM_STAGES);
         } else {
-            asm volatile("cp.async.commit_group;");
+            cp_commit();
         }
         const int b = st % GM_STAGES;
         uint4 wv[4];

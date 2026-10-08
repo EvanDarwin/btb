@@ -13,9 +13,9 @@ import torch.nn.functional as F
 from ..fixed_rows import KeyRows
 from .gpt_oss.sinks import attention_sinks
 
-# the engine whose card layer's module attends now (`_run_card_layer`): past a prompt's first rows its attention runs
-# on btb's kernels (`_card_attention`) - a paged layer's rows through the card's row map, a contiguous one's where they
-# lie, one set of bits for the two
+# the engine whose card layer's module attends now (`_run_card_layer`): its attention runs on btb's kernels
+# (`_card_attention`), a prompt's first rows too - a paged layer's rows through the card's row map, a contiguous one's
+# where they lie, one set of bits for the two
 CARD_ATTENTION: contextvars.ContextVar[Any] = contextvars.ContextVar("btb_card_attention", default=None)
 
 

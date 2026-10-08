@@ -2011,7 +2011,6 @@ class _Cuda:
                 P(part_l),
                 P(part_acc),
                 P(cnt),
-                ci(S),
             ],
         )
 

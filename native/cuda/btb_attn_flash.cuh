@@ -44,15 +44,13 @@ struct FaPick {
     static constexpr int WPB = D >= 256 ? 4 : 8;  // the warps' item states in shared memory: 35 KB at the widest head
     // the prefill form: four warps, the rows the mma's M (`attn_flash_prefill_rm`), a row tile of 16 to SPL warps - two
     // at the widest head, where one warp's q, group output and tile accumulators pass its registers. Its fallback in the
-    // decode form's orientation (`attn_flash_prefill`, for a card failing `btb_mma_roles`): NR row tiles of 8 a warp,
-    // the group state in registers (GSR)
+    // decode form's orientation (`attn_flash_prefill`, for a card failing `btb_mma_roles`): NR row tiles of 8 a warp
     static constexpr int PFW = 4;
     // the prefill's blocks an SM, the registers' bound: three at the narrowest head (its shared memory allows six),
     // else what the registers give (two)
     static constexpr int PFB = D <= 64 ? 3 : 1;
     static constexpr int SPL = D >= 256 ? 2 : 1;
     static constexpr int NR = D >= 256 ? 1 : 2;
-    static constexpr bool GSR = true;
 };
 
 template <int D, int BN_, int GT_>
@@ -307,11 +305,11 @@ __device__ __forceinline__ void fa_pass(FaState<F::MD, 1>& st, const unsigned (&
 #pragma unroll
     for (int c = 0; c < F::SL; ++c) sl[c] = slot(j0 + c * 32 + lane);
     // the tile's K rows, and its V rows beside them where both fit a lane's registers (a short tile: one trip to the
-    // memory a tile, not two); a long tile's V is loaded after its scores - a k-tile's keys at a time where the
-    // tile's would pass the registers beside the accumulators (the widest head: 128 of V, 64 of accumulators, 32 of
-    // q - spilled)
+    // memory a tile, not two); a long tile's V after its scores, a k-tile's keys at a time as its P . V takes them -
+    // the whole tile's would pass the registers beside the accumulators (the widest head: 128 of V, 64 of
+    // accumulators, 32 of q - spilled)
     constexpr bool EARLY_V = F::MT * F::ST * 8 + F::MT * 4 * F::RUN <= 160;
-    constexpr bool V_BY_KK = !EARLY_V && F::MT * 4 * F::RUN > 64;
+    constexpr bool V_BY_KK = !EARLY_V;
     uint4 kv[F::MT][F::ST][2];
 #pragma unroll
     for (int mt = 0; mt < F::MT; ++mt) {
@@ -334,11 +332,10 @@ __device__ __forceinline__ void fa_pass(FaState<F::MD, 1>& st, const unsigned (&
             fa_ld_run<F::RUN>(vw[at][k][1], Vg, rk, rs, D / 2 + gid * F::RUN);
         }
     };
-    [[maybe_unused]] auto load_v = [&]() {
+    if constexpr (EARLY_V) {
 #pragma unroll
         for (int kk = 0; kk < F::MT; ++kk) load_vk(kk, kk);
-    };
-    if constexpr (EARLY_V) load_v();
+    }
     float s[F::MT][1][4];
 #pragma unroll
     for (int mt = 0; mt < F::MT; ++mt) {
@@ -346,7 +343,6 @@ __device__ __forceinline__ void fa_pass(FaState<F::MD, 1>& st, const unsigned (&
 #pragma unroll
         for (int t = 0; t < F::ST; ++t) fa_qk(s[mt][0], kv[mt][t][0], kv[mt][t][1], qb[2 * t], qb[2 * t + 1]);
     }
-    if constexpr (!EARLY_V && !V_BY_KK) load_v();
     fa_softmax<F, 1>(st, s, j0, first, last, live, scale2, gid, full);
     {
         // the tile's accumulators from zero here, not before its loads and scores: zeros held through them are
@@ -441,10 +437,13 @@ __device__ __forceinline__ void attn_flash(const bf16* __restrict__ q, const bf1
         first = win > 0 ? max(last + 1 - win, 0) : 0;
         return ex;
     };
-    int tok[2], head[2], first[2], last[2];
+    int tok[2], first[2], last[2];
     bool exists[2];
 #pragma unroll
-    for (int e = 0; e < 2; ++e) exists[e] = row_at(2 * tig + e, tok[e], head[e], first[e], last[e]);
+    for (int e = 0; e < 2; ++e) {
+        int head;  // the row's query head: its output's, which the threads storing it look up again
+        exists[e] = row_at(2 * tig + e, tok[e], head, first[e], last[e]);
+    }
     // the block's reach in this group: the keys any of its rows sees here (every warp the same)
     int b_lo = min(exists[0] ? first[0] : 0x7fffffff, exists[1] ? first[1] : 0x7fffffff);
     int b_hi = max(last[0], last[1]);
@@ -678,55 +677,43 @@ ATTN_FLASH_K(256)
 // Block (z, g) takes PFW * 8 NR / G tokens' rows of key head g (their G query heads each), NR row tiles a warp, and
 // walks every tile from its first row's first key to its last row's own position: each tile's state from nothing,
 // folded into the group's as the walk goes, the group's into the row's as the walk leaves the group - the decode
-// form's arithmetic. The three states each where they are touched: the tile's in registers (the mma's accumulators),
-// the group's output in shared memory (its warp's slice, folded into once a tile), the row's in `run` ([T, Hq, D]
-// float32 on the card, touched at the groups' ends alone); their (max, sum)s in registers. Held in registers, the
-// group's state stood idle through every P . V beside the tile's accumulators, and the compiler kept a third of it in
-// local memory and serialized the row's read-modify-writes against the rest: a kernel stalled on L1 more than on the
-// tensor cores. A tile lands in shared memory by asynchronous copies, the next tile's K while this one's V is used and
-// its V while the next scores run; K's rows swizzled (a row's 16-byte chunk c at c ^ 4 (row & 1), so a quarter-warp's
-// eight fragment loads fall in distinct banks), V's padded for ldmatrix. Output m-tile md's slot r is dim md * 16 + r.
+// form's arithmetic. The three states: the tile's and the group's in registers (the tile's the mma's accumulators, a
+// row tile's at a time, folded into the group's as its P . V ends), the row's in `run` ([T, Hq, D] float32 on the
+// card, touched at the groups' ends alone); their (max, sum)s in registers. A tile lands in shared memory by
+// asynchronous copies, the next tile's K while this one's V is used and its V while the next scores run; K's rows
+// swizzled (a row's 16-byte chunk c at c ^ 4 (row & 1), so a quarter-warp's eight fragment loads fall in distinct
+// banks), V's padded for ldmatrix. Output m-tile md's slot r is dim md * 16 + r.
 // The block's shared memory is dynamic (`FaPfSmem`, past the 48 KB a static array may take): the host sets the
 // kernel's ceiling to it and launches with it.
 // ---------------------------------------------------------------------------------------------------------
-__device__ __forceinline__ void fa_cp16(void* smem, const void* gmem, bool ok) {
-    const unsigned sa = static_cast<unsigned>(__cvta_generic_to_shared(smem));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(sa), "l"(gmem), "r"(ok ? 16 : 0));
-}
-__device__ __forceinline__ void fa_cp_commit() { asm volatile("cp.async.commit_group;"); }
-__device__ __forceinline__ void fa_cp_wait1() { asm volatile("cp.async.wait_group 1;" ::: "memory"); }
-__device__ __forceinline__ void fa_cp_wait0() { asm volatile("cp.async.wait_group 0;" ::: "memory"); }
 
 // a prefill block's key head and first token, grid (ceil(T / tpb), Hk): a key head's blocks dispatched together, so
 // the blocks on the card at once walk one head's keys side by side and read them from the L2 (numbered heads fastest,
 // they spread over every head and read each head's keys from DRAM again and again: 20 times the existing prefill's
 // DRAM traffic at a long prefix, the DRAM saturated), and within a head the chunk's last tokens first - the longest
 // walks (a token's keys are its position) dispatched first, the launch's tail short ones
-__device__ __forceinline__ void fa_pf_block(int Hk, int tpb, int& g, int& t0) {
-    (void)Hk;
+__device__ __forceinline__ void fa_pf_block(int tpb, int& g, int& t0) {
     g = blockIdx.y;
     t0 = (gridDim.x - 1 - blockIdx.x) * tpb;
 }
 
-// the prefill form's shared memory, bytes: K's tile, V's tile, and - the group state's output held there (GSR off) -
-// each warp's (NR row tiles of MD m-tiles, four elements a lane)
-template <class F, int D, int PFW, int NR, bool GSR>
+// the prefill form's shared memory, bytes: K's tile and V's
+template <class F, int D>
 struct FaPfSmem {
     static constexpr int K = F::BN * D * 2;
     static constexpr int V = F::BN * F::SROW * 2;
-    static constexpr int GW = GSR ? 0 : NR * F::MD * 4 * 32;  // a warp's group output, floats
-    static constexpr int BYTES = K + V + PFW * GW * 4;
+    static constexpr int BYTES = K + V;
 };
 
-// GSR: the group state's output in registers, the P . V and its fold a row tile at a time (the row tiles' V fragments
-// read again for each, the tile's accumulators of one row tile live at once) - the block's shared memory only the tile
-// it walks, two blocks to an SM, whose phases drift apart where one block's warps all stood in step at its barriers
-template <class F, int D, int PFW, int NR, bool GSR>
+// the group state's output in registers, the P . V and its fold a row tile at a time (the row tiles' V fragments read
+// again for each, the tile's accumulators of one row tile live at once) - the block's shared memory only the tile it
+// walks, two blocks to an SM, whose phases drift apart where one block's warps all stood in step at its barriers
+template <class F, int D, int PFW, int NR>
 __device__ __forceinline__ void attn_flash_prefill(const bf16* __restrict__ q, const bf16* __restrict__ K,
                                                    const bf16* __restrict__ V, bf16* __restrict__ out, int n0, int T,
                                                    int Hq, int Hk, int hs, int rs, float scale, int win,
                                                    const int* __restrict__ tbl, float* __restrict__ run) {
-    using SM = FaPfSmem<F, D, PFW, NR, GSR>;
+    using SM = FaPfSmem<F, D>;
     constexpr int NTH = PFW * 32;
     constexpr int RW = 8 * NR;  // a warp's rows
     extern __shared__ __align__(16) unsigned char fa_smem[];
@@ -744,7 +731,7 @@ __device__ __forceinline__ void attn_flash_prefill(const bf16* __restrict__ q, c
     const int tpb = PFW * RW / G;  // tokens a block
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
     int g, t0;
-    fa_pf_block(Hk, tpb, g, t0);
+    fa_pf_block(tpb, g, t0);
     // the lane's rows: r = 2 nr + e, slot nr * 8 + 2 tig + e of the warp's - each its row of out (and of run), its keys
     int orow[2 * NR], first[2 * NR], last[2 * NR];
     bool exists[2 * NR];
@@ -781,10 +768,9 @@ __device__ __forceinline__ void attn_flash_prefill(const bf16* __restrict__ q, c
         const int iq = warp * RW + nr * 8 + gid, tq = t0 + iq / G;
         qr[nr] = (iq < tpb * G && tq < T) ? q + ((size_t)tq * Hq + g * G + iq % G) * D + tig * 8 : nullptr;
     }
-    // the tile's state (registers); the group's (m, l) here and its output in registers (GSR) or the warp's slice of
-    // shared memory, element (nr, md, c) of lane `lane` at go_[((nr * MD + md) * 4 + c) * 32 + lane]; the row's (m, l)
-    // here and its output in `run`. The group's output is always finite (zeros before any tile), as a fold scaling it
-    // by 0 needs
+    // the tile's state (registers); the group's (m, l) and its output (`gso`, element (nr, md, c) as the tile state's)
+    // in registers; the row's (m, l) here and its output in `run`. The group's output is always finite (zeros before any
+    // tile), as a fold scaling it by 0 needs
     FaState<F::MD, NR> st;
     float gM[2 * NR], gL[2 * NR], rM[2 * NR], rL[2 * NR];
 #pragma unroll
@@ -792,24 +778,11 @@ __device__ __forceinline__ void attn_flash_prefill(const bf16* __restrict__ q, c
         gM[r] = rM[r] = NEG_INF;
         gL[r] = rL[r] = 0.f;
     }
-    [[maybe_unused]] float gsr[GSR ? NR : 1][GSR ? F::MD : 1][4];
-    [[maybe_unused]] float* const go_ = reinterpret_cast<float*>(fa_smem + SM::K + SM::V) + warp * SM::GW + lane;
-    auto gso = [&](int nr, int md, int c) -> float& {
-        if constexpr (GSR) {
-            return gsr[nr][md][c];
-        } else {
-            return go_[((nr * F::MD + md) * 4 + c) * 32];
-        }
-    };
-    auto clear_group = [&]() {
+    float gso[NR][F::MD][4];
 #pragma unroll
-        for (int nr = 0; nr < NR; ++nr)
+    for (int nr = 0; nr < NR; ++nr)
 #pragma unroll
-            for (int md = 0; md < F::MD; ++md)
-#pragma unroll
-                for (int c = 0; c < 4; ++c) gso(nr, md, c) = 0.f;
-    };
-    clear_group();
+        for (int md = 0; md < F::MD; ++md) gso[nr][md][0] = gso[nr][md][1] = gso[nr][md][2] = gso[nr][md][3] = 0.f;
     // row tile nr's tile state into the group's: a row's factors once, then its elements
     auto fold_tile = [&](int nr) {
 #pragma unroll
@@ -819,8 +792,8 @@ __device__ __forceinline__ void attn_flash_prefill(const bf16* __restrict__ q, c
             fa_fold_ml(gM[r], gL[r], st.m[r], st.l[r], cO, co);
 #pragma unroll
             for (int md = 0; md < F::MD; ++md) {
-                gso(nr, md, e) = fa_fold_e(gso(nr, md, e), st.o[nr][md][e], cO, co);
-                gso(nr, md, 2 + e) = fa_fold_e(gso(nr, md, 2 + e), st.o[nr][md][2 + e], cO, co);
+                gso[nr][md][e] = fa_fold_e(gso[nr][md][e], st.o[nr][md][e], cO, co);
+                gso[nr][md][2 + e] = fa_fold_e(gso[nr][md][2 + e], st.o[nr][md][2 + e], cO, co);
             }
         }
     };
@@ -854,8 +827,8 @@ __device__ __forceinline__ void attn_flash_prefill(const bf16* __restrict__ q, c
                 fa_fold_ml(rM[r], rL[r], gM[r], gL[r], cO, co);
 #pragma unroll
                 for (int md = 0; md < F::MD; ++md) {
-                    v[e][md][0] = fa_fold_e(v[e][md][0], gso(nr, md, e), cO, co);
-                    v[e][md][1] = fa_fold_e(v[e][md][1], gso(nr, md, 2 + e), cO, co);
+                    v[e][md][0] = fa_fold_e(v[e][md][0], gso[nr][md][e], cO, co);
+                    v[e][md][1] = fa_fold_e(v[e][md][1], gso[nr][md][2 + e], cO, co);
                 }
                 gM[r] = NEG_INF;
                 gL[r] = 0.f;
@@ -899,12 +872,12 @@ __device__ __forceinline__ void attn_flash_prefill(const bf16* __restrict__ q, c
             const bool ok = j <= b_hi;
             const int sl = ok ? (tbl != nullptr ? tbl[j] : j) : 0;
             if (is_k) {
-                fa_cp16(sk0 + it * RSTEP * D, Kc + (size_t)sl * rs, ok);
+                cp16(sk0 + it * RSTEP * D, Kc + (size_t)sl * rs, ok);
             } else {
-                fa_cp16(sv0 + it * RSTEP * F::SROW, Vc + (size_t)sl * rs, ok);
+                cp16(sv0 + it * RSTEP * F::SROW, Vc + (size_t)sl * rs, ok);
             }
         }
-        fa_cp_commit();
+        cp_commit();
     };
     const int jf = b_lo / F::BN * F::BN;
     issue(true, jf);
@@ -916,7 +889,7 @@ __device__ __forceinline__ void attn_flash_prefill(const bf16* __restrict__ q, c
             if (warp_rows) fold_row(false);
             grp = j0 / F::GK;
         }
-        fa_cp_wait1();  // this tile's K (its V may still be on the way)
+        cp_wait1();  // this tile's K (its V may still be on the way)
         __syncthreads();
         // the tile's state is made in its own phases: (m, l) by the softmax, o zeroed just before P . V - zeroed here,
         // its 64 accumulators stood live and idle through the scores and the softmax
@@ -957,7 +930,7 @@ __device__ __forceinline__ void attn_flash_prefill(const bf16* __restrict__ q, c
         if (more) {
             issue(true, j0 + F::BN);
         } else {
-            fa_cp_commit();
+            cp_commit();
         }
         // the weights packed into the P . V B fragments as soon as they are made: bf16 pairs, half the scores' registers
         // through the P . V, where the tile's accumulators and the group's state stand beside them
@@ -969,18 +942,17 @@ __device__ __forceinline__ void attn_flash_prefill(const bf16* __restrict__ q, c
 #pragma unroll
                 for (int nr = 0; nr < NR; ++nr) fa_pv_b(pb[kk][nr], s[kk][nr]);
         }
-        fa_cp_wait1();  // this tile's V (the next K may still be on the way)
+        cp_wait1();  // this tile's V (the next K may still be on the way)
         __syncthreads();
         if (warp_rows) {
-            // the weights times V: a key m-tile a step, V^T's A fragments transposed out of shared memory - each for
-            // every row tile, or (GSR) a row tile at a time, folded into the group's as it ends
-            auto pv = [&](int nr0, int nr1) {
+            // the weights times V: a key m-tile a step, V^T's A fragments transposed out of shared memory, a row tile at
+            // a time, folded into the group's as it ends
 #pragma unroll
-                for (int nr = nr0; nr < nr1; ++nr)
+            for (int nr = 0; nr < NR; ++nr) {
 #pragma unroll
-                    for (int md = 0; md < F::MD; ++md)
+                for (int md = 0; md < F::MD; ++md)
 #pragma unroll
-                        for (int c = 0; c < 4; ++c) st.o[nr][md][c] = 0.f;
+                    for (int c = 0; c < 4; ++c) st.o[nr][md][c] = 0.f;
 #pragma unroll
                 for (int kk = 0; kk < F::MT; ++kk) {
                     const bf16* vr = sV + (kk * 16 + (lane >> 4) * 8 + (lane & 7)) * F::SROW + ((lane >> 3) & 1) * 8;
@@ -988,34 +960,18 @@ __device__ __forceinline__ void attn_flash_prefill(const bf16* __restrict__ q, c
                     for (int md = 0; md < F::MD; ++md) {
                         unsigned a0, a1, a2, a3;
                         fa_ldsm_t4(a0, a1, a2, a3, vr + md * 16);
-#pragma unroll
-                        for (int nr = nr0; nr < nr1; ++nr)
-                            btb_mma16816(st.o[nr][md][0], st.o[nr][md][1], st.o[nr][md][2], st.o[nr][md][3], a0, a1,
-                                         a2, a3, pb[kk][nr][0], pb[kk][nr][1]);
+                        btb_mma16816(st.o[nr][md][0], st.o[nr][md][1], st.o[nr][md][2], st.o[nr][md][3], a0, a1, a2,
+                                     a3, pb[kk][nr][0], pb[kk][nr][1]);
                     }
                 }
-            };
-            if constexpr (GSR) {
-#pragma unroll
-                for (int nr = 0; nr < NR; ++nr) {
-                    pv(nr, nr + 1);
-                    fold_tile(nr);
-                }
-            } else {
-                pv(0, NR);
+                fold_tile(nr);
             }
         }
         __syncthreads();  // V's tile consumed
         if (more) {
             issue(false, j0 + F::BN);
         } else {
-            fa_cp_commit();
-        }
-        if constexpr (!GSR) {
-            if (warp_rows) {
-#pragma unroll
-                for (int nr = 0; nr < NR; ++nr) fold_tile(nr);
-            }
+            cp_commit();
         }
     }
     if (warp_rows) fold_row(true);
@@ -1090,7 +1046,7 @@ __device__ __forceinline__ void attn_flash_prefill_rm(const bf16* __restrict__ q
     [[maybe_unused]] float* const xs = reinterpret_cast<float*>(fa_smem + 2 * SM::K) + warp * SM::XW + lane;
     [[maybe_unused]] const float* const xp = reinterpret_cast<float*>(fa_smem + 2 * SM::K) + (warp ^ 1) * SM::XW + lane;
     int g, t0;
-    fa_pf_block(Hk, tpb, g, t0);
+    fa_pf_block(tpb, g, t0);
     // the lane's rows: r = 0 the warp's row gid, r = 1 its row gid + 8 - each a row of out (and of run) and its keys
     int orow[2], first[2], last[2];
     bool exists[2];
@@ -1220,9 +1176,9 @@ __device__ __forceinline__ void attn_flash_prefill_rm(const bf16* __restrict__ q
             const bool ok = j <= b_hi;
             const int sl = ok ? (tbl != nullptr ? tbl[j] : j) : 0;
             bf16* dst = is_v ? sv[it % VB] + (it / VB) * VB * RSTEP * D : sk0 + it * RSTEP * D;
-            fa_cp16(dst, src + (size_t)sl * rs, ok);
+            cp16(dst, src + (size_t)sl * rs, ok);
         }
-        fa_cp_commit();
+        cp_commit();
     };
     // the lane's fragment addresses: K's row 8 nt + gid at super-tile st's chunk 4 st + tig, swizzled - st's low bit
     // flipped where the row is odd, so two bases by that bit and the rest a constant (the warp's first key n-tile in
@@ -1246,7 +1202,7 @@ __device__ __forceinline__ void attn_flash_prefill_rm(const bf16* __restrict__ q
             if (warp_rows) fold_row(false);
             grp = j0 / F::GK;
         }
-        fa_cp_wait0();  // this tile's K
+        cp_wait0();  // this tile's K
         __syncthreads();
         issue(true, Vg + ch0 * 8, j0);
         const bool mine = warp_rows && j0 <= w_hi && j0 + F::BN - 1 >= w_lo;
@@ -1335,7 +1291,7 @@ __device__ __forceinline__ void attn_flash_prefill_rm(const bf16* __restrict__ q
                 softmax(sw);
             }
         }
-        fa_cp_wait0();  // this tile's V
+        cp_wait0();  // this tile's V
         __syncthreads();
         if (j0 + F::BN <= b_hi) issue(false, Kg + ch0 * 8, j0 + F::BN);
         if (mine) {
@@ -1510,8 +1466,8 @@ extern "C" __global__ void __launch_bounds__(256) btb_mma_roles(int* __restrict_
     }                                                                                                        \
     extern "C" __global__ void __launch_bounds__(FaPick<D>::PFW * 32, 1)                                     \
         btb_attn_flash_prefill_kq_d##D(ATTN_FLASH_PF_ARGS) {                                                 \
-        attn_flash_prefill<FaTile<D, FaPick<D>::BN, FaPick<D>::GT>, D, FaPick<D>::PFW, FaPick<D>::NR,        \
-                           FaPick<D>::GSR>(q, K, V, out, n0, T, Hq, Hk, hs, rs, scale, win, tbl, run);       \
+        attn_flash_prefill<FaTile<D, FaPick<D>::BN, FaPick<D>::GT>, D, FaPick<D>::PFW, FaPick<D>::NR>(       \
+            q, K, V, out, n0, T, Hq, Hk, hs, rs, scale, win, tbl, run);                                      \
     }
 ATTN_FLASH_PREFILL_K(64)
 ATTN_FLASH_PREFILL_K(128)

@@ -437,7 +437,7 @@ class _CudaMixin(_State):
         _, Hq, T, D = (int(x) for x in query.shape)
         i = int(getattr(module, "layer_idx", -1))
         if (
-            f"btb_attn_flash_prefill_d{D}" not in k.fn
+            k.flash_prefill_kernel(D) not in k.fn  # the orientation this card takes (`btb_mma_roles`)
             or f"btb_attn_flash_d{D}" not in k.fn
             or not 0 <= i < min(self.L, len(ctx.layers))
             # a layer that lets its rows past the window go holds no position's row where the walk looks for it
@@ -2718,7 +2718,7 @@ class _CudaMixin(_State):
                     )
                 if parents is None:
                     k.launch(
-                        attn,
+                        k.flash_prefill_kernel(D),
                         ((T + tpb - 1) // tpb, Hk, 1),
                         (128, 1, 1),
                         [P(q), P(kb), P(vb), P(att), ci(past), ci(T), ci(Hq), ci(Hk), ci(hs), ci(rs), cf(L["scale"])]
@@ -2727,7 +2727,7 @@ class _CudaMixin(_State):
                     )
                 else:
                     k.launch(
-                        attn,
+                        f"btb_attn_flash_d{D}",
                         ((T * G + 7) // 8, S, Hk),
                         (self._attn_warps(D) * 32, 1, 1),
                         [P(q), P(kb), P(vb), P(att), P(n0p), P(run), ci(T), ci(Hq), ci(Hk), ci(hs), ci(rs)]
