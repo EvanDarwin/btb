@@ -438,9 +438,11 @@ def test_the_cert_reads_the_engines_own_rule_for_the_paged_reader(monkeypatch: M
 
     for name in ("attn_spans", "attn_nodes"):
         monkeypatch.setattr(Native, name, object())  # the native library as a built one has it
-    # the card's kernels as a built fatbin has them: every paged attention kernel's width
+    # the card's kernels as a built fatbin has them: the one attention's forms at every width, and the prefill form a
+    # card whose tensor cores pass `btb_mma_roles` takes (`_Cuda.flash_prefill_kernel`)
     kernels = types.SimpleNamespace(
-        fn={f"btb_attn_{k}_d{d}": object() for k in ("prefill", "split_tbl") for d in spec.CARD_HEAD_DIMS}
+        fn={f"btb_attn_flash_{k}d{d}": object() for k in ("", "prefill_") for d in spec.CARD_HEAD_DIMS},
+        flash_prefill_kernel=lambda d, kq=None: f"btb_attn_flash_prefill_d{d}",
     )
     monkeypatch.setattr(Native, "card_kernels", classmethod(lambda cls: kernels))
     devices = {spec.Hardware.CPU: torch.device("cpu"), spec.Hardware.CUDA: torch.device("cuda")}
@@ -485,13 +487,16 @@ def test_the_prefix_axis_runs_where_the_prefix_cache_serves_and_is_a_gap_elsewhe
     assert cpu[FamilyKind.QWEN3_5] is manifest.Missing.PREFIX_SNAPSHOT
     assert cpu[FamilyKind.GPT_OSS] is manifest.Missing.PREFIX_FAMILY
     # the card serves the dense families on every sub-path its bf16 kernels read - where the sub-path engages at all
-    # (Phi-3's card graph is a gap of its own) - though a hit there cannot equal its cold decode until the card's
-    # prefill makes each row as the step does; its fp32 sub-path is a gap of its own; the families the host does not
-    # serve keep the host's reasons there
+    # (Phi-3's card graph is a gap of its own). A hit equals its cold decode where every layer runs the card graph's
+    # kernels, whose prefill makes each row as the step does (the card graph's families on its own sub-path); a host
+    # layer, the kv_host tier or a family's torch modules cannot yet. Its fp32 sub-path is a gap of its own; the
+    # families the host does not serve keep the host's reasons there
     for key in ("cuda-graph", "cuda-split", "cuda-kvhost"):
         for kind in (FamilyKind.QWEN3, FamilyKind.PHI3, FamilyKind.GEMMA3):
             own = manifest.subpath_gap(kind, spec.Storage.SAFE_BF16, spec.SUBPATH[key])
-            assert by.get((kind, key)) is (own or manifest.Missing.PREFIX_INVARIANCE), (kind, key, by.get((kind, key)))
+            whole = key == "cuda-graph" and spec.card_rows(kind)
+            gap = own or (None if whole else manifest.Missing.PREFIX_INVARIANCE)
+            assert by.get((kind, key)) is gap, (kind, key, by.get((kind, key)))
         assert by[(FamilyKind.QWEN3_5, key)] in (
             manifest.Missing.PREFIX_SNAPSHOT,
             manifest.subpath_gap(FamilyKind.QWEN3_5, spec.Storage.SAFE_BF16, spec.SUBPATH[key]),
@@ -500,6 +505,7 @@ def test_the_prefix_axis_runs_where_the_prefix_cache_serves_and_is_a_gap_elsewhe
             manifest.Missing.PREFIX_FAMILY,
             manifest.subpath_gap(FamilyKind.GPT_OSS, spec.Storage.SAFE_BF16, spec.SUBPATH[key]),
         )
+    assert spec.card_rows(FamilyKind.QWEN3) and spec.card_rows(FamilyKind.GEMMA3)
     assert by[(FamilyKind.QWEN3, "cuda-torch")] is manifest.Missing.PREFIX_WIDE
     for (kind, key), why in by.items():
         dev = spec.SUBPATH[key]
@@ -526,7 +532,8 @@ def test_the_prefix_axis_runs_where_the_prefix_cache_serves_and_is_a_gap_elsewhe
     found = delta.findings()
     assert f"[manifest/prefix-snapshot] prefix/{FamilyKind.QWEN3_5.value}/cpu" in found
     assert not any(f.endswith(f"prefix/{FamilyKind.QWEN3.value}/cpu") for f in found)
-    assert f"[manifest/prefix-invariance] prefix/{FamilyKind.QWEN3.value}/cuda-graph" in found
+    assert f"[manifest/prefix-invariance] prefix/{FamilyKind.QWEN3.value}/cuda-split" in found
+    assert not any(f.endswith(f"prefix/{FamilyKind.QWEN3.value}/cuda-graph") for f in found)
     assert spec.recurrent(FamilyKind.QWEN3_5) and not spec.recurrent(FamilyKind.QWEN3)
     on = spec.SUBPATH["cpu"]
     assert PassTag.SNAPSHOT_RESUME in spec.SURFACE_TAGS[spec.Surface.PREFIX](FamilyKind.QWEN3_5, on)

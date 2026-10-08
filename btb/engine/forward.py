@@ -322,16 +322,24 @@ class _ForwardMixin(_State):
         # the graph carries its own rotary tables and its attention needs no mask, and the rotary and the
         # mask together cost more host time than the graph's replay on a small model
         # and only where the cache's rows sit in the graphs' arena, bound now if not: where the arena cannot take
-        # them, the torch layers read them where they are. Never a chunked prefill's chunk (`_batched_cont`): a
-        # prompt's rows are the torch layers' whatever its chunks - a chunk of 32 rows or fewer (a short last one,
-        # or chunks the free memory made that small) took the graph's kernels where a longer one and the
-        # layer-by-layer sweep took torch's, so the same prompt's cache parted by a bf16 step with how it was cut
+        # them, the torch layers read them where they are. Never a chunked prefill's chunk (`_batched_cont`): its
+        # chunks take the prefill's launches below whatever their width, as the layer-by-layer sweep's do - the
+        # graph's rows are the same bits, but a chunk's width picking the path is a fork no prompt needs
         graph_ok = (
             not getattr(self, "_batched_cont", False)
             and self._card_pass_ok(cache, B, T, past, am, on_layer, stop_after)
             and self._card_arena_holds(cache, T)
         )
-        if graph_ok and self._card_segment_at(0, n_layers) == (0, n_layers) and n_layers == self.L:
+        # a pass the graph does not take - a prompt, or a chunk of one, at any width and position, a hooked step or
+        # verify pass - runs the same kernels as they come where the card graph serves its layers
+        # (`_forward_card_prefill`): each row the row its step makes, so a prompt's rows are its steps' whatever its
+        # chunks, a cache hit decodes as the prompt cold, and a hooked verify pass's tree as its hooked steps
+        prefill_ok = (
+            not graph_ok
+            and self._card_prefill_ok(cache, B, T, past, am, on_layer, stop_after)
+            and self._card_arena_holds(cache, T)
+        )
+        if (graph_ok or prefill_ok) and self._card_segment_at(0, n_layers) == (0, n_layers) and n_layers == self.L:
             self._attn_ctx = cache
             pas = _Pass(
                 cache=cache,
@@ -347,19 +355,23 @@ class _ForwardMixin(_State):
                 own=own,
                 card_pass=False,
                 n_layers=n_layers,
-                on_layer=None,
+                on_layer=on_layer,  # the graph takes no hook (`_card_pass_ok`); the prefill's kernels hand it each layer
             )
             try:
                 with self.device.hold() as place:
                     pas.place = place
                     tail = head and self.head is not None and self.norm is not None
-                    hcard, logits = self._forward_card_segment(0, n_layers, h, pas, tail)
-            except RuntimeError as e:
+                    if graph_ok:
+                        hcard, logits = self._forward_card_segment(0, n_layers, h, pas, tail)
+                    else:
+                        hcard, logits = self._forward_card_prefill(0, n_layers, h, pas, tail, all_rows=not last_only)
+            except (RuntimeError, MemoryGrantError) as e:
                 if not self._is_card_oom(e):
                     raise
-                # the graph's build found no room (another program took the card): this pass on the torch path
+                # the graph's build (or the prefill's buffers) found no room - another program took the card, or the
+                # ledger refused them: this pass on the torch path, over the cache as the pass found it
                 self._card_oom(e)
-                graph_ok = False
+                graph_ok = prefill_ok = False
             else:
                 if logits is not None:
                     return logits[:, -1:] if last_only else logits
@@ -442,11 +454,12 @@ class _ForwardMixin(_State):
         # (the move and the cast), and holds the placement for the pass, so a shed asked for meanwhile waits.
         # A run of resident attention layers replays as one captured graph when the pass has the shape for it
         # (the one-token step, a verify pass); the head rides in the last run's graph when it ends the model
+        logits = None
         with self.device.hold() as place:
             pas.place = place
             i = 0
             while i < n_layers:
-                seg = self._card_segment_at(i, n_layers) if graph_ok else None
+                seg = self._card_segment_at(i, n_layers) if (graph_ok or prefill_ok) else None
                 if seg is None:
                     h = self.device.run_layer(i, h, pas)
                     i += 1
@@ -454,25 +467,32 @@ class _ForwardMixin(_State):
                 a, b = seg
                 tail = b == self.L and head and self.head is not None and self.norm is not None
                 try:
-                    hcard, logits = self._forward_card_segment(a, b, h, pas, tail)
-                except RuntimeError as e:
+                    if graph_ok:
+                        hcard, logits = self._forward_card_segment(a, b, h, pas, tail)
+                    else:
+                        hcard, logits = self._forward_card_prefill(a, b, h, pas, tail, all_rows=not last_only)
+                except (RuntimeError, MemoryGrantError) as e:
                     if not self._is_card_oom(e):
                         raise
-                    # no room for the run's graph (another program took the card): its layers on the torch path
+                    # no room for the run's graph or the prefill's buffers (another program took the card, or the
+                    # ledger refused them): its layers on the torch path
                     self._card_oom(e)
-                    graph_ok = False
+                    graph_ok = prefill_ok = False
                     continue
                 if logits is not None:
-                    self._flush_events()
-                    return logits[:, -1:] if last_only else logits
+                    break
                 assert hcard is not None  # logits None means the segment returned (h, None)
                 h = hcard
                 i = b
         self._flush_events()
         if card_pass and cache is not None:
+            # the host layers' rows back where they live, the pass's too - a pass whose last run carried the head
+            # as much as one that ends here
             for i in self.host:
                 if i < n_layers:
                     self._cache_to(cache, i, "cpu")
+        if logits is not None:
+            return logits[:, -1:] if last_only else logits
         if n_layers < self.L:
             return None
         h = self._norm_input(h)
@@ -1377,6 +1397,7 @@ class _ForwardMixin(_State):
         hs: list[torch.Tensor] = []
         frames: list[dict[str, Any]] = []
         scores_open = False
+        last_on_card = False  # the last layer ran the card graph's kernels (`_forward_card_prefill`)
         try:
             if on_cuda:
                 # the allocator's cached blocks given back first, so what the ledger reads as free is memory the card
@@ -1486,13 +1507,60 @@ class _ForwardMixin(_State):
                         lt = self.layer_types[i]
                         tl, es = time.perf_counter(), float(self.expert_stat.get("s", 0.0))
                         host = place.tier(i) in (LayerTier.HOST, LayerTier.COLD)
-                        tmpl = self._card_layer(i, proto) if (not host or any(card)) else None
+                        # a layer the card graph runs takes each chunk through its kernels, each row its step's
+                        # (`_forward_card_prefill`), where the arena or the card's region holds the conversation's rows
+                        # - reserved before the first layer, so nothing more is bound (`_card_arena_has`): a bind here
+                        # would take a refused arena from the cache holding it, at the length the cache has, short of
+                        # the prompt's rows
+                        graph_layer = (
+                            not host
+                            and self._card_prefill_ok(cache, B, T, past0, None, None, None)
+                            and self._card_runs_layer(i)
+                            and self._card_arena_has(cache, past0 + T)
+                        )
+                        tmpl = self._card_layer(i, proto) if (not graph_layer and (not host or any(card))) else None
                         if ring and i in self.cold:
                             self._cold_wait(i)
                             self._cold_held = i
                         hopped = False  # a host layer's rows on the card, in the sweep's one buffer for them
+                        last_on_card = graph_layer
                         for c in range(len(spans)):
                             h = hs[c]
+                            if graph_layer:
+                                f, (ca, cb) = frames[c], spans[c]
+                                pas = _Pass(
+                                    cache=cache,
+                                    pe=None,
+                                    text_pos=f["text_pos"],
+                                    causal=None,
+                                    linear_mask=None,
+                                    ple_ids=None,
+                                    T=cb - ca,
+                                    past=f["past"],
+                                    am=None,
+                                    batched=True,
+                                    own=own,
+                                    card_pass=True,
+                                    n_layers=self.L,
+                                    on_layer=None,
+                                )
+                                pas.place = place
+                                try:
+                                    hcard, _ = self._forward_card_prefill(i, i + 1, h, pas, False, bind_rows=0)
+                                except (RuntimeError, MemoryGrantError) as e:
+                                    if not self._is_card_oom(e):
+                                        raise
+                                    # no room for the chunk's buffers: the layer's chunks from this one on the torch
+                                    # layer over the rows the ones before wrote, the layers after it as the card graph
+                                    # off has them (`_card_oom`)
+                                    self._card_oom(e)
+                                    graph_layer = last_on_card = False
+                                    tmpl = self._card_layer(i, proto)
+                                else:
+                                    assert hcard is not None  # a run without the tail hands its rows back
+                                    # into the sweep's own buffer: the prefill's comes back for the next chunk's rows
+                                    hs[c] = keep(c, hcard)
+                                    continue
                             if host and not card[c]:
                                 if hopped:
                                     cache.layers[i].land(where(Device.CPU), self.host_kv_dtype())
@@ -1624,6 +1692,12 @@ class _ForwardMixin(_State):
             if depot is not None:
                 depot.close()
         self._flush_events()
+        if last_on_card:
+            # the last layer ran the card graph's kernels: its norm and head too, as the graph's tail makes a step's
+            # logits (the run ends the model where the card graph runs its last layer)
+            logits = self._card_tail(last)
+            if logits is not None:
+                return logits
         h = self._norm_input(last)
         h = self._final_norm(h)
         return self._apply_head(h.to(cd if cd is not None else h.dtype))

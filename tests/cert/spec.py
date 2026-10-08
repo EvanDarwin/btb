@@ -678,6 +678,10 @@ def prefix_tags(kind: FamilyKind, dev: DeviceSubpath) -> frozenset[PassTag]:
         # the card runs layers whose rows it holds: the request between the turns parks the conversation's pages in
         # RAM, and its next turn brings them back
         out.add(PassTag.KV_PARK)
+    if dev.card_graph and card_rows(kind):
+        # every layer on the card graph's kernels: the prompts take them too, each row as its step makes it - the
+        # hit's rows and the cold decode's alike (`_forward_card_prefill`)
+        out.add(PassTag.CARD_PREFILL)
     return frozenset(out)
 
 

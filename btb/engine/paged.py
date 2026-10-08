@@ -458,6 +458,9 @@ class CardRegion:
             tbl = self.tbl
             if bound is not table:
                 held = table.held
+                # none bound until this one is: a load refused after the park leaves the table bound before with its
+                # pages parked, and its next bind must bring them back, not read its map as current
+                self._bound = None
                 self.park([p for p in self.slots if p is not None and p.id not in held])
                 self.load([p for p in held.values() if p.park >= 0])
                 for p in held.values():
@@ -844,7 +847,7 @@ class Table:
 
 
 class PagedKV:
-    """a card layer's rows past its first as its module hands them to its attention (`btb_sdpa`,
+    """a card layer's rows as its module hands them to its attention (`btb_sdpa`,
     families/attention.py): the layer - its arenas read through the card's row map - and the pass's place, its `T`
     rows after `n0`. Not a tensor: a reader that would take it for one fails, rather than read the arena's slots as
     the sequence's positions"""
@@ -858,11 +861,11 @@ class PagedKV:
 class PagedLayer(DynamicLayer):
     """one attention layer of a `PagedCache`: its rows the table's, written into its region of the pool (the host's,
     or the card's where the card runs the layer). `append` is the paged readers' (the region and the table's map
-    back); `update` serves the first rows of a fresh prompt to a module, whose attention then reads them as they came,
-    and past them a card layer's rows as a `PagedKV` the engine's attention reads through the map - a host layer's
-    module past its first rows is a `PagedError`, as `keys`/`values` are: `gather()` is the explicit copy (a fork's
-    prefix, `Session.rows`). `hop` holds a host layer's rows on the card for a prefill's chunks there, `land` puts
-    the chunks' rows back"""
+    back); `update` serves a card layer's rows as a `PagedKV` the engine's attention reads through the map, and a
+    host layer's first rows of a fresh prompt to its module, whose attention then reads them as they came - a host
+    layer's module past its first rows is a `PagedError`, as `keys`/`values` are: `gather()` is the explicit copy (a
+    fork's prefix, `Session.rows`). `hop` holds a host layer's rows on the card for a prefill's chunks there, `land`
+    puts the chunks' rows back"""
 
     paged = True
 
@@ -935,12 +938,13 @@ class PagedLayer(DynamicLayer):
         got = self.append(key_states, value_states)
         if self._hop is not None:
             return got
-        if first:
-            dt = torch.bfloat16 if self.on_card else self.pool.host.dtype
-            return key_states.to(dt), value_states.to(dt)
         if self.on_card:
+            # the first rows too: read through the map by the kernels a contiguous cache's rows take, never the
+            # module's own rows (a fused projection's slices, strided apart, sent them to sdpa and its bits)
             kv = PagedKV(self, self.n - T, T)
             return kv, kv
+        if first:
+            return key_states.to(self.pool.host.dtype), value_states.to(self.pool.host.dtype)
         raise PagedError(
             f"layer {self.i}: a module read a paged cache past its first rows, as one buffer - a path the paged "
             "reader does not take"
@@ -1018,11 +1022,13 @@ class PagedCache(DynamicCache):
 
     def bind(self, T: int = 0) -> torch.Tensor | None:
         """the table on the card for a pass of `T` more rows - its rows reserved, its pages there, its map uploaded
-        (`CardRegion.bind`): the card's map, None where the pool has no card"""
+        (`CardRegion.bind`): the card's map, None where the pool has no card. The rows counted from the layers the pass
+        has yet to run: the host layers before a card run have appended the pass's rows already, and counted from
+        them a prompt's chunk reserved its rows twice"""
         card = self.prefix.pool.card
         if card is None:
             return None
-        n = max((cl.n for cl in self.layers if isinstance(cl, PagedLayer)), default=0)
+        n = min((cl.n for cl in self.layers if isinstance(cl, PagedLayer)), default=0)
         self.table.extend(n + int(T))
         return card.bind(self.table)
 

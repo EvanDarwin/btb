@@ -63,6 +63,15 @@ def _prefill(layers: bool, ids: list[int], **kw: Any) -> tuple[torch.Tensor, dic
                 lg = out[0, -1].float().cpu()
             else:
                 lg = sm._prefill(t, cache)[0, -1].float().cpu()
+            # a host layer's rows where it runs once the prompt is in, whichever path took it: a card pass that hopped
+            # them onto the card puts them back, its last run carrying the head as much as one ending short of it
+            away = [
+                i
+                for i in sm.host
+                if isinstance(getattr(cache.layers[i], "keys", None), torch.Tensor)
+                and cache.layers[i].keys.device.type != "cpu"
+            ]
+            assert not away, f"host layers {away}: their rows left on the card past the prefill"
             got = {name: t.detach().float().cpu().clone() for name, t in _tensors(cache)}
     finally:
         sm.close()
@@ -135,8 +144,9 @@ def test_drive_layers_by_layer_hold_their_ring_slot(fx: str) -> None:
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("fx", DENSE)
 def test_dense_card_pass_by_layer_is_the_chunks_bits(fx: str, dtype: torch.dtype) -> None:
-    """in bf16 too: the chunks' resident layers, 3 rows past a cache, would fit the card graph, and its kernels
-    round a key a bf16 step from torch's - a chunked prefill's chunk runs the torch layers, as the sweep's does"""
+    """in bf16 too: the chunks' resident layers take the card graph's kernels (`_forward_card_prefill`), the
+    chunked loop's a run of them a chunk, the sweep's a layer at a time - each row its step's either way, an engine's
+    first chunk too (its kernels were read before they were loaded, and its first chunk took torch's)"""
     dev = need_cuda()
     L = layer_count(fixture(fx))
     StreamedTextModel.register_attention()

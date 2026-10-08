@@ -1,17 +1,21 @@
 """The CUDA card-kernel matrix. The card runs only where a GPU is present (CI has none), so this certifies the
 kernel surface structurally, source-parsed and torch-free: every kernel the engine loads (`_Cuda.KERNELS` in
-btb/engine/native.py) must be defined in native/cuda/*.cu|.cuh, and every kernel defined there must be one the
-engine loads. A new .cu kernel the engine does not load - or a loaded name with no definition - is a reported
-gap, so a card kernel cannot land uncertified.
+btb/engine/native.py) must be defined in native/cuda/*.cu|.cuh, every kernel defined there must be one the
+engine loads, and every one it loads must be one btb launches - its name, or an f-string naming it, somewhere in
+the package outside the load list. A new .cu kernel the engine does not load, a loaded name with no definition,
+or a kernel nothing launches any more (a dead path, compiled and loaded for nothing) is a reported gap, so a card
+kernel cannot land uncertified, nor outlive its last caller.
 
     python -m tests.cert.cuda_ops --report    # the kernel matrix and the plain-language gaps
     python -m tests.cert.cuda_ops --missing   # only the gaps in plain language: what is missing and how to close
-    python -m tests.cert.cuda_ops --check      # nonzero when the loaded set and the defined set disagree
+    python -m tests.cert.cuda_ops --check      # nonzero when the loaded, defined and launched sets disagree
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
+import glob
 import os
 import re
 import sys
@@ -29,6 +33,8 @@ class Missing(StrEnum):
 
     DEFINED_NOT_LOADED = "defined-not-loaded"
     LOADED_NOT_DEFINED = "loaded-not-defined"
+    LOADED_NOT_LAUNCHED = "loaded-not-launched"
+    LAUNCH_UNRESOLVED = "launch-unresolved"
 
 
 # kind -> (what is missing about kernel {s}, how to close it).
@@ -44,16 +50,27 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "fail on a GPU",
         "define {s} in native/cuda (or its generating macro), or drop it from _Cuda.KERNELS if it was renamed",
     ),
+    Missing.LOADED_NOT_LAUNCHED: (
+        "the engine loads {s} (_Cuda.KERNELS) but no `.launch(...)` in btb/ can launch it - a presence check, a "
+        "requirement list or a message naming it launches nothing: a dead kernel path, compiled and loaded for nothing",
+        "launch {s} where it belongs, or remove its definition from native/cuda and its name from _Cuda.KERNELS "
+        "(and the tests and benches that drive it alone)",
+    ),
+    Missing.LAUNCH_UNRESOLVED: (
+        "the launch at {s} names its kernel in a way the cert cannot read (a parameter, a loop variable, an "
+        "unpacked tuple), so it cannot say which kernels the launch keeps alive",
+        "spell the kernel's name at {s} as a constant, an f-string, a conditional of those or a local assigned one, "
+        "as every other launch does",
+    ),
 }
 
 # a kernel entry point: `extern "C" __global__ void [__launch_bounds__(...)] btb_<name>(`, the name possibly on
 # the next line (the MMA kernel), and NOT a macro template (a name ending at `##` is caught by _macro_kernels).
 _EXTERN = re.compile(r'extern\s+"C"\s+__global__\s+void\s+(?:__launch_bounds__\([^)]*\)\s*)?(btb_\w+)\s*\(')
-# a macro body's templated name(s), every `##` part: btb_gemv_bf16_m##M, btb_attn_split_gqa##G##_d##D
+# a macro body's templated name(s), every `##` part: btb_gemv_bf16_m##M, btb_attn_flash_prefill_kq_d##D
 _TEMPLATE = re.compile(r"(btb_\w+(?:##\w+)+)")
 _DEFINE = re.compile(r"#define\s+(\w+)\(([^)]*)\)")  # a macro definition head and its parameters
 _INST = re.compile(r"^(\w+)\(([\d,\s]+)\)", re.M)  # a macro instantiation, e.g. GEMV(16) or ATTN(2, 64)
-_KERNELS_BLOCK = re.compile(r"KERNELS\s*=\s*\((.*?)\)", re.S)
 
 
 def _cuda_source() -> str:
@@ -68,12 +85,16 @@ def _cuda_source() -> str:
 
 def loaded_kernels() -> set[str]:
     """the card kernels the engine loads by name, from `_Cuda.KERNELS` in native.py (parsed as source, so no
-    torch import); a missing one fails at load on a GPU, so this is the authoritative required set."""
+    torch import); a missing one fails at load on a GPU, so this is the authoritative required set. Read as Python,
+    not cut at the first parenthesis: a comment in the list naming a file "(btb_gemm.cuh)" ended it there"""
     with open(NATIVE_PY, encoding="utf-8") as f:
-        block = _KERNELS_BLOCK.search(f.read())
-    if block is None:
-        return set()
-    return set(re.findall(r'"(btb_\w+)"', block.group(1)))
+        tree = ast.parse(f.read(), filename=NATIVE_PY)
+    out: set[str] = set()
+    for node in ast.walk(tree):
+        listed = _load_list(node)
+        if listed is not None:
+            out |= {n.value for n in ast.walk(listed) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    return {k for k in out if k.startswith("btb_")}
 
 
 def defined_kernels() -> set[str]:
@@ -98,11 +119,185 @@ def defined_kernels() -> set[str]:
     return out
 
 
+Pieces = tuple[str | None, ...]  # a name's spelling: literal text, None for a part the source does not fix (`{D}`)
+_DEPTH = 6  # how deep a name's resolution follows assignments and calls before it calls the part unknown
+
+
+class _Resolver:
+    """the kernel names a module's `.launch(...)` calls can launch, read off their first argument: a constant, an
+    f-string (each hole resolved the same way - `via = "_tbl" if paged else ""` gives both spellings - or any name
+    part where the source does not fix it, `{D}`), a conditional of those, a local or an enclosing function's variable
+    (every assignment to it), or a call of a method whose returns are those (`k.flash_prefill_kernel(D)`). Only what
+    flows into a launch counts: a kernel named in a presence check, a requirement list or a message is not launched"""
+
+    def __init__(self, trees: list[ast.Module]) -> None:
+        self.parent: dict[int, ast.AST] = {}
+        self.defs: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+        for tree in trees:
+            for node in ast.walk(tree):
+                for child in ast.iter_child_nodes(node):
+                    self.parent[id(child)] = node
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    self.defs.setdefault(node.name, []).append(node)
+
+    def _scopes(self, node: ast.AST) -> list[ast.AST]:
+        """the functions enclosing `node`, innermost first, then its module"""
+        out: list[ast.AST] = []
+        cur = self.parent.get(id(node))
+        while cur is not None:
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+                out.append(cur)
+            cur = self.parent.get(id(cur))
+        return out
+
+    @staticmethod
+    def _assigned(scope: ast.AST, name: str) -> list[ast.expr] | None:
+        """the values `scope`'s own body assigns to `name` (not a nested function's); None where it binds it otherwise
+        (a parameter, a loop, a tuple's unpacking) - a value the source does not fix"""
+        values: list[ast.expr] = []
+        other = isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
+            a.arg == name for a in [*scope.args.posonlyargs, *scope.args.args, *scope.args.kwonlyargs]
+        )
+        stack = list(ast.iter_child_nodes(scope))
+        while stack:
+            node = stack.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id == name:
+                        values.append(node.value)
+                    elif any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(t)):
+                        other = True
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == name:
+                if node.value is not None:
+                    values.append(node.value)
+            elif isinstance(node, (ast.For, ast.AugAssign, ast.NamedExpr, ast.With, ast.comprehension)):
+                target = getattr(node, "target", None)
+                if target is not None and any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(target)):
+                    other = True
+            stack.extend(ast.iter_child_nodes(node))
+        return None if other or not values else values
+
+    def spell(self, expr: ast.expr, depth: int = _DEPTH) -> set[Pieces]:
+        """every spelling `expr` can take"""
+        unknown: set[Pieces] = {(None,)}
+        if depth <= 0:
+            return unknown
+        if isinstance(expr, ast.Constant):
+            return {(expr.value,)} if isinstance(expr.value, str) else unknown
+        if isinstance(expr, ast.JoinedStr):
+            out: set[Pieces] = {()}
+            for v in expr.values:
+                part = self.spell(v.value, depth - 1) if isinstance(v, ast.FormattedValue) else self.spell(v, depth - 1)
+                out = {a + b for a in out for b in part}
+            return out
+        if isinstance(expr, ast.IfExp):
+            return self.spell(expr.body, depth - 1) | self.spell(expr.orelse, depth - 1)
+        if isinstance(expr, ast.Name):
+            for scope in self._scopes(expr):
+                values = self._assigned(scope, expr.id)
+                if values is not None:
+                    return set().union(*(self.spell(v, depth - 1) for v in values))
+            return unknown
+        if isinstance(expr, ast.Call):
+            fn = expr.func.attr if isinstance(expr.func, ast.Attribute) else getattr(expr.func, "id", None)
+            returns = [
+                r.value
+                for d in self.defs.get(fn or "", [])
+                for r in ast.walk(d)
+                if isinstance(r, ast.Return) and r.value is not None
+            ]
+            return set().union(*(self.spell(r, depth - 1) for r in returns)) if returns else unknown
+        return unknown
+
+    def launches(self, tree: ast.Module) -> list[tuple[int, set[Pieces]]]:
+        """(line, spellings) of every `.launch(...)` call in `tree`"""
+        return [
+            (node.lineno, self.spell(node.args[0]))
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "launch"
+            and node.args
+        ]
+
+
+def _pattern(spelling: Pieces) -> re.Pattern[str] | None:
+    """a spelling as the names it matches - each unfixed part one or more name characters - or None where it fixes no
+    `btb_` kernel's name (nothing literal before its first unknown part)"""
+    merged: list[str | None] = []
+    for p in spelling:
+        if p is not None and merged and merged[-1] is not None:
+            merged[-1] += p
+        else:
+            merged.append(p)
+    if not merged or merged[0] is None or not merged[0].startswith("btb_"):
+        return None
+    return re.compile("".join(r"\w+" if p is None else re.escape(p) for p in merged))
+
+
+def _sources(root: str) -> list[tuple[str, ast.Module]]:
+    """every module of the package under `root` (btb/mlx's Metal kernels share names with the card's, not launches)"""
+    out = []
+    for path in sorted(glob.glob(os.path.join(root, "**", "*.py"), recursive=True)):
+        if os.path.join(root, "mlx") + os.sep in path:
+            continue
+        with open(path, encoding="utf-8") as f:
+            out.append((path, ast.parse(f.read(), filename=path)))
+    return out
+
+
+def launch_sites(sources: list[tuple[str, ast.Module]] | None = None) -> list[tuple[str, int, set[Pieces]]]:
+    """(file, line, spellings) of every card kernel launch in btb/"""
+    sources = _sources(BTB_SRC) if sources is None else sources
+    resolver = _Resolver([tree for _, tree in sources])
+    return [(path, line, sp) for path, tree in sources for line, sp in resolver.launches(tree)]
+
+
+def _load_list(node: ast.AST) -> ast.expr | None:
+    """the value of an assignment to `KERNELS` (native.py's load list), else None"""
+    if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "KERNELS" for t in node.targets):
+        return node.value
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "KERNELS":
+        return node.value
+    return None
+
+
+def launch_patterns(sites: list[tuple[str, int, set[Pieces]]] | None = None) -> list[re.Pattern[str]]:
+    """the names btb's launches can launch (`launch_sites`), each spelling as a pattern"""
+    sites = launch_sites() if sites is None else sites
+    return [p for _, _, spellings in sites for sp in spellings if (p := _pattern(sp)) is not None]
+
+
+def unresolved_launches(sites: list[tuple[str, int, set[Pieces]]] | None = None) -> list[str]:
+    """the launches the parse cannot name a kernel of, as `file:line`: a launch whose kernel the cert cannot read
+    certifies nothing, so it is a gap of its own rather than a wildcard over every name"""
+    sites = launch_sites() if sites is None else sites
+    out = []
+    for path, line, spellings in sites:
+        if any(_pattern(sp) is None for sp in spellings):
+            out.append(f"{os.path.relpath(path, os.path.dirname(BTB_SRC))}:{line}")
+    return out
+
+
+def launched_kernels(loaded: set[str] | None = None) -> set[str]:
+    """the loaded kernels some launch in btb/ can launch (`launch_patterns`)"""
+    loaded = loaded_kernels() if loaded is None else loaded
+    pats = launch_patterns()
+    return {k for k in loaded if any(p.fullmatch(k) for p in pats)}
+
+
 def _findings() -> list[tuple[Missing, str]]:
     """the single classified list of gaps as (kind, kernel name); gaps() and render_missing() both derive from it."""
     loaded, defined = loaded_kernels(), defined_kernels()
+    sites = launch_sites()
+    pats = launch_patterns(sites)
+    launched = {k for k in loaded if any(p.fullmatch(k) for p in pats)}
     out = [(Missing.DEFINED_NOT_LOADED, k) for k in sorted(defined - loaded)]
     out += [(Missing.LOADED_NOT_DEFINED, k) for k in sorted(loaded - defined)]
+    out += [(Missing.LOADED_NOT_LAUNCHED, k) for k in sorted(loaded - launched)]
+    out += [(Missing.LAUNCH_UNRESOLVED, s) for s in unresolved_launches(sites)]
     return out
 
 

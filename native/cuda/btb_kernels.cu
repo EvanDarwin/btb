@@ -1,14 +1,19 @@
 // Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
-// The card's decode kernels. Every reduction runs in an order fixed by the element's index alone - never by
-// the number of rows a pass carries, the cache's length or the launch's timing - so a verify pass of T rows
+// The card's kernels. Every reduction runs in an order fixed by the element's index alone - never by the number of
+// rows a pass carries, the cache's length or the launch's timing - so a verify pass of T rows, or a prompt's chunk,
 // computes each row bit-for-bit as the one-row step does, and one captured graph serves every length.
 //
 //   btb_gemv_bf16_m{1,..,32}      y[m][r] = sum_c w[r][c] * x[m][c]      (bf16 in, f32 accumulate, bf16 out)
 //   btb_gemv_{silu,gelu}_bf16_m{1,..,32}  the down projection with act(g) * u folded into its x load
-//   btb_attn_split_d{64,128,256}  one pass of T queries over the cache (a sliding layer's window of it), a tree of
-//                                 T rows at its end, split over the sequence
-//   btb_attn_rows_d{64,128,256}   the same over T sequences a token each (a fork's or a batch's rows)
-//   btb_norm_rope_kv_d{64,128,256} q/k RMSNorm, rope, the pass's rows written into the cache
+//   btb_gemv_mma*, btb_gemm_{mma,f32}_bf16  the tensor-core matvec, and a prompt's matmuls in the bits of the matvec
+//                                 the warm-up picked (btb_gemv_mma.cuh, btb_gemm.cuh)
+//   btb_attn_flash_d{64,128,256}  the one attention (btb_attn_flash.cuh), its decode form: a step, or a verify pass's
+//                                 chain or tree of T rows, over the cache (a sliding layer's window of it)
+//   btb_attn_flash_rows_d{64,128,256}  the same over T sequences a token each (a fork's or a batch's rows)
+//   btb_attn_flash_prefill{,_kq}_d{64,128,256}  its prefill form: a prompt's chunk, each row the bits its step makes
+//   btb_mma_roles                 the tensor cores' self-check that picks the prefill form's orientation
+//   btb_norm_rope_kv{,_tbl}_d{64,128,256} q/k RMSNorm, rope, the pass's rows written into the cache (through its
+//                                 row map)
 //   btb_norm_rope_kv_rows_d{64,128,256}  the same for T sequences, each at its own position
 //   btb_add_rmsnorm               h += y; x = rmsnorm(h) * w   (or * (1 + w), the zero-centred norm)
 //   btb_sandwich_add              h += rmsnorm(y) * w          (the sandwich block: the delta normed, then added)
@@ -26,7 +31,7 @@
 //                                 indexer's q and raw key)
 //   btb_qsa_pool_d{128,256}       the indexer's pooled keys of the committed blocks, caught up on the card
 //   btb_qsa_select_d{128,256}     a tree node's picked key blocks (the indexer's top-k over its visible blocks)
-//   btb_qsa_attn_split_d{128,256} the attention over a node's picks and its tail: btb_attn_split's walk over a list
+//   btb_qsa_attn_split_d{128,256} the attention over a node's picks and its tail, split over its list
 //   btb_gemv_lane16_f32_m{1,..,32}  the host's bf16 x f32 gemv (native/src/gemv.rs) to the bit: an expert seated on
 //                                 the card computes what it computes on the host
 //   btb_ple_gate, btb_ple_conv    the per-layer n-gram embedding over a pass's nodes: the key's gate on the streams
@@ -224,63 +229,15 @@ GEMV_ACT(16)
 GEMV_ACT(32)
 
 // ---------------------------------------------------------------------------------------------------------
-// attention: q [T, Hq, D] bf16 (normed, roped), K/V bf16 the cache layer's rows, row j of head g at g * hs + j * rs
-// elements (position-major [cap, Hk, D]: hs = D, rs = Hk * D, the card arena's; head-major [Hk, cap, D]: hs = cap * D,
-// rs = D), out [T, Hq, D] bf16. *n0 rows stand before the pass; the pass's own T rows
-// sit at slots n0 .. n0+T-1, row u parented to par[u] (-1 at the root), and query t sees the prefix, its
-// ancestors and itself. Block (h, t) of 8 warps walks the keys in LOGICAL order - position j: the prefix row
-// j for j < n0, then the ancestor of t at depth j - n0 (whatever slot holds it) - key j to warp (j >> 5) & 7,
-// each warp in increasing j with an online softmax, warp 0 folding the eight partial states in a fixed order.
-// That is exactly the sequence a one-row step at the same position walks, so a verify pass over any tree
-// gives the bits of the one-row steps of its accepted path. The kernel below is that walk split over the
-// sequence; the one-block-per-head form it grew from is gone (equal at short contexts, 2-4x slower past 4K).
+// the rows layout: a pass's T rows as T sequences a token each - a fork's rows, or a batch's - each at its own
+// position. Row t's keys are its prefix, len rows from slot off (a fork's rows share one prefix, a batch's lie end to
+// end), then its own steps, step i at slot base + i * W + col: every row's step i in one stretch of W slots. One int32
+// array on the card, [base, steps, W, then per row (col, off, len)]; a row with len < 0 is padding (the pass is
+// launched for a width its graph was captured at) and computes nothing. The norm/rope write lands each row's step at
+// its slot (btb_norm_rope_kv_rows below); the one attention's rows form walks each row's keys in logical order, the
+// sequence a one-row step of that sequence alone walks (btb_attn_flash.cuh), so a row's bits are its own decode's
+// whatever rows step beside it.
 // ---------------------------------------------------------------------------------------------------------
-// ---------------------------------------------------------------------------------------------------------
-// the attention above, split over the sequence: block (h, t, s) walks the logical keys [s*ATTN_SPLIT, (s+1)*
-// ATTN_SPLIT) of query t exactly as above (key -> warp by logical index, warps folded in order), stores its
-// state, and the last block to arrive for (h, t) folds the S states in split order and writes the row. The
-// blocks past the sequence's end store an empty state and take part in the count, so S is fixed per graph
-// (the arena's capacity over the split length) and the result depends on the key set alone - one graph,
-// every length, the bits of the one-row steps at long contexts too, where one block per head left the card
-// latency-bound. `part_*` hold S x T x Hq states, `cnt` T x Hq arrival counts (zero between launches: the
-// last block resets its own).
-//
-// ROWS: the T queries are T sequences instead of one tree - a fork's rows, or a batch's - each one token at its
-// own position. Row t's keys are its prefix, lens[t] rows from slot offs[t] (a fork's rows share one prefix, a
-// batch's lie end to end), then its own steps, step i at slot base + i * W + col[t]: every row's step i in one
-// stretch of W slots. The walk is row t's logical keys in order, the sequence a one-row step of that sequence
-// alone walks over a contiguous cache, so a row's bits are its own decode's whatever rows step beside it.
-// ---------------------------------------------------------------------------------------------------------
-#define ATTN_SPLIT 1024
-// the keys a warp loads, then scores, then folds in order: its K and V rows standing together, and their scores'
-// butterflies side by side instead of each behind the last key's softmax. A short sequence - a block a head, a
-// warp 128 keys at 1k - is nothing but that chain (Qwen3-0.6B at 1k: 32 us a layer for 4 MB). A key's score is
-// its own dot product and butterfly and the fold is key by key in order whatever the batch, so the batch moves
-// no bit; it is bounded by the registers the rows take (E a lane a row), which the long-context tree needs for
-// the blocks it keeps resident
-#define ATTN_BATCH(E) ((E) >= 8 ? 4 : 8)
-
-// the batch's B scores q . k_u * scale, each over the lane's E elements then the butterfly: independent chains
-template <int E, int B>
-__device__ __forceinline__ void attn_scores(float* sc, const float* qf, const Vec<E>* kv, float scale) {
-#pragma unroll
-    for (int u = 0; u < B; ++u) {
-        float d = 0.f;
-#pragma unroll
-        for (int e = 0; e < E; ++e) d = fmaf(qf[e], kv[u].at(e), d);
-        sc[u] = d;
-    }
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-#pragma unroll
-        for (int u = 0; u < B; ++u) sc[u] += __shfl_xor_sync(0xffffffffu, sc[u], o);
-    }
-#pragma unroll
-    for (int u = 0; u < B; ++u) sc[u] *= scale;
-}
-
-// the rows' layout, one int32 array on the card: [base, steps, W, then per row (col, off, len)]; a row with
-// len < 0 is padding (the pass is launched for a width its graph was captured at) and computes nothing
 struct RowsLayout {
     int base = 0, step = 0, W = 0, col = 0, off = 0, len = 0;
     RowsLayout() = default;
@@ -290,463 +247,6 @@ struct RowsLayout {
     __device__ __forceinline__ int slot(int j) const { return j < len ? off + j : base + (j - len) * W + col; }
 };
 
-// the walk's forms: WALK_TREE a tree of T rows at the cache's end, WALK_ROWS T sequences a token each, WALK_QSA the
-// tree's rows each over the QSA indexer's picks alone (btb_qsa_attn_split below)
-#define WALK_TREE 0
-#define WALK_ROWS 1
-#define WALK_QSA 2
-
-// `tbl` (null: none) is a cache's row map: the walk's slot j is the cache row tbl[j], wherever its page put it. The
-// walk, its key -> warp map, its splits and its folds are the logical keys' as they are without it - the map moves
-// an address, never a bit (a conversation reads the prefix pages it shares with others in place)
-template <int D, int MODE>
-__device__ __forceinline__ void attn_decode_split(const bf16* __restrict__ q, const bf16* __restrict__ K,
-                                                  const bf16* __restrict__ V, bf16* __restrict__ out,
-                                                  const int* __restrict__ n0p, const int* __restrict__ par,
-                                                  const int* __restrict__ rw, const int* __restrict__ sel,
-                                                  const int* __restrict__ nsel, int ratio, int ktop, int T, int Hq,
-                                                  int Hk, int hs, int rs, float scale, float* __restrict__ part_m,
-                                                  float* __restrict__ part_l, float* __restrict__ part_acc,
-                                                  int* __restrict__ cnt, int S, int win,
-                                                  const int* __restrict__ tbl = nullptr) {
-    constexpr int E = D / 32;
-    const int h = blockIdx.x, t = blockIdx.y, s = blockIdx.z;
-    const int g = h / (Hq / Hk);
-    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
-    // the tree's walk (its prefix length and each row's ancestors) or the rows' layout: one of the two is used
-    [[maybe_unused]] __shared__ int anc[32];
-    [[maybe_unused]] __shared__ int s_d;
-    [[maybe_unused]] int n0 = 0;
-    [[maybe_unused]] RowsLayout r;
-    // QSA: the row's complete blocks, the keys of its picks (nsel * ratio) and its picks' block indices
-    [[maybe_unused]] int nb = 0, npk = 0;
-    [[maybe_unused]] const int* selt = nullptr;
-    int n;  // the length of the walk: the row's logical keys (QSA: its list)
-    if constexpr (MODE == WALK_ROWS) {
-        r = RowsLayout(rw, t);
-        if (r.len < 0) return;
-        n = r.len + r.step + 1;
-        if (s * ATTN_SPLIT >= n) return;
-    } else {
-        n0 = *n0p;
-        if constexpr (MODE == WALK_TREE) {
-            // no query of this pass reaches past n0 + T rows: a block whose range starts beyond that leaves before
-            // the walk and the barrier, so at a short context the launch costs what the unsplit kernel costs
-            if (s * ATTN_SPLIT >= n0 + T) return;
-        } else {
-            if (par[t] < -1) return;  // a padding row: nothing to attend
-        }
-        if (threadIdx.x == 0) {
-            int tmp[32];
-            int len = 0;
-            for (int p = t; p >= 0 && p < T && len < 32; p = par[p]) tmp[len++] = p;
-            for (int e = 0; e < len; ++e) anc[e] = tmp[len - 1 - e];
-            s_d = len - 1;
-        }
-        __syncthreads();
-        n = n0 + s_d + 1;
-        if constexpr (MODE == WALK_QSA) {
-            // the list: the picked blocks' keys in block order, then the partial tail - ascending positions
-            nb = n / ratio;
-            npk = nsel[t] * ratio;
-            selt = sel + (size_t)t * ktop;
-            n = npk + (n - nb * ratio);
-        }
-    }
-    float qf[E];
-    const bf16* qp = q + ((size_t)t * Hq + h) * D + lane * E;
-#pragma unroll
-    for (int e = 0; e < E; ++e) qf[e] = bf2f(qp[e]);
-    const size_t rowstride = (size_t)rs;
-    const bf16* Kg = K + (size_t)g * hs + lane * E;
-    const bf16* Vg = V + (size_t)g * hs + lane * E;
-    float m = NEG_INF, l = 0.f, acc[E];
-#pragma unroll
-    for (int e = 0; e < E; ++e) acc[e] = 0.f;
-    // a sliding layer (win > 0) sees the last win logical keys, [first, n): the walk below keeps its key -> warp
-    // map and passes over the keys before first, so a windowed row folds as the full row's tail would
-    const int first = win > 0 ? max(n - win, 0) : 0;
-    // the splits this query needs: a single one writes its row directly, without the partials
-    const int S_active = (n + ATTN_SPLIT - 1) / ATTN_SPLIT;
-    if (s >= S_active) return;
-    const int lo = s * ATTN_SPLIT, hi = min(lo + ATTN_SPLIT, n);
-    for (int j0 = lo + w * 32; j0 < hi; j0 += 256) {
-        const int j1 = min(j0 + 32, hi);
-        for (int j = j0; j < j1; j += ATTN_BATCH(E)) {
-            const int c4 = min(ATTN_BATCH(E), j1 - j);
-            Vec<E> kv[ATTN_BATCH(E)] = {}, vv[ATTN_BATCH(E)];
-#pragma unroll
-            for (int u = 0; u < ATTN_BATCH(E); ++u) {
-                if (u < c4 && j + u >= first) {
-                    const int jj = j + u;
-                    int slot;
-                    if constexpr (MODE == WALK_ROWS) {
-                        slot = r.slot(jj);
-                    } else {
-                        int pos = jj;  // list index -> logical position (the identity but for QSA)
-                        if constexpr (MODE == WALK_QSA)
-                            pos = jj < npk ? selt[jj / ratio] * ratio + jj % ratio : nb * ratio + (jj - npk);
-                        slot = pos < n0 ? pos : n0 + anc[pos - n0];
-                    }
-                    if (tbl != nullptr) slot = tbl[slot];
-                    kv[u].load(Kg + (size_t)slot * rowstride);
-                    vv[u].load(Vg + (size_t)slot * rowstride);
-                }
-            }
-            float sc[ATTN_BATCH(E)];
-            attn_scores<E, ATTN_BATCH(E)>(sc, qf, kv, scale);
-#pragma unroll
-            for (int u = 0; u < ATTN_BATCH(E); ++u) {
-                if (u < c4 && j + u >= first) {
-                    const float mn = fmaxf(m, sc[u]);
-                    const float corr = expf(m - mn);
-                    const float p = expf(sc[u] - mn);
-                    l = l * corr + p;
-#pragma unroll
-                    for (int e = 0; e < E; ++e) acc[e] = fmaf(p, vv[u].at(e), acc[e] * corr);
-                    m = mn;
-                }
-            }
-        }
-    }
-    __shared__ float sm_m[8], sm_l[8];
-    __shared__ float sm_acc[8][D];
-    if (lane == 0) {
-        sm_m[w] = m;
-        sm_l[w] = l;
-    }
-#pragma unroll
-    for (int e = 0; e < E; ++e) sm_acc[w][lane * E + e] = acc[e];
-    __syncthreads();
-    if (w != 0) return;
-    // the block's state: the eight warps folded in order
-    float M = sm_m[0], L = sm_l[0], o[E];
-#pragma unroll
-    for (int e = 0; e < E; ++e) o[e] = sm_acc[0][lane * E + e];
-    for (int u = 1; u < 8; ++u) {
-        const float mu = sm_m[u];
-        if (mu == NEG_INF) continue;
-        if (M == NEG_INF) {
-            M = mu;
-            L = sm_l[u];
-#pragma unroll
-            for (int e = 0; e < E; ++e) o[e] = sm_acc[u][lane * E + e];
-            continue;
-        }
-        const float Mn = fmaxf(M, mu);
-        const float c0 = expf(M - Mn), c1 = expf(mu - Mn);
-        L = L * c0 + sm_l[u] * c1;
-#pragma unroll
-        for (int e = 0; e < E; ++e) o[e] = o[e] * c0 + sm_acc[u][lane * E + e] * c1;
-        M = Mn;
-    }
-    const size_t row = ((size_t)t * Hq + h);
-    if (S_active == 1) {
-        bf16* op = out + row * D + lane * E;
-        const float inv = 1.f / L;
-#pragma unroll
-        for (int e = 0; e < E; ++e) op[e] = f2bf(o[e] * inv);
-        return;
-    }
-    const size_t idx = (size_t)s * T * Hq + row;
-    if (lane == 0) {
-        part_m[idx] = M;
-        part_l[idx] = L;
-    }
-#pragma unroll
-    for (int e = 0; e < E; ++e) part_acc[idx * D + lane * E + e] = o[e];
-    __threadfence();
-    __syncwarp();  // every lane's partial stores precede lane 0's arrival: the last arriver folds a whole state
-    int last = 0;
-    if (lane == 0) last = (atomicAdd(cnt + row, 1) == S_active - 1) ? 1 : 0;
-    last = __shfl_sync(0xffffffffu, last, 0);
-    if (!last) return;
-    __threadfence();
-    // the last block for (h, t): the active states in split order, read past L1
-    M = NEG_INF;
-    L = 0.f;
-#pragma unroll
-    for (int e = 0; e < E; ++e) o[e] = 0.f;
-    for (int u = 0; u < S_active; ++u) {
-        const size_t iu = (size_t)u * T * Hq + row;
-        const float mu = __ldcg(part_m + iu);
-        if (mu == NEG_INF) continue;
-        const float lu = __ldcg(part_l + iu);
-        if (M == NEG_INF) {
-            M = mu;
-            L = lu;
-#pragma unroll
-            for (int e = 0; e < E; ++e) o[e] = __ldcg(part_acc + iu * D + lane * E + e);
-            continue;
-        }
-        const float Mn = fmaxf(M, mu);
-        const float c0 = expf(M - Mn), c1 = expf(mu - Mn);
-        L = L * c0 + lu * c1;
-#pragma unroll
-        for (int e = 0; e < E; ++e) o[e] = o[e] * c0 + __ldcg(part_acc + iu * D + lane * E + e) * c1;
-        M = Mn;
-    }
-    bf16* op = out + row * D + lane * E;
-    const float inv = 1.f / L;
-#pragma unroll
-    for (int e = 0; e < E; ++e) op[e] = f2bf(o[e] * inv);
-    if (lane == 0) cnt[row] = 0;
-}
-
-#define ATTN_SPLIT_K(D)                                                                                      \
-    extern "C" __global__ void __launch_bounds__(256) btb_attn_split_d##D(                                   \
-        const bf16* __restrict__ q, const bf16* __restrict__ K, const bf16* __restrict__ V,                  \
-        bf16* __restrict__ out, const int* __restrict__ n0p, const int* __restrict__ par, int T, int Hq,     \
-        int Hk, int hs, int rs, float scale, float* __restrict__ part_m, float* __restrict__ part_l,         \
-        float* __restrict__ part_acc, int* __restrict__ cnt, int S, int win) {                               \
-        attn_decode_split<D, WALK_TREE>(q, K, V, out, n0p, par, nullptr, nullptr, nullptr, 0, 0, T, Hq, Hk,  \
-                                        hs, rs, scale, part_m, part_l, part_acc, cnt, S, win);               \
-    }                                                                                                        \
-    extern "C" __global__ void __launch_bounds__(256) btb_attn_rows_d##D(                                    \
-        const bf16* __restrict__ q, const bf16* __restrict__ K, const bf16* __restrict__ V,                  \
-        bf16* __restrict__ out, const int* __restrict__ rw, int T, int Hq, int Hk, int hs, int rs,           \
-        float scale, float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,   \
-        int* __restrict__ cnt, int S, int win) {                                                             \
-        attn_decode_split<D, WALK_ROWS>(q, K, V, out, nullptr, nullptr, rw, nullptr, nullptr, 0, 0, T, Hq,   \
-                                        Hk, hs, rs, scale, part_m, part_l, part_acc, cnt, S, win);           \
-    }                                                                                                        \
-    extern "C" __global__ void __launch_bounds__(256) btb_attn_split_tbl_d##D(                               \
-        const bf16* __restrict__ q, const bf16* __restrict__ K, const bf16* __restrict__ V,                  \
-        bf16* __restrict__ out, const int* __restrict__ n0p, const int* __restrict__ par, int T, int Hq,     \
-        int Hk, int hs, int rs, float scale, float* __restrict__ part_m, float* __restrict__ part_l,         \
-        float* __restrict__ part_acc, int* __restrict__ cnt, int S, int win, const int* __restrict__ tbl) {  \
-        attn_decode_split<D, WALK_TREE>(q, K, V, out, n0p, par, nullptr, nullptr, nullptr, 0, 0, T, Hq, Hk,  \
-                                        hs, rs, scale, part_m, part_l, part_acc, cnt, S, win, tbl);          \
-    }
-ATTN_SPLIT_K(64)
-ATTN_SPLIT_K(128)
-ATTN_SPLIT_K(256)
-
-// ---------------------------------------------------------------------------------------------------------
-// the tree walk above for the G query heads of one KV group at once: one block loads each of its keys' K and V
-// rows once and runs every head's walk over them - where a block a query head reads the group's rows G times
-// over, and a tree pass's T rows T times more. The L2 catches most of that for a one-row step; a long tree's
-// verify it does not (Qwen3-0.6B, a 5-row tree: 11% off the attention at 8k, 27% at 40k). Each head's walk is the
-// one above operation for operation - its keys in the same warps and order, its online softmax, its warps
-// folded in order (warp h folds head h), its splits folded in order by the last block - so a head's bits are
-// the one-head kernel's, and the partials and counts are the one-head kernel's, a head's by its own row.
-// ---------------------------------------------------------------------------------------------------------
-template <int D, int G>
-__device__ __forceinline__ void attn_split_gqa(const bf16* __restrict__ q, const bf16* __restrict__ K,
-                                               const bf16* __restrict__ V, bf16* __restrict__ out, int n0,
-                                               const int* __restrict__ par, int g, int T, int Hq, int hs, int rs,
-                                               float scale, float* __restrict__ part_m, float* __restrict__ part_l,
-                                               float* __restrict__ part_acc, int* __restrict__ cnt, int win,
-                                               const int* __restrict__ tbl = nullptr) {
-    static_assert(G <= 8, "a head's fold is one warp's");
-    constexpr int E = D / 32;
-    const int t = blockIdx.y, s = blockIdx.z;
-    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
-    __shared__ int anc[32];
-    __shared__ int s_d;
-    if (threadIdx.x == 0) {
-        int tmp[32];
-        int len = 0;
-        for (int p = t; p >= 0 && p < T && len < 32; p = par[p]) tmp[len++] = p;
-        for (int e = 0; e < len; ++e) anc[e] = tmp[len - 1 - e];
-        s_d = len - 1;
-    }
-    __syncthreads();
-    const int n = n0 + s_d + 1;
-    const int S_active = (n + ATTN_SPLIT - 1) / ATTN_SPLIT;
-    if (s >= S_active) return;
-    float qf[G][E];
-#pragma unroll
-    for (int hh = 0; hh < G; ++hh) {
-        const bf16* qp = q + ((size_t)t * Hq + g * G + hh) * D + lane * E;
-#pragma unroll
-        for (int e = 0; e < E; ++e) qf[hh][e] = bf2f(qp[e]);
-    }
-    const bf16* Kg = K + (size_t)g * hs + lane * E;
-    const bf16* Vg = V + (size_t)g * hs + lane * E;
-    float m[G], l[G], acc[G][E];
-#pragma unroll
-    for (int hh = 0; hh < G; ++hh) {
-        m[hh] = NEG_INF;
-        l[hh] = 0.f;
-#pragma unroll
-        for (int e = 0; e < E; ++e) acc[hh][e] = 0.f;
-    }
-    const int first = win > 0 ? max(n - win, 0) : 0;
-    const int lo = s * ATTN_SPLIT, hi = min(lo + ATTN_SPLIT, n);
-    // four keys a batch: the G heads' scores are the independent chains here, and the block keeps the registers
-    // the long-context tree needs resident (at eight, 97 of them on d128 x 2 heads, 16% slower at 40k)
-    constexpr int B = 4;
-    for (int j0 = lo + w * 32; j0 < hi; j0 += 256) {
-        const int j1 = min(j0 + 32, hi);
-        for (int j = j0; j < j1; j += B) {
-            const int c4 = min(B, j1 - j);
-            Vec<E> kv[B] = {}, vv[B];
-#pragma unroll
-            for (int u = 0; u < B; ++u) {
-                if (u < c4 && j + u >= first) {
-                    const int jj = j + u;
-                    int slot = jj < n0 ? jj : n0 + anc[jj - n0];
-                    if (tbl != nullptr) slot = tbl[slot];  // the row map, as the one-head walk reads it
-                    kv[u].load(Kg + (size_t)slot * rs);
-                    vv[u].load(Vg + (size_t)slot * rs);
-                }
-            }
-            // head by head: the batch's scores, then the head's fold over them in key order
-#pragma unroll
-            for (int hh = 0; hh < G; ++hh) {
-                float sc[B];
-                attn_scores<E, B>(sc, qf[hh], kv, scale);
-#pragma unroll
-                for (int u = 0; u < B; ++u) {
-                    if (u < c4 && j + u >= first) {
-                        const float mn = fmaxf(m[hh], sc[u]);
-                        const float corr = expf(m[hh] - mn);
-                        const float p = expf(sc[u] - mn);
-                        l[hh] = l[hh] * corr + p;
-#pragma unroll
-                        for (int e = 0; e < E; ++e) acc[hh][e] = fmaf(p, vv[u].at(e), acc[hh][e] * corr);
-                        m[hh] = mn;
-                    }
-                }
-            }
-        }
-    }
-    // every warp's state for every head, then warp h folds head h's eight in order and writes its row, or its
-    // partial and - the last split to arrive - the row from every split
-    __shared__ float sm_m[G][8], sm_l[G][8];
-    __shared__ float sm_acc[G][8][D];
-#pragma unroll
-    for (int hh = 0; hh < G; ++hh) {
-        if (lane == 0) {
-            sm_m[hh][w] = m[hh];
-            sm_l[hh][w] = l[hh];
-        }
-#pragma unroll
-        for (int e = 0; e < E; ++e) sm_acc[hh][w][lane * E + e] = acc[hh][e];
-    }
-    __syncthreads();
-    if (w >= G) return;
-    const int hh = w;
-    float M = sm_m[hh][0], L = sm_l[hh][0], o[E];
-#pragma unroll
-    for (int e = 0; e < E; ++e) o[e] = sm_acc[hh][0][lane * E + e];
-    for (int u = 1; u < 8; ++u) {
-        const float mu = sm_m[hh][u];
-        if (mu == NEG_INF) continue;
-        if (M == NEG_INF) {
-            M = mu;
-            L = sm_l[hh][u];
-#pragma unroll
-            for (int e = 0; e < E; ++e) o[e] = sm_acc[hh][u][lane * E + e];
-            continue;
-        }
-        const float Mn = fmaxf(M, mu);
-        const float c0 = expf(M - Mn), c1 = expf(mu - Mn);
-        L = L * c0 + sm_l[hh][u] * c1;
-#pragma unroll
-        for (int e = 0; e < E; ++e) o[e] = o[e] * c0 + sm_acc[hh][u][lane * E + e] * c1;
-        M = Mn;
-    }
-    const size_t row = ((size_t)t * Hq + g * G + hh);
-    if (S_active == 1) {
-        bf16* op = out + row * D + lane * E;
-        const float inv = 1.f / L;
-#pragma unroll
-        for (int e = 0; e < E; ++e) op[e] = f2bf(o[e] * inv);
-        return;
-    }
-    const size_t idx = (size_t)s * T * Hq + row;
-    if (lane == 0) {
-        part_m[idx] = M;
-        part_l[idx] = L;
-    }
-#pragma unroll
-    for (int e = 0; e < E; ++e) part_acc[idx * D + lane * E + e] = o[e];
-    __threadfence();
-    __syncwarp();
-    int last = 0;
-    if (lane == 0) last = (atomicAdd(cnt + row, 1) == S_active - 1) ? 1 : 0;
-    last = __shfl_sync(0xffffffffu, last, 0);
-    if (!last) return;
-    __threadfence();
-    M = NEG_INF;
-    L = 0.f;
-#pragma unroll
-    for (int e = 0; e < E; ++e) o[e] = 0.f;
-    for (int u = 0; u < S_active; ++u) {
-        const size_t iu = (size_t)u * T * Hq + row;
-        const float mu = __ldcg(part_m + iu);
-        if (mu == NEG_INF) continue;
-        const float lu = __ldcg(part_l + iu);
-        if (M == NEG_INF) {
-            M = mu;
-            L = lu;
-#pragma unroll
-            for (int e = 0; e < E; ++e) o[e] = __ldcg(part_acc + iu * D + lane * E + e);
-            continue;
-        }
-        const float Mn = fmaxf(M, mu);
-        const float c0 = expf(M - Mn), c1 = expf(mu - Mn);
-        L = L * c0 + lu * c1;
-#pragma unroll
-        for (int e = 0; e < E; ++e) o[e] = o[e] * c0 + __ldcg(part_acc + iu * D + lane * E + e) * c1;
-        M = Mn;
-    }
-    bf16* op = out + row * D + lane * E;
-    const float inv = 1.f / L;
-#pragma unroll
-    for (int e = 0; e < E; ++e) op[e] = f2bf(o[e] * inv);
-    if (lane == 0) cnt[row] = 0;
-}
-
-// btb_attn_split_d{D}'s launch - grid (Hq, T, S) - plus `sharedp`: from a prefix of *sharedp keys on (n0 and
-// the threshold both read on the card, so one captured graph serves every context and the host can move the
-// threshold between replays), block (g G, t, s) runs its group's G heads and the group's other blocks leave;
-// below it every block runs its own head. Both give every head the same bits.
-#define ATTN_SPLIT_GQA_K(G, D)                                                                               \
-    extern "C" __global__ void __launch_bounds__(256) btb_attn_split_gqa##G##_d##D(                          \
-        const bf16* __restrict__ q, const bf16* __restrict__ K, const bf16* __restrict__ V,                  \
-        bf16* __restrict__ out, const int* __restrict__ n0p, const int* __restrict__ par, int T, int Hq,     \
-        int Hk, int hs, int rs, float scale, float* __restrict__ part_m, float* __restrict__ part_l,         \
-        float* __restrict__ part_acc, int* __restrict__ cnt, int S, int win, const int* __restrict__ sharedp) { \
-        const int n0 = *n0p;                                                                                 \
-        if (blockIdx.z * ATTN_SPLIT >= n0 + T) return;                                                       \
-        if (n0 >= *sharedp) {                                                                                \
-            if (blockIdx.x % G) return;                                                                      \
-            attn_split_gqa<D, G>(q, K, V, out, n0, par, blockIdx.x / G, T, Hq, hs, rs, scale, part_m,        \
-                                 part_l, part_acc, cnt, win);                                                \
-        } else {                                                                                             \
-            attn_decode_split<D, WALK_TREE>(q, K, V, out, n0p, par, nullptr, nullptr, nullptr, 0, 0, T, Hq,  \
-                                            Hk, hs, rs, scale, part_m, part_l, part_acc, cnt, S, win);       \
-        }                                                                                                    \
-    }                                                                                                        \
-    extern "C" __global__ void __launch_bounds__(256) btb_attn_split_gqa##G##_tbl_d##D(                      \
-        const bf16* __restrict__ q, const bf16* __restrict__ K, const bf16* __restrict__ V,                  \
-        bf16* __restrict__ out, const int* __restrict__ n0p, const int* __restrict__ par, int T, int Hq,     \
-        int Hk, int hs, int rs, float scale, float* __restrict__ part_m, float* __restrict__ part_l,         \
-        float* __restrict__ part_acc, int* __restrict__ cnt, int S, int win, const int* __restrict__ sharedp, \
-        const int* __restrict__ tbl) {                                                                       \
-        const int n0 = *n0p;                                                                                 \
-        if (blockIdx.z * ATTN_SPLIT >= n0 + T) return;                                                       \
-        if (n0 >= *sharedp) {                                                                                \
-            if (blockIdx.x % G) return;                                                                      \
-            attn_split_gqa<D, G>(q, K, V, out, n0, par, blockIdx.x / G, T, Hq, hs, rs, scale, part_m,        \
-                                 part_l, part_acc, cnt, win, tbl);                                           \
-        } else {                                                                                             \
-            attn_decode_split<D, WALK_TREE>(q, K, V, out, n0p, par, nullptr, nullptr, nullptr, 0, 0, T, Hq,  \
-                                            Hk, hs, rs, scale, part_m, part_l, part_acc, cnt, S, win, tbl);  \
-        }                                                                                                    \
-    }
-ATTN_SPLIT_GQA_K(2, 64)
-ATTN_SPLIT_GQA_K(2, 128)
-ATTN_SPLIT_GQA_K(2, 256)
-ATTN_SPLIT_GQA_K(4, 64)
-ATTN_SPLIT_GQA_K(4, 128)
-ATTN_SPLIT_GQA_K(4, 256)
-ATTN_SPLIT_GQA_K(8, 64)
-ATTN_SPLIT_GQA_K(8, 128)
-
 // ---------------------------------------------------------------------------------------------------------
 // norm + rope + cache write: qkv [T, (Hq + 2 Hk) * D] bf16 (the merged projection's output), wq/wk [D] the
 // q/k norm weights (null: no norm), cos/sin [positions, D] bf16 (the model's own rotary tables), the rows'
@@ -755,8 +255,8 @@ ATTN_SPLIT_GQA_K(8, 128)
 // the head's dims and 16-31 the second, so rotate_half is a shuffle with lane ^ 16. The norm is the fused
 // F.rms_norm (fp32 throughout, one rounding), the rope the engine's fused form: q*cos rounded to bf16, then
 // one fused multiply-add with the rotated half and sin, rounded once. Warps past Hq + Hk copy the v rows.
-// ROWS: row t is a sequence of its own (the attention's RowsLayout), at position len + steps, its row written
-// to its step's slot.
+// ROWS: row t is a sequence of its own (RowsLayout above), at position len + steps, its row written to its step's
+// slot.
 // ---------------------------------------------------------------------------------------------------------
 template <int D, bool ROWS>
 __device__ __forceinline__ void norm_rope_kv(const bf16* __restrict__ qkv, const bf16* __restrict__ wq,
@@ -923,202 +423,11 @@ extern "C" __global__ void __launch_bounds__(256) btb_sandwich_add(bf16* __restr
 // the tensor-core matvec for wide passes (one kernel for every row count, so a one-row step and a 32-row
 // verify pass share their bits): btb_gemv_mma.cuh
 #include "btb_gemv_mma.cuh"
+// a prompt's matmuls in the bits of the matvec the warm-up picked: btb_gemm.cuh
+#include "btb_gemm.cuh"
 
-// ---------------------------------------------------------------------------------------------------------
-// a prompt chunk's attention: T query rows q [T, Hq, D] at positions n0 .. n0 + T - 1, row t over the cache rows
-// of positions [first, n0 + t] - every row before it and itself, the last `win` under a window - the chunk's own
-// K and V written into the cache before the launch. Tensor cores (bf16 mma.sync m16n8k16, fp32 accumulation): a
-// block takes PF_BM query rows of one head, four warps of 16, and walks the keys in tiles of BN positions from
-// position 0 (a tile's K and V rows loaded once into shared memory for the block's rows), an online softmax
-// across the tiles. A row's bits are fixed by its own keys and the tiles' absolute boundaries alone - not T, not
-// the block it falls in, not the tiles it skips - so a prompt cut into chunks of any size gives the same rows.
-// `tbl` (null: none) maps a position to its cache row, wherever a page put it: the walk is the logical one, the
-// map moves addresses and never a bit, so a paged cache's rows are a contiguous cache's. Head g's row r at
-// g * hs + r * rs, as the decode kernels read it (either layout).
-// ---------------------------------------------------------------------------------------------------------
-#define PF_BM 64
-#define PF_WARPS 4
-
-// a tile's key rows: 64 positions, 32 at the widest head (its rows' registers)
-template <int D>
-struct PfTile {
-    static constexpr int BN = D >= 256 ? 32 : 64;
-};
-
-__device__ __forceinline__ unsigned pf_pack(float a, float b) {
-    const __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
-    return *reinterpret_cast<const unsigned*>(&v);
-}
-
-// four 8x8 bf16 matrices out of shared memory, each transposed into a lane's mma B fragment: lane i supplies the
-// address of row i & 7 of matrix i >> 3
-__device__ __forceinline__ void pf_ldsm_t4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, const bf16* p) {
-    const unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(p));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                 : "r"(a));
-}
-
-template <int D>
-__device__ __forceinline__ void attn_prefill(const bf16* __restrict__ q, const bf16* __restrict__ K,
-                                             const bf16* __restrict__ V, bf16* __restrict__ out, int n0, int T,
-                                             int Hq, int Hk, int hs, int rs, float scale, int win,
-                                             const int* __restrict__ tbl) {
-    constexpr int BN = PfTile<D>::BN;
-    constexpr int KT = D / 16;    // the dot product's k-tiles
-    constexpr int NT = BN / 8;    // a key tile's score n-tiles
-    constexpr int OT = D / 8;     // the output's n-tiles
-    constexpr int SROW = D + 8;   // a key row in shared memory, padded so a fragment's rows fall in distinct banks
-    constexpr int CH = D / 8;     // 16-byte chunks a row
-    __shared__ __align__(16) bf16 sK[BN * SROW];
-    __shared__ __align__(16) bf16 sV[BN * SROW];
-    const int h = blockIdx.y, g = h / (Hq / Hk);
-    const int t0 = blockIdx.x * PF_BM;
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
-    const int r0 = t0 + warp * 16;  // the warp's first row
-    // the warp's rows' q as mma A fragments: rows gid and gid + 8, k pairs tig * 2 and tig * 2 + 8 of each k-tile
-    unsigned qa[KT][4];
-#pragma unroll
-    for (int kt = 0; kt < KT; ++kt) {
-#pragma unroll
-        for (int u = 0; u < 4; ++u) {
-            const int row = r0 + gid + (u & 1) * 8;
-            const int col = kt * 16 + tig * 2 + (u >> 1) * 8;
-            qa[kt][u] = row < T ? *reinterpret_cast<const unsigned*>(q + ((size_t)row * Hq + h) * D + col) : 0u;
-        }
-    }
-    // the lane's two rows' positions, their running max and sum, and their output
-    const int pos[2] = {n0 + r0 + gid, n0 + r0 + gid + 8};
-    float m[2] = {NEG_INF, NEG_INF}, l[2] = {0.f, 0.f};
-    float o[OT][4];
-#pragma unroll
-    for (int ot = 0; ot < OT; ++ot) o[ot][0] = o[ot][1] = o[ot][2] = o[ot][3] = 0.f;
-    // the block's keys: the first row's window start through the last live row's own position
-    const int hi = n0 + min(t0 + PF_BM, T);
-    const int lo = win > 0 ? max(n0 + t0 + 1 - win, 0) : 0;
-    // the warp's rows' span: a tile past its last row, or before its first row's window, it skips (all masked)
-    const int w_hi = n0 + min(r0 + 16, T);
-    const int w_lo = win > 0 ? n0 + r0 + 1 - win : 0;
-    const bf16* Kg = K + (size_t)g * hs;
-    const bf16* Vg = V + (size_t)g * hs;
-    for (int j0 = lo / BN * BN; j0 < hi; j0 += BN) {
-        __syncthreads();  // the tile before is consumed
-        for (int c = threadIdx.x; c < BN * CH; c += PF_WARPS * 32) {
-            const int r = c / CH, ch = c % CH;
-            const int j = j0 + r;
-            uint4 kv = make_uint4(0u, 0u, 0u, 0u), vv = make_uint4(0u, 0u, 0u, 0u);
-            if (j < hi) {
-                const size_t slot = (size_t)(tbl != nullptr ? tbl[j] : j);
-                kv = *reinterpret_cast<const uint4*>(Kg + slot * rs + ch * 8);
-                vv = *reinterpret_cast<const uint4*>(Vg + slot * rs + ch * 8);
-            }
-            *reinterpret_cast<uint4*>(sK + r * SROW + ch * 8) = kv;
-            *reinterpret_cast<uint4*>(sV + r * SROW + ch * 8) = vv;
-        }
-        __syncthreads();
-        if (j0 >= w_hi || j0 + BN <= w_lo || r0 >= T) continue;  // every score of the warp's rows masked here
-        // scores: q . k over the tile's keys, n-tile nt holding keys nt * 8 + tig * 2 (+1) of rows gid, gid + 8
-        float s[NT][4];
-#pragma unroll
-        for (int nt = 0; nt < NT; ++nt) s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.f;
-#pragma unroll
-        for (int kt = 0; kt < KT; ++kt) {
-#pragma unroll
-            for (int nt = 0; nt < NT; ++nt) {
-                const bf16* kp = sK + (nt * 8 + gid) * SROW + kt * 16 + tig * 2;
-                const unsigned b0 = *reinterpret_cast<const unsigned*>(kp);
-                const unsigned b1 = *reinterpret_cast<const unsigned*>(kp + 8);
-                btb_mma16816(s[nt][0], s[nt][1], s[nt][2], s[nt][3], qa[kt][0], qa[kt][1], qa[kt][2], qa[kt][3], b0,
-                             b1);
-            }
-        }
-        // scaled, the keys a row does not see masked: after its own position, before its window, past the chunk
-        float mx[2] = {m[0], m[1]};
-#pragma unroll
-        for (int nt = 0; nt < NT; ++nt) {
-#pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                const int j = j0 + nt * 8 + tig * 2 + (e & 1);
-                const int p = pos[e >> 1];
-                const bool ok = j <= p && j < hi && (win <= 0 || j > p - win);
-                s[nt][e] = ok ? s[nt][e] * scale : NEG_INF;
-                mx[e >> 1] = fmaxf(mx[e >> 1], s[nt][e]);
-            }
-        }
-        // the rows' new max over the quad holding them, the old state rescaled to it, the tile's weights
-        float sum[2] = {0.f, 0.f}, corr[2];
-#pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 1));
-            mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 2));
-            corr[r] = mx[r] == NEG_INF ? 1.f : expf(m[r] - mx[r]);
-        }
-#pragma unroll
-        for (int nt = 0; nt < NT; ++nt) {
-#pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                const int r = e >> 1;
-                const float p = mx[r] == NEG_INF ? 0.f : expf(s[nt][e] - mx[r]);
-                s[nt][e] = p;
-                sum[r] += p;
-            }
-        }
-#pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            sum[r] += __shfl_xor_sync(0xffffffffu, sum[r], 1);
-            sum[r] += __shfl_xor_sync(0xffffffffu, sum[r], 2);
-            l[r] = l[r] * corr[r] + sum[r];
-            m[r] = mx[r];
-        }
-#pragma unroll
-        for (int ot = 0; ot < OT; ++ot) {
-            o[ot][0] *= corr[0];
-            o[ot][1] *= corr[0];
-            o[ot][2] *= corr[1];
-            o[ot][3] *= corr[1];
-        }
-        // the weights times V: a k-tile of 16 keys a step, the weights in bf16 as the A fragments, V transposed out
-        // of shared memory as the B fragments, two output n-tiles a load
-#pragma unroll
-        for (int kk = 0; kk < BN / 16; ++kk) {
-            const unsigned a0 = pf_pack(s[2 * kk][0], s[2 * kk][1]);
-            const unsigned a1 = pf_pack(s[2 * kk][2], s[2 * kk][3]);
-            const unsigned a2 = pf_pack(s[2 * kk + 1][0], s[2 * kk + 1][1]);
-            const unsigned a3 = pf_pack(s[2 * kk + 1][2], s[2 * kk + 1][3]);
-            const int vr = kk * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
-#pragma unroll
-            for (int ot = 0; ot < OT; ot += 2) {
-                unsigned b0, b1, b2, b3;
-                pf_ldsm_t4(b0, b1, b2, b3, sV + vr * SROW + ot * 8 + (lane >> 4) * 8);
-                btb_mma16816(o[ot][0], o[ot][1], o[ot][2], o[ot][3], a0, a1, a2, a3, b0, b1);
-                btb_mma16816(o[ot + 1][0], o[ot + 1][1], o[ot + 1][2], o[ot + 1][3], a0, a1, a2, a3, b2, b3);
-            }
-        }
-    }
-#pragma unroll
-    for (int r = 0; r < 2; ++r) {
-        const int row = r0 + gid + r * 8;
-        if (row >= T) continue;
-        const float inv = 1.f / l[r];
-        bf16* op = out + ((size_t)row * Hq + h) * D + tig * 2;
-#pragma unroll
-        for (int ot = 0; ot < OT; ++ot) {
-            *reinterpret_cast<__nv_bfloat162*>(op + ot * 8) =
-                __floats2bfloat162_rn(o[ot][2 * r] * inv, o[ot][2 * r + 1] * inv);
-        }
-    }
-}
-
-#define ATTN_PREFILL_K(D)                                                                                    \
-    extern "C" __global__ void __launch_bounds__(PF_WARPS * 32) btb_attn_prefill_d##D(                       \
-        const bf16* __restrict__ q, const bf16* __restrict__ K, const bf16* __restrict__ V,                  \
-        bf16* __restrict__ out, int n0, int T, int Hq, int Hk, int hs, int rs, float scale, int win,          \
-        const int* __restrict__ tbl) {                                                                       \
-        attn_prefill<D>(q, K, V, out, n0, T, Hq, Hk, hs, rs, scale, win, tbl);                              \
-    }
-ATTN_PREFILL_K(64)
-ATTN_PREFILL_K(128)
-ATTN_PREFILL_K(256)
+// the one attention of every pass, the decode's and the prefill's alike: btb_attn_flash.cuh
+#include "btb_attn_flash.cuh"
 
 // ---------------------------------------------------------------------------------------------------------
 // the step's handoff to the host: the token and the cache's length written straight into pinned host memory
@@ -1934,8 +1243,8 @@ __device__ __forceinline__ unsigned qsa_key(float f) {
 
 // ---------------------------------------------------------------------------------------------------------
 // btb_qsa_select_d{128,256}: node t's picks, a block of QSA_THREADS a node. qi [T, Hi, DI] bf16 its index queries
-// (normed and roped: btb_norm_rope_part), n0 / par the tree as btb_attn_split walks it (par -2: a padding row, nothing
-// picked). The node sees n = n0 + depth + 1 positions, nb = n / r complete blocks: nb <= k_top keeps them all (the
+// (normed and roped: btb_norm_rope_part), n0 / par the pass's tree (*n0 rows before it, node u at slot n0 + u parented
+// to par[u]; par -2: a padding row, nothing picked). The node sees n = n0 + depth + 1 positions, nb = n / r complete blocks: nb <= k_top keeps them all (the
 // reference's top-k over all of them); otherwise its blocks past the committed ones are pooled into shared memory and
 // every block scored - a warp a block, its key in registers wherever it came from, for each head in ascending order
 // the lane's E products in order then the warp's butterfly, relu, added to the block's sum, times 1/sqrt(DI) - into
@@ -2070,16 +1379,207 @@ __device__ __forceinline__ void qsa_select(const bf16* __restrict__ qi, const bf
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// btb_qsa_attn_split_d{128,256}: btb_attn_split's walk over a node's KEY LIST instead of its whole sequence - its
-// picked blocks' positions in block order, then its partial tail, all ascending - list index j at position p(j),
-// cache slot p < n0 ? p : n0 + anc[p - n0]. Key j to warp (j >> 5) & 7, split j / ATTN_SPLIT, the folds as
-// btb_attn_split's: all by LIST index, so a node's bits are a function of its list and its keys' values alone - the
-// T = 1 launch's over its committed path. The grid's splits are fixed by the budget, S = ceil((k_top + 1) r /
-// ATTN_SPLIT) (a list holds at most k_top r + r - 1 keys), so the cost is the budget's, not the context's; a node
-// under the budget lists every position it sees in order and walks exactly as btb_attn_split walks it. Padding rows
-// (par -2) write nothing. Qwen4: 24 q heads, 2 kv heads, head_dim 256, scale 1/16, the output then through the gate
-// (btb_sigmoid_mul / btb_gemv_sgate).
+// btb_qsa_attn_split_d{128,256}: the attention of a pass's T nodes over each node's KEY LIST - its picked blocks'
+// positions in block order, then its partial tail, all ascending - list index j at position p(j), cache slot
+// p < n0 ? p : n0 + anc[p - n0] (*n0 rows stand before the pass, node u at slot n0 + u parented to par[u], -1 at the
+// root, -2 a padding row that writes nothing). q [T, Hq, D] bf16, K/V the layer's rows, head g's row j at g * hs +
+// j * rs, out [T, Hq, D] bf16. Block (h, t, s) walks the list's keys [s QSA_SPLIT, (s + 1) QSA_SPLIT), key j to warp
+// (j >> 5) & 7, each warp in increasing j with an online softmax, warp 0 folding the eight in order; it stores its
+// state, and the last block of (h, t) to arrive folds the splits in order and writes the row (`part_*` S x T x Hq
+// states, `cnt` T x Hq arrival counts, zero between launches: the last block resets its own). All by LIST index, so a
+// node's bits are a function of its list and its keys' values alone - the T = 1 launch's over its committed path. The
+// grid's splits are fixed by the budget, S = ceil((k_top + 1) r / QSA_SPLIT) (a list holds at most k_top r + r - 1
+// keys), so the cost is the budget's, not the context's; a node under the budget lists every position it sees, in
+// order. Qwen4: 24 q heads, 2 kv heads, head_dim 256, scale 1/16, the output then through the gate (btb_sigmoid_mul /
+// btb_gemv_sgate).
 // ---------------------------------------------------------------------------------------------------------
+#define QSA_SPLIT 1024
+// the keys a warp loads, then scores, then folds in order: its K and V rows standing together, and their scores'
+// butterflies side by side instead of each behind the last key's softmax. A key's score is its own dot product and
+// butterfly and the fold is key by key in order whatever the batch, so the batch moves no bit; it is bounded by the
+// registers the rows take (E a lane a row)
+#define QSA_BATCH(E) ((E) >= 8 ? 4 : 8)
+
+// the batch's B scores q . k_u * scale, each over the lane's E elements then the butterfly: independent chains
+template <int E, int B>
+__device__ __forceinline__ void qsa_scores(float* sc, const float* qf, const Vec<E>* kv, float scale) {
+#pragma unroll
+    for (int u = 0; u < B; ++u) {
+        float d = 0.f;
+#pragma unroll
+        for (int e = 0; e < E; ++e) d = fmaf(qf[e], kv[u].at(e), d);
+        sc[u] = d;
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+#pragma unroll
+        for (int u = 0; u < B; ++u) sc[u] += __shfl_xor_sync(0xffffffffu, sc[u], o);
+    }
+#pragma unroll
+    for (int u = 0; u < B; ++u) sc[u] *= scale;
+}
+
+template <int D>
+__device__ __forceinline__ void qsa_attn(const bf16* __restrict__ q, const bf16* __restrict__ K,
+                                         const bf16* __restrict__ V, bf16* __restrict__ out,
+                                         const int* __restrict__ n0p, const int* __restrict__ par,
+                                         const int* __restrict__ sel, const int* __restrict__ nsel, int ratio,
+                                         int ktop, int T, int Hq, int Hk, int hs, int rs, float scale,
+                                         float* __restrict__ part_m, float* __restrict__ part_l,
+                                         float* __restrict__ part_acc, int* __restrict__ cnt) {
+    constexpr int E = D / 32;
+    constexpr int B = QSA_BATCH(E);
+    const int h = blockIdx.x, t = blockIdx.y, s = blockIdx.z;
+    const int g = h / (Hq / Hk);
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    // the node's ancestors among the pass's rows, root first, and its depth
+    __shared__ int anc[32];
+    __shared__ int s_d;
+    const int n0 = *n0p;
+    if (par[t] < -1) return;  // a padding row: nothing to attend
+    if (threadIdx.x == 0) {
+        int tmp[32];
+        int len = 0;
+        for (int p = t; p >= 0 && p < T && len < 32; p = par[p]) tmp[len++] = p;
+        for (int e = 0; e < len; ++e) anc[e] = tmp[len - 1 - e];
+        s_d = len - 1;
+    }
+    __syncthreads();
+    // the list: the picked blocks' keys in block order, then the partial tail - ascending positions
+    const int seq = n0 + s_d + 1;
+    const int nb = seq / ratio;
+    const int npk = nsel[t] * ratio;
+    const int* selt = sel + (size_t)t * ktop;
+    const int n = npk + (seq - nb * ratio);
+    float qf[E];
+    const bf16* qp = q + ((size_t)t * Hq + h) * D + lane * E;
+#pragma unroll
+    for (int e = 0; e < E; ++e) qf[e] = bf2f(qp[e]);
+    const size_t rowstride = (size_t)rs;
+    const bf16* Kg = K + (size_t)g * hs + lane * E;
+    const bf16* Vg = V + (size_t)g * hs + lane * E;
+    float m = NEG_INF, l = 0.f, acc[E];
+#pragma unroll
+    for (int e = 0; e < E; ++e) acc[e] = 0.f;
+    // the splits this node needs: a single one writes its row directly, without the partials
+    const int S_active = (n + QSA_SPLIT - 1) / QSA_SPLIT;
+    if (s >= S_active) return;
+    const int lo = s * QSA_SPLIT, hi = min(lo + QSA_SPLIT, n);
+    for (int j0 = lo + w * 32; j0 < hi; j0 += 256) {
+        const int j1 = min(j0 + 32, hi);
+        for (int j = j0; j < j1; j += B) {
+            const int c4 = min(B, j1 - j);
+            Vec<E> kv[B] = {}, vv[B];
+#pragma unroll
+            for (int u = 0; u < B; ++u) {
+                if (u < c4) {
+                    const int jj = j + u;
+                    const int pos = jj < npk ? selt[jj / ratio] * ratio + jj % ratio : nb * ratio + (jj - npk);
+                    const int slot = pos < n0 ? pos : n0 + anc[pos - n0];
+                    kv[u].load(Kg + (size_t)slot * rowstride);
+                    vv[u].load(Vg + (size_t)slot * rowstride);
+                }
+            }
+            float sc[B];
+            qsa_scores<E, B>(sc, qf, kv, scale);
+#pragma unroll
+            for (int u = 0; u < B; ++u) {
+                if (u < c4) {
+                    const float mn = fmaxf(m, sc[u]);
+                    const float corr = expf(m - mn);
+                    const float p = expf(sc[u] - mn);
+                    l = l * corr + p;
+#pragma unroll
+                    for (int e = 0; e < E; ++e) acc[e] = fmaf(p, vv[u].at(e), acc[e] * corr);
+                    m = mn;
+                }
+            }
+        }
+    }
+    __shared__ float sm_m[8], sm_l[8];
+    __shared__ float sm_acc[8][D];
+    if (lane == 0) {
+        sm_m[w] = m;
+        sm_l[w] = l;
+    }
+#pragma unroll
+    for (int e = 0; e < E; ++e) sm_acc[w][lane * E + e] = acc[e];
+    __syncthreads();
+    if (w != 0) return;
+    // the block's state: the eight warps folded in order
+    float M = sm_m[0], L = sm_l[0], o[E];
+#pragma unroll
+    for (int e = 0; e < E; ++e) o[e] = sm_acc[0][lane * E + e];
+    for (int u = 1; u < 8; ++u) {
+        const float mu = sm_m[u];
+        if (mu == NEG_INF) continue;
+        if (M == NEG_INF) {
+            M = mu;
+            L = sm_l[u];
+#pragma unroll
+            for (int e = 0; e < E; ++e) o[e] = sm_acc[u][lane * E + e];
+            continue;
+        }
+        const float Mn = fmaxf(M, mu);
+        const float c0 = expf(M - Mn), c1 = expf(mu - Mn);
+        L = L * c0 + sm_l[u] * c1;
+#pragma unroll
+        for (int e = 0; e < E; ++e) o[e] = o[e] * c0 + sm_acc[u][lane * E + e] * c1;
+        M = Mn;
+    }
+    const size_t row = ((size_t)t * Hq + h);
+    if (S_active == 1) {
+        bf16* op = out + row * D + lane * E;
+        const float inv = 1.f / L;
+#pragma unroll
+        for (int e = 0; e < E; ++e) op[e] = f2bf(o[e] * inv);
+        return;
+    }
+    const size_t idx = (size_t)s * T * Hq + row;
+    if (lane == 0) {
+        part_m[idx] = M;
+        part_l[idx] = L;
+    }
+#pragma unroll
+    for (int e = 0; e < E; ++e) part_acc[idx * D + lane * E + e] = o[e];
+    __threadfence();
+    __syncwarp();  // every lane's partial stores precede lane 0's arrival: the last arriver folds a whole state
+    int last = 0;
+    if (lane == 0) last = (atomicAdd(cnt + row, 1) == S_active - 1) ? 1 : 0;
+    last = __shfl_sync(0xffffffffu, last, 0);
+    if (!last) return;
+    __threadfence();
+    // the last block for (h, t): the active states in split order, read past L1
+    M = NEG_INF;
+    L = 0.f;
+#pragma unroll
+    for (int e = 0; e < E; ++e) o[e] = 0.f;
+    for (int u = 0; u < S_active; ++u) {
+        const size_t iu = (size_t)u * T * Hq + row;
+        const float mu = __ldcg(part_m + iu);
+        if (mu == NEG_INF) continue;
+        const float lu = __ldcg(part_l + iu);
+        if (M == NEG_INF) {
+            M = mu;
+            L = lu;
+#pragma unroll
+            for (int e = 0; e < E; ++e) o[e] = __ldcg(part_acc + iu * D + lane * E + e);
+            continue;
+        }
+        const float Mn = fmaxf(M, mu);
+        const float c0 = expf(M - Mn), c1 = expf(mu - Mn);
+        L = L * c0 + lu * c1;
+#pragma unroll
+        for (int e = 0; e < E; ++e) o[e] = o[e] * c0 + __ldcg(part_acc + iu * D + lane * E + e) * c1;
+        M = Mn;
+    }
+    bf16* op = out + row * D + lane * E;
+    const float inv = 1.f / L;
+#pragma unroll
+    for (int e = 0; e < E; ++e) op[e] = f2bf(o[e] * inv);
+    if (lane == 0) cnt[row] = 0;
+}
+
 #define QSA_K(D)                                                                                             \
     extern "C" __global__ void __launch_bounds__(256) btb_qsa_pool_d##D(                                     \
         const bf16* __restrict__ raw, bf16* __restrict__ pk, int* pk_len, const int* __restrict__ n0p,       \
@@ -2101,8 +1601,8 @@ __device__ __forceinline__ void qsa_select(const bf16* __restrict__ qi, const bf
         const int* __restrict__ sel, const int* __restrict__ nsel, int r, int ktop, int T, int Hq, int Hk,   \
         int hs, int rs, float scale, float* __restrict__ part_m, float* __restrict__ part_l,                 \
         float* __restrict__ part_acc, int* __restrict__ cnt, int S) {                                        \
-        attn_decode_split<D, WALK_QSA>(q, K, V, out, n0p, par, nullptr, sel, nsel, r, ktop, T, Hq, Hk, hs,   \
-                                       rs, scale, part_m, part_l, part_acc, cnt, S, 0);                      \
+        qsa_attn<D>(q, K, V, out, n0p, par, sel, nsel, r, ktop, T, Hq, Hk, hs, rs, scale, part_m, part_l,    \
+                    part_acc, cnt); /* S: the grid's splits, its z extent */                                 \
     }
 QSA_K(128)
 QSA_K(256)

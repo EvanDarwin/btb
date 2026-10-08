@@ -25,13 +25,17 @@ from typing import Any
 import pytest
 import torch
 
-from btb.engine import StreamedTextModel
+from btb.engine import MemoryGrantError, StreamedTextModel
+from btb.engine.cuda import CardPassFailed
 from btb.engine.paged import PagedCache
 from btb.engine.prefix import PrefixCache
 from btb.kinds import PassTag
 from tests.helpers import FIXTURES, fixture, shared_key, shared_model
 
 DENSE = ["tiny_gemma3", "tiny_phi3", "tiny_qwen3"]
+# the dense families the card graph serves, whose prompts take its kernels (`_forward_card_prefill`): Phi-3's fused
+# projections run its torch modules (`Missing.PREFIX_INVARIANCE` in the cert's manifest)
+GRAPHED = ["tiny_gemma3", "tiny_qwen3"]
 OTHERS = ["tiny_gpt_oss", "tiny_q35", "tiny_q4"]
 VOCAB = 200  # inside every fixture's vocabulary
 # where a conversation's rows lie: the host's region on the CPU; on the card, the card's region under the card graph
@@ -68,13 +72,19 @@ def prefix(sm: StreamedTextModel) -> PrefixCache:
 
 @contextlib.contextmanager
 def contiguous(sm: StreamedTextModel) -> Iterator[None]:
-    """the engine's sessions on contiguous caches of their own, as an engine without a prefix cache keeps them"""
+    """the engine's sessions on contiguous caches of their own, as an engine without a prefix cache keeps them - the
+    engine left as it was found after: a prefix cache not made yet is made when next asked for, never left off for
+    the tests after on the same load"""
+    made = "_kv" in sm.__dict__
     held = sm.__dict__.get("_kv")
     sm.__dict__["_kv"] = None
     try:
         yield
     finally:
-        sm.__dict__["_kv"] = held
+        if made:
+            sm.__dict__["_kv"] = held
+        else:
+            sm.__dict__.pop("_kv", None)
 
 
 def toks(rng: random.Random, n: int) -> list[int]:
@@ -219,12 +229,237 @@ def test_two_conversations_opening_alike_read_the_same_rows(stem: str, place: st
 
 
 @CARD
+@pytest.mark.parametrize("place", ["card"])  # named, so the test declares the load it takes (`shared_model_keys`)
+@pytest.mark.parametrize("stem", GRAPHED)
+def test_a_hit_decodes_as_its_prompt_cold(stem: str, place: str) -> None:
+    """on the card, a conversation's next turn read from the cache - its rows made by the turn before's prefill and
+    by its decode's steps and verify passes - answers as the same prompt decoded cold, every logit and token: each of
+    a prompt's rows is the row its step makes (`_forward_card_prefill`), whole or in chunks, greedy or speculative"""
+    sm = model(stem, place)
+    rng = random.Random(4)
+    a1, more = chatty(rng, 150), chatty(rng, 40)
+    keep = sm.prefill_chunk
+    try:
+        for chunk in (None, 16):  # the prompt whole, or in chunks: the chunk loop and the layer-by-layer sweep
+            for spec in (False, True):
+                sm.prefill_chunk = chunk
+                prefix(sm)
+                s = sm.session()
+                out1 = list(sm.generate(a1, 12, eos=(), session=s, speculate=spec).tokens)
+                got = list(sm.generate([*a1, *out1, *more], 12, eos=(), session=s, speculate=spec).tokens)
+                assert s.last_reuse >= len(a1) + len(out1) - 1, "the next turn did not find the conversation's rows"
+                assert PassTag.PREFIX_HIT in sm.last_pass_report()
+                after = s.next_logits()
+                prefix(sm)  # nothing kept: the same prompt cold
+                cold = sm.session()
+                want = list(sm.generate([*a1, *out1, *more], 12, eos=(), session=cold, speculate=spec).tokens)
+                assert cold.last_reuse == 0
+                assert PassTag.CARD_PREFILL in sm.last_pass_report(), "the cold prompt did not take the card's kernels"
+                assert got == want, f"chunks of {chunk}, speculative {spec}: the hit {got} against cold {want}"
+                assert torch.equal(after, cold.next_logits()), f"chunks of {chunk}, speculative {spec}: logits apart"
+    finally:
+        sm.prefill_chunk = keep
+
+
+@CARD
+@pytest.mark.parametrize("place", ["card"])
+@pytest.mark.parametrize("stem", GRAPHED)
+def test_a_prompts_card_rows_outlive_another_taking_the_arena(stem: str, place: str) -> None:
+    """a contiguous cache's fresh prompt, its rows written by the card's kernels straight into the arena, keeps every
+    one of them when another session's prompt takes the arena - copied out as an appended cache's are (left
+    uninitialized, the eviction took the layer for empty and let them go) - and goes on as it would have alone"""
+    sm = model(stem, place)
+    rng = random.Random(5)
+    p1, p2, more = toks(rng, 90), toks(rng, 70), toks(rng, 10)
+    p2[0] = (p1[0] + 1) % VOCAB or 3
+    with contiguous(sm):
+        a = sm.session()
+        a.feed(p1)
+        assert PassTag.CARD_PREFILL in sm.last_pass_report()
+        held = [a.rows(i) for i in range(sm.L)]
+        b = sm.session()
+        b.feed(p2)  # the arena the second prompt's
+        assert sm._card_state()["arena"]["owner"]() is b.cache, "the second prompt did not take the arena"
+        for i, (k, v) in enumerate(held):
+            k2, v2 = a.rows(i)
+            assert torch.equal(k, k2) and torch.equal(v, v2), f"layer {i}: the first prompt's rows were let go"
+        got = a.feed(more).logits
+        alone = sm.session()
+        alone.feed(p1)
+        assert torch.equal(got, alone.feed(more).logits)
+
+
+@CARD
+@pytest.mark.parametrize("place", ["card"])
+@pytest.mark.parametrize("stem", GRAPHED)
+def test_a_sweep_leaves_the_arena_with_the_cache_holding_it(stem: str, place: str) -> None:
+    """contiguous caches: a prompt swept layer by layer while another session's rows hold the card graphs' arena
+    takes the torch layers over rows of its own - the arena, its holder's rows and its holder's next turn as they
+    were (bound by the sweep's layers, the arena was taken from its holder at the length the new cache had, its
+    chunks' rows written past it)"""
+    sm = model(stem, place)
+    rng = random.Random(9)
+    p1, p2, more = toks(rng, 90), toks(rng, 150), toks(rng, 10)
+    p2[0] = (p1[0] + 1) % VOCAB or 3
+    keep = sm.prefill_chunk
+    with contiguous(sm):
+        a = sm.session()
+        a.feed(p1)
+        assert sm._card_state()["arena"]["owner"]() is a.cache
+        held = [a.rows(i) for i in range(sm.L)]
+        sm.prefill_chunk = 16
+        try:
+            b = sm.session()
+            b.feed(p2, last_only=True)  # the layer-by-layer sweep
+        finally:
+            sm.prefill_chunk = keep
+        assert sm._card_state()["arena"]["owner"]() is a.cache, "the sweep took the arena from the session holding it"
+        assert b.cache is not None and b.cache.get_seq_length() == len(p2)
+        for i, (k, v) in enumerate(held):
+            k2, v2 = a.rows(i)
+            assert torch.equal(k, k2) and torch.equal(v, v2), f"layer {i}: the holder's rows moved under the sweep"
+        got = a.feed(more).logits
+        alone = sm.session()
+        alone.feed(p1)
+        assert torch.equal(got, alone.feed(more).logits)
+
+
+@CARD
+@pytest.mark.parametrize("place", ["card"])
+@pytest.mark.parametrize("stem", GRAPHED)
+def test_a_prompts_logits_are_its_own_whatever_its_chunks(stem: str, place: str) -> None:
+    """every row's logits of a prompt fed in chunks are the whole prompt's, paged or contiguous: each chunk's its
+    own, never the buffer the next chunk's tail writes again"""
+    sm = model(stem, place)
+    p = chatty(random.Random(6), 150)
+    keep = sm.prefill_chunk
+    got: dict[tuple[int | None, bool], torch.Tensor] = {}
+    try:
+        for chunk in (None, 16):
+            sm.prefill_chunk = chunk
+            for paged in (True, False):
+                prefix(sm)
+                with contextlib.nullcontext() if paged else contiguous(sm):
+                    got[(chunk, paged)] = sm.session().feed(p).logits
+    finally:
+        sm.prefill_chunk = keep
+    want = got[(None, True)]
+    assert want.shape[0] == len(p)
+    for (chunk, paged), lg in got.items():
+        assert torch.equal(lg, want), f"chunks of {chunk}, {'paged' if paged else 'contiguous'}: logits apart"
+
+
+@CARD
+@pytest.mark.parametrize("place", ["card"])
+@pytest.mark.parametrize("stem", GRAPHED)
+def test_a_hooked_decode_speculates_as_it_steps(stem: str, place: str) -> None:
+    """taps on: the verify passes - trees of the n-gram drafts - and the steps both take the card's kernels, so the
+    speculative decode's tokens and every tapped layer's states are the plain decode's, bit for bit (a hooked tree
+    took the torch layers, its steps the card's)"""
+    sm = model(stem, place)
+    p = chatty(random.Random(7), 120)
+    g: dict[bool, Any] = {}
+    for spec in (False, True):
+        prefix(sm)
+        g[spec] = sm.generate(p, 24, eos=(), speculate=spec, taps=[0, -1])
+    assert list(g[True].tokens) == list(g[False].tokens)
+    hs, hg = g[True].hidden, g[False].hidden
+    assert hs is not None and hg is not None and sorted(hs) == sorted(hg) == [0, sm.L - 1]
+    for i in hg:
+        assert torch.equal(hs[i], hg[i]), f"layer {i}: the speculative decode's taps apart from the steps'"
+
+
+@CARD
+@pytest.mark.parametrize("place", ["card"])
+@pytest.mark.parametrize("stem", GRAPHED)
+def test_a_card_prefill_short_of_room_runs_the_torch_path(
+    stem: str, place: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """the card prefill's buffers refused (the ledger's MemoryGrantError), or the card out of memory at its tail: the
+    pass runs the torch layers over the cache as it found it - every row written once - and answers as those layers
+    do with the card graph off; a hooked pass out of room past its hook's first layer raises (`CardPassFailed`), its
+    hook never fed the layers twice"""
+    sm = model(stem, place)
+    rng = random.Random(8)
+    p = toks(rng, 90)
+    take = sm.scratch.take
+
+    def refuse(name: str, *a: Any, **kw: Any) -> torch.Tensor:
+        if name.startswith("card prefill"):
+            raise MemoryGrantError(f"{name}: refused for the test")
+        return take(name, *a, **kw)
+
+    def full(*a: Any, **kw: Any) -> torch.Tensor:
+        raise torch.OutOfMemoryError("CUDA out of memory (the test's)")
+
+    keep = getattr(sm, "card_graphs", True)
+    try:
+        for paged in (True, False):
+            with contextlib.nullcontext() if paged else contiguous(sm):
+                sm.__dict__.update(card_graphs=False)
+                if paged:
+                    prefix(sm)
+                want = sm.session().feed(p).logits
+                sm.__dict__.update(card_graphs=keep)
+                for short in ("buffers", "tail"):
+                    what = f"{'paged' if paged else 'contiguous'}, short of {short}"
+                    if paged:
+                        prefix(sm)
+                    if short == "buffers":
+                        monkeypatch.setattr(sm.scratch, "take", refuse)
+                    else:
+                        monkeypatch.setattr(sm, "_card_tail", full)
+                    try:
+                        s = sm.session()
+                        got = s.feed(p).logits
+                        assert PassTag.CARD_PREFILL in sm.last_pass_report(), f"{what}: the card's kernels not tried"
+                        sm.__dict__.pop("_card_off", None)  # the card graph back, off since the refusal
+                        if short == "tail":
+                            with pytest.raises(CardPassFailed):
+                                sm.session().feed(p, taps=[0])
+                    finally:
+                        monkeypatch.undo()
+                        sm.__dict__.pop("_card_off", None)
+                    assert s.cache is not None and s.cache.get_seq_length() == len(p), f"{what}: rows written twice"
+                    assert torch.equal(got, want), f"{what}: the torch path's logits apart"
+    finally:
+        sm.__dict__.update(card_graphs=keep)
+        sm.__dict__.pop("_card_off", None)
+
+
+@CARD
+@pytest.mark.parametrize("place", ["card"])
+@pytest.mark.parametrize("stem", ["tiny_qwen3"])
+def test_a_prompt_past_the_cards_grid_is_its_chunks_bits(stem: str, place: str) -> None:
+    """a prompt of more rows than a launch takes on the card's grid.y (65535) in one pass - its rows' writes and its
+    matmuls launched in slices - gives the last row's logits its chunks give"""
+    sm = model(stem, place)
+    rng = random.Random(10)
+    p = [rng.randrange(3, VOCAB) for _ in range(70_000)]
+    keep = sm.prefill_chunk
+    got: dict[int, torch.Tensor] = {}
+    try:
+        for chunk in (1 << 17, 4096):
+            sm.prefill_chunk = chunk
+            prefix(sm)
+            s = sm.session()
+            got[chunk] = s.feed(p, last_only=True).logits
+            assert PassTag.CARD_PREFILL in sm.last_pass_report()
+            del s
+    finally:
+        sm.prefill_chunk = keep
+        prefix(sm)
+    assert torch.equal(got[1 << 17], got[4096])
+
+
+@CARD
+@pytest.mark.parametrize("place", ["card"])
 @pytest.mark.parametrize("stem", DENSE)
-def test_a_layer_the_card_gives_up_takes_every_conversations_rows_and_back(stem: str) -> None:
+def test_a_layer_the_card_gives_up_takes_every_conversations_rows_and_back(stem: str, place: str) -> None:
     """a layer shed to the host and regrown on the card takes every conversation's rows of it each way - the one the
     card holds and one parked in RAM - once for all of them; the conversations go on as contiguous caches moved the
     same way do, logits and all. Last on its load: the placement it leaves is another load's"""
-    sm = model(stem, "card")
+    sm = model(stem, place)
     rng = random.Random(4)
     p1, p2, more = toks(rng, 90), toks(rng, 70), toks(rng, 10)
     p2[0] = (p1[0] + 1) % VOCAB or 3

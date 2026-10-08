@@ -28,7 +28,7 @@ from .radix import RadixTree
 if TYPE_CHECKING:
     from .state import _State
 
-# the head widths the card's attention kernels are built for (btb_attn_prefill_d*, btb_attn_split_tbl_d*)
+# the head widths the card's one attention is built for (btb_attn_flash.cuh: its prefill and decode forms)
 CARD_HEAD_DIMS = (64, 128, 256)
 
 
@@ -116,7 +116,7 @@ class PrefixCache:
         k = Native.card_kernels()
         if k is None:
             return f"the card's kernels are not loaded ({Native.cuda_reason})"
-        missing = [n for n in (f"btb_attn_prefill_d{d}", f"btb_attn_split_tbl_d{d}") if n not in k.fn]
+        missing = [n for n in (k.flash_prefill_kernel(d), f"btb_attn_flash_d{d}") if n not in k.fn]
         if missing:
             return f"the card's kernels lack {', '.join(missing)}"
         return None

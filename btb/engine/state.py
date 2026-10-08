@@ -411,6 +411,14 @@ class _State:
     def _card_segment_at(self, i: int, n_layers: int) -> tuple[int, int] | None:
         raise NotImplementedError
 
+    def _card_prefill_ok(
+        self, cache: Any, B: int, T: int, past: int, am: torch.Tensor | None, on_layer: Any, stop_after: int | None
+    ) -> bool:  # an engine without the card mixin runs no prompt on the card graph's kernels
+        return False
+
+    def _card_runs_layer(self, i: int) -> bool:  # an engine without the card mixin runs no layer in a card graph
+        return False
+
     def _card_ready(self) -> bool:  # an engine without the card mixin runs no card graph
         return False
 
@@ -428,6 +436,9 @@ class _State:
         return False
 
     def _card_arena_take(self, cache: Any, T: int) -> bool:
+        return False
+
+    def _card_arena_has(self, cache: Any, n: int) -> bool:
         return False
 
     def _card_program(
@@ -488,6 +499,21 @@ class _State:
         self, a: int, b: int, h: torch.Tensor, pas: Any, tail: bool
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         raise NotImplementedError
+
+    def _forward_card_prefill(
+        self,
+        a: int,
+        b: int,
+        h: torch.Tensor,
+        pas: Any,
+        tail: bool,
+        all_rows: bool = False,
+        bind_rows: int | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        raise NotImplementedError
+
+    def _card_tail(self, h: torch.Tensor) -> torch.Tensor | None:  # an engine without the card mixin has no card head
+        return None
 
     def _forward_fast(self, h: torch.Tensor, pe: Any, cache: Any, last_only: bool, head: bool) -> torch.Tensor:
         raise NotImplementedError

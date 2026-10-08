@@ -363,8 +363,9 @@ def test_pack12_cell_loads_and_is_deterministic(kind: FamilyKind, stem: str, dev
 
 # input-shape axes beyond the single short stream: a batch of ragged rows (the batched decode loop) and a longer
 # prompt (cache growth, and gemma3's sliding_window=32 eviction). One per backend here (cpu, mlx-step) - the loop
-# is device-specific, family-orthogonal enough that a representative device per backend exercises it. The 1024+
-# attention split (ATTN_SPLIT) still needs a real model: tiny fixtures cap at max_position_embeddings=512.
+# is device-specific, family-orthogonal enough that a representative device per backend exercises it. The card
+# attention's groups past the first (512 keys, 256 at the widest head) are the kernel tests' to cover: tiny fixtures
+# cap at max_position_embeddings=512.
 BATCH_ROWS = [[1, 2, 3, 4], [5, 6, 7, 8]]  # two rows through the batched loop (rectangular: one tensor)
 # 96 tokens: past gemma3's sliding_window (32), real cache growth, and two of cuda-prefill's 64-row chunks
 LONG_PROMPT = list(range(1, 97))

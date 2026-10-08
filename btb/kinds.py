@@ -314,6 +314,9 @@ class PassTag(StrEnum):
     # prefill), read from the buffer itself rather than the views an append hands back
     MLX_ATTN_KERNEL = "mlx_attn_kernel"
     CUDA_GRAPH = "cuda_graph"  # a captured card graph ran the pass (_forward_card_segment/_forward_fast/step graph)
+    # a prompt's chunk through the card graph's kernels as they come, each row the row its step makes
+    # (_forward_card_prefill)
+    CARD_PREFILL = "card_prefill"
     CUDA_TORCH_FALLBACK = "cuda_torch_fallback"  # a card layer through torch modules, btb's kernels absent
     CPU_NATIVE = "cpu_native"  # a host layer through the native CPU gemv kernels
     MLX_PEROP = "mlx_perop"  # a host layer's linears through Native.mlx.linear (the non-fused MLX path: MoE, offload)

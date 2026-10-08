@@ -878,7 +878,12 @@ class GrowLayer(_DynamicLayer):
         self._buf = None
 
     def set_front(self, n: int) -> None:
-        """the rows are the buffer's first n (a graph step wrote them in place): no views, one integer"""
+        """the rows are the buffer's first n (a graph step wrote them in place): no views, one integer. A layer whose
+        first rows the card wrote (a fresh prompt's, `_forward_card_prefill`) holds them as an append's first would:
+        left uninitialized, a move or an eviction from the arena took it for empty and let its rows go"""
+        if not self.is_initialized and self._buf is not None:
+            self.dtype, self.device = self._buf[0].dtype, self._buf[0].device
+            self.is_initialized = True
         self._an = int(n)
 
     def _attached(self) -> bool:

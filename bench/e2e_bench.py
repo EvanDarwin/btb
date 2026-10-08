@@ -393,22 +393,67 @@ def test_cuda_gemv_mma(benchmark: object, shape: str, warps: int, rows: int) -> 
 
 
 @cuda_only
-@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
-@pytest.mark.parametrize("how", ["split", "gqa", "gqa-off"])
-@pytest.mark.parametrize("T", [1, 5])  # the one-row step, a speculative tree's verify
-@pytest.mark.parametrize("n", [128, 512, 1024, 2048, 4096, 8192, 16384, 40960])  # the context the rows attend over
-def test_cuda_attn_gqa(benchmark: object, n: int, T: int, how: str) -> None:
-    """a decode step's attention at Qwen3-0.6B's heads (16 q, 8 kv, d 128): `btb_attn_split_d128`, a block a query
-    head, against `btb_attn_split_gqa2_d128`, a block a KV group reading each key once for its two heads - the same
-    bits (tests/kernels) - and against that kernel below its threshold (`gqa-off`: a block a head, what its
-    registers cost the one-head walk). A round runs one launch a layer over distinct caches past the L2, as a step does, and the
-    rate is the caches' live K/V bytes over the round (`gbps`)."""
+@pytest.mark.benchmark(min_rounds=10, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("how", ["mma", "f32", "cublas"])
+@pytest.mark.parametrize("T", [512, 4096])  # a prompt chunk's rows
+@pytest.mark.parametrize("shape", list(MMA_SHAPES))
+def test_cuda_gemm(benchmark: object, shape: str, T: int, how: str) -> None:
+    """a prompt chunk's matmul over a decode's weight shapes (Qwen3-0.6B's): `btb_gemm_mma_bf16` - each row the
+    tensor-core matvec's bits, at its warps for the shape - and `btb_gemm_f32_bf16` - each row the fp32-chain matvec's
+    - against torch's matmul (cuBLAS), what a prompt's chunk took before its rows had to be its steps'. The rate is
+    the multiply-adds over the time (`tflops`)."""
     k = _cuda_kernels()
-    if "btb_attn_split_gqa2_d128" not in k.fn:
-        pytest.skip("the grouped-query attention is not in this build")
+    if "btb_gemm_mma_bf16" not in k.fn:
+        pytest.skip("the prompt's GEMMs are not in this build")
+    R, C = MMA_SHAPES[shape]
+    w = torch.randn(R, C, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(T, C, dtype=torch.bfloat16, device="cuda")
+    y = torch.empty(T, R, dtype=torch.bfloat16, device="cuda")
+    P, I = k.ptr, ctypes.c_int
+    nw = 2 if (R + 15) // 16 >= 512 else 4  # `_card_mma_warps`: the step's warps for the shape
+
+    def run() -> None:
+        if how == "mma":
+            k.launch(
+                "btb_gemm_mma_bf16",
+                ((R + 63) // 64, (T + 127) // 128, 1),
+                (128, 1, 1),
+                [P(w), P(x), P(y), I(R), I(C), I(T), I(nw)],
+            )
+        elif how == "f32":
+            k.launch(
+                "btb_gemm_f32_bf16",
+                ((R + 31) // 32, (T + 7) // 8, 1),
+                (128, 1, 1),
+                [P(w), P(x), P(y), I(R), I(C), I(T)],
+            )
+        else:
+            torch.matmul(x, w.t(), out=y)
+        torch.cuda.synchronize()
+
+    benchmark.group = f"cuda-gemm-{shape}-t{T}"  # type: ignore[attr-defined]
+    benchmark(run)  # type: ignore[operator]
+    mean = float(benchmark.stats.stats.mean)  # type: ignore[attr-defined]
+    benchmark.extra_info["tflops"] = round(2 * T * R * C / mean / 1e12, 1)  # type: ignore[attr-defined]
+
+
+@cuda_only
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("how", ["flash", "sdpa"])
+@pytest.mark.parametrize("T", [1, 5])  # the one-row step, a speculative tree's verify
+# the context the rows attend over, to a million keys (one layer's cache there: 4 GB)
+@pytest.mark.parametrize("n", [128, 512, 1024, 2048, 4096, 8192, 16384, 40960, 262144, 1048576])
+def test_cuda_attn_decode(benchmark: object, n: int, T: int, how: str) -> None:
+    """a decode step's attention at Qwen3-0.6B's heads (16 q, 8 kv, d 128): the one attention every pass takes, in its
+    decode form (`btb_attn_flash_d128`, tensor cores, a row's bits its own whatever the pass), against torch's sdpa
+    over the same rows (the tree's mask where T > 1). A round runs one call a layer over distinct caches past the L2,
+    as a step does, and the rate is the caches' live K/V bytes over the round (`gbps`)."""
+    k = _cuda_kernels()
+    if "btb_attn_flash_d128" not in k.fn:
+        pytest.skip("the one attention is not in this build")
     Hq, Hk, D = 16, 8, 128
     cap = (n + T + 1023) // 1024 * 1024
-    S = cap // 1024
+    S = cap // 512  # the groups the launch covers: 8 tiles of 64 keys each
     live = 2 * Hk * (n + T) * D * 2
     layers = min(28, -(-(160 << 20) // live))
     KV = [torch.randn(2, Hk, cap, D, dtype=torch.bfloat16, device="cuda") for _ in range(layers)]
@@ -418,19 +463,34 @@ def test_cuda_attn_gqa(benchmark: object, n: int, T: int, how: str) -> None:
     pl = torch.zeros(S * T * Hq, device="cuda")
     pa = torch.zeros(S * T * Hq * D, device="cuda")
     cnt = torch.zeros(T * Hq, dtype=torch.int32, device="cuda")
+    tree = [-1, 0, 1, 0, 3][:T]
     n0 = torch.tensor([n], dtype=torch.int32, device="cuda")
-    par = torch.tensor([-1, 0, 1, 0, 3][:T], dtype=torch.int32, device="cuda")
-    P, I, F = k.ptr, ctypes.c_int, ctypes.c_float
-    name = "btb_attn_split_d128" if how == "split" else "btb_attn_split_gqa2_d128"
-    tail = [I(T), I(Hq), I(Hk), I(cap), F(D**-0.5), P(pm), P(pl), P(pa), P(cnt), I(S), I(0)]
-    # the grouped form's threshold, read on the card as the passes' switch holds it
-    shared = torch.tensor([0 if how == "gqa" else 1 << 30], dtype=torch.int32, device="cuda")
-    tail += [] if how == "split" else [P(shared)]
+    par = torch.tensor(tree, dtype=torch.int32, device="cuda")
+    P, I, Fl = k.ptr, ctypes.c_int, ctypes.c_float
+    # head g's row r at g * hs + r * rs: the caches here head-major [Hk, cap, D]; a block 8 rows of a group, a warp a
+    # tile
+    grid, block = ((T * (Hq // Hk) + 7) // 8, S, Hk), (256, 1, 1)
+    tail = [I(T), I(Hq), I(Hk), I(cap * D), I(D), Fl(D**-0.5), P(pm), P(pl), P(pa), P(cnt), I(0), P(None)]
     args = [[P(q), P(kv[0]), P(kv[1]), P(out), P(n0), P(par), *tail] for kv in KV]
+    # sdpa's rows: each over the prefix, its ancestors and itself
+    seen = torch.zeros(T, n + T, dtype=torch.bool, device="cuda")
+    seen[:, :n] = True
+    for t in range(T):
+        p = t
+        while p >= 0:
+            seen[t, n + p] = True
+            p = tree[p]
+    qs = q.transpose(0, 1)[None]  # [1, Hq, T, D], the module's layout
 
     def body() -> None:
-        for a in args:
-            k.launch(name, (Hq, T, S), (256, 1, 1), a)
+        if how == "flash":
+            for a in args:
+                k.launch("btb_attn_flash_d128", grid, block, a)
+        else:
+            for kv in KV:
+                F.scaled_dot_product_attention(
+                    qs, kv[0, None, :, : n + T], kv[1, None, :, : n + T], attn_mask=seen, enable_gqa=True, scale=D**-0.5
+                )
 
     body()
     torch.cuda.synchronize()
@@ -442,7 +502,7 @@ def test_cuda_attn_gqa(benchmark: object, n: int, T: int, how: str) -> None:
         g.replay()
         torch.cuda.synchronize()
 
-    benchmark.group = f"cuda-attn-gqa-n{n}-t{T}"  # type: ignore[attr-defined]
+    benchmark.group = f"cuda-attn-decode-n{n}-t{T}"  # type: ignore[attr-defined]
     benchmark(run)  # type: ignore[operator]
     mean = float(benchmark.stats.stats.mean)  # type: ignore[attr-defined]
     benchmark.extra_info["gbps"] = round(layers * live / mean / 1e9, 1)  # type: ignore[attr-defined]
@@ -450,31 +510,41 @@ def test_cuda_attn_gqa(benchmark: object, n: int, T: int, how: str) -> None:
 
 @cuda_only
 @pytest.mark.benchmark(min_rounds=10, warmup=True, disable_gc=True)
-@pytest.mark.parametrize("how", ["prefill", "sdpa"])
-@pytest.mark.parametrize("n", [0, 4096, 16384])  # the rows before the chunk
+@pytest.mark.parametrize("how", ["flash", "sdpa"])
+@pytest.mark.parametrize("n", [0, 4096, 16384, 262144, 1048576])  # the rows before the chunk
 @pytest.mark.parametrize("T", [512, 4096])  # the chunk's rows
 def test_cuda_attn_prefill(benchmark: object, T: int, n: int, how: str) -> None:
-    """a prompt chunk's attention at Qwen3-0.6B's heads (16 q, 8 kv, d 128): `btb_attn_prefill_d128` - each row over
-    the rows before it and itself, on tensor cores, through a row map where a cache is paged - against torch's sdpa
-    over the same rows with the causal mask the chunk takes, the module's attention a contiguous cache's prefill
-    took. The rate is the attention's multiply-adds over the time (`tflops`)."""
+    """a prompt chunk's attention at Qwen3-0.6B's heads (16 q, 8 kv, d 128): the one attention every pass takes in its
+    prefill form (`btb_attn_flash_prefill_d128`, each row over the rows before it and itself on tensor cores, the bits
+    its step makes), against torch's sdpa over the same rows with the causal mask the chunk takes. The rate is the
+    attention's multiply-adds over the time (`tflops`)."""
     k = _cuda_kernels()
-    if "btb_attn_prefill_d128" not in k.fn:
-        pytest.skip("the prefill attention is not in this build")
+    if "btb_attn_flash_prefill_d128" not in k.fn:
+        pytest.skip("the one attention is not in this build")
+    if how == "sdpa" and n > 16384:
+        pytest.skip("sdpa takes the chunk's causal mask as a T x (n + T) tensor: 4 GB at a million keys")
     Hq, Hk, D = 16, 8, 128
     K = torch.randn(Hk, n + T, D, dtype=torch.bfloat16, device="cuda")
     V = torch.randn(Hk, n + T, D, dtype=torch.bfloat16, device="cuda")
     q = torch.randn(T, Hq, D, dtype=torch.bfloat16, device="cuda")
     out = torch.empty(T, Hq, D, dtype=torch.bfloat16, device="cuda")
     P, I, Fl = k.ptr, ctypes.c_int, ctypes.c_float
+    states = torch.empty(T * Hq * D, device="cuda")  # the row states (its `run`)
     args = [P(q), P(K), P(V), P(out), I(n), I(T), I(Hq), I(Hk), I(K.stride(0)), I(K.stride(1)), Fl(D**-0.5)]
-    args += [I(0), P(None)]
+    args += [I(0), P(None), P(states)]
     qs = q.transpose(0, 1)[None]  # [1, Hq, T, D], the module's layout
     mask = torch.ones(T, n + T, dtype=torch.bool, device="cuda").tril(diagonal=n)
+    tpb = k.flash_prefill_rows(D) // (Hq // Hk)  # the flash form's tokens a block: their G heads each
 
     def run() -> None:
-        if how == "prefill":
-            k.launch("btb_attn_prefill_d128", ((T + 63) // 64, Hq, 1), (128, 1, 1), args)
+        if how == "flash":
+            k.launch(
+                k.flash_prefill_kernel(D),  # the orientation this card takes (`btb_mma_roles`)
+                ((T + tpb - 1) // tpb, Hk, 1),
+                (128, 1, 1),
+                args,
+                shared=k.flash_prefill_smem(D),
+            )
         else:
             F.scaled_dot_product_attention(qs, K[None], V[None], attn_mask=mask, enable_gqa=True, scale=D**-0.5)
         torch.cuda.synchronize()
@@ -493,12 +563,16 @@ def test_cuda_attn_prefill(benchmark: object, T: int, n: int, how: str) -> None:
 @pytest.mark.parametrize("rows", [1, 8, 32])
 def test_cuda_attn_rows(benchmark: object, rows: int, n: int, how: str) -> None:
     """a fork's decode attention at Qwen3-0.6B's heads (16 q, 8 kv, d 128), each row 16 steps past a shared prefix:
-    `btb_attn_rows_d128` over all rows in one launch, against one `btb_attn_split_d128` launch a row over the same
-    keys (the one-row steps the rows would take one session at a time)."""
+    the one attention's rows form (`btb_attn_flash_rows_d128`) over all rows in one launch, against its decode form
+    (`btb_attn_flash_d128`) a launch a row over the same keys (the one-row steps the rows would take one session at a
+    time)."""
     k = _cuda_kernels()
+    if "btb_attn_flash_rows_d128" not in k.fn:
+        pytest.skip("the one attention is not in this build")
     Hq, Hk, D, steps = 16, 8, 128, 16
+    G = Hq // Hk
     cap = (n + (steps + 1) * rows + 1023) // 1024 * 1024
-    S = cap // 1024
+    S = cap // 512  # the groups the launch covers: 8 tiles of 64 keys each
     K = torch.randn(Hk, cap, D, dtype=torch.bfloat16, device="cuda")
     V = torch.randn(Hk, cap, D, dtype=torch.bfloat16, device="cuda")
     q = torch.randn(rows, Hq, D, dtype=torch.bfloat16, device="cuda")
@@ -511,26 +585,31 @@ def test_cuda_attn_rows(benchmark: object, rows: int, n: int, how: str) -> None:
     rw = torch.tensor([n, steps, rows, *[x for c in range(rows) for x in (c, 0, n)]], dtype=torch.int32, device="cuda")
     n0 = torch.tensor([n + steps], dtype=torch.int32, device="cuda")
     root = torch.tensor([-1], dtype=torch.int32, device="cuda")
-    P, I, F = k.ptr, ctypes.c_int, ctypes.c_float
-    scale = F(D**-0.5)
-    tail = [P(pm), P(pl), P(pa), P(cnt), I(S), I(0)]
+    P, I, Fl = k.ptr, ctypes.c_int, ctypes.c_float
+    # head g's row r at g * hs + r * rs: the cache head-major [Hk, cap, D]
+    dims = [I(Hq), I(Hk), I(cap * D), I(D), Fl(D**-0.5)]
+    states = [P(pm), P(pl), P(pa), P(cnt), I(0)]
     if how == "rows":
         launches = [
-            ((Hq, rows, S), [P(q), P(K), P(V), P(out), P(rw), I(rows), I(Hq), I(Hk), I(cap), scale, *tail], "rows")
+            (
+                "btb_attn_flash_rows_d128",
+                (rows * ((G + 7) // 8), S, Hk),
+                [P(q), P(K), P(V), P(out), P(rw), I(rows), *dims, *states],
+            )
         ]
     else:
         launches = [
             (
-                (Hq, 1, S),
-                [P(q[r]), P(K), P(V), P(out[r]), P(n0), P(root), I(1), I(Hq), I(Hk), I(cap), scale, *tail],
-                "split",
+                "btb_attn_flash_d128",
+                ((G + 7) // 8, S, Hk),
+                [P(q[r]), P(K), P(V), P(out[r]), P(n0), P(root), I(1), *dims, *states, P(None)],
             )
             for r in range(rows)
         ]
 
     def run() -> None:
-        for grid, args, kind in launches:
-            k.launch(f"btb_attn_{kind}_d{D}", grid, (256, 1, 1), args)
+        for name, grid, args in launches:
+            k.launch(name, grid, (256, 1, 1), args)
         torch.cuda.synchronize()
 
     benchmark.group = f"cuda-attn-rows/n{n}/rows{rows}"  # type: ignore[attr-defined]

@@ -245,12 +245,19 @@ class _MemoryMixin(_State):
             self._card_let_go()
             i = max(self.resident)
             # the host's copy made before the card's leaves: one that raises leaves the layer where it was, never in
-            # neither tier
+            # neither tier. Its rows follow it (`_caches_to`, the prefix cache's region for every conversation): a
+            # move refused - the host's region not granted the room - puts the layer back with them, never a layer
+            # on the host whose rows stayed on the card
             host = self._make_host_layer(i)
             tmpl = self.resident.pop(i)
-            del tmpl
             self.host[i] = host
-            self._caches_to(i, "cpu", cache)
+            try:
+                self._caches_to(i, "cpu", cache)
+            except BaseException:
+                self.host.pop(i, None)
+                self.resident[i] = tmpl
+                raise
+            del tmpl
             moved = f"layer {i}"
         elif self.resident_head and self.dev.type == Device.CUDA:
             self._head_host()
@@ -287,8 +294,17 @@ class _MemoryMixin(_State):
                 for p in tmpl.parameters():
                     p.data = p.data.to(self.compute_dtype)
             self.resident[i] = tmpl
-            self.host.pop(i, None)
-            self._caches_to(i, self.dev, cache)
+            host = self.host.pop(i, None)
+            try:
+                self._caches_to(i, self.dev, cache)
+            except BaseException:
+                # its rows refused the card (the region's arena for it not granted): the layer stays shed, its rows
+                # with it on the host
+                self.resident.pop(i, None)
+                if host is not None:
+                    self.host[i] = host
+                self._shed.append(what)
+                raise
         log(f"[vram] REGROW {what} -> {self.dev} (still shed: {self._shed}); " + vram_pressure_line())
         return what
 

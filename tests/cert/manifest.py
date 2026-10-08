@@ -226,18 +226,20 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "the card's paged attention kernels read bf16 rows with heads of 64, 128 or 256 dims, and this sub-path's "
         "card layers compute wider (`fp32`), so the prefix cache does not serve it (btb/engine/prefix.py "
         "`_card_why_not`): its sessions keep one conversation's cache each",
-        "give btb_attn_prefill_d* and btb_attn_split_tbl_d* float32 variants (native/cuda/btb_kernels.cu) and the "
-        "card's arenas a float32 layout, then take the condition out of `_card_why_not` and spec.paged",
+        "give the one attention (native/cuda/btb_attn_flash.cuh) float32 forms and the card's arenas a float32 "
+        "layout, then take the condition out of `_card_why_not` and spec.paged",
     ),
     Missing.PREFIX_INVARIANCE: (
-        "on the card a prompt's rows come out of a prefill with other bits than the decode steps make them with - its "
-        "matmuls, attention, norms and rope are other kernels - so a hit, reading the rows its conversation's steps "
-        "made, parts from the same prompt decoded cold at a bf16 near-tie (tiny_phi3 under kv_host: 0.004 between "
-        "the top two). The hit equals the uninterrupted conversation bit for bit (tests/integration/"
-        "test_prefix_cache.py); it is the cold decode it cannot equal yet",
-        "make the card's prefill compute each row as the step does - a GEMM summing each row in the step's matvec "
-        "order, one attention kernel for both at fixed key splits, the card graph's norm, rope and activation "
-        "kernels - and the host's layers' likewise; then drop the condition from manifest.prefix_gap",
+        "on this sub-path a prompt's rows come out of layers the card graph's kernels do not run - the torch modules "
+        "of a family they are not written for (Phi-3's fused projections), the host's layers, the kv_host tier - "
+        "whose matmuls sum a row otherwise than its decode step does, so a hit, reading the rows its conversation's "
+        "steps made, parts from the same prompt decoded cold at a bf16 near-tie. The hit equals the uninterrupted "
+        "conversation bit for bit (tests/integration/test_prefix_cache.py); it is the cold decode it cannot equal "
+        "yet. Where every layer runs the card graph's kernels the prefill makes each row as its step does "
+        "(`_forward_card_prefill`), and the gap is closed",
+        "bring the family onto the card graph's kernels (cuda.py `_card_family_ok`; Phi-3: its fused q/k/v and "
+        "gate/up as the card's merged weights, no q/k norm), and make the host's layers and the kv_host tier compute "
+        "each prompt row as their step does; then narrow manifest.prefix_gap",
     ),
     Missing.PREFIX_SNAPSHOT: (
         "a hybrid's recurrent layers resume only from a kept snapshot of their state, and none is kept at a message "
@@ -554,13 +556,16 @@ def prefix_gap(kind: FamilyKind, dev: spec.DeviceSubpath) -> Missing | None:
     """why the prefix axis's conversations cannot hold on this family and sub-path, in the order the engine hits
     it: a sub-path that does not engage at all (its own gap), then the engine's own reasons (`PrefixCache.why_not`,
     whose rule `spec.paged` is): a tier the prefix cache is not on yet, a hybrid's snapshots, a family's own
-    attention, then the card's own conditions (its kernels' widths). Served on the card, a hit cannot equal its cold
-    decode until the card's prefill makes each row as the step does (`PREFIX_INVARIANCE`)"""
+    attention, then the card's own conditions (its kernels' widths). Served on the card, a hit equals its cold decode
+    where every layer runs the card graph's kernels, whose prefill makes each row as the step does; elsewhere on the
+    card it cannot yet (`PREFIX_INVARIANCE`)"""
     refused = subpath_gap(kind, spec.Storage.SAFE_BF16, dev)
     if refused is not None:
         return refused
     if spec.paged(kind, dev.hardware, dev.knobs):
-        return Missing.PREFIX_INVARIANCE if dev.hardware is spec.Hardware.CUDA else None
+        if dev.hardware is not spec.Hardware.CUDA or (dev.card_graph and spec.card_rows(kind)):
+            return None
+        return Missing.PREFIX_INVARIANCE
     if dev.hardware not in (spec.Hardware.CPU, spec.Hardware.CUDA):
         return Missing.PREFIX_CACHE
     if spec.recurrent(kind):
