@@ -14,7 +14,7 @@ import enum
 import weakref
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, TypedDict, Unpack
+from typing import TYPE_CHECKING, Any, TypedDict, Unpack, cast
 
 from .api import api
 from .kinds import LayerKind, PassTag, Tokens
@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     from .engine.generate import LinSnap
     from .engine.hooks import Taps
     from .engine.model import StreamedTextModel
+    from .engine.paged import PagedCache, PagedLayer
+    from .engine.prefix import PrefixCache
     from .engine.state import _State
     from .engine.text import GenerateArgs, RowGeneration
 
@@ -83,10 +85,25 @@ class Mark:
     path: tuple[int, ...] | None = None
 
 
+def _prefix(eng: Any) -> PrefixCache | None:
+    """the engine's prefix cache where its sessions' rows live in it (btb/engine/prefix.py), else None"""
+    get = getattr(eng, "_prefix_cache", None)
+    return get() if get is not None else None
+
+
+def _fresh_cache(eng: Any) -> KvCache:
+    """a new cache for a session: over the engine's pool where it has a prefix cache, else a contiguous one"""
+    pc = _prefix(eng)
+    return pc.new() if pc is not None else eng.new_cache()
+
+
 def crop(cache: KvCache, engine: _State, n: int) -> None:
     """the attention layers of `cache` cut back to their first n rows"""
     from transformers.cache_utils import CacheLayerMixin, DynamicIndexedLayer, DynamicSlidingWindowLayer
 
+    if getattr(cache, "paged", False):
+        cast("PagedCache", cache).crop_to(n)  # the table's positions past n let go, every layer's with them
+        return
     for i in range(engine.L):
         cl = cache.layers[i]
         if not isinstance(cl, CacheLayerMixin) or cl.keys is None or cl.values is None or cl.keys.shape[-2] <= n:
@@ -165,6 +182,9 @@ class _Txn:
         s.ids = [int(t) for t in ids]
         s._pending, s.logits = (int(pending) if pending is not None else None), logits
         s.n_prompt = len(s.ids) if n_prompt is None else int(n_prompt)
+        if getattr(s.cache, "paged", False):
+            # what the session made, into the engine's tree: a later prompt opens on it
+            cast("PagedCache", s.cache).commit(s.ids)
         if anchors is not None:
             s.anchor = list(anchors)
         dr, dr_len, pend_h = drafter
@@ -188,7 +208,7 @@ class _Txn:
         if p.n == 0 or s.cache is None:
             # a point over no rows: a fresh cache. No rows is no recurrent state either, and a snapshot taken there
             # holds none to restore - a hybrid's states the transaction's passes made would be left standing
-            s.cache = eng.new_cache()
+            s.cache = _fresh_cache(eng)
         else:
             import torch
 
@@ -357,7 +377,7 @@ class Session:
         last one's, [1, V], with `last_only`), and the `taps` layers' states at each, {layer: [T, H]}"""
         eng = t.eng
         new = [self._pending, *new] if self._pending is not None else new
-        cache = self.cache if self.cache is not None else eng.new_cache()
+        cache = self.cache if self.cache is not None else _fresh_cache(eng)
         seen: dict[int, list[torch.Tensor]] = {i: [] for i in taps}
 
         def keep(i: int, h: torch.Tensor) -> None:
@@ -462,8 +482,11 @@ class Session:
             self._unforked()
             self._flush(eng)
             cl = cache.layers[i]
-            assert isinstance(cl, CacheLayerMixin) and cl.keys is not None and cl.values is not None
             # made outside inference mode, so the caller can write to them
+            if getattr(cl, "paged", False):
+                with torch.inference_mode(False):
+                    return cast("PagedLayer", cl).gather()  # the rows in order out of their pages: copies already
+            assert isinstance(cl, CacheLayerMixin) and cl.keys is not None and cl.values is not None
             with torch.inference_mode(False):
                 return cl.keys.clone(), cl.values.clone()
 
@@ -529,6 +552,9 @@ class Session:
         eng = t.eng
         self._held = None
         prompt = [int(x) for x in prompt]
+        pc = _prefix(eng)
+        if pc is not None:
+            return self._open_paged(t, prompt, whole, pc)
         if self.cache is None:
             return None, 0, None
         if (
@@ -591,6 +617,55 @@ class Session:
         _let_go(dr, self)
         t.keep(_Point(0, first, None, None, 0))
         return None, 0, None
+
+    def _open_paged(
+        self, t: _Txn, prompt: list[int], whole: bool, pc: PrefixCache
+    ) -> tuple[KvCache | None, int, Anchor | None]:
+        """`_reuse` where the session's rows live in the engine's pool: the prompt opens on the longest prefix held -
+        the session's own rows, or the tree's (another conversation's, or one this session left), read in place - and
+        a cache over the pool comes back, empty where nothing is held. The session's own rows win a tie: its table
+        writes on in the page it was writing. A prompt parting from the session keeps the session's rows in the tree,
+        where the next turn of that conversation finds them; the points a failed call goes back to are `_reuse`'s"""
+        eng = t.eng
+        cur = cast("PagedCache", self.cache) if getattr(self.cache, "paged", False) else None
+        if cur is not None and whole and self._pending is None and self.logits is not None and prompt == self.ids:
+            self._held, self.logits = self.logits, None
+            return cur, len(self.ids), None
+        own = self._match(prompt) if cur is not None else 0
+        held = pc.tree.match(prompt[: len(prompt) - 1])
+        if cur is not None and own >= held.length:
+            if own == len(self.ids) and len(prompt) > len(self.ids):
+                self._pending, self.logits = None, None
+                return cur, own, None
+            if own > 0:
+                toks = self.tokens
+                if own < len(toks) and own < len(prompt) and prompt[own] == toks[own]:
+                    t.keep(_Point(own, toks[own], None, None, min(self.n_prompt, own)))
+                else:
+                    t.keep(_Point(own - 1, self.ids[own - 1], None, None, min(self.n_prompt, own - 1)))
+                crop(cur, eng, own)
+                del self.ids[own:]
+                self._pending, self.logits = None, None
+                return cur, own, None
+        # the tree holds more of the prompt than the session's own rows do: a cache over its rows, the session's left
+        # in the tree (it put them there at its commit) and its table let go
+        m = held.length
+        toks = self.tokens
+        first = toks[0] if toks and prompt and prompt[0] == toks[0] else None
+        dr = self.dr
+        if cur is not None:
+            cur.release()
+        new = pc.new(held.rows[:m])
+        self.cache, self.anchor, self.ids, self.n_prompt = new, [], list(prompt[:m]), 0
+        self._pending, self.logits = None, None
+        self.dr, self.dr_len, self.pend_h = None, 0, None
+        _let_go(dr, self)
+        if m:
+            t.keep(_Point(m - 1, prompt[m - 1], None, None, 0))
+            eng._tag(PassTag.PREFIX_SHARED)
+        else:
+            t.keep(_Point(0, first, None, None, 0))
+        return new, m, None
 
     # -- a decode over the session (`generate(session=...)`): the transaction spans the engine's decode loop --------
 

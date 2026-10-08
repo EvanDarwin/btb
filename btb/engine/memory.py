@@ -13,7 +13,7 @@ import weakref
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -49,6 +49,7 @@ from .tiers import ColdRing
 if TYPE_CHECKING:
     from .cache import KvCache
     from .device import Device as DeviceLedger
+    from .paged import PagedCache
 
 
 @dataclass
@@ -1067,6 +1068,12 @@ class _MemoryMixin(_State):
         does not fit."""
         if cache is None or not getattr(self, "adapt", True):
             return
+        if getattr(cache, "paged", False):
+            # the pool's growth: the conversations the prefix cache's tree holds go first, their pages taking the
+            # rows, before anything else btb holds is given up for them
+            pc = cast("PagedCache", cache)
+            host = torch.device(Device.CPU)
+            pc.prefix.room(pc, B * T, lambda: self.scheduler.free_for(host))
         done: set[Where] = set()
         while True:
             # the devices still to make room on: a shed can add the host to them, its rows' growth now there
@@ -1089,6 +1096,13 @@ class _MemoryMixin(_State):
         so the largest layer's growth once more (a doubling's room holds a concatenation's copy already)"""
         need: dict[Where, int] = {}
         if cache is None:
+            return need
+        if getattr(cache, "paged", False):
+            # every attention layer's rows in the engine's pool, one sequence's: its growth where its free pages do not
+            # hold them, the buffer in flight counted in (`HostPool.growth`)
+            g = cast("PagedCache", cache).growth(B * T)
+            if g:
+                need[where(Device.CPU)] = g
             return need
         first = next(((i, cl) for i, cl in enumerate(cache.layers) if isinstance(cl, GrowLayer)), None)
         if first is None and not any(isinstance(cl, GrantedIndexedLayer) for cl in cache.layers):

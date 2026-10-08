@@ -324,7 +324,7 @@ class _GenerateMixin(_State):
             # as long as the call reaches - the prompt, the answer and the widest verify pass past its last token - as
             # the greedy loop's is, so the two hold the same rows: where no reach is named a host layer takes the whole
             # context window's
-            cache = self.new_cache(max_len=n + int(max_new) + self._spec_full(v_max))
+            cache = self._decode_cache(n + int(max_new) + self._spec_full(v_max))
         logits: Any
         logits, anchors = self._session_prefill(
             ids, cache, reuse, session, on_layer=aw if (use_mtp or tapped) else None
@@ -859,7 +859,10 @@ class _GenerateMixin(_State):
                 finally:
                     self._in_epoch = False
                 return rows
-        cache = self.new_cache(max_len=target_len)
+        # one sequence over the prefix cache's pages where the engine has one; rows side by side keep a cache of their
+        # own (a paged cache holds one sequence)
+        single = B == 1 and attention_mask is None
+        cache = self._decode_cache(target_len) if single else self.new_cache(max_len=target_len)
         am = None if attention_mask is None else torch.as_tensor(attention_mask, dtype=torch.long)
         out: list[list[int]] = [[] for _ in range(B)]
         done = [False] * B

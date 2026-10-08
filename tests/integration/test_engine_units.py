@@ -461,10 +461,20 @@ def test_a_calls_cache_is_as_long_as_the_call_and_goes_with_it() -> None:
     """a generate's cache is let go when the call returns, plain or speculative: the engine held the last pass's
     cache (`_attn_ctx`) until the next pass, so a 40k prompt's 2.6 GB of host rows lived on into the next call and
     were priced twice there - its prefill refused, with the room still held by the answer before it. And it is as
-    long as the call reaches: the speculative one named none, and a host layer took the whole context window"""
+    long as the call reaches: the speculative one named none, and a host layer took the whole context window. Over
+    the prefix cache's pages (the engine has one here) the call's pages go back to the pool with it"""
     import gc
 
     with loaded_model(fixture("tiny_qwen3"), device="cpu") as sm:
+        pc = sm._prefix_cache()
+        assert pc is not None
+        for speculate in (False, True):
+            sm.generate([5, 6, 7, 8, 9, 10], 4, eos=(), speculate=speculate)
+            gc.collect()
+            assert sm._attn_ctx is None, f"the cache outlived its call (speculate={speculate})"
+            assert len(pc.pool.pages) == 0, f"the call's pages outlived it (speculate={speculate})"
+        # a contiguous cache, as an engine the prefix cache does not serve keeps one
+        sm.__dict__["_kv"] = None
         made: list[int | None] = []
         new_cache = sm.new_cache
 
@@ -480,6 +490,8 @@ def test_a_calls_cache_is_as_long_as_the_call_and_goes_with_it() -> None:
         # each call's cache as long as it reaches, not the context window a host layer reserves where none is named:
         # the speculative one the prompt, the answer and its widest verify pass
         assert made[0] == 6 + 4 and made[-1] == 6 + 4 + sm._spec_full(), made
+        sm.new_cache = new_cache  # type: ignore[method-assign]
+        sm.__dict__["_kv"] = pc
         # an id past the vocabulary is refused on the host, by name: on a card its embedding lookup fired a
         # device-side assert, which leaves the process's CUDA context unusable
         V = int(sm.cfg.vocab_size)
@@ -1282,13 +1294,41 @@ def test_every_native_kernel_refuses_a_dtype_it_was_not_built_for(monkeypatch: p
             lambda y: Native.attn_nodes(q[None], kv, kv, offs.long(), rows, 1.0, y),
             f32,
         ),
+        (
+            "attn_spans",
+            "btb_attn_spans",
+            "k",
+            lambda y: Native.attn_spans(q[None], kv.half(), kv, rows, offs[:1], offs[1:], 1.0, y),
+            f32,
+        ),
+        (
+            "attn_spans",
+            "btb_attn_spans",
+            "rows",
+            lambda y: Native.attn_spans(q[None], kv, kv, rows.long(), offs[:1], offs[1:], 1.0, y),
+            f32,
+        ),
+        (
+            "attn_spans",
+            "btb_attn_spans",
+            "starts",
+            lambda y: Native.attn_spans(q[None], kv, kv, rows, offs[:1].long(), offs[1:], 1.0, y),
+            f32,
+        ),
+        (
+            "attn_spans",
+            "btb_attn_spans",
+            "ends",
+            lambda y: Native.attn_spans(q[None], kv, kv, rows, offs[:1], offs[1:].long(), 1.0, y),
+            f32,
+        ),
         ("delta_step", "btb_delta_step", "norm_w", delta(norm_w=torch.zeros(dv, dtype=bf)), f32),
         ("delta_step", "btb_delta_step", "conv_b", delta(conv_b=torch.zeros(cd, dtype=bf)), f32),
     ]
     missing = sorted({b for b, *_ in cases if getattr(Native, b) is None})
     assert not missing, f"the library built in this tree binds every kernel; unbound: {missing}"
     for binding, call, arg, run, ydt in cases:
-        y = torch.full((2, 16) if binding in ("attn_decode", "attn_nodes") else (1, r), 7.0, dtype=ydt)
+        y = torch.full((2, 16) if binding.startswith("attn_") else (1, r), 7.0, dtype=ydt)
         if binding == "delta_step":
             y = torch.full((hv * dv,), 7.0, dtype=f32)
         with pytest.raises(NativeDtypeError) as e:

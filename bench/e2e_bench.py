@@ -200,6 +200,39 @@ def test_batch_generate(benchmark: object, model: str, device: str, knobs: dict[
         benchmark(once)  # type: ignore[operator]
 
 
+# A conversation's next turn as a server sees it, per family and device: after another request on the same session,
+# the turn opening on the rows the conversation left (`hit`: the prefix cache's, where the engine has one), against
+# the same prompt with nothing kept (`cold`). The turn alone is timed; the conversation and the request between
+# are each round's setup. A tier the prefix cache is not on yet drops the conversation at the request between: its
+# hit is its cold
+PREFIX_FIRST = [3 + (7 * i) % 190 for i in range(300)]  # the conversation's first prompt, inside every vocabulary
+PREFIX_SIDE = [200 + i % 50 for i in range(20)]  # a request sharing nothing with it
+
+
+@pytest.mark.parametrize("arm", ["hit", "cold"])
+@pytest.mark.parametrize("model", FAMILIES)
+@pytest.mark.parametrize("device,knobs", DEVICES, ids=[d for d, _ in DEVICES])
+def test_prefix_turn(benchmark: object, model: str, device: str, knobs: dict[str, str], arm: str) -> None:
+    with _api(benchmark, model, device, knobs, f"prefix-{arm}") as sm:
+        out = list(sm.generate(PREFIX_FIRST, N, eos=(), speculate=False).tokens)
+        turn = [*PREFIX_FIRST, *out, *range(5, 25)]
+
+        def setup() -> tuple[tuple[object, ...], dict[str, object]]:
+            pc = sm._prefix_cache()
+            if pc is not None:
+                pc.tree.evict()  # the rounds before let go: each starts from nothing kept
+            s = sm.session()
+            if arm == "hit":
+                sm.generate(PREFIX_FIRST, N, eos=(), session=s, speculate=False)
+                sm.generate(PREFIX_SIDE, 1, eos=(), session=s, speculate=False)
+            return (s,), {}
+
+        def once(s: object) -> object:
+            return sm.generate(turn, 1, eos=(), session=cast("btb.Session", s), speculate=False)
+
+        benchmark.pedantic(once, setup=setup, rounds=25, warmup_rounds=1)  # type: ignore[attr-defined]
+
+
 @pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
 @pytest.mark.parametrize("device,knobs", DEVICES, ids=[d for d, _ in DEVICES])
 def test_lend(benchmark: object, device: str, knobs: dict[str, str]) -> None:

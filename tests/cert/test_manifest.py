@@ -414,30 +414,77 @@ def test_every_cell_asserts_the_reader_its_cache_rows_take() -> None:
     for dev in spec.DEVICE_SUBPATHS:
         for kind in core.served_kinds():
             assert spec.kv_tag(kind, dev.hardware) in dev.expects(kind, bf16), (dev.key, kind)
-    assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.CPU) is PassTag.KV_CONTIGUOUS
+    assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.CPU) is PassTag.KV_PAGED
+    assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.CUDA) is PassTag.KV_CONTIGUOUS
+    assert spec.kv_tag(FamilyKind.QWEN3_5, spec.Hardware.CPU) is PassTag.KV_CONTIGUOUS
 
 
-def test_the_prefix_axis_is_a_gap_until_a_tier_keeps_every_conversation() -> None:
-    """the prefix axis - a conversation through other requests, prompts sharing a prefix - is a gap of its own on
-    every tier the prefix cache is not on: never a runnable id, a GAP in the gate's missing list and in the delta's
-    findings alike, so each tier's phase shows as closed when it lands. A sub-path that cannot engage at all keeps
-    its own reason; a family with recurrent layers must show a resume from a kept snapshot"""
+def test_the_cert_reads_the_engines_own_rule_for_the_paged_reader(monkeypatch: MonkeyPatch) -> None:
+    """`spec.paged` - the reader every cell asserts, the prefix axis's gaps - is the engine's `PrefixCache.why_not`
+    on each family's fixture, on each hardware: the cert expects pages exactly where the engine reads them"""
+    import types
+
+    import torch
+
+    from btb.engine.families.base import _flags
+    from btb.engine.native import Native
+    from btb.engine.prefix import PrefixCache
+    from btb.kinds import LayerKind
+
+    for name in ("attn_spans", "attn_nodes"):
+        monkeypatch.setattr(Native, name, object())  # the native library as a built one has it
+    devices = {spec.Hardware.CPU: torch.device("cpu"), spec.Hardware.CUDA: torch.device("cuda")}
+    for kind in core.served_kinds():
+        if kind not in spec.FIXTURE_STEM:
+            continue
+        cfg = spec.fixture_config(kind)
+        types_ = [LayerKind.of(t) for t in cfg.get("layer_types") or [LayerKind.FULL]]
+        for hw, dev in devices.items():
+            sm = types.SimpleNamespace(
+                dev=dev,
+                mlx=None,
+                layer_types=types_,
+                fam=types.SimpleNamespace(**_flags(kind)),
+                flat_cache=lambda: True,
+            )
+            why = PrefixCache.why_not(sm)
+            assert (why is None) is spec.paged(kind, hw), (kind, hw, why)
+
+
+def test_the_prefix_axis_runs_where_the_prefix_cache_serves_and_is_a_gap_elsewhere() -> None:
+    """the prefix axis - a conversation through other requests, prompts sharing a prefix - runs exactly where the
+    prefix cache serves the family (`spec.paged`), and is a gap of its own everywhere else, its reason the engine's:
+    a tier it is not on yet, a hybrid's snapshots, a family's own attention. A gap is never a runnable id, and is a
+    GAP in the gate's missing list and in the delta's findings alike, so each phase shows as closed when it lands. A
+    sub-path that cannot engage at all keeps its own reason; a family with recurrent layers must show a resume from a
+    kept snapshot"""
     from . import delta
 
+    served = {k for k in core.served_kinds() if k in spec.FIXTURE_STEM}
     prefix = [g for g in manifest.shape_gaps() if g[0] is spec.Surface.PREFIX]
-    assert {kind for _s, kind, key, why in prefix if key == "cpu" and why is manifest.Missing.PREFIX_CACHE} == {
-        k for k in core.served_kinds() if k in spec.FIXTURE_STEM
-    }
+    cpu = {kind: why for _s, kind, key, why in prefix if key == "cpu"}
+    assert set(cpu) == {k for k in served if not spec.paged(k, spec.Hardware.CPU)}
+    assert {FamilyKind.QWEN3, FamilyKind.PHI3, FamilyKind.GEMMA3} <= served - set(cpu)
+    assert cpu[FamilyKind.QWEN3_5] is manifest.Missing.PREFIX_SNAPSHOT
+    assert cpu[FamilyKind.GPT_OSS] is manifest.Missing.PREFIX_FAMILY
     for _s, kind, key, why in prefix:
-        own = manifest.subpath_gap(kind, spec.Storage.SAFE_BF16, spec.SUBPATH[key])
-        assert why is (own or manifest.Missing.PREFIX_CACHE), (kind, key, why)
-    assert not any(i.startswith(f"{spec.Surface.PREFIX.value}/") for i in manifest.runnable_ids())
-    assert manifest.Missing.PREFIX_CACHE in {kind for kind, _n, _f in manifest.missing_items()}
-    assert f"[manifest/prefix-cache] prefix/{FamilyKind.QWEN3.value}/cpu" in delta.findings()
+        dev = spec.SUBPATH[key]
+        own = manifest.subpath_gap(kind, spec.Storage.SAFE_BF16, dev)
+        if own is not None or dev.hardware is not spec.Hardware.CPU:
+            assert why is (own or manifest.Missing.PREFIX_CACHE), (kind, key, why)
+    ran = {i for i in manifest.runnable_ids() if i.startswith(f"{spec.Surface.PREFIX.value}/")}
+    want = {k for k in served if spec.paged(k, spec.Hardware.CPU)}
+    assert ran == {manifest.stem_id(spec.Surface.PREFIX, spec.FIXTURE_STEM[k], "cpu") for k in want}
+    missing = {kind for kind, _n, _f in manifest.missing_items()}
+    assert {manifest.Missing.PREFIX_CACHE, manifest.Missing.PREFIX_SNAPSHOT, manifest.Missing.PREFIX_FAMILY} <= missing
+    found = delta.findings()
+    assert f"[manifest/prefix-snapshot] prefix/{FamilyKind.QWEN3_5.value}/cpu" in found
+    assert not any(f.endswith(f"prefix/{FamilyKind.QWEN3.value}/cpu") for f in found)
     assert spec.recurrent(FamilyKind.QWEN3_5) and not spec.recurrent(FamilyKind.QWEN3)
-    cpu = spec.SUBPATH["cpu"]
-    assert PassTag.SNAPSHOT_RESUME in spec.SURFACE_TAGS[spec.Surface.PREFIX](FamilyKind.QWEN3_5, cpu)
-    assert PassTag.SNAPSHOT_RESUME not in spec.SURFACE_TAGS[spec.Surface.PREFIX](FamilyKind.QWEN3, cpu)
+    on = spec.SUBPATH["cpu"]
+    assert PassTag.SNAPSHOT_RESUME in spec.SURFACE_TAGS[spec.Surface.PREFIX](FamilyKind.QWEN3_5, on)
+    assert PassTag.SNAPSHOT_RESUME not in spec.SURFACE_TAGS[spec.Surface.PREFIX](FamilyKind.QWEN3, on)
+    assert {PassTag.KV_PAGED, PassTag.PREFIX_SHARED} <= spec.SURFACE_TAGS[spec.Surface.PREFIX](FamilyKind.QWEN3, on)
 
 
 def test_every_open_gap_is_explained() -> None:

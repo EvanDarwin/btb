@@ -10,7 +10,7 @@ import time
 from abc import abstractmethod
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Self, cast
 
 import torch
 
@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from .cache import CacheLayer, KvCache
     from .generate import LinLayer, LinSnap
     from .model import StreamedTextModel
+    from .paged import PagedLayer
     from .text import BatchGeneration
 
     # a row's own attention rows taken out of the batch: a fork's torch (k, v[, indexer keys]), or the MLX step
@@ -513,6 +514,9 @@ class _Rows:
                         k, v = kv[0], kv[1]
                     pl.mx_update(k, v)
                     mlxdev.mx().eval(*[x for x in pl._mx if x is not None])
+                elif getattr(pl, "paged", False):
+                    # the row's own rows onto the session's table, in pages of its own
+                    cast("PagedLayer", pl).append(kv[0], kv[1])
                 else:
                     assert isinstance(pl, CacheLayerMixin)
                     pl.update(kv[0], kv[1])

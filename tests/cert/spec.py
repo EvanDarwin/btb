@@ -374,11 +374,19 @@ def storage_tag(storage: Storage, hw: Hardware) -> PassTag | None:
     return PassTag.FP8_ASSTORED if hw is Hardware.CPU else PassTag.FP8_WIDENED
 
 
+def paged(kind: FamilyKind, hw: Hardware) -> bool:
+    """whether the prefix cache serves the family on this hardware - its attention reading every one-sequence cache
+    through the pages - by the engine's own rule (`PrefixCache.why_not`), in its order: the host's tier alone so far,
+    and there not a hybrid's recurrent layers, a family's own layer (Qwen4) or its own attention module (gpt-oss)"""
+    fl = core.flags(kind)
+    return hw is Hardware.CPU and not recurrent(kind) and Cap.OWN not in fl and Cap.FAST in fl
+
+
 def kv_tag(kind: FamilyKind, hw: Hardware) -> PassTag:
-    """the reader a cell's attention must take its cache rows through: each conversation's own contiguous buffers,
-    on every tier until the prefix cache's paged reader replaces them there - this is the line that flips per tier
-    as each lands, so a receipt banked on the old reader stops proving the cell"""
-    return PassTag.KV_CONTIGUOUS
+    """the reader a cell's attention must take its cache rows through: the engine's pool of pages where the prefix
+    cache serves the family there (`paged`), else each conversation's own contiguous buffers - the line that flips
+    per tier as each lands, so a receipt banked on the old reader stops proving the cell"""
+    return PassTag.KV_PAGED if paged(kind, hw) else PassTag.KV_CONTIGUOUS
 
 
 def expert_tag(kind: FamilyKind, storage: Storage) -> PassTag | None:
@@ -650,8 +658,9 @@ def prefill_tags(kind: FamilyKind, dev: DeviceSubpath) -> frozenset[PassTag]:
 
 def prefix_tags(kind: FamilyKind, dev: DeviceSubpath) -> frozenset[PassTag]:
     """what the prefix axis's conversations must show: a prompt whose rows the cache held (a conversation's next turn
-    with another request between) and one it did not, and on recurrent layers a resume from a kept snapshot"""
-    out = {PassTag.PREFIX_HIT, PassTag.PREFIX_MISS}
+    with another request between) and one it did not, read through the pages and opened on rows the tree holds
+    (another conversation's, read in place), and on recurrent layers a resume from a kept snapshot"""
+    out = {PassTag.PREFIX_HIT, PassTag.PREFIX_MISS, PassTag.KV_PAGED, PassTag.PREFIX_SHARED}
     if recurrent(kind):
         out.add(PassTag.SNAPSHOT_RESUME)
     return frozenset(out)

@@ -171,6 +171,14 @@ OPS: tuple[Op, ...] = (
         "guard_attn_nodes.rs",
         "attn.rs",
     ),
+    Op(
+        "attn_spans",
+        (Stored.BF16, Stored.F32),
+        ("btb_attn_spans_bf16", "btb_attn_spans_f32"),
+        "attn_spans.rs",
+        "guard_attn_spans.rs",
+        "attn.rs",
+    ),
     Op("delta_step", (Stored.F32,), ("btb_delta_step",), "delta.rs", "guard_delta.rs", "delta.rs"),
     Op("sample_pick", (Stored.F32,), ("btb_sample_pick",), "sample.rs", "guard_sample.rs", "sample.rs"),
     Op(

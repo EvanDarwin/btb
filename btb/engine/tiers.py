@@ -678,6 +678,10 @@ class _TiersMixin(_State):
         # compared with the rows' own devices below: a card by its index, as they name it
         dev = where(torch.device(device))
         cl = cache.layers[i]
+        if getattr(cl, "paged", False):
+            # its rows live in the engine's pool of pages, which the host's attention reads whatever the layer's
+            # placement (btb/engine/paged.py): nothing of the cache's own moves
+            return
         if isinstance(cl, ForkLayer):
             cl.to(dev)
             return

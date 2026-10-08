@@ -723,6 +723,10 @@ class _State:
     def new_cache(self, max_len: int | None = None) -> Any:
         raise NotImplementedError
 
+    # -- text.py --
+    def _decode_cache(self, max_len: int) -> Any:
+        raise NotImplementedError
+
     # -- memory.py --
     def lend_policy(self) -> None:
         raise NotImplementedError
@@ -785,10 +789,11 @@ class _State:
             self._tag(PassTag.FP8_WIDENED)
 
     def _tag_kv(self, cache: Any) -> None:
-        """record the reader the pass's attention takes the cache's rows through: today every cache keeps a
-        conversation's rows in buffers of its own, in order from the first (none for a pass with no cache)"""
+        """record the reader the pass's attention takes the cache's rows through: the engine's pool of pages through
+        the conversation's row map (a session's cache where the prefix cache serves the engine), or a cache's own
+        buffers, its rows in order from the first (none for a pass with no cache)"""
         if cache is not None:
-            self._tag(PassTag.KV_CONTIGUOUS)
+            self._tag(PassTag.KV_PAGED if getattr(cache, "paged", False) else PassTag.KV_CONTIGUOUS)
 
     def _tag_quant(self) -> None:
         """record the stored-weight path on MLX: as-stored quant bytes (`mlx_state.affine`) vs a bf16 slot"""

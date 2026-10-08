@@ -12,6 +12,7 @@ tensors are the engine's.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -50,6 +51,9 @@ class PagePool:
         self.free: list[int] = []
         self._grow = grow
         self.clock = 0
+        # a conversation's table can be let go from another thread (its session collected there): the counts and
+        # the free list change under this, whoever changes them
+        self.lock = threading.RLock()
 
     def __len__(self) -> int:
         """pages held: the pool's size less its free list"""
@@ -62,34 +66,37 @@ class PagePool:
             p.tick = self.clock
 
     def alloc(self, writer: object | None = None) -> Page:
-        if self.free:
-            p = self.pages[self.free.pop()]
-        else:
-            if self._grow is not None:
-                self._grow(len(self.pages) + 1)
-            p = Page(len(self.pages))
-            self.pages.append(p)
-        p.refs, p.fill, p.frozen, p.writer = 1, 0, 0, writer
-        self.clock += 1
-        p.tick = self.clock
-        return p
+        with self.lock:
+            if self.free:
+                p = self.pages[self.free.pop()]
+            else:
+                if self._grow is not None:
+                    self._grow(len(self.pages) + 1)
+                p = Page(len(self.pages))
+                self.pages.append(p)
+            p.refs, p.fill, p.frozen, p.writer = 1, 0, 0, writer
+            self.clock += 1
+            p.tick = self.clock
+            return p
 
     def ref(self, p: Page) -> None:
-        if p.refs <= 0:
-            raise PoolError(f"page {p.id} referenced after it was freed")
-        p.refs += 1
+        with self.lock:
+            if p.refs <= 0:
+                raise PoolError(f"page {p.id} referenced after it was freed")
+            p.refs += 1
 
     def unref(self, p: Page) -> bool:
         """one holder less; True when that was the last and the page is free again"""
-        if p.refs <= 0:
-            raise PoolError(f"page {p.id} let go more often than it was held")
-        p.refs -= 1
-        if p.refs:
-            return False
-        p.fill = p.frozen = 0
-        p.writer = None
-        self.free.append(p.id)
-        return True
+        with self.lock:
+            if p.refs <= 0:
+                raise PoolError(f"page {p.id} let go more often than it was held")
+            p.refs -= 1
+            if p.refs:
+                return False
+            p.fill = p.frozen = 0
+            p.writer = None
+            self.free.append(p.id)
+            return True
 
     def of(self, rows: Iterable[int]) -> list[Page]:
         """the distinct pages `rows` lie in, in the order first met"""

@@ -135,6 +135,23 @@ def test_usage_counts_the_prompt_tokens_the_cache_held(
 
 
 @pytest.mark.parametrize("stream", [False, True])
+def test_a_side_request_between_turns_leaves_the_conversation_cached(served: tuple[Server, str], stream: bool) -> None:
+    """another conversation's request between two turns of one (a title call, a sub-agent's) leaves the first in the
+    cache: its next turn finds its previous prompt there all the same"""
+    server, name = served
+    eng = server.registry.loaded_get(name)
+    assert eng is not None
+    first = [{"role": "user", "content": f"name the {'streamed ' if stream else ''}rivers of the north"}]
+    u1, answer = _usage(served, stream, first)
+    title = f"write a short {'streamed ' if stream else ''}title for this chat"
+    side, _ = _usage(served, stream, [{"role": "user", "content": title}])
+    assert side["prompt_tokens_details"]["cached_tokens"] < u1["prompt_tokens"] // 2, side
+    nxt = [*first, {"role": "assistant", "content": answer}, {"role": "user", "content": "and the south"}]
+    u2, _ = _usage(served, stream, nxt)
+    assert u2["prompt_tokens_details"]["cached_tokens"] >= u1["prompt_tokens"] - eng.session.tail, (u1, side, u2)
+
+
+@pytest.mark.parametrize("stream", [False, True])
 def test_a_stop_string_ends_the_answer_before_it(served: tuple[Server, str], stream: bool) -> None:
     full = chat(served, max_tokens=24)["choices"][0]["message"]["content"]
     assert len(full) > 6, full

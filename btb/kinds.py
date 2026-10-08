@@ -347,9 +347,11 @@ class PassTag(StrEnum):
     ROWS_CARD = "rows_card"  # a fork's or a batch's rows on the card graph's rows pass, read in place in its arena
     # the reader a pass's attention took its cache rows through (btb/engine/state.py `_tag_kv`)
     KV_CONTIGUOUS = "kv_contiguous"  # the conversation's own buffers, its rows in order from the first
+    KV_PAGED = "kv_paged"  # the engine's pool of pages, read through the conversation's row map (btb/engine/paged.py)
     # what a decode over a session kept of the cache for its prompt (btb/session.py `_begin_decode`)
     PREFIX_HIT = "prefix_hit"  # rows of the prompt the cache held: prefilled from there on
     PREFIX_MISS = "prefix_miss"  # nothing kept: the whole prompt prefilled
+    PREFIX_SHARED = "prefix_shared"  # the prompt opened on rows the prefix tree holds, read in place (`_open_paged`)
     SNAPSHOT_RESUME = "snapshot_resume"  # a hybrid's recurrent states restored from a kept snapshot to resume
     # the placement tiers a pass ran layers on (btb/engine/device.py Placement.tier)
     TIER_RESIDENT = "tier_resident"

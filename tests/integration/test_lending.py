@@ -10,7 +10,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Iterator
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 import torch
@@ -26,6 +26,7 @@ from tests.helpers import fixture, loaded_model, need_cuda, need_mlx
 
 if TYPE_CHECKING:
     from btb.engine.cache import KvCache
+    from btb.engine.paged import PagedCache
 
 PROMPT = [5, 17, 99, 3, 42, 8, 61, 7, 12, 30]
 MiB = 2**20
@@ -106,8 +107,11 @@ def test_a_refusal_names_the_request_and_leaves_the_model_answering(
 
 
 def _cache_bytes(cache: KvCache | None) -> int:
-    """what a cache's grown buffers hold, k and v (and an int8 layer's scales)"""
+    """what a cache's grown buffers hold, k and v (and an int8 layer's scales); a paged cache's, what the engine's
+    pool of pages holds"""
     assert cache is not None
+    if getattr(cache, "paged", False):
+        return cast("PagedCache", cache).prefix.pool.nbytes()
     n = 0
     for cl in cache.layers:
         if isinstance(cl, GrowLayer) and cl._buf is not None:
@@ -118,13 +122,14 @@ def _cache_bytes(cache: KvCache | None) -> int:
 
 
 def test_a_cache_growth_is_priced_before_the_pass(sm: StreamedTextModel, monkeypatch: pytest.MonkeyPatch) -> None:
-    """the room a pass's cache growth needs is asked for before the pass, as the bytes its buffers then hold; a
-    pass the buffers already fit asks for nothing"""
+    """the room a pass's cache growth needs is asked for before the pass, as the bytes its buffers then hold (the
+    prefix cache's pool, on an engine it serves: its first growth here); a pass the buffers already fit asks for
+    nothing"""
     asked: list[int] = []
     make = sm._make_room
 
-    def record(dev: torch.device, nbytes: int, what: str, own: str | None = None) -> set[str]:
-        asked.append(nbytes)
+    def record(dev: torch.device, nbytes: int | Callable[[], int], what: str, own: str | None = None) -> set[str]:
+        asked.append(nbytes() if callable(nbytes) else nbytes)  # a need re-priced as room is made: its first price
         return make(dev, nbytes, what, own)
 
     monkeypatch.setattr(sm, "_make_room", record)
@@ -144,8 +149,8 @@ def test_a_sparse_layers_growth_is_priced_before_the_pass(monkeypatch: pytest.Mo
         granted: list[tuple[int, int]] = []  # (bytes asked, bytes of the room they replace)
         make, real = sm._make_room, sm.scheduler.grant
 
-        def record(dev: torch.device, nbytes: int, what: str, own: str | None = None) -> set[str]:
-            asked.append(nbytes)
+        def record(dev: torch.device, nbytes: int | Callable[[], int], what: str, own: str | None = None) -> set[str]:
+            asked.append(nbytes() if callable(nbytes) else nbytes)  # a re-priced need: its first price
             return make(dev, nbytes, what, own)
 
         def grant(nbytes: int, kind: str, **kw: Any) -> None:
@@ -181,25 +186,33 @@ def test_a_sparse_layers_growth_is_priced_before_the_pass(monkeypatch: pytest.Mo
 
 def test_a_cache_growth_makes_room_instead_of_refusing(monkeypatch: pytest.MonkeyPatch) -> None:
     """a prefill whose cache growth finds no room: the grant alone refuses it (what the room a policy took left);
-    asked for before the pass, btb gives up what it holds and the prefill runs as it would have"""
+    asked for before the pass, btb gives up what it holds and the prefill runs as it would have - a contiguous
+    cache's layers, and the prefix cache's pool of pages (its first growth: no conversation held to let go first)"""
     with loaded_model(fixture("tiny_qwen3"), device="cpu") as sm:
+        sm.__dict__["_kv"] = None  # contiguous caches first, as an engine the prefix cache does not serve keeps
         ref = sm.session(PROMPT).logits
         assert ref is not None
         keep = sm.ram_reserve
-        squeeze(sm, 0, monkeypatch)
-        with monkeypatch.context() as mp:
-            mp.setattr(sm, "cache_room", lambda cache, B, T: None)
-            with pytest.raises(MemoryGrantError, match="only"):
-                sm.session(PROMPT)
 
         def give(dev: torch.device, short: int, tried: set[str]) -> bool:
             # a shed's freed room, stood in for: the tiny fixture's layers are too small to free a cache's worth
             sm.ram_reserve = keep
             return True
 
-        monkeypatch.setattr(sm, "_give_up_one", give)
-        got = sm.session(PROMPT).logits
-        assert got is not None and torch.equal(got, ref)
+        for paged in (False, True):
+            if paged:
+                del sm.__dict__["_kv"]  # the prefix cache, made at the next session's first use: a pool of nothing
+            with monkeypatch.context() as mp:
+                squeeze(sm, 0, mp)
+                with monkeypatch.context() as off:
+                    off.setattr(sm, "cache_room", lambda cache, B, T: None)
+                    with pytest.raises(MemoryGrantError, match="only"):
+                        sm.session(PROMPT)
+                mp.setattr(sm, "_give_up_one", give)
+                s = sm.session(PROMPT)
+                assert bool(getattr(s.cache, "paged", False)) is paged
+                assert s.logits is not None and torch.equal(s.logits, ref), f"paged={paged}"
+            sm.ram_reserve = keep
 
 
 def test_a_pinned_placement_makes_no_room_for_growth(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -436,22 +449,29 @@ def test_a_card_gives_layers_up_for_a_tensor_and_every_cache_follows(monkeypatch
 
 def test_a_layer_move_reaches_every_live_cache() -> None:
     """a layer btb moves takes its rows in every live cache along: an idle session's, a fork's shared prefix and its
-    own rows - not only the running pass's; a cache nobody holds any more is not kept alive for it"""
+    own rows - not only the running pass's; a cache nobody holds any more is not kept alive for it. A session's rows
+    in the prefix cache's pool stay there, where the host's attention reads them whatever the layer's placement"""
     with loaded_model(fixture("tiny_qwen3"), device="cpu") as sm:
-        gone = weakref.ref(sm.session(PROMPT).cache)
-        idle = sm.session(PROMPT)
-        forked = sm.session(PROMPT)
-        br = forked.fork(2)
-        br.step([1, 2])
-        gc.collect()
-        assert gone() is None and all(c is not None for c in sm._live_caches)
-        sm._caches_to(0, "meta")
-        assert idle.rows(0)[0].device.type == "meta"
-        fl = br._check().layers[0]
-        assert isinstance(fl, ForkLayer) and fl.keys.device.type == "meta" and fl._kv is not None
-        assert fl._kv[0].device.type == "meta"
-        assert idle.rows(1)[0].device.type == "cpu"
-        br.close()
+        assert sm._prefix_cache() is not None
+        for paged in (True, False):
+            if not paged:
+                sm.__dict__["_kv"] = None  # contiguous caches, as an engine the prefix cache does not serve keeps
+            gone = weakref.ref(sm.session(PROMPT).cache)
+            idle = sm.session(PROMPT)
+            forked = sm.session(PROMPT)
+            br = forked.fork(2)
+            br.step([1, 2])
+            gc.collect()
+            assert gone() is None and all(c is not None for c in sm._live_caches)
+            sm._caches_to(0, "meta")
+            assert idle.rows(0)[0].device.type == ("cpu" if paged else "meta")
+            fl = br._check().layers[0]
+            assert isinstance(fl, ForkLayer) and fl.keys.device.type == "meta" and fl._kv is not None
+            assert fl._kv[0].device.type == "meta"
+            assert idle.rows(1)[0].device.type == "cpu"
+            br.close()
+            del gone, idle, forked, br, fl
+            gc.collect()  # the moved rows let go before the next arm's caches are made
 
 
 # -- lifetimes: late, on another thread, through views, out of order -----------------------------------------------

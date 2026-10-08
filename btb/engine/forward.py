@@ -593,7 +593,12 @@ class _ForwardMixin(_State):
         lt = self.layer_types[i]
         spec = getattr(self, "aq", False) and cache is not None and T > 1 and past > 0
         step1 = Native.delta_step is not None and cache is not None and T == 1 and past > 0 and am is None
-        cont = cache is not None and T > 1 and past > 0 and am is None and not pas.batched
+        # a prompt's later chunks (`pas.batched`) too, an attention layer's: its rows through the host's native
+        # attention as every pass past a cache's first rows reads them (a paged cache has no other reader, and a
+        # contiguous one takes the same so the two keep one set of bits); a linear layer's chunk through the module's
+        # chunked rule, and MLX's host layers as they were
+        chunk_ok = not pas.batched or (lt != LayerKind.LINEAR and self.mlx is None)
+        cont = cache is not None and T > 1 and past > 0 and am is None and chunk_ok
         # `ai` is the single-sequence host path (it also serves speculative decode, always one row); it stores
         # k/v as [1, heads, ...] and would merge a real batch into the head dim, so a batched decode takes the
         # standard module forward instead - which stores [B, heads, ...] as prefill does and is the streaming

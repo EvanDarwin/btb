@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import weakref
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 import torch
 
@@ -54,9 +54,13 @@ def conv_states_as(cl: Any, dtype: torch.dtype) -> None:
 
 
 def attention_rows(cl: CacheLayer) -> tuple[torch.Tensor, torch.Tensor]:
-    """an attention layer's keys and values; a TypeError for a layer that holds none"""
+    """an attention layer's keys and values; a TypeError for a layer that holds none. A paged layer's are gathered
+    out of their pages, a copy (a fork's prefix and a batch's rows: what their own layers copy in anyway)"""
     from transformers.cache_utils import CacheLayerMixin
 
+    gather = getattr(cl, "gather", None)
+    if getattr(cl, "paged", False) and gather is not None:
+        return cast("tuple[torch.Tensor, torch.Tensor]", gather())
     if not isinstance(cl, CacheLayerMixin) or cl.keys is None or cl.values is None:
         raise TypeError(f"an attention layer's rows were asked of a {type(cl).__name__} holding none")
     return cl.keys, cl.values

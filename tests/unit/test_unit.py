@@ -497,6 +497,41 @@ def test_native_attn_nodes_rows_are_the_one_row_steps(dtype: torch.dtype) -> Non
     assert bool((kept == 7.0).all()), "a refused call wrote its output"
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_native_attn_spans_rows_are_their_node_lists(dtype: torch.dtype) -> None:
+    """a prompt chunk through `Native.attn_spans`: each row over its span of one map of cache rows - the positions
+    scattered over a pool as a paged table maps them, a window on one call - is `Native.attn_nodes` over that span
+    as a list, bit for bit; and a map naming a row past the cache is refused with ERR_DOMAIN before anything is
+    written"""
+    from btb.engine.native import Native, NativeError
+
+    native_library()
+    hq, hk, d, base, T, pool = 24, 2, 256, 90, 40, 140
+    g = torch.Generator().manual_seed(11)
+    k = torch.randn(hk, pool, d, generator=g).to(dtype)
+    v = torch.randn(hk, pool, d, generator=g).to(dtype)
+    rows = torch.randperm(pool, generator=g)[: base + T].to(torch.int32)
+    q = torch.randn(T, hq, d, generator=g)
+    ends = torch.arange(base + 1, base + T + 1, dtype=torch.int32)
+    for win in (0, 48):
+        starts = (ends - win).clamp(min=0) if win else torch.zeros(T, dtype=torch.int32)
+        out = torch.full((T, hq, d), float("nan"))
+        Native.attn_spans(q, k, v, rows, starts, ends, 0.0625, out)
+        lists = [rows[int(s) : int(e)] for s, e in zip(starts, ends, strict=True)]
+        offs = torch.tensor([0, *torch.tensor([len(li) for li in lists]).cumsum(0).tolist()], dtype=torch.int32)
+        want = torch.full((T, hq, d), float("nan"))
+        Native.attn_nodes(q, k, v, offs, torch.cat(lists), 0.0625, want)
+        assert torch.equal(out, want), f"a span's row is not its node list's (window {win})"
+
+    bad = rows.clone()
+    bad[3] = pool
+    kept = torch.full((T, hq, d), 7.0)
+    with pytest.raises(NativeError) as e:
+        Native.attn_spans(q, k, v, bad, torch.zeros(T, dtype=torch.int32), ends, 0.0625, kept)
+    assert e.value.rc == -6, "a map row past the cache is ERR_DOMAIN"
+    assert bool((kept == 7.0).all()), "a refused call wrote its output"
+
+
 @pytest.mark.parametrize("norm_topk_prob", [True, False])
 def test_qwen4_router_rows_are_the_one_row_calls(norm_topk_prob: bool) -> None:
     """Qwen4's host router (families/qwen4/router.py): a row's logits, weights and experts from a call of many rows

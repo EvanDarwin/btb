@@ -2655,10 +2655,17 @@ class _CudaMixin(_State):
         keep = list(range(base_len)) + [base_len + j for j in path]
         lazy: list[Any] = []
         flags: list[Any] = []
+        paged = bool(getattr(cache, "paged", False))
+        if paged:
+            # a paged cache's accepted rows copied down into its own pages, every attention layer's at once, and the
+            # rest let go (`PagedCache.keep_path`)
+            cache.keep_path(base_len, list(path))
         for i, layer in enumerate(cache.layers):
             # every attention layer's keys and values are cropped to the accepted path; a sliding layer
             # keeps the whole cache (its window is a mask, not a shorter cache), so it is cropped too, and a
             # sparse layer's indexer keys with its rows
+            if getattr(layer, "paged", False):
+                continue
             if self.layer_types[i] in (LayerKind.FULL, LayerKind.SLIDING, LayerKind.QWEN_SPARSE):
                 keep_path = getattr(layer, "keep_path", None)
                 if keep_path is not None:
@@ -3062,11 +3069,20 @@ class _CudaMixin(_State):
             k_all = at.k_norm(at.k_proj(x).view(1, T, -1, hd))
             v_all = at.v_proj(x).view(1, T, -1, hd)
             gate_all = None
-        base = cl.keys.shape[-2] if getattr(cl, "keys", None) is not None else 0
+        # a paged layer's rows lie in the engine's pool wherever their pages do: appended through the layer, read
+        # through the conversation's row map (btb/engine/paged.py)
+        paged = bool(getattr(cl, "paged", False))
+        if paged:
+            base = cl.get_seq_length()
+        else:
+            base = cl.keys.shape[-2] if getattr(cl, "keys", None) is not None else 0
         win = layer_window(self.cfg, self.layer_types[i])
         attn_fn = ALL_ATTENTION_FUNCTIONS.get_interface(self.cfg._attn_implementation, eager_attention_forward)
         q_rot, k_rot = apply_rotary_pos_emb(q_all.transpose(1, 2), k_all.transpose(1, 2), pe[0], pe[1])
-        k_full, v_full = cache.update(k_rot, v_all.transpose(1, 2), i)
+        if paged:
+            k_full, v_full = cl.append(k_rot, v_all.transpose(1, 2))
+        else:
+            k_full, v_full = cache.update(k_rot, v_all.transpose(1, 2), i)
         native = (
             k_full.shape[0] == 1
             and k_full.device.type == "cpu"
@@ -3077,12 +3093,22 @@ class _CudaMixin(_State):
             and v_full.stride(-1) == 1
             and v_full.stride(-2) == hd
         )
-        kernel = native and T == 1 and not tree and Native.attn_decode is not None
-        # a verify pass's rows (a chain's or a tree's) through the step's own arithmetic: each row over the cache rows
-        # its committed step will read, in the order it reads them (`attn_nodes`, row for row `attn_decode` bit for
-        # bit). Through sdpa a row at a time, a verify rounded a bf16 tie apart from the step - Qwen3-0.6B with
-        # eleven host layers took ':' where its greedy step took '.', speculation then no longer the greedy answer
-        nodes = native and not kernel and Native.attn_nodes is not None
+        # a paged layer's one-row step too: its rows are the table's, which `attn_spans` reads with `attn_decode`'s bits
+        kernel = native and T == 1 and not tree and Native.attn_decode is not None and not paged
+        # a pass's rows past the first (a verify's chain or tree, a prompt's later chunk) through the step's own
+        # arithmetic: each row over the cache rows its committed step will read, in the order it reads them, row for
+        # row `attn_decode` bit for bit - a chain's rows each a span of one map (`attn_spans`: the cache's rows, a
+        # paged layer's through its table), a tree's each a list of its own (`attn_nodes`). Through sdpa a row at a
+        # time, a verify rounded a bf16 tie apart from the step - Qwen3-0.6B with eleven host layers took ':' where
+        # its greedy step took '.', speculation then no longer the greedy answer
+        spans = native and not kernel and not tree and Native.attn_spans is not None
+        nodes = native and not kernel and not spans and Native.attn_nodes is not None
+        if paged and not (spans or nodes):
+            from .paged import PagedError
+
+            raise PagedError(
+                f"layer {i}: the paged rows are read by the native attention alone, and it cannot run here"
+            )
         if kernel:
             qf = q_rot[0, :, 0].float().contiguous()
             out = torch.empty(qf.shape, dtype=torch.float32)
@@ -3090,21 +3116,24 @@ class _CudaMixin(_State):
             Native.attn_decode(qf, k_full[0][:, first:], v_full[0][:, first:], at.scaling, out)
             a1 = out.view(1, 1, -1).to(h.dtype)
             outs.append(a1 if gate_all is None else a1 * torch.sigmoid(gate_all[:, 0:1]))
-        elif nodes:
-            lists = []
-            for p in range(T):
-                rows = node_mask(base, p, parents, win)
-                lists.append(torch.arange(base + p + 1) if rows is None else rows.nonzero()[:, 0])
-            idx = torch.cat(lists).to(torch.int32).contiguous()
-            offs = torch.zeros(T + 1, dtype=torch.int32)
-            offs[1:] = torch.tensor([len(x) for x in lists]).cumsum(0).to(torch.int32)
+        elif spans or nodes:
             qf = q_rot[0].transpose(0, 1).float().contiguous()  # [T, hq, d]
             out = torch.empty(qf.shape, dtype=torch.float32)
-            Native.attn_nodes(qf, k_full[0], v_full[0], offs, idx, float(at.scaling), out)
-            for p in range(T):  # a row at a time, as each step casts and gates its one
-                a1 = out[p].view(1, 1, -1).to(h.dtype)
-                outs.append(a1 if gate_all is None else a1 * torch.sigmoid(gate_all[:, p : p + 1]))
-        for p in range(T) if not (kernel or nodes) else range(0):
+            if spans:
+                amap, starts, ends = self._span_lists(cache if paged else None, base, T, win)
+                Native.attn_spans(qf, k_full[0], v_full[0], amap, starts, ends, float(at.scaling), out)
+            else:
+                offs, idx = self._node_lists(cache if paged else None, base, T, parents, win)
+                Native.attn_nodes(qf, k_full[0], v_full[0], offs, idx, float(at.scaling), out)
+            if paged and i == max(j for j, lt in enumerate(self.layer_types) if lt != LayerKind.LINEAR):
+                cache._lists = None  # the pass's lists go with its last attention layer: an idle cache holds none
+            if gate_all is None:
+                outs.append(out.view(1, T, -1).to(h.dtype))  # a cast: each element its own, whatever its neighbours
+            else:
+                for p in range(T):  # a row at a time, as each step gates its one
+                    a1 = out[p].view(1, 1, -1).to(h.dtype)
+                    outs.append(a1 * torch.sigmoid(gate_all[:, p : p + 1]))
+        for p in range(T) if not (kernel or spans or nodes) else range(0):
             qs = q_rot[:, :, p : p + 1]
             ks = k_full[..., : base + p + 1, :]
             vs = v_full[..., : base + p + 1, :]
@@ -3117,6 +3146,60 @@ class _CudaMixin(_State):
         if self.fam.sandwich:
             mix = layer.post_attention_layernorm(mix)  # the sandwich block norms the delta before its add
         return self._ai_mlp(layer, residual + mix)
+
+    @staticmethod
+    def _pass_lists(paged: Any) -> dict[Any, Any]:
+        """a paged cache's lists for the pass (`_span_lists`, `_node_lists`): those of its row map's present version
+        alone, which every change to the map moves - a window's and the whole prefix's (Gemma 3's layers alternate)
+        side by side, made once for every layer that reads them alike"""
+        ver, memo = paged.__dict__.get("_lists") or (None, {})
+        if ver != paged.table.version:
+            memo = {}
+            paged._lists = (paged.table.version, memo)
+        return cast("dict[Any, Any]", memo)
+
+    @staticmethod
+    def _span_lists(paged: Any, base: int, T: int, win: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """a chain's T rows after `base` as `attn_spans` takes them: (rows, starts, ends) int32, row p over the rows
+        before it and itself - the last `win` of them under a window - each a span of one map: the cache's rows in
+        order, a paged cache's (`paged`) through its table"""
+        memo = _CudaMixin._pass_lists(paged) if paged is not None else None
+        key = ("spans", base, T, win)
+        got = memo.get(key) if memo is not None else None
+        if got is not None:
+            return cast("tuple[torch.Tensor, torch.Tensor, torch.Tensor]", got)
+        ends = torch.arange(base + 1, base + T + 1, dtype=torch.int32)
+        starts = (ends - win).clamp_(min=0) if win else torch.zeros(T, dtype=torch.int32)
+        if paged is None:
+            return torch.arange(base + T, dtype=torch.int32), starts, ends
+        rows = paged.table.rows()[: base + T].to(torch.int32)
+        assert memo is not None
+        memo[key] = (rows, starts, ends)
+        return rows, starts, ends
+
+    @staticmethod
+    def _node_lists(paged: Any, base: int, T: int, parents: Parents, win: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """each of a pass's T rows' cache rows, in the order its committed step reads them, as `attn_nodes` takes
+        them: (offs [T + 1], idx) int32. `paged` (a paged cache): the rows are its pool's, through its row map, made
+        once a pass (`_pass_lists`)"""
+        memo = _CudaMixin._pass_lists(paged) if paged is not None else None
+        key = (base, T, tuple(parents), win)
+        got = memo.get(key) if memo is not None else None
+        if got is not None:
+            return cast("tuple[torch.Tensor, torch.Tensor]", got)
+        lists = []
+        for p in range(T):
+            rows = node_mask(base, p, parents, win)
+            lists.append(torch.arange(base + p + 1) if rows is None else rows.nonzero()[:, 0])
+        flat = torch.cat(lists)
+        if paged is not None:
+            flat = paged.table.rows()[flat]
+        idx = flat.to(torch.int32).contiguous()
+        offs = torch.zeros(T + 1, dtype=torch.int32)
+        offs[1:] = torch.tensor([len(x) for x in lists]).cumsum(0).to(torch.int32)
+        if memo is not None:
+            memo[key] = (offs, idx)
+        return offs, idx
 
     def _ai_mlp(self, layer: Any, h: torch.Tensor) -> torch.Tensor:
         residual = h

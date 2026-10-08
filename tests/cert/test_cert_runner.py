@@ -157,6 +157,7 @@ _LOADS: dict[str, tuple[Callable[[dict[str, Any]], Load], tuple[int, ...]]] = {
             "test_fork_and_batch_are_deterministic",
             "test_the_models_calls_are_deterministic",
             "test_a_sessions_calls_are_deterministic",
+            "test_conversations_through_the_prefix_cache_answer_as_cold",
         )
     },
 }
@@ -584,6 +585,61 @@ def test_a_sessions_calls_are_deterministic(stem: str, dev: spec.DeviceSubpath) 
         )
     assert runs[0] == runs[1], f"{stem} on {dev.key}: a session's calls answered differently across two loads"
     receipt.record(manifest.stem_id(spec.Surface.SESSION, stem, dev.key))
+
+
+SIDE = [150, 151, 152, 153, 154]  # a request sharing nothing with PROMPT's conversation
+
+
+@pytest.mark.parametrize("stem,dev", _shape_cells(spec.Surface.PREFIX))
+def test_conversations_through_the_prefix_cache_answer_as_cold(stem: str, dev: spec.DeviceSubpath) -> None:
+    """conversations as a server sees them, on one load: A's first turn (the oracle's prompt, held to its banked
+    answer), an unrelated request on the same session, A's next turn - opening on every row A left - and B, a second
+    session opening with A's first turn whole. Each later answer is its prompt's decoded cold (no session) on the
+    other load, the two loads answer alike, and the axis's tags show (`spec.prefix_tags`): a miss, a hit, rows the
+    tree held read in place, through the pages"""
+    if not _hardware_here(dev.hardware):
+        pytest.skip(f"{dev.hardware.value} not available on this machine")
+    path, knobs = _stem_load(stem, dev)
+    if not os.path.isdir(path):
+        pytest.skip(f"fixture {stem} not built")
+    kind = spec.kind_of_stem(stem)
+    assert kind is not None
+    runs = []
+    asked: list[list[int]] = []
+    for i in TWO:
+        sm = shared_model(path, i, **knobs)
+        pc = sm._prefix_cache()
+        if pc is not None:
+            pc.tree.evict()  # the conversations earlier cells on this load left: each load starts from none
+        tags: set[PassTag] = set()
+
+        def turn(prompt: list[int], s: Any, sm: StreamedTextModel = sm, tags: set[PassTag] = tags) -> list[int]:
+            out = [int(t) for t in sm.generate(prompt, N, session=s, speculate=False).tokens]
+            tags.update(sm.last_pass_report().tags)
+            return out
+
+        a = sm.session()
+        first = turn(list(PROMPT), a)
+        turn(list(SIDE), a)
+        missed = a.last_reuse
+        asked = [[*PROMPT, *first, *OTHER], [*PROMPT, *first, *SIDE]]
+        second = turn(asked[0], a)
+        hit = a.last_reuse
+        b = sm.session()
+        third = turn(asked[1], b)
+        runs.append((first, second, third, missed, hit, b.last_reuse))
+        if i == 0:
+            oracle.assert_matches(kind, first, dev.hardware.value)
+            for want in sorted(spec.SURFACE_TAGS[spec.Surface.PREFIX](kind, dev)):
+                assert want in tags, f"{stem} on {dev.key}/prefix: {want} never engaged (got {sorted(tags)})"
+            assert (missed, hit, b.last_reuse) == (0, len(PROMPT) + len(first) - 1, len(PROMPT) + len(first)), (
+                f"{stem} on {dev.key}/prefix: reused {missed}, {hit}, {b.last_reuse} rows"
+            )
+    assert runs[0] == runs[1], f"{stem} on {dev.key}: conversations answered differently across two loads"
+    cold = shared_model(path, TWO[-1], **knobs)
+    for prompt, got in zip(asked, runs[0][1:3], strict=True):
+        assert_same_tokens(oracle.decode(cold, prompt), got, f"{stem} on {dev.key}: a prefix hit left the cold decode")
+    receipt.record(manifest.stem_id(spec.Surface.PREFIX, stem, dev.key))
 
 
 def test_cross_process_determinism() -> None:

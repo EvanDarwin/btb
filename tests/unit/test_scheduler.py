@@ -179,6 +179,9 @@ class _StubEngine(_GenerateMixin):
     def new_cache(self, max_len: int | None = None) -> _StubCache:
         return _StubCache(max_len)
 
+    def _decode_cache(self, max_len: int) -> _StubCache:
+        return self.new_cache(max_len)  # an engine with no prefix cache: a cache of the call's own
+
     def _logits(self, rows: TokenRows, k: int) -> torch.Tensor:
         out = torch.zeros(len(rows), 1, V)
         for b, r in enumerate(rows):

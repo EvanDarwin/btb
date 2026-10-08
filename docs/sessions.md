@@ -59,7 +59,9 @@ with session._txn(eng) as t:  # the rollback point: len(ids), the state, recurre
   `m`, not to the call's start: the rows past `m` are overwritten by the new prompt's, and keeping both would cost a
   copy of the tail. The state at `m` is `Pending` on the token at `m - 1` (a dense cache crops to it; a hybrid
   restores the anchor it opened from). This is the one place a failure leaves the session shorter than it was, and
-  it is shorter by exactly what the call was replacing.
+  it is shorter by exactly what the call was replacing. Where the engine's prefix cache serves it
+  (btb/engine/prefix.py), the rows past `m` are not overwritten but stay in the engine's tree, which every commit
+  adds the session's tokens to: the prompt opens on the longest prefix any conversation left there, read in place.
 * **Every public mutator is a transaction:** `feed`, `sync`, `rewind`, `crop`, `generate(session=...)`, and a
   fork's or batch's write-back. `_open`/`_keep`/`_abandon`/`_whole`/`_back_to`/`_undo`/`_held` go away; `_open`
   becomes "the rollback point this prompt keeps", `_keep` becomes `commit`.

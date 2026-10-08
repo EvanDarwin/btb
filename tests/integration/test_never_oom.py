@@ -119,9 +119,10 @@ def told(sm: StreamedTextModel, mp: pytest.MonkeyPatch) -> Iterator[dict[str, in
         reserve(tag, nbytes, device, **kw)
         t["reserved"] = max(t["reserved"], int(dv.reserved(sm.dev)) - base)
 
-    def m(dev: torch.device, nbytes: int, what: str, own: str | None = None) -> set[str]:
+    def m(dev: torch.device, nbytes: int | Callable[[], int], what: str, own: str | None = None) -> set[str]:
         if torch.device(dev).type == "cuda":
-            t["asked"] += int(nbytes)
+            # a need re-priced as room is made (a cache's growth) asks what it prices first
+            t["asked"] += int(nbytes() if callable(nbytes) else nbytes)
         return make(dev, nbytes, what, own)
 
     with mp.context() as ctx:

@@ -88,6 +88,8 @@ class Missing(StrEnum):
     QUANT_FIXTURE = "quant-fixture"
     NO_FIXTURE = "no-fixture"
     PREFIX_CACHE = "prefix-cache"
+    PREFIX_SNAPSHOT = "prefix-snapshot"
+    PREFIX_FAMILY = "prefix-family"
 
 
 # kind -> (what is missing, how to close it), both a full sentence. This is the single natural-language source
@@ -211,12 +213,27 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "add the family's fixture stem to spec.FIXTURE_STEM and generate the twin in tests/make_fixtures.py",
     ),
     Missing.PREFIX_CACHE: (
-        "the engine keeps one conversation's cache a session and drops it whole for a prompt that shares nothing "
-        "with it (btb/session.py `_reuse`): a conversation's next turn after another request is prefilled again from "
-        "its first token, and a prefix two conversations share is computed and held once each",
-        "land the paged prefix cache on this tier (btb/engine/kvpool.py and radix.py: every conversation's rows in "
-        "shared, referenced pages, the tier's attention reading them through the row map); `prefix_gap` then stops "
-        "naming the tier and the runner's prefix cells run there",
+        "this tier's attention reads no pages yet (btb/engine/prefix.py `why_not`): its sessions keep one "
+        "conversation's cache each and drop it whole for a prompt that shares nothing with it, so a conversation's "
+        "next turn after another request is prefilled again from its first token, and a prefix two conversations "
+        "share is computed and held once each",
+        "land the paged prefix cache on this tier - the card's graphs and kernels through the row map (plan phase "
+        "P2), MLX's per-op kernels and megakernel over one pool buffer (P8) - then take the tier out of `why_not` and "
+        "spec.paged; the runner's prefix cells run there",
+    ),
+    Missing.PREFIX_SNAPSHOT: (
+        "a hybrid's recurrent layers resume only from a kept snapshot of their state, and none is kept at a message "
+        "boundary yet, so the prefix cache does not serve the family (btb/engine/prefix.py `why_not`)",
+        "keep the linear layers' snapshots at every message boundary in the prefill's sweep and store them on the "
+        "tree's nodes (plan phase P4), then take the hybrid out of `why_not` and spec.paged",
+    ),
+    Missing.PREFIX_FAMILY: (
+        "the family reads its rows through attention of its own - Qwen4's card programs and indexed layers, "
+        "gpt-oss's sinks module over one contiguous buffer - which no row map reaches yet, so the prefix cache does "
+        "not serve it (btb/engine/prefix.py `why_not`)",
+        "give the family's attention the table: Qwen4's qsa kernels and `ArenaIndexedLayer` (plan phase P6), a "
+        "sinks-aware paged split kernel and Rust kernel for gpt-oss (P7); then take it out of `why_not` and "
+        "spec.paged",
     ),
 }
 
@@ -517,12 +534,17 @@ def subpath_gap(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath
 
 def prefix_gap(kind: FamilyKind, dev: spec.DeviceSubpath) -> Missing | None:
     """why the prefix axis's conversations cannot hold on this family and sub-path, in the order the engine hits
-    it: a sub-path that does not engage at all (its own gap), then a tier the prefix cache is not on yet. Every
-    tier until its phase lands - this is the rule the engine's own `supported` reasons will mirror."""
+    it: a sub-path that does not engage at all (its own gap), then the engine's own reasons (`PrefixCache.why_not`,
+    whose rule `spec.paged` is): a tier the prefix cache is not on yet, a hybrid's snapshots, a family's own
+    attention"""
     refused = subpath_gap(kind, spec.Storage.SAFE_BF16, dev)
     if refused is not None:
         return refused
-    return Missing.PREFIX_CACHE
+    if spec.paged(kind, dev.hardware):
+        return None
+    if dev.hardware is not spec.Hardware.CPU:
+        return Missing.PREFIX_CACHE
+    return Missing.PREFIX_SNAPSHOT if spec.recurrent(kind) else Missing.PREFIX_FAMILY
 
 
 def shape_gap(surface: spec.Surface, kind: FamilyKind, dev: spec.DeviceSubpath) -> Missing | None:

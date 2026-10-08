@@ -154,6 +154,18 @@ _WANTS: dict[str, tuple[str, Callable[..., dict[str, Want]]]] = {
             "out": (out, (_F32,)),
         },
     ),
+    "attn_spans": (
+        "btb_attn_spans",
+        lambda q, k, v, rows, starts, ends, scale, out: {
+            "q": (q, (_F32,)),
+            "k": (k, (_BF16, _F32)),
+            "v": (v, (k.dtype,)),
+            "rows": (rows, (_I32,)),
+            "starts": (starts, (_I32,)),
+            "ends": (ends, (_I32,)),
+            "out": (out, (_F32,)),
+        },
+    ),
 }
 
 
@@ -210,6 +222,7 @@ class Native(metaclass=_Binding):
         "gemv_fp8_group",
         "attn_decode",
         "attn_nodes",
+        "attn_spans",
         "delta_step",
         "sample_pick",
         "read_direct",
@@ -231,6 +244,7 @@ class Native(metaclass=_Binding):
     gemv_fp8_group: Any
     attn_decode: Any
     attn_nodes: Any
+    attn_spans: Any
     delta_step: Any
     sample_pick: Any
     read_direct: Any
@@ -764,6 +778,57 @@ class Native(metaclass=_Binding):
                     raise NativeError("btb_attn_nodes", rc)
 
             cls.attn_nodes = attn_nodes
+        cls.attn_spans = None
+        if hasattr(lib, "btb_attn_spans_bf16") and hasattr(lib, "btb_attn_spans_f32"):
+            P = ctypes.c_void_p
+            S = ctypes.c_size_t
+            sfns = {}
+            for name, dt in (("btb_attn_spans_bf16", torch.bfloat16), ("btb_attn_spans_f32", torch.float32)):
+                fn = getattr(lib, name)
+                fn.restype = ctypes.c_int32
+                fn.argtypes = [P, P, P, P, S, P, P, S, S, S, S, S, S, S, ctypes.c_float, P, S]
+                sfns[dt] = fn
+
+            def attn_spans(
+                q: torch.Tensor,
+                k: torch.Tensor,
+                v: torch.Tensor,
+                rows: torch.Tensor,
+                starts: torch.Tensor,
+                ends: torch.Tensor,
+                scale: float,
+                out: torch.Tensor,
+            ) -> None:
+                """`attn_nodes` with every query's rows a span of one map: `q` and `out` [T, hq, d] float32,
+                `k`/`v` [hk, n_rows, d] as `attn_decode` takes them, `rows` the map and `starts`/`ends` [T] int32,
+                query t attending the rows `rows[starts[t]:ends[t]]` in map order. The spans may overlap (a chunk's
+                rows each over the rows before them), and row t is `attn_nodes` over that span as a list, bit for
+                bit"""
+                fn = sfns[k.dtype]
+                hk, n_rows, d = k.shape
+                rc = fn(
+                    q.data_ptr(),
+                    k.data_ptr(),
+                    v.data_ptr(),
+                    rows.data_ptr(),
+                    rows.shape[0],
+                    starts.data_ptr(),
+                    ends.data_ptr(),
+                    starts.shape[0],
+                    n_rows,
+                    q.shape[1],
+                    hk,
+                    d,
+                    k.stride(0),
+                    v.stride(0),
+                    float(scale),
+                    out.data_ptr(),
+                    threads,
+                )
+                if rc != 0:
+                    raise NativeError("btb_attn_spans", rc)
+
+            cls.attn_spans = attn_spans
         if checked:
             for name in _WANTS:
                 bound = getattr(cls, name)
