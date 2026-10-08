@@ -930,6 +930,7 @@ class _Cuda:
         "btb_gemv_mma_glu_gelu",
         # a prompt's matmuls in the step's bits (btb_gemm.cuh): one for each matvec the warm-up may pick
         "btb_gemm_mma_bf16",
+        "btb_gemm_mma_tail_bf16",
         "btb_gemm_f32_bf16",
         "btb_l2_warm",
         "btb_norm_rope_kv_d64",
@@ -1052,6 +1053,7 @@ class _Cuda:
         self._call("cuCtxGetDevice", ctypes.byref(dev))
         self.device = int(dev.value)
         self.sms = self.attr(16)  # CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT
+        self._resident: dict[tuple[str, int, int], int] = {}  # `blocks_per_sm`'s answers
         # the one attention's prefill form takes its block's shared memory dynamically, past the 48 KB a launch may
         # take without the kernel's ceiling raised to it
         for d in (64, 128, 256):
@@ -1122,6 +1124,23 @@ class _Cuda:
         v = ctypes.c_int()
         self._call("cuDeviceGetAttribute", ctypes.byref(v), ctypes.c_int(which), ctypes.c_int(self.device))
         return int(v.value)
+
+    def blocks_per_sm(self, name: str, threads: int, shared: int = 0) -> int:
+        """the blocks of kernel `name` an SM holds at once at `threads` a block and `shared` bytes of dynamic shared
+        memory: the driver's count, from the kernel's registers and shared memory on this card"""
+        key = (name, threads, shared)
+        n = self._resident.get(key)
+        if n is None:
+            v = ctypes.c_int()
+            self._call(
+                "cuOccupancyMaxActiveBlocksPerMultiprocessor",
+                ctypes.byref(v),
+                self.fn[name],
+                ctypes.c_int(threads),
+                ctypes.c_size_t(shared),
+            )
+            n = self._resident[key] = int(v.value)
+        return n
 
     def l2_bytes(self) -> int:
         """the card's L2, as the driver reports it"""

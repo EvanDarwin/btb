@@ -26,8 +26,12 @@ class Scratch:
         self._bufs: dict[tuple[str, str], torch.Tensor] = {}
         sm.holdings.own(Stage.MEMORY, "the passes' scratch buffers", self.clear)
 
-    def take(self, name: str, shape: Sequence[int], dtype: torch.dtype, device: Any, requester: str) -> torch.Tensor:
-        """buffer `name` on `device` as `shape` of `dtype` (its contents whatever the last user left)"""
+    def take(
+        self, name: str, shape: Sequence[int], dtype: torch.dtype, device: Any, requester: str, zeroed: bool = False
+    ) -> torch.Tensor:
+        """buffer `name` on `device` as `shape` of `dtype` (its contents whatever the last user left). `zeroed`: a
+        buffer made new is zeros - for a user that leaves it at zero itself (a kernel's counters), so a buffer it
+        takes again is zeros too"""
         dev = torch.device(device)
         key = (name, str(dev))
         n = math.prod(int(s) for s in shape)
@@ -40,7 +44,7 @@ class Scratch:
             assert sm is not None
             nbytes = n * torch.empty(0, dtype=dtype).element_size()
             sm.scheduler.grant(nbytes, "scratch", requester=requester, device=dev)
-            t = torch.empty(n, dtype=dtype, device=dev)
+            t = (torch.zeros if zeroed else torch.empty)(n, dtype=dtype, device=dev)
             self._bufs[key] = t
         return t[:n].view(*shape)
 

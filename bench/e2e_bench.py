@@ -410,18 +410,14 @@ def test_cuda_gemm(benchmark: object, shape: str, T: int, how: str) -> None:
     w = torch.randn(R, C, dtype=torch.bfloat16, device="cuda")
     x = torch.randn(T, C, dtype=torch.bfloat16, device="cuda")
     y = torch.empty(T, R, dtype=torch.bfloat16, device="cuda")
-    P, I = k.ptr, ctypes.c_int
-    nw = _CudaMixin._card_mma_warps(R, C)  # the step's warps for the shape
+    take = _CudaMixin._card_gemm_takes("cuda")  # a split tail's buffers, kept from round to round as the engine's
 
     def run() -> None:
-        if how == "mma":
-            grid = _CudaMixin._card_gemm_grid(True, R, T)
-            k.launch("btb_gemm_mma_bf16", grid, (128, 1, 1), [P(w), P(x), P(y), I(R), I(C), I(T), I(nw)])
-        elif how == "f32":
-            grid = _CudaMixin._card_gemm_grid(False, R, T)
-            k.launch("btb_gemm_f32_bf16", grid, (128, 1, 1), [P(w), P(x), P(y), I(R), I(C), I(T)])
-        else:
+        if how == "cublas":
             torch.matmul(x, w.t(), out=y)
+        else:
+            # the engine's launch: the step's warps for the shape, its last wave split where the card's plan splits it
+            _CudaMixin._card_gemm_launch(k, how == "mma", w, x, y, R, C, T, take)
         torch.cuda.synchronize()
 
     benchmark.group = f"cuda-gemm-{shape}-t{T}"  # type: ignore[attr-defined]

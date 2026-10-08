@@ -2719,6 +2719,11 @@ class _CudaMixin(_State):
             cnt = buf("cnt", (T * Hq,), torch.int32)
         r0 = 0 if all_rows else T - 1
         tail_bufs = self._card_tail_buffers(T - r0, H) if tail else None
+        # the matmuls' split tails (`_card_gemm_plan`): the layer's four, and the head's where the pass carries it
+        gemms = [((Hq + 2 * Hk) * D, H, T), (H, Hq * D, T), (2 * I, H, T), (H, I, T)]
+        if tail_bufs is not None:
+            gemms.append((int(tail_bufs[1].shape[1]), H, T - r0))
+        self._card_gemm_ready(k, gemms)
         hb.copy_(h.reshape(T, H))
         for s in range(nsl):
             where[s : s + 1].fill_(past + s * self.GRID_Y)
@@ -2843,26 +2848,116 @@ class _CudaMixin(_State):
     # the most rows a launch takes on grid.y (the card's limit), where a chunk's rows ride it
     GRID_Y = 65535
 
+    # the tensor-core GEMM's last wave split by slice (`_card_gemm_plan`): where its tiles fill the card's SMs this
+    # many times at most (the wave a block an SM or not much past), the weight's k this many super-tiles at least (a
+    # slice's block outlasting the split's own cost: the second launch, its partials, the fold), and the chunk's
+    # tiles this many SMs' worth at most (past it the last wave is a small share of the chunk)
+    GEMM_TAIL_SPARSE = 1.5
+    GEMM_TAIL_MIN_K = 96
+    GEMM_TAIL_MAX_WAVES = 8
+
+    @classmethod
+    def _card_gemm_plan(cls, R: int, C: int, rows: int, nw: int, sms: int, per_sm: int) -> tuple[int, int]:
+        """a tensor-core prompt GEMM's tiles (btb_gemm.cuh: 128 x rows by 64 weight rows, `per_sm` blocks an SM on
+        `sms` SMs): (the whole tiles btb_gemm_mma_bf16 takes, the tail's btb_gemm_mma_tail_bf16 takes a slice a
+        block). A last wave of a few whole tiles held the card while most of its SMs idled (Qwen3-0.6B's down at 512
+        rows: 64 tiles on 60 SMs); split, its tiles' slices spread over every SM. Where a slice is short, or the last
+        wave a small share of a long chunk, the split's own cost outweighs it and every tile is whole"""
+        tiles = (rows + 127) // 128 * ((R + 63) // 64)
+        tail = tiles % (per_sm * sms)
+        if nw < 2 or (C + 31) // 32 < cls.GEMM_TAIL_MIN_K or tiles > cls.GEMM_TAIL_MAX_WAVES * sms:
+            return tiles, 0
+        if tail == 0 or tail > cls.GEMM_TAIL_SPARSE * sms:
+            return tiles, 0
+        return tiles - tail, tail
+
+    @classmethod
+    def _card_gemm_launch(
+        cls,
+        k: Any,
+        mma: bool,
+        W: torch.Tensor,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        R: int,
+        C: int,
+        rows: int,
+        take: Callable[[str, tuple[int, ...], torch.dtype, bool], torch.Tensor],
+        plan: tuple[int, int] | None = None,
+        nw: int | None = None,
+    ) -> None:
+        """y[:rows] = x[:rows] W^T [R, C] as the step's matvec sums each row (btb_gemm.cuh): the tensor cores' at the
+        matvec's warps for the weight's shape, or the fp32 chain - the one the warm-up picked (`mma`). `take(name,
+        shape, dtype, zeroed)`: the split tail's buffers (`_card_gemm_plan`). The engine's, the kernel tests' and the
+        bench's launch; `plan` and `nw` (the matvec's warps) forced only by the tests"""
+        P, ci = k.ptr, ctypes.c_int
+        if not mma:
+            grid = ((rows + 7) // 8 * ((R + 31) // 32), 1, 1)  # a block 8 x rows by 32 weight rows, in groups
+            k.launch("btb_gemm_f32_bf16", grid, (128, 1, 1), [P(W), P(x), P(y), ci(R), ci(C), ci(rows)])
+            return
+        if nw is None:
+            nw = cls._card_mma_warps(R, C)
+        if plan is None:
+            plan = cls._card_gemm_plan(R, C, rows, nw, k.sms, k.blocks_per_sm("btb_gemm_mma_bf16", 128))
+        whole, tail = plan
+        args = [P(W), P(x), P(y), ci(R), ci(C), ci(rows), ci(nw)]
+        part = cnt = None
+        if tail:
+            # a slice's partial in each block's own fragment order; a tile's counter left at zero by its fold. Taken
+            # before either launch: refused, every tile is whole - the same bits
+            try:
+                part = take("card gemm parts", (tail * nw * 128 * 64,), torch.float32, False)
+                cnt = take("card gemm counts", (tail,), torch.int32, True)
+            except MemoryGrantError:
+                whole, tail = whole + tail, 0
+        if whole:
+            # the first `whole` tiles in group order (`gm_tile`)
+            k.launch("btb_gemm_mma_bf16", (whole, 1, 1), (128, 1, 1), args)
+        if tail:
+            k.launch("btb_gemm_mma_tail_bf16", (tail * nw, 1, 1), (128, 1, 1), args + [P(part), P(cnt), ci(whole)])
+
     @staticmethod
-    def _card_gemm_grid(mma: bool, R: int, rows: int) -> tuple[int, int, int]:
-        """a prompt GEMM's launch (btb_gemm.cuh): a block a tile of 128 x rows by 64 weight rows (the tensor cores'),
-        or 8 by 32 (the fp32 chain's), every tile in one line of blocks the kernel takes in groups (`gm_tile`)"""
-        if mma:
-            return ((rows + 127) // 128 * ((R + 63) // 64), 1, 1)
-        return ((rows + 7) // 8 * ((R + 31) // 32), 1, 1)
+    def _card_gemm_takes(device: Any) -> Callable[[str, tuple[int, ...], torch.dtype, bool], torch.Tensor]:
+        """`_card_gemm_launch`'s buffers outside an engine (the kernel tests, the bench): each name's kept for the
+        next launch and grown as asked, zeros where made new for a `zeroed` one, as the engine's scratch keeps them"""
+        bufs: dict[str, torch.Tensor] = {}
+
+        def take(name: str, shape: tuple[int, ...], dtype: torch.dtype, zeroed: bool) -> torch.Tensor:
+            n = 1
+            for s in shape:
+                n *= int(s)
+            t = bufs.get(name)
+            if t is None or t.dtype != dtype or t.numel() < n:
+                t = bufs[name] = (torch.zeros if zeroed else torch.empty)(n, dtype=dtype, device=device)
+            return t[:n].view(*shape)
+
+        return take
+
+    def _card_gemm_take(self, name: str, shape: tuple[int, ...], dtype: torch.dtype, zeroed: bool) -> torch.Tensor:
+        """a split tail's buffer (`_card_gemm_launch`), the engine's scratch"""
+        who = "the card's prompt GEMM: its last wave's tiles split by slice"
+        return self.scratch.take(name, shape, dtype, self.dev, who, zeroed=zeroed)
+
+    def _card_gemm_ready(self, k: Any, gemms: Iterable[tuple[int, int, int]]) -> None:
+        """the split tails' buffers for a pass's matmuls (each [R, C] over `rows`): the widest any of them asks,
+        taken now - with the pass's other buffers, before a row of the cache is written - so no matmul asks the
+        ledger past the pass's first write"""
+        parts = counts = 0
+        for R, C, rows in gemms:
+            if not self._card_mma_for(rows):
+                continue
+            nw = self._card_mma_warps(R, C)
+            _, tail = self._card_gemm_plan(R, C, rows, nw, k.sms, k.blocks_per_sm("btb_gemm_mma_bf16", 128))
+            parts, counts = max(parts, tail * nw * 128 * 64), max(counts, tail)
+        if counts:
+            self._card_gemm_take("card gemm parts", (parts,), torch.float32, False)
+            self._card_gemm_take("card gemm counts", (counts,), torch.int32, True)
 
     def _card_gemm(
         self, k: Any, mma: bool, W: torch.Tensor, x: torch.Tensor, y: torch.Tensor, R: int, C: int, rows: int
     ) -> None:
-        """y[:rows] = x[:rows] W^T [R, C] as the step's matvec sums each row (btb_gemm.cuh): the tensor cores' at
-        the matvec's warps for the weight's shape, or the fp32 chain - the one the warm-up picked (`mma`)"""
-        P, ci = k.ptr, ctypes.c_int
-        grid = self._card_gemm_grid(mma, R, rows)
-        if mma:
-            args = [P(W), P(x), P(y), ci(R), ci(C), ci(rows), ci(self._card_mma_warps(R, C))]
-            k.launch("btb_gemm_mma_bf16", grid, (128, 1, 1), args)
-        else:
-            k.launch("btb_gemm_f32_bf16", grid, (128, 1, 1), [P(W), P(x), P(y), ci(R), ci(C), ci(rows)])
+        """`_card_gemm_launch` with the engine's scratch for the split tail's buffers"""
+        self._card_gemm_launch(k, mma, W, x, y, R, C, rows, self._card_gemm_take)
 
     def _card_tail_ok(self) -> bool:
         """the card graph's kernels run the tail: the card graph on, the final norm and the head on the card, bf16"""

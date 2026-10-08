@@ -122,6 +122,7 @@ def test_kernels_parameters_are_read_off_their_definitions() -> None:
     arity = cuda_ops.defined_arity()
     assert set(arity) == cuda_ops.defined_kernels() and all(n > 0 for n in arity.values())
     assert arity["btb_gemm_mma_bf16"] == 7  # w, x, y, R, C, T, nw
+    assert arity["btb_gemm_mma_tail_bf16"] == 10  # and part, cnt, t0
     assert arity["btb_attn_flash_d64"] == arity["btb_attn_flash_d256"] == 18
     assert arity["btb_attn_flash_prefill_d128"] == arity["btb_attn_flash_prefill_kq_d128"] == 14  # ATTN_FLASH_PF_ARGS
 

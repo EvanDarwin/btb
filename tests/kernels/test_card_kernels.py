@@ -469,16 +469,18 @@ def test_the_glu_matvec_is_the_matvec_and_the_activation_bit_for_bit(
 # ---------------------------------------------------------------------------------------------------------
 
 
-def _gemm(cu: _Cuda, W: torch.Tensor, x: torch.Tensor, warps: int = 0) -> torch.Tensor:
-    """`btb_gemm_mma_bf16` at the matvec's `warps`, or `btb_gemm_f32_bf16` (warps 0), over every row of x"""
+_gemm_takes = _CudaMixin._card_gemm_takes(dev)  # the split tail's buffers, kept from launch to launch as the engine's
+
+
+def _gemm(
+    cu: _Cuda, W: torch.Tensor, x: torch.Tensor, warps: int = 0, plan: tuple[int, int] | None = None
+) -> torch.Tensor:
+    """the engine's launch (`_card_gemm_launch`) over every row of x: `btb_gemm_mma_bf16` at the matvec's `warps`
+    (its last wave split by slice where the plan - the card's, or `plan` - splits it), or `btb_gemm_f32_bf16` (warps 0)"""
     T, C = x.shape
     R = W.shape[0]
     y = torch.full((T, R), float("nan"), device=dev, dtype=bf)
-    grid = _CudaMixin._card_gemm_grid(bool(warps), R, T)  # the engine's launch: its tiles in groups
-    if warps:
-        cu.launch("btb_gemm_mma_bf16", grid, (128, 1, 1), [P(W), P(x), P(y), I(R), I(C), I(T), I(warps)])
-    else:
-        cu.launch("btb_gemm_f32_bf16", grid, (128, 1, 1), [P(W), P(x), P(y), I(R), I(C), I(T)])
+    _CudaMixin._card_gemm_launch(cu, bool(warps), W, x, y, R, C, T, _gemm_takes, plan=plan, nw=warps or None)
     return y
 
 
@@ -495,6 +497,45 @@ def test_a_prompts_matmul_gives_the_steps_rows_on_tensor_cores(cu: _Cuda, R: int
         assert torch.equal(y[a : a + 32], _mma(cu, W, x[a : a + 32], warps)), a
     assert torch.equal(_gemm(cu, W, x[:1], warps), y[:1])
     assert torch.equal(_gemm(cu, W, x[100:229], warps), y[100:229])
+
+
+@pytest.mark.parametrize("warps", [2, 4, 8])
+@pytest.mark.parametrize("R,C", [(1024, 3072), (2560, 9728), (1020, 1032), (64, 4136), (17, 8)])
+def test_a_prompts_matmul_split_by_slice_gives_its_whole_tiles_bits(cu: _Cuda, R: int, C: int, warps: int) -> None:
+    """`btb_gemm_mma_tail_bf16`: a tile split into the matvec's slices - a block a slice, the last to finish folding
+    them in slice order - gives the bits its whole block gives, whichever tiles the split takes (every one, the
+    second half, the last alone; a slice past the last super-tile where the k is short), and leaves its counters at
+    zero for the next launch, which gives them again"""
+    torch.manual_seed(15)
+    W = torch.randn(R, C, device=dev, dtype=bf)
+    x = torch.randn(300, C, device=dev, dtype=bf)
+    tiles = (300 + 127) // 128 * ((R + 63) // 64)
+    want = _gemm(cu, W, x, warps, plan=(tiles, 0))
+    for whole in (0, tiles // 2, tiles - 1, 0):
+        assert torch.equal(_gemm(cu, W, x, warps, plan=(whole, tiles - whole)), want), whole
+        cnt = _gemm_takes("card gemm counts", (tiles - whole,), torch.int32, True)
+        assert int(cnt.abs().sum()) == 0, whole
+
+
+def test_a_prompts_matmul_whose_split_the_ledger_refuses_runs_every_tile_whole(cu: _Cuda) -> None:
+    """`_card_gemm_launch` where the plan splits the last wave (Qwen3-0.6B's down over 300 rows: 48 tiles, every
+    one) and the split's buffers are refused: every tile whole, the same bits, nothing launched before the refusal"""
+    from btb.engine.scheduler import MemoryGrantError
+
+    torch.manual_seed(16)
+    R, C, T = 1024, 3072, 300
+    W = torch.randn(R, C, device=dev, dtype=bf)
+    x = torch.randn(T, C, device=dev, dtype=bf)
+    tiles = (T + 127) // 128 * ((R + 63) // 64)
+    plan = _CudaMixin._card_gemm_plan(R, C, T, 4, cu.sms, cu.blocks_per_sm("btb_gemm_mma_bf16", 128))
+    assert plan[1] > 0, plan  # the case splits on this card
+
+    def refuse(name: str, shape: tuple[int, ...], dtype: torch.dtype, zeroed: bool) -> torch.Tensor:
+        raise MemoryGrantError(f"refused {name}", device=dev)
+
+    y = torch.full((T, R), float("nan"), device=dev, dtype=bf)
+    _CudaMixin._card_gemm_launch(cu, True, W, x, y, R, C, T, refuse)
+    assert torch.equal(y, _gemm(cu, W, x, 4, plan=(tiles, 0)))
 
 
 @pytest.mark.parametrize("R,C", [(4096, 1024), (1024, 3072), (2560, 9728), (1020, 1032), (17, 8)])
