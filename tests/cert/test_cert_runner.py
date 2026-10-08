@@ -257,6 +257,8 @@ def _assert_path_engaged(
             f"{subject} on {dev.key} ({storage.value}): {want} never engaged (got {sorted(report.tags)}); "
             f"a fallback ran"
         )
+    for bad in sorted(spec.forbidden_tags(kind, dev)):
+        assert bad not in report, f"{subject} on {dev.key} ({storage.value}): a pass took {bad}, a fallback"
 
 
 # The GGUF storage axis: each tiny GGUF fixture crossed with the sub-paths the GGUF surface runs (dequant to
@@ -419,7 +421,8 @@ def test_context_growth_is_deterministic(stem: str, dev: spec.DeviceSubpath) -> 
 def _axis_tags(
     sm: StreamedTextModel, surface: spec.Surface, stem: str, dev: spec.DeviceSubpath, calls: bool = True
 ) -> None:
-    """the surface's tags in the report: the last pass's forks, and (`calls`) every API call made on the model"""
+    """the surface's tags in the report: the last decode's forks, and (`calls`) every API call made on the model - and
+    none it must never show (`spec.SURFACE_FORBIDS`)"""
     kind = next(k for k, s in spec.FIXTURE_STEM.items() if s == stem)
     report = sm.last_pass_report()
     for want in sorted(spec.SURFACE_TAGS[surface](kind, dev)):
@@ -427,22 +430,31 @@ def _axis_tags(
             assert want in report, (
                 f"{stem} on {dev.key}/{surface.value}: {want} never engaged (got {sorted(report.tags)})"
             )
+    forbids = spec.SURFACE_FORBIDS.get(surface)
+    for bad in sorted(forbids(kind, dev) if forbids is not None else ()):
+        assert bad not in report, f"{stem} on {dev.key}/{surface.value}: a pass took {bad}, a fallback"
 
 
 @pytest.mark.parametrize("stem,dev", _shape_cells(spec.Surface.HOOKED))
 def test_hooked_decode_is_the_plain_one(stem: str, dev: spec.DeviceSubpath) -> None:
     """a decode with every hook on (a processor, logprobs, a tapped layer) picks over the logits in hand, the
-    in-graph picks standing aside, and draws the plain decode's tokens - reproducibly across two loads"""
+    in-graph picks standing aside, and draws the plain decode's tokens - reproducibly across two loads; speculative
+    too (the plain answer offered as a span to draft from), its verify passes hooked as its steps are"""
     if not _hardware_here(dev.hardware):
         pytest.skip(f"{dev.hardware.value} not available on this machine")
     path, knobs = _stem_load(stem, dev)
     if not os.path.isdir(path):
         pytest.skip(f"fixture {stem} not built")
     runs = []
+    hooks: dict[str, Any] = {"processors": [lambda ids, lg: lg], "logprobs": 2, "taps": [-1]}
     for i in TWO:
         sm = shared_model(path, i, **knobs)
         plain = oracle.decode(sm, PROMPT)
-        g = sm.generate(list(PROMPT), N, speculate=False, processors=[lambda ids, lg: lg], logprobs=2, taps=[-1])
+        drafted = sm.generate(list(PROMPT), N, speculate=True, spans=[("plain", [*PROMPT, *plain])], **hooks)
+        if i == 0:
+            _axis_tags(sm, spec.Surface.HOOKED, stem, dev)
+        assert_same_tokens(plain, list(drafted.tokens), f"{stem} on {dev.key}: the hooked speculative decode left it")
+        g = sm.generate(list(PROMPT), N, speculate=False, **hooks)
         if i == 0:
             _axis_tags(sm, spec.Surface.HOOKED, stem, dev)
         toks = list(g.tokens)
@@ -633,6 +645,8 @@ def test_conversations_through_the_prefix_cache_answer_as_cold(stem: str, dev: s
             oracle.assert_matches(kind, first, dev.hardware.value)
             for want in sorted(spec.SURFACE_TAGS[spec.Surface.PREFIX](kind, dev)):
                 assert want in tags, f"{stem} on {dev.key}/prefix: {want} never engaged (got {sorted(tags)})"
+            for bad in sorted(spec.SURFACE_FORBIDS[spec.Surface.PREFIX](kind, dev)):
+                assert bad not in tags, f"{stem} on {dev.key}/prefix: a pass took {bad}, its rows not its steps'"
             assert (missed, hit, b.last_reuse) == (0, len(PROMPT) + len(first) - 1, len(PROMPT) + len(first)), (
                 f"{stem} on {dev.key}/prefix: reused {missed}, {hit}, {b.last_reuse} rows"
             )

@@ -30,12 +30,13 @@ from btb.engine.cuda import CardPassFailed
 from btb.engine.paged import PagedCache
 from btb.engine.prefix import PrefixCache
 from btb.kinds import PassTag
+from tests.cert.spec import card_rows, kind_of_stem
 from tests.helpers import FIXTURES, fixture, shared_key, shared_model
 
 DENSE = ["tiny_gemma3", "tiny_phi3", "tiny_qwen3"]
-# the dense families the card graph serves, whose prompts take its kernels (`_forward_card_prefill`): Phi-3's fused
-# projections run its torch modules (`Missing.PREFIX_INVARIANCE` in the cert's manifest)
-GRAPHED = ["tiny_gemma3", "tiny_qwen3"]
+# the dense families the card graph serves, whose prompts take its kernels (`_forward_card_prefill`), by the cert's
+# own rule (`card_rows`): Phi-3's fused projections run its torch modules (`Missing.PREFIX_INVARIANCE`)
+GRAPHED = [s for s in DENSE if (k := kind_of_stem(s)) is not None and card_rows(k)]
 OTHERS = ["tiny_gpt_oss", "tiny_q35", "tiny_q4"]
 VOCAB = 200  # inside every fixture's vocabulary
 # where a conversation's rows lie: the host's region on the CPU; on the card, the card's region under the card graph

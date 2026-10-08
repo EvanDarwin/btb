@@ -629,7 +629,8 @@ SURFACE_SUBPATHS: dict[Surface, tuple[str, ...]] = {
     **{CONTAINER_SURFACE[c]: container_subpaths(c) for c in Container},
     Surface.BATCH: ("cpu", "mlx-step"),
     Surface.CONTEXT: ("cpu", "mlx-step", "cuda-prefill"),
-    Surface.HOOKED: ("cpu", "mlx-step", "cuda-torch"),
+    # a hooked pass on the card graph's kernels too: its prompt, steps and verify passes each row as the unhooked
+    Surface.HOOKED: ("cpu", "mlx-step", "cuda-graph", "cuda-torch"),
     Surface.FORK: ("cpu", "mlx-step", "cuda-graph", "cuda-torch"),
     Surface.MODEL: ("cpu", "mlx-step", "cuda-torch"),
     Surface.SESSION: ("cpu", "mlx-step", "cuda-torch"),
@@ -685,6 +686,18 @@ def prefix_tags(kind: FamilyKind, dev: DeviceSubpath) -> frozenset[PassTag]:
     return frozenset(out)
 
 
+def forbidden_tags(kind: FamilyKind, dev: DeviceSubpath) -> frozenset[PassTag]:
+    """the forks a cell's own decode must NEVER show, beside the tags it must: on a sub-path that runs the card graph
+    for a family whose rows it makes (`card_rows`), every pass of a decode - its prompt, its steps, its verify passes,
+    hooked or not - takes the card's kernels, each row as its step makes it, so a layer run through torch's modules
+    (CUDA_TORCH_FALLBACK) is a path the cell certifies against: its rows would not be its steps', and a cache hit
+    would part from its prompt cold (a hooked verify pass once did, its steps on the card's kernels). A fork's or a
+    batch's rows (Surface.FORK) are not held to it: a forked cache's prompt is the torch layers' by design"""
+    if dev.card_graph and card_rows(kind):
+        return frozenset({PassTag.CUDA_TORCH_FALLBACK})
+    return frozenset()
+
+
 SURFACE_TAGS: dict[Surface, Callable[[FamilyKind, DeviceSubpath], frozenset[PassTag]]] = {
     Surface.CONTEXT: prefill_tags,
     Surface.HOOKED: lambda k, dev: frozenset({PassTag.PICK_HOOKED}),
@@ -694,6 +707,13 @@ SURFACE_TAGS: dict[Surface, Callable[[FamilyKind, DeviceSubpath], frozenset[Pass
     Surface.MODEL: lambda k, dev: api_tags("model") | api_tags("room"),
     Surface.SESSION: lambda k, dev: api_tags("session"),
     Surface.PREFIX: prefix_tags,
+}
+
+# the tags a cell of an axis beside the cartesian must never show (`forbidden_tags`): the axes whose passes are a
+# decode's own - a hooked one, a conversation's - not a fork's or a batch's rows
+SURFACE_FORBIDS: dict[Surface, Callable[[FamilyKind, DeviceSubpath], frozenset[PassTag]]] = {
+    Surface.HOOKED: forbidden_tags,
+    Surface.PREFIX: forbidden_tags,
 }
 
 

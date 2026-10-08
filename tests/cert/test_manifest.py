@@ -541,6 +541,25 @@ def test_the_prefix_axis_runs_where_the_prefix_cache_serves_and_is_a_gap_elsewhe
     assert {PassTag.KV_PAGED, PassTag.PREFIX_SHARED} <= spec.SURFACE_TAGS[spec.Surface.PREFIX](FamilyKind.QWEN3, on)
 
 
+def test_a_cell_never_forbids_what_it_expects() -> None:
+    """the card graph's sub-path forbids a family whose rows it makes the torch layers (`spec.forbidden_tags`), and no
+    other - a family it does not serve, the torch sub-path, the host's - is held to it; whatever a cell forbids, no cell
+    of its sub-path and family must show, on the cartesian or an axis beside it"""
+    graph, torch_ = spec.SUBPATH["cuda-graph"], spec.SUBPATH["cuda-torch"]
+    assert spec.forbidden_tags(FamilyKind.QWEN3, graph) == {PassTag.CUDA_TORCH_FALLBACK}
+    assert spec.forbidden_tags(FamilyKind.PHI3, graph) == spec.forbidden_tags(FamilyKind.QWEN3, torch_) == set()
+    assert spec.forbidden_tags(FamilyKind.QWEN3, spec.SUBPATH["cpu"]) == set()
+    for dev in spec.DEVICE_SUBPATHS:
+        for kind in core.served_kinds():
+            bad = spec.forbidden_tags(kind, dev)
+            for st in spec.Storage:
+                assert not bad & dev.expects(kind, st), (dev.key, kind, st)
+            for surface, forbids in spec.SURFACE_FORBIDS.items():
+                if dev.key in spec.SURFACE_SUBPATHS[surface]:
+                    assert not forbids(kind, dev) & spec.SURFACE_TAGS[surface](kind, dev), (surface, dev.key, kind)
+    assert "cuda-graph" in spec.SURFACE_SUBPATHS[spec.Surface.HOOKED]
+
+
 def test_every_open_gap_is_explained() -> None:
     """each open gap names the families it affects and what closing it takes. Which gaps are open is the
     manifest's to derive - `tests.cert.delta check` names the ones a change opened."""
