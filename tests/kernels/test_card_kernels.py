@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 from pytest import CaptureFixture
 
+from btb.engine.cuda import _CudaMixin
 from tests.helpers import need_card_kernels
 
 if TYPE_CHECKING:
@@ -571,9 +572,12 @@ def test_gemv_mma_streams_the_weights_at_the_cards_ceiling(cu: _Cuda, capsys: Ca
 # ---------------------------------------------------------------------------------------------------------
 
 
-def _fa_group(D: int) -> int:
-    """the keys of a group: FA_GT tiles of BN (btb_attn_flash.cuh), the decode form's block"""
-    return 8 * (32 if D >= 256 else 64)
+# the decode form's shape as the engine launches it (FaPick in btb_attn_flash.cuh): a group's keys, a block's threads
+_fa_group = _CudaMixin._attn_group
+
+
+def _fa_threads(D: int) -> int:
+    return 32 * _CudaMixin._attn_warps(D)
 
 
 def _flash(
@@ -585,12 +589,12 @@ def _flash(
     par: Sequence[int],
     scale: float,
     win: int = 0,
-    tbl: torch.Tensor | None = None,
+    tbl: torch.Tensor | ctypes.c_void_p | None = None,
     cap: int | None = None,
 ) -> torch.Tensor:
     """the decode form `btb_attn_flash_d{D}`: T tokens after n0 rows, token t parented to par[t], every row's group
     states stored and folded by the last of its groups to arrive; `cap` the positions the launch's groups cover (the
-    graph's), K's own by default"""
+    graph's), K's own by default; `tbl` a row map, or a pointer to one (a node's map set back to its window's start)"""
     T, Hq, D = q.shape
     Hk = K.shape[0]
     G = Hq // Hk
@@ -605,9 +609,9 @@ def _flash(
     cu.launch(
         f"btb_attn_flash_d{D}",
         ((T * G + 7) // 8, S, Hk),  # a block 8 rows of a group, its warps its tiles (four at the widest head)
-        (128 if D >= 256 else 256, 1, 1),
+        (_fa_threads(D), 1, 1),
         [P(q), P(K), P(V), P(out), P(n0t), P(pt), I(T), I(Hq), I(Hk), I(K.stride(0)), I(K.stride(1)), Fl(scale)]
-        + [P(pm), P(pl), P(pa), P(cnt), I(win), P(tbl)],
+        + [P(pm), P(pl), P(pa), P(cnt), I(win), tbl if isinstance(tbl, ctypes.c_void_p) else P(tbl)],
     )
     assert int(cnt.abs().sum()) == 0, "every row's count is reset by the block that folds it"
     return out
@@ -628,7 +632,7 @@ def _flash_rows(
     cu.launch(
         f"btb_attn_flash_rows_d{D}",
         (T * ((Hq // Hk + 7) // 8), S, Hk),
-        (128 if D >= 256 else 256, 1, 1),
+        (_fa_threads(D), 1, 1),
         [P(q), P(K), P(V), P(out), P(rw), I(T), I(Hq), I(Hk), I(K.stride(0)), I(K.stride(1)), Fl(scale)]
         + [P(pm), P(pl), P(pa), P(cnt), I(win)],
     )
@@ -755,14 +759,16 @@ def test_one_attention_verifies_a_tree_as_its_steps(cu: _Cuda, Hq: int, Hk: int,
 @pytest.mark.parametrize("D", [64, 128, 256])
 @pytest.mark.parametrize("layout", [FORK, BATCH], ids=["fork", "batch"])
 @pytest.mark.parametrize("win", [0, 512])
+@pytest.mark.parametrize("Hq,Hk", [(8, 4), (40, 4)], ids=["G2", "G10"])
 def test_one_attention_takes_each_rows_own_keys(
-    cu: _Cuda, D: int, layout: tuple[int, int, int, list[RowSpec]], win: int
+    cu: _Cuda, D: int, layout: tuple[int, int, int, list[RowSpec]], win: int, Hq: int, Hk: int
 ) -> None:
     """a fork's or a batch's rows: each within bf16 of the float32 reference over its own keys, and its own
-    sequence's one-row step, bit for bit, whatever rows step beside it - the same bits again"""
+    sequence's one-row step, bit for bit, whatever rows step beside it - the same bits again; a token's heads past
+    the 8 rows of a block (G 10) in blocks of their own"""
     torch.manual_seed(33)
     base, step, W, rows = layout
-    Hq, Hk, T = 8, 4, len(rows)
+    T = len(rows)
     cap = (base + (step + 1) * W + 1023) // 1024 * 1024
     K = torch.randn(Hk, cap, D, device=dev, dtype=bf)
     V = torch.randn(Hk, cap, D, device=dev, dtype=bf)
@@ -813,3 +819,18 @@ def test_one_attention_reads_rows_where_they_lie(cu: _Cuda, Hq: int, Hk: int, D:
     # one head of each group alone, its key head's rows its own
     alone = _flash(cu, q[:, ::G].contiguous(), K, V, n0, par, scale, win)
     assert torch.equal(alone, want[:, ::G])
+    # a prompt over several of the prefill's blocks through the map, and a one-row chunk through it - the step's row
+    qp = torch.randn(150, Hq, D, device=dev, dtype=bf)
+    for kq in _prefill_forms(cu):
+        pf = _flash_prefill(cu, qp, K, V, n0, scale, win, kq=kq)
+        assert torch.equal(_flash_prefill(cu, qp, Kp, Vp, n0, scale, win, tbl=tbl, kq=kq), pf), kq
+        one = _flash_prefill(cu, qp[:1], Kp, Vp, n0, scale, win, tbl=tbl, kq=kq)
+        assert torch.equal(one, _flash(cu, qp[:1], K, V, n0, [-1], scale, win)), kq
+    # a node's keys named one by one from its window's start (`_card_attention`'s KeyRows): the map's pointer set back
+    # by the window's first position, never read before it - the node's row as its step's through the whole map
+    pos = n0 + 3
+    first = max(0, pos + 1 - win) if win else 0
+    rows = tbl[first : pos + 1].clone()
+    via = ctypes.c_void_p(int(rows.data_ptr()) - 4 * first)
+    node = _flash(cu, q[:1], Kp, Vp, pos, [-1], scale, win, tbl=via, cap=cap)
+    assert torch.equal(node, _flash(cu, q[:1], K, V, pos, [-1], scale, win)), "a node through its named keys"
