@@ -632,7 +632,9 @@ class Session:
             self._held, self.logits = self.logits, None
             return cur, len(self.ids), None
         own = self._match(prompt) if cur is not None else 0
-        held = pc.tree.match(prompt[: len(prompt) - 1])
+        # every other session's commits in the tree first; this one's rows it reads itself, and what it parts from it
+        # keeps or lets go below - put in the tree first, a regenerate's cut left a page to the tree each time
+        held = pc.match(prompt[: len(prompt) - 1], asking=cur)
         if cur is not None and own >= held.length:
             if own == len(self.ids) and len(prompt) > len(self.ids):
                 self._pending, self.logits = None, None

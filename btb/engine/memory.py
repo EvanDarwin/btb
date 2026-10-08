@@ -1184,10 +1184,16 @@ class _MemoryMixin(_State):
         return torch.bfloat16 if card_bf16 else torch.float32
 
     def _give_up_one(self, dev: torch.device, short: int, tried: set[str]) -> bool:
-        """the cheapest thing btb holds on `dev`, given up toward `short` bytes: on a card the drafter, then layers
-        from the top, then the head (each live cache following its layer); on the host MLX's cached buffers, the
-        expert store's blocks, then a warm layer to the drive. False when nothing is left"""
+        """the cheapest thing btb holds on `dev`, given up toward `short` bytes: on a card the passes' scratch (made
+        again by the next pass that wants it), the drafter, then layers from the top, then the head (each live cache
+        following its layer); on the host MLX's cached buffers, the expert store's blocks, then a warm layer to the
+        drive. False when nothing is left"""
         log = self.log
+        if dev.type == Device.CUDA and "scratch" not in tried:
+            tried.add("scratch")
+            if self.scratch.release(device=self.dev):
+                torch.cuda.empty_cache()
+                return True
         if dev.type == Device.CUDA:
             if self.dev.type != Device.CUDA or self.device.request("lend", lambda: self.vram_shed(None, log)) is None:
                 return False

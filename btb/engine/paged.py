@@ -49,6 +49,12 @@ class PagedError(RuntimeError):
     """a paged cache read as one contiguous buffer: a path the paged reader does not reach (yet)"""
 
 
+def _page_rows(starts: Iterable[int]) -> torch.Tensor:
+    """the rows of the pages at `starts` (page ids, or slots), PAGE each, in order: an int64 index on the host"""
+    s = torch.tensor(list(starts), dtype=torch.int64)
+    return (s[:, None] * PAGE + torch.arange(PAGE)[None]).flatten()
+
+
 def _runs(pairs: Iterable[tuple[int, int]]) -> list[tuple[int, int, int]]:
     """(from, to) slot pairs as runs (from, to, count) where both go up by one together, at most MOVE_PAGES long:
     one copy a run instead of one a page"""
@@ -203,9 +209,9 @@ class HostRegion:
 class CardRegion:
     """The rows of the layers the card runs. On the card: per layer an arena (`KvArena` of one layer: K and V
     position-major [rows, Hk, D], grown in place where the driver maps memory, so the kernels' pointers stand), a
-    page's rows at `slot * PAGE ..` of every layer's - the pages of the conversation the card decodes (`bind`), the
-    rest parked as another is bound. In pinned RAM: the park, the same layout, a page at a park slot of its own until
-    a conversation reading it is bound again. `tbl` is the bound conversation's row map on the card: position j at card
+    page's rows at `slot * PAGE ..` of every layer's - the pages of the conversation the card decodes (`bind`), and
+    other conversations' until their slots are wanted, then parked, least recently used first. In pinned RAM: the
+    park, the same layout, a page at a park slot of its own until a conversation reading it is bound again. `tbl` is the bound conversation's row map on the card: position j at card
     row `tbl[j]`, as the card's kernels read it. `version` moves with every page that changes slots (the map is made
     again); `layout` with every move of the arenas' addresses, their length or the map's buffer (what a graph captured
     over them is made again)"""
@@ -318,18 +324,56 @@ class CardRegion:
             return 0
         return len(self.arenas) * (self._target(len(self.parked), slots) - len(self.parked)) * self._page_bytes()
 
-    def need(self, table: Table, new: int) -> tuple[int, int]:
-        """what binding `table` and `new` more pages of it take past what the region holds: (card slots, park
-        slots) - its pages off the card brought in and its new ones placed, less the slots its binding parks (the
-        pages there it does not read), which take park slots of their own"""
+    def _counts(self, table: Table) -> tuple[int, int, int]:
+        """(the table's pages in the park, its pages on neither, the pages on the card it does not read): what binding
+        it moves. In constant time while it stays bound with nothing moved since its map was made - each page it holds
+        is on the card then - else over its pages (a switch's)"""
         held = table.held
         bound = self._bound() if self._bound is not None else None
-        off = sum(1 for p in held.values() if p.slot < 0)
-        others = 0 if bound is table else sum(1 for p in self.slots if p is not None and p.id not in held)
-        back = sum(1 for p in held.values() if p.park >= 0)
-        slots = max(0, off + int(new) - others - len(self.free))
-        parks = max(0, others - back - len(self.pfree))
-        return slots, parks
+        used = len(self.slots) - len(self.free)
+        if bound is table and self._mapped[0] == self.version:
+            return 0, 0, used - len(held)
+        back = nowhere = 0
+        for p in held.values():
+            if p.park >= 0:
+                back += 1
+            elif p.slot < 0:
+                nowhere += 1
+        return back, nowhere, used - (len(held) - back - nowhere)
+
+    def need(self, table: Table, new: int) -> tuple[int, int]:
+        """what binding `table` and placing `new` more pages of it take past what the region holds: (card slots, park
+        slots), moved as `bind` and `reserve` move them - its parked pages into the free slots first, then traded with
+        pages on the card it does not read (their park slots theirs), the rest into slots the arenas grow for; its new
+        pages into the free slots left, then into the slots of more pages it does not read, parked, then grown"""
+        back, nowhere, others = self._counts(table)
+        free, pfree = len(self.free), len(self.pfree)
+        loaded = min(back, free)  # into free slots: their park slots free after
+        traded = min(back - loaded, others)
+        grow = back - loaded - traded
+        free, others, pfree = free - loaded, others - traded, pfree + loaded
+        want = nowhere + int(new)
+        into_free = min(want, free)
+        parked = min(want - into_free, others)
+        grow += want - into_free - parked
+        return grow, max(0, parked - pfree)
+
+    def _others(self, held: dict[int, Page]) -> list[Page]:
+        """the pages on the card a table holding `held` does not read, least recently used first: the ones parked for
+        its room"""
+        return sorted((p for p in self.slots if p is not None and p.id not in held), key=lambda p: p.tick)
+
+    def reserve(self, k: int, table: Table) -> None:
+        """`k` free slots on the card for `table`'s pages to come: the slots of pages it does not read parked for them,
+        least recently used first, the rest grown - one move for the pass's new pages, not one a page"""
+        with self._move():
+            short = int(k) - len(self.free)
+            if short <= 0:
+                return
+            out = self._others(table.held)[:short]
+            self.park(out)
+            if short > len(out):
+                self._grow(self.cap + short - len(out))
 
     @_kept
     def _grow(self, slots: int) -> None:
@@ -478,22 +522,90 @@ class CardRegion:
             if self.arenas:
                 self.loaded += len(pages)
 
+    def bind_for(self, table: Table, n: int) -> torch.Tensor:
+        """`table` bound (`bind`) with rows for its positions up to `n`: its own pages onto the card first, then room
+        for its new ones made in one move (`reserve`), then they are placed and the map brought up to date - placed
+        first, the new pages took slots the arenas grew for while the slots of the pages the binding then parked stood
+        empty. Each step a move of its own, under the lock: a page let go during one is freed before the table takes
+        new ones (`KvPool.alloc`), which could otherwise be that very page"""
+        with self.lock:
+            self.bind(table)
+            self.reserve(table.pages_for(max(0, int(n) - len(table))), table)
+            table.extend(int(n))
+            return self.bind(table)
+
+    @_kept
+    def swap(self, out: Sequence[Page], back: Sequence[Page]) -> None:
+        """each page of `out` (on the card) and the page of `back` beside it (in the park) trading places, the parked
+        one into the card slot and the card's into the park slot, through a staging buffer of up to MOVE_PAGES pages
+        on the card: a switch between conversations that fill the card and the park grows neither, where parking the
+        one before loading the other grew the park by every page it took off the card"""
+        pairs = list(zip(out, back, strict=False))
+        if not pairs:
+            return
+        with self._move():
+            if self.arenas:
+                n = min(len(pairs), MOVE_PAGES)
+                el = torch.empty(0, dtype=self.dtype).element_size()
+                if self.grant is not None:
+                    self.grant(
+                        n * PAGE * self.hk * self.d * el,
+                        "kv",
+                        requester="the prefix cache's trade of pages between the card and the park",
+                        device=self.dev,
+                        draws="",
+                    )
+                stage = torch.empty(n * PAGE, self.hk, self.d, dtype=self.dtype, device=self.dev)
+                for i in self.arenas:
+                    for w in ("k", "v"):
+                        card, park = self.arenas[i].view(w, 0), self.parks[i].view(w, 0)
+                        for c0 in range(0, len(pairs), n):
+                            chunk = pairs[c0 : c0 + n]
+                            for j, (o, _) in enumerate(chunk):
+                                stage[j * PAGE : (j + 1) * PAGE].copy_(card[o.slot * PAGE : (o.slot + 1) * PAGE])
+                            for o, b in chunk:
+                                src = park[b.park * PAGE : (b.park + 1) * PAGE]
+                                card[o.slot * PAGE : (o.slot + 1) * PAGE].copy_(src, non_blocking=True)
+                            for j, (_, b) in enumerate(chunk):
+                                src = stage[j * PAGE : (j + 1) * PAGE]
+                                park[b.park * PAGE : (b.park + 1) * PAGE].copy_(src, non_blocking=True)
+            for o, b in pairs:
+                s, ps = o.slot, b.park
+                self.slots[s], self.parked[ps] = b, o
+                self._set_slot(b, s)
+                b.park, b.where = -1, "card"
+                self._set_slot(o, -1)
+                o.park, o.where = ps, "park"
+            self.version += 1
+            if self.arenas:
+                self.loaded += len(pairs)
+
     def bind(self, table: Table) -> torch.Tensor:
-        """`table`'s pages on the card - those in the park brought back, the pages on the card it does not read
-        parked first - and its row map on the card (`tbl`, int32: position j at card row tbl[j]) brought up to date,
-        only its new positions uploaded while it stays the one bound"""
+        """`table`'s pages on the card and its row map there (`tbl`, int32: position j at card row tbl[j]) brought up
+        to date, only its new positions uploaded while it stays the one bound. Its pages in the park come back into
+        the free slots, then trade places with pages on the card it does not read (least recently used first), and
+        the rest into slots the arenas grow for. Another conversation's pages stay where they are until their slots
+        are wanted: a switch back and forth with room for both moves nothing"""
         with self._move():
             bound = self._bound() if self._bound is not None else None
             tbl = self.tbl
             if bound is not table:
                 held = table.held
-                # none bound until this one is: a load refused after the park leaves the table bound before with its
-                # pages parked, and its next bind must bring them back, not read its map as current
+                # none bound until this one is: a load refused part way leaves the table bound before with its pages
+                # elsewhere, and its next bind must bring them back, not read its map as current
                 self._bound = None
-                self.park([p for p in self.slots if p is not None and p.id not in held])
-                self.load([p for p in held.values() if p.park >= 0])
-                for p in held.values():
-                    if p.slot < 0:
+                back = sorted((p for p in held.values() if p.park >= 0), key=lambda p: p.park)
+                into_free = min(len(back), len(self.free))
+                self.load(back[:into_free])
+                rest = back[into_free:]
+                if rest:
+                    out = self._others(held)[: len(rest)]
+                    self.swap(out, rest[: len(out)])
+                    self.load(rest[len(out) :])
+                nowhere = [p for p in held.values() if p.slot < 0]
+                if nowhere:
+                    self.reserve(len(nowhere), table)
+                    for p in nowhere:
                         self.place(p)
             elif (
                 table.low >= len(table)
@@ -538,32 +650,38 @@ class CardRegion:
 
     def gather(self, i: int, rows: torch.Tensor, pages: Sequence[Page]) -> tuple[torch.Tensor, torch.Tensor]:
         """layer i's page rows `rows` in order as [1, Hk, n, D] tensors of their own on the card, wherever their
-        pages (`pages`, the pool's by id) lie - the card, or the park: a copy"""
+        pages (`pages`, the pool's by id) lie - the card, or the park: a copy, one gather from each"""
+        r = rows.to(torch.int64).cpu()
+        pid, off = r // PAGE, r % PAGE
+        slot = torch.full_like(pid, -1)
+        known = pid < len(self.slot_of)
+        slot[known] = self.slot_of[pid[known]]
+        on = slot >= 0
+        at_on, at_off = torch.nonzero(on).flatten(), torch.nonzero(~on).flatten()
+        park = torch.empty(0, dtype=torch.int64)
+        if len(at_off):
+            ids, inv = torch.unique(pid[at_off], return_inverse=True)
+            where = torch.tensor([pages[int(x)].park for x in ids.tolist()], dtype=torch.int64)
+            if bool((where < 0).any()):
+                raise PagedError(f"pages {ids[where < 0].tolist()} have no rows on the card or in the park")
+            park = where[inv] * PAGE + off[at_off]
         out = []
         for w in ("k", "v"):
-            got = torch.empty(len(rows), self.hk, self.d, dtype=self.dtype, device=self.dev)
-            for a, b in self._spans(rows):
-                p, off = pages[int(rows[a]) // PAGE], int(rows[a]) % PAGE
-                if p.slot >= 0:
-                    got[a:b] = self.arenas[i].view(w, 0)[p.slot * PAGE + off : p.slot * PAGE + off + b - a]
-                elif p.park >= 0:
-                    got[a:b] = self.parks[i].view(w, 0)[p.park * PAGE + off : p.park * PAGE + off + b - a]
-                else:
-                    raise PagedError(f"page {p.id} has no rows on the card or in the park")
+            got = torch.empty(len(r), self.hk, self.d, dtype=self.dtype, device=self.dev)
+            if len(at_on):
+                src = (slot[at_on] * PAGE + off[at_on]).to(self.dev)
+                got[at_on.to(self.dev)] = self.arenas[i].view(w, 0).index_select(0, src)
+            if len(at_off):
+                got[at_off.to(self.dev)] = self.parks[i].view(w, 0).index_select(0, park).to(self.dev)
             out.append(got.transpose(0, 1)[None])
         return out[0], out[1]
 
-    @staticmethod
-    def _spans(rows: torch.Tensor) -> list[tuple[int, int]]:
-        """`rows` cut where they leave a page or skip a row: each span one page's consecutive rows"""
-        r = rows.tolist()
-        out: list[tuple[int, int]] = []
-        a = 0
-        for j in range(1, len(r) + 1):
-            if j == len(r) or r[j] != r[j - 1] + 1 or r[j] // PAGE != r[a] // PAGE:
-                out.append((a, j))
-                a = j
-        return out
+    def _stage(self, n: int, what: str) -> None:
+        """the copies of a layer's move asked of the scheduler: `n` pages' K or V, on the card and in RAM at once"""
+        if self.grant is not None and n:
+            nbytes = n * PAGE * self.hk * self.d * torch.empty(0, dtype=self.dtype).element_size()
+            for dev in (self.dev, torch.device("cpu")):
+                self.grant(nbytes, "kv", requester=f"the prefix cache's {what}, a run at a time", device=dev, draws="")
 
     def move(self, src: torch.Tensor, dst: torch.Tensor) -> None:
         """every layer's page rows at `src` copied to `dst` on the card (the source read whole first)"""
@@ -594,17 +712,26 @@ class CardRegion:
         self.layout += 1
         if i not in host.k:
             return
+        # a run of pages at a time: their rows gathered off the host's region in one, sent in one copy and put in
+        # their slots in one - a page a copy, a 32k conversation's layer was 512 synchronous copies each way
+        on = [p for p in live if p.slot >= 0]
+        parked = [p for p in live if p.slot < 0 and p.park >= 0]
+        self._stage(min(MOVE_PAGES, max(len(on), len(parked))), f"layer {i}'s rows onto the card")
         for w, src in (("k", host.k[i]), ("v", host.v[i])):
-            for p in live:
-                rows = src[:, p.id * PAGE : (p.id + 1) * PAGE].transpose(0, 1)
-                if p.slot >= 0:
-                    a.view(w, 0)[p.slot * PAGE : (p.slot + 1) * PAGE].copy_(rows)
-                elif p.park >= 0:
-                    self.parks[i].view(w, 0)[p.park * PAGE : (p.park + 1) * PAGE].copy_(rows)
+            for c0 in range(0, len(on), MOVE_PAGES):
+                run = on[c0 : c0 + MOVE_PAGES]
+                rows = src.index_select(1, _page_rows(p.id for p in run)).transpose(0, 1)
+                at = _page_rows(p.slot for p in run).to(self.dev)
+                a.view(w, 0).index_copy_(0, at, rows.to(self.dev, self.dtype))
+            for c0 in range(0, len(parked), MOVE_PAGES):
+                run = parked[c0 : c0 + MOVE_PAGES]
+                rows = src.index_select(1, _page_rows(p.id for p in run)).transpose(0, 1)
+                self.parks[i].view(w, 0).index_copy_(0, _page_rows(p.park for p in run), rows.to(self.dtype))
 
     def drop(self, i: int, host: HostRegion, live: Sequence[Page]) -> None:
         """layer i's rows held on the host from now on (it left the card): every live page's rows of it copied to
-        the host's region (made for it there first), its arena and park let go"""
+        the host's region (made for it there first), a run of pages at a time - gathered in one, sent in one copy,
+        put in place in one - and its arena and park let go"""
         if i not in self.arenas:
             return
         host.add(i)
@@ -612,15 +739,19 @@ class CardRegion:
             if self.dev.type == "cuda":
                 torch.cuda.synchronize(self.dev)  # the park's copies in flight landed before the host reads it
             a, pk = self.arenas[i], self.parks.get(i)
+            on = [p for p in live if p.slot >= 0]
+            parked = [p for p in live if p.slot < 0 and p.park >= 0] if pk is not None else []
+            self._stage(min(MOVE_PAGES, max(len(on), len(parked))), f"layer {i}'s rows off the card")
             for w, dst in (("k", host.k[i]), ("v", host.v[i])):
-                for p in live:
-                    if p.slot >= 0:
-                        rows = a.view(w, 0)[p.slot * PAGE : (p.slot + 1) * PAGE]
-                    elif p.park >= 0 and pk is not None:
-                        rows = pk.view(w, 0)[p.park * PAGE : (p.park + 1) * PAGE]
-                    else:
-                        continue
-                    dst[:, p.id * PAGE : (p.id + 1) * PAGE].copy_(rows.transpose(0, 1))
+                for c0 in range(0, len(on), MOVE_PAGES):
+                    run = on[c0 : c0 + MOVE_PAGES]
+                    rows = a.view(w, 0).index_select(0, _page_rows(p.slot for p in run).to(self.dev)).cpu()
+                    dst.index_copy_(1, _page_rows(p.id for p in run), rows.transpose(0, 1).to(dst.dtype))
+                for c0 in range(0, len(parked), MOVE_PAGES):
+                    assert pk is not None
+                    run = parked[c0 : c0 + MOVE_PAGES]
+                    rows = pk.view(w, 0).index_select(0, _page_rows(p.park for p in run))
+                    dst.index_copy_(1, _page_rows(p.id for p in run), rows.transpose(0, 1).to(dst.dtype))
         self.arenas.pop(i).close()
         pk = self.parks.pop(i, None)
         if pk is not None:
@@ -659,6 +790,7 @@ class KvPool:
         ceiling: int = 1,
     ) -> None:
         self.hk, self.d = int(hk), int(d)
+        self.grant = grant  # the scheduler's, which a fork of a paged layer asks as its own rows grow
         self.pages = PagePool(grow=self._grow, freed=self._freed)
         self.host = HostRegion(host_layers, hk, d, grant, dtype)
         # a card's region whether or not it runs a layer now: the layers coming onto it later find their pages placed
@@ -680,7 +812,11 @@ class KvPool:
     def alloc(self, writer: object) -> Page:
         """a page for `writer` to append to - placed on the card where there is one - a free one, else the host's
         region grown; refused, conversations the tree holds let go, least recently used first, until a page frees.
-        The card's room is the pass's to have made (`cache_room`): a slot it cannot grow for is refused as it is"""
+        The card's room is the pass's to have made (`cache_room`): a slot it cannot grow for is refused as it is. Never
+        while the card's slots move: a page let go there waits to be freed (`CardRegion._move`), and handed out again
+        meanwhile its new slot would be the one freed"""
+        if self.card is not None and self.card._moving:
+            raise PagedError("a page asked for while the card's slots move: the move's held-back frees would take it")
         while True:
             try:
                 p = self.pages.alloc(writer)
@@ -752,6 +888,10 @@ class Table:
         self.held: dict[int, Page] = {}
         self.count: dict[int, int] = {}
         self.tail: Page | None = None
+        # the conversation's commit held back for the tree (`PagedCache.commit`), and the position from which its rows
+        # were made off the route its steps take, never given to the tree (`PagedCache.off_route`)
+        self.held_ids: list[int] | None = None
+        self.exact: int | None = None
         self._fin = weakref.finalize(self, Table._let_go, pool.pages, self.held, self.count)
         self._take(rows)
 
@@ -838,6 +978,8 @@ class Table:
         """positions past `n` let go: a page the table no longer reads is unheld, and its own tail page takes its
         rows back where no other holder froze them (else it writes there no more)"""
         n = max(0, int(n))
+        if self.held_ids is not None and len(self.held_ids) > n:
+            del self.held_ids[n:]  # the commit held back cut with the rows: what it cuts never reached the tree
         if n >= self.n:
             return
         self.version += 1
@@ -928,6 +1070,11 @@ class PagedLayer(DynamicLayer):
         """whether the card runs the layer: its rows in the card's arenas, read through the card's row map"""
         return self.pool.on_card(self.i)
 
+    @property
+    def grant(self) -> Callable[..., None] | None:
+        """the scheduler's gate, the pool's: a fork of the layer (`branches._fork_layer`) asks it as its rows grow"""
+        return self.pool.grant
+
     def get_seq_length(self) -> int:
         return self.n
 
@@ -943,6 +1090,13 @@ class PagedLayer(DynamicLayer):
             raise PagedError(f"a paged cache holds one sequence, not {int(k.shape[0])}")
         T = int(k.shape[-2])
         self.pool.shape(self.i, k)
+        if self._hop is None and self.on_card:
+            card = self.pool.card
+            assert card is not None
+            tbl = card.bind_for(self.table, self.n + T)
+            card.write(self.i, tbl[self.n : self.n + T], k[0], v[0])
+            self.n += T
+            return card.view(self.i)
         self.table.extend(self.n + T)
         if self._hop is not None:
             kb, vb, _ = self._hop
@@ -950,13 +1104,6 @@ class PagedLayer(DynamicLayer):
             vb[0, :, self.n : self.n + T].copy_(v[0])
             self.n += T
             return kb[..., : self.n, :], vb[..., : self.n, :]
-        if self.on_card:
-            card = self.pool.card
-            assert card is not None
-            tbl = card.bind(self.table)
-            card.write(self.i, tbl[self.n : self.n + T], k[0], v[0])
-            self.n += T
-            return card.view(self.i)
         host = self.pool.host
         host.write(self.i, self.table.rows()[self.n : self.n + T], k[0], v[0])
         self.n += T
@@ -1001,11 +1148,22 @@ class PagedLayer(DynamicLayer):
             self.pool.host.write(self.i, self.table.rows()[n0 : self.n], kb[0, :, n0 : self.n], vb[0, :, n0 : self.n])
 
     def gather(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """the layer's rows in order as [1, Hk, n, D] tensors of their own: a copy"""
+        """the layer's rows in order as [1, Hk, n, D] tensors of their own: a copy, asked of the scheduler first (a
+        fork's prefix, a batch's rows: the whole conversation's K and V again)"""
         rows = self.table.rows()[: self.n]
-        if self.on_card:
-            card = self.pool.card
-            assert card is not None
+        card = self.pool.card if self.on_card else None
+        dtype = card.dtype if card is not None else (self.pool.host.dtype or torch.float32)
+        dev = card.dev if card is not None else torch.device("cpu")
+        if self.grant is not None and self.n:
+            el = torch.empty(0, dtype=dtype).element_size()
+            self.grant(
+                2 * self.n * self.pool.hk * self.pool.d * el,
+                "kv",
+                requester=f"a paged layer's rows gathered, {self.n} rows of layer {self.i}",
+                device=dev,
+                draws="",
+            )
+        if card is not None:
             return card.gather(self.i, rows, self.pool.pages.pages)
         return self.pool.host.gather(self.i, rows)
 
@@ -1053,13 +1211,12 @@ class PagedCache(DynamicCache):
         """the table on the card for a pass of `T` more rows - its rows reserved, its pages there, its map uploaded
         (`CardRegion.bind`): the card's map, None where the pool has no card. The rows counted from the layers the pass
         has yet to run: the host layers before a card run have appended the pass's rows already, and counted from
-        them a prompt's chunk reserved its rows twice"""
+        them a prompt's chunk reserved its rows twice (`CardRegion.bind_for`)"""
         card = self.prefix.pool.card
         if card is None:
             return None
         n = min((cl.n for cl in self.layers if isinstance(cl, PagedLayer)), default=0)
-        self.table.extend(n + int(T))
-        return card.bind(self.table)
+        return card.bind_for(self.table, n + int(T))
 
     def crop(self, max_length: int) -> None:
         """transformers' crop (a negative length counting from the end), the table cut with the layers: a layer cut
@@ -1068,7 +1225,8 @@ class PagedCache(DynamicCache):
         self.crop_to(n + max_length if max_length < 0 else max_length)
 
     def crop_to(self, n: int) -> None:
-        """the sequence's first `n` positions kept, every layer's and the table's"""
+        """the sequence's first `n` positions kept, every layer's and the table's - and of the commit it holds back for
+        the tree (`commit`): the rows past `n` never frozen, the table writes on in its own page"""
         for cl in self.layers:
             if isinstance(cl, PagedLayer):
                 cl.crop(n)
@@ -1083,12 +1241,30 @@ class PagedCache(DynamicCache):
         self.crop_to(base + len(path))
 
     def commit(self, ids: Sequence[int]) -> None:
-        """the session's tokens and the rows holding them into the tree: what a later prompt opens on"""
+        """the session's tokens and the rows holding them for the tree, what a later prompt opens on: held back on the
+        table until the tree is next read (`PrefixCache.hold`) - the table, which holds the pages, not the cache, so a
+        session let go is collected - a later commit replacing it, a crop cutting it"""
         n = min(len(ids), len(self.table))
+        self.table.held_ids = [int(t) for t in ids[:n]] if n else None
         if n:
-            self.prefix.insert(ids[:n], self.table.rows()[:n].tolist())
+            self.prefix.hold(self.table)
+        else:
+            self.prefix.let_go(self.table)
+
+    def off_route(self, n: int) -> None:
+        """the rows from position `n` on made off the route a step takes (a card layer the pass ran through torch,
+        out of room on the card): the conversation reads them, the tree is never given them - a hit there would
+        decode other bits than its prompt cold"""
+        t = self.table
+        t.exact = int(n) if t.exact is None else min(t.exact, int(n))
+
+    def flush(self) -> None:
+        """the commit held back into the tree now (`PrefixCache.put`)"""
+        self.prefix.put(self.table)
 
     def release(self) -> None:
+        """the table let go, what the session committed in the tree first: the next conversation finds it there"""
+        self.flush()
         self.table.release()
         for cl in self.layers:
             if isinstance(cl, PagedLayer):

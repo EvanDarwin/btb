@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Self, cast
 
 import torch
+from transformers.cache_utils import DynamicCache
 
 from .. import mlx as mlxdev
 from ..api import api, in_hook
@@ -43,7 +44,7 @@ if TYPE_CHECKING:
     from .cache import CacheLayer, KvCache
     from .generate import LinLayer, LinSnap
     from .model import StreamedTextModel
-    from .paged import PagedLayer
+    from .paged import PagedCache, PagedLayer
     from .text import BatchGeneration
 
     # a row's own attention rows taken out of the batch: a fork's torch (k, v[, indexer keys]), or the MLX step
@@ -125,7 +126,13 @@ class _Rows:
         self.eng._called(tag)
 
     def _shell(self, parent: KvCache) -> KvCache:
-        cache = copy.copy(parent)
+        """the rows' own cache, its layers the parent's until the fork's replace them. A paged session's is a plain
+        one: copied, it kept the session's table and read as paged - priced as the table's growth, bound to the table
+        every step (parking another conversation's pages for it), its own rows never counted"""
+        if getattr(parent, "paged", False):
+            cache = DynamicCache(config=cast("PagedCache", parent).prefix.cfg)
+        else:
+            cache = copy.copy(parent)
         cache.layers = list(parent.layers)
         return self.eng._track(mark_forked(cache))
 
@@ -773,8 +780,19 @@ class Batch(_Rows):
             elif card_ok:
                 continue  # every layer formed below, together: the sessions' rows end to end in the card's arena
             else:
-                # left-padded: every row ends at the longest and steps together, the mask hiding the padding
+                # left-padded: every row ends at the longest and steps together, the mask hiding the padding - the
+                # padded rows asked of the scheduler first, a copy of every session's rows
                 kvs = [attention_rows(pl) for pl in pls]
+                k0 = kvs[0][0]
+                sched = getattr(eng, "scheduler", None)
+                if sched is not None:
+                    sched.grant(
+                        2 * B * int(k0.shape[1]) * max(lens) * int(k0.shape[-1]) * k0.element_size(),
+                        "kv",
+                        requester=f"Batch: layer {i}'s rows of {B} sessions, padded together",
+                        device=k0.device,
+                        draws="",
+                    )
                 k = _pad([kv[0][0] for kv in kvs], lens, 1)
                 v = _pad([kv[1][0] for kv in kvs], lens, 1)
                 iks = [indexer_keys(pl) for pl in pls]

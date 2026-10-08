@@ -744,8 +744,11 @@ class _CudaMixin(_State):
             self._card_family = ok
         return bool(ok)
 
-    def _card_ready(self) -> bool:
-        """the engine can run the card graph at all: the card, the cache on it, a family the kernels know"""
+    def _card_ready(self, capture: bool = True) -> bool:
+        """the engine can run the card graph at all: the card, the cache on it, a family the kernels know - and, for
+        a graph to capture (`capture`), no build the card had no room for at this placement and not long ago
+        (`_card_oom`). The kernels launched as they come (`_forward_card_prefill`) take no graph's room: they run
+        through that while, so the rows stay the steps' own"""
         return (
             self.dev.type == Device.CUDA
             and not getattr(self, "kv_host", False)
@@ -754,9 +757,14 @@ class _CudaMixin(_State):
             and getattr(self, "_probe", None) is None
             and self._card_family_ok()
             and self._card_kernels() is not None
-            # a build the card had no room for, at this placement and not long ago (`_card_oom`)
-            and not self._card_off_now()
+            and not (capture and self._card_off_now())
         )
+
+    def _card_off_route(self, i: int) -> bool:
+        """whether layer `i` run through torch's modules is off the route its rows take: the card graph serves the
+        family and runs the layer, so a step - and a prompt cold - makes its rows on the card's kernels (a pass that
+        fell back, out of room, made other bits)"""
+        return self._card_ready(capture=False) and self._card_runs_layer(i)
 
     # a card graph a build found no room for is tried again this long after, doubling with each refusal at one
     # placement up to CARD_RETRY_MAX_S: the program that took the card may have gone, with no placement move to say so
@@ -849,6 +857,7 @@ class _CudaMixin(_State):
                 graph.reset()
             st["graphs"].clear()
             st["layers"].clear()
+            st.pop("parts", None)
             # the step graph's embedding table too - a granted copy, or a tied head's weight a shed would free
             # otherwise for nothing: made again by the next step graph (`_card_table`)
             st.pop("table", None)
@@ -1068,6 +1077,7 @@ class _CudaMixin(_State):
         new = {"A": store, "cap": store.cap, "slot": slot, "owner": ar["owner"] if ar is not None else None}
         st["arena"] = new
         st["graphs"].clear()
+        self._card_prune_parts(st)
         # how much of the arena's front sits in persisting L2 is the scheduler's call (it holds the
         # hierarchy's sizes); the driver call is only the mechanism
         k = st["k"]
@@ -1206,9 +1216,10 @@ class _CudaMixin(_State):
 
     def _card_bind_paged(self, cache: Any, st: dict[str, Any], T: int) -> dict[str, Any]:
         """A paged cache on the card for a pass of `T` rows: its table's rows reserved, its pages in the card's region
-        (another conversation's parked first), its row map uploaded (`PagedCache.bind`). Every conversation's graphs
-        are the same ones - the arenas and the map's buffer are the region's, the map in it the bound table's - made
-        again only when the region's layout moves (its arenas grown past their addresses, the map's buffer longer)"""
+        (another conversation's parked where their slots are wanted), its row map uploaded (`PagedCache.bind`). Every
+        conversation's graphs are the same ones - the arenas and the map's buffer are the region's, the map in it the
+        bound table's - made again only when the region's layout moves (its arenas grown past their addresses, the
+        map's buffer longer)"""
         from .kvpool import PAGE
 
         card = cache.prefix.pool.card
@@ -1219,6 +1230,7 @@ class _CudaMixin(_State):
         if pg is None or pg["card"] is not card or pg["layout"] != card.layout:
             for key in [key for key, g in st["graphs"].items() if g.get("paged")]:
                 del st["graphs"][key]
+            self._card_prune_parts(st)
             pg = st["pg"] = {"card": card, "layout": card.layout, "cap": max(card.cap * PAGE, PAGE)}
         layers = [i for a, b in st["segments"] for i in range(a, b)]
         off = [i for i in layers if i not in card.arenas]
@@ -1343,6 +1355,11 @@ class _CudaMixin(_State):
             V = int(self.head.weight.shape[0])
         cap = int(st["pg"]["cap"]) if paged else int(st["arena"]["cap"])
         S = (cap + self._attn_group(D) - 1) // self._attn_group(D)
+        # the graph's own buffers, asked of the ledger first (the GEMV-facing ones at M rows, the tail's logits)
+        el = 2
+        own = M * (H * 3 + (Hq + 2 * Hk) * D + 2 * Hq * D + 2 * I + (I if mma else 0)) * el + M * V * el + V * 4
+        who = f"the card graph's buffers for {T} rows, layers {a}..{b - 1}"
+        self.scheduler.grant(own, "scratch", requester=who, device=dev)
         g = {
             "key": key,
             "paged": paged,
@@ -1355,13 +1372,11 @@ class _CudaMixin(_State):
             "q": torch.zeros(M, Hq, D, dtype=bf, device=dev),
             "att": torch.zeros(M, Hq * D, dtype=bf, device=dev),
             "gu": torch.zeros(M, 2 * I, dtype=bf, device=dev),
-            # the attention's per-group states and arrival counts (the group's keys are the kernel's; the
-            # count of groups covers the arena, so one graph serves every length)
+            # the attention's per-group states and arrival counts (the group's keys are the kernel's; the count of
+            # groups covers the arena, so one graph serves every length): one set for every graph of T rows over S
+            # groups (`_card_parts`)
             "S": S,
-            "part_m": torch.zeros(S * T * Hq, dtype=torch.float32, device=dev),
-            "part_l": torch.zeros(S * T * Hq, dtype=torch.float32, device=dev),
-            "part_acc": torch.zeros(S * T * Hq * D, dtype=torch.float32, device=dev),
-            "cnt": torch.zeros(T * Hq, dtype=torch.int32, device=dev),
+            **self._card_parts(st, T, S),
             "n0": torch.zeros(1, dtype=torch.int32, device=dev),
             "depth": torch.arange(T, dtype=torch.int32, device=dev),
             # a chain until a pass says otherwise (the warm-up run reads it: a row parented to itself
@@ -1373,6 +1388,35 @@ class _CudaMixin(_State):
         }
         st["graphs"][key] = g
         return g
+
+    def _card_parts(self, st: dict[str, Any], T: int, S: int) -> dict[str, torch.Tensor]:
+        """the one attention's group states for passes of `T` rows over `S` groups (its decode form: a row's state a
+        group it reaches, `cnt` its groups' arrivals), one set for every graph of the card state that takes them -
+        graphs replay one at a time, and each launch leaves `cnt` at zero - asked of the ledger first. A set a graph
+        was the arena's every group again for each run, tail and kernel variant: a gigabyte a graph at a million rows
+        and 32 of them"""
+        parts: dict[tuple[int, int], dict[str, torch.Tensor]] = st.setdefault("parts", {})
+        got = parts.get((T, S))
+        if got is None:
+            _, Hq, _, D, _ = self._card_dims()
+            n, dev = S * T * Hq, self.dev
+            who = f"the card graph's attention states, {T} rows over {S} groups"
+            self.scheduler.grant(4 * (n * (D + 2) + T * Hq), "scratch", requester=who, device=dev)
+            got = parts[(T, S)] = {
+                "part_m": torch.zeros(n, dtype=torch.float32, device=dev),
+                "part_l": torch.zeros(n, dtype=torch.float32, device=dev),
+                "part_acc": torch.zeros(n * D, dtype=torch.float32, device=dev),
+                "cnt": torch.zeros(T * Hq, dtype=torch.int32, device=dev),
+            }
+        return got
+
+    @staticmethod
+    def _card_prune_parts(st: dict[str, Any]) -> None:
+        """the attention states no graph reads any more let go (their graphs made again over another arena)"""
+        used = {(int(g["key"][2]), int(g["S"])) for g in st["graphs"].values()}
+        parts = st.get("parts", {})
+        for key in [key for key in parts if key not in used]:
+            del parts[key]
 
     @staticmethod
     def _card_key(
@@ -2080,7 +2124,7 @@ class _CudaMixin(_State):
                 try:
                     lane = self._card_step_lane(st, table, Uk, smp, past, first, fz, paged)
                     lanes[(kind, fz)] = {**lane, "kind": kind}
-                except RuntimeError as err:
+                except (RuntimeError, MemoryGrantError) as err:
                     if not self._is_card_oom(err):
                         raise
                     if (kind, fz) == ("usual", False):
@@ -2577,7 +2621,7 @@ class _CudaMixin(_State):
             and cache is not None
             and not forked(cache)
             and (T <= self.CARD_T_MAX or getattr(self, "ap", None) is None)
-            and self._card_ready()
+            and self._card_ready(capture=False)
         ):
             return False
         k = Native.cuda
@@ -2663,7 +2707,9 @@ class _CudaMixin(_State):
         nsl = (T + self.GRID_Y - 1) // self.GRID_Y
         where = buf("where", (nsl + T,), torch.int32)  # each slice's start, then the rows' depths
         if parents is None:
-            run = buf("rows", (T * Hq * D,), torch.float32)
+            # the row states, the buffer the module attention's prefill form takes too (`_card_attention`): one of a
+            # chunk's width, never both at once
+            run = self.scratch.take("card attention rows", (T * Hq * D,), torch.float32, dev, who)
         else:
             # the decode form's group states: the groups the card's rows reach, as a graph's cover the arena
             S = (cap + self._attn_group(D) - 1) // self._attn_group(D)
@@ -2824,7 +2870,7 @@ class _CudaMixin(_State):
 
     def _card_tail_ok(self) -> bool:
         """the card graph's kernels run the tail: the card graph on, the final norm and the head on the card, bf16"""
-        if not self._card_ready() or self.head is None or self.norm is None:
+        if not self._card_ready(capture=False) or self.head is None or self.norm is None:
             return False
         norm_w, head_w = self.norm.weight, self.head.weight
         return norm_w.device.type == "cuda" and head_w.device.type == "cuda" and head_w.dtype == torch.bfloat16

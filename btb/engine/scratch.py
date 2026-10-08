@@ -44,5 +44,15 @@ class Scratch:
             self._bufs[key] = t
         return t[:n].view(*shape)
 
+    def release(self, prefix: str = "", device: Any = None) -> int:
+        """the buffers whose names start with `prefix` (every one where empty) on `device` (every device where None)
+        let go - a view a pass still holds keeps its memory until the pass lets it go - and the bytes they held"""
+        dev = str(torch.device(device)) if device is not None else None
+        gone = 0
+        for key in [k for k in self._bufs if k[0].startswith(prefix) and (dev is None or k[1] == dev)]:
+            t = self._bufs.pop(key)
+            gone += t.numel() * t.element_size()
+        return gone
+
     def clear(self) -> None:
         self._bufs.clear()

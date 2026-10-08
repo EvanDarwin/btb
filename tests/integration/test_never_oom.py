@@ -262,6 +262,9 @@ def test_a_presize_refused_after_the_sweep_made_room_sheds_from_the_top_and_goes
                 sweep()
         assert sorted(sm.resident) == top, "a pinned placement gave a layer up"
         asked.clear()
+        # the card's scratch (the holder's prefill left some) is the first thing a refusal gives up, before a layer:
+        # let go here, each refusal has a layer to give up
+        sm.scratch.release()
         with monkeypatch.context() as mp:
             mp.setattr(sm.scheduler, "grant", taken(2))
             sweep()
@@ -297,6 +300,7 @@ def test_a_presize_refused_after_the_sweep_made_room_sheds_from_the_top_and_goes
             with pytest.raises(MemoryGrantError, match="another program took the room"):
                 paged_sweep(1)
         assert sorted(sm.resident) == left, "a pinned placement gave a layer up"
+        sm.scratch.release()  # as above: the refusal's give-up a layer, not the scratch
         calls = paged_sweep(1)
         assert calls[:2] == [len(PROMPT), len(PROMPT)], calls  # refused, then asked again once a layer went
         assert sorted(sm.resident) == left[:-1], "the refusal gives up the top resident layer, and no more"

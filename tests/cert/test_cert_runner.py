@@ -27,6 +27,7 @@ import pytest
 import torch
 
 import btb
+from btb.engine.kvpool import PAGE
 from btb.kinds import FamilyKind, LayerKind, PassTag
 from tests.helpers import FIXTURES, GGUF_FIXTURES, assert_same_tokens, shared_key, shared_model
 
@@ -600,7 +601,11 @@ def test_a_sessions_calls_are_deterministic(stem: str, dev: spec.DeviceSubpath) 
     receipt.record(manifest.stem_id(spec.Surface.SESSION, stem, dev.key))
 
 
-SIDE = [150, 151, 152, 153, 154]  # a request sharing nothing with PROMPT's conversation
+def _side(rows: int) -> list[int]:
+    """a request sharing nothing with PROMPT's conversation, `rows` long: on the card longer than its region holds, so
+    its rows want the conversation's slots and park it in RAM for the next turn to bring back - the card parks a
+    conversation only when its slots are wanted"""
+    return [150 + i % 100 for i in range(rows)]
 
 
 @pytest.mark.parametrize("stem,dev", _shape_cells(spec.Surface.PREFIX))
@@ -619,6 +624,9 @@ def test_conversations_through_the_prefix_cache_answer_as_cold(stem: str, dev: s
     assert kind is not None
     runs = []
     asked: list[list[int]] = []
+    # the side request past every slot either load's card region holds, the same tokens on both
+    caps = [pc.pool.card.cap for i in TWO if (pc := shared_model(path, i, **knobs)._prefix_cache()) and pc.pool.card]
+    side = _side((max(caps, default=0) + 1) * PAGE + 5)
     for i in TWO:
         sm = shared_model(path, i, **knobs)
         pc = sm._prefix_cache()
@@ -633,9 +641,9 @@ def test_conversations_through_the_prefix_cache_answer_as_cold(stem: str, dev: s
 
         a = sm.session()
         first = turn(list(PROMPT), a)
-        turn(list(SIDE), a)
+        turn(side, a)
         missed = a.last_reuse
-        asked = [[*PROMPT, *first, *OTHER], [*PROMPT, *first, *SIDE]]
+        asked = [[*PROMPT, *first, *OTHER], [*PROMPT, *first, *side]]
         second = turn(asked[0], a)
         hit = a.last_reuse
         b = sm.session()

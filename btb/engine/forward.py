@@ -664,12 +664,16 @@ class _ForwardMixin(_State):
 
     def _run_card_layer(self, i: int, tmpl: Any, h: torch.Tensor, pas: Any) -> torch.Tensor:
         """layer `i` on the card (or the compute device), `h` already there in the layer's dtype"""
+        lt = self.layer_types[i]
+        cache, T, past, am = pas.cache, pas.T, pas.past, pas.am
         if self.dev.type == Device.CUDA:
             # a card layer through the torch modules, not a captured card graph: btb's kernels are absent or the
             # family is not one they serve, so the pass runs like torch
             self._tag(PassTag.CUDA_TORCH_FALLBACK)
-        lt = self.layer_types[i]
-        cache, T, past, am = pas.cache, pas.T, pas.past, pas.am
+            if getattr(cache, "paged", False) and self._card_off_route(i):
+                # a layer the card's kernels serve, run through torch (the pass out of room on the card): its rows are
+                # not the ones a step makes, and the tree never shares them (`PagedCache.off_route`)
+                cache.off_route(past)
         if cache is not None and i < len(cache.layers):
             conv_states_as(cache.layers[i], h.dtype)  # a state left by the layer's run elsewhere, in its dtype here
         t0 = time.time()
@@ -952,7 +956,8 @@ class _ForwardMixin(_State):
         pages of another conversation found there parked in pinned RAM, this one's brought back - which the pass
         records (`KV_PARK`) - and its `T` rows reserved, so nothing of the region grows mid-pass. A growth refused
         though the room was made (another program took the card's memory since) gives up the cheapest thing the card
-        holds - the top layer first, its rows taken to the host's region - and asks again, as a presize does; with
+        holds - the top layer first, its rows taken to the host's region - and asks again, as a presize does; a park
+        refused in RAM gives up the host's cheapest instead (a card layer shed for it would only add rows to RAM). With
         `adapt` off the placement is pinned and the refusal stands. Nothing for a contiguous cache, or a pool with no
         card"""
         card = cache.prefix.pool.card if getattr(cache, "paged", False) else None
@@ -964,8 +969,9 @@ class _ForwardMixin(_State):
             try:
                 cache.bind(T)
                 break
-            except MemoryGrantError:
-                if not getattr(self, "adapt", True) or not self._give_up_one(self.dev, 0, tried):
+            except MemoryGrantError as e:
+                short = torch.device(e.device) if e.device is not None else self.dev
+                if not getattr(self, "adapt", True) or not self._give_up_one(short, 0, tried):
                     self.device.refused()  # what was shed on the way grows back once there is room
                     raise
         if card.loaded > loaded:
@@ -1132,8 +1138,24 @@ class _ForwardMixin(_State):
         last_only: bool = True,
     ) -> Any:
         """`ids` into `cache` in chunks the free memory prices: the last row's logits, or every row's (the chunks'
-        joined) without `last_only`"""
+        joined) without `last_only`. A prompt past a step's rows lets the card's scratch go after it (its chunks'
+        buffers, a width no step takes): kept, they held the prompt's width for every step after - half a gigabyte
+        past a 70k-row prompt"""
         ids = self._ids(ids)
+        try:
+            return self._prefill_chunks(ids, cache, on_layer, attention_mask, last_only)
+        finally:
+            if self.dev.type == Device.CUDA and int(ids.shape[1]) > PREFILL_MIN_ROWS:
+                self.scratch.release("card", self.dev)
+
+    def _prefill_chunks(
+        self,
+        ids: torch.Tensor,
+        cache: Any,
+        on_layer: Any,
+        attention_mask: torch.Tensor | None,
+        last_only: bool,
+    ) -> Any:
         T = ids.shape[1]
         if cache is None or attention_mask is not None or getattr(self, "aq", False):
             return self.forward(ids, cache=cache, on_layer=on_layer, attention_mask=attention_mask, last_only=last_only)
@@ -1865,6 +1887,10 @@ class _ForwardMixin(_State):
             else:
                 amap, starts, ends = self._span_lists(cache if paged else None, past, T, win)
                 Native.attn_spans(qf, kf[0], vf[0], amap, starts, ends, float(at.scaling), out)
+            if paged and i == max(j for j, lt in enumerate(self.layer_types) if lt != LayerKind.LINEAR):
+                # the pass's lists go with its last attention layer, as `_ai_attention`'s do: kept, an idle
+                # conversation held its whole map's lists (12.8 MB at 32k rows) until its next pass
+                cache._lists = None
             attn = out.view(1, T, qf.shape[1], qf.shape[2])
         elif paged:
             # a prompt's chunk on the card over the prefix staged from the host's region through the map

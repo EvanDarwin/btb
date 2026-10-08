@@ -12,6 +12,7 @@ leaves go first when memory is wanted (`evict`).
 
 from __future__ import annotations
 
+import heapq
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -56,11 +57,19 @@ class RadixTree:
     def __init__(self, pool: PagePool) -> None:
         self.pool = pool
         self.root = Node((), (), None, 0)
+        # what puts in the commits held back for the tree (`PrefixCache.flush`), asked before the tree is read or let
+        # go of: it holds every conversation then
+        self.before: Callable[[], None] | None = None
+
+    def _ready(self) -> None:
+        if self.before is not None:
+            self.before()
 
     # -- reading -------------------------------------------------------------------------------------------------
 
     def match(self, tokens: Sequence[int]) -> Match:
         """how much of `tokens` the tree holds, and the rows holding it; the nodes passed are used now"""
+        self._ready()
         toks = [int(t) for t in tokens]
         m = Match()
         node, i = self.root, 0
@@ -164,17 +173,30 @@ class RadixTree:
     def evict(self, enough: Callable[[int], bool] | None = None, keep: Callable[[Node], bool] | None = None) -> int:
         """The least recently used leaves out, one at a time (a parent left childless is a leaf in turn), until
         `enough(pages freed so far)` says so - every leaf when None - but those `keep` holds back. Returns the pages
-        freed"""
+        freed. The leaves are found once and kept in order (a heap), a parent joining them as its last child goes:
+        found again for every leaf, a tree of n nodes let go whole took n walks of it"""
+        self._ready()
         freed = 0
-        while enough is None or not enough(freed):
-            leaves = [n for n in self.nodes() if not n.kids and (keep is None or not keep(n))]
-            if not leaves:
-                break
-            freed += self._remove(min(leaves, key=lambda n: n.tick))
+        leaves = [(n.tick, i, n) for i, n in enumerate(self.nodes()) if not n.kids and (keep is None or not keep(n))]
+        heapq.heapify(leaves)
+        seq = len(leaves)
+        while leaves and (enough is None or not enough(freed)):
+            _, _, n = heapq.heappop(leaves)
+            parent = n.parent
+            freed += self._remove(n)
+            if (
+                parent is not None
+                and parent is not self.root
+                and not parent.kids
+                and (keep is None or not keep(parent))
+            ):
+                heapq.heappush(leaves, (parent.tick, seq, parent))
+                seq += 1
         return freed
 
     def drop_snaps(self, enough: Callable[[int], bool], keep: Callable[[Node], bool] | None = None) -> int:
         """the least recently used snapshots let go (their nodes stay) until `enough(dropped)`: how many went"""
+        self._ready()
         held = sorted((n for n in self.nodes() if n.snap is not None and (keep is None or not keep(n))), key=_tick)
         dropped = 0
         for n in held:

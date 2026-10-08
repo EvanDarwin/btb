@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 """The engine's prefix cache: every conversation its sessions decode, in one pool of pages (btb/engine/paged.py) under
-one tree over their tokens (btb/engine/radix.py). A session's commit puts its tokens and rows in the tree; a prompt
-then opens on the longest prefix held - the session's own, or another conversation's read in place - so a side request
+one tree over their tokens (btb/engine/radix.py). A session's commit puts its tokens and rows in the tree - held back
+until the tree is next read, so a session cut back before then never froze what it cuts; a prompt then opens on the
+longest prefix held - the session's own, or another conversation's read in place - so a side request
 between two turns leaves the conversation where it was, and a system prompt two conversations share is held once.
 
 The rows of the layers the card runs lie on the card, in the reserved room the conversation the card decodes takes
@@ -22,8 +23,8 @@ import torch
 from ..kinds import LayerKind
 from ..options import Device
 from .native import Native
-from .paged import KvPool, PagedCache
-from .radix import RadixTree
+from .paged import KvPool, PagedCache, Table
+from .radix import Match, RadixTree
 
 if TYPE_CHECKING:
     from .state import _State
@@ -72,6 +73,11 @@ class PrefixCache:
         )
         self.tree = RadixTree(self.pool.pages)
         self.pool.tree = self.tree
+        # the sessions' commits held back for the tree on their tables (`PagedCache.commit`), put in when it is next
+        # read (`flush`)
+        self._held: dict[int, Table] = {}
+        self._asking: Table | None = None
+        self.tree.before = self.flush
 
     @staticmethod
     def why_not(sm: Any) -> str | None:
@@ -128,6 +134,42 @@ class PrefixCache:
     def insert(self, ids: Sequence[int], rows: Sequence[int]) -> None:
         self.tree.insert(ids, rows)
 
+    def hold(self, table: Table) -> None:
+        """the commit on `table` (`held_ids`) held back for the tree until it is read (`flush`): put in then, the rows
+        frozen for every reader; a session cut back meanwhile (a rewind, a regenerate) cuts what it holds back too, and
+        writes on in its own page - frozen at once, every cut left that page to the tree and took a fresh one (a
+        mark/feed/rewind loop wrote two rows a page). A session's commits come in once for many feeds, not its whole
+        path each feed. The table is held, which holds the pages: the session's cache is collected as it would be"""
+        self._held[id(table)] = table
+
+    def let_go(self, table: Table) -> None:
+        self._held.pop(id(table), None)
+
+    def put(self, table: Table) -> None:
+        """the commit held back on `table` into the tree now: its rows made on the route alone (`Table.exact`)"""
+        self._held.pop(id(table), None)
+        ids, table.held_ids = table.held_ids, None
+        if ids and table.exact is not None:
+            ids = ids[: table.exact]
+        if ids:
+            self.insert(ids, table.rows()[: len(ids)].tolist())
+
+    def flush(self) -> None:
+        """every commit held back put in the tree, but the asking session's own (`match`): what it parts from it keeps
+        or drops itself"""
+        for t in list(self._held.values()):
+            if t is not self._asking:
+                self.put(t)
+
+    def match(self, tokens: Sequence[int], asking: PagedCache | None = None) -> Match:
+        """how much of `tokens` the tree holds (`RadixTree.match`), every session's commits in it first - but
+        `asking`'s, the session asking (its own rows it reads itself)"""
+        self._asking = asking.table if asking is not None else None
+        try:
+            return self.tree.match(tokens)
+        finally:
+            self._asking = None
+
     def place(self, sm: Any, i: int) -> None:
         """layer i's rows to the region where the engine now runs it (a shed's, a regrow's): every conversation's at
         once"""
@@ -150,4 +192,5 @@ class PrefixCache:
     def close(self) -> None:
         """everything let go with the engine: the tree's conversations, and the pool's rows whoever reads them"""
         self.tree.evict()
+        self._held.clear()
         self.pool.close()

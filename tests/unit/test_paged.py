@@ -10,6 +10,7 @@ host, the card's own layout. Model-free: a config and random rows."""
 from __future__ import annotations
 
 import gc
+import weakref
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any, cast
@@ -140,8 +141,9 @@ def test_a_shared_prefix_is_the_same_rows_held_once() -> None:
 
 
 def test_a_crop_takes_back_only_rows_no_one_else_reads() -> None:
-    """cut back, a table writes again over its own rows no other holder reads; over rows the tree froze it never
-    does - it goes on in a new page, the tree's rows as they were"""
+    """cut back, a table writes again over its own rows no other holder reads - its commit too, while the tree has
+    not read it yet (held back, cut with the table: a mark/feed/rewind loop takes no page a turn); over rows the tree
+    took it never does - it goes on in a new page, the tree's rows as they were"""
     pc = prefix()
     a = pc.new()
     k, v = rows(100, 8)
@@ -150,16 +152,66 @@ def test_a_crop_takes_back_only_rows_no_one_else_reads() -> None:
     k2, v2 = rows(5, 9)
     write(a, k2, v2)
     assert len(pc.pool.pages) == 2 and a.table.rows()[90:].tolist() == list(range(PAGE + 26, PAGE + 31))
+    for turn in range(3):  # committed, then rewound before anything read the tree: the same page, written again
+        a.commit(list(range(95)))
+        a.crop_to(90)
+        write(a, *rows(5, 20 + turn))
+        assert len(pc.pool.pages) == 2, f"turn {turn}: a rewound commit left its page to the tree"
+    a.crop_to(90)
+    write(a, k2, v2)
     a.commit(list(range(95)))
+    m = pc.tree.match(list(range(95)))  # the tree read: the commit in it, its rows frozen
+    assert m.length == 95
     a.crop_to(90)
     write(a, *rows(5, 10))
     assert len(pc.pool.pages) == 3, "a crop let rows the tree reads be written again"
-    m = pc.tree.match(list(range(95)))
-    assert m.length == 95
     assert torch.equal(pc.pool.host.k[0][:, torch.tensor(m.rows)][None], torch.cat([k[..., :90, :], k2], -2))
     a.crop(-3)  # transformers' crop, from the end: the table cut with the layers
     assert a.get_seq_length() == len(a.table) == 92
     assert not pc.pool.pages.check()
+
+
+def test_a_commit_reaches_the_tree_when_it_is_read() -> None:
+    """a commit held back goes in when the tree is next read - another prompt's match, an eviction - or the session
+    lets its cache go; the session asking keeps its own out of its match (what it parts from it keeps or cuts itself);
+    a later commit replaces the one held, a crop cuts it"""
+    pc = prefix()
+    a, b = pc.new(), pc.new()
+    write(a, *rows(30, 30))
+    a.commit(list(range(30)))
+    assert not list(pc.tree.nodes()), "held back until the tree is read"
+    assert pc.match(list(range(30)), asking=a).length == 0, "the asking session's own commit left out of its match"
+    assert pc.match(list(range(30))).length == 30, "in the tree once another reads it"
+    write(b, *rows(40, 31))
+    b.commit([100 + t for t in range(40)])
+    b.crop_to(25)
+    b.release()  # let go: what it committed - cut to 25 - in the tree first
+    m = pc.tree.match([100 + t for t in range(40)])
+    assert m.length == 25
+    c = pc.new()
+    write(c, *rows(20, 32))
+    c.commit([200 + t for t in range(20)])
+    gone = weakref.ref(c)
+    del c
+    gc.collect()
+    assert gone() is None, "a session's cache let go is collected, its commit held on the table alone"
+    assert pc.match([200 + t for t in range(20)]).length == 20, "and the commit reaches the tree all the same"
+    assert pc.tree.evict() > 0 and not list(pc.tree.nodes())
+    assert not pc.pool.pages.check()
+
+
+def test_rows_made_off_the_route_never_reach_the_tree() -> None:
+    """a conversation whose rows from some position were made off the route its steps take (a card layer run through
+    torch, out of room on the card) reads them itself, and the tree is given the rows before them alone: a hit on
+    them would decode other bits than its prompt cold"""
+    pc = prefix()
+    a = pc.new()
+    write(a, *rows(50, 70))
+    a.off_route(40)
+    a.off_route(30)  # the earliest wins
+    a.commit(list(range(50)))
+    assert pc.match(list(range(50))).length == 30
+    assert a.get_seq_length() == 50
 
 
 def test_a_verify_keeps_its_accepted_path_in_place() -> None:
@@ -290,10 +342,12 @@ def card_rows(c: PagedCache, i: int) -> tuple[torch.Tensor, torch.Tensor]:
     return k[:, :, tbl], v[:, :, tbl]
 
 
-def test_the_card_holds_the_bound_conversations_pages_and_parks_the_rest() -> None:
+def test_the_card_parks_another_conversations_pages_only_when_their_slots_are_wanted() -> None:
     """the card runs layers 0 and 1, the host layer 2: a conversation's rows of the card's layers go into its slots,
-    read back through the card's map as written; another conversation bound parks the first one's own pages - a
-    prefix the two share stays - and the first bound again brings them back, every row as it was, the map made again"""
+    read back through the card's map as written. Another conversation bound leaves the first one's pages where they
+    are while the card has room for both - nothing moves; a third filling the card parks the least recently used page
+    it does not read for its room, one move for all its pages; the first bound again trades its parked page for one
+    it does not read - every row as it was, the map made again, neither the card nor the park grown for the trade"""
     pc = prefix(card=(0, 1))
     card = pc.pool.card
     assert card is not None and card.layers == [0, 1] and pc.pool.host.layers == [2]
@@ -312,17 +366,28 @@ def test_the_card_holds_the_bound_conversations_pages_and_parks_the_rest() -> No
     k2, v2 = rows(10, 41)
     ver = card.version
     write(b, k2, v2)  # b's first card layer's rows bind b
-    parked = {p.id for p in pc.pool.pages.pages if p.park >= 0}
-    assert parked == {2}, f"a's own third page parked, the two it shares with b kept: {parked}"
-    assert card.version > ver
+    assert not any(p.park >= 0 for p in pc.pool.pages.pages) and card.version == ver, "room for both: nothing moved"
     for i in (0, 1):
         ck, _ = card_rows(b, i)
         assert torch.equal(ck, bf(torch.cat([k[..., : PAGE + 3, :], k2], -2) + i))
+    free = len(card.free)
+    c = pc.new()
+    k3, v3 = rows(free * PAGE + 1, 42)  # a page more than the free slots hold
+    write(c, k3, v3)
+    parked = [p.id for p in pc.pool.pages.pages if p.park >= 0]
+    assert parked == [0], f"the least recently used page c does not read parked for its room: {parked}"
+    for i in (0, 1):
         assert torch.equal(read(a, i)[0], bf(k + i)), "a's rows read back from the park"
+        assert torch.equal(card_rows(c, i)[0], bf(k3 + i))
+    cap, park = card.cap, len(card.parked)
     for i in (0, 1):
         ck, cv = card_rows(a, i)
         assert torch.equal(ck, bf(k + i)) and torch.equal(cv, bf(v - i)), "a's rows brought back as they were"
+    assert card.cap == cap and len(card.parked) == park, "the trade grew neither the card nor the park"
     assert all(p.park < 0 for p in a.table.held.values())
+    for i in (0, 1):
+        assert torch.equal(read(b, i)[0], bf(torch.cat([k[..., : PAGE + 3, :], k2], -2) + i)), "b's page traded"
+        assert torch.equal(read(c, i)[0], bf(k3 + i))
     assert not pc.pool.pages.check()
 
 
@@ -335,8 +400,7 @@ def test_a_conversation_let_go_while_the_card_parks_frees_its_slots_after(monkey
     assert card is not None
     a, c = pc.new(), pc.new()
     write(a, *rows(PAGE + 7, 49))  # a bound: its two pages on the card
-    held = list(a.table.held.values())
-    assert all(p.slot >= 0 for p in held)
+    assert all(p.slot >= 0 for p in a.table.held.values())
     copy = card._copy
 
     def collected_mid_copy(src: dict[int, Any], dst: dict[int, Any], runs: list[tuple[int, int, int]]) -> None:
@@ -345,16 +409,58 @@ def test_a_conversation_let_go_while_the_card_parks_frees_its_slots_after(monkey
         copy(src, dst, runs)
 
     monkeypatch.setattr(card, "_copy", collected_mid_copy)
-    kc, vc = rows(9, 50)
-    write(c, kc, vc)  # c bound: a's pages parked, a let go meanwhile
-    assert all(p.refs == 0 and p.slot < 0 and p.park < 0 for p in held), "a's pages left a slot behind"
-    assert not any(p in held for p in [*card.slots, *card.parked] if p is not None)
-    assert len(set(card.free)) == len(card.free) and len(set(card.pfree)) == len(card.pfree), "a slot freed twice"
-    assert min([*card.free, *card.pfree], default=0) >= 0
+    kc, vc = rows(len(card.free) * PAGE + 1, 50)  # a page more than the free slots hold
+    write(c, kc, vc)  # c bound: a page of a's parked for its room, a let go meanwhile
+    assert not a.table.held and not region_check(card)
     assert not pc.pool.pages.check()
     for i in (0, 1):
         ck, cv = card_rows(c, i)
         assert torch.equal(ck, bf(kc + i)) and torch.equal(cv, bf(vc - i))
+
+
+def test_a_binding_grows_the_card_or_the_park_only_where_its_price_said() -> None:
+    """what a pass's binding is priced at before the pass (`CardRegion.need`, the ledger's ask) is what it then grows:
+    a switch back to a conversation whose pages fill the park, while another's fill the card, trades them - priced at
+    nothing and growing nothing (it grew the park by every page it parked) - and new pages past every slot the card
+    can free are priced and grown"""
+    pc = prefix(card=(0, 1))
+    card = pc.pool.card
+    assert card is not None
+    a, b = pc.new(), pc.new()
+    ka, va = rows(8 * PAGE, 60)
+    write(a, ka, va)
+    kb, vb = rows(len(card.free) * PAGE + 6 * PAGE, 61)  # the card full: six of a's pages parked for b's
+    write(b, kb, vb)
+    assert sum(p.park >= 0 for p in a.table.held.values()) == 6 and not card.free
+
+    def bind(c: PagedCache, rows_more: int) -> tuple[tuple[int, int], tuple[bool, bool]]:
+        price = card.need(c.table, c.table.pages_for(rows_more))
+        cap, park = card.cap, len(card.parked)
+        card.bind_for(c.table, len(c.table) + rows_more)
+        assert not region_check(card)
+        return price, (card.cap > cap, len(card.parked) > park)
+
+    assert bind(a, 0) == ((0, 0), (False, False)), "a switch back trades a's parked pages for b's"
+    assert all(p.slot >= 0 for p in a.table.held.values())
+    (grow, _), grown = bind(a, (card.cap + 1) * PAGE)  # more than every slot the card can free
+    assert grow > 0 and grown[0], "new pages past the card's room priced and grown"
+    for c, k in ((a, ka), (b, kb)):
+        assert torch.equal(read(c, 1)[0][..., : k.shape[-2], :], bf(k + 1)), "every row as it was written"
+    assert not pc.pool.pages.check()
+
+
+def region_check(card: CardRegion) -> list[str]:
+    """the card region's slots against its pages: every slot holding a live page that names it back, the free lists
+    the empty slots once each"""
+    bad: list[str] = []
+    for where, slots, free, at in (("card", card.slots, card.free, "slot"), ("park", card.parked, card.pfree, "park")):
+        empty = {s for s, p in enumerate(slots) if p is None}
+        if sorted(free) != sorted(empty):
+            bad.append(f"the {where}'s free slots {sorted(free)} are not its empty ones {sorted(empty)}")
+        for s, p in enumerate(slots):
+            if p is not None and (p.refs <= 0 or getattr(p, at) != s):
+                bad.append(f"{where} slot {s}: page {p.id} ({p.refs} holders) names slot {getattr(p, at)}")
+    return bad
 
 
 def test_the_cards_map_uploads_only_the_positions_that_moved() -> None:
@@ -386,10 +492,9 @@ def test_a_layer_moving_between_the_regions_takes_every_conversations_rows() -> 
     assert card is not None
     a, b = pc.new(), pc.new()
     ka, va = rows(PAGE + 7, 46)
-    kb, vb = rows(20, 47)
     write(a, ka, va)
+    kb, vb = rows((len(card.free) + 1) * PAGE, 47)  # more pages than the free slots: one of a's parked for them
     write(b, kb, vb)
-    card.bind(b.table)  # a's pages parked
     assert any(p.park >= 0 for p in a.table.held.values())
     pc.pool.rehome(1, card=False)
     assert card.layers == [0] and 1 in pc.pool.host.layers and not pc.pool.on_card(1)

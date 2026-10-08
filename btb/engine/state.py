@@ -419,7 +419,10 @@ class _State:
     def _card_runs_layer(self, i: int) -> bool:  # an engine without the card mixin runs no layer in a card graph
         return False
 
-    def _card_ready(self) -> bool:  # an engine without the card mixin runs no card graph
+    def _card_ready(self, capture: bool = True) -> bool:  # an engine without the card mixin runs no card graph
+        return False
+
+    def _card_off_route(self, i: int) -> bool:  # an engine without the card mixin has no card route to leave
         return False
 
     def _card_let_go(self) -> None:  # an engine without the card mixin holds no card graph

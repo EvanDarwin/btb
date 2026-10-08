@@ -26,7 +26,9 @@ import pytest
 import torch
 
 from btb.engine import MemoryGrantError, StreamedTextModel
+from btb.engine.cache import ForkLayer
 from btb.engine.cuda import CardPassFailed
+from btb.engine.kvpool import PAGE
 from btb.engine.paged import PagedCache
 from btb.engine.prefix import PrefixCache
 from btb.kinds import PassTag
@@ -171,11 +173,12 @@ def test_a_side_request_leaves_the_conversation_where_it_was(stem: str, place: s
     """a turn of conversation A, an unrelated prompt on the same session (a title call, a sub-agent), A's next turn:
     the next turn opens on every row A left - its prompt and its answer but the answer's last token, still pending
     when the side request came - and answers as A uninterrupted on a contiguous cache does, logits and all (the same
-    rows prefilled from the same point). On the card the side request parks A's pages in RAM, and A's next turn
-    brings them back"""
+    rows prefilled from the same point). On the card the side request, longer than the card's region holds, parks A's
+    pages in RAM for its room, and A's next turn brings them back"""
     sm = model(stem, place)
     rng = random.Random(2)
-    a1, more, side = toks(rng, 100), toks(rng, 20), toks(rng, 50)
+    card = prefix(sm).pool.card
+    a1, more, side = toks(rng, 100), toks(rng, 20), toks(rng, ((card.cap if card is not None else 0) + 1) * PAGE)
     side[0] = (a1[0] + 1) % VOCAB or 3  # nothing in common with A
     prefix(sm)
     s = sm.session()
@@ -415,6 +418,9 @@ def test_a_card_prefill_short_of_room_runs_the_torch_path(
                         got = s.feed(p).logits
                         assert PassTag.CARD_PREFILL in sm.last_pass_report(), f"{what}: the card's kernels not tried"
                         sm.__dict__.pop("_card_off", None)  # the card graph back, off since the refusal
+                        if paged:
+                            pc = sm._prefix_cache()
+                            assert pc is not None and pc.match(p).length == 0, f"{what}: torch's rows given to the tree"
                         if short == "tail":
                             with pytest.raises(CardPassFailed):
                                 sm.session().feed(p, taps=[0])
@@ -469,7 +475,15 @@ def test_a_layer_the_card_gives_up_takes_every_conversations_rows_and_back(stem:
         seen: list[torch.Tensor | list[int]] = []
         a, b = sm.session(), sm.session()
         seen.append(a.feed(p1).logits)
-        seen.append(b.feed(p2).logits)  # a's pages parked
+        seen.append(b.feed(p2).logits)
+        pc = sm._prefix_cache()
+        card = pc.pool.card if pc is not None else None
+        if card is not None:
+            # every page b does not read parked, as a request wanting the card's slots would park them: a's among them
+            assert isinstance(b.cache, PagedCache)
+            others = sum(1 for p in card.slots if p is not None and p.id not in b.cache.table.held)
+            card.reserve(len(card.free) + others, b.cache.table)
+            assert isinstance(a.cache, PagedCache) and all(p.park >= 0 for p in a.cache.table.held.values())
         i = max(sm.resident)
         sm.device.request("shed", sm.vram_shed)  # as the memory policy moves a layer: the placement's version moves
         assert i in sm.host
@@ -488,6 +502,60 @@ def test_a_layer_the_card_gives_up_takes_every_conversations_rows_and_back(stem:
     with contiguous(sm):
         flat = run()
     same(paged, flat, "a layer shed and regrown")
+
+
+@pytest.mark.parametrize("place", ["cpu", pytest.param("kvhost", marks=CARD)])
+@pytest.mark.parametrize("stem", ["tiny_qwen3"])
+def test_rows_off_the_conversation_are_their_own_and_asked_for(stem: str, place: str) -> None:
+    """a fork and a batch of conversations in the pages are caches of their own - never a session's table read as
+    paged (priced as its growth, bound to it every step) - whose rows are asked of the ledger as they grow (a paged
+    layer hands its fork the pool's gate) and step as a contiguous session's fork and batch do; and an idle
+    conversation holds none of its last pass's row lists"""
+    sm = model(stem, place)
+    rng = random.Random(11)
+    p, q = toks(rng, 90), toks(rng, 40)
+
+    def run() -> list[torch.Tensor]:
+        seen: list[torch.Tensor] = []
+        a, b = sm.session(), sm.session()
+        a.feed(p)
+        b.feed(q)
+        if sm._prefix_cache() is not None:
+            assert isinstance(a.cache, PagedCache) and a.cache.__dict__.get("_lists") is None, "an idle cache's lists"
+        with a.fork(3) as br:
+            assert br.cache is not None and not getattr(br.cache, "paged", False)
+            assert all(cl.grant is not None for cl in br.cache.layers if isinstance(cl, ForkLayer))
+            seen += [br.step([5, 6, 7]).logits, br.step([8, 9, 10]).logits]
+        with sm.batch([a, b]) as bt:
+            assert bt.cache is not None and not getattr(bt.cache, "paged", False)
+            seen += [bt.step([11, 12]).logits, bt.step([13, 14]).logits]
+        return seen
+
+    prefix(sm)
+    paged = run()
+    with contiguous(sm):
+        flat = run()
+    same(list(paged), list(flat), f"{place}: a fork and a batch")
+
+
+@CARD
+@pytest.mark.parametrize("place", ["card"])
+@pytest.mark.parametrize("stem", GRAPHED)
+def test_a_long_prompt_leaves_no_scratch_and_graphs_share_their_states(stem: str, place: str) -> None:
+    """a prompt past a step's rows lets the card's scratch of its width go with it (kept, it held the prompt's width
+    for every step after); the card graph's attention states are one set for every graph of a width, asked of the
+    ledger, not one for each run, tail and kernel"""
+    sm = model(stem, place)
+    prefix(sm)
+    s = sm.session()
+    s.feed(chatty(random.Random(12), 300))
+    assert not [k for k in sm.scratch._bufs if k[0].startswith("card")], "a prompt's scratch kept past it"
+    s.generate(8, eos=(), speculate=True)
+    st = sm._card_state()
+    parts = st.get("parts", {})
+    for g in st["graphs"].values():
+        got = parts.get((int(g["key"][2]), int(g["S"])))
+        assert got is not None and g["part_m"] is got["part_m"] and g["cnt"] is got["cnt"], g["key"]
 
 
 @pytest.mark.parametrize("stem", OTHERS)
