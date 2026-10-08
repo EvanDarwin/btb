@@ -326,6 +326,37 @@ def test_the_card_holds_the_bound_conversations_pages_and_parks_the_rest() -> No
     assert not pc.pool.pages.check()
 
 
+def test_a_conversation_let_go_while_the_card_parks_frees_its_slots_after(monkeypatch: pytest.MonkeyPatch) -> None:
+    """a conversation collected while the card moves its pages - the collector run by an allocation of the copies, on
+    the same thread under the region's reentrant lock - lets them go once the move is done: each page keeps the slots
+    the move reads and writes, and then every slot it held is free again, once"""
+    pc = prefix(card=(0, 1))
+    card = pc.pool.card
+    assert card is not None
+    a, c = pc.new(), pc.new()
+    write(a, *rows(PAGE + 7, 49))  # a bound: its two pages on the card
+    held = list(a.table.held.values())
+    assert all(p.slot >= 0 for p in held)
+    copy = card._copy
+
+    def collected_mid_copy(src: dict[int, Any], dst: dict[int, Any], runs: list[tuple[int, int, int]]) -> None:
+        if a.table.held:
+            a.release()  # as a's finalizer would, run by the collector inside the move
+        copy(src, dst, runs)
+
+    monkeypatch.setattr(card, "_copy", collected_mid_copy)
+    kc, vc = rows(9, 50)
+    write(c, kc, vc)  # c bound: a's pages parked, a let go meanwhile
+    assert all(p.refs == 0 and p.slot < 0 and p.park < 0 for p in held), "a's pages left a slot behind"
+    assert not any(p in held for p in [*card.slots, *card.parked] if p is not None)
+    assert len(set(card.free)) == len(card.free) and len(set(card.pfree)) == len(card.pfree), "a slot freed twice"
+    assert min([*card.free, *card.pfree], default=0) >= 0
+    assert not pc.pool.pages.check()
+    for i in (0, 1):
+        ck, cv = card_rows(c, i)
+        assert torch.equal(ck, bf(kc + i)) and torch.equal(cv, bf(vc - i))
+
+
 def test_the_cards_map_uploads_only_the_positions_that_moved() -> None:
     """while a table stays bound, an append uploads its new positions alone, a crop then the positions written again;
     a card layer's module past its first rows is handed the rows through the map (`PagedKV`), never a buffer"""

@@ -16,10 +16,11 @@ meets a `PagedError` rather than a silent gather.
 
 from __future__ import annotations
 
+import contextlib
 import heapq
 import threading
 import weakref
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -243,6 +244,24 @@ class CardRegion:
         self.tbl: torch.Tensor | None = None
         self._bound: weakref.ref[Table] | None = None
         self._mapped = (-1, 0)  # the region's version and the positions the map holds for the bound table
+        # the pages let go while the slots were moving (`_moving`), their slots freed once the move is done
+        self._moving = 0
+        self._let_go: list[Page] = []
+
+    @contextlib.contextmanager
+    def _move(self) -> Iterator[None]:
+        """the slots changing - pages parked, brought back, placed - under the lock: a page let go meanwhile has its
+        slots freed once the change is done. The lock is reentrant, and a conversation's table collected mid-change
+        (the collector run by an allocation of the copies) lets its pages go on this very thread: a page among those
+        moving, freed then, read its slot as gone - the move then wrote slot -1, the region's last"""
+        with self.lock:
+            self._moving += 1
+            try:
+                yield
+            finally:
+                self._moving -= 1
+                while not self._moving and self._let_go:
+                    self._free_slots(self._let_go.pop())
 
     def _arena(self) -> KvArena:
         return KvArena(1, self.hk, self.d, self.dev, self.ceiling)
@@ -375,15 +394,23 @@ class CardRegion:
 
     def place(self, p: Page) -> None:
         """a new page `p` on the card, at the lowest free slot or one the arenas grow for"""
-        with self.lock:
+        with self._move():
             s = self._take()
             self.slots[s] = p
             self._set_slot(p, s)
             p.where = "card"
 
     def freed(self, p: Page) -> None:
-        """page `p` has no holder left: its slot on the card or in the park free again - nothing to free once the
-        region is closed, a table outliving the engine letting its pages go"""
+        """page `p` has no holder left: its slot on the card or in the park free again - once the slots moving now
+        are moved (`_move`) - and nothing to free once the region is closed, a table outliving the engine letting its
+        pages go"""
+        with self.lock:
+            if self._moving and not self.closed:
+                self._let_go.append(p)
+                return
+            self._free_slots(p)
+
+    def _free_slots(self, p: Page) -> None:
         with self.lock:
             if self.closed:
                 p.slot = p.park = -1
@@ -409,51 +436,53 @@ class CardRegion:
 
     def park(self, pages: Sequence[Page]) -> None:
         """`pages` off the card into the park, their card slots free again"""
-        pages = sorted(pages, key=lambda p: p.slot)
-        if not pages:
-            return
-        # the park grown for them all before a slot is taken: a growth refused leaves every page where it was
-        self._grow_park(len(self.parked) + max(0, len(pages) - len(self.pfree)))
-        pairs = []
-        for p in pages:
-            ps = self._take_park()
-            pairs.append((p.slot, ps))
-            self.parked[ps] = p
-        self._copy(self.arenas, self.parks, _runs(pairs))
-        for p, (s, ps) in zip(pages, pairs, strict=True):
-            self.slots[s] = None
-            heapq.heappush(self.free, s)
-            self._set_slot(p, -1)
-            p.park, p.where = ps, "park"
-        self.version += 1
+        with self._move():
+            pages = sorted(pages, key=lambda p: p.slot)
+            if not pages:
+                return
+            # the park grown for them all before a slot is taken: a growth refused leaves every page where it was
+            self._grow_park(len(self.parked) + max(0, len(pages) - len(self.pfree)))
+            pairs = []
+            for p in pages:
+                ps = self._take_park()
+                pairs.append((p.slot, ps))
+                self.parked[ps] = p
+            self._copy(self.arenas, self.parks, _runs(pairs))
+            for p, (s, ps) in zip(pages, pairs, strict=True):
+                self.slots[s] = None
+                heapq.heappush(self.free, s)
+                self._set_slot(p, -1)
+                p.park, p.where = ps, "park"
+            self.version += 1
 
     def load(self, pages: Sequence[Page]) -> None:
         """`pages` out of the park onto the card, their park slots free again"""
-        pages = sorted(pages, key=lambda p: p.park)
-        if not pages:
-            return
-        # the arenas grown for them all before a slot is taken: a growth refused leaves every page where it was
-        self._grow(self.cap + max(0, len(pages) - len(self.free)))
-        pairs = []
-        for p in pages:
-            s = self._take()
-            pairs.append((p.park, s))
-            self.slots[s] = p
-        self._copy(self.parks, self.arenas, _runs(pairs))
-        for p, (ps, s) in zip(pages, pairs, strict=True):
-            self.parked[ps] = None
-            heapq.heappush(self.pfree, ps)
-            self._set_slot(p, s)
-            p.park, p.where = -1, "card"
-        self.version += 1
-        if self.arenas:
-            self.loaded += len(pages)
+        with self._move():
+            pages = sorted(pages, key=lambda p: p.park)
+            if not pages:
+                return
+            # the arenas grown for them all before a slot is taken: a growth refused leaves every page where it was
+            self._grow(self.cap + max(0, len(pages) - len(self.free)))
+            pairs = []
+            for p in pages:
+                s = self._take()
+                pairs.append((p.park, s))
+                self.slots[s] = p
+            self._copy(self.parks, self.arenas, _runs(pairs))
+            for p, (ps, s) in zip(pages, pairs, strict=True):
+                self.parked[ps] = None
+                heapq.heappush(self.pfree, ps)
+                self._set_slot(p, s)
+                p.park, p.where = -1, "card"
+            self.version += 1
+            if self.arenas:
+                self.loaded += len(pages)
 
     def bind(self, table: Table) -> torch.Tensor:
         """`table`'s pages on the card - those in the park brought back, the pages on the card it does not read
         parked first - and its row map on the card (`tbl`, int32: position j at card row tbl[j]) brought up to date,
         only its new positions uploaded while it stays the one bound"""
-        with self.lock:
+        with self._move():
             bound = self._bound() if self._bound is not None else None
             tbl = self.tbl
             if bound is not table:
