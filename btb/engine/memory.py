@@ -388,8 +388,9 @@ class _MemoryMixin(_State):
             return  # the warm-up's own passes: answered once it is done (model.py `_warming`)
         self.vram_state.asked = False  # the budget read here, by the pass
         # a batched decode is sized by the scheduler (the one OOM guard), so the per-step streaming policy stands
-        # aside: shedding mid-batch only slows it, and the triggers fire on a large batch's legitimate KV growth
-        if cache is not None and getattr(cache, "layers", None):
+        # aside: shedding mid-batch only slows it, and the triggers fire on a large batch's legitimate KV growth. A
+        # paged cache holds one sequence, its rows read through the map alone
+        if cache is not None and not getattr(cache, "paged", False) and getattr(cache, "layers", None):
             k0 = getattr(cache.layers[0], "keys", None)
             if k0 is not None and k0.numel() and int(k0.shape[0]) > 1:
                 return
@@ -1098,11 +1099,12 @@ class _MemoryMixin(_State):
         if cache is None:
             return need
         if getattr(cache, "paged", False):
-            # every attention layer's rows in the engine's pool, one sequence's: its growth where its free pages do not
-            # hold them, the buffer in flight counted in (`HostPool.growth`)
-            g = cast("PagedCache", cache).growth(B * T)
-            if g:
-                need[where(Device.CPU)] = g
+            # every attention layer's rows in the engine's pool, one sequence's: its growth where its free pages, slots
+            # and park do not hold them - the host's region and the park in RAM, the card's arenas on the card - the
+            # buffer in flight counted in (`PagedCache.growth`)
+            for at, g in cast("PagedCache", cache).growth(B * T).items():
+                if g:
+                    need[where(torch.device(at))] = g
             return need
         first = next(((i, cl) for i, cl in enumerate(cache.layers) if isinstance(cl, GrowLayer)), None)
         if first is None and not any(isinstance(cl, GrantedIndexedLayer) for cl in cache.layers):
@@ -1245,6 +1247,11 @@ class _MemoryMixin(_State):
             aj = getattr(self, "aj", None)
             if aj is not None and aj.dev.type == Device.CUDA:
                 n += self._drafter_bytes()
+            pc = self.__dict__.get("_kv")
+            card = pc.pool.card if pc is not None else None
+            if card is not None:
+                # the prefix cache's arenas of the resident layers: a layer shed takes its rows to the host's region
+                n += sum(card.layer_bytes() for i in resident if i in card.arenas)
             return n + sum(_bytes_on(c, dev, resident) for c in list(self.__dict__.get("_live_caches", ())))
         packed = bool(getattr(self, "_packed", None))
         n = sum(self._layer_bytes_stored(i, packed) for i in list(self.host) if i not in self.cold)
@@ -1261,7 +1268,10 @@ _LOANS: Iterator[int] = itertools.count(1)
 
 
 def _bytes_on(cache: KvCache, dev: torch.device, layers: Iterable[int]) -> int:
-    """the bytes `cache` holds on `dev` for `layers`"""
+    """the bytes `cache` holds on `dev` for `layers`: none of a paged cache's, whose rows are the pool's (counted once,
+    for every conversation, in `_sheddable`)"""
+    if getattr(cache, "paged", False):
+        return 0
     n = 0
     for i in layers:
         if i >= len(cache.layers):

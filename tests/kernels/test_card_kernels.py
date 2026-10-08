@@ -6,6 +6,7 @@ same path. Needs a CUDA card and the built fatbin; skipped otherwise."""
 from __future__ import annotations
 
 import ctypes
+import itertools
 import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
@@ -358,6 +359,102 @@ def test_the_grouped_query_split_attention_is_the_one_head_kernel_bit_for_bit(
     want = _attn_split(cu, q, K, V, n0, par, scale, win=win)
     for shared in (0, n0, n0 + 1, 1 << 30):
         assert torch.equal(_attn_split(cu, q, K, V, n0, par, scale, win=win, shared=shared), want), shared
+
+
+# ---------------------------------------------------------------------------------------------------------
+# the prefill kernel: a prompt chunk's T rows on tensor cores, each over the rows before it and itself. Not the
+# one-row step's bits (a prefill's need not be), but fixed by a row's keys and the key tiles alone, so a prompt cut
+# into any chunks gives the same rows, and a row map moves addresses only.
+# ---------------------------------------------------------------------------------------------------------
+
+
+def _prefill(
+    cu: _Cuda,
+    q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    n0: int,
+    scale: float,
+    win: int = 0,
+    tbl: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """`btb_attn_prefill_d{D}`: the chunk's rows q [T, Hq, D] at positions n0 .., each over the cache rows before it
+    and itself (the last `win` under a window), through the row map `tbl` where given"""
+    T, Hq, D = q.shape
+    out = torch.full((T, Hq, D), float("nan"), device=dev, dtype=bf)
+    cu.launch(
+        f"btb_attn_prefill_d{D}",
+        ((T + 63) // 64, Hq, 1),
+        (128, 1, 1),
+        [P(q), P(K), P(V), P(out), I(n0), I(T), I(Hq), I(K.shape[0]), I(K.stride(0)), I(K.stride(1)), Fl(scale)]
+        + [I(win), P(tbl)],
+    )
+    return out
+
+
+@pytest.mark.parametrize("win", [0, 100])
+@pytest.mark.parametrize("n0,T", [(0, 1), (0, 130), (37, 64), (700, 37), (1500, 300)])
+@pytest.mark.parametrize("Hq,Hk,D", [(16, 8, 128), (32, 8, 64), (8, 2, 256), (12, 12, 128)])
+def test_prefill_matches_the_reference(cu: _Cuda, Hq: int, Hk: int, D: int, n0: int, T: int, win: int) -> None:
+    """each row of a chunk is its softmax over the cache rows before it and itself (the last `win` under a window),
+    within the bf16 weights' rounding of the float32 reference - every query head of every kv group, rows on both
+    sides of a 64-row block, a chunk starting at 0 and deep into the cache - and the same bits again"""
+    torch.manual_seed(21)
+    cap = n0 + T + 64
+    K = torch.randn(Hk, cap, D, device=dev, dtype=bf)
+    V = torch.randn(Hk, cap, D, device=dev, dtype=bf)
+    q = torch.randn(T, Hq, D, device=dev, dtype=bf)
+    scale = 1.0 / math.sqrt(D)
+    out = _prefill(cu, q, K, V, n0, scale, win)
+    for t in range(T):
+        p = n0 + t
+        first = max(0, p + 1 - win) if win else 0
+        ref = _attn_ref(q[t], K, V, list(range(first, p + 1)), scale)
+        err = (out[t].float() - ref.float()).abs().max().item()
+        # a bf16 step at the row's magnitude: the weights' rounding and the output's (a row of two keys averages to
+        # values near 3, whose step is 2^-6)
+        tol = 2**-6 * max(1.0, ref.float().abs().max().item())
+        assert err <= tol, f"row {t}: {err} against {tol}"
+    assert torch.equal(out, _prefill(cu, q, K, V, n0, scale, win))
+
+
+@pytest.mark.parametrize("win", [0, 100])
+@pytest.mark.parametrize("Hq,Hk,D", [(16, 8, 128), (32, 8, 64), (8, 2, 256)])
+def test_prefill_rows_are_the_same_however_the_prompt_is_chunked(cu: _Cuda, Hq: int, Hk: int, D: int, win: int) -> None:
+    """a prompt's rows come out the same bits whether it is prefilled whole or in chunks of any size - a row's sums
+    run over its own keys in tiles fixed by position, whatever chunk or block it falls in"""
+    torch.manual_seed(22)
+    n = 700
+    K = torch.randn(Hk, n, D, device=dev, dtype=bf)
+    V = torch.randn(Hk, n, D, device=dev, dtype=bf)
+    q = torch.randn(n, Hq, D, device=dev, dtype=bf)
+    scale = 1.0 / math.sqrt(D)
+    whole = _prefill(cu, q, K, V, 0, scale, win)
+    for cuts in ([0, 64, 128, 700], [0, 1, 37, 300, 301, 700], [0, 333, 700]):
+        parts = [_prefill(cu, q[a:b], K, V, a, scale, win) for a, b in itertools.pairwise(cuts)]
+        assert torch.equal(torch.cat(parts), whole), cuts
+
+
+@pytest.mark.parametrize("win", [0, 100])
+@pytest.mark.parametrize("Hq,Hk,D", [(16, 8, 128), (32, 8, 64), (8, 2, 256)])
+def test_prefill_through_a_row_map_reads_the_rows_where_their_pages_lie_bit_for_bit(
+    cu: _Cuda, Hq: int, Hk: int, D: int, win: int
+) -> None:
+    """the prefill through a cache's row map: the rows scattered in pages over a position-major pool twice their
+    size, in any order, give the bits the same rows read in place give (head-major or position-major); an identity
+    map is the plain kernel"""
+    torch.manual_seed(23)
+    cap, n0, T = 2048, 1100, 300
+    K = torch.randn(Hk, cap, D, device=dev, dtype=bf)
+    V = torch.randn(Hk, cap, D, device=dev, dtype=bf)
+    q = torch.randn(T, Hq, D, device=dev, dtype=bf)
+    scale = 1.0 / math.sqrt(D)
+    want = _prefill(cu, q, K, V, n0, scale, win)
+    tbl, Kp, Vp = _paged(K, V, D + win)
+    assert torch.equal(_prefill(cu, q, Kp, Vp, n0, scale, win, tbl=tbl), want)
+    assert torch.equal(_prefill(cu, q, _position_major(K), _position_major(V), n0, scale, win), want)
+    ident = torch.arange(cap, dtype=torch.int32, device=dev)
+    assert torch.equal(_prefill(cu, q, K, V, n0, scale, win, tbl=ident), want)
 
 
 # ---------------------------------------------------------------------------------------------------------

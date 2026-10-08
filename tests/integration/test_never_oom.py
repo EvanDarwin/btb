@@ -207,7 +207,8 @@ def test_a_presize_refused_after_the_sweep_made_room_sheds_from_the_top_and_goes
     raised). A refused layer gives up the top resident layer - no rows of its there yet - and asks again, until the
     rest fits or it is the one given up; with `adapt` off the placement is pinned and the refusal stands. And a host
     layer's first chunk on the card starts its rows in the sweep's reservation, a buffer for the chunk alone: grown
-    there, it took the whole sequence's rows out of the epoch's room (0.16 GiB at 40k on Qwen3-0.6B, refused)"""
+    there, it took the whole sequence's rows out of the epoch's room (0.16 GiB at 40k on Qwen3-0.6B, refused). A
+    paged cache's prompt rows, reserved in the card's region before the sweep, are refused and given room the same way"""
     dev = need_cuda()
     kw: dict[str, Any] = {"device": dev, "cpu_layers": 1, "prefill_chunk": 8, "prefill_card_min": 4}
     with loaded_model(fixture("tiny_qwen3"), **kw) as sm:
@@ -215,15 +216,14 @@ def test_a_presize_refused_after_the_sweep_made_room_sheds_from_the_top_and_goes
         assert len(top) >= 3, top
         real = sm.scheduler.grant
         asked: list[str] = []
-        # another session holds the card graph's arena, so the prefill's cache keeps rows of its own (a cache taking
-        # the free arena writes its rows there, and nothing of it is presized)
-        holder = sm.session(PROMPT[:8])
-        assert holder.cache is not None
+        # another cache holds the card graph's arena, so the prefill's cache keeps rows of its own (a cache taking
+        # the free arena writes its rows there, and nothing of it is presized): a contiguous one, as the arena holds
+        holder = sm.new_cache(max_len=len(PROMPT) + 2)
         st = sm._card_state()
-        if st.get("arena") is not None:
-            with torch.inference_mode():
-                sm._card_bind(holder.cache, st, 0)
-            assert st["arena"]["owner"]() is holder.cache, "the holder did not take the arena"
+        with torch.inference_mode():
+            sm._prefill(torch.tensor([PROMPT[:8]]), holder)
+            sm._card_bind(holder, st, 0)
+        assert st["arena"]["owner"]() is holder, "the holder did not take the arena"
 
         def sweep() -> None:
             # the prompt's prefill alone: a decode step would take the arena from the holder
@@ -270,6 +270,39 @@ def test_a_presize_refused_after_the_sweep_made_room_sheds_from_the_top_and_goes
         assert {top[-1], top[-2]} <= set(sm.host)
         del holder
 
+        # a paged cache: its prompt's rows reserved in the card's region (`_bind_kv`), the reservation refused as
+        # the presize was - pinned, the refusal stands; else the top layer goes, its rows to the host's region
+        pc = sm._prefix_cache()
+        assert pc is not None, "the prefix cache does not serve the card here"
+        left = sorted(sm.resident)
+
+        def paged_sweep(refusals: int) -> list[int]:
+            cache = pc.new()
+            bind, calls = cache.bind, []
+
+            def refused(T: int = 0) -> Any:
+                calls.append(T)
+                if len(calls) <= refusals:
+                    raise MemoryGrantError("[grant] REFUSED the test's reservation: another program took the room")
+                return bind(T)
+
+            cache.bind = refused  # type: ignore[method-assign]
+            with torch.inference_mode():
+                sm._prefill(torch.tensor([PROMPT]), cache)
+            assert cache.get_seq_length() == len(PROMPT)
+            return calls
+
+        with monkeypatch.context() as mp:
+            mp.setattr(sm, "adapt", False)
+            with pytest.raises(MemoryGrantError, match="another program took the room"):
+                paged_sweep(1)
+        assert sorted(sm.resident) == left, "a pinned placement gave a layer up"
+        calls = paged_sweep(1)
+        assert calls[:2] == [len(PROMPT), len(PROMPT)], calls  # refused, then asked again once a layer went
+        assert sorted(sm.resident) == left[:-1], "the refusal gives up the top resident layer, and no more"
+        card = pc.pool.card
+        assert card is not None and left[-1] not in card.layers and left[-1] in pc.pool.host.layers
+
 
 def test_a_prefills_rows_are_made_once_in_the_arena_and_a_refused_arena_decodes_on_the_torch_layers(
     monkeypatch: pytest.MonkeyPatch,
@@ -277,7 +310,9 @@ def test_a_prefills_rows_are_made_once_in_the_arena_and_a_refused_arena_decodes_
     """with the card graphs' arena free, a prefill's cache takes it grown to its reach and its rows are made there,
     once - presized in buffers of its own, the first decode step asked a second whole copy to move them in (3.3 GB
     of a 40k prompt on Qwen3-0.6B, refused). Where the arena cannot take them, the cache keeps its own rows and the
-    answer goes on through the torch layers over them, not refused"""
+    answer goes on through the torch layers over them, not refused. A paged cache's rows are the prefix cache's card
+    region's: made there once, never presized, and its graphs refused the answer goes on through the torch layers
+    reading them where they lie"""
     dev = need_cuda()
     kw: dict[str, Any] = {"device": dev, "cpu_layers": 1, "prefill_chunk": 8, "prefill_card_min": 4}
     with loaded_model(fixture("tiny_qwen3"), **kw) as sm:
@@ -290,21 +325,27 @@ def test_a_prefills_rows_are_made_once_in_the_arena_and_a_refused_arena_decodes_
                 presized.append(str(g["requester"]))
             real(nbytes, kind, **g)
 
-        with monkeypatch.context() as mp:
-            mp.setattr(sm.scheduler, "grant", seen)
-            got = sm.generate(list(PROMPT), 4, eos=(), speculate=False).tokens
-        assert len(got) == 4
-        assert not presized, f"a prefill with the arena free made rows of its own: {presized}"
-
         def refused(*a: Any, **k: Any) -> Any:
             raise MemoryGrantError("[grant] REFUSED the test's arena: no room for the cache's rows")
 
-        with monkeypatch.context() as mp:
-            mp.setattr(sm.scheduler, "grant", seen)
-            mp.setattr(sm, "_card_bind", refused)
-            got = sm.generate(list(PROMPT), 4, eos=(), speculate=False).tokens
-        assert len(got) == 4, "a refused arena failed the answer"
-        assert presized, "the arena refused, the prefill's rows were made nowhere of their own"
+        pc = sm._prefix_cache()
+        assert pc is not None, "the prefix cache does not serve the card here"
+        for paged in (False, True):
+            presized.clear()
+            with monkeypatch.context() as mp:
+                if not paged:
+                    mp.setitem(sm.__dict__, "_kv", None)  # contiguous caches: the card graph's arena
+                mp.setattr(sm.scheduler, "grant", seen)
+                got = sm.generate(list(PROMPT), 4, eos=(), speculate=False).tokens
+                assert len(got) == 4
+                assert not presized, f"a prefill with the arena free made rows of its own: {presized}"
+                mp.setattr(sm, "_card_bind", refused)
+                refused_got = sm.generate(list(PROMPT), 4, eos=(), speculate=False).tokens
+            assert len(refused_got) == 4, "a refused arena failed the answer"
+            if paged:
+                assert not presized, f"a paged cache's rows presized apart from its pages: {presized}"
+            else:
+                assert presized, "the arena refused, the prefill's rows were made nowhere of their own"
 
 
 @pytest.mark.parametrize("speculate", [False, True], ids=["plain", "speculative"])

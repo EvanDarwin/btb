@@ -348,6 +348,7 @@ class PassTag(StrEnum):
     # the reader a pass's attention took its cache rows through (btb/engine/state.py `_tag_kv`)
     KV_CONTIGUOUS = "kv_contiguous"  # the conversation's own buffers, its rows in order from the first
     KV_PAGED = "kv_paged"  # the engine's pool of pages, read through the conversation's row map (btb/engine/paged.py)
+    KV_PARK = "kv_park"  # the conversation's pages brought back onto the card from pinned RAM (`CardRegion.bind`)
     # what a decode over a session kept of the cache for its prompt (btb/session.py `_begin_decode`)
     PREFIX_HIT = "prefix_hit"  # rows of the prompt the cache held: prefilled from there on
     PREFIX_MISS = "prefix_miss"  # nothing kept: the whole prompt prefilled

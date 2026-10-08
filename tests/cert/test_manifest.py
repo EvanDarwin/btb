@@ -413,10 +413,15 @@ def test_every_cell_asserts_the_reader_its_cache_rows_take() -> None:
     bf16 = spec.Storage.SAFE_BF16
     for dev in spec.DEVICE_SUBPATHS:
         for kind in core.served_kinds():
-            assert spec.kv_tag(kind, dev.hardware) in dev.expects(kind, bf16), (dev.key, kind)
+            assert spec.kv_tag(kind, dev.hardware, dev.knobs) in dev.expects(kind, bf16), (dev.key, kind)
     assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.CPU) is PassTag.KV_PAGED
-    assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.CUDA) is PassTag.KV_CONTIGUOUS
+    assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.CUDA) is PassTag.KV_PAGED
+    assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.MLX) is PassTag.KV_CONTIGUOUS
     assert spec.kv_tag(FamilyKind.QWEN3_5, spec.Hardware.CPU) is PassTag.KV_CONTIGUOUS
+    # the card's layers computing in float32 are wider than its paged kernels read
+    assert PassTag.KV_CONTIGUOUS in spec.SUBPATH["cuda-torch"].expects(FamilyKind.QWEN3, bf16)
+    for key in ("cuda-graph", "cuda-split", "cuda-kvhost", "cuda-prefill"):
+        assert PassTag.KV_PAGED in spec.SUBPATH[key].expects(FamilyKind.QWEN3, bf16), key
 
 
 def test_the_cert_reads_the_engines_own_rule_for_the_paged_reader(monkeypatch: MonkeyPatch) -> None:
@@ -433,22 +438,33 @@ def test_the_cert_reads_the_engines_own_rule_for_the_paged_reader(monkeypatch: M
 
     for name in ("attn_spans", "attn_nodes"):
         monkeypatch.setattr(Native, name, object())  # the native library as a built one has it
+    # the card's kernels as a built fatbin has them: every paged attention kernel's width
+    kernels = types.SimpleNamespace(
+        fn={f"btb_attn_{k}_d{d}": object() for k in ("prefill", "split_tbl") for d in spec.CARD_HEAD_DIMS}
+    )
+    monkeypatch.setattr(Native, "card_kernels", classmethod(lambda cls: kernels))
     devices = {spec.Hardware.CPU: torch.device("cpu"), spec.Hardware.CUDA: torch.device("cuda")}
     for kind in core.served_kinds():
         if kind not in spec.FIXTURE_STEM:
             continue
         cfg = spec.fixture_config(kind)
         types_ = [LayerKind.of(t) for t in cfg.get("layer_types") or [LayerKind.FULL]]
+        options: tuple[dict[str, object], ...] = ({}, {"fp32": 1})
         for hw, dev in devices.items():
-            sm = types.SimpleNamespace(
-                dev=dev,
-                mlx=None,
-                layer_types=types_,
-                fam=types.SimpleNamespace(**_flags(kind)),
-                flat_cache=lambda: True,
-            )
-            why = PrefixCache.why_not(sm)
-            assert (why is None) is spec.paged(kind, hw), (kind, hw, why)
+            for knobs in options:
+                sm = types.SimpleNamespace(
+                    dev=dev,
+                    mlx=None,
+                    layer_types=types_,
+                    fam=types.SimpleNamespace(**_flags(kind)),
+                    flat_cache=lambda: True,
+                    cfg=types.SimpleNamespace(**{**cfg, "_attn_implementation": "btb_sdpa"}),
+                    compute_dtype=torch.float32 if knobs else None,
+                    resident_fp32=bool(knobs),
+                    shadow={},
+                )
+                why = PrefixCache.why_not(sm)
+                assert (why is None) is spec.paged(kind, hw, knobs), (kind, hw, knobs, why)
 
 
 def test_the_prefix_axis_runs_where_the_prefix_cache_serves_and_is_a_gap_elsewhere() -> None:
@@ -462,24 +478,55 @@ def test_the_prefix_axis_runs_where_the_prefix_cache_serves_and_is_a_gap_elsewhe
 
     served = {k for k in core.served_kinds() if k in spec.FIXTURE_STEM}
     prefix = [g for g in manifest.shape_gaps() if g[0] is spec.Surface.PREFIX]
-    cpu = {kind: why for _s, kind, key, why in prefix if key == "cpu"}
+    by = {(kind, key): why for _s, kind, key, why in prefix}
+    cpu = {kind: why for (kind, key), why in by.items() if key == "cpu"}
     assert set(cpu) == {k for k in served if not spec.paged(k, spec.Hardware.CPU)}
     assert {FamilyKind.QWEN3, FamilyKind.PHI3, FamilyKind.GEMMA3} <= served - set(cpu)
     assert cpu[FamilyKind.QWEN3_5] is manifest.Missing.PREFIX_SNAPSHOT
     assert cpu[FamilyKind.GPT_OSS] is manifest.Missing.PREFIX_FAMILY
-    for _s, kind, key, why in prefix:
+    # the card serves the dense families on every sub-path its bf16 kernels read - where the sub-path engages at all
+    # (Phi-3's card graph is a gap of its own) - though a hit there cannot equal its cold decode until the card's
+    # prefill makes each row as the step does; its fp32 sub-path is a gap of its own; the families the host does not
+    # serve keep the host's reasons there
+    for key in ("cuda-graph", "cuda-split", "cuda-kvhost"):
+        for kind in (FamilyKind.QWEN3, FamilyKind.PHI3, FamilyKind.GEMMA3):
+            own = manifest.subpath_gap(kind, spec.Storage.SAFE_BF16, spec.SUBPATH[key])
+            assert by.get((kind, key)) is (own or manifest.Missing.PREFIX_INVARIANCE), (kind, key, by.get((kind, key)))
+        assert by[(FamilyKind.QWEN3_5, key)] in (
+            manifest.Missing.PREFIX_SNAPSHOT,
+            manifest.subpath_gap(FamilyKind.QWEN3_5, spec.Storage.SAFE_BF16, spec.SUBPATH[key]),
+        )
+        assert by[(FamilyKind.GPT_OSS, key)] in (
+            manifest.Missing.PREFIX_FAMILY,
+            manifest.subpath_gap(FamilyKind.GPT_OSS, spec.Storage.SAFE_BF16, spec.SUBPATH[key]),
+        )
+    assert by[(FamilyKind.QWEN3, "cuda-torch")] is manifest.Missing.PREFIX_WIDE
+    for (kind, key), why in by.items():
         dev = spec.SUBPATH[key]
         own = manifest.subpath_gap(kind, spec.Storage.SAFE_BF16, dev)
-        if own is not None or dev.hardware is not spec.Hardware.CPU:
+        if own is not None or dev.hardware is spec.Hardware.MLX:
             assert why is (own or manifest.Missing.PREFIX_CACHE), (kind, key, why)
     ran = {i for i in manifest.runnable_ids() if i.startswith(f"{spec.Surface.PREFIX.value}/")}
-    want = {k for k in served if spec.paged(k, spec.Hardware.CPU)}
-    assert ran == {manifest.stem_id(spec.Surface.PREFIX, spec.FIXTURE_STEM[k], "cpu") for k in want}
+    want = {
+        manifest.stem_id(spec.Surface.PREFIX, spec.FIXTURE_STEM[k], key)
+        for k in served
+        for key in spec.SURFACE_SUBPATHS[spec.Surface.PREFIX]
+        if manifest.prefix_gap(k, spec.SUBPATH[key]) is None
+    }
+    assert ran == want
+    assert manifest.stem_id(spec.Surface.PREFIX, spec.FIXTURE_STEM[FamilyKind.QWEN3], "cpu") in ran
     missing = {kind for kind, _n, _f in manifest.missing_items()}
-    assert {manifest.Missing.PREFIX_CACHE, manifest.Missing.PREFIX_SNAPSHOT, manifest.Missing.PREFIX_FAMILY} <= missing
+    assert {
+        manifest.Missing.PREFIX_CACHE,
+        manifest.Missing.PREFIX_SNAPSHOT,
+        manifest.Missing.PREFIX_FAMILY,
+        manifest.Missing.PREFIX_WIDE,
+        manifest.Missing.PREFIX_INVARIANCE,
+    } <= missing
     found = delta.findings()
     assert f"[manifest/prefix-snapshot] prefix/{FamilyKind.QWEN3_5.value}/cpu" in found
     assert not any(f.endswith(f"prefix/{FamilyKind.QWEN3.value}/cpu") for f in found)
+    assert f"[manifest/prefix-invariance] prefix/{FamilyKind.QWEN3.value}/cuda-graph" in found
     assert spec.recurrent(FamilyKind.QWEN3_5) and not spec.recurrent(FamilyKind.QWEN3)
     on = spec.SUBPATH["cpu"]
     assert PassTag.SNAPSHOT_RESUME in spec.SURFACE_TAGS[spec.Surface.PREFIX](FamilyKind.QWEN3_5, on)

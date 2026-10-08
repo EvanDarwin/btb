@@ -470,6 +470,7 @@ class StreamedTextModel(
         self.holdings.own(Stage.STOP, "the cold ring's reader", self._cold_stop)
         self.holdings.own(Stage.RECORD, "the expert profile", self._save_profile)
         self.holdings.own(Stage.MEMORY, "a verify pass's recurrent-state checkpoints", self._drop_spec_state)
+        self.holdings.own(Stage.MEMORY, "the pinned buffers RAM's rows are staged through", self._drop_kv_stage)
         # free-read: the load's log line
         res = torch.cuda.memory_allocated(self.dev) / 2**30 if self.dev.type == DeviceKind.CUDA else 0.0
         n_templates = sum(len(v) for v in self.templates.values())

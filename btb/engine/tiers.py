@@ -642,7 +642,11 @@ class _TiersMixin(_State):
     def _caches_to(self, i: int, dev: str | torch.device, cache: KvCache | None = None) -> None:
         """layer i's rows in every live cache (and `cache`) moved to `dev`, where the layer now runs - an attention
         layer coming to the card under `kv_host` leaves its rows in RAM, where they live whatever the placement (its
-        linear states, small and its own step's, come with it)"""
+        linear states, small and its own step's, come with it). The prefix cache's pages move once for every
+        conversation, to the region where the layer now runs (`PrefixCache.place`)"""
+        pc = self.__dict__.get("_kv")
+        if pc is not None:
+            pc.place(self, i)
         if self._rows_stay(i, dev):
             return
         live: list[KvCache] = list(self.__dict__.get("_live_caches", ()))
@@ -741,9 +745,14 @@ class _TiersMixin(_State):
             return self._drafter_bytes()
         fp32 = self.compute_dtype is not None and self.compute_dtype != torch.bfloat16
         i = int(what.split()[1])
-        # and its rows in every live cache, which follow it onto the card (not under `kv_host`: `_rows_stay`)
+        # and its rows in every live cache, which follow it onto the card (not under `kv_host`: `_rows_stay`) - the
+        # prefix cache's pages' once for every conversation, an arena of the card region's slots
         live = [] if self._rows_stay(i, self.dev) else list(self.__dict__.get("_live_caches", ()))
         rows = sum(_rows_bytes(c, i, self.dev) for c in live)
+        pc = self.__dict__.get("_kv")
+        card = pc.pool.card if pc is not None else None
+        if card is not None and not self._rows_stay(i, self.dev) and self.layer_types[i] != LayerKind.LINEAR:
+            rows += card.layer_bytes()
         return self._layer_bytes(i) * (2 if (fp32 and self.resident_fp32) else 1) + rows
 
     def _realloc_bytes(self) -> int:
@@ -1384,6 +1393,8 @@ def _rows_bytes(cache: Any, i: int, dev: torch.device) -> int:
     if cache is None or i >= len(cache.layers):
         return 0
     cl = cache.layers[i]
+    if getattr(cl, "paged", False):
+        return 0  # the pool's rows, moved once for every conversation and granted there (`KvPool.rehome`)
     if isinstance(cl, CardRowsLayer):
         return 0  # the arena's rows: a fork's layer made of them grants its own buffer (`to_fork`)
     if isinstance(cl, ForkLayer):

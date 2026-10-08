@@ -925,6 +925,202 @@ extern "C" __global__ void __launch_bounds__(256) btb_sandwich_add(bf16* __restr
 #include "btb_gemv_mma.cuh"
 
 // ---------------------------------------------------------------------------------------------------------
+// a prompt chunk's attention: T query rows q [T, Hq, D] at positions n0 .. n0 + T - 1, row t over the cache rows
+// of positions [first, n0 + t] - every row before it and itself, the last `win` under a window - the chunk's own
+// K and V written into the cache before the launch. Tensor cores (bf16 mma.sync m16n8k16, fp32 accumulation): a
+// block takes PF_BM query rows of one head, four warps of 16, and walks the keys in tiles of BN positions from
+// position 0 (a tile's K and V rows loaded once into shared memory for the block's rows), an online softmax
+// across the tiles. A row's bits are fixed by its own keys and the tiles' absolute boundaries alone - not T, not
+// the block it falls in, not the tiles it skips - so a prompt cut into chunks of any size gives the same rows.
+// `tbl` (null: none) maps a position to its cache row, wherever a page put it: the walk is the logical one, the
+// map moves addresses and never a bit, so a paged cache's rows are a contiguous cache's. Head g's row r at
+// g * hs + r * rs, as the decode kernels read it (either layout).
+// ---------------------------------------------------------------------------------------------------------
+#define PF_BM 64
+#define PF_WARPS 4
+
+// a tile's key rows: 64 positions, 32 at the widest head (its rows' registers)
+template <int D>
+struct PfTile {
+    static constexpr int BN = D >= 256 ? 32 : 64;
+};
+
+__device__ __forceinline__ unsigned pf_pack(float a, float b) {
+    const __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
+    return *reinterpret_cast<const unsigned*>(&v);
+}
+
+// four 8x8 bf16 matrices out of shared memory, each transposed into a lane's mma B fragment: lane i supplies the
+// address of row i & 7 of matrix i >> 3
+__device__ __forceinline__ void pf_ldsm_t4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, const bf16* p) {
+    const unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                 : "r"(a));
+}
+
+template <int D>
+__device__ __forceinline__ void attn_prefill(const bf16* __restrict__ q, const bf16* __restrict__ K,
+                                             const bf16* __restrict__ V, bf16* __restrict__ out, int n0, int T,
+                                             int Hq, int Hk, int hs, int rs, float scale, int win,
+                                             const int* __restrict__ tbl) {
+    constexpr int BN = PfTile<D>::BN;
+    constexpr int KT = D / 16;    // the dot product's k-tiles
+    constexpr int NT = BN / 8;    // a key tile's score n-tiles
+    constexpr int OT = D / 8;     // the output's n-tiles
+    constexpr int SROW = D + 8;   // a key row in shared memory, padded so a fragment's rows fall in distinct banks
+    constexpr int CH = D / 8;     // 16-byte chunks a row
+    __shared__ __align__(16) bf16 sK[BN * SROW];
+    __shared__ __align__(16) bf16 sV[BN * SROW];
+    const int h = blockIdx.y, g = h / (Hq / Hk);
+    const int t0 = blockIdx.x * PF_BM;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
+    const int r0 = t0 + warp * 16;  // the warp's first row
+    // the warp's rows' q as mma A fragments: rows gid and gid + 8, k pairs tig * 2 and tig * 2 + 8 of each k-tile
+    unsigned qa[KT][4];
+#pragma unroll
+    for (int kt = 0; kt < KT; ++kt) {
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int row = r0 + gid + (u & 1) * 8;
+            const int col = kt * 16 + tig * 2 + (u >> 1) * 8;
+            qa[kt][u] = row < T ? *reinterpret_cast<const unsigned*>(q + ((size_t)row * Hq + h) * D + col) : 0u;
+        }
+    }
+    // the lane's two rows' positions, their running max and sum, and their output
+    const int pos[2] = {n0 + r0 + gid, n0 + r0 + gid + 8};
+    float m[2] = {NEG_INF, NEG_INF}, l[2] = {0.f, 0.f};
+    float o[OT][4];
+#pragma unroll
+    for (int ot = 0; ot < OT; ++ot) o[ot][0] = o[ot][1] = o[ot][2] = o[ot][3] = 0.f;
+    // the block's keys: the first row's window start through the last live row's own position
+    const int hi = n0 + min(t0 + PF_BM, T);
+    const int lo = win > 0 ? max(n0 + t0 + 1 - win, 0) : 0;
+    // the warp's rows' span: a tile past its last row, or before its first row's window, it skips (all masked)
+    const int w_hi = n0 + min(r0 + 16, T);
+    const int w_lo = win > 0 ? n0 + r0 + 1 - win : 0;
+    const bf16* Kg = K + (size_t)g * hs;
+    const bf16* Vg = V + (size_t)g * hs;
+    for (int j0 = lo / BN * BN; j0 < hi; j0 += BN) {
+        __syncthreads();  // the tile before is consumed
+        for (int c = threadIdx.x; c < BN * CH; c += PF_WARPS * 32) {
+            const int r = c / CH, ch = c % CH;
+            const int j = j0 + r;
+            uint4 kv = make_uint4(0u, 0u, 0u, 0u), vv = make_uint4(0u, 0u, 0u, 0u);
+            if (j < hi) {
+                const size_t slot = (size_t)(tbl != nullptr ? tbl[j] : j);
+                kv = *reinterpret_cast<const uint4*>(Kg + slot * rs + ch * 8);
+                vv = *reinterpret_cast<const uint4*>(Vg + slot * rs + ch * 8);
+            }
+            *reinterpret_cast<uint4*>(sK + r * SROW + ch * 8) = kv;
+            *reinterpret_cast<uint4*>(sV + r * SROW + ch * 8) = vv;
+        }
+        __syncthreads();
+        if (j0 >= w_hi || j0 + BN <= w_lo || r0 >= T) continue;  // every score of the warp's rows masked here
+        // scores: q . k over the tile's keys, n-tile nt holding keys nt * 8 + tig * 2 (+1) of rows gid, gid + 8
+        float s[NT][4];
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.f;
+#pragma unroll
+        for (int kt = 0; kt < KT; ++kt) {
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+                const bf16* kp = sK + (nt * 8 + gid) * SROW + kt * 16 + tig * 2;
+                const unsigned b0 = *reinterpret_cast<const unsigned*>(kp);
+                const unsigned b1 = *reinterpret_cast<const unsigned*>(kp + 8);
+                btb_mma16816(s[nt][0], s[nt][1], s[nt][2], s[nt][3], qa[kt][0], qa[kt][1], qa[kt][2], qa[kt][3], b0,
+                             b1);
+            }
+        }
+        // scaled, the keys a row does not see masked: after its own position, before its window, past the chunk
+        float mx[2] = {m[0], m[1]};
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int j = j0 + nt * 8 + tig * 2 + (e & 1);
+                const int p = pos[e >> 1];
+                const bool ok = j <= p && j < hi && (win <= 0 || j > p - win);
+                s[nt][e] = ok ? s[nt][e] * scale : NEG_INF;
+                mx[e >> 1] = fmaxf(mx[e >> 1], s[nt][e]);
+            }
+        }
+        // the rows' new max over the quad holding them, the old state rescaled to it, the tile's weights
+        float sum[2] = {0.f, 0.f}, corr[2];
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 1));
+            mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 2));
+            corr[r] = mx[r] == NEG_INF ? 1.f : expf(m[r] - mx[r]);
+        }
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int r = e >> 1;
+                const float p = mx[r] == NEG_INF ? 0.f : expf(s[nt][e] - mx[r]);
+                s[nt][e] = p;
+                sum[r] += p;
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            sum[r] += __shfl_xor_sync(0xffffffffu, sum[r], 1);
+            sum[r] += __shfl_xor_sync(0xffffffffu, sum[r], 2);
+            l[r] = l[r] * corr[r] + sum[r];
+            m[r] = mx[r];
+        }
+#pragma unroll
+        for (int ot = 0; ot < OT; ++ot) {
+            o[ot][0] *= corr[0];
+            o[ot][1] *= corr[0];
+            o[ot][2] *= corr[1];
+            o[ot][3] *= corr[1];
+        }
+        // the weights times V: a k-tile of 16 keys a step, the weights in bf16 as the A fragments, V transposed out
+        // of shared memory as the B fragments, two output n-tiles a load
+#pragma unroll
+        for (int kk = 0; kk < BN / 16; ++kk) {
+            const unsigned a0 = pf_pack(s[2 * kk][0], s[2 * kk][1]);
+            const unsigned a1 = pf_pack(s[2 * kk][2], s[2 * kk][3]);
+            const unsigned a2 = pf_pack(s[2 * kk + 1][0], s[2 * kk + 1][1]);
+            const unsigned a3 = pf_pack(s[2 * kk + 1][2], s[2 * kk + 1][3]);
+            const int vr = kk * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
+#pragma unroll
+            for (int ot = 0; ot < OT; ot += 2) {
+                unsigned b0, b1, b2, b3;
+                pf_ldsm_t4(b0, b1, b2, b3, sV + vr * SROW + ot * 8 + (lane >> 4) * 8);
+                btb_mma16816(o[ot][0], o[ot][1], o[ot][2], o[ot][3], a0, a1, a2, a3, b0, b1);
+                btb_mma16816(o[ot + 1][0], o[ot + 1][1], o[ot + 1][2], o[ot + 1][3], a0, a1, a2, a3, b2, b3);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        const int row = r0 + gid + r * 8;
+        if (row >= T) continue;
+        const float inv = 1.f / l[r];
+        bf16* op = out + ((size_t)row * Hq + h) * D + tig * 2;
+#pragma unroll
+        for (int ot = 0; ot < OT; ++ot) {
+            *reinterpret_cast<__nv_bfloat162*>(op + ot * 8) =
+                __floats2bfloat162_rn(o[ot][2 * r] * inv, o[ot][2 * r + 1] * inv);
+        }
+    }
+}
+
+#define ATTN_PREFILL_K(D)                                                                                    \
+    extern "C" __global__ void __launch_bounds__(PF_WARPS * 32) btb_attn_prefill_d##D(                       \
+        const bf16* __restrict__ q, const bf16* __restrict__ K, const bf16* __restrict__ V,                  \
+        bf16* __restrict__ out, int n0, int T, int Hq, int Hk, int hs, int rs, float scale, int win,          \
+        const int* __restrict__ tbl) {                                                                       \
+        attn_prefill<D>(q, K, V, out, n0, T, Hq, Hk, hs, rs, scale, win, tbl);                              \
+    }
+ATTN_PREFILL_K(64)
+ATTN_PREFILL_K(128)
+ATTN_PREFILL_K(256)
+
+// ---------------------------------------------------------------------------------------------------------
 // the step's handoff to the host: the token and the cache's length written straight into pinned host memory
 // (device-addressable under unified addressing) by one thread of one block - a kernel node at the graph's
 // end, where a memcpy node was its own submission. The token lands first, with the card's clock at the step's end

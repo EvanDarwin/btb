@@ -449,6 +449,44 @@ def test_cuda_attn_gqa(benchmark: object, n: int, T: int, how: str) -> None:
 
 
 @cuda_only
+@pytest.mark.benchmark(min_rounds=10, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("how", ["prefill", "sdpa"])
+@pytest.mark.parametrize("n", [0, 4096, 16384])  # the rows before the chunk
+@pytest.mark.parametrize("T", [512, 4096])  # the chunk's rows
+def test_cuda_attn_prefill(benchmark: object, T: int, n: int, how: str) -> None:
+    """a prompt chunk's attention at Qwen3-0.6B's heads (16 q, 8 kv, d 128): `btb_attn_prefill_d128` - each row over
+    the rows before it and itself, on tensor cores, through a row map where a cache is paged - against torch's sdpa
+    over the same rows with the causal mask the chunk takes, the module's attention a contiguous cache's prefill
+    took. The rate is the attention's multiply-adds over the time (`tflops`)."""
+    k = _cuda_kernels()
+    if "btb_attn_prefill_d128" not in k.fn:
+        pytest.skip("the prefill attention is not in this build")
+    Hq, Hk, D = 16, 8, 128
+    K = torch.randn(Hk, n + T, D, dtype=torch.bfloat16, device="cuda")
+    V = torch.randn(Hk, n + T, D, dtype=torch.bfloat16, device="cuda")
+    q = torch.randn(T, Hq, D, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty(T, Hq, D, dtype=torch.bfloat16, device="cuda")
+    P, I, Fl = k.ptr, ctypes.c_int, ctypes.c_float
+    args = [P(q), P(K), P(V), P(out), I(n), I(T), I(Hq), I(Hk), I(K.stride(0)), I(K.stride(1)), Fl(D**-0.5)]
+    args += [I(0), P(None)]
+    qs = q.transpose(0, 1)[None]  # [1, Hq, T, D], the module's layout
+    mask = torch.ones(T, n + T, dtype=torch.bool, device="cuda").tril(diagonal=n)
+
+    def run() -> None:
+        if how == "prefill":
+            k.launch("btb_attn_prefill_d128", ((T + 63) // 64, Hq, 1), (128, 1, 1), args)
+        else:
+            F.scaled_dot_product_attention(qs, K[None], V[None], attn_mask=mask, enable_gqa=True, scale=D**-0.5)
+        torch.cuda.synchronize()
+
+    benchmark.group = f"cuda-attn-prefill-t{T}-n{n}"  # type: ignore[attr-defined]
+    benchmark(run)  # type: ignore[operator]
+    mean = float(benchmark.stats.stats.mean)  # type: ignore[attr-defined]
+    macs = Hq * D * 2 * sum(n + t + 1 for t in range(T))  # q.k and p.v, the causal half
+    benchmark.extra_info["tflops"] = round(2 * macs / mean / 1e12, 1)  # type: ignore[attr-defined]
+
+
+@cuda_only
 @pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
 @pytest.mark.parametrize("how", ["rows", "per-row"])
 @pytest.mark.parametrize("n", [512, 4096])  # the shared prefix the rows attend over

@@ -111,7 +111,7 @@ def _cache_bytes(cache: KvCache | None) -> int:
     pool of pages holds"""
     assert cache is not None
     if getattr(cache, "paged", False):
-        return cast("PagedCache", cache).prefix.pool.nbytes()
+        return sum(cast("PagedCache", cache).prefix.pool.nbytes().values())
     n = 0
     for cl in cache.layers:
         if isinstance(cl, GrowLayer) and cl._buf is not None:

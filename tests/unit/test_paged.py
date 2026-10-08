@@ -3,7 +3,9 @@
 order through its map whatever pages they lie in; a prefix two caches share is the same rows, held once and never
 rewritten; a crop takes back only what no one else reads; a verify's accepted path moved into place; the pool grown a
 buffer at a time as the ledger grants, the tree's conversations let go first where it refuses; a table let go or
-collected gives its pages back. Model-free: a config and random rows."""
+collected gives its pages back. The card's region: the bound conversation's pages in its slots and every other parked,
+its map uploaded only where it moved, a layer's rows following it between the regions - run here over arenas on the
+host, the card's own layout. Model-free: a config and random rows."""
 
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ import torch
 from transformers import Qwen3Config
 
 from btb.engine.kvpool import PAGE
-from btb.engine.paged import HostPool, PagedCache, PagedError, PagedLayer, Table
+from btb.engine.paged import CardRegion, HostRegion, KvPool, PagedCache, PagedError, PagedKV, PagedLayer, Table
 from btb.engine.prefix import PrefixCache
 from btb.engine.scheduler import MemoryGrantError
 from btb.kinds import LayerKind
@@ -26,8 +28,9 @@ HK, D, L = 2, 8, 3
 ROW = HK * PAGE * D * 4  # one page of one float32 buffer (a layer's K, or its V)
 
 
-def prefix(grant: Callable[..., None] | None = None) -> PrefixCache:
-    """a prefix cache over L full-attention layers of HK heads of D, its growth asked of `grant`"""
+def prefix(grant: Callable[..., None] | None = None, card: tuple[int, ...] = ()) -> PrefixCache:
+    """a prefix cache over L full-attention layers of HK heads of D, its growth asked of `grant`; the layers `card`
+    in a card region whose arenas lie on the host (the card's layout and bookkeeping, no card needed)"""
     cfg = Qwen3Config(
         num_hidden_layers=L,
         num_attention_heads=2 * HK,
@@ -39,11 +42,24 @@ def prefix(grant: Callable[..., None] | None = None) -> PrefixCache:
     )
     sm = SimpleNamespace(
         cfg=cfg,
+        dev=torch.device("cpu"),
+        resident={},
         layer_types=[LayerKind.FULL] * L,
         host_kv_dtype=lambda: torch.float32,
         scheduler=SimpleNamespace(grant=grant) if grant is not None else None,
     )
-    return PrefixCache(cast(Any, sm))
+    pc = PrefixCache(cast(Any, sm))
+    if card:
+        pool = pc.pool
+        for i in card:
+            pool.host.drop(i)
+        pool.card = CardRegion(card, HK, D, torch.device("cpu"), grant, PAGE, pool.pages.lock)
+    return pc
+
+
+def bf(t: torch.Tensor) -> torch.Tensor:
+    """rows as the card's arenas keep them: bf16"""
+    return t.to(torch.bfloat16)
 
 
 def rows(T: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -86,7 +102,7 @@ def test_rows_go_in_through_the_table_and_come_back_in_order() -> None:
 def test_a_fresh_layers_first_rows_serve_a_module_as_they_came() -> None:
     """a module's first write to a fresh layer gets its rows back in the pool's dtype (a contiguous layer's own),
     kept there; rows of another shape are refused"""
-    pool = HostPool([0], HK, D, dtype=torch.bfloat16)
+    pool = KvPool([0], HK, D, dtype=torch.bfloat16)
     layer = PagedLayer(Table(pool), pool, 0)
     k, v = rows(3, 3)
     gk, gv = layer.update(k, v)
@@ -140,7 +156,7 @@ def test_a_crop_takes_back_only_rows_no_one_else_reads() -> None:
     assert len(pc.pool.pages) == 3, "a crop let rows the tree reads be written again"
     m = pc.tree.match(list(range(95)))
     assert m.length == 95
-    assert torch.equal(pc.pool.k[0][:, torch.tensor(m.rows)][None], torch.cat([k[..., :90, :], k2], -2))
+    assert torch.equal(pc.pool.host.k[0][:, torch.tensor(m.rows)][None], torch.cat([k[..., :90, :], k2], -2))
     a.crop(-3)  # transformers' crop, from the end: the table cut with the layers
     assert a.get_seq_length() == len(a.table) == 92
     assert not pc.pool.pages.check()
@@ -201,16 +217,16 @@ def test_the_pool_grows_a_buffer_at_a_time_and_lets_the_tree_go_when_refused() -
 
     pc = prefix(grant)
     a = pc.new()
-    first = HostPool.MIN_PAGES
-    assert a.growth(1) == 2 * L * first * ROW, "a first growth takes what the regions then hold"
+    first = HostRegion.MIN_PAGES
+    assert a.growth(1) == {"cpu": 2 * L * first * ROW}, "a first growth takes what the regions then hold"
     write(a, *rows(1, 17))
-    assert asked == [(first * ROW, 0)] * (2 * L) and pc.pool.cap == first
-    assert pc.pool.nbytes() == 2 * L * first * ROW
+    assert asked == [(first * ROW, 0)] * (2 * L) and pc.pool.host.cap == first
+    assert pc.pool.nbytes() == {"cpu": 2 * L * first * ROW}
     room = (PAGE - 1) + (first - 1) * PAGE
-    new = int(first * HostPool.GROW)
-    assert a.table.pages_for(room) == first - 1 and a.growth(room) == 0
+    new = int(first * HostRegion.GROW)
+    assert a.table.pages_for(room) == first - 1 and a.growth(room) == {}
     # what the regions add, and one buffer held while its replacement fills
-    assert a.growth(room + 1) == 2 * L * (new - first) * ROW + first * ROW
+    assert a.growth(room + 1) == {"cpu": 2 * L * (new - first) * ROW + first * ROW}
     write(a, *rows(room, 18))
     assert len(asked) == 2 * L, "a growth was asked where the pool held the rows"
     a.commit(list(range(a.get_seq_length())))
@@ -219,7 +235,7 @@ def test_the_pool_grows_a_buffer_at_a_time_and_lets_the_tree_go_when_refused() -
     refuse[0] = True
     b = pc.new()
     write(b, *rows(PAGE + 1, 19))
-    assert len(asked) == 2 * L + 1 and pc.pool.cap == first
+    assert len(asked) == 2 * L + 1 and pc.pool.host.cap == first
     assert not list(pc.tree.nodes()) and len(pc.pool.pages) == 2 and not pc.pool.pages.check()
     with pytest.raises(MemoryGrantError):
         write(b, *rows(first * PAGE, 20))
@@ -237,7 +253,7 @@ def test_room_before_a_pass_is_made_of_the_trees_conversations_only_where_growth
         olds.append(c)
     for c in olds:
         c.release()
-    assert len(pc.pool.pages) == 15 and pc.pool.cap == HostPool.MIN_PAGES
+    assert len(pc.pool.pages) == 15 and pc.pool.host.cap == HostRegion.MIN_PAGES
     pc.tree.match([100])  # the second conversation used last
     b = pc.new()
     need = PAGE * 6  # one free page past the 15 the tree holds: five more wanted
@@ -246,14 +262,112 @@ def test_room_before_a_pass_is_made_of_the_trees_conversations_only_where_growth
     pc.room(b, need, lambda: 0)
     left = {n.key[0] for n in pc.tree.nodes()}
     assert left == {100, 200}, f"not the least recently used went first: {left}"
-    assert b.growth(need) == 0
+    assert b.growth(need) == {}
 
 
 def test_a_closed_prefix_cache_holds_nothing() -> None:
-    pc = prefix()
-    c = pc.new()
+    """closed, the cache holds nothing; a conversation outliving it lets its pages go after with nothing left to free
+    on the card (a session collected after its engine closed)"""
+    pc = prefix(card=(0,))
+    c, late = pc.new(), pc.new()
     write(c, *rows(10, 30))
+    write(late, *rows(70, 31))
     c.commit(list(range(10)))
     c.release()
     pc.close()
-    assert not list(pc.tree.nodes()) and len(pc.pool.pages) == 0 and not pc.pool.k and pc.pool.cap == 0
+    assert not list(pc.tree.nodes()) and len(pc.pool.pages) == 2 and not pc.pool.host.k and pc.pool.host.cap == 0
+    late.release()
+    assert len(pc.pool.pages) == 0 and all(p.slot < 0 and p.park < 0 for p in pc.pool.pages.pages)
+
+
+def card_rows(c: PagedCache, i: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """layer i's rows of `c` read as the card's kernels read them: its arena's rows at the card's map of the table
+    (the conversation bound first), [1, Hk, n, D]"""
+    card = c.prefix.pool.card
+    assert card is not None
+    tbl = card.bind(c.table)[: len(c.table)].long()
+    k, v = card.view(i)
+    return k[:, :, tbl], v[:, :, tbl]
+
+
+def test_the_card_holds_the_bound_conversations_pages_and_parks_the_rest() -> None:
+    """the card runs layers 0 and 1, the host layer 2: a conversation's rows of the card's layers go into its slots,
+    read back through the card's map as written; another conversation bound parks the first one's own pages - a
+    prefix the two share stays - and the first bound again brings them back, every row as it was, the map made again"""
+    pc = prefix(card=(0, 1))
+    card = pc.pool.card
+    assert card is not None and card.layers == [0, 1] and pc.pool.host.layers == [2]
+    a = pc.new()
+    k, v = rows(2 * PAGE + 5, 40)
+    write(a, k, v)
+    a.commit(list(range(2 * PAGE + 5)))
+    assert len(card.slots) >= 3 and not card.parked, "a's pages on the card, none parked"
+    for i in (0, 1):
+        assert torch.equal(read(a, i)[0], bf(k + i)) and torch.equal(read(a, i)[1], bf(v - i))
+        ck, cv = card_rows(a, i)
+        assert torch.equal(ck, bf(k + i)) and torch.equal(cv, bf(v - i))
+    assert torch.equal(read(a, 2)[0], k + 2), "the host's layer in the host's region, as written"
+    m = pc.tree.match(list(range(PAGE + 3)))
+    b = pc.new(m.rows)  # b shares a's first page whole and three rows of its second
+    k2, v2 = rows(10, 41)
+    ver = card.version
+    write(b, k2, v2)  # b's first card layer's rows bind b
+    parked = {p.id for p in pc.pool.pages.pages if p.park >= 0}
+    assert parked == {2}, f"a's own third page parked, the two it shares with b kept: {parked}"
+    assert card.version > ver
+    for i in (0, 1):
+        ck, _ = card_rows(b, i)
+        assert torch.equal(ck, bf(torch.cat([k[..., : PAGE + 3, :], k2], -2) + i))
+        assert torch.equal(read(a, i)[0], bf(k + i)), "a's rows read back from the park"
+    for i in (0, 1):
+        ck, cv = card_rows(a, i)
+        assert torch.equal(ck, bf(k + i)) and torch.equal(cv, bf(v - i)), "a's rows brought back as they were"
+    assert all(p.park < 0 for p in a.table.held.values())
+    assert not pc.pool.pages.check()
+
+
+def test_the_cards_map_uploads_only_the_positions_that_moved() -> None:
+    """while a table stays bound, an append uploads its new positions alone, a crop then the positions written again;
+    a card layer's module past its first rows is handed the rows through the map (`PagedKV`), never a buffer"""
+    pc = prefix(card=(0, 1, 2))
+    card = pc.pool.card
+    assert card is not None
+    a = pc.new()
+    write(a, *rows(5, 42))
+    tbl = card.bind(a.table)
+    assert a.table.low == len(a.table) == 5
+    tbl[:5] = -7  # stale entries the next upload must leave alone
+    write(a, *rows(3, 43))
+    assert tbl[:5].tolist() == [-7] * 5 and tbl[5:8].tolist() == card.rows(a.table.rows()[5:8]).tolist()
+    a.crop_to(6)
+    write(a, *rows(2, 44))
+    assert tbl[:5].tolist() == [-7] * 5 and tbl[6:8].tolist() == card.rows(a.table.rows()[6:8]).tolist()
+    layer = cast(PagedLayer, a.layers[1])
+    kv, kv2 = layer.update(*rows(1, 45))
+    assert isinstance(kv, PagedKV) and kv is kv2 and (kv.n0, kv.T) == (8, 1)
+
+
+def test_a_layer_moving_between_the_regions_takes_every_conversations_rows() -> None:
+    """a layer shed to the host takes every conversation's rows of it - the bound one's from the card, a parked one's
+    from the park - into the host's region, and back onto the card when it regrows: the same rows, read the same"""
+    pc = prefix(card=(0, 1))
+    card = pc.pool.card
+    assert card is not None
+    a, b = pc.new(), pc.new()
+    ka, va = rows(PAGE + 7, 46)
+    kb, vb = rows(20, 47)
+    write(a, ka, va)
+    write(b, kb, vb)
+    card.bind(b.table)  # a's pages parked
+    assert any(p.park >= 0 for p in a.table.held.values())
+    pc.pool.rehome(1, card=False)
+    assert card.layers == [0] and 1 in pc.pool.host.layers and not pc.pool.on_card(1)
+    for c, k, v in ((a, ka, va), (b, kb, vb)):
+        got = read(c, 1)
+        assert torch.equal(got[0], bf(k + 1).float()) and torch.equal(got[1], bf(v - 1).float())
+    write(b, *rows(2, 48))  # the shed layer's new rows into the host's region
+    pc.pool.rehome(1, card=True)
+    assert card.layers == [0, 1] and 1 not in pc.pool.host.layers
+    for c, k in ((a, ka), (b, kb)):
+        assert torch.equal(read(c, 1)[0][..., : k.shape[-2], :], bf(k + 1))
+    assert torch.equal(card_rows(a, 1)[0], bf(ka + 1))

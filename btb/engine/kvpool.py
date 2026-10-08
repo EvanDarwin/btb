@@ -29,7 +29,8 @@ class PoolError(RuntimeError):
 @dataclass(eq=False)
 class Page:
     """one page's bookkeeping: its holders, the rows written and frozen, its writer, where it lives, when it was last
-    used (the pool's clock)"""
+    used (the pool's clock), and on a card where the rows of the layers the card runs sit - the card's slot for it,
+    or the park's in pinned RAM (-1: none)"""
 
     id: int
     refs: int = 0
@@ -38,18 +39,27 @@ class Page:
     writer: object | None = None
     where: str = "host"
     tick: int = 0
+    slot: int = -1
+    park: int = -1
 
 
 class PagePool:
     """Pages handed out and taken back. `alloc()` gives a free page (one holder: the caller) or, with none free, asks
     `grow(pages)` - the ledger's grant for the storage of `pages` pages in all - before it adds one; a grow that
-    raises leaves the pool as it was. `ref`/`unref` count holders; the last `unref` frees the page."""
+    raises leaves the pool as it was. `ref`/`unref` count holders; the last `unref` frees the page, and tells `freed`
+    (the regions holding a page somewhere of their own let that go)."""
 
-    def __init__(self, grow: Callable[[int], None] | None = None, rows: int = PAGE) -> None:
+    def __init__(
+        self,
+        grow: Callable[[int], None] | None = None,
+        rows: int = PAGE,
+        freed: Callable[[Page], None] | None = None,
+    ) -> None:
         self.rows = int(rows)
         self.pages: list[Page] = []
         self.free: list[int] = []
         self._grow = grow
+        self._freed = freed
         self.clock = 0
         # a conversation's table can be let go from another thread (its session collected there): the counts and
         # the free list change under this, whoever changes them
@@ -95,6 +105,8 @@ class PagePool:
                 return False
             p.fill = p.frozen = 0
             p.writer = None
+            if self._freed is not None:
+                self._freed(p)
             self.free.append(p.id)
             return True
 

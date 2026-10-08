@@ -964,6 +964,10 @@ class _Cuda:
         "btb_norm_rope_kv_tbl_d64",
         "btb_norm_rope_kv_tbl_d128",
         "btb_norm_rope_kv_tbl_d256",
+        # a prompt chunk's attention on tensor cores, a row over every key before it, through a row map or none
+        "btb_attn_prefill_d64",
+        "btb_attn_prefill_d128",
+        "btb_attn_prefill_d256",
         "btb_add_rmsnorm",
         "btb_sandwich_add",
         "btb_silu_mul",

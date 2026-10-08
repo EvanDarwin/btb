@@ -519,6 +519,14 @@ class _State:
     def ai(self, layer: Any, i: int, h: torch.Tensor, pe: Any, text_pos: Any, cache: Any) -> torch.Tensor:
         raise NotImplementedError
 
+    @staticmethod
+    def _span_lists(paged: Any, base: int, T: int, win: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        raise NotImplementedError
+
+    @staticmethod
+    def _node_lists(paged: Any, base: int, T: int, parents: Parents, win: int) -> tuple[torch.Tensor, torch.Tensor]:
+        raise NotImplementedError
+
     # -- mlx_forward.py --
     def _bind_mlx_resident(self, layer: Any, checkpoint: bool = True) -> Any:
         raise NotImplementedError

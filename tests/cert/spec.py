@@ -374,19 +374,30 @@ def storage_tag(storage: Storage, hw: Hardware) -> PassTag | None:
     return PassTag.FP8_ASSTORED if hw is Hardware.CPU else PassTag.FP8_WIDENED
 
 
-def paged(kind: FamilyKind, hw: Hardware) -> bool:
-    """whether the prefix cache serves the family on this hardware - its attention reading every one-sequence cache
-    through the pages - by the engine's own rule (`PrefixCache.why_not`), in its order: the host's tier alone so far,
-    and there not a hybrid's recurrent layers, a family's own layer (Qwen4) or its own attention module (gpt-oss)"""
+# the head widths the card's paged attention kernels are built for (btb/engine/prefix.py CARD_HEAD_DIMS)
+CARD_HEAD_DIMS = (64, 128, 256)
+
+
+def paged(kind: FamilyKind, hw: Hardware, knobs: dict[str, object] | None = None) -> bool:
+    """whether the prefix cache serves the family on this hardware and with these load options - its attention
+    reading every one-sequence cache through the pages - by the engine's own rule (`PrefixCache.why_not`), in its
+    order: the host's tier and the card's, not MLX's yet; not a hybrid's recurrent layers, a family's own layer
+    (Qwen4) or its own attention module (gpt-oss); on the card, heads its kernels take and bf16 compute (`fp32` keeps
+    the card's layers wider than its kernels read)"""
     fl = core.flags(kind)
-    return hw is Hardware.CPU and not recurrent(kind) and Cap.OWN not in fl and Cap.FAST in fl
+    if hw is Hardware.CUDA:
+        hd = head_dim(kind)
+        tier = not (knobs or {}).get("fp32") and (hd is None or hd in CARD_HEAD_DIMS)
+    else:
+        tier = hw is Hardware.CPU
+    return tier and not recurrent(kind) and Cap.OWN not in fl and Cap.FAST in fl
 
 
-def kv_tag(kind: FamilyKind, hw: Hardware) -> PassTag:
+def kv_tag(kind: FamilyKind, hw: Hardware, knobs: dict[str, object] | None = None) -> PassTag:
     """the reader a cell's attention must take its cache rows through: the engine's pool of pages where the prefix
     cache serves the family there (`paged`), else each conversation's own contiguous buffers - the line that flips
     per tier as each lands, so a receipt banked on the old reader stops proving the cell"""
-    return PassTag.KV_PAGED if paged(kind, hw) else PassTag.KV_CONTIGUOUS
+    return PassTag.KV_PAGED if paged(kind, hw, knobs) else PassTag.KV_CONTIGUOUS
 
 
 def expert_tag(kind: FamilyKind, storage: Storage) -> PassTag | None:
@@ -436,7 +447,7 @@ class DeviceSubpath:
         (`storage_tag`), and the form a MoE family's experts take there (`expert_tag`)."""
         extra = (residency_tag(kind, self.knobs), storage_tag(storage, self.hardware), expert_tag(kind, storage))
         return frozenset(
-            {self.expect(kind, storage), kv_tag(kind, self.hardware), *(t for t in extra if t is not None)}
+            {self.expect(kind, storage), kv_tag(kind, self.hardware, self.knobs), *(t for t in extra if t is not None)}
         )
 
 
@@ -663,6 +674,10 @@ def prefix_tags(kind: FamilyKind, dev: DeviceSubpath) -> frozenset[PassTag]:
     out = {PassTag.PREFIX_HIT, PassTag.PREFIX_MISS, PassTag.KV_PAGED, PassTag.PREFIX_SHARED}
     if recurrent(kind):
         out.add(PassTag.SNAPSHOT_RESUME)
+    if dev.hardware is Hardware.CUDA and not dev.knobs.get("kv_host"):
+        # the card runs layers whose rows it holds: the request between the turns parks the conversation's pages in
+        # RAM, and its next turn brings them back
+        out.add(PassTag.KV_PARK)
     return frozenset(out)
 
 

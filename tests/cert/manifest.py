@@ -90,6 +90,8 @@ class Missing(StrEnum):
     PREFIX_CACHE = "prefix-cache"
     PREFIX_SNAPSHOT = "prefix-snapshot"
     PREFIX_FAMILY = "prefix-family"
+    PREFIX_WIDE = "prefix-wide"
+    PREFIX_INVARIANCE = "prefix-invariance"
 
 
 # kind -> (what is missing, how to close it), both a full sentence. This is the single natural-language source
@@ -217,9 +219,25 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "conversation's cache each and drop it whole for a prompt that shares nothing with it, so a conversation's "
         "next turn after another request is prefilled again from its first token, and a prefix two conversations "
         "share is computed and held once each",
-        "land the paged prefix cache on this tier - the card's graphs and kernels through the row map (plan phase "
-        "P2), MLX's per-op kernels and megakernel over one pool buffer (P8) - then take the tier out of `why_not` and "
-        "spec.paged; the runner's prefix cells run there",
+        "land the paged prefix cache on this tier - MLX's per-op kernels and megakernel over one pool buffer (plan "
+        "phase P8) - then take the tier out of `why_not` and spec.paged; the runner's prefix cells run there",
+    ),
+    Missing.PREFIX_WIDE: (
+        "the card's paged attention kernels read bf16 rows with heads of 64, 128 or 256 dims, and this sub-path's "
+        "card layers compute wider (`fp32`), so the prefix cache does not serve it (btb/engine/prefix.py "
+        "`_card_why_not`): its sessions keep one conversation's cache each",
+        "give btb_attn_prefill_d* and btb_attn_split_tbl_d* float32 variants (native/cuda/btb_kernels.cu) and the "
+        "card's arenas a float32 layout, then take the condition out of `_card_why_not` and spec.paged",
+    ),
+    Missing.PREFIX_INVARIANCE: (
+        "on the card a prompt's rows come out of a prefill with other bits than the decode steps make them with - its "
+        "matmuls, attention, norms and rope are other kernels - so a hit, reading the rows its conversation's steps "
+        "made, parts from the same prompt decoded cold at a bf16 near-tie (tiny_phi3 under kv_host: 0.004 between "
+        "the top two). The hit equals the uninterrupted conversation bit for bit (tests/integration/"
+        "test_prefix_cache.py); it is the cold decode it cannot equal yet",
+        "make the card's prefill compute each row as the step does - a GEMM summing each row in the step's matvec "
+        "order, one attention kernel for both at fixed key splits, the card graph's norm, rope and activation "
+        "kernels - and the host's layers' likewise; then drop the condition from manifest.prefix_gap",
     ),
     Missing.PREFIX_SNAPSHOT: (
         "a hybrid's recurrent layers resume only from a kept snapshot of their state, and none is kept at a message "
@@ -536,15 +554,20 @@ def prefix_gap(kind: FamilyKind, dev: spec.DeviceSubpath) -> Missing | None:
     """why the prefix axis's conversations cannot hold on this family and sub-path, in the order the engine hits
     it: a sub-path that does not engage at all (its own gap), then the engine's own reasons (`PrefixCache.why_not`,
     whose rule `spec.paged` is): a tier the prefix cache is not on yet, a hybrid's snapshots, a family's own
-    attention"""
+    attention, then the card's own conditions (its kernels' widths). Served on the card, a hit cannot equal its cold
+    decode until the card's prefill makes each row as the step does (`PREFIX_INVARIANCE`)"""
     refused = subpath_gap(kind, spec.Storage.SAFE_BF16, dev)
     if refused is not None:
         return refused
-    if spec.paged(kind, dev.hardware):
-        return None
-    if dev.hardware is not spec.Hardware.CPU:
+    if spec.paged(kind, dev.hardware, dev.knobs):
+        return Missing.PREFIX_INVARIANCE if dev.hardware is spec.Hardware.CUDA else None
+    if dev.hardware not in (spec.Hardware.CPU, spec.Hardware.CUDA):
         return Missing.PREFIX_CACHE
-    return Missing.PREFIX_SNAPSHOT if spec.recurrent(kind) else Missing.PREFIX_FAMILY
+    if spec.recurrent(kind):
+        return Missing.PREFIX_SNAPSHOT
+    if spec.paged(kind, spec.Hardware.CPU):
+        return Missing.PREFIX_WIDE  # served on the host, so the card's own conditions refuse it
+    return Missing.PREFIX_FAMILY
 
 
 def shape_gap(surface: spec.Surface, kind: FamilyKind, dev: spec.DeviceSubpath) -> Missing | None:
