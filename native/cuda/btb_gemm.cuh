@@ -49,23 +49,33 @@ extern "C" __global__ void __launch_bounds__(128)
     const int m0 = xt * GM_BM, r0 = wt * GM_BR;
     const int nst = (C + 31) >> 5;
     const int per = (nst + nw - 1) / nw;
+    // a thread's copies: the 16-byte chunk ch of x rows crow + 32 i and w rows crow + 32 i, their row starts found
+    // once (a row past the matrix reads row 0's address, copied as zeros), a super-tile's k added to them
+    const int crow = threadIdx.x >> 2, ch = threadIdx.x & 3;
+    const bf16* xs[GM_BM / 32];
+    bool xok[GM_BM / 32];
+#pragma unroll
+    for (int i = 0; i < GM_BM / 32; ++i) {
+        xok[i] = m0 + crow + 32 * i < T;
+        xs[i] = x + (size_t)(xok[i] ? m0 + crow + 32 * i : 0) * C + ch * 8;
+    }
+    const bf16* ws[GM_BR / 32];
+    bool wok[GM_BR / 32];
+#pragma unroll
+    for (int i = 0; i < GM_BR / 32; ++i) {
+        wok[i] = r0 + crow + 32 * i < R;
+        ws[i] = w + (size_t)(wok[i] ? r0 + crow + 32 * i : 0) * C + ch * 8;
+    }
     // a super-tile's x and w rows into stage buffer b: x 128 rows of 64 bytes, w 64; a chunk past C or a row past
     // the matrix is zeros, as the matvec's zero loads
     auto issue = [&](int st, int b) {
+        const int kk = st << 5;
+        const bool kin = kk + ch * 8 < C;
+        const int ko = kin ? kk : 0;
 #pragma unroll
-        for (int it = 0; it < GM_BM * 4 / 128; ++it) {
-            const int c = it * 128 + threadIdx.x, row = c >> 2, ch = c & 3;
-            const int k = (st << 5) + (ch << 3);
-            const bool ok = m0 + row < T && k < C;
-            cp16(&sx[b][row * 32 + ch * 8], x + (size_t)(ok ? m0 + row : 0) * C + (ok ? k : 0), ok);
-        }
+        for (int i = 0; i < GM_BM / 32; ++i) cp16(&sx[b][(crow + 32 * i) * 32 + ch * 8], xs[i] + ko, xok[i] && kin);
 #pragma unroll
-        for (int it = 0; it < GM_BR * 4 / 128; ++it) {
-            const int c = it * 128 + threadIdx.x, row = c >> 2, ch = c & 3;
-            const int k = (st << 5) + (ch << 3);
-            const bool ok = r0 + row < R && k < C;
-            cp16(&sw[b][row * 32 + ch * 8], w + (size_t)(ok ? r0 + row : 0) * C + (ok ? k : 0), ok);
-        }
+        for (int i = 0; i < GM_BR / 32; ++i) cp16(&sw[b][(crow + 32 * i) * 32 + ch * 8], ws[i] + ko, wok[i] && kin);
         cp_commit();
     };
     float tot[4][4][4], acc[4][4][4];
@@ -81,16 +91,18 @@ extern "C" __global__ void __launch_bounds__(128)
     } else {
         cp_commit();
     }
-    int slice = 0;
+    // the slice ends counted down (a division a super-tile was the loop's costliest arithmetic), the stage buffers
+    // turned round
+    int slice = 0, left = per, b = 0, nb = 2;
     for (int st = 0; st < nst; ++st) {
         cp_wait1();
         __syncthreads();  // super-tile st landed for every thread, and st - 1's buffer is free
         if (st + 2 < nst) {
-            issue(st + 2, (st + 2) % GM_STAGES);
+            issue(st + 2, nb);
         } else {
             cp_commit();
         }
-        const int b = st % GM_STAGES;
+        nb = nb + 1 == GM_STAGES ? 0 : nb + 1;
         uint4 wv[4];
 #pragma unroll
         for (int nt = 0; nt < 4; ++nt)
@@ -99,14 +111,21 @@ extern "C" __global__ void __launch_bounds__(128)
         for (int mt = 0; mt < 4; ++mt) {
             const uint4 xa = *reinterpret_cast<const uint4*>(&sx[b][(wm * 64 + mt * 16 + gid) * 32 + tig * 8]);
             const uint4 xb = *reinterpret_cast<const uint4*>(&sx[b][(wm * 64 + mt * 16 + gid + 8) * 32 + tig * 8]);
+            // the first k-tile across the n-tiles, then the second: an output's two mma stay in order, four
+            // others between them
 #pragma unroll
             for (int nt = 0; nt < 4; ++nt) {
                 float* a = acc[mt][nt];
                 btb_mma16816(a[0], a[1], a[2], a[3], xa.x, xb.x, xa.y, xb.y, wv[nt].x, wv[nt].y);
+            }
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                float* a = acc[mt][nt];
                 btb_mma16816(a[0], a[1], a[2], a[3], xa.z, xb.z, xa.w, xb.w, wv[nt].z, wv[nt].w);
             }
         }
-        if ((st + 1) % per == 0 || st + 1 == nst) {
+        b = b + 1 == GM_STAGES ? 0 : b + 1;
+        if (--left == 0 || st + 1 == nst) {
             // the slice's end: its partial into the total, in slice order (the first a copy, as warp 0's is kept)
 #pragma unroll
             for (int mt = 0; mt < 4; ++mt)
@@ -118,6 +137,7 @@ extern "C" __global__ void __launch_bounds__(128)
                         acc[mt][nt][e] = 0.f;
                     }
             ++slice;
+            left = per;
         }
     }
     // the matvec's warps past the last super-tile add their zero partials too
