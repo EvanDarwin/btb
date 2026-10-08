@@ -1,7 +1,8 @@
 """The CUDA card-kernel matrix as a suite gate. The card runs only where a GPU is present, so this is the
 structural half: the kernels the engine loads, the kernels native/cuda defines and the kernels btb launches must be
-the same set. A new card kernel that the engine does not load, a loaded name with no definition, or a kernel nothing
-launches any more (a dead path) fails here."""
+the same set, and every launch must hand its kernel as many values as it declares parameters. A new card kernel that
+the engine does not load, a loaded name with no definition, a kernel nothing launches any more (a dead path), or a
+launch whose argument list is not its kernel's fails here."""
 
 from __future__ import annotations
 
@@ -95,7 +96,41 @@ def run(k, name, names):
     assert launched == [] and unresolved == ["mod.py:3", "mod.py:5"], (launched, unresolved)
 
 
+def test_a_launch_handed_another_count_than_its_kernel_declares_is_a_gap() -> None:
+    """a launch's argument list counted as written - list literals, `*part`s of the lengths their assignments give,
+    sums and conditionals of those, by position or by keyword - against every kernel its name can be: one choosing a
+    row map's kernel and its extra value passes either way, a dropped value is caught, and a list the parse cannot
+    count is a gap of its own"""
+    src = """
+def run(k, paged, D, xs):
+    tbl = [P(t)] if paged else []
+    name = f"btb_x{'_tbl' if paged else ''}_d{D}"
+    k.launch(name, (1, 1, 1), (32, 1, 1), [a, b, c, *tbl])
+    k.launch("btb_x_d64", (1, 1, 1), (32, 1, 1), [a, b])
+    k.launch("btb_x_d64", (1, 1, 1), (32, 1, 1), args=[a] + [b, c])
+    k.launch("btb_x_d64", (1, 1, 1), (32, 1, 1), list(xs))
+"""
+    sites = cuda_ops.launch_sites([("mod.py", ast.parse(src))])
+    arity = {"btb_x_d64": 3, "btb_x_tbl_d64": 4}
+    assert cuda_ops.arity_mismatches(sites, arity) == ["mod.py:6 btb_x_d64 (declares 3, handed 2)"]
+    assert cuda_ops.uncounted_launches(sites) == ["mod.py:8"]
+
+
+def test_kernels_parameters_are_read_off_their_definitions() -> None:
+    """the parameters each kernel declares: an entry point spelled out (its name on the line after its bounds), one a
+    macro makes for each head width, one whose list is an object-like macro"""
+    arity = cuda_ops.defined_arity()
+    assert set(arity) == cuda_ops.defined_kernels() and all(n > 0 for n in arity.values())
+    assert arity["btb_gemm_mma_bf16"] == 7  # w, x, y, R, C, T, nw
+    assert arity["btb_attn_flash_d64"] == arity["btb_attn_flash_d256"] == 18
+    assert arity["btb_attn_flash_prefill_d128"] == arity["btb_attn_flash_prefill_kq_d128"] == 14  # ATTN_FLASH_PF_ARGS
+
+
 def test_every_launch_in_btb_is_read() -> None:
-    """btb's own launches all name their kernels as the parse reads them, and launch only loaded kernels"""
-    assert cuda_ops.unresolved_launches() == []
+    """btb's own launches all name their kernels and count their arguments as the parse reads them, launch only
+    loaded kernels, and hand each kernel its parameters"""
+    sites = cuda_ops.launch_sites()
+    assert cuda_ops.unresolved_launches(sites) == []
+    assert cuda_ops.uncounted_launches(sites) == []
+    assert cuda_ops.arity_mismatches(sites) == []
     assert cuda_ops.launched_kernels() <= cuda_ops.loaded_kernels()

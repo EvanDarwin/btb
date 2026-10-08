@@ -1,10 +1,13 @@
 """The CUDA card-kernel matrix. The card runs only where a GPU is present (CI has none), so this certifies the
 kernel surface structurally, source-parsed and torch-free: every kernel the engine loads (`_Cuda.KERNELS` in
 btb/engine/native.py) must be defined in native/cuda/*.cu|.cuh, every kernel defined there must be one the
-engine loads, and every one it loads must be one btb launches - its name, or an f-string naming it, somewhere in
-the package outside the load list. A new .cu kernel the engine does not load, a loaded name with no definition,
-or a kernel nothing launches any more (a dead path, compiled and loaded for nothing) is a reported gap, so a card
-kernel cannot land uncertified, nor outlive its last caller.
+engine loads, and every one it loads must be one a `.launch(...)` in btb/ can launch - its name read through what
+flows into the call (`_Resolver`), never a presence check or a message naming it. Each launch's argument list must
+hold as many values as every kernel it can launch declares parameters: the driver reads one pointer a parameter from
+the list it is handed, so a short list is a read past it and a long one a value the kernel never sees. A new .cu
+kernel the engine does not load, a loaded name with no definition, a kernel nothing launches any more (a dead path,
+compiled and loaded for nothing), a launch whose kernel or argument count the parse cannot read, or one whose count
+is not its kernel's is a reported gap, so a card kernel cannot land uncertified, nor outlive its last caller.
 
     python -m tests.cert.cuda_ops --report    # the kernel matrix and the plain-language gaps
     python -m tests.cert.cuda_ops --missing   # only the gaps in plain language: what is missing and how to close
@@ -35,6 +38,8 @@ class Missing(StrEnum):
     LOADED_NOT_DEFINED = "loaded-not-defined"
     LOADED_NOT_LAUNCHED = "loaded-not-launched"
     LAUNCH_UNRESOLVED = "launch-unresolved"
+    LAUNCH_ARGS_UNRESOLVED = "launch-args-unresolved"
+    LAUNCH_ARITY = "launch-arity"
 
 
 # kind -> (what is missing about kernel {s}, how to close it).
@@ -62,14 +67,27 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "spell the kernel's name at {s} as a constant, an f-string, a conditional of those or a local assigned one, "
         "as every other launch does",
     ),
+    Missing.LAUNCH_ARGS_UNRESOLVED: (
+        "the launch at {s} builds its argument list in a way the cert cannot count (a call, a comprehension, a list "
+        "grown in place), so it cannot say the kernel gets the values it reads",
+        "build the arguments at {s} as list literals, their sums, conditionals of those or locals assigned one "
+        "(`*name` for a part that varies), as every other launch does",
+    ),
+    Missing.LAUNCH_ARITY: (
+        "the launch at {s}: the driver reads one value a declared parameter from the list it is handed - a short "
+        "list a read past its end, a long one a value the kernel never sees",
+        "give the launch at {s} exactly the kernel's parameters, in its order (native/cuda), or the kernel the "
+        "launch's values",
+    ),
 }
 
 # a kernel entry point: `extern "C" __global__ void [__launch_bounds__(...)] btb_<name>(`, the name possibly on
 # the next line (the MMA kernel), and NOT a macro template (a name ending at `##` is caught by _macro_kernels).
 _EXTERN = re.compile(r'extern\s+"C"\s+__global__\s+void\s+(?:__launch_bounds__\([^)]*\)\s*)?(btb_\w+)\s*\(')
-# a macro body's templated name(s), every `##` part: btb_gemv_bf16_m##M, btb_attn_flash_prefill_kq_d##D
-_TEMPLATE = re.compile(r"(btb_\w+(?:##\w+)+)")
+# a macro body's templated name(s), every `##` part, and its parameter list's opening: btb_gemv_bf16_m##M(
+_TEMPLATE = re.compile(r"(btb_\w+(?:##\w+)+)\s*\(")
 _DEFINE = re.compile(r"#define\s+(\w+)\(([^)]*)\)")  # a macro definition head and its parameters
+_OBJECT = re.compile(r"#define\s+(\w+)(?:\s+(.*))?$")  # an object-like macro: its name, then its text
 _INST = re.compile(r"^(\w+)\(([\d,\s]+)\)", re.M)  # a macro instantiation, e.g. GEMV(16) or ATTN(2, 64)
 
 
@@ -97,26 +115,61 @@ def loaded_kernels() -> set[str]:
     return {k for k in out if k.startswith("btb_")}
 
 
-def defined_kernels() -> set[str]:
-    """the card kernels defined in native/cuda: the literal `extern "C" __global__` entry points plus the
-    macro-generated ones (each `#define MACRO(P) ... btb_x##P ...` expanded over its `MACRO(v)` instantiations)."""
+def _arity(text: str, i: int, objects: dict[str, str]) -> int:
+    """the parameters of the list whose `(` is text[i]: its top-level commas plus one (none for `()` or `(void)`); a
+    list that is one object-like macro (`ATTN_FLASH_PF_ARGS`) counted as the macro's text"""
+    depth = 0
+    commas = 0
+    j = i
+    for j in range(i, len(text)):
+        c = text[j]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                break
+        elif c == "," and depth == 1:
+            commas += 1
+    body = text[i + 1 : j].strip()
+    if body in objects:
+        return _arity(f"({objects[body]})", 0, objects)
+    return 0 if body in ("", "void") else commas + 1
+
+
+def defined_arity() -> dict[str, int]:
+    """the card kernels defined in native/cuda and the parameters each declares: the literal `extern "C" __global__`
+    entry points plus the macro-generated ones (each `#define MACRO(P) ... btb_x##P(...) ...` expanded over its
+    `MACRO(v)` instantiations, every expansion the template's parameters)."""
     src = _cuda_source()
-    out = set(_EXTERN.findall(src))
-    templates: dict[str, tuple[list[str], list[str]]] = {}
-    for line in src.splitlines():
-        d = _DEFINE.match(line.strip())
+    objects: dict[str, str] = {}
+    templates: dict[str, tuple[list[str], list[tuple[str, int]]]] = {}
+    lines = [line.strip() for line in src.splitlines()]
+    for line in lines:
+        o = _OBJECT.match(line)
+        if o and not line.startswith(f"#define {o.group(1)}("):
+            objects[o.group(1)] = (o.group(2) or "").strip()
+    out = {m.group(1): _arity(src, m.end() - 1, objects) for m in _EXTERN.finditer(src)}
+    for line in lines:
+        d = _DEFINE.match(line)
         if d:
             params = [p.strip() for p in d.group(2).split(",") if p.strip()]
-            templates[d.group(1)] = (params, _TEMPLATE.findall(line))
+            names = [(m.group(1), _arity(line, m.end() - 1, objects)) for m in _TEMPLATE.finditer(line)]
+            templates[d.group(1)] = (params, names)
     for macro, args in _INST.findall(src):
         if macro not in templates:
             continue
         params, names = templates[macro]
         values = dict(zip(params, (a.strip() for a in args.split(",")), strict=False))
-        for name in names:
+        for name, n in names:
             # each `##` part a parameter's value where it names one, else the literal text between them
-            out.add("".join(values.get(part, part) for part in name.split("##")))
+            out["".join(values.get(part, part) for part in name.split("##"))] = n
     return out
+
+
+def defined_kernels() -> set[str]:
+    """the card kernels defined in native/cuda (`defined_arity`)."""
+    return set(defined_arity())
 
 
 Pieces = tuple[str | None, ...]  # a name's spelling: literal text, None for a part the source does not fix (`{D}`)
@@ -211,16 +264,53 @@ class _Resolver:
             return set().union(*(self.spell(r, depth - 1) for r in returns)) if returns else unknown
         return unknown
 
-    def launches(self, tree: ast.Module) -> list[tuple[int, set[Pieces]]]:
-        """(line, spellings) of every `.launch(...)` call in `tree`"""
-        return [
-            (node.lineno, self.spell(node.args[0]))
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "launch"
-            and node.args
-        ]
+    def count(self, expr: ast.expr, depth: int = _DEPTH) -> set[int] | None:
+        """every length the argument list `expr` can have: a list or tuple literal (a `*part` the lengths of the part),
+        a sum of those, a conditional of those, a variable assigned them (every assignment); None where the source
+        does not fix it"""
+        if depth <= 0:
+            return None
+        if isinstance(expr, (ast.List, ast.Tuple)):
+            out = {0}
+            for e in expr.elts:
+                part = self.count(e.value, depth - 1) if isinstance(e, ast.Starred) else {1}
+                if part is None:
+                    return None
+                out = {a + b for a in out for b in part}
+            return out
+        if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+            left, right = self.count(expr.left, depth - 1), self.count(expr.right, depth - 1)
+            return None if left is None or right is None else {a + b for a in left for b in right}
+        if isinstance(expr, ast.IfExp):
+            body, orelse = self.count(expr.body, depth - 1), self.count(expr.orelse, depth - 1)
+            return None if body is None or orelse is None else body | orelse
+        if isinstance(expr, ast.Name):
+            for scope in self._scopes(expr):
+                values = self._assigned(scope, expr.id)
+                if values is not None:
+                    counts = [self.count(v, depth - 1) for v in values]
+                    if any(c is None for c in counts):
+                        return None
+                    return set().union(*(c for c in counts if c is not None))
+            return None
+        return None
+
+    @staticmethod
+    def _args(call: ast.Call) -> ast.expr | None:
+        """a `.launch(name, grid, block, args, ...)` call's argument list"""
+        if len(call.args) >= 4:
+            return call.args[3]
+        return next((kw.value for kw in call.keywords if kw.arg == "args"), None)
+
+    def launches(self, tree: ast.Module) -> list[tuple[int, set[Pieces], set[int] | None]]:
+        """(line, spellings, argument counts) of every `.launch(...)` call in `tree`"""
+        out = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "launch":
+                if node.args:
+                    args = self._args(node)
+                    out.append((node.lineno, self.spell(node.args[0]), None if args is None else self.count(args)))
+        return out
 
 
 def _pattern(spelling: Pieces) -> re.Pattern[str] | None:
@@ -248,11 +338,20 @@ def _sources(root: str) -> list[tuple[str, ast.Module]]:
     return out
 
 
-def launch_sites(sources: list[tuple[str, ast.Module]] | None = None) -> list[tuple[str, int, set[Pieces]]]:
-    """(file, line, spellings) of every card kernel launch in btb/"""
+# a launch: its file and line, the spellings of the kernel it names, the lengths its argument list can have (None: the
+# parse cannot count it)
+Site = tuple[str, int, set[Pieces], set[int] | None]
+
+
+def launch_sites(sources: list[tuple[str, ast.Module]] | None = None) -> list[Site]:
+    """every card kernel launch in btb/"""
     sources = _sources(BTB_SRC) if sources is None else sources
     resolver = _Resolver([tree for _, tree in sources])
-    return [(path, line, sp) for path, tree in sources for line, sp in resolver.launches(tree)]
+    return [(path, line, sp, n) for path, tree in sources for line, sp, n in resolver.launches(tree)]
+
+
+def _where(path: str, line: int) -> str:
+    return f"{os.path.relpath(path, os.path.dirname(BTB_SRC))}:{line}"
 
 
 def _load_list(node: ast.AST) -> ast.expr | None:
@@ -264,20 +363,41 @@ def _load_list(node: ast.AST) -> ast.expr | None:
     return None
 
 
-def launch_patterns(sites: list[tuple[str, int, set[Pieces]]] | None = None) -> list[re.Pattern[str]]:
+def launch_patterns(sites: list[Site] | None = None) -> list[re.Pattern[str]]:
     """the names btb's launches can launch (`launch_sites`), each spelling as a pattern"""
     sites = launch_sites() if sites is None else sites
-    return [p for _, _, spellings in sites for sp in spellings if (p := _pattern(sp)) is not None]
+    return [p for _, _, spellings, _ in sites for sp in spellings if (p := _pattern(sp)) is not None]
 
 
-def unresolved_launches(sites: list[tuple[str, int, set[Pieces]]] | None = None) -> list[str]:
+def unresolved_launches(sites: list[Site] | None = None) -> list[str]:
     """the launches the parse cannot name a kernel of, as `file:line`: a launch whose kernel the cert cannot read
     certifies nothing, so it is a gap of its own rather than a wildcard over every name"""
     sites = launch_sites() if sites is None else sites
+    return [_where(path, line) for path, line, spellings, _ in sites if any(_pattern(sp) is None for sp in spellings)]
+
+
+def uncounted_launches(sites: list[Site] | None = None) -> list[str]:
+    """the launches whose argument list the parse cannot count, as `file:line`"""
+    sites = launch_sites() if sites is None else sites
+    return [_where(path, line) for path, line, _, counts in sites if counts is None]
+
+
+def arity_mismatches(sites: list[Site] | None = None, arity: dict[str, int] | None = None) -> list[str]:
+    """the launches that can hand a kernel they name a list of another length than its parameters, as
+    `file:line kernel` with the counts: each kernel a launch's spellings match must take one of the lengths its list
+    can have (a launch choosing between kernels and argument lists - a row map or none - is held to the union, so a
+    dropped argument that no choice makes up for is caught)"""
+    sites = launch_sites() if sites is None else sites
+    arity = defined_arity() if arity is None else arity
     out = []
-    for path, line, spellings in sites:
-        if any(_pattern(sp) is None for sp in spellings):
-            out.append(f"{os.path.relpath(path, os.path.dirname(BTB_SRC))}:{line}")
+    for path, line, spellings, counts in sites:
+        if counts is None:
+            continue
+        pats = [p for sp in spellings if (p := _pattern(sp)) is not None]
+        for k in sorted(k for k in arity if any(p.fullmatch(k) for p in pats)):
+            if arity[k] not in counts:
+                got = "/".join(str(c) for c in sorted(counts))
+                out.append(f"{_where(path, line)} {k} (declares {arity[k]}, handed {got})")
     return out
 
 
@@ -290,7 +410,8 @@ def launched_kernels(loaded: set[str] | None = None) -> set[str]:
 
 def _findings() -> list[tuple[Missing, str]]:
     """the single classified list of gaps as (kind, kernel name); gaps() and render_missing() both derive from it."""
-    loaded, defined = loaded_kernels(), defined_kernels()
+    arity = defined_arity()
+    loaded, defined = loaded_kernels(), set(arity)
     sites = launch_sites()
     pats = launch_patterns(sites)
     launched = {k for k in loaded if any(p.fullmatch(k) for p in pats)}
@@ -298,6 +419,8 @@ def _findings() -> list[tuple[Missing, str]]:
     out += [(Missing.LOADED_NOT_DEFINED, k) for k in sorted(loaded - defined)]
     out += [(Missing.LOADED_NOT_LAUNCHED, k) for k in sorted(loaded - launched)]
     out += [(Missing.LAUNCH_UNRESOLVED, s) for s in unresolved_launches(sites)]
+    out += [(Missing.LAUNCH_ARGS_UNRESOLVED, s) for s in uncounted_launches(sites)]
+    out += [(Missing.LAUNCH_ARITY, s) for s in arity_mismatches(sites, arity)]
     return out
 
 
