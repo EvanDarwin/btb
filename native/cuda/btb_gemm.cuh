@@ -4,22 +4,38 @@
 // conversation's steps made, and the conversation's next turn read from the cache decodes as the prompt cold does.
 // There are two matvecs and the warm-up picks one for the engine (`_card_mma_for`); each has its GEMM here.
 //
-//   btb_gemm_mma_bf16(w [R, C], x [T, C], y [T, R], R, C, T, nw)  grid ceil(R / 64) x ceil(T / 128), block 128
+//   btb_gemm_mma_bf16(w [R, C], x [T, C], y [T, R], R, C, T, nw)  ceil(T / 128) * ceil(R / 64) blocks, block 128
 //     btb_gemv_mma_bf16's bits at `nw` warps (`_card_mma_warps(R, C)`, the step's): the super-tiles of 32 k (the
 //     permuted k), cut in nw slices of ceil(nst / nw) as its warps cut them, each slice's partial an mma chain from
 //     zero in super-tile order and the partials added in slice order - the matvec's warp-ordered fold. x as the mma's
 //     A operand and w as its B, as there.
-//   btb_gemm_f32_bf16(w [R, C], x [T, C], y [T, R], R, C, T)  grid ceil(R / 32) x ceil(T / 8), block 128
+//   btb_gemm_f32_bf16(w [R, C], x [T, C], y [T, R], R, C, T)  ceil(T / 8) * ceil(R / 32) blocks, block 128
 //     btb_gemv_bf16_m{M}'s bits: lane l's fp32 chain over chunks l, l + 32, .. of 8 elements in index order, then
 //     the butterfly over the lanes (xor 16, 8, 4, 2, 1), each lane here the same lane of 64 outputs at once.
 //
 // The mma GEMM reuses a tile of w over 128 rows of x (the matvec reads w once a step; a prompt's chunk reads it once
 // a 128 rows), staged in shared memory by asynchronous copies three super-tiles deep; a lane's fragments are one
-// 16-byte shared load each, a row's 64 bytes a super-tile, two rows filling the banks once.
+// 16-byte shared load each, a row's 64 bytes a super-tile, two rows filling the banks once. Both launch their tiles
+// in groups of x tiles (`gm_tile`): which block takes which tile moves no bit, each output its own block's.
 
 #define GM_BM 128  // x rows a block
 #define GM_BR 64   // weight rows a block
 #define GM_STAGES 3
+#define GM_GROUP 8      // the mma GEMM's x tiles a group: 1024 x rows
+#define GM_GROUP_F32 32  // the fp32 chain's: 256 x rows
+
+// a block's tiles (x tile, weight tile) of a 1-D launch of nx * nw blocks: a group of G x tiles walks the weight
+// tiles together, so the blocks on the card at once read a stretch of the weights for every x tile of the group out
+// of the L2 and the group's x rows stay there. With the weight tiles fastest, each x tile read every weight row again
+// from DRAM (a 4096-row chunk's 32 x tiles: the weights 32 times over); with the x tiles fastest, the x rows again
+// for each weight tile
+__device__ __forceinline__ void gm_tile(int nx, int nw, int G, int& xt, int& wt) {
+    const int per = G * nw;
+    const int g = blockIdx.x / per, k = blockIdx.x % per;
+    const int first = g * G, size = min(nx - first, G);
+    xt = first + k % size;
+    wt = k / size;
+}
 
 extern "C" __global__ void __launch_bounds__(128)
     btb_gemm_mma_bf16(const bf16* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ y, int R, int C,
@@ -28,7 +44,9 @@ extern "C" __global__ void __launch_bounds__(128)
     __shared__ __align__(16) bf16 sw[GM_STAGES][GM_BR * 32];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
     const int wm = warp >> 1, wr = warp & 1;  // the warp's tile: x rows wm * 64 .., weight rows wr * 32 ..
-    const int m0 = blockIdx.y * GM_BM, r0 = blockIdx.x * GM_BR;
+    int xt, wt;
+    gm_tile((T + GM_BM - 1) / GM_BM, (R + GM_BR - 1) / GM_BR, GM_GROUP, xt, wt);
+    const int m0 = xt * GM_BM, r0 = wt * GM_BR;
     const int nst = (C + 31) >> 5;
     const int per = (nst + nw - 1) / nw;
     // a super-tile's x and w rows into stage buffer b: x 128 rows of 64 bytes, w 64; a chunk past C or a row past
@@ -152,7 +170,9 @@ extern "C" __global__ void __launch_bounds__(128)
     btb_gemm_f32_bf16(const bf16* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ y, int R, int C,
                       int T) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int m0 = blockIdx.y * 8, r0 = blockIdx.x * 32 + warp * 8;
+    int xt, wt;
+    gm_tile((T + 7) / 8, (R + 31) / 32, GM_GROUP_F32, xt, wt);
+    const int m0 = xt * 8, r0 = wt * 32 + warp * 8;
     const int nchunk = C >> 3;
     const uint4* xr[8];
     const uint4* wr[8];

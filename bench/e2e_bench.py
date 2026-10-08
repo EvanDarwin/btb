@@ -415,19 +415,11 @@ def test_cuda_gemm(benchmark: object, shape: str, T: int, how: str) -> None:
 
     def run() -> None:
         if how == "mma":
-            k.launch(
-                "btb_gemm_mma_bf16",
-                ((R + 63) // 64, (T + 127) // 128, 1),
-                (128, 1, 1),
-                [P(w), P(x), P(y), I(R), I(C), I(T), I(nw)],
-            )
+            grid = _CudaMixin._card_gemm_grid(True, R, T)
+            k.launch("btb_gemm_mma_bf16", grid, (128, 1, 1), [P(w), P(x), P(y), I(R), I(C), I(T), I(nw)])
         elif how == "f32":
-            k.launch(
-                "btb_gemm_f32_bf16",
-                ((R + 31) // 32, (T + 7) // 8, 1),
-                (128, 1, 1),
-                [P(w), P(x), P(y), I(R), I(C), I(T)],
-            )
+            grid = _CudaMixin._card_gemm_grid(False, R, T)
+            k.launch("btb_gemm_f32_bf16", grid, (128, 1, 1), [P(w), P(x), P(y), I(R), I(C), I(T)])
         else:
             torch.matmul(x, w.t(), out=y)
         torch.cuda.synchronize()

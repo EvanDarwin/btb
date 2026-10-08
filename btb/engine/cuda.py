@@ -2843,30 +2843,26 @@ class _CudaMixin(_State):
     # the most rows a launch takes on grid.y (the card's limit), where a chunk's rows ride it
     GRID_Y = 65535
 
+    @staticmethod
+    def _card_gemm_grid(mma: bool, R: int, rows: int) -> tuple[int, int, int]:
+        """a prompt GEMM's launch (btb_gemm.cuh): a block a tile of 128 x rows by 64 weight rows (the tensor cores'),
+        or 8 by 32 (the fp32 chain's), every tile in one line of blocks the kernel takes in groups (`gm_tile`)"""
+        if mma:
+            return ((rows + 127) // 128 * ((R + 63) // 64), 1, 1)
+        return ((rows + 7) // 8 * ((R + 31) // 32), 1, 1)
+
     def _card_gemm(
         self, k: Any, mma: bool, W: torch.Tensor, x: torch.Tensor, y: torch.Tensor, R: int, C: int, rows: int
     ) -> None:
         """y[:rows] = x[:rows] W^T [R, C] as the step's matvec sums each row (btb_gemm.cuh): the tensor cores' at
-        the matvec's warps for the weight's shape, or the fp32 chain - the one the warm-up picked (`mma`). The rows
-        ride grid.y in blocks of 128 or 8: more than it takes run in slices, each row its own sum either way"""
+        the matvec's warps for the weight's shape, or the fp32 chain - the one the warm-up picked (`mma`)"""
         P, ci = k.ptr, ctypes.c_int
-        step = self.GRID_Y * (128 if mma else 8)
-        for m0 in range(0, rows, step):
-            m = min(step, rows - m0)
-            if mma:
-                k.launch(
-                    "btb_gemm_mma_bf16",
-                    ((R + 63) // 64, (m + 127) // 128, 1),
-                    (128, 1, 1),
-                    [P(W), P(x[m0:]), P(y[m0:]), ci(R), ci(C), ci(m), ci(self._card_mma_warps(R, C))],
-                )
-            else:
-                k.launch(
-                    "btb_gemm_f32_bf16",
-                    ((R + 31) // 32, (m + 7) // 8, 1),
-                    (128, 1, 1),
-                    [P(W), P(x[m0:]), P(y[m0:]), ci(R), ci(C), ci(m)],
-                )
+        grid = self._card_gemm_grid(mma, R, rows)
+        if mma:
+            args = [P(W), P(x), P(y), ci(R), ci(C), ci(rows), ci(self._card_mma_warps(R, C))]
+            k.launch("btb_gemm_mma_bf16", grid, (128, 1, 1), args)
+        else:
+            k.launch("btb_gemm_f32_bf16", grid, (128, 1, 1), [P(W), P(x), P(y), ci(R), ci(C), ci(rows)])
 
     def _card_tail_ok(self) -> bool:
         """the card graph's kernels run the tail: the card graph on, the final norm and the head on the card, bf16"""

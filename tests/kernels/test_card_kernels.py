@@ -474,13 +474,11 @@ def _gemm(cu: _Cuda, W: torch.Tensor, x: torch.Tensor, warps: int = 0) -> torch.
     T, C = x.shape
     R = W.shape[0]
     y = torch.full((T, R), float("nan"), device=dev, dtype=bf)
+    grid = _CudaMixin._card_gemm_grid(bool(warps), R, T)  # the engine's launch: its tiles in groups
     if warps:
-        grid, args = ((R + 63) // 64, (T + 127) // 128, 1), [P(W), P(x), P(y), I(R), I(C), I(T), I(warps)]
-        cu.launch("btb_gemm_mma_bf16", grid, (128, 1, 1), args)
+        cu.launch("btb_gemm_mma_bf16", grid, (128, 1, 1), [P(W), P(x), P(y), I(R), I(C), I(T), I(warps)])
     else:
-        cu.launch(
-            "btb_gemm_f32_bf16", ((R + 31) // 32, (T + 7) // 8, 1), (128, 1, 1), [P(W), P(x), P(y), I(R), I(C), I(T)]
-        )
+        cu.launch("btb_gemm_f32_bf16", grid, (128, 1, 1), [P(W), P(x), P(y), I(R), I(C), I(T)])
     return y
 
 
