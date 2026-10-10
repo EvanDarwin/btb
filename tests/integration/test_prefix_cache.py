@@ -609,16 +609,19 @@ def cold_turn(sm: StreamedTextModel, prompt: list[int], spec: bool) -> tuple[lis
     return out, s.next_logits()
 
 
+@pytest.mark.parametrize("place", PLACED)
 @pytest.mark.parametrize("stem", [HYBRID])
-def test_a_hybrids_hit_decodes_as_its_prompt_cold(stem: str) -> None:
+def test_a_hybrids_hit_decodes_as_its_prompt_cold(stem: str, place: str) -> None:
     """a hybrid's conversation through a side request: its next turn opens at the last block's end within the turn
     before's prompt - the rows before it read from the tree, the recurrent states restored from the snapshot its
     prefill kept there - never from where its decode left them, and answers as the same prompt decoded cold, every
     token: the rest of the prompt prefilled as the cold prompt's later chunk. Whole or in chunks, greedy or
-    speculative; and a second conversation opening on the first's system prompt the same. Tokens, not logits: the
-    host's matmuls sum a row by how many rows its call holds, so a prompt's rows made in two calls part in the last
-    bits from the same rows made in one (test_prefill_layers' hybrid test), here as for every family on the host"""
-    sm = model(stem)
+    speculative; and a second conversation opening on the first's system prompt the same. On the host and on the card
+    in each placement, a card layer's states restored onto the card. Tokens, not logits: the host's matmuls and the
+    card's torch modules sum a row by how many rows its call holds, so a prompt's rows made in two calls part in the
+    last bits from the same rows made in one (test_prefill_layers' hybrid test), as for every family off the card
+    graph (`Missing.PREFIX_INVARIANCE`)"""
+    sm = model(stem, place)
     rng = random.Random(14)
     a1, more, side, u2 = chatty(rng, 150), chatty(rng, 40), toks(rng, 70), toks(rng, 20)
     keep = sm.prefill_chunk
@@ -651,13 +654,15 @@ def test_a_hybrids_hit_decodes_as_its_prompt_cold(stem: str) -> None:
         sm.prefill_chunk = keep
 
 
+@pytest.mark.parametrize("place", PLACED)
 @pytest.mark.parametrize("stem", [HYBRID])
-def test_a_hybrid_opened_on_a_prompt_keeps_its_rows_and_its_snapshots(stem: str) -> None:
+def test_a_hybrid_opened_on_a_prompt_keeps_its_rows_and_its_snapshots(stem: str, place: str) -> None:
     """a session opened on a prompt (`session(ids)`, a feed from nothing) decodes on from the prompt's logits, no row
     prefilled again, and its feed kept the states at the block ends it crossed: a second conversation opening alike
     resumes at the last one, reading the same rows - and both answer as cold. Rewound to a mark, the states put back
-    are never gone on from (a mark's could be a decode's): the next decode opens on the snapshot before it"""
-    sm = model(stem)
+    are never gone on from (a mark's could be a decode's): the next decode opens on the snapshot before it. On the
+    host and on the card in each placement"""
+    sm = model(stem, place)
     rng = random.Random(15)
     system, u2 = chatty(rng, 150), toks(rng, 20)
     pc = prefix(sm)

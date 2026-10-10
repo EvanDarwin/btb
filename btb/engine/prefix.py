@@ -94,8 +94,6 @@ class PrefixCache:
             return "MLX's attention reads no pages yet: the prefix cache serves the CPU's and the card's"
         if sm.dev.type not in (Device.CPU, Device.CUDA):
             return f"a {sm.dev.type} engine's attention reads no pages, only the host's and the card's do"
-        if LayerKind.LINEAR in sm.layer_types and sm.dev.type != Device.CPU:
-            return "a hybrid's recurrent states resume from snapshots the host's prefill keeps; the card's come later"
         if sm.fam.own:
             return "a family that brings its own layer (Qwen4) reads its rows through programs of its own"
         if not sm.fam.fast:

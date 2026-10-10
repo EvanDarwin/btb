@@ -88,7 +88,6 @@ class Missing(StrEnum):
     QUANT_FIXTURE = "quant-fixture"
     NO_FIXTURE = "no-fixture"
     PREFIX_CACHE = "prefix-cache"
-    PREFIX_SNAPSHOT = "prefix-snapshot"
     PREFIX_FAMILY = "prefix-family"
     PREFIX_WIDE = "prefix-wide"
     PREFIX_INVARIANCE = "prefix-invariance"
@@ -231,7 +230,8 @@ MISSING: dict[Missing, tuple[str, str]] = {
     ),
     Missing.PREFIX_INVARIANCE: (
         "on this sub-path a prompt's rows come out of layers the card graph's kernels do not run - the torch modules "
-        "of a family they are not written for (Phi-3's fused projections), the host's layers, the kv_host tier - "
+        "of a family they are not written for (Phi-3's fused projections, a hybrid's DeltaNet), the host's layers, "
+        "the kv_host tier - "
         "whose matmuls sum a row otherwise than its decode step does, so a hit, reading the rows its conversation's "
         "steps made, parts from the same prompt decoded cold at a bf16 near-tie. The hit equals the uninterrupted "
         "conversation bit for bit (tests/integration/test_prefix_cache.py); it is the cold decode it cannot equal "
@@ -240,14 +240,6 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "bring the family onto the card graph's kernels (cuda.py `_card_family_ok`; Phi-3: its fused q/k/v and "
         "gate/up as the card's merged weights, no q/k norm), and make the host's layers and the kv_host tier compute "
         "each prompt row as their step does; then narrow manifest.prefix_gap",
-    ),
-    Missing.PREFIX_SNAPSHOT: (
-        "a hybrid's recurrent layers resume only from a kept snapshot of their state, which the host's prefill keeps "
-        "at its blocks' ends and the card's does not yet, so the prefix cache does not serve the family on the card "
-        "(btb/engine/prefix.py `why_not`)",
-        "keep the card layers' snapshots in pinned RAM and restore them onto the card (`GenerateMixin._anchor`, "
-        "`_lin_restore`), with the card's linear layers prefilled through the chunked rule a cold prompt takes (plan "
-        "phase P4), then take the card out of the hybrid's refusal in `why_not` and spec.paged",
     ),
     Missing.PREFIX_FAMILY: (
         "the family reads its rows through attention of its own - Qwen4's card programs and indexed layers, "
@@ -557,10 +549,10 @@ def subpath_gap(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath
 def prefix_gap(kind: FamilyKind, dev: spec.DeviceSubpath) -> Missing | None:
     """why the prefix axis's conversations cannot hold on this family and sub-path, in the order the engine hits
     it: a sub-path that does not engage at all (its own gap), then the engine's own reasons (`PrefixCache.why_not`,
-    whose rule `spec.paged` is): a tier the prefix cache is not on yet, a hybrid's snapshots on the card, a family's
-    own attention, then the card's own conditions (its kernels' widths). Served on the card, a hit equals its cold decode
-    where every layer runs the card graph's kernels, whose prefill makes each row as the step does; elsewhere on the
-    card it cannot yet (`PREFIX_INVARIANCE`)"""
+    whose rule `spec.paged` is): a tier the prefix cache is not on yet, a family's own attention, then the card's own
+    conditions (its kernels' widths). Served on the card, a hit equals its cold decode where every layer runs the card
+    graph's kernels, whose prefill makes each row as the step does; elsewhere on the card it cannot yet
+    (`PREFIX_INVARIANCE`), a hybrid's resumed from the snapshots its prefill kept among them"""
     refused = subpath_gap(kind, spec.Storage.SAFE_BF16, dev)
     if refused is not None:
         return refused
@@ -570,8 +562,6 @@ def prefix_gap(kind: FamilyKind, dev: spec.DeviceSubpath) -> Missing | None:
         return Missing.PREFIX_INVARIANCE
     if dev.hardware not in (spec.Hardware.CPU, spec.Hardware.CUDA):
         return Missing.PREFIX_CACHE
-    if spec.recurrent(kind) and dev.hardware is spec.Hardware.CUDA:
-        return Missing.PREFIX_SNAPSHOT
     if spec.paged(kind, spec.Hardware.CPU):
         return Missing.PREFIX_WIDE  # served on the host, so the card's own conditions refuse it
     return Missing.PREFIX_FAMILY

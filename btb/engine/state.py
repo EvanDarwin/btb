@@ -683,11 +683,14 @@ class _State:
         raise NotImplementedError
 
     @staticmethod
-    def _lin_snap(cl: LinLayer) -> LinSnap:
+    def _lin_snap(cl: LinLayer, dev: torch.device | None = None) -> LinSnap:
+        raise NotImplementedError
+
+    def _lin_home(self, i: int) -> torch.device:
         raise NotImplementedError
 
     @staticmethod
-    def _lin_restore(cl: LinLayer, snap: LinSnap) -> None:
+    def _lin_restore(cl: LinLayer, snap: LinSnap, dev: torch.device | None = None) -> None:
         raise NotImplementedError
 
     def generate_greedy(

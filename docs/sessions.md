@@ -70,8 +70,8 @@ with session._txn(eng) as t:  # the rollback point: len(ids), the state, recurre
   before the prompt's last token and the last before where the next turn's re-rendering parts from it. The tree keeps
   each snapshot at a node's end. A prompt opens at the deepest snapshot the tree holds within it and prefills the rest
   as the cold prompt's later chunk. It never goes on from where a decode left the states, whose steps sum otherwise:
-  a turn prefills the previous answer again, and a hit decodes as the prompt cold. The host's prefix cache serves
-  hybrids so far; the card's does not yet.
+  a turn prefills the previous answer again, and a hit decodes as the prompt cold. The snapshots are kept in RAM,
+  and a card layer's states are restored onto the card.
 * **Every public mutator is a transaction:** `feed`, `sync`, `rewind`, `crop`, `generate(session=...)`, and a
   fork's or batch's write-back. `_open`/`_keep`/`_abandon`/`_whole`/`_back_to`/`_undo`/`_held` go away; `_open`
   becomes "the rollback point this prompt keeps", `_keep` becomes `commit`.

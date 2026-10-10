@@ -161,16 +161,29 @@ class _GenerateMixin(_State):
     _lin = staticmethod(_lin)
 
     @staticmethod
-    def _lin_snap(cl: LinLayer) -> LinSnap:
+    def _lin_snap(cl: LinLayer, dev: torch.device | None = None) -> LinSnap:
+        """a DeltaNet layer's states copied - where they lie, or straight to `dev` (a snapshot the prefix tree keeps
+        in RAM, never a copy on the card first)"""
+
+        def one(v: torch.Tensor) -> torch.Tensor:
+            return v.clone() if dev is None else v.to(dev, copy=True)
+
         def copy(s: LinState) -> LinState:
             if isinstance(s, dict):
-                return {k: v.clone() for k, v in s.items() if isinstance(v, torch.Tensor)}
-            return s.clone()
+                return {k: one(v) for k, v in s.items() if isinstance(v, torch.Tensor)}
+            return one(s)
 
         return copy(cl.conv_states), copy(cl.recurrent_states)
 
+    def _lin_home(self, i: int) -> torch.device:
+        """where linear layer i's recurrent states live: the host's for a layer the host runs, else the engine's
+        device - where a snapshot restored into a fresh cache puts them"""
+        return torch.device("cpu") if i in self.host or self.dev.type == Device.CPU else torch.device(self.dev)
+
     @staticmethod
-    def _lin_restore(cl: LinLayer, snap: LinSnap) -> None:
+    def _lin_restore(cl: LinLayer, snap: LinSnap, dev: torch.device | None = None) -> None:
+        """`snap` into the layer's states: copied into the slots it holds, a slot it has not filled made on `dev`
+        (else where the snapshot lies)"""
         conv, rec = snap
         if isinstance(conv, dict) and isinstance(rec, dict):
             for have, snap_states in ((cl.conv_states, conv), (cl.recurrent_states, rec)):
@@ -185,12 +198,13 @@ class _GenerateMixin(_State):
                     # goes on from the state, not from none - a copy of its own, never a view of the snapshot's (a
                     # later pass writes the layer's states in place)
                     setter = getattr(cl, "update_conv_state" if conv_slot else "update_recurrent_state", None)
+                    own = v.to(dev or v.device, copy=True)
                     if setter is None:
-                        have[k] = v.clone()
+                        have[k] = own
                     elif conv_slot:
-                        setter(v.clone(), k, conv_kernel_size=int(v.shape[-1]))
+                        setter(own, k, conv_kernel_size=int(v.shape[-1]))
                     else:
-                        setter(v.clone(), k)
+                        setter(own, k)
             return
         assert isinstance(conv, torch.Tensor) and isinstance(rec, torch.Tensor)  # _lin_snap copies both alike
         c, r = _lin(cl)
@@ -249,14 +263,17 @@ class _GenerateMixin(_State):
     def _anchor(self, cache: Any, at: int, logits: Any, h_last: torch.Tensor | None) -> Anchor:
         """a hybrid's point to resume from (`Anchor`): the DeltaNet layers' states at position `at`, copies, and the
         next token's logits there - the last row of `logits` - so the point is a state of its own (`Ready`), which a
-        failed call goes back to"""
+        failed call goes back to. A paged cache's go to the prefix tree, kept in RAM: copied there, a card layer's too"""
+        host = torch.device("cpu") if getattr(cache, "paged", False) else None
         return {
             "n": at,
             "logits": logits[0, -1].float().cpu().clone(),
             "states": {
-                i: self._lin_snap(cache.layers[i]) for i in range(self.L) if self.layer_types[i] == LayerKind.LINEAR
+                i: self._lin_snap(cache.layers[i], host)
+                for i in range(self.L)
+                if self.layer_types[i] == LayerKind.LINEAR
             },
-            "h_last": h_last,
+            "h_last": h_last if h_last is None or host is None else h_last.to(host),
         }
 
     def _prefill_at_blocks(

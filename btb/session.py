@@ -749,7 +749,8 @@ class Session:
             from .engine.generate import lin_layer
 
             for i, states in snap["states"].items():
-                eng._lin_restore(lin_layer(new.layers[i]), states)
+                # kept in RAM, onto the device the layer runs on: a card layer's states on the card
+                eng._lin_restore(lin_layer(new.layers[i]), states, eng._lin_home(i))
         self.cache, self.anchor, self.ids, self.n_prompt = new, [], list(prompt[:a]), 0
         self._pending, self.logits = None, None
         if drafted:
