@@ -99,20 +99,28 @@ def run(k, name, names):
 def test_a_launch_handed_another_count_than_its_kernel_declares_is_a_gap() -> None:
     """a launch's argument list counted as written - list literals, `*part`s of the lengths their assignments give,
     sums and conditionals of those, by position or by keyword - against every kernel its name can be: one choosing a
-    row map's kernel and its extra value passes either way, a dropped value is caught, and a list the parse cannot
-    count is a gap of its own"""
+    row map's kernel and its extra value passes either way, a dropped value is caught - on one branch of a fixed
+    kernel's list as well, its other branch's count right - and a list the parse cannot count is a gap of its own"""
     src = """
-def run(k, paged, D, xs):
+def run(k, paged, D, xs, cond):
     tbl = [P(t)] if paged else []
     name = f"btb_x{'_tbl' if paged else ''}_d{D}"
     k.launch(name, (1, 1, 1), (32, 1, 1), [a, b, c, *tbl])
     k.launch("btb_x_d64", (1, 1, 1), (32, 1, 1), [a, b])
     k.launch("btb_x_d64", (1, 1, 1), (32, 1, 1), args=[a] + [b, c])
     k.launch("btb_x_d64", (1, 1, 1), (32, 1, 1), list(xs))
+    k.launch("btb_x_d64", (1, 1, 1), (32, 1, 1), [a, b, c] if cond else [a, b])
+    k.launch(f"btb_x_d{D}", (1, 1, 1), (32, 1, 1), [a, b, *tbl])
 """
     sites = cuda_ops.launch_sites([("mod.py", ast.parse(src))])
-    arity = {"btb_x_d64": 3, "btb_x_tbl_d64": 4}
-    assert cuda_ops.arity_mismatches(sites, arity) == ["mod.py:6 btb_x_d64 (declares 3, handed 2)"]
+    arity = {"btb_x_d64": 3, "btb_x_d128": 3, "btb_x_tbl_d64": 4}
+    assert cuda_ops.arity_mismatches(sites, arity) == [
+        "mod.py:6 btb_x_d64 (declares 3, handed 2)",
+        "mod.py:9 btb_x_d64 (declares 3, handed 2/3)",
+        # the head widths of one kernel declare one count: the branch without the row map hands it one short
+        "mod.py:10 btb_x_d128 (declares 3, handed 2/3)",
+        "mod.py:10 btb_x_d64 (declares 3, handed 2/3)",
+    ]
     assert cuda_ops.uncounted_launches(sites) == ["mod.py:8"]
 
 

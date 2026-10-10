@@ -716,3 +716,104 @@ def test_a_snapshot_the_ram_has_no_room_for_lets_the_least_used_go_first() -> No
     refusals[0] = 1 << 30
     assert not pc.snap_room(1 << 20)
     assert not [n for n in pc.tree.nodes() if n.snap is not None] and len(list(pc.tree.nodes())) == 2
+
+
+def test_free_pages_past_the_last_held_one_give_their_ram_back() -> None:
+    """a long decode with no session grew the host's regions for its rows, and let go its pages were free while the
+    regions kept their length until the engine closed - gigabytes no conversation read. `trim` lets the free pages past
+    the last held one go and cuts the regions to the pages left, never below their first growth (`MIN_PAGES`, the room
+    any request starts in - cut to nothing, a model that gave up all it could had none to answer in); the rows of the
+    pages held read as they were, and the next growth goes on from there. A region cut to nothing is made again by
+    the next growth"""
+    asked: list[str] = []
+
+    def grant(nbytes: int, kind: str, **kw: Any) -> None:
+        asked.append(str(kw.get("requester", "")))
+
+    first = HostRegion.MIN_PAGES
+    pc = prefix(grant)
+    keep = pc.new()
+    k0, v0 = rows(PAGE, 21)
+    write(keep, k0, v0)  # page 0, held
+    long = pc.new()
+    write(long, *rows(40 * PAGE, 22))  # pages 1..40
+    grown = pc.pool.nbytes()["cpu"]
+    long.release()
+    assert pc.pool.trimmable() == grown - 2 * L * first * ROW > 0
+    assert pc.pool.trim() == grown - 2 * L * first * ROW and pc.pool.nbytes()["cpu"] == 2 * L * first * ROW
+    assert len(pc.pool.pages.pages) == 1 and pc.pool.host.cap == first and not pc.pool.pages.check()
+    assert any(f"cut to {first} pages" in a for a in asked), "the cut copies were not asked of the ledger"
+    for i in range(L):
+        got = read(keep, i)
+        assert torch.equal(got[0], k0 + i) and torch.equal(got[1], v0 - i)
+    k1, v1 = rows(3 * PAGE, 23)
+    write(keep, k1, v1)  # on in the room left
+    for i in range(L):
+        got = read(keep, i)
+        assert torch.equal(got[0], torch.cat([k0, k1], -2) + i) and torch.equal(got[1], torch.cat([v0, v1], -2) - i)
+    keep.release()
+    assert pc.pool.trim() == 0 and pc.pool.trimmable() == 0, "the first growth's room given back"
+    assert pc.pool.pages.pages == [] and pc.pool.nbytes()["cpu"] == 2 * L * first * ROW
+    assert pc.pool.host.shrink(0) == 2 * L * first * ROW and pc.pool.host.cap == 0 and not pc.pool.host.k
+    again = pc.new()
+    write(again, *rows(PAGE + 3, 24))
+    assert len(pc.pool.pages.pages) == 2 and pc.pool.host.cap == first
+    for i in range(L):
+        assert read(again, i)[0].shape[-2] == PAGE + 3
+
+
+def test_a_host_region_refused_part_way_is_made_whole_at_the_next_write() -> None:
+    """pages counted before the host's first rows (a card engine's card layers wrote first) have their regions made
+    at the host's first write, a layer at a time as the ledger grants each. Refused part way, the next write makes the
+    rest: with the dtype set and the pages counted, nothing was asked again and a write to a layer whose regions were
+    never made raised KeyError, however much RAM had come back"""
+    calls = [0]
+
+    def grant(nbytes: int, kind: str, **kw: Any) -> None:
+        calls[0] += 1
+        if calls[0] == 3:  # layer 1's K: layer 0 whole, layers 1 and 2 none
+            raise MemoryGrantError("refused")
+
+    host = HostRegion([0, 1, 2], HK, D, grant)
+    host.grow(4)
+    k, v = rows(PAGE, 25)
+    with pytest.raises(MemoryGrantError):
+        host.shape(k)
+    assert host.dtype is not None and sorted(host.k) == [0] and host.growth(4) > 0
+    host.shape(k)
+    at = torch.arange(PAGE)
+    for i in (0, 1, 2):
+        host.write(i, at, k[0], v[0])
+        got = host.gather(i, at)
+        assert torch.equal(got[0][0], k[0]) and torch.equal(got[1][0], v[0])
+    assert host.growth(4) == 0
+
+
+def test_the_card_region_asks_its_growths_peak_not_its_whole_new_size() -> None:
+    """the card's arenas and the park ask the ledger for what a growth takes at its peak - what they add, and where
+    regrown rather than mapped in place one layer's old buffer beside its new - the figure `growth` and `park_growth`
+    price. Asked for their whole new size, a growth priced as fitting was refused (1 GiB to 1.5 GiB with 600 MiB
+    free): here the ledger refuses anything past the price"""
+    asked: list[tuple[str, int, int]] = []
+    budget: list[int | None] = [None]
+
+    def grant(nbytes: int, kind: str, **kw: Any) -> None:
+        asked.append((str(kw.get("requester", "")), int(nbytes), int(kw.get("held", 0))))
+        if budget[0] is not None and nbytes > budget[0]:
+            raise MemoryGrantError("refused")
+
+    pc = prefix(grant, card=(0, 1))
+    card = pc.pool.card
+    assert card is not None
+    card._grow(HostRegion.MIN_PAGES)
+    old = card.cap
+    budget[0] = price = card.growth(old + 1)
+    card._grow(old + 1)
+    added = len(card.arenas) * (card.cap - old) * card._page_bytes()
+    assert asked[-1][1:] == (price, price - added) and "card arenas" in asked[-1][0], asked[-1]
+    card._grow_park(4)
+    have = len(card.parked)
+    budget[0] = price = card.park_growth(have + 1)
+    card._grow_park(have + 1)
+    added = len(card.arenas) * (len(card.parked) - have) * card._page_bytes()
+    assert asked[-1][1:] == (price, price - added) and "park" in asked[-1][0], asked[-1]

@@ -779,8 +779,9 @@ class _MemoryMixin(_State):
         return mapped + own - grow, own - grow
 
     def ram_yield(self, log: Log | None = None) -> int:
-        """The host given back to another program at once: the expert store's blocks first (their bytes are on the
-        drive, read again on a miss), then host layers to the drive (`_shed_warm`) while a shed frees what is short -
+        """The host given back to another program at once: the prefix cache's free pages past its last held one first
+        (no row anyone reads, `KvPool.trim`), then the expert store's blocks (their bytes are on the drive, read again
+        on a miss), then host layers to the drive (`_shed_warm`) while a shed frees what is short -
         RAM, or commit, each counted down by what the shed let go (a layer on the checkpoint's mapping frees RAM and
         no commit, and its ring slot takes both), not read again from the OS, whose figures move only as it gets round
         to the pages - until the reserve and a launch's headroom are free, or no shed frees what is short without
@@ -796,6 +797,8 @@ class _MemoryMixin(_State):
         # free-read: the yield's own log line (what it gained), never a decision
         before = min(int(host_free_bytes()), int(host_commit_bytes()))
         log(f"[ram] another program wants memory: {short / 2**30:.2f} GB to give back")
+        pc = self.__dict__.get("_kv")
+        trimmed = pc.pool.trim() if pc is not None else 0
         store = getattr(self, "expert_store", None)
         blocks = 0
         if store is not None:
@@ -824,8 +827,9 @@ class _MemoryMixin(_State):
         gained = min(int(host_free_bytes()), int(host_commit_bytes())) - before
         still = max(need_ram, need_commit)
         log(
-            f"[ram] gave back {gained / 2**30:.2f} GB ({blocks} store slots, host layers {layers or 'none'} to the "
-            f"drive; the store holds off growing back for {self.RAM_HOLD_S:.0f} s)"
+            f"[ram] gave back {gained / 2**30:.2f} GB ({trimmed / 2**30:.2f} GB of free KV pages, {blocks} store "
+            f"slots, host layers {layers or 'none'} to the drive; the store holds off growing back for "
+            f"{self.RAM_HOLD_S:.0f} s)"
             + (f"; {still / 2**30:.2f} GB short of the headroom, nothing more a shed frees" if still > 0 else "")
         )
         st.spent = max(1, self._ram_short())
@@ -1196,8 +1200,9 @@ class _MemoryMixin(_State):
     def _give_up_one(self, dev: torch.device, short: int, tried: set[str]) -> bool:
         """the cheapest thing btb holds on `dev`, given up toward `short` bytes: on a card the passes' scratch (made
         again by the next pass that wants it), the drafter, then layers from the top, then the head (each live cache
-        following its layer); on the host MLX's cached buffers, the expert store's blocks, then a warm layer to the
-        drive. False when nothing is left"""
+        following its layer); on the host the prefix cache's free pages past its last held one (no row anyone reads,
+        `KvPool.trim`), MLX's cached buffers, the expert store's blocks, then a warm layer to the drive. False when
+        nothing is left"""
         log = self.log
         if dev.type == Device.CUDA and "scratch" not in tried:
             tried.add("scratch")
@@ -1210,6 +1215,11 @@ class _MemoryMixin(_State):
             if not self.vram_watch:  # a running policy regrows what it sheds; none runs to regrow this
                 self._lent_shed("card")
             return True
+        pc = self.__dict__.get("_kv")
+        if pc is not None and "kv" not in tried:
+            tried.add("kv")
+            if pc.pool.trim():
+                return True
         mlx = getattr(self, "mlx", None)
         if mlx is not None and mlx.held_bytes() > mlx.active_bytes():
             mlx.clear_cache()
@@ -1287,6 +1297,9 @@ class _MemoryMixin(_State):
             return n + sum(_bytes_on(c, dev, resident) for c in list(self.__dict__.get("_live_caches", ())))
         packed = bool(getattr(self, "_packed", None))
         n = sum(self._layer_bytes_stored(i, packed) for i in list(self.host) if i not in self.cold)
+        pc = self.__dict__.get("_kv")
+        if pc is not None:
+            n += pc.pool.trimmable()
         store = getattr(self, "expert_store", None)
         if store is not None and store.per:
             n += store.live() * int(store.per)

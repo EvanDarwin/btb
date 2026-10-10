@@ -520,7 +520,8 @@ def test_cuda_attn_prefill(benchmark: object, T: int, n: int, how: str) -> None:
     args = [P(q), P(K), P(V), P(out), I(n), I(T), I(Hq), I(Hk), I(K.stride(0)), I(K.stride(1)), Fl(D**-0.5)]
     args += [I(0), P(None), P(states)]
     qs = q.transpose(0, 1)[None]  # [1, Hq, T, D], the module's layout
-    mask = torch.ones(T, n + T, dtype=torch.bool, device="cuda").tril(diagonal=n)
+    # sdpa's alone: the flash kernel reads no mask, and at a million keys this one is 4 GB (twice that while it is made)
+    mask = torch.ones(T, n + T, dtype=torch.bool, device="cuda").tril(diagonal=n) if how == "sdpa" else None
     tpb = k.flash_prefill_rows(D) // (Hq // Hk)  # the flash form's tokens a block: their G heads each
 
     def run() -> None:

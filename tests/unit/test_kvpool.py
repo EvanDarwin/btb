@@ -28,6 +28,27 @@ def test_a_page_lives_while_anyone_holds_it() -> None:
     assert not pool.check()
 
 
+def test_the_lowest_free_page_goes_first_and_the_free_tail_is_let_go() -> None:
+    """a page let go goes back to the free pages and the lowest of them is handed out next, so the pages held gather at
+    the front; `trim` lets every free page past the last held one go - none while the last is held, all where none
+    is - and the next page made takes the id after the ones left"""
+    pool = PagePool()
+    pages = [pool.alloc() for _ in range(5)]
+    pool.unref(pages[1])
+    pool.unref(pages[3])
+    assert pool.alloc() is pages[1], "the lowest free page is not the one handed out"
+    assert pool.trim() == 5 and len(pool.pages) == 5, "a free page before a held one let go"
+    for p in pages[3:]:
+        if p.refs:
+            pool.unref(p)
+    assert pool.trim() == 3 and len(pool.pages) == 3 and pool.free == [] and not pool.check()
+    assert pool.alloc().id == 3
+    for p in pool.pages:
+        if p.refs:
+            pool.unref(p)
+    assert pool.trim() == 0 and pool.pages == [] and pool.free == [] and not pool.check()
+
+
 def test_growth_is_asked_before_a_page_is_made() -> None:
     """a pool with no free page asks the ledger for the storage of one more first; refused, it holds what it held"""
     asked: list[int] = []

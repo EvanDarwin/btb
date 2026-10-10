@@ -106,6 +106,9 @@ class HostRegion:
         self.dtype: torch.dtype | None = None  # the regions' dtype, from the first rows written
         self.k: dict[int, torch.Tensor] = {}
         self.v: dict[int, torch.Tensor] = {}
+        # a layer's regions short of `cap` pages: a fill the ledger refused part way (`_fill`), finished at the next
+        # ask - a write's `shape`, a growth - before any row lands in them
+        self._short = False
 
     def _el(self) -> int:
         return torch.empty(0, dtype=self.dtype or self.kv_dtype or torch.float32).element_size()
@@ -116,41 +119,54 @@ class HostRegion:
 
     def nbytes(self) -> int:
         """what the regions hold"""
-        return 2 * len(self.k) * self.hk * self.cap * PAGE * self.d * self._el()
+        return sum(t.numel() * t.element_size() for store in (self.k, self.v) for t in store.values())
 
     def growth(self, pages: int) -> int:
         """the free memory a growth to hold `pages` pages takes at its peak: what the regions add, and the buffer a
         new one replaces, held until its rows are copied over (the last one's, every other let go by then); 0 where
         they hold them already"""
-        if pages <= self.cap or not self.layers:
+        if (pages <= self.cap and not self._short) or not self.layers:
             return 0
-        new = self._target(pages)
+        new = self._target(pages) if pages > self.cap else self.cap
         row = self.hk * PAGE * self.d * self._el()
-        return 2 * len(self.layers) * (new - self.cap) * row + self.cap * row
+        if self.dtype is None:
+            return 2 * len(self.layers) * (new - self.cap) * row + self.cap * row
+        have = [store[i].shape[1] // PAGE if i in store else 0 for store in (self.k, self.v) for i in self.layers]
+        return sum(max(0, new - n) for n in have) * row + max(have, default=0) * row
 
     def shape(self, k: torch.Tensor) -> None:
-        """the rows' dtype from the first ones written, [B, Hk, T, D] - their heads and width the pool's"""
+        """the rows' dtype from the first ones written, [B, Hk, T, D] - their heads and width the pool's - and every
+        layer's regions made for the pages counted (`_fill`) before a row lands in them"""
         if int(k.shape[1]) != self.hk or int(k.shape[-1]) != self.d:
             raise PagedError(
                 f"rows of {int(k.shape[1])} heads of {int(k.shape[-1])} into a pool of {self.hk} of {self.d}"
             )
         if self.dtype is None:
             self.dtype = self.kv_dtype or k.dtype
-            if self.cap:
-                # pages made before the host's first rows (the card's layers wrote first): their regions made now
-                for i in self.layers:
-                    self._regrow(i, self.cap)
+            # pages made before the host's first rows (the card's layers wrote first): their regions made now
+            self._short = bool(self.cap)
+        if self._short:
+            self._fill(self.cap)
 
     def grow(self, pages: int) -> None:
         """the regions hold rows for `pages` pages: each layer's K and V regrown in turn as the ledger grants it -
         once the rows' dtype is known (`shape`), the pages counted till then"""
-        if pages <= self.cap:
+        if pages <= self.cap and not self._short:
             return
-        new = self._target(pages)
+        new = self._target(pages) if pages > self.cap else self.cap
         if self.dtype is not None:
-            for i in self.layers:
-                self._regrow(i, new)
+            self._fill(new)
         self.cap = new
+
+    def _fill(self, pages: int) -> None:
+        """every layer's K and V made or regrown to `pages` pages as the ledger grants each. Refused part way, the
+        layers grown keep theirs and the region stays short (`_short`): the next write or growth goes on from the first
+        layer short - with the dtype set and the pages counted, nothing asked again, and a write to a layer whose
+        regions were never made raised KeyError however much RAM had come back"""
+        self._short = True
+        for i in self.layers:
+            self._regrow(i, pages)
+        self._short = False
 
     @_kept
     def _regrow(self, i: int, new: int) -> None:
@@ -192,6 +208,42 @@ class HostRegion:
             self.layers.remove(i)
         self.k.pop(i, None)
         self.v.pop(i, None)
+
+    @_kept
+    def shrink(self, pages: int) -> int:
+        """the regions cut to `pages` pages - the pool let every page past them go (`PagePool.trim`) - a buffer at a
+        time, its rows kept copied into one of the new length as the ledger grants it, or let go whole where no page
+        is left. Refused part way, the buffers not yet cut keep their length, their rows past `pages` unread. Returns
+        the bytes given back: grown for the longest conversation, the regions held them until the engine closed"""
+        pages = max(0, int(pages))
+        if pages >= self.cap:
+            return 0
+        before = self.nbytes()
+        rows, el = pages * PAGE, self._el()
+        try:
+            for store in (self.k, self.v):
+                for i in list(store):
+                    old = store[i]
+                    if old.shape[1] <= rows:
+                        continue
+                    if rows:
+                        if self.grant is not None:
+                            # a copy of rows the ledger counted already, made smaller: it spends no reservation
+                            self.grant(
+                                self.hk * rows * self.d * el,
+                                "kv",
+                                requester=f"the prefix cache's layer {i} cut to {pages} pages",
+                                device="cpu",
+                                draws="",
+                            )
+                        store[i] = old[:, :rows].clone()
+                    else:
+                        del store[i]
+                    del old
+        except MemoryGrantError:
+            pass
+        self.cap = pages
+        return max(0, before - self.nbytes())
 
     def write(self, i: int, rows: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
         """layer i's `k`, `v` [Hk, T, D] at `rows` (T of them, int64 on the host)"""
@@ -332,15 +384,28 @@ class CardRegion:
         if slots <= self.cap or not self.arenas:
             return 0
         new = self._target(self.cap, slots)
-        a = next(iter(self.arenas.values()))
-        extra = 0 if a.in_place else self.cap * self._page_bytes()
-        return len(self.arenas) * (new - self.cap) * self._page_bytes() + extra
+        return len(self.arenas) * (new - self.cap) * self._page_bytes() + self._beside()
 
     def park_growth(self, slots: int) -> int:
-        """the RAM a growth of the park to `slots` slots takes; 0 where it holds them already"""
-        if slots <= len(self.parked) or not self.arenas:
+        """the RAM a growth of the park to `slots` slots takes at its peak: what the parks add, and regrown rather
+        than mapped in place, a layer's park at a time, its old one beside its new; 0 where it holds them already"""
+        have = len(self.parked)
+        if slots <= have or not self.arenas:
             return 0
-        return len(self.arenas) * (self._target(len(self.parked), slots) - len(self.parked)) * self._page_bytes()
+        new = self._target(have, slots)
+        return len(self.arenas) * (new - have) * self._page_bytes() + self._park_beside()
+
+    def _park_beside(self) -> int:
+        """the old park a park's growth holds beside its new one: one layer's, where the parks are regrown rather than
+        mapped in place"""
+        p = next(iter(self.parks.values()), None)
+        return 0 if p is None or p.in_place else len(self.parked) * self._page_bytes()
+
+    def _beside(self) -> int:
+        """the old arena an arenas' growth holds beside its new one: one layer's, where they are regrown rather than
+        mapped in place"""
+        a = next(iter(self.arenas.values()), None)
+        return 0 if a is None or a.in_place else self.cap * self._page_bytes()
 
     def _counts(self, table: Table) -> tuple[int, int]:
         """(the table's pages in the park, the pages on the card it does not read): what binding it moves - a page is
@@ -395,12 +460,15 @@ class CardRegion:
             return
         new = self._target(self.cap, slots)
         if self.grant is not None and self.arenas:
+            # the growth's peak (`growth`), which the free memory must hold - not the arenas' whole new size: grown in
+            # place, what they hold already is no part of it (asked for whole, a growth `growth` priced as fitting was
+            # refused). The old arena held beside its new one is let go once filled
             self.grant(
-                len(self.arenas) * new * self._page_bytes(),
+                self.growth(slots),
                 "kv",
                 requester=f"the prefix cache's card arenas, {len(self.arenas)} layers x {new} pages of {PAGE} rows",
                 device=self.dev,
-                held=self.nbytes(),
+                held=self._beside(),
             )
         for a in self.arenas.values():
             a.grow(new * PAGE)
@@ -415,12 +483,13 @@ class CardRegion:
             return
         new = self._target(len(self.parked), slots)
         if self.grant is not None and self.arenas:
+            # the growth's peak (`park_growth`), as the card arenas' (`_grow`)
             self.grant(
-                len(self.arenas) * new * self._page_bytes(),
+                self.park_growth(slots),
                 "kv",
                 requester=f"the prefix cache's park, {len(self.arenas)} layers x {new} pages of {PAGE} rows",
                 device="cpu",
-                held=self.park_nbytes(),
+                held=self._park_beside(),
             )
         # a park regrown where the driver maps no RAM in place is copied by the host: the copies queued into it first
         self._settle()
@@ -905,6 +974,31 @@ class KvPool:
                 self.host.drop(i)
             else:
                 self.card.drop(i, self.host, live)
+
+    def trim(self) -> int:
+        """the free pages past the last one held let go, and the host's region cut to the pages left - never below its
+        first growth (`HostRegion.MIN_PAGES`), the room any request starts in: the RAM given back. Its buffers grow for
+        the longest conversation and kept that length once its pages were free - a long decode with no session held
+        gigabytes no conversation read. Cut to nothing, a model that had given up all it could for another program
+        could not grow them again to answer its next request. Nothing while the card's slots move (a page let go there
+        is freed once the move is done)"""
+        if self.card is not None and self.card._moving:
+            return 0
+        with self.pages.lock:
+            return self.host.shrink(max(self.pages.trim(), HostRegion.MIN_PAGES))
+
+    def trimmable(self) -> int:
+        """the RAM `trim` would give back now"""
+        with self.pages.lock:
+            pages = self.pages.pages
+            n = len(pages)
+            while n and pages[n - 1].refs <= 0:
+                n -= 1
+            n = max(n, HostRegion.MIN_PAGES)
+            if n >= self.host.cap:
+                return 0
+            row = self.host.hk * PAGE * self.host.d * self.host._el()
+            return sum(max(0, t.shape[1] // PAGE - n) * row for s in (self.host.k, self.host.v) for t in s.values())
 
     def nbytes(self) -> dict[str, int]:
         """what the regions hold, by where: the host's and the park's in RAM, the card's arenas on the card"""

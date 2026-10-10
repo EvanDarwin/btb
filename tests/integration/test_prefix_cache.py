@@ -239,6 +239,35 @@ def test_two_conversations_opening_alike_read_the_same_rows(stem: str, place: st
 
 
 @CARD
+@pytest.mark.parametrize("place", ["card"])
+@pytest.mark.parametrize("stem", GRAPHED)
+def test_a_pass_at_a_callers_own_positions_rotates_by_them(stem: str, place: str) -> None:
+    """a pass the caller hands positions of its own (`forward(positions=)`), not the cache's next: the card's own
+    kernels rotate a chain at the cache's next positions, so the pass takes the torch layers, which rotate by the
+    caller's - every logit as with the card graph off (a cold prompt at its own positions came out at 0, 1, ...'s). At
+    the cache's next positions, handed or not, the card's kernels take it as ever"""
+    sm = model(stem, place)
+    ids = [[5, 9, 13, 2, 30]]
+    keep = getattr(sm, "card_graphs", True)
+    try:
+        out: dict[bool, torch.Tensor] = {}
+        for on in (True, False):
+            sm.__dict__.update(card_graphs=on)
+            with torch.inference_mode():
+                lg = sm.forward(ids, cache=sm._decode_cache(16), positions=[[10, 11, 12, 13, 14]], last_only=False)
+            assert lg is not None
+            out[on] = lg.float().cpu()
+            assert PassTag.CARD_PREFILL not in sm.last_pass_report(), f"card graphs {on}: the card rotated the rows"
+        assert torch.equal(out[True], out[False]), "the pass at the caller's positions parted from the torch layers'"
+        sm.__dict__.update(card_graphs=True)
+        with torch.inference_mode():
+            sm.forward(ids, cache=sm._decode_cache(16), positions=[[0, 1, 2, 3, 4]], last_only=False)
+        assert PassTag.CARD_PREFILL in sm.last_pass_report(), "the cache's next positions left the card's kernels"
+    finally:
+        sm.__dict__.update(card_graphs=keep)
+
+
+@CARD
 @pytest.mark.parametrize("place", ["card"])  # named, so the test declares the load it takes (`shared_model_keys`)
 @pytest.mark.parametrize("stem", GRAPHED)
 def test_a_hit_decodes_as_its_prompt_cold(stem: str, place: str) -> None:

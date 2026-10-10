@@ -12,6 +12,7 @@ bookkeeping.
 
 from __future__ import annotations
 
+import heapq
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -49,6 +50,8 @@ class PagePool:
 
     def __init__(self, grow: Callable[[int], None] | None = None, freed: Callable[[Page], None] | None = None) -> None:
         self.pages: list[Page] = []
+        # the free page ids, a heap: the lowest handed out first, so the pages held gather at the front and the free
+        # ones past the last held can be let go (`trim`)
         self.free: list[int] = []
         self._grow = grow
         self._freed = freed
@@ -70,7 +73,7 @@ class PagePool:
     def alloc(self, writer: object | None = None) -> Page:
         with self.lock:
             if self.free:
-                p = self.pages[self.free.pop()]
+                p = self.pages[heapq.heappop(self.free)]
             else:
                 if self._grow is not None:
                     self._grow(len(self.pages) + 1)
@@ -99,8 +102,21 @@ class PagePool:
             p.writer = None
             if self._freed is not None:
                 self._freed(p)
-            self.free.append(p.id)
+            heapq.heappush(self.free, p.id)
             return True
+
+    def trim(self) -> int:
+        """the free pages past the last one held let go: the pool's size after, the rows past it no page's (the
+        regions' to give back, `KvPool.trim`)"""
+        with self.lock:
+            n = len(self.pages)
+            while n and self.pages[n - 1].refs <= 0:
+                n -= 1
+            if n < len(self.pages):
+                del self.pages[n:]
+                self.free = [i for i in self.free if i < n]
+                heapq.heapify(self.free)
+            return n
 
     def of(self, rows: Iterable[int]) -> list[Page]:
         """the distinct pages `rows` lie in, in the order first met"""

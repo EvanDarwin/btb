@@ -320,6 +320,14 @@ class _ForwardMixin(_State):
         else:
             text_pos, rope_pos = self._positions(B, T, past, am)
         n_layers = self.L if stop_after is None else min(self.L, int(stop_after))
+        # a caller's own positions for a chain's rows (a verify tree's, `ap`, are its depths, which the card reads): the
+        # card's own kernels rotate a chain at the cache's next positions from `past`, so a pass at others takes the
+        # torch layers, which rotate by them - a cold prompt at its own positions came out at `past + t`'s
+        odd = (
+            positions is not None
+            and getattr(self, "ap", None) is None
+            and not torch.equal(text_pos, torch.arange(past, past + T, device=text_pos.device).expand_as(text_pos))
+        )
         # a pass the card graph takes whole (every layer one resident run) needs none of the preamble below:
         # the graph carries its own rotary tables and its attention needs no mask, and the rotary and the
         # mask together cost more host time than the graph's replay on a small model
@@ -328,7 +336,8 @@ class _ForwardMixin(_State):
         # chunks take the prefill's launches below whatever their width, as the layer-by-layer sweep's do - the
         # graph's rows are the same bits, but a chunk's width picking the path is a fork no prompt needs
         graph_ok = (
-            not getattr(self, "_batched_cont", False)
+            not odd
+            and not getattr(self, "_batched_cont", False)
             and self._card_pass_ok(cache, B, T, past, am, on_layer, stop_after)
             and self._card_arena_holds(cache, T)
         )
@@ -337,7 +346,10 @@ class _ForwardMixin(_State):
         # (`_forward_card_prefill`): each row the row its step makes, so a prompt's rows are its steps' whatever its
         # chunks, a cache hit decodes as the prompt cold, and a hooked verify pass's tree as its hooked steps
         prefill_ok = (
-            not graph_ok and self._card_prefill_ok(cache, B, T, am, stop_after) and self._card_arena_holds(cache, T)
+            not odd
+            and not graph_ok
+            and self._card_prefill_ok(cache, B, T, am, stop_after)
+            and self._card_arena_holds(cache, T)
         )
         if (graph_ok or prefill_ok) and self._card_segment_at(0, n_layers) == (0, n_layers) and n_layers == self.L:
             self._attn_ctx = cache

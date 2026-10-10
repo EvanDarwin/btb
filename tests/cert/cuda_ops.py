@@ -385,8 +385,12 @@ def uncounted_launches(sites: list[Site] | None = None) -> list[str]:
 def arity_mismatches(sites: list[Site] | None = None, arity: dict[str, int] | None = None) -> list[str]:
     """the launches that can hand a kernel they name a list of another length than its parameters, as
     `file:line kernel` with the counts: each kernel a launch's spellings match must take one of the lengths its list
-    can have (a launch choosing between kernels and argument lists - a row map or none - is held to the union, so a
-    dropped argument that no choice makes up for is caught)"""
+    can have. Where every kernel it can name declares one count (a fixed kernel, or one of its head widths), every
+    length its list can have must be that count: a list one value short on one branch passed while another branch had
+    the count. A launch choosing between kernels of different counts and their argument lists - a row map or none - is
+    held to the union, so a dropped argument that no choice makes up for is caught: its lists' lengths are counted
+    across their conditions independently, and a length no kernel declares there is the parse's, not a branch's (the
+    rows form's one value and no row map beside the tree form's two and its map read as 17 of 16 and 18)"""
     sites = launch_sites() if sites is None else sites
     arity = defined_arity() if arity is None else arity
     out = []
@@ -394,9 +398,11 @@ def arity_mismatches(sites: list[Site] | None = None, arity: dict[str, int] | No
         if counts is None:
             continue
         pats = [p for sp in spellings if (p := _pattern(sp)) is not None]
-        for k in sorted(k for k in arity if any(p.fullmatch(k) for p in pats)):
-            if arity[k] not in counts:
-                got = "/".join(str(c) for c in sorted(counts))
+        names = sorted(k for k in arity if any(p.fullmatch(k) for p in pats))
+        got = "/".join(str(c) for c in sorted(counts))
+        takes = {arity[k] for k in names}
+        for k in names:
+            if arity[k] not in counts or (len(takes) == 1 and len(counts) > 1):
                 out.append(f"{_where(path, line)} {k} (declares {arity[k]}, handed {got})")
     return out
 
