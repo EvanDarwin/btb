@@ -15,6 +15,7 @@ contiguous cache they always had, never a copied prefix.
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -78,6 +79,9 @@ class PrefixCache:
         self._held: dict[int, Table] = {}
         self._asking: Table | None = None
         self.tree.before = self.flush
+        # the row lists the host's attention reads a pass's rows by (`_CudaMixin._pass_lists`): the last conversation's
+        # alone - its table, the map's version they were made for, the lists
+        self._lists: tuple[weakref.ref[Table], int, dict[Any, Any]] | None = None
 
     @staticmethod
     def why_not(sm: Any) -> str | None:

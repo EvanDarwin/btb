@@ -508,13 +508,14 @@ def test_a_layer_the_card_gives_up_takes_every_conversations_rows_and_back(stem:
     same(paged, flat, "a layer shed and regrown")
 
 
-@pytest.mark.parametrize("place", ["cpu", pytest.param("kvhost", marks=CARD)])
+@pytest.mark.parametrize("place", ["cpu", pytest.param("kvhost", marks=CARD), pytest.param("split", marks=CARD)])
 @pytest.mark.parametrize("stem", ["tiny_qwen3"])
 def test_rows_off_the_conversation_are_their_own_and_asked_for(stem: str, place: str) -> None:
     """a fork and a batch of conversations in the pages are caches of their own - never a session's table read as
     paged (priced as its growth, bound to it every step) - whose rows are asked of the ledger as they grow (a paged
-    layer hands its fork the pool's gate) and step as a contiguous session's fork and batch do; and an idle
-    conversation holds none of its last pass's row lists"""
+    layer hands its fork the pool's gate) and step as a contiguous session's fork and batch do; and the row lists the
+    host's attention read a pass's rows by are the last conversation's alone - an idle one's held none, whatever ran
+    its last attention layer (the card's, under a split placement; kv_host's steps)"""
     sm = model(stem, place)
     rng = random.Random(11)
     p, q = toks(rng, 90), toks(rng, 40)
@@ -524,8 +525,12 @@ def test_rows_off_the_conversation_are_their_own_and_asked_for(stem: str, place:
         a, b = sm.session(), sm.session()
         a.feed(p)
         b.feed(q)
-        if sm._prefix_cache() is not None:
-            assert isinstance(a.cache, PagedCache) and a.cache.__dict__.get("_lists") is None, "an idle cache's lists"
+        a.generate(2, eos=(), speculate=False)  # a step's lists (kv_host's on the host, a split's under the card)
+        b.feed(q[:3])
+        pc = sm._prefix_cache()
+        if pc is not None:
+            held = pc._lists
+            assert isinstance(b.cache, PagedCache) and (held is None or held[0]() is b.cache.table), "idle lists held"
         with a.fork(3) as br:
             assert br.cache is not None and not getattr(br.cache, "paged", False)
             assert all(cl.grant is not None for cl in br.cache.layers if isinstance(cl, ForkLayer))

@@ -2729,12 +2729,19 @@ class _CudaMixin(_State):
             # chunk's width, never both at once
             run = self.scratch.take("card attention rows", (T * Hq * D,), torch.float32, dev, who)
         else:
-            # the decode form's group states: the groups the card's rows reach, as a graph's cover the arena
+            # the decode form's group states: the groups the card's rows reach, as a graph's cover the arena - the set
+            # the graphs of this width hold where they hold one (`_card_parts`: a hooked verify runs here beside them,
+            # and a set of its own held the arena's every group twice, a gigabyte at a million rows), else the chunk's
             S = (cap + self._attn_group(D) - 1) // self._attn_group(D)
             run = buf("par", (T,), torch.int32)
-            part_m, part_l = buf("part m", (S * T * Hq,), torch.float32), buf("part l", (S * T * Hq,), torch.float32)
-            part_acc = buf("part acc", (S * T * Hq * D,), torch.float32)
-            cnt = buf("cnt", (T * Hq,), torch.int32)
+            held = st.get("parts", {}).get((T, S))
+            if held is not None:
+                part_m, part_l, part_acc, cnt = held["part_m"], held["part_l"], held["part_acc"], held["cnt"]
+            else:
+                part_m = buf("part m", (S * T * Hq,), torch.float32)
+                part_l = buf("part l", (S * T * Hq,), torch.float32)
+                part_acc = buf("part acc", (S * T * Hq * D,), torch.float32)
+                cnt = buf("cnt", (T * Hq,), torch.int32)
         r0 = 0 if all_rows else T - 1
         tail_bufs = self._card_tail_buffers(T - r0, H) if tail else None
         hb.copy_(h.reshape(T, H))
@@ -3788,8 +3795,6 @@ class _CudaMixin(_State):
             else:
                 offs, idx = self._node_lists(cache if paged else None, base, T, parents, win)
                 Native.attn_nodes(qf, k_full[0], v_full[0], offs, idx, float(at.scaling), out)
-            if paged and i == max(j for j, lt in enumerate(self.layer_types) if lt != LayerKind.LINEAR):
-                cache._lists = None  # the pass's lists go with its last attention layer: an idle cache holds none
             if gate_all is None:
                 outs.append(out.view(1, T, -1).to(h.dtype))  # a cast: each element its own, whatever its neighbours
             else:
@@ -3814,11 +3819,14 @@ class _CudaMixin(_State):
     def _pass_lists(paged: Any) -> dict[Any, Any]:
         """a paged cache's lists for the pass (`_span_lists`, `_node_lists`): those of its row map's present version
         alone, which every change to the map moves - a window's and the whole prefix's (Gemma 3's layers alternate)
-        side by side, made once for every layer that reads them alike"""
-        ver, memo = paged.__dict__.get("_lists") or (None, {})
-        if ver != paged.table.version:
+        side by side, made once for every layer that reads them alike. One set for the engine's prefix cache, the last
+        conversation's: kept on each conversation, an idle one held its last pass's (let go at the last attention
+        layer, which a pass running it on the card - a split placement's, kv_host's steps - never reached)"""
+        pc, table = paged.prefix, paged.table
+        ref, ver, memo = pc._lists or (None, None, {})
+        if ref is None or ref() is not table or ver != table.version:
             memo = {}
-            paged._lists = (paged.table.version, memo)
+            pc._lists = (weakref.ref(table), table.version, memo)
         return cast("dict[Any, Any]", memo)
 
     @staticmethod

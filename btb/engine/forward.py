@@ -1912,10 +1912,6 @@ class _ForwardMixin(_State):
             else:
                 amap, starts, ends = self._span_lists(cache if paged else None, past, T, win)
                 Native.attn_spans(qf, kf[0], vf[0], amap, starts, ends, float(at.scaling), out)
-            if paged and i == max(j for j, lt in enumerate(self.layer_types) if lt != LayerKind.LINEAR):
-                # the pass's lists go with its last attention layer, as `_ai_attention`'s do: kept, an idle
-                # conversation held its whole map's lists (12.8 MB at 32k rows) until its next pass
-                cache._lists = None
             attn = out.view(1, T, qf.shape[1], qf.shape[2])
         elif paged:
             # a prompt's chunk on the card over the prefix staged from the host's region through the map
