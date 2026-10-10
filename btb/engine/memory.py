@@ -256,6 +256,7 @@ class _MemoryMixin(_State):
             except BaseException:
                 self.host.pop(i, None)
                 self.resident[i] = tmpl
+                self._kv_back(i)
                 raise
             del tmpl
             moved = f"layer {i}"
@@ -304,9 +305,18 @@ class _MemoryMixin(_State):
                 if host is not None:
                     self.host[i] = host
                 self._shed.append(what)
+                self._kv_back(i)
                 raise
         log(f"[vram] REGROW {what} -> {self.dev} (still shed: {self._shed}); " + vram_pressure_line())
         return what
+
+    def _kv_back(self, i: int) -> None:
+        """a layer's move undone: the prefix cache's rows of it back in the region where it runs again. `_caches_to`
+        moves them before the live caches' rows, which may still be refused; left, a layer back on the host read its
+        rows on the card (or one back on the card, its rows on the host) until the next move"""
+        pc = self.__dict__.get("_kv")
+        if pc is not None:
+            pc.place(self, i)
 
     def vram_trim(self, tag: str = "") -> Any:
         if self.dev.type != Device.CUDA:

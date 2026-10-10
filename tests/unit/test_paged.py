@@ -522,3 +522,104 @@ def test_a_layer_moving_between_the_regions_takes_every_conversations_rows() -> 
     for c, k in ((a, ka), (b, kb)):
         assert torch.equal(read(c, 1)[0][..., : k.shape[-2], :], bf(k + 1))
     assert torch.equal(card_rows(a, 1)[0], bf(ka + 1))
+
+
+def test_a_conversation_let_go_while_a_layer_moves_frees_its_pages_after(monkeypatch: pytest.MonkeyPatch) -> None:
+    """a conversation collected while a layer's rows move between the regions (the collector run by an allocation of
+    the copies, on the same thread): its pages keep the slots the copies read until the move is done, then free once
+    - the layer moves whole, the other conversation's rows as they were, every way"""
+    from btb.engine import paged
+
+    pc = prefix(card=(0, 1))
+    card = pc.pool.card
+    assert card is not None
+    b = pc.new()
+    kb, vb = rows(PAGE + 9, 85)
+    write(b, kb, vb)
+    real = paged._page_rows
+    for to_card in (False, True):
+        victim = pc.new()
+        write(victim, *rows(2 * PAGE + 3, 86))  # bound last: its pages before b's in no run of slots
+        assert all(p.slot >= 0 for p in victim.table.held.values())
+
+        def collected(starts: Any, victim: PagedCache = victim) -> torch.Tensor:
+            if victim.table.held:
+                victim.release()  # as its finalizer would, run by the collector inside the move
+            return real(starts)
+
+        monkeypatch.setattr(paged, "_page_rows", collected)
+        pc.pool.rehome(1, card=to_card)
+        monkeypatch.setattr(paged, "_page_rows", real)
+        assert pc.pool.on_card(1) == to_card and (1 in pc.pool.host.layers) != to_card
+        assert not victim.table.held and not region_check(card) and not pc.pool.pages.check()
+        got = read(b, 1)
+        assert torch.equal(got[0].to(torch.bfloat16), bf(kb + 1)) and torch.equal(got[1].to(torch.bfloat16), bf(vb - 1))
+
+
+def test_a_layer_move_refused_part_way_leaves_its_rows_where_they_were() -> None:
+    """a layer's move asks every grant before it makes anything, and registers what it made only once the rows are
+    in: refused, the layer's rows are where they were - the host's region whole, no arena of no rows on the card for
+    the next move to take as made - and asked again it moves them. A layer leaving the card stages its rows in RAM
+    alone: nothing asked of the card, whose room is what the shed makes"""
+    refuse: list[str] = []  # the requests refused, by what their requester says
+    asked: list[tuple[str, Any]] = []
+
+    def grant(nbytes: int, kind: str, **kw: Any) -> None:
+        asked.append((str(kw.get("requester")), kw.get("device")))
+        if any(r in str(kw.get("requester")) for r in refuse):
+            raise MemoryGrantError("refused", device=kw.get("device"))
+
+    pc = prefix(grant, card=(0, 1))
+    card = pc.pool.card
+    assert card is not None
+    a = pc.new()
+    k, v = rows(2 * PAGE + 5, 87)
+    write(a, k, v)
+    refuse[:] = ["a run at a time"]
+    with pytest.raises(MemoryGrantError):
+        pc.pool.rehome(1, card=False)  # its staging refused: nothing made on the host
+    assert pc.pool.on_card(1) and 1 not in pc.pool.host.layers and 1 not in pc.pool.host.k, "a host region left"
+    refuse.clear()
+    asked.clear()
+    pc.pool.rehome(1, card=False)
+    assert not pc.pool.on_card(1) and 1 in pc.pool.host.layers
+    staged = [dev for who, dev in asked if "a run at a time" in who]
+    assert staged == ["cpu"], f"a shed staged its rows on the card: {asked}"
+    refuse[:] = ["card arena for layer 1"]
+    with pytest.raises(MemoryGrantError):
+        pc.pool.rehome(1, card=True)  # the arena refused: nothing made
+    assert 1 not in card.arenas and 1 not in card.parks and 1 in pc.pool.host.layers
+    refuse[:] = ["a run at a time"]
+    with pytest.raises(MemoryGrantError):
+        pc.pool.rehome(1, card=True)  # the staging refused after the arena's grant: still nothing made
+    assert 1 not in card.arenas and 1 not in card.parks and 1 in pc.pool.host.k
+    refuse.clear()
+    pc.pool.rehome(1, card=True)
+    assert pc.pool.on_card(1) and 1 not in pc.pool.host.layers
+    assert torch.equal(card_rows(a, 1)[0], bf(k + 1)) and torch.equal(card_rows(a, 1)[1], bf(v - 1))
+
+
+def test_the_host_reads_the_park_only_once_the_copies_into_it_landed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """the park's copies run on the card's stream, which the host's own reads of the park do not wait for: a gather
+    of parked rows waits for the copies queued into the park first (a batch re-formed after its write-back read a
+    trade's rows before they landed: another conversation's keys), and nothing is waited for once they have"""
+    pc = prefix(card=(0, 1))
+    card = pc.pool.card
+    assert card is not None
+    waits: list[bool] = []
+    settle = card._settle
+
+    def watch() -> None:
+        waits.append(card._queued)
+        settle()
+
+    monkeypatch.setattr(card, "_settle", watch)
+    a, b = pc.new(), pc.new()
+    ka, va = rows(PAGE + 7, 88)
+    write(a, ka, va)
+    write(b, *rows((len(card.free) + 2) * PAGE, 89))  # both of a's pages parked for b's room
+    assert all(p.park >= 0 for p in a.table.held.values()) and card._queued
+    for i in (0, 1):
+        got = read(a, i)
+        assert torch.equal(got[0], bf(ka + i)) and torch.equal(got[1], bf(va - i))
+    assert waits and waits[-1] is False and True in waits and not card._queued, waits

@@ -1440,6 +1440,44 @@ def test_a_shed_whose_host_copy_is_refused_leaves_the_layer_on_the_card() -> Non
     assert 3 in stub.resident and not stub.host
 
 
+def test_a_layer_move_undone_puts_the_prefix_caches_rows_back_with_it() -> None:
+    """a shed or a regrow whose live caches' rows are refused after the prefix cache's moved (`_caches_to` places
+    the pool's first) puts the layer back - and asks the pool to place its rows where the layer runs again: left, a
+    layer back on the card read rows on the host (or back on the host, rows on the card) until its next move"""
+    placed: list[tuple[int, bool]] = []
+
+    def refuse(i: int, dev: Any, cache: Any = None) -> None:
+        raise MemoryGrantError("the fork's rows refused")
+
+    stub = types.SimpleNamespace(
+        aj=None,
+        resident={3: object()},
+        host={},
+        dev=torch.device("cpu"),
+        resident_head=False,
+        _shed=[],
+        log=lambda *a: None,
+        _layer_bytes=lambda i: GB,
+        _card_let_go=lambda: None,
+        _make_host_layer=lambda i: object(),
+        _caches_to=refuse,
+        _new_layer=lambda i: object(),
+        _load_layer=lambda i, tmpl, first=False: None,
+        resident_fp32=False,
+        compute_dtype=None,
+    )
+    stub._kv = types.SimpleNamespace(place=lambda sm, i: placed.append((i, i in sm.resident)))
+    stub._kv_back = lambda i: _MemoryMixin._kv_back(cast(Any, stub), i)
+    with pytest.raises(MemoryGrantError):
+        _MemoryMixin.vram_shed(cast(Any, stub))
+    assert 3 in stub.resident and not stub.host and placed == [(3, True)], placed
+    stub.resident, stub.host, stub._shed = {}, {3: object()}, ["layer 3"]
+    with pytest.raises(MemoryGrantError):
+        _MemoryMixin.vram_regrow(cast(Any, stub))
+    assert 3 in stub.host and not stub.resident and stub._shed == ["layer 3"]
+    assert placed == [(3, True), (3, False)], placed
+
+
 def test_the_widest_speculative_pass_is_held_to_what_the_family_verifies() -> None:
     """a tree budget past what the family verifies exactly (Qwen4's card program: 32 rows) is held to it - a wider
     pass took the torch path, and its pricing raised past the program's widths - and a pass the pricer is handed past

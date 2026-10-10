@@ -55,6 +55,18 @@ def _page_rows(starts: Iterable[int]) -> torch.Tensor:
     return (s[:, None] * PAGE + torch.arange(PAGE)[None]).flatten()
 
 
+def _consecutive(pages: Iterable[Page], at: Callable[[Page], int]) -> list[list[Page]]:
+    """`pages` in runs whose `at` (a card slot, a park slot) goes up by one, at most MOVE_PAGES long: a run's rows
+    one slice of the region"""
+    out: list[list[Page]] = []
+    for p in sorted(pages, key=at):
+        if out and at(out[-1][-1]) + 1 == at(p) and len(out[-1]) < MOVE_PAGES:
+            out[-1].append(p)
+        else:
+            out.append([p])
+    return out
+
+
 def _runs(pairs: Iterable[tuple[int, int]]) -> list[tuple[int, int, int]]:
     """(from, to) slot pairs as runs (from, to, count) where both go up by one together, at most MOVE_PAGES long:
     one copy a run instead of one a page"""
@@ -253,6 +265,8 @@ class CardRegion:
         # the pages let go while the slots were moving (`_moving`), their slots freed once the move is done
         self._moving = 0
         self._let_go: list[Page] = []
+        # copies into or out of the park queued on the card's stream and not yet waited for (`_settle`)
+        self._queued = False
 
     @contextlib.contextmanager
     def _move(self) -> Iterator[None]:
@@ -289,9 +303,12 @@ class CardRegion:
         """the card slots the arenas hold rows for"""
         return len(self.slots)
 
+    def _el(self) -> int:
+        return torch.empty(0, dtype=self.dtype).element_size()
+
     def _page_bytes(self) -> int:
         """one page's K and V of one layer"""
-        return 2 * PAGE * self.hk * self.d * torch.empty(0, dtype=self.dtype).element_size()
+        return 2 * PAGE * self.hk * self.d * self._el()
 
     def nbytes(self) -> int:
         """what the arenas hold on the card"""
@@ -408,6 +425,8 @@ class CardRegion:
                 device="cpu",
                 held=self.park_nbytes(),
             )
+        # a park regrown where the driver maps no RAM in place is copied by the host: the copies queued into it first
+        self._settle()
         for i in self.arenas:
             p = self.parks.get(i)
             if p is None:
@@ -477,6 +496,16 @@ class CardRegion:
                 a, b = src[i].view(w, 0), dst[i].view(w, 0)
                 for s, d, n in runs:
                     b[d * PAGE : (d + n) * PAGE].copy_(a[s * PAGE : (s + n) * PAGE], non_blocking=True)
+        self._queued = self._queued or bool(runs and self.arenas)
+
+    def _settle(self) -> None:
+        """the copies queued into and out of the park landed, before the host reads or copies the park itself: they
+        run on the card's stream, the host's reads do not wait for it (a gather read rows a trade was still writing,
+        another conversation's)"""
+        if self._queued:
+            if self.dev.type == "cuda":
+                torch.cuda.synchronize(self.dev)
+            self._queued = False
 
     def park(self, pages: Sequence[Page]) -> None:
         """`pages` off the card into the park, their card slots free again"""
@@ -546,10 +575,9 @@ class CardRegion:
         with self._move():
             if self.arenas:
                 n = min(len(pairs), MOVE_PAGES)
-                el = torch.empty(0, dtype=self.dtype).element_size()
                 if self.grant is not None:
                     self.grant(
-                        n * PAGE * self.hk * self.d * el,
+                        n * self._page_bytes() // 2,
                         "kv",
                         requester="the prefix cache's trade of pages between the card and the park",
                         device=self.dev,
@@ -569,6 +597,7 @@ class CardRegion:
                             for j, (_, b) in enumerate(chunk):
                                 src = stage[j * PAGE : (j + 1) * PAGE]
                                 park[b.park * PAGE : (b.park + 1) * PAGE].copy_(src, non_blocking=True)
+                self._queued = True
             for o, b in pairs:
                 s, ps = o.slot, b.park
                 self.slots[s], self.parked[ps] = b, o
@@ -668,6 +697,7 @@ class CardRegion:
             if bool((where < 0).any()):
                 raise PagedError(f"pages {ids[where < 0].tolist()} have no rows on the card or in the park")
             park = where[inv] * PAGE + off[at_off]
+            self._settle()  # read on the host: what a park or a trade is still copying into it landed first
         out = []
         for w in ("k", "v"):
             got = torch.empty(len(r), self.hk, self.d, dtype=self.dtype, device=self.dev)
@@ -679,12 +709,16 @@ class CardRegion:
             out.append(got.transpose(0, 1)[None])
         return out[0], out[1]
 
-    def _stage(self, n: int, what: str) -> None:
-        """the copies of a layer's move asked of the scheduler: `n` pages' K or V, on the card and in RAM at once"""
+    def _stage(self, n: int, what: str, host: HostRegion) -> None:
+        """the copies of a layer's move asked of the scheduler: `n` pages' K or V staged in RAM - gathered off the
+        host's region, made contiguous, cast - a run at a time. Nothing on the card: a run of slots is sent straight
+        into the arena or read straight out of it, so a shed, which is what makes the card's room, never waits for
+        room on the card (staged there, a game launching found the shed refused and every request failing)"""
         if self.grant is not None and n:
-            nbytes = n * PAGE * self.hk * self.d * torch.empty(0, dtype=self.dtype).element_size()
-            for dev in (self.dev, torch.device("cpu")):
-                self.grant(nbytes, "kv", requester=f"the prefix cache's {what}, a run at a time", device=dev, draws="")
+            el = torch.empty(0, dtype=host.dtype or host.kv_dtype or torch.float32).element_size()
+            nbytes = n * PAGE * self.hk * self.d * (2 * el + self._el())
+            who = f"the prefix cache's {what}, a run at a time"
+            self.grant(nbytes, "kv", requester=who, device="cpu", draws="")
 
     def move(self, src: torch.Tensor, dst: torch.Tensor) -> None:
         """every layer's page rows at `src` copied to `dst` on the card (the source read whole first)"""
@@ -697,69 +731,88 @@ class CardRegion:
     @_kept
     def add(self, i: int, host: HostRegion, live: Sequence[Page]) -> None:
         """layer i's rows held here from now on (it came onto the card): its arena and park made at the slots the
-        region holds, granted, and every live page's rows of it copied in from the host's region"""
+        region holds and every live page's rows of it copied in from the host's region, a run of slots a copy straight
+        into the arena. Under the move (`_move`): a conversation let go meanwhile frees its pages once the copies that
+        read their slots are done. Every grant asked before anything is made, the arena and park registered once their
+        rows are in: refused or failed part way, the layer's rows are the host's as they were, and the move asked
+        again makes it (registered first, a refused stage left an arena of no rows the next move took as made)"""
         if i in self.arenas:
             return
-        pb = self._page_bytes()
-        if self.grant is not None:
-            self.grant(self.cap * pb, "kv", requester=f"the prefix cache's card arena for layer {i}", device=self.dev)
-            if self.parked:
-                who = f"the prefix cache's park for layer {i}"
-                self.grant(len(self.parked) * pb, "kv", requester=who, device="cpu")
-        a = self.arenas[i] = self._arena()
-        if self.cap:
-            a.grow(self.cap * PAGE)
-        if self.parked:
-            pk = self.parks[i] = self._park_arena()
-            pk.grow(len(self.parked) * PAGE)
-        self.layout += 1
-        if i not in host.k:
-            return
-        # a run of pages at a time: their rows gathered off the host's region in one, sent in one copy and put in
-        # their slots in one - a page a copy, a 32k conversation's layer was 512 synchronous copies each way
-        on = [p for p in live if p.slot >= 0]
-        parked = [p for p in live if p.slot < 0 and p.park >= 0]
-        self._stage(min(MOVE_PAGES, max(len(on), len(parked))), f"layer {i}'s rows onto the card")
-        for w, src in (("k", host.k[i]), ("v", host.v[i])):
-            for c0 in range(0, len(on), MOVE_PAGES):
-                run = on[c0 : c0 + MOVE_PAGES]
-                rows = src.index_select(1, _page_rows(p.id for p in run)).transpose(0, 1)
-                at = _page_rows(p.slot for p in run).to(self.dev)
-                a.view(w, 0).index_copy_(0, at, rows.to(self.dev, self.dtype))
-            for c0 in range(0, len(parked), MOVE_PAGES):
-                run = parked[c0 : c0 + MOVE_PAGES]
-                rows = src.index_select(1, _page_rows(p.id for p in run)).transpose(0, 1)
-                self.parks[i].view(w, 0).index_copy_(0, _page_rows(p.park for p in run), rows.to(self.dtype))
+        with self._move():
+            pb = self._page_bytes()
+            rows = i in host.k
+            on = [p for p in live if p.slot >= 0] if rows else []
+            parked = [p for p in live if p.slot < 0 and p.park >= 0] if rows else []
+            if self.grant is not None:
+                who = f"the prefix cache's card arena for layer {i}"
+                self.grant(self.cap * pb, "kv", requester=who, device=self.dev)
+                if self.parked:
+                    who = f"the prefix cache's park for layer {i}"
+                    self.grant(len(self.parked) * pb, "kv", requester=who, device="cpu")
+            self._stage(min(MOVE_PAGES, max(len(on), len(parked))), f"layer {i}'s rows onto the card", host)
+            a = self._arena()
+            pk = self._park_arena() if self.parked else None
+            try:
+                if self.cap:
+                    a.grow(self.cap * PAGE)
+                if pk is not None:
+                    pk.grow(len(self.parked) * PAGE)
+                for w, src in (("k", host.k[i]), ("v", host.v[i])) if rows else ():
+                    for run in _consecutive(on, lambda p: p.slot):
+                        got = src.index_select(1, _page_rows(p.id for p in run)).transpose(0, 1).contiguous()
+                        s = run[0].slot
+                        a.view(w, 0)[s * PAGE : (s + len(run)) * PAGE].copy_(got.to(self.dtype))
+                    for c0 in range(0, len(parked), MOVE_PAGES):
+                        assert pk is not None
+                        run = parked[c0 : c0 + MOVE_PAGES]
+                        got = src.index_select(1, _page_rows(p.id for p in run)).transpose(0, 1)
+                        pk.view(w, 0).index_copy_(0, _page_rows(p.park for p in run), got.to(self.dtype))
+            except BaseException:
+                a.close()
+                if pk is not None:
+                    pk.close()
+                raise
+            self.arenas[i] = a
+            if pk is not None:
+                self.parks[i] = pk
+            self.layout += 1
 
     def drop(self, i: int, host: HostRegion, live: Sequence[Page]) -> None:
         """layer i's rows held on the host from now on (it left the card): every live page's rows of it copied to
-        the host's region (made for it there first), a run of pages at a time - gathered in one, sent in one copy,
-        put in place in one - and its arena and park let go"""
+        the host's region (made for it there first), a run of slots read straight off the arena in one copy - nothing
+        made on the card, whose room the shed is making - and its arena and park let go. Under the move, as `add`;
+        refused or failed part way, the host's region made for it goes again and the layer's rows stay the card's"""
         if i not in self.arenas:
             return
-        host.add(i)
-        if i in host.k:
-            if self.dev.type == "cuda":
-                torch.cuda.synchronize(self.dev)  # the park's copies in flight landed before the host reads it
+        with self._move():
             a, pk = self.arenas[i], self.parks.get(i)
             on = [p for p in live if p.slot >= 0]
             parked = [p for p in live if p.slot < 0 and p.park >= 0] if pk is not None else []
-            self._stage(min(MOVE_PAGES, max(len(on), len(parked))), f"layer {i}'s rows off the card")
-            for w, dst in (("k", host.k[i]), ("v", host.v[i])):
-                for c0 in range(0, len(on), MOVE_PAGES):
-                    run = on[c0 : c0 + MOVE_PAGES]
-                    rows = a.view(w, 0).index_select(0, _page_rows(p.slot for p in run).to(self.dev)).cpu()
-                    dst.index_copy_(1, _page_rows(p.id for p in run), rows.transpose(0, 1).to(dst.dtype))
-                for c0 in range(0, len(parked), MOVE_PAGES):
-                    assert pk is not None
-                    run = parked[c0 : c0 + MOVE_PAGES]
-                    rows = pk.view(w, 0).index_select(0, _page_rows(p.park for p in run))
-                    dst.index_copy_(1, _page_rows(p.id for p in run), rows.transpose(0, 1).to(dst.dtype))
-        self.arenas.pop(i).close()
-        pk = self.parks.pop(i, None)
-        if pk is not None:
-            pk.close()
-        self.layout += 1
+            self._stage(min(MOVE_PAGES, max(len(on), len(parked))), f"layer {i}'s rows off the card", host)
+            made = i not in host.layers
+            try:
+                host.add(i)
+                if i in host.k:
+                    self._settle()  # the park's copies in flight landed before the host reads it
+                    for w, dst in (("k", host.k[i]), ("v", host.v[i])):
+                        for run in _consecutive(on, lambda p: p.slot):
+                            s = run[0].slot
+                            got = a.view(w, 0)[s * PAGE : (s + len(run)) * PAGE].cpu()
+                            dst.index_copy_(1, _page_rows(p.id for p in run), got.transpose(0, 1).to(dst.dtype))
+                        for c0 in range(0, len(parked), MOVE_PAGES):
+                            assert pk is not None
+                            run = parked[c0 : c0 + MOVE_PAGES]
+                            got = pk.view(w, 0).index_select(0, _page_rows(p.park for p in run))
+                            dst.index_copy_(1, _page_rows(p.id for p in run), got.transpose(0, 1).to(dst.dtype))
+            except BaseException:
+                if made:
+                    host.drop(i)
+                raise
+            self.arenas.pop(i).close()
+            pk = self.parks.pop(i, None)
+            if pk is not None:
+                pk.close()
+            self.layout += 1
 
     @_kept
     def close(self) -> None:
@@ -853,12 +906,15 @@ class KvPool:
         at once: the pages are the pool's, so a layer's placement moves them once for all"""
         if self.card is None or card == self.on_card(i):
             return
-        live = [p for p in self.pages.pages if p.refs > 0]
-        if card:
-            self.card.add(i, self.host, live)
-            self.host.drop(i)
-        else:
-            self.card.drop(i, self.host, live)
+        # the pages found and moved under the card's move: one a conversation lets go meanwhile (its table collected
+        # by an allocation of the copies, or on another thread) is freed once the copies are done, never mid-copy
+        with self.card._move():
+            live = [p for p in self.pages.pages if p.refs > 0]
+            if card:
+                self.card.add(i, self.host, live)
+                self.host.drop(i)
+            else:
+                self.card.drop(i, self.host, live)
 
     def nbytes(self) -> dict[str, int]:
         """what the regions hold, by where: the host's and the park's in RAM, the card's arenas on the card"""
