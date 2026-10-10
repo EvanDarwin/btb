@@ -624,8 +624,9 @@ class Session:
         """`_reuse` where the session's rows live in the engine's pool: the prompt opens on the longest prefix held -
         the session's own rows, or the tree's (another conversation's, or one this session left), read in place - and
         a cache over the pool comes back, empty where nothing is held. The session's own rows win a tie: its table
-        writes on in the page it was writing. A prompt parting from the session keeps the session's rows in the tree,
-        where the next turn of that conversation finds them; the points a failed call goes back to are `_reuse`'s"""
+        writes on past the rows it keeps, in a page of its own. A prompt parting from the session puts the session's
+        rows in the tree first, where the next turn of that conversation finds them; the points a failed call goes
+        back to are `_reuse`'s"""
         eng = t.eng
         cur = cast("PagedCache", self.cache) if getattr(self.cache, "paged", False) else None
         if cur is not None and whole and self._pending is None and self.logits is not None and prompt == self.ids:
@@ -633,7 +634,7 @@ class Session:
             return cur, len(self.ids), None
         own = self._match(prompt) if cur is not None else 0
         # every other session's commits in the tree first; this one's rows it reads itself, and what it parts from it
-        # keeps or lets go below - put in the tree first, a regenerate's cut left a page to the tree each time
+        # puts in the tree below before it cuts them
         held = pc.match(prompt[: len(prompt) - 1], asking=cur)
         if cur is not None and own >= held.length:
             if own == len(self.ids) and len(prompt) > len(self.ids):
@@ -645,6 +646,11 @@ class Session:
                     t.keep(_Point(own, toks[own], None, None, min(self.n_prompt, own)))
                 else:
                     t.keep(_Point(own - 1, self.ids[own - 1], None, None, min(self.n_prompt, own - 1)))
+                if own < len(self.ids):
+                    # the conversation the prompt parts from into the tree before the cut: its next turn opens on it
+                    # there. Cut back held, a side request sharing the template's opening with it (a title call, a
+                    # sub-agent) let its rows go, and the next turn prefilled the whole conversation again
+                    cur.flush()
                 crop(cur, eng, own)
                 del self.ids[own:]
                 self._pending, self.logits = None, None

@@ -173,30 +173,34 @@ def test_a_side_request_leaves_the_conversation_where_it_was(stem: str, place: s
     """a turn of conversation A, an unrelated prompt on the same session (a title call, a sub-agent), A's next turn:
     the next turn opens on every row A left - its prompt and its answer but the answer's last token, still pending
     when the side request came - and answers as A uninterrupted on a contiguous cache does, logits and all (the same
-    rows prefilled from the same point). On the card the side request, longer than the card's region holds, parks A's
-    pages in RAM for its room, and A's next turn brings them back"""
+    rows prefilled from the same point). A side request sharing nothing with A, and one sharing its opening tokens
+    (the chat template's header), whose prompt the session's own rows serve: A's rows go to the tree before the
+    session parts from them. On the card the side request, longer than the card's region holds, parks A's pages in RAM
+    for its room, and A's next turn brings them back"""
     sm = model(stem, place)
-    rng = random.Random(2)
     card = prefix(sm).pool.card
-    a1, more, side = toks(rng, 100), toks(rng, 20), toks(rng, ((card.cap if card is not None else 0) + 1) * PAGE)
-    side[0] = (a1[0] + 1) % VOCAB or 3  # nothing in common with A
-    prefix(sm)
-    s = sm.session()
-    out1 = list(sm.generate(a1, 6, eos=(), session=s, speculate=False).tokens)
-    sm.generate(side, 4, eos=(), session=s, speculate=False)
-    assert s.last_reuse == 0
-    got = list(sm.generate([*a1, *out1, *more], 6, eos=(), session=s, speculate=False).tokens)
-    assert s.last_reuse == len(a1) + len(out1) - 1, "the next turn did not find the conversation's rows"
-    rep = sm.last_pass_report()
-    assert PassTag.PREFIX_SHARED in rep and PassTag.PREFIX_HIT in rep and PassTag.KV_PAGED in rep
-    if place in ("card", "split", "served"):
-        assert PassTag.KV_PARK in rep, "A's pages were not brought back from RAM"
-    after = s.next_logits()
-    with contiguous(sm):
-        alone = sm.session()
-        assert list(sm.generate(a1, 6, eos=(), session=alone, speculate=False).tokens) == out1
-        assert list(sm.generate([*a1, *out1, *more], 6, eos=(), session=alone, speculate=False).tokens) == got
-        assert torch.equal(after, alone.next_logits())
+    for shared in (0, 3):
+        rng = random.Random(2)
+        a1, more, side = toks(rng, 100), toks(rng, 20), toks(rng, ((card.cap if card is not None else 0) + 1) * PAGE)
+        side[:shared] = a1[:shared]
+        side[shared] = (a1[shared] + 1) % VOCAB or 3  # nothing more in common with A
+        prefix(sm)
+        s = sm.session()
+        out1 = list(sm.generate(a1, 6, eos=(), session=s, speculate=False).tokens)
+        sm.generate(side, 4, eos=(), session=s, speculate=False)
+        assert s.last_reuse == shared
+        got = list(sm.generate([*a1, *out1, *more], 6, eos=(), session=s, speculate=False).tokens)
+        assert s.last_reuse == len(a1) + len(out1) - 1, f"the next turn did not find the conversation's rows ({shared})"
+        rep = sm.last_pass_report()
+        assert PassTag.PREFIX_SHARED in rep and PassTag.PREFIX_HIT in rep and PassTag.KV_PAGED in rep
+        if place in ("card", "split", "served"):
+            assert PassTag.KV_PARK in rep, "A's pages were not brought back from RAM"
+        after = s.next_logits()
+        with contiguous(sm):
+            alone = sm.session()
+            assert list(sm.generate(a1, 6, eos=(), session=alone, speculate=False).tokens) == out1
+            assert list(sm.generate([*a1, *out1, *more], 6, eos=(), session=alone, speculate=False).tokens) == got
+            assert torch.equal(after, alone.next_logits())
 
 
 @pytest.mark.parametrize("place", PLACED)
