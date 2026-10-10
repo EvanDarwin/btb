@@ -953,9 +953,10 @@ class _ForwardMixin(_State):
         return per_token, scores, per_key
 
     def _bind_kv(self, cache: Any, T: int) -> None:
-        """A paged cache's conversation onto the card before a pass of `T` rows, its room made (`cache_room`): the
-        pages of another conversation found there parked in pinned RAM, this one's brought back - which the pass
-        records (`KV_PARK`) - and its `T` rows reserved, so nothing of the region grows mid-pass. A growth refused
+        """A paged cache's conversation onto the card before a pass of `T` rows, its room made (`cache_room`): this
+        one's pages in RAM brought back - which the pass records (`KV_PARK`) - into free slots, or trading places with
+        the least recently used pages it does not read, and its `T` rows reserved, so nothing of the region grows
+        mid-pass; another conversation's pages stay on the card while there is room for both. A growth refused
         though the room was made (another program took the card's memory since) gives up the cheapest thing the card
         holds - the top layer first, its rows taken to the host's region - and asks again, as a presize does; a park
         refused in RAM gives up the host's cheapest instead (a card layer shed for it would only add rows to RAM). With

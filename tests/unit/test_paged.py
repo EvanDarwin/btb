@@ -3,9 +3,9 @@
 order through its map whatever pages they lie in; a prefix two caches share is the same rows, held once and never
 rewritten; a crop takes back only what no one else reads; a verify's accepted path moved into place; the pool grown a
 buffer at a time as the ledger grants, the tree's conversations let go first where it refuses; a table let go or
-collected gives its pages back. The card's region: the bound conversation's pages in its slots and every other parked,
-its map uploaded only where it moved, a layer's rows following it between the regions - run here over arenas on the
-host, the card's own layout. Model-free: a config and random rows."""
+collected gives its pages back. The card's region: the bound conversation's pages in its slots, another's parked only
+when their slots are wanted, its map uploaded only where it moved, a layer's rows following it between the regions -
+run here over arenas on the host, the card's own layout. Model-free: a config and random rows."""
 
 from __future__ import annotations
 

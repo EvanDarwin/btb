@@ -5,8 +5,8 @@
 K and a V region [Hk, rows, D] indexed by page id, head-major as the native kernels read a cache (head g's row r at
 g * rows * D + r * D). On a card the layers the card runs keep theirs in the `CardRegion`: per layer an arena in VRAM,
 position-major [slots * PAGE, Hk, D] as the card's kernels read it, a page at a slot of its own - the pages of the
-conversation the card decodes (`bind`) - and every other page parked in pinned RAM until a conversation reading it is
-bound again. A conversation's `Table` is its row map - position j of the sequence at row `rows()[j]` (page * PAGE +
+conversation the card decodes (`bind`), and other conversations' until their slots are wanted, then parked in pinned
+RAM, least recently used first, until a conversation reading them is bound again. A conversation's `Table` is its row map - position j of the sequence at row `rows()[j]` (page * PAGE +
 offset) - and the pages it holds a reference on; a prefix two conversations share is the same rows, read in place by
 both. `PagedCache` is the cache a session decodes over: its attention layers `PagedLayer`s over one table. Every reader
 takes a layer's rows through the map - the host's native attention by row, the card's kernels through the card's row

@@ -6,7 +6,8 @@ longest prefix held - the session's own, or another conversation's read in place
 between two turns leaves the conversation where it was, and a system prompt two conversations share is held once.
 
 The rows of the layers the card runs lie on the card, in the reserved room the conversation the card decodes takes
-(`CardRegion`); the other conversations' rows of those layers wait in pinned RAM until one of them is decoded again.
+(`CardRegion`); the other conversations' rows of those layers stay there until their room is wanted, then wait in
+pinned RAM, least recently used first, until one of them is decoded again.
 The host's layers' rows lie in RAM (`HostRegion`). A layer moving between the two takes its rows along (`place`).
 
 `why_not(sm)` says why an engine has none yet, tier by tier as the phases land: the engine's sessions then keep the

@@ -1343,8 +1343,8 @@ class _CudaMixin(_State):
         rows, w = (8, cls.MMA8_WARPS) if cls._card_mma_narrow(R, sms) else (16, cls.MMA_WARPS)
         return ((R + rows * w - 1) // (rows * w), 1, 1), (32 * w, 1, 1)
 
-    # the card state's switches (`st["switch"]`, int32 on the card): the share of each matvec slice warmed into L2
-    # ahead of it, in 256ths (`CARD_WARM`)
+    # the card state's switches (`st["switch"]`, int32 on the card): the share of each weight row warmed into L2 ahead
+    # of its matvec, in 256ths, from the row's start (`CARD_WARM`)
     SW_WARM = 0
 
     def _card_switch_init(self) -> torch.Tensor:
@@ -1614,7 +1614,7 @@ class _CudaMixin(_State):
                 )
             if glu_on:
                 # gate, up and the activation in one kernel, the activation in its epilogue - the plain matvec's
-                # and btb_{act}_mul's bits at the plain kernel's warps for the merged weight (folded into the down
+                # and btb_{act}_mul's bits, each output one chain over all of k whatever the block (folded into the down
                 # projection's x load instead, each row group recomputed the whole row's act(gate) * up before
                 # its loads and stalled the stream: Qwen3-0.6B's down 21.6 us against 1.7 + its GEMV apart)
                 k.launch(
@@ -1669,7 +1669,7 @@ class _CudaMixin(_State):
             g["h"][:T].add_(y_prev[:T])
         warm.join()
 
-    # the share of each warp's k slice of a matvec's weights warmed into L2 ahead of it (`_card_warm`); 0: none
+    # the share of each weight row of a matvec warmed into L2 ahead of it, from the row's start (`_card_warm`); 0: none
     CARD_WARM = 0.0
     # the step loop picks among the switches' settings as it runs, by their measured speed (`_Tuner`)
     CARD_TUNE = True

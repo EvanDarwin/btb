@@ -5,7 +5,7 @@
 //
 //   btb_gemv_bf16_m{1,..,32}      y[m][r] = sum_c w[r][c] * x[m][c]      (bf16 in, f32 accumulate, bf16 out)
 //   btb_gemv_{silu,gelu}_bf16_m{1,..,32}  the down projection with act(g) * u folded into its x load
-//   btb_gemv_mma*, btb_gemm_{mma,mma_tail,f32}_bf16  the tensor-core matvec, and a prompt's matmuls in the bits of the matvec
+//   btb_gemv_mma*, btb_gemm_{mma,mma_small,f32}_bf16  the tensor-core matvec, and a prompt's matmuls in the bits of the matvec
 //                                 the warm-up picked (btb_gemv_mma.cuh, btb_gemm.cuh)
 //   btb_attn_flash_d{64,128,256}  the one attention (btb_attn_flash.cuh), its decode form: a step, or a verify pass's
 //                                 chain or tree of T rows, over the cache (a sliding layer's window of it)
