@@ -40,7 +40,7 @@ def _release_allocator_caches() -> Iterator[None]:
     runner with "0 KiB free, 7.49 GiB held by MLX". After each test: drop the cyclic garbage that pins tensors, then
     return the CUDA and MLX caches, so memory reads the same in any order. First, before the collection that would
     free it, what a closed engine kept - still reached from it or btb, or held only by a cycle - fails the test at
-    its teardown, apart from the test's own outcome."""
+    its teardown, apart from the test's own outcome. The MLX pool's idle blocks go back too."""
     yield
     leaks = sys.modules.get("btb.engine.leaks")  # only a test that built an engine has one to check
     found = leaks.verify() if leaks is not None else []
@@ -54,6 +54,9 @@ def _release_allocator_caches() -> Iterator[None]:
     mx = sys.modules.get("mlx.core")  # only a test that loaded MLX has an MLX cache to return
     if mx is not None:
         mx.clear_cache()
+    pool = sys.modules.get("btb.pool")  # the touched blocks a closed model gave back, kept for a next load
+    if pool is not None:
+        pool.POOL.trim()
     if found:
         pytest.fail("a closed engine kept memory:\n" + "\n".join(found), pytrace=False)
 

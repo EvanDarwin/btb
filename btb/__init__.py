@@ -199,12 +199,15 @@ def load(
     path = resolve(path)
     # the pool cuts and faults the model's buffers under the imports, so torch is imported only after it has
     # seeded. That is btb's own order; a caller that imported torch first cannot be stopped, only noticed: the
-    # pool detects it and logs that the RAM baseline is off by torch's footprint
-    pool.seed_for(path, log, gguf_packed=bool(int(c.get("gguf_packed", 1))))
+    # pool detects it and logs that the RAM baseline is off by torch's footprint. Only the MLX tier reads into the
+    # pool: a load named for the CPU or a card samples the baseline and cuts nothing it would leave idle
+    pool.seed_for(
+        path, log, gguf_packed=bool(int(c.get("gguf_packed", 1))), cut=asked is None or asked.kind is Device.MLX
+    )
     import torch
 
     from .engine import StreamedTextModel
-    from .engine.device import mlx_available, resolve_device
+    from .engine.device import resolve_device
     from .engine.native import Native, quiet_omp
     from .engine.state import DRAFT_VOCAB
     from .native_files import native_path
@@ -405,21 +408,6 @@ def load(
                 sm.bind_host_packed()
             if log:
                 log(f"[store] 12-bit model: the layers from {path}, the rest from {sm.pack['source']}")
-        if (
-            dev.kind is Device.CPU
-            and sys.platform == "darwin"
-            and sm.host
-            and c.get("fp32") != 1
-            and os.environ.get("BTB_CPU_GEMM", "1") != "0"
-            and mlx_available()
-        ):
-            # a Mac's CPU tier: the prefill's matmuls on MLX's CPU stream in bf16 (half the f32 path's time); one-row
-            # steps and verify passes keep the native kernels. --fp32 1 or BTB_CPU_GEMM=0 keeps float32
-            n = sm.bind_cpu_gemm()
-            if log and n:
-                log(
-                    f"[stream] host linears in shared memory ({n / 2**30:.2f} GB): the prefill's GEMM on the CPU stream"
-                )
         # closed before the interpreter tears down, so reader threads and GPU work end while their buffers exist
         ref = weakref.ref(sm)
 

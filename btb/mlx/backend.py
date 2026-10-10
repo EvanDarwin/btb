@@ -47,6 +47,7 @@ class Weight:
     off: int
     nb: int
     a: Any
+    host: Any  # a slot weight's bytes as a bf16 torch view, for the host's gemv over a few rows (`_HostLinear`)
 
     legacy: tuple[str, Any, int, int] | None  # (kind, raw bytes, rows, cols): a GGUF Q4_0/Q4_1/Q8_0 weight, as stored
     q6k: tuple[Any, int, int] | None  # (raw bytes, rows, cols): a GGUF Q6_K weight, multiplied by its own kernel

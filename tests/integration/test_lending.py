@@ -22,6 +22,7 @@ from btb.engine.device import Device
 from btb.engine.host import _HostLinear
 from btb.engine.memory import Room
 from btb.engine.scheduler import EPOCH, MemoryGrantError
+from btb.pool import POOL
 from tests.helpers import fixture, loaded_model, need_cuda, need_mlx
 
 if TYPE_CHECKING:
@@ -554,3 +555,31 @@ def test_layers_shed_for_two_tensors_grow_back_whichever_goes_first(monkeypatch:
         del a
         gc.collect()
         assert _until(lambda: not sm.cold, sm), f"still from the drive: {sorted(sm.cold)}"
+
+
+def test_a_closed_models_pool_blocks_go_back_and_the_next_load_reads_into_them() -> None:
+    """an MLX load's blocks go back idle when it closes, and the next load cuts its weights from them rather than
+    growing the pool; a load named for the CPU, which reads nothing into the pool, cuts none"""
+    need_mlx()
+    with loaded_model(fixture("tiny_qwen3"), device="mlx") as sm:
+        owner = id(sm)
+        assert any(e[4] == owner for e in POOL.blocks), "the weights were not read into the pool"
+    assert not any(e[4] == owner for e in POOL.blocks)
+    blocks = len(POOL.blocks)
+    with loaded_model(fixture("tiny_qwen3"), device="mlx") as sm:
+        assert len(POOL.blocks) == blocks and any(e[4] == id(sm) for e in POOL.blocks)
+    POOL.trim()
+    with loaded_model(fixture("tiny_qwen3"), device="cpu"):
+        assert not POOL.blocks, "a CPU load faulted pool blocks nothing reads into"
+
+
+def test_a_refused_grant_lets_the_pools_idle_blocks_go_first() -> None:
+    """the touched blocks a closed model left for the next load are the cheapest room on the host: given up before
+    anything of the model's own"""
+    need_mlx()
+    with loaded_model(fixture("tiny_qwen3"), device="cpu") as sm:
+        POOL._seed_cuts([8 * MiB])
+        POOL._settle()
+        assert POOL.free_bytes() >= 8 * MiB
+        assert sm._give_up_one(torch.device("cpu"), MiB, set())
+        assert POOL.free_bytes() == 0 and not sm.cold

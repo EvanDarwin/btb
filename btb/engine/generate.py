@@ -159,15 +159,20 @@ class _GenerateMixin(_State):
             for have, snap_states in ((cl.conv_states, conv), (cl.recurrent_states, rec)):
                 assert isinstance(have, dict)  # a layer keeps its states as its snapshot does
                 for k, v in snap_states.items():
-                    if have.get(k) is None:
-                        # a slot the layer has not filled yet (a host prefill leaves some to the first step): the
-                        # state becomes a copy of its own, never a view of the rows it came from
+                    cur = have.get(k)
+                    if cur is None or cur.dtype != v.dtype or cur.shape != v.shape:
+                        # a slot the layer has not filled yet (a host prefill leaves some to the first step), or one
+                        # a step has widened since (Qwen4's holds its states float32): a copy of the snapshot's own,
+                        # in its dtype, which the next pass computes in - never a view of the rows it came from
                         have[k] = v.clone()
                     else:
-                        have[k].copy_(v)
+                        cur.copy_(v)
             return
         assert isinstance(conv, torch.Tensor) and isinstance(rec, torch.Tensor)  # _lin_snap copies both alike
         c, r = _lin(cl)
+        if c.dtype != conv.dtype or r.dtype != rec.dtype or c.shape != conv.shape or r.shape != rec.shape:
+            cl.conv_states, cl.recurrent_states = conv.clone(), rec.clone()
+            return
         c.copy_(conv)
         r.copy_(rec)
 

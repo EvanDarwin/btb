@@ -49,6 +49,11 @@ class Hardware(StrEnum):
 # hardware a user owns that btb has no backend for; its sub-paths exist so the grid carries the gap
 NO_BACKEND: frozenset[Hardware] = frozenset({Hardware.ROCM})
 
+# how far a row's next logits may sit from its one-row steps' when the row shared a pass wider than any row count the
+# engine picks a kernel by (the session cell's width check), relative to the logits' scale: float32 on the CPU,
+# where a GEMM and the gemv differ only in their sums' order; a bf16 pass's rounding on a GPU
+WIDTH_TOL: dict[Hardware, float] = {h: 1e-4 if h is Hardware.CPU else 0.05 for h in Hardware}
+
 
 class Container(StrEnum):
     """the file shape a cell loads from: the three loaders, each with its own reader and binder."""

@@ -125,7 +125,7 @@ def attention_sinks(
         if T == 1:
             start = mlxdev.attn_window_start(n, win)
             Kv, Vv = cl.mx_kv(start, n)
-            mask = None
+            mx_mask = None
         else:
             tree = any(parents[j] != j - 1 for j in range(T))
             if tree:
@@ -139,7 +139,7 @@ def attention_sinks(
                     while cur >= 0:
                         allow[t, past + cur] = True
                         cur = parents[cur]
-                mask = mlxdev.to_mx(allow)
+                mx_mask = mlxdev.to_mx(allow)
             else:
                 # a sliding layer's chunk needs only the window's worth of keys behind it: slicing there is exact and
                 # makes the prefill O(T*win)
@@ -147,9 +147,9 @@ def attention_sinks(
                 Kv, Vv = cl.mx_kv(start, n)
                 p = past + m.arange(T, dtype=m.int32)[:, None]
                 j = start + m.arange(n - start, dtype=m.int32)[None]
-                mask = (j <= p) if win is None else ((j <= p) & (j > p - win))
+                mx_mask = (j <= p) if win is None else ((j <= p) & (j > p - win))
         a = m.fast.scaled_dot_product_attention(
-            qh.astype(Kv.dtype), Kv, Vv, scale=scale, mask=mask, sinks=sinks.astype(Kv.dtype)
+            qh.astype(Kv.dtype), Kv, Vv, scale=scale, mask=mx_mask, sinks=sinks.astype(Kv.dtype)
         )
         return mlxdev.from_mx(a[0].transpose(1, 0, 2)).to(query.dtype)[None], None
     if T == 1 and B == 1 and (sm is None or getattr(sm, "_attn_ctx", None) is not None):
