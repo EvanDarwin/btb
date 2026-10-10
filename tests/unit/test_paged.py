@@ -762,6 +762,32 @@ def test_free_pages_past_the_last_held_one_give_their_ram_back() -> None:
         assert read(again, i)[0].shape[-2] == PAGE + 3
 
 
+def test_a_trim_refused_part_way_gives_the_rest_back_at_the_next_ask() -> None:
+    """a trim's cut copies are asked of the ledger a buffer at a time. Refused part way, the buffers not yet cut keep
+    their length, still counted as what a trim gives back (`trimmable`), and the next trim cuts them: with the page
+    count cut already, the retry found nothing to do and they stayed held"""
+    cuts = [0]
+
+    def grant(nbytes: int, kind: str, **kw: Any) -> None:
+        if "cut to" in str(kw.get("requester", "")):
+            cuts[0] += 1
+            if cuts[0] == 2:  # the second buffer's cut, once
+                raise MemoryGrantError("refused")
+
+    first = HostRegion.MIN_PAGES
+    floor = 2 * L * first * ROW
+    pc = prefix(grant)
+    long = pc.new()
+    write(long, *rows(40 * PAGE, 26))
+    grown = pc.pool.nbytes()["cpu"]
+    long.release()
+    part = pc.pool.trim()
+    assert 0 < part < grown - floor, "the refusal stopped nothing, or everything"
+    assert pc.pool.trimmable() == pc.pool.nbytes()["cpu"] - floor > 0, "the buffers left long are not counted"
+    assert pc.pool.trim() == grown - floor - part and pc.pool.nbytes()["cpu"] == floor
+    assert pc.pool.trimmable() == 0 and pc.pool.host.cap == first
+
+
 def test_a_host_region_refused_part_way_is_made_whole_at_the_next_write() -> None:
     """pages counted before the host's first rows (a card engine's card layers wrote first) have their regions made
     at the host's first write, a layer at a time as the ledger grants each. Refused part way, the next write makes the

@@ -213,11 +213,11 @@ class HostRegion:
     def shrink(self, pages: int) -> int:
         """the regions cut to `pages` pages - the pool let every page past them go (`PagePool.trim`) - a buffer at a
         time, its rows kept copied into one of the new length as the ledger grants it, or let go whole where no page
-        is left. Refused part way, the buffers not yet cut keep their length, their rows past `pages` unread. Returns
-        the bytes given back: grown for the longest conversation, the regions held them until the engine closed"""
+        is left. Refused part way, the buffers not yet cut keep their length, their rows past `pages` unread, and the
+        next ask cuts them: what is cut is read off the buffers' lengths, not the page count - cut already, a retry
+        found nothing to do and they stayed held. Returns the bytes given back: grown for the longest conversation, the
+        regions held them until the engine closed"""
         pages = max(0, int(pages))
-        if pages >= self.cap:
-            return 0
         before = self.nbytes()
         rows, el = pages * PAGE, self._el()
         try:
@@ -242,7 +242,7 @@ class HostRegion:
                     del old
         except MemoryGrantError:
             pass
-        self.cap = pages
+        self.cap = min(self.cap, pages)
         return max(0, before - self.nbytes())
 
     def write(self, i: int, rows: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
@@ -988,15 +988,14 @@ class KvPool:
             return self.host.shrink(max(self.pages.trim(), HostRegion.MIN_PAGES))
 
     def trimmable(self) -> int:
-        """the RAM `trim` would give back now"""
+        """the RAM `trim` would give back now: every buffer past the pages left, read off its length (a cut refused
+        part way leaves some longer than the page count says)"""
         with self.pages.lock:
             pages = self.pages.pages
             n = len(pages)
             while n and pages[n - 1].refs <= 0:
                 n -= 1
             n = max(n, HostRegion.MIN_PAGES)
-            if n >= self.host.cap:
-                return 0
             row = self.host.hk * PAGE * self.host.d * self.host._el()
             return sum(max(0, t.shape[1] // PAGE - n) * row for s in (self.host.k, self.host.v) for t in s.values())
 
