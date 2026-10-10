@@ -3811,8 +3811,9 @@ class _CudaMixin(_State):
         """a paged cache's lists for the pass (`_span_lists`, `_node_lists`): those of its row map's present version
         alone, which every change to the map moves - a window's and the whole prefix's (Gemma 3's layers alternate)
         side by side, made once for every layer that reads them alike. One set for the engine's prefix cache, the last
-        conversation's: kept on each conversation, an idle one held its last pass's (let go at the last attention
-        layer, which a pass running it on the card - a split placement's, kv_host's steps - never reached)"""
+        conversation's: kept on each conversation, an idle one held its last pass's. Let go as another conversation's
+        pass begins (`PrefixCache.reading`): replaced only by a pass that builds its own, one whose layers build none
+        (the card's, under a split placement or kv_host) left an idle conversation's held"""
         pc, table = paged.prefix, paged.table
         ref, ver, memo = pc._lists or (None, None, {})
         if ref is None or ref() is not table or ver != table.version:

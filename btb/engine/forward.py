@@ -960,7 +960,9 @@ class _ForwardMixin(_State):
         holds - the top layer first, its rows taken to the host's region - and asks again, as a presize does; a park
         refused in RAM gives up the host's cheapest instead (a card layer shed for it would only add rows to RAM). With
         `adapt` off the placement is pinned and the refusal stands. Nothing for a contiguous cache, or a pool with no
-        card"""
+        card. Every pass over a paged cache lets go of the row lists another conversation's pass left (`reading`)"""
+        if getattr(cache, "paged", False):
+            cache.prefix.reading(cache.table)
         card = cache.prefix.pool.card if getattr(cache, "paged", False) else None
         if card is None:
             return

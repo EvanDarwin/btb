@@ -157,6 +157,14 @@ class PrefixCache:
         if ids:
             self.insert(ids, table.rows()[: len(ids)].tolist())
 
+    def reading(self, table: Table) -> None:
+        """a pass over `table` begins: the row lists another conversation's pass left (`_lists`) let go. Made only by
+        the host's attention, a pass whose layers never read them (the card's, under kv_host or a split placement)
+        left the idle conversation's held"""
+        held = self._lists
+        if held is not None and held[0]() is not table:
+            self._lists = None
+
     def flush(self) -> None:
         """every commit held back put in the tree, but the asking session's own (`match`): what it parts from it keeps
         or drops itself"""
