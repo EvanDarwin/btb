@@ -131,6 +131,36 @@ def test_the_least_recently_used_leaf_goes_first() -> None:
     assert tree.evict() == 2 and len(pool) == 0
 
 
+def test_room_is_never_made_of_rows_a_live_conversation_reads() -> None:
+    """asked for room, eviction passes over a leaf whose every page a conversation's table still reads - let go, it
+    frees nothing, and the next conversation opening alike would prefill it again - and takes the ones that free a
+    page; with none, it frees nothing and the tree stands. Let go whole, every leaf goes"""
+    pool = PagePool()
+    tree = RadixTree(pool)
+    sysp = list(range(100, 164))  # a page of system prompt two live conversations share
+    a, b, c = [*sysp, *range(1000, 1064)], [*sysp, *range(2000, 2064)], [*sysp, *range(3000, 3064)]
+    ra = table(pool, 128)
+    rb = ra[:64] + table(pool, 64)
+    for p in pool.of(rb[:64]):
+        pool.ref(p)  # b's table reads the shared page too
+    tree.insert(a, ra)
+    tree.insert(b, rb)
+    assert tree.evict(enough=lambda freed: freed >= 1) == 0, "rows live tables read were let go"
+    assert tree.match(a).length == 128 and tree.match(b).length == 128 and not pool.check()
+    rc = ra[:64] + table(pool, 64)
+    for p in pool.of(rc[:64]):
+        pool.ref(p)
+    tree.insert(c, rc)
+    let_go(pool, rc)  # c's conversation over: its own page the tree's alone
+    tree.match(a)
+    tree.match(b)  # c used longest ago, and still the one leaf that frees anything
+    assert tree.evict(enough=lambda freed: freed >= 1) == 1
+    assert tree.match(c).length == 64 and tree.match(a).length == 128 and tree.match(b).length == 128
+    let_go(pool, ra)
+    let_go(pool, rb)
+    assert tree.evict() == 3 and len(pool) == 0 and not tree.holds and not pool.check()
+
+
 def test_random_conversations_keep_the_books_straight() -> None:
     """many conversations sharing prefixes at random, tables let go as they end and leaves evicted at random: the
     tree and the pool stay consistent, every match's rows are the rows inserted for those tokens, and once all is

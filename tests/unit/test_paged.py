@@ -212,6 +212,20 @@ def test_rows_made_off_the_route_never_reach_the_tree() -> None:
     a.commit(list(range(50)))
     assert pc.match(list(range(50))).length == 30
     assert a.get_seq_length() == 50
+    # cut back past them (a rewind, a regenerate) and made again on the route: the tree is given them, as it would
+    # have been had the fallback never run - cut short of them, the rows past the cut stay out
+    b = pc.new()
+    write(b, *rows(50, 71))
+    b.off_route(40)
+    b.crop_to(45)
+    b.commit([500 + t for t in range(45)])
+    assert pc.match([500 + t for t in range(45)]).length == 40, "a crop short of the fallback's rows lost the mark"
+    b.crop_to(20)
+    write(b, *rows(30, 72))
+    again = [*range(500, 520), *range(600, 630)]
+    b.commit(again)
+    assert pc.match(again).length == 50, "rows remade on the route kept out of the tree"
+    assert not pc.pool.pages.check() and not pc.tree.check()
 
 
 def test_a_verify_keeps_its_accepted_path_in_place() -> None:
@@ -375,7 +389,8 @@ def test_the_card_parks_another_conversations_pages_only_when_their_slots_are_wa
     k3, v3 = rows(free * PAGE + 1, 42)  # a page more than the free slots hold
     write(c, k3, v3)
     parked = [p.id for p in pc.pool.pages.pages if p.park >= 0]
-    assert parked == [0], f"the least recently used page c does not read parked for its room: {parked}"
+    # a's own last page, unread since a was bound: the page a and b share b's binding used since
+    assert parked == [2], f"the least recently used page c does not read parked for its room: {parked}"
     for i in (0, 1):
         assert torch.equal(read(a, i)[0], bf(k + i)), "a's rows read back from the park"
         assert torch.equal(card_rows(c, i)[0], bf(k3 + i))

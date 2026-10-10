@@ -17,7 +17,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from .kvpool import PagePool
+from .kvpool import Page, PagePool
 
 
 class Node:
@@ -57,6 +57,8 @@ class RadixTree:
     def __init__(self, pool: PagePool) -> None:
         self.pool = pool
         self.root = Node((), (), None, 0)
+        # the holds the nodes have on each page (by id): a page held more often is read by a conversation's table too
+        self.holds: dict[int, int] = {}
         # what puts in the commits held back for the tree (`PrefixCache.flush`), asked before the tree is read or let
         # go of: it holds every conversation then
         self.before: Callable[[], None] | None = None
@@ -135,7 +137,7 @@ class RadixTree:
     def _add(self, parent: Node, key: Sequence[int], rows: Sequence[int]) -> Node:
         n = Node(key, rows, parent, parent.end + len(key))
         for p in self.pool.of(n.rows):
-            self.pool.ref(p)
+            self._hold(p)
         self.pool.freeze(n.rows)
         parent.kids[n.key[0]] = n
         return n
@@ -152,16 +154,31 @@ class RadixTree:
         top.kids[n.key[0]] = n
         both = {p.id for p in self.pool.of(top.rows)} & {p.id for p in self.pool.of(n.rows)}
         for pid in both:
-            self.pool.ref(self.pool.pages[pid])
+            self._hold(self.pool.pages[pid])
         return top
+
+    def _hold(self, p: Page) -> None:
+        self.pool.ref(p)
+        self.holds[p.id] = self.holds.get(p.id, 0) + 1
 
     def _remove(self, n: Node) -> int:
         """leaf `n` out of the tree, its pages let go: how many that freed"""
         assert not n.kids and n.parent is not None
         del n.parent.kids[n.key[0]]
-        freed = sum(self.pool.unref(p) for p in self.pool.of(n.rows))
+        freed = 0
+        for p in self.pool.of(n.rows):
+            left = self.holds[p.id] - 1
+            if left:
+                self.holds[p.id] = left
+            else:
+                del self.holds[p.id]
+            freed += self.pool.unref(p)
         n.parent = None
         return freed
+
+    def _read(self, n: Node) -> bool:
+        """whether a conversation's table reads every page of node `n`: let go, it frees none of them"""
+        return all(p.refs > self.holds.get(p.id, 0) for p in self.pool.of(n.rows))
 
     def _touch(self, path: Sequence[Node]) -> None:
         self.pool.clock += 1
@@ -170,26 +187,27 @@ class RadixTree:
 
     # -- letting go ----------------------------------------------------------------------------------------------
 
-    def evict(self, enough: Callable[[int], bool] | None = None, keep: Callable[[Node], bool] | None = None) -> int:
+    def evict(self, enough: Callable[[int], bool] | None = None) -> int:
         """The least recently used leaves out, one at a time (a parent left childless is a leaf in turn), until
-        `enough(pages freed so far)` says so - every leaf when None - but those `keep` holds back. Returns the pages
-        freed. The leaves are found once and kept in order (a heap), a parent joining them as its last child goes:
-        found again for every leaf, a tree of n nodes let go whole took n walks of it"""
+        `enough(pages freed so far)` says so - every leaf when None. Asked for room (`enough`), a leaf whose every page
+        a conversation's table reads stays: let go, it frees nothing, and the tree loses what the next conversation
+        opening alike would read (a system prompt live sessions share, stripped for no page). Returns the pages freed.
+        The leaves are found once and kept in order (a heap), a parent joining them as its last child goes: found
+        again for every leaf, a tree of n nodes let go whole took n walks of it"""
         self._ready()
+
+        def out(n: Node) -> bool:
+            return enough is None or not self._read(n)
+
         freed = 0
-        leaves = [(n.tick, i, n) for i, n in enumerate(self.nodes()) if not n.kids and (keep is None or not keep(n))]
+        leaves = [(n.tick, i, n) for i, n in enumerate(self.nodes()) if not n.kids and out(n)]
         heapq.heapify(leaves)
         seq = len(leaves)
         while leaves and (enough is None or not enough(freed)):
             _, _, n = heapq.heappop(leaves)
             parent = n.parent
             freed += self._remove(n)
-            if (
-                parent is not None
-                and parent is not self.root
-                and not parent.kids
-                and (keep is None or not keep(parent))
-            ):
+            if parent is not None and parent is not self.root and not parent.kids and out(parent):
                 heapq.heappush(leaves, (parent.tick, seq, parent))
                 seq += 1
         return freed

@@ -594,6 +594,9 @@ class CardRegion:
                 # none bound until this one is: a load refused part way leaves the table bound before with its pages
                 # elsewhere, and its next bind must bring them back, not read its map as current
                 self._bound = None
+                # its pages used now: the conversation bound last is the last parked (`_others`), a prefix it shares
+                # with an idle one among them - stamped only when made, a hot system prompt went first
+                table.pool.pages.tick(held.values())
                 back = sorted((p for p in held.values() if p.park >= 0), key=lambda p: p.park)
                 into_free = min(len(back), len(self.free))
                 self.load(back[:into_free])
@@ -907,6 +910,7 @@ class Table:
         self._fin()
         self._fin = weakref.finalize(self, Table._let_go, self.pool.pages, self.held, self.count)
         self.n, self.tail, self.low = 0, None, 0
+        self.held_ids = self.exact = None
         self.version += 1
 
     def __len__(self) -> int:
@@ -980,6 +984,10 @@ class Table:
         n = max(0, int(n))
         if self.held_ids is not None and len(self.held_ids) > n:
             del self.held_ids[n:]  # the commit held back cut with the rows: what it cuts never reached the tree
+        if self.exact is not None and n <= self.exact:
+            # every row made off the route cut: the rows made from here are the route's again (kept, the tree was
+            # given nothing past them for the table's life)
+            self.exact = None
         if n >= self.n:
             return
         self.version += 1
