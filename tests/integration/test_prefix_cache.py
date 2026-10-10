@@ -542,6 +542,32 @@ def test_rows_off_the_conversation_are_their_own_and_asked_for(stem: str, place:
     same(list(paged), list(flat), f"{place}: a fork and a batch")
 
 
+@pytest.mark.parametrize("stem", ["tiny_qwen3"])
+def test_rows_a_fork_made_off_the_steps_route_never_reach_the_tree(stem: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """a fork's or a batch's rows made through the torch pass where a step makes its rows on the card's kernels (a
+    fork wider than the card's rows pass, a batch beside a host layer, one the card ran out of room for) are their
+    session's to read, never the tree's: a prompt opening on them decoded other bits than the same prompt cold. The
+    route here is the host engine's read as a card engine's would be (`_card_off_route`): its forks' pass is torch's"""
+    sm = model(stem, "cpu")
+    pc = prefix(sm)
+    rng = random.Random(14)
+    p = toks(rng, 90)
+    for off in (False, True):
+        pc.tree.evict()
+        monkeypatch.setattr(sm, "_card_off_route", lambda i, off=off: off)
+        a, b = sm.session(), sm.session()
+        a.feed(p)
+        with a.fork(2) as br:
+            br.step([5, 6])
+            br.step([7, 8])
+            br.keep(0)
+        assert a.tokens == [*p, 5, 7]
+        b.feed(toks(rng, 40))  # another prompt: the tree read, a's commit put in
+        assert pc.match(a.tokens).length == (len(p) if off else len(a.tokens)), off
+        a.generate(3, eos=(), speculate=False)  # the session reads its rows still
+    monkeypatch.undo()
+
+
 @CARD
 @pytest.mark.parametrize("place", ["card"])
 @pytest.mark.parametrize("stem", GRAPHED)

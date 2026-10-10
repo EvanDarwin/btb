@@ -190,3 +190,50 @@ def test_an_arena_layer_leaving_for_another_device_moves_its_rows_straight_there
     cl2.detach()
     assert [(a["device"], a["draws"]) for a in asked] == [(torch.device("cpu"), "")]
     assert cl2.keys is not None and cl2.keys.data_ptr() != arena[0].data_ptr()
+
+
+def test_a_rows_step_the_card_has_no_room_for_goes_on_through_the_torch_pass() -> None:
+    """a fork's or a batch's step on the card graph whose buffers the ledger refuses (another program took the card)
+    turns the card graph off as a single step's refusal does (`_card_oom`) and takes the step through the torch pass,
+    the rows leaving the arena: the answer goes on - raised, it failed mid-decode, and every step after was refused
+    alike. Any other failure is the caller's, the rows where the step began"""
+    from btb.engine.branches import _Rows
+    from btb.engine.cuda import _CudaMixin
+    from btb.engine.scheduler import MemoryGrantError
+
+    oomed: list[BaseException] = []
+    eng = types.SimpleNamespace(
+        _is_card_oom=_CudaMixin._is_card_oom,
+        _card_oom=oomed.append,
+        _card_rows_ok=lambda B, cache=None: True,
+        _card_rows_release=lambda cache: None,
+    )
+
+    class _Stepped(_Rows):  # the rows alone: what a fork and a batch share
+        def close(self) -> None:
+            pass
+
+    rows = _Stepped(cast(Any, eng))
+    rows.cache = cast(Any, types.SimpleNamespace(layers=[]))
+    seen: list[str] = []
+    fail: list[BaseException] = []
+
+    def step(cache: Any, toks: list[int], taps: Any, host: bool) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
+        seen.append(rows.mode)
+        if rows.mode == "card" or fail:
+            raise fail[0] if fail else MemoryGrantError("[grant] REFUSED the card graph's buffers for 2 rows")
+        return torch.zeros(len(toks), 4), {}
+
+    rows._step_rows = step  # type: ignore[method-assign]
+    rows.mode = "card"
+    lg, _ = rows._advance([1, 2])
+    assert seen == ["card", "fork"] and rows.mode == "fork" and len(oomed) == 1 and lg.shape == (2, 4)
+    rows.mode = "card"
+    fail.append(ValueError("a token past the vocabulary"))
+    try:
+        rows._advance([1, 2])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a failure that is not the card's room was taken for one")
+    assert rows.mode == "card" and len(oomed) == 1

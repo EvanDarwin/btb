@@ -85,6 +85,9 @@ class _Rows:
         # "fork": the torch pass over ForkLayers
         self.mode = ""
         self._lens: list[int] = []  # on the card, the live rows' prefix lengths (a batch's mask, should they leave it)
+        # a step made its rows through the torch pass where a step makes them on the card's kernels: the rows written
+        # back are their sessions' to read, never the tree's (`_write`)
+        self._off_route = False
 
     # -- the cache --
     def _card_ok(self, B: int) -> bool:
@@ -245,6 +248,20 @@ class _Rows:
         undo = self._point(cache)
         try:
             return self._step_rows(cache, toks, taps, host)
+        except BaseException as e:
+            for u in undo:
+                u()
+            if self.mode != "card" or not eng._is_card_oom(e):
+                raise
+            # no room for the rows graph's buffers (another program took the card): the card graph off as a single
+            # step's refusal turns it off (`_card_oom`), and the rows go on through the torch pass - raised, the answer
+            # failed mid-decode, and every step after was refused alike
+            eng._card_oom(e)
+            self._off_card()
+        cache = self._check()
+        undo = self._point(cache)
+        try:
+            return self._step_rows(cache, toks, taps, host)
         except BaseException:
             for u in undo:
                 u()
@@ -322,6 +339,10 @@ class _Rows:
         am = None
         if self._am is not None:
             am = self._am = torch.cat([self._am, torch.ones((B, 1), dtype=torch.long)], dim=1)
+        # the torch pass: off the route a step takes where the card makes a step's rows on its kernels
+        self._off_route = self._off_route or any(
+            eng._card_off_route(i) for i, lt in enumerate(eng.layer_types) if lt != LayerKind.LINEAR
+        )
         out = eng.forward(ids, cache=cache, attention_mask=am, on_layer=on_layer)
         assert out is not None
         lg = out[:, -1].float()
@@ -507,8 +528,14 @@ class _Rows:
         from transformers.cache_utils import CacheLayerMixin, DynamicIndexedLayer
 
         eng = self.eng
+        off = self._off_route
 
         def write(cache: KvCache) -> None:
+            if off and getattr(cache, "paged", False):
+                # the row's own rows made through the torch pass, other bits than a step's: the session reads them,
+                # the tree is never given them - a prompt opening on them decoded otherwise than the same prompt cold
+                pc = cast("PagedCache", cache)
+                pc.off_route(len(pc.table))
             for i, kv in row.kv.items():
                 pl = cache.layers[i]
                 if isinstance(kv, list):
