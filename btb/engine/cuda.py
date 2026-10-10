@@ -1256,8 +1256,7 @@ class _CudaMixin(_State):
         from .kvpool import PAGE
 
         card = cache.prefix.pool.card
-        if card is None:
-            raise RuntimeError("[card] a paged cache over a pool with no card region")
+        assert card is not None  # a card engine's prefix cache makes its region with its pool
         cache.bind(T)
         pg = st.get("pg")
         if pg is None or pg["card"] is not card or pg["layout"] != card.layout:
@@ -2623,15 +2622,13 @@ class _CudaMixin(_State):
             return None, g["logits"][:T].view(1, T, -1)
         return g["h"][:T].view(1, T, -1), None
 
-    def _card_prefill_ok(
-        self, cache: Any, B: int, T: int, past: int, am: torch.Tensor | None, on_layer: Any, stop_after: int | None
-    ) -> bool:
+    def _card_prefill_ok(self, cache: Any, B: int, T: int, am: torch.Tensor | None, stop_after: int | None) -> bool:
         """a prompt's chunk the card graph's kernels take as its steps' rows (`_forward_card_prefill`): one sequence's
-        cache, no caller's mask or early stop, an engine the card graph serves, and the build's GEMMs that sum a row as
-        the steps' matvecs do - any width, any position, the first rows of a cache too, a layer hook's pass as well (it
-        reads each layer's residual as the run leaves it), a verify pass's tree of the graph's widths. The kernels
-        read after `_card_ready` loads them: read before, an engine's first prompt found none and took the torch layers"""
-        if not (
+        cache, no caller's mask or early stop, an engine the card graph serves (its kernels loaded, the GEMMs that sum
+        a row as the steps' matvecs do among them) - any width, any position, the first rows of a cache too, a layer
+        hook's pass as well (it reads each layer's residual as the run leaves it), a verify pass's tree of the graph's
+        widths"""
+        return (
             B == 1
             and T >= 1
             and am is None
@@ -2640,10 +2637,7 @@ class _CudaMixin(_State):
             and not forked(cache)
             and (T <= self.CARD_T_MAX or getattr(self, "ap", None) is None)
             and self._card_ready(capture=False)
-        ):
-            return False
-        k = Native.cuda
-        return k is not None and "btb_gemm_mma_bf16" in k.fn and "btb_gemm_f32_bf16" in k.fn
+        )
 
     def _forward_card_prefill(
         self,

@@ -336,9 +336,7 @@ class _ForwardMixin(_State):
         # (`_forward_card_prefill`): each row the row its step makes, so a prompt's rows are its steps' whatever its
         # chunks, a cache hit decodes as the prompt cold, and a hooked verify pass's tree as its hooked steps
         prefill_ok = (
-            not graph_ok
-            and self._card_prefill_ok(cache, B, T, past, am, on_layer, stop_after)
-            and self._card_arena_holds(cache, T)
+            not graph_ok and self._card_prefill_ok(cache, B, T, am, stop_after) and self._card_arena_holds(cache, T)
         )
         if (graph_ok or prefill_ok) and self._card_segment_at(0, n_layers) == (0, n_layers) and n_layers == self.L:
             self._attn_ctx = cache
@@ -1550,7 +1548,7 @@ class _ForwardMixin(_State):
                         # the prompt's rows
                         graph_layer = (
                             not host
-                            and self._card_prefill_ok(cache, B, T, past0, None, None, None)
+                            and self._card_prefill_ok(cache, B, T, None, None)
                             and self._card_runs_layer(i)
                             and self._card_arena_has(cache, past0 + T)
                         )

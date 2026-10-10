@@ -412,7 +412,7 @@ class _State:
         raise NotImplementedError
 
     def _card_prefill_ok(
-        self, cache: Any, B: int, T: int, past: int, am: torch.Tensor | None, on_layer: Any, stop_after: int | None
+        self, cache: Any, B: int, T: int, am: torch.Tensor | None, stop_after: int | None
     ) -> bool:  # an engine without the card mixin runs no prompt on the card graph's kernels
         return False
 

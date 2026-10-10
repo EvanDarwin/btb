@@ -55,12 +55,12 @@ def _page_rows(starts: Iterable[int]) -> torch.Tensor:
     return (s[:, None] * PAGE + torch.arange(PAGE)[None]).flatten()
 
 
-def _consecutive(pages: Iterable[Page], at: Callable[[Page], int]) -> list[list[Page]]:
-    """`pages` in runs whose `at` (a card slot, a park slot) goes up by one, at most MOVE_PAGES long: a run's rows
-    one slice of the region"""
+def _consecutive(pages: Iterable[Page]) -> list[list[Page]]:
+    """`pages` (on the card) in runs whose slots go up by one, at most MOVE_PAGES long: a run's rows one slice of an
+    arena"""
     out: list[list[Page]] = []
-    for p in sorted(pages, key=at):
-        if out and at(out[-1][-1]) + 1 == at(p) and len(out[-1]) < MOVE_PAGES:
+    for p in sorted(pages, key=lambda p: p.slot):
+        if out and out[-1][-1].slot + 1 == p.slot and len(out[-1]) < MOVE_PAGES:
             out[-1].append(p)
         else:
             out.append([p])
@@ -341,35 +341,31 @@ class CardRegion:
             return 0
         return len(self.arenas) * (self._target(len(self.parked), slots) - len(self.parked)) * self._page_bytes()
 
-    def _counts(self, table: Table) -> tuple[int, int, int]:
-        """(the table's pages in the park, its pages on neither, the pages on the card it does not read): what binding
-        it moves. In constant time while it stays bound with nothing moved since its map was made - each page it holds
-        is on the card then - else over its pages (a switch's)"""
+    def _counts(self, table: Table) -> tuple[int, int]:
+        """(the table's pages in the park, the pages on the card it does not read): what binding it moves - a page is
+        placed on the card as it is made (`KvPool.alloc`), so each one a table holds is on the card or in the park. In
+        constant time while it stays bound with nothing moved since its map was made - each page it holds is on the
+        card then - else over its pages (a switch's)"""
         held = table.held
         bound = self._bound() if self._bound is not None else None
         used = len(self.slots) - len(self.free)
         if bound is table and self._mapped[0] == self.version:
-            return 0, 0, used - len(held)
-        back = nowhere = 0
-        for p in held.values():
-            if p.park >= 0:
-                back += 1
-            elif p.slot < 0:
-                nowhere += 1
-        return back, nowhere, used - (len(held) - back - nowhere)
+            return 0, used - len(held)
+        back = sum(1 for p in held.values() if p.park >= 0)
+        return back, used - (len(held) - back)
 
     def need(self, table: Table, new: int) -> tuple[int, int]:
         """what binding `table` and placing `new` more pages of it take past what the region holds: (card slots, park
         slots), moved as `bind` and `reserve` move them - its parked pages into the free slots first, then traded with
         pages on the card it does not read (their park slots theirs), the rest into slots the arenas grow for; its new
         pages into the free slots left, then into the slots of more pages it does not read, parked, then grown"""
-        back, nowhere, others = self._counts(table)
+        back, others = self._counts(table)
         free, pfree = len(self.free), len(self.pfree)
         loaded = min(back, free)  # into free slots: their park slots free after
         traded = min(back - loaded, others)
         grow = back - loaded - traded
         free, others, pfree = free - loaded, others - traded, pfree + loaded
-        want = nowhere + int(new)
+        want = int(new)
         into_free = min(want, free)
         parked = min(want - into_free, others)
         grow += want - into_free - parked
@@ -634,11 +630,6 @@ class CardRegion:
                     out = self._others(held)[: len(rest)]
                     self.swap(out, rest[: len(out)])
                     self.load(rest[len(out) :])
-                nowhere = [p for p in held.values() if p.slot < 0]
-                if nowhere:
-                    self.reserve(len(nowhere), table)
-                    for p in nowhere:
-                        self.place(p)
             elif (
                 table.low >= len(table)
                 and self._mapped[0] == self.version
@@ -758,7 +749,7 @@ class CardRegion:
                 if pk is not None:
                     pk.grow(len(self.parked) * PAGE)
                 for w, src in (("k", host.k[i]), ("v", host.v[i])) if rows else ():
-                    for run in _consecutive(on, lambda p: p.slot):
+                    for run in _consecutive(on):
                         got = src.index_select(1, _page_rows(p.id for p in run)).transpose(0, 1).contiguous()
                         s = run[0].slot
                         a.view(w, 0)[s * PAGE : (s + len(run)) * PAGE].copy_(got.to(self.dtype))
@@ -795,7 +786,7 @@ class CardRegion:
                 if i in host.k:
                     self._settle()  # the park's copies in flight landed before the host reads it
                     for w, dst in (("k", host.k[i]), ("v", host.v[i])):
-                        for run in _consecutive(on, lambda p: p.slot):
+                        for run in _consecutive(on):
                             s = run[0].slot
                             got = a.view(w, 0)[s * PAGE : (s + len(run)) * PAGE].cpu()
                             dst.index_copy_(1, _page_rows(p.id for p in run), got.transpose(0, 1).to(dst.dtype))
@@ -1279,16 +1270,15 @@ class PagedCache(DynamicCache):
             out["cpu"] = out.get("cpu", 0) + ram
         return out
 
-    def bind(self, T: int = 0) -> torch.Tensor | None:
+    def bind(self, T: int = 0) -> None:
         """the table on the card for a pass of `T` more rows - its rows reserved, its pages there, its map uploaded
-        (`CardRegion.bind`): the card's map, None where the pool has no card. The rows counted from the layers the pass
+        (`CardRegion.bind`), which the card's kernels read from the region. The rows counted from the layers the pass
         has yet to run: the host layers before a card run have appended the pass's rows already, and counted from
-        them a prompt's chunk reserved its rows twice (`CardRegion.bind_for`)"""
+        them a prompt's chunk reserved its rows twice (`CardRegion.bind_for`). Asked only of a pool with a card"""
         card = self.prefix.pool.card
-        if card is None:
-            return None
+        assert card is not None
         n = min((cl.n for cl in self.layers if isinstance(cl, PagedLayer)), default=0)
-        return card.bind_for(self.table, n + int(T))
+        card.bind_for(self.table, n + int(T))
 
     def crop(self, max_length: int) -> None:
         """transformers' crop (a negative length counting from the end), the table cut with the layers: a layer cut
