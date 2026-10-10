@@ -352,14 +352,14 @@ MMA_SHAPES = {"qkv": (4096, 1024), "o": (1024, 2048), "gu": (6144, 1024), "down"
 @cuda_only
 @pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
 @pytest.mark.parametrize("rows", [16, 8])
-@pytest.mark.parametrize("warps", [2, 4, 8])
+@pytest.mark.parametrize("warps", [1, 4])
 @pytest.mark.parametrize("shape", list(MMA_SHAPES))
 def test_cuda_gemv_mma(benchmark: object, shape: str, warps: int, rows: int) -> None:
-    """the tensor-core matvec at one row over a decode's weight shapes, by warps and rows a block
-    (`btb_gemv_mma_bf16` at 16, `btb_gemv_mma8_bf16` at 8 - the same bits): a round streams distinct weights past
-    the card's L2 back to back, as a step reads its layers, and the rate is the weights' bytes over the round
-    (`gbps`). A short weight (1024 rows: 64 groups of 16 on a 60-SM card) streams at its best with more warps to a
-    group than a tall one, or more groups"""
+    """the tensor-core matvec at one row over a decode's weight shapes, by a warp's rows and a block's warps
+    (`btb_gemv_mma_bf16` a warp 16 rows, `btb_gemv_mma8_bf16` 8 - the same bits): a round streams distinct weights
+    past the card's L2 back to back, as a step reads its layers, and the rate is the weights' bytes over the round
+    (`gbps`). A short weight (1024 rows: 64 groups of 16 on a 60-SM card) streams at its best at 8 rows a warp, for
+    twice the warps"""
     k = _cuda_kernels()
     name = "btb_gemv_mma_bf16" if rows == 16 else "btb_gemv_mma8_bf16"
     if name not in k.fn:
@@ -369,7 +369,7 @@ def test_cuda_gemv_mma(benchmark: object, shape: str, warps: int, rows: int) -> 
     ws = [torch.randn(R, C, dtype=torch.bfloat16, device="cuda") for _ in range(n)]
     x = torch.randn(32, C, dtype=torch.bfloat16, device="cuda")
     y = torch.empty(32, R, dtype=torch.bfloat16, device="cuda")
-    grid, block = ((R + rows - 1) // rows, 1, 1), (32 * warps, 1, 1)
+    grid, block = ((R + rows * warps - 1) // (rows * warps), 1, 1), (32 * warps, 1, 1)
     args = [[k.ptr(w), k.ptr(x), k.ptr(y), ctypes.c_int(R), ctypes.c_int(C), ctypes.c_int(1)] for w in ws]
 
     def body() -> None:
@@ -399,10 +399,10 @@ def test_cuda_gemv_mma(benchmark: object, shape: str, warps: int, rows: int) -> 
 @pytest.mark.parametrize("T", [512, 4096])  # a prompt chunk's rows
 @pytest.mark.parametrize("shape", list(MMA_SHAPES))
 def test_cuda_gemm(benchmark: object, shape: str, T: int, how: str) -> None:
-    """a prompt chunk's matmul over a decode's weight shapes (Qwen3-0.6B's): `btb_gemm_mma_bf16` - each row the
-    tensor-core matvec's bits, at its warps for the shape - and `btb_gemm_f32_bf16` - each row the fp32-chain matvec's
-    - against torch's matmul (cuBLAS), what a prompt's chunk took before its rows had to be its steps'. The rate is
-    the multiply-adds over the time (`tflops`)."""
+    """a prompt chunk's matmul over a decode's weight shapes (Qwen3-0.6B's): the tensor-core GEMM - each row the
+    tensor-core matvec's bits, its kernel the card's plan's - and `btb_gemm_f32_bf16` - each row the fp32-chain
+    matvec's - against torch's matmul (cuBLAS), what a prompt's chunk took before its rows had to be its steps'. The
+    rate is the multiply-adds over the time (`tflops`)."""
     k = _cuda_kernels()
     if "btb_gemm_mma_bf16" not in k.fn:
         pytest.skip("the prompt's GEMMs are not in this build")
@@ -410,14 +410,12 @@ def test_cuda_gemm(benchmark: object, shape: str, T: int, how: str) -> None:
     w = torch.randn(R, C, dtype=torch.bfloat16, device="cuda")
     x = torch.randn(T, C, dtype=torch.bfloat16, device="cuda")
     y = torch.empty(T, R, dtype=torch.bfloat16, device="cuda")
-    take = _CudaMixin._card_gemm_takes("cuda")  # a split tail's buffers, kept from round to round as the engine's
 
     def run() -> None:
         if how == "cublas":
             torch.matmul(x, w.t(), out=y)
         else:
-            # the engine's launch: the step's warps for the shape, its last wave split where the card's plan splits it
-            _CudaMixin._card_gemm_launch(k, how == "mma", w, x, y, R, C, T, take)
+            _CudaMixin._card_gemm(k, how == "mma", w, x, y, R, C, T)  # the engine's launch and plan
         torch.cuda.synchronize()
 
     benchmark.group = f"cuda-gemm-{shape}-t{T}"  # type: ignore[attr-defined]

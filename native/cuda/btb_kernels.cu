@@ -420,6 +420,10 @@ __device__ __forceinline__ void cp16(void* smem, const void* gmem, bool ok) {
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;"); }
 __device__ __forceinline__ void cp_wait1() { asm volatile("cp.async.wait_group 1;" ::: "memory"); }
 __device__ __forceinline__ void cp_wait0() { asm volatile("cp.async.wait_group 0;" ::: "memory"); }
+template <int N>
+__device__ __forceinline__ void cp_waitn() {
+    asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory");
+}
 
 // the tensor-core matvec for wide passes (one kernel for every row count, so a one-row step and a 32-row
 // verify pass share their bits): btb_gemv_mma.cuh

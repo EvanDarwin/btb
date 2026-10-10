@@ -376,90 +376,89 @@ def test_scheduler_reports_the_hierarchy(cu: _Cuda) -> None:
 
 # ---------------------------------------------------------------------------------------------------------
 # the tensor-core matvec: one kernel for every row count, the caller padding x to the 32 rows it always
-# carries. A row group is 16 weight rows to a block of 2 to 8 warps (k split between them), so the grid is
-# ceil(R / 16).
+# carries. Each output one chain over all of k; a warp a group of 16 weight rows (8 in btb_gemv_mma8_bf16), a
+# block `warps` of them, so the grid is ceil(R / 16 warps) - the block's size the launch's to choose, never a bit.
 # ---------------------------------------------------------------------------------------------------------
 
 MMA_SHAPES = [(151936, 1024), (19456, 2560), (2560, 9728), (4096, 1024), (6144, 1024), (1024, 3072), (6144, 2560)]
 
 
-def _mma(cu: _Cuda, W: torch.Tensor, x: torch.Tensor, warps: int = 2) -> torch.Tensor:
+def _mma(cu: _Cuda, W: torch.Tensor, x: torch.Tensor, warps: int = 1, rows: int = 16) -> torch.Tensor:
+    """the tensor-core matvec over x's rows: btb_gemv_mma_bf16 (rows 16) or btb_gemv_mma8_bf16 (8), `warps` a block"""
     M, C = x.shape
     R = W.shape[0]
     xp = x if M == 32 else torch.cat([x, torch.zeros(32 - M, C, device=dev, dtype=x.dtype)])
     y = torch.empty(32, R, device=dev, dtype=bf)
-    cu.launch("btb_gemv_mma_bf16", ((R + 15) // 16, 1, 1), (32 * warps, 1, 1), [P(W), P(xp), P(y), I(R), I(C), I(M)])
+    name = "btb_gemv_mma_bf16" if rows == 16 else "btb_gemv_mma8_bf16"
+    grid = ((R + rows * warps - 1) // (rows * warps), 1, 1)
+    cu.launch(name, grid, (32 * warps, 1, 1), [P(W), P(xp), P(y), I(R), I(C), I(M)])
     return y[:M]
 
 
-@pytest.mark.parametrize("warps", [2, 4, 8])
-@pytest.mark.parametrize("R,C", MMA_SHAPES + [(1020, 1032), (17, 8), (16, 32)])
-def test_gemv_mma_matches_linear_within_one_ulp(cu: _Cuda, R: int, C: int, warps: int) -> None:
+@pytest.mark.parametrize("R,C", MMA_SHAPES + [(1020, 1032), (17, 8), (16, 32), (24, 4136)])
+def test_gemv_mma_matches_linear_within_one_ulp(cu: _Cuda, R: int, C: int) -> None:
     torch.manual_seed(0)
     W = torch.randn(R, C, device=dev, dtype=bf)
     x = torch.randn(32, C, device=dev, dtype=bf)
     ref = F.linear(x, W).float()
     # within one bf16 ulp of cuBLAS at the outputs' magnitude - the k inside a super-tile is permuted, so the
     # fp32 sums differ from cuBLAS's in the last bits and can round to the neighbouring bf16
-    assert (_mma(cu, W, x, warps).float() - ref).abs().max().item() <= ref.abs().max().item() * 2**-7
+    assert (_mma(cu, W, x).float() - ref).abs().max().item() <= ref.abs().max().item() * 2**-7
 
 
-@pytest.mark.parametrize("warps", [2, 4, 8])
 @pytest.mark.parametrize("R,C", [(151936, 1024), (2560, 9728), (1024, 3072), (1020, 1032)])
-def test_gemv_mma_is_repeat_identical_and_carries_no_row_across(cu: _Cuda, R: int, C: int, warps: int) -> None:
+def test_gemv_mma_is_repeat_identical_and_carries_no_row_across(cu: _Cuda, R: int, C: int) -> None:
     torch.manual_seed(1)
     W = torch.randn(R, C, device=dev, dtype=bf)
     x = torch.randn(32, C, device=dev, dtype=bf)
-    y = _mma(cu, W, x, warps)
-    assert torch.equal(y, _mma(cu, W, x, warps))
+    y = _mma(cu, W, x)
+    assert torch.equal(y, _mma(cu, W, x))
     # row 0 is the one-row step's bits whatever stands in the other 31: mma accumulates each output element
     # from its own row of x, so a 1-row step and a 32-row verify pass agree bit for bit
     zeros = x.clone()
     zeros[1:] = 0
-    assert torch.equal(y[:1], _mma(cu, W, zeros, warps)[:1])
+    assert torch.equal(y[:1], _mma(cu, W, zeros)[:1])
     other = x.clone()
     other[1:] = torch.randn(31, C, device=dev, dtype=bf)
-    assert torch.equal(y[:1], _mma(cu, W, other, warps)[:1])
+    assert torch.equal(y[:1], _mma(cu, W, other)[:1])
     # and a 4-row pass is the first four rows of the 32-row one
-    assert torch.equal(y[:4], _mma(cu, W, x[:4], warps))
+    assert torch.equal(y[:4], _mma(cu, W, x[:4]))
 
 
 @pytest.mark.parametrize("M", [1, 5, 32])
-@pytest.mark.parametrize("warps", [2, 4, 8])
-@pytest.mark.parametrize("R,C", [(1024, 2048), (1024, 3072), (1020, 1032), (17, 8), (4096, 1024)])
-def test_the_eight_row_matvec_is_the_sixteen_row_one_bit_for_bit(cu: _Cuda, R: int, C: int, warps: int, M: int) -> None:
-    """`btb_gemv_mma8_bf16`, a block 8 weight rows, against btb_gemv_mma_bf16's 16: each output the same mma, k
-    slices and fold, so the same bits at any warps and any live rows"""
+@pytest.mark.parametrize("R,C", [(1024, 2048), (1024, 3072), (1020, 1032), (17, 8), (4096, 1024), (24, 4136)])
+def test_every_launch_of_the_matvec_gives_its_bits(cu: _Cuda, R: int, C: int, M: int) -> None:
+    """btb_gemv_mma_bf16 and btb_gemv_mma8_bf16 (a warp 16 rows, or 8), one to four warps a block: each output the
+    same chain, so the same bits whichever launch - at any live rows, a k not a whole number of bursts or of
+    super-tiles"""
     torch.manual_seed(12)
     W = torch.randn(R, C, device=dev, dtype=bf)
     x = torch.randn(M, C, device=dev, dtype=bf)
-    xp = x if M == 32 else torch.cat([x, torch.zeros(32 - M, C, device=dev, dtype=bf)])
-    y = torch.empty(32, R, device=dev, dtype=bf)
-    cu.launch("btb_gemv_mma8_bf16", ((R + 7) // 8, 1, 1), (32 * warps, 1, 1), [P(W), P(xp), P(y), I(R), I(C), I(M)])
-    assert torch.equal(y[:M], _mma(cu, W, x, warps))
+    want = _mma(cu, W, x)
+    for rows, warps in itertools.product((16, 8), (1, 2, 4)):
+        assert torch.equal(_mma(cu, W, x, warps, rows), want), (rows, warps)
 
 
 @pytest.mark.parametrize("act", ["silu", "gelu"])
 @pytest.mark.parametrize("M", [1, 5, 32])
-@pytest.mark.parametrize("warps", [2, 4, 8])
-@pytest.mark.parametrize("Ii,C", [(3072, 1024), (1000, 1032), (24, 64)])
+@pytest.mark.parametrize("warps", [1, 4])
+@pytest.mark.parametrize("Ii,C", [(3072, 1024), (1000, 1032), (24, 64), (40, 4136)])
 def test_the_glu_matvec_is_the_matvec_and_the_activation_bit_for_bit(
     cu: _Cuda, Ii: int, C: int, warps: int, M: int, act: str
 ) -> None:
     """`btb_gemv_mma_glu_{act}`, gate and up in one kernel and the activation in its epilogue, against
     btb_gemv_mma_bf16 over the merged [2I, C] weight and btb_{act}_mul over its output - at any I (a row group's
-    gate and up rows need not line up with the plain kernel's groups), any warps, any live rows"""
+    gate and up rows need not line up with the plain kernel's groups), any warps a block, any live rows"""
     torch.manual_seed(9)
     W = torch.randn(2 * Ii, C, device=dev, dtype=bf)
     x = torch.randn(M, C, device=dev, dtype=bf)
-    gu = _mma(cu, W, x, warps)
+    gu = _mma(cu, W, x)
     want = torch.empty(M, Ii, device=dev, dtype=bf)
     cu.launch(f"btb_{act}_mul", (min(4096, (M * Ii + 255) // 256), 1, 1), (256, 1, 1), [P(gu), P(want), I(M), I(Ii)])
     xp = x if M == 32 else torch.cat([x, torch.zeros(32 - M, C, device=dev, dtype=bf)])
     m = torch.empty(32, Ii, device=dev, dtype=bf)
-    cu.launch(
-        f"btb_gemv_mma_glu_{act}", ((Ii + 15) // 16, 1, 1), (32 * warps, 1, 1), [P(W), P(xp), P(m), I(Ii), I(C), I(M)]
-    )
+    grid = ((Ii + 16 * warps - 1) // (16 * warps), 1, 1)
+    cu.launch(f"btb_gemv_mma_glu_{act}", grid, (32 * warps, 1, 1), [P(W), P(xp), P(m), I(Ii), I(C), I(M)])
     assert torch.equal(m[:M], want)
 
 
@@ -469,73 +468,29 @@ def test_the_glu_matvec_is_the_matvec_and_the_activation_bit_for_bit(
 # ---------------------------------------------------------------------------------------------------------
 
 
-_gemm_takes = _CudaMixin._card_gemm_takes(dev)  # the split tail's buffers, kept from launch to launch as the engine's
-
-
-def _gemm(
-    cu: _Cuda, W: torch.Tensor, x: torch.Tensor, warps: int = 0, plan: tuple[int, int] | None = None
-) -> torch.Tensor:
-    """the engine's launch (`_card_gemm_launch`) over every row of x: `btb_gemm_mma_bf16` at the matvec's `warps`
-    (its last wave split by slice where the plan - the card's, or `plan` - splits it), or `btb_gemm_f32_bf16` (warps 0)"""
+def _gemm(cu: _Cuda, W: torch.Tensor, x: torch.Tensor, mma: bool = True, plan: str | None = None) -> torch.Tensor:
+    """the engine's launch (`_card_gemm`) over every row of x: the tensor cores' chain (the kernel the card's plan
+    picks, or `plan`'s: "big", "small"), or `btb_gemm_f32_bf16`"""
     T, C = x.shape
     R = W.shape[0]
     y = torch.full((T, R), float("nan"), device=dev, dtype=bf)
-    _CudaMixin._card_gemm_launch(cu, bool(warps), W, x, y, R, C, T, _gemm_takes, plan=plan, nw=warps or None)
+    _CudaMixin._card_gemm(cu, mma, W, x, y, R, C, T, plan=plan)
     return y
 
 
-@pytest.mark.parametrize("warps", [2, 4, 8])
+@pytest.mark.parametrize("plan", ["big", "small"])
 @pytest.mark.parametrize("R,C", [(4096, 1024), (1024, 3072), (6144, 1024), (2560, 9728), (1020, 1032), (17, 8)])
-def test_a_prompts_matmul_gives_the_steps_rows_on_tensor_cores(cu: _Cuda, R: int, C: int, warps: int) -> None:
-    """`btb_gemm_mma_bf16` at the matvec's warps: every row of a chunk bit for bit the row btb_gemv_mma_bf16 gives
-    a step, whatever the chunk's length and wherever in a block the row falls"""
+def test_a_prompts_matmul_gives_the_steps_rows_on_tensor_cores(cu: _Cuda, R: int, C: int, plan: str) -> None:
+    """each of the tensor-core GEMM's kernels - 128 x 64 tiles, 64 x 64 - gives every row of a chunk bit for bit the
+    row btb_gemv_mma_bf16 gives a step, whatever the chunk's length and wherever in a tile the row falls"""
     torch.manual_seed(13)
     W = torch.randn(R, C, device=dev, dtype=bf)
     x = torch.randn(300, C, device=dev, dtype=bf)
-    y = _gemm(cu, W, x, warps)
+    y = _gemm(cu, W, x, plan=plan)
     for a in range(0, 300, 32):
-        assert torch.equal(y[a : a + 32], _mma(cu, W, x[a : a + 32], warps)), a
-    assert torch.equal(_gemm(cu, W, x[:1], warps), y[:1])
-    assert torch.equal(_gemm(cu, W, x[100:229], warps), y[100:229])
-
-
-@pytest.mark.parametrize("warps", [2, 4, 8])
-@pytest.mark.parametrize("R,C", [(1024, 3072), (2560, 9728), (1020, 1032), (64, 4136), (17, 8)])
-def test_a_prompts_matmul_split_by_slice_gives_its_whole_tiles_bits(cu: _Cuda, R: int, C: int, warps: int) -> None:
-    """`btb_gemm_mma_tail_bf16`: a tile split into the matvec's slices - a block a slice, the last to finish folding
-    them in slice order - gives the bits its whole block gives, whichever tiles the split takes (every one, the
-    second half, the last alone; a slice past the last super-tile where the k is short), and leaves its counters at
-    zero for the next launch, which gives them again"""
-    torch.manual_seed(15)
-    W = torch.randn(R, C, device=dev, dtype=bf)
-    x = torch.randn(300, C, device=dev, dtype=bf)
-    tiles = (300 + 127) // 128 * ((R + 63) // 64)
-    want = _gemm(cu, W, x, warps, plan=(tiles, 0))
-    for whole in (0, tiles // 2, tiles - 1, 0):
-        assert torch.equal(_gemm(cu, W, x, warps, plan=(whole, tiles - whole)), want), whole
-        cnt = _gemm_takes("card gemm counts", (tiles - whole,), torch.int32, True)
-        assert int(cnt.abs().sum()) == 0, whole
-
-
-def test_a_prompts_matmul_whose_split_the_ledger_refuses_runs_every_tile_whole(cu: _Cuda) -> None:
-    """`_card_gemm_launch` where the plan splits the last wave (Qwen3-0.6B's down over 300 rows: 48 tiles, every
-    one) and the split's buffers are refused: every tile whole, the same bits, nothing launched before the refusal"""
-    from btb.engine.scheduler import MemoryGrantError
-
-    torch.manual_seed(16)
-    R, C, T = 1024, 3072, 300
-    W = torch.randn(R, C, device=dev, dtype=bf)
-    x = torch.randn(T, C, device=dev, dtype=bf)
-    tiles = (T + 127) // 128 * ((R + 63) // 64)
-    plan = _CudaMixin._card_gemm_plan(R, C, T, 4, cu.sms, cu.blocks_per_sm("btb_gemm_mma_bf16", 128))
-    assert plan[1] > 0, plan  # the case splits on this card
-
-    def refuse(name: str, shape: tuple[int, ...], dtype: torch.dtype, zeroed: bool) -> torch.Tensor:
-        raise MemoryGrantError(f"refused {name}", device=dev)
-
-    y = torch.full((T, R), float("nan"), device=dev, dtype=bf)
-    _CudaMixin._card_gemm_launch(cu, True, W, x, y, R, C, T, refuse)
-    assert torch.equal(y, _gemm(cu, W, x, 4, plan=(tiles, 0)))
+        assert torch.equal(y[a : a + 32], _mma(cu, W, x[a : a + 32])), a
+    assert torch.equal(_gemm(cu, W, x[:1], plan=plan), y[:1])
+    assert torch.equal(_gemm(cu, W, x[100:229], plan=plan), y[100:229])
 
 
 @pytest.mark.parametrize("R,C", [(4096, 1024), (1024, 3072), (2560, 9728), (1020, 1032), (17, 8)])
@@ -545,10 +500,10 @@ def test_a_prompts_matmul_gives_the_steps_rows_in_the_fp32_chain(cu: _Cuda, R: i
     torch.manual_seed(14)
     W = torch.randn(R, C, device=dev, dtype=bf)
     x = torch.randn(77, C, device=dev, dtype=bf)
-    y = _gemm(cu, W, x)
+    y = _gemm(cu, W, x, mma=False)
     for a in range(0, 77, 32):
         assert torch.equal(y[a : a + 32], _gemv(cu, W, x[a : a + 32])), a
-    assert torch.equal(_gemm(cu, W, x[5:6]), y[5:6])
+    assert torch.equal(_gemm(cu, W, x[5:6], mma=False), y[5:6])
 
 
 def test_gemv_mma_streams_the_weights_at_the_cards_ceiling(cu: _Cuda, capsys: CaptureFixture[str]) -> None:
@@ -571,9 +526,10 @@ def test_gemv_mma_streams_the_weights_at_the_cards_ceiling(cu: _Cuda, capsys: Ca
         ) -> float:
             def body() -> None:
                 assert Ws is not None
+                grid, block = _CudaMixin._card_mma_launch(R, cu.sms)  # the engine's launch for the shape
                 for W in Ws:
                     cu.launch(
-                        "btb_gemv_mma_bf16", ((R + 15) // 16, 1, 1), (64, 1, 1), [P(W), P(xs), P(y), I(R), I(C), I(m)]
+                        _CudaMixin._card_mma_kernel(R, cu.sms), grid, block, [P(W), P(xs), P(y), I(R), I(C), I(m)]
                     )
 
             for _ in range(3):

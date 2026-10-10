@@ -4,322 +4,164 @@
 // conversation's steps made, and the conversation's next turn read from the cache decodes as the prompt cold does.
 // There are two matvecs and the warm-up picks one for the engine (`_card_mma_for`); each has its GEMM here.
 //
-//   btb_gemm_mma_bf16(w [R, C], x [T, C], y [T, R], R, C, T, nw)  ceil(T / 128) * ceil(R / 64) blocks, block 128
-//     btb_gemv_mma_bf16's bits at `nw` warps (`_card_mma_warps(R, C)`, the step's): the super-tiles of 32 k (the
-//     permuted k), cut in nw slices of ceil(nst / nw) as its warps cut them, each slice's partial an mma chain from
-//     zero in super-tile order and the partials added in slice order - the matvec's warp-ordered fold. x as the mma's
-//     A operand and w as its B, as there.
-//   btb_gemm_mma_tail_bf16(w, x, y, R, C, T, nw, part, cnt, t0)  the same bits for the tiles past t0, a slice a block
-//     and the slices folded by each tile's last block: a chunk's last wave split where it would idle the card
+//   btb_gemm_mma_bf16(w [R, C], x [T, C], y [T, R], R, C, T)  ceil(T / 128) * ceil(R / 64) blocks, block 128
+//     btb_gemv_mma_bf16's bits: each output one mma chain from zero over the super-tiles of 32 k (the permuted k) in
+//     order, x as the mma's A operand and w as its B, as there. Four warps of 64 x rows by 32 weight rows
+//   btb_gemm_mma_small_bf16(w, x, y, R, C, T)  ceil(T / 64) * ceil(R / 64) blocks, block 128
+//     the same chain on tiles of 64 x 64 (four warps of 32 x 32), for a chunk too few tiles at 128 x 64 to fill the
+//     card: a chain can use no more SMs than there are tiles
 //   btb_gemm_f32_bf16(w [R, C], x [T, C], y [T, R], R, C, T)  ceil(T / 8) * ceil(R / 32) blocks, block 128
 //     btb_gemv_bf16_m{M}'s bits: lane l's fp32 chain over chunks l, l + 32, .. of 8 elements in index order, then
 //     the butterfly over the lanes (xor 16, 8, 4, 2, 1), each lane here the same lane of 64 outputs at once.
 //
-// The mma GEMM reuses a tile of w over 128 rows of x (the matvec reads w once a step; a prompt's chunk reads it once
-// a 128 rows), staged in shared memory by asynchronous copies three super-tiles deep; a lane's fragments are one
-// 16-byte shared load each, a row's 64 bytes a super-tile, two rows filling the banks once. Both launch their tiles
-// in groups of x tiles (`gm_tile`): which block takes which tile moves no bit, each output its own block's.
+// The mma GEMM reuses a tile of w over the tile's x rows (the matvec reads w once a step; a prompt's chunk reads it
+// once a tile), staged in shared memory by asynchronous copies a super-tile a stage; a lane's fragments are one
+// 16-byte shared load each, a row's 64 bytes a super-tile, two rows filling the banks once. With nothing folded an
+// output needs one accumulator, so a thread holds 64 at a 64 x 32 warp tile and four blocks stand on an SM. Both
+// kernels take their tiles in groups of x tiles (`gm_tile`): which block takes which tile moves no bit.
 
-#define GM_BM 128  // x rows a block
-#define GM_BR 64   // weight rows a block
-#define GM_STAGES 3
-#define GM_GROUP 8      // the mma GEMM's x tiles a group: 1024 x rows
+#define GM_GROUP 8       // the mma GEMM's x tiles a group
 #define GM_GROUP_F32 32  // the fp32 chain's: 256 x rows
+#define GM_BIG_STAGES 2  // the 128 x 64 kernel's stages, and the blocks an SM it is built for
+#define GM_BIG_BLOCKS 4
+#define GM_SMALL_STAGES 3
+#define GM_SMALL_BLOCKS 4
 
 // a block's tiles (x tile, weight tile) of a 1-D launch of nx * nw blocks: a group of G x tiles walks the weight
 // tiles together, so the blocks on the card at once read a stretch of the weights for every x tile of the group out
 // of the L2 and the group's x rows stay there. With the weight tiles fastest, each x tile read every weight row again
 // from DRAM (a 4096-row chunk's 32 x tiles: the weights 32 times over); with the x tiles fastest, the x rows again
 // for each weight tile
-__device__ __forceinline__ void gm_tile_at(int at, int nx, int nw, int G, int& xt, int& wt) {
+__device__ __forceinline__ void gm_tile(int nx, int nw, int G, int& xt, int& wt) {
     const int per = G * nw;
-    const int g = at / per, k = at % per;
+    const int g = blockIdx.x / per, k = blockIdx.x % per;
     const int first = g * G, size = min(nx - first, G);
     xt = first + k % size;
     wt = k / size;
 }
-__device__ __forceinline__ void gm_tile(int nx, int nw, int G, int& xt, int& wt) {
-    gm_tile_at(blockIdx.x, nx, nw, G, xt, wt);
-}
 
-extern "C" __global__ void __launch_bounds__(128)
-    btb_gemm_mma_bf16(const bf16* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ y, int R, int C,
-                      int T, int nw) {
-    __shared__ __align__(16) bf16 sx[GM_STAGES][GM_BM * 32];
-    __shared__ __align__(16) bf16 sw[GM_STAGES][GM_BR * 32];
+// a block's tile of WM x WN warps, each MT m-tiles (16 x rows) by NT n-tiles (8 weight rows), NS stages of a
+// super-tile: its whole chain
+template <int WM, int WN, int MT, int NT, int NS>
+__device__ __forceinline__ void gm_mma(const bf16* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ y,
+                                       int R, int C, int T, bf16* sm) {
+    constexpr int NTH = 32 * WM * WN, BM = 16 * MT * WM, BR = 8 * NT * WN;
+    constexpr int XS = BM * 32, WS = BR * 32, STG = XS + WS;  // a stage: the tile's x and w rows, 64 B each
+    constexpr int XC = BM * 4 / NTH, WC = BR * 4 / NTH, RSTEP = NTH / 4;  // a thread's copies a stage
+    static_assert(XC * NTH == BM * 4 && WC * NTH == BR * 4, "a tile's copies split evenly over its threads");
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
-    const int wm = warp >> 1, wr = warp & 1;  // the warp's tile: x rows wm * 64 .., weight rows wr * 32 ..
+    const int wm = warp / WN, wr = warp % WN;
     int xt, wt;
-    gm_tile((T + GM_BM - 1) / GM_BM, (R + GM_BR - 1) / GM_BR, GM_GROUP, xt, wt);
-    const int m0 = xt * GM_BM, r0 = wt * GM_BR;
+    gm_tile((T + BM - 1) / BM, (R + BR - 1) / BR, GM_GROUP, xt, wt);
+    const int m0 = xt * BM, r0 = wt * BR;
     const int nst = (C + 31) >> 5;
-    const int per = (nst + nw - 1) / nw;
-    // a thread's copies: the 16-byte chunk ch of x rows crow + 32 i and w rows crow + 32 i, their row starts found
-    // once (a row past the matrix reads row 0's address, copied as zeros), a super-tile's k added to them
+    // a thread's copies: the 16-byte chunk ch of rows crow + RSTEP i, their row starts found once (a row past the
+    // matrix reads row 0's address, copied as zeros), a super-tile's k added to them
     const int crow = threadIdx.x >> 2, ch = threadIdx.x & 3;
-    const bf16* xs[GM_BM / 32];
-    bool xok[GM_BM / 32];
+    const bf16* xs[XC];
+    bool xok[XC];
 #pragma unroll
-    for (int i = 0; i < GM_BM / 32; ++i) {
-        xok[i] = m0 + crow + 32 * i < T;
-        xs[i] = x + (size_t)(xok[i] ? m0 + crow + 32 * i : 0) * C + ch * 8;
+    for (int i = 0; i < XC; ++i) {
+        const int row = crow + i * RSTEP;
+        xok[i] = m0 + row < T;
+        xs[i] = x + (size_t)(xok[i] ? m0 + row : 0) * C + ch * 8;
     }
-    const bf16* ws[GM_BR / 32];
-    bool wok[GM_BR / 32];
+    const bf16* ws[WC];
+    bool wok[WC];
 #pragma unroll
-    for (int i = 0; i < GM_BR / 32; ++i) {
-        wok[i] = r0 + crow + 32 * i < R;
-        ws[i] = w + (size_t)(wok[i] ? r0 + crow + 32 * i : 0) * C + ch * 8;
+    for (int i = 0; i < WC; ++i) {
+        const int row = crow + i * RSTEP;
+        wok[i] = r0 + row < R;
+        ws[i] = w + (size_t)(wok[i] ? r0 + row : 0) * C + ch * 8;
     }
-    // a super-tile's x and w rows into stage buffer b: x 128 rows of 64 bytes, w 64; a chunk past C or a row past
-    // the matrix is zeros, as the matvec's zero loads
+    const int dst = crow * 32 + ch * 8;
+    // super-tile st's rows into stage b; a chunk past C or a row past the matrix is zeros, as the matvec's
     auto issue = [&](int st, int b) {
+        bf16* const base = sm + b * STG;
         const int kk = st << 5;
         const bool kin = kk + ch * 8 < C;
         const int ko = kin ? kk : 0;
 #pragma unroll
-        for (int i = 0; i < GM_BM / 32; ++i) cp16(&sx[b][(crow + 32 * i) * 32 + ch * 8], xs[i] + ko, xok[i] && kin);
+        for (int i = 0; i < XC; ++i) cp16(base + dst + i * RSTEP * 32, xs[i] + ko, xok[i] && kin);
 #pragma unroll
-        for (int i = 0; i < GM_BR / 32; ++i) cp16(&sw[b][(crow + 32 * i) * 32 + ch * 8], ws[i] + ko, wok[i] && kin);
+        for (int i = 0; i < WC; ++i) cp16(base + XS + dst + i * RSTEP * 32, ws[i] + ko, wok[i] && kin);
         cp_commit();
     };
-    float tot[4][4][4], acc[4][4][4];
+    float acc[MT][NT][4];
 #pragma unroll
-    for (int mt = 0; mt < 4; ++mt)
+    for (int mt = 0; mt < MT; ++mt)
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt)
-#pragma unroll
-            for (int e = 0; e < 4; ++e) tot[mt][nt][e] = acc[mt][nt][e] = 0.f;
-    issue(0, 0);
-    if (nst > 1) {
-        issue(1, 1);
-    } else {
-        cp_commit();
-    }
-    // the slice ends counted down (a division a super-tile was the loop's costliest arithmetic), the stage buffers
-    // turned round
-    int slice = 0, left = per, b = 0, nb = 2;
-    for (int st = 0; st < nst; ++st) {
-        cp_wait1();
-        __syncthreads();  // super-tile st landed for every thread, and st - 1's buffer is free
-        if (st + 2 < nst) {
-            issue(st + 2, nb);
-        } else {
-            cp_commit();
-        }
-        nb = nb + 1 == GM_STAGES ? 0 : nb + 1;
-        uint4 wv[4];
-#pragma unroll
-        for (int nt = 0; nt < 4; ++nt)
-            wv[nt] = *reinterpret_cast<const uint4*>(&sw[b][(wr * 32 + nt * 8 + gid) * 32 + tig * 8]);
-#pragma unroll
-        for (int mt = 0; mt < 4; ++mt) {
-            const uint4 xa = *reinterpret_cast<const uint4*>(&sx[b][(wm * 64 + mt * 16 + gid) * 32 + tig * 8]);
-            const uint4 xb = *reinterpret_cast<const uint4*>(&sx[b][(wm * 64 + mt * 16 + gid + 8) * 32 + tig * 8]);
-            // the first k-tile across the n-tiles, then the second: an output's two mma stay in order, four
-            // others between them
-#pragma unroll
-            for (int nt = 0; nt < 4; ++nt) {
-                float* a = acc[mt][nt];
-                btb_mma16816(a[0], a[1], a[2], a[3], xa.x, xb.x, xa.y, xb.y, wv[nt].x, wv[nt].y);
-            }
-#pragma unroll
-            for (int nt = 0; nt < 4; ++nt) {
-                float* a = acc[mt][nt];
-                btb_mma16816(a[0], a[1], a[2], a[3], xa.z, xb.z, xa.w, xb.w, wv[nt].z, wv[nt].w);
-            }
-        }
-        b = b + 1 == GM_STAGES ? 0 : b + 1;
-        if (--left == 0 || st + 1 == nst) {
-            // the slice's end: its partial into the total, in slice order (the first a copy, as warp 0's is kept)
-#pragma unroll
-            for (int mt = 0; mt < 4; ++mt)
-#pragma unroll
-                for (int nt = 0; nt < 4; ++nt)
-#pragma unroll
-                    for (int e = 0; e < 4; ++e) {
-                        tot[mt][nt][e] = slice == 0 ? acc[mt][nt][e] : tot[mt][nt][e] + acc[mt][nt][e];
-                        acc[mt][nt][e] = 0.f;
-                    }
-            ++slice;
-            left = per;
-        }
-    }
-    // the matvec's warps past the last super-tile add their zero partials too
-    for (; slice < nw; ++slice) {
-#pragma unroll
-        for (int mt = 0; mt < 4; ++mt)
-#pragma unroll
-            for (int nt = 0; nt < 4; ++nt)
-#pragma unroll
-                for (int e = 0; e < 4; ++e) tot[mt][nt][e] = tot[mt][nt][e] + 0.f;
-    }
-#pragma unroll
-    for (int mt = 0; mt < 4; ++mt) {
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            const int m = m0 + wm * 64 + mt * 16 + gid + h * 8;
-            if (m >= T) continue;
-            bf16* const p = y + (size_t)m * R;
-#pragma unroll
-            for (int nt = 0; nt < 4; ++nt)
-                btb_mma_st2(p, r0 + wr * 32 + nt * 8 + tig * 2, R, tot[mt][nt][2 * h], tot[mt][nt][2 * h + 1]);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------------------------------------
-// a chunk's last partial wave of tiles, split by the matvec's own slices. btb_gemm_mma_bf16 runs the tiles that fill
-// the card's waves whole (its grid the first t0 tiles in group order, `_card_gemm_plan`), this kernel the rest: tile
-// t0 + b / nw's slice b % nw a block, the slice's chain from zero in super-tile order (as the whole tile's block
-// chains it) stored in the thread's own fragment order - part[b][thread][64], float4s. The last of a tile's nw
-// blocks to store (cnt[b / nw], left at zero for the next launch) folds the tile's planes in slice order, the first a
-// copy and each after added, as the whole tile's block folds its slices: a tile's bits are the same in either kernel.
-// A last wave that ran a few whole tiles while the rest of the card idled runs nw times the blocks, each an nw-th of
-// the k.
-//
-//   btb_gemm_mma_tail_bf16(w, x, y, R, C, T, nw, part [ntail nw 128 64] f32, cnt [ntail] i32, t0)
-//     ntail * nw blocks, block 128
-// ---------------------------------------------------------------------------------------------------------
-extern "C" __global__ void __launch_bounds__(128)
-    btb_gemm_mma_tail_bf16(const bf16* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ y, int R, int C,
-                           int T, int nw, float* __restrict__ part, int* __restrict__ cnt, int t0) {
-    __shared__ __align__(16) bf16 sx[GM_STAGES][GM_BM * 32];
-    __shared__ __align__(16) bf16 sw[GM_STAGES][GM_BR * 32];
-    __shared__ int last;
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
-    const int wm = warp >> 1, wr = warp & 1;
-    const int tile = blockIdx.x / nw, slice = blockIdx.x % nw;
-    int xt, wt;
-    gm_tile_at(t0 + tile, (T + GM_BM - 1) / GM_BM, (R + GM_BR - 1) / GM_BR, GM_GROUP, xt, wt);
-    const int m0 = xt * GM_BM, r0 = wt * GM_BR;
-    const int nst = (C + 31) >> 5;
-    const int per = (nst + nw - 1) / nw;
-    const int s0 = min(slice * per, nst), ns = min(s0 + per, nst) - s0;  // a slice past the last super-tile: none
-    const int crow = threadIdx.x >> 2, ch = threadIdx.x & 3;
-    const bf16* xs[GM_BM / 32];
-    bool xok[GM_BM / 32];
-#pragma unroll
-    for (int i = 0; i < GM_BM / 32; ++i) {
-        xok[i] = m0 + crow + 32 * i < T;
-        xs[i] = x + (size_t)(xok[i] ? m0 + crow + 32 * i : 0) * C + ch * 8;
-    }
-    const bf16* ws[GM_BR / 32];
-    bool wok[GM_BR / 32];
-#pragma unroll
-    for (int i = 0; i < GM_BR / 32; ++i) {
-        wok[i] = r0 + crow + 32 * i < R;
-        ws[i] = w + (size_t)(wok[i] ? r0 + crow + 32 * i : 0) * C + ch * 8;
-    }
-    auto issue = [&](int st, int b) {
-        const int kk = st << 5;
-        const bool kin = kk + ch * 8 < C;
-        const int ko = kin ? kk : 0;
-#pragma unroll
-        for (int i = 0; i < GM_BM / 32; ++i) cp16(&sx[b][(crow + 32 * i) * 32 + ch * 8], xs[i] + ko, xok[i] && kin);
-#pragma unroll
-        for (int i = 0; i < GM_BR / 32; ++i) cp16(&sw[b][(crow + 32 * i) * 32 + ch * 8], ws[i] + ko, wok[i] && kin);
-        cp_commit();
-    };
-    float acc[4][4][4];
-#pragma unroll
-    for (int mt = 0; mt < 4; ++mt)
-#pragma unroll
-        for (int nt = 0; nt < 4; ++nt)
+        for (int nt = 0; nt < NT; ++nt)
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[mt][nt][e] = 0.f;
-    if (ns > 0) {
-        issue(s0, 0);
-    } else {
-        cp_commit();
-    }
-    if (ns > 1) {
-        issue(s0 + 1, 1);
-    } else {
-        cp_commit();
-    }
-    int b = 0, nb = 2;
-    for (int i = 0; i < ns; ++i) {
-        cp_wait1();
-        __syncthreads();
-        if (i + 2 < ns) {
-            issue(s0 + i + 2, nb);
+#pragma unroll
+    for (int g = 0; g < NS - 1; ++g) {
+        if (g < nst) {
+            issue(g, g);
         } else {
             cp_commit();
         }
-        nb = nb + 1 == GM_STAGES ? 0 : nb + 1;
-        uint4 wv[4];
+    }
+    int rb = 0, wb = NS - 1;  // the stage read, the stage written
+    for (int st = 0; st < nst; ++st) {
+        cp_waitn<NS - 2>();
+        __syncthreads();  // super-tile st landed for every thread, and the stage read before it is free
+        if (st + NS - 1 < nst) {
+            issue(st + NS - 1, wb);
+        } else {
+            cp_commit();
+        }
+        wb = wb + 1 == NS ? 0 : wb + 1;
+        const bf16* const bx = sm + rb * STG;
+        const bf16* const bw = bx + XS;
+        rb = rb + 1 == NS ? 0 : rb + 1;
+        uint4 wv[NT];
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt)
-            wv[nt] = *reinterpret_cast<const uint4*>(&sw[b][(wr * 32 + nt * 8 + gid) * 32 + tig * 8]);
+        for (int nt = 0; nt < NT; ++nt)
+            wv[nt] = *reinterpret_cast<const uint4*>(&bw[(wr * NT * 8 + nt * 8 + gid) * 32 + tig * 8]);
 #pragma unroll
-        for (int mt = 0; mt < 4; ++mt) {
-            const uint4 xa = *reinterpret_cast<const uint4*>(&sx[b][(wm * 64 + mt * 16 + gid) * 32 + tig * 8]);
-            const uint4 xb = *reinterpret_cast<const uint4*>(&sx[b][(wm * 64 + mt * 16 + gid + 8) * 32 + tig * 8]);
+        for (int mt = 0; mt < MT; ++mt) {
+            const uint4 xa = *reinterpret_cast<const uint4*>(&bx[(wm * MT * 16 + mt * 16 + gid) * 32 + tig * 8]);
+            const uint4 xb = *reinterpret_cast<const uint4*>(&bx[(wm * MT * 16 + mt * 16 + gid + 8) * 32 + tig * 8]);
+            // the first k-tile across the n-tiles, then the second: an output's two mma in order, others between
 #pragma unroll
-            for (int nt = 0; nt < 4; ++nt) {
+            for (int nt = 0; nt < NT; ++nt) {
                 float* a = acc[mt][nt];
                 btb_mma16816(a[0], a[1], a[2], a[3], xa.x, xb.x, xa.y, xb.y, wv[nt].x, wv[nt].y);
             }
 #pragma unroll
-            for (int nt = 0; nt < 4; ++nt) {
+            for (int nt = 0; nt < NT; ++nt) {
                 float* a = acc[mt][nt];
                 btb_mma16816(a[0], a[1], a[2], a[3], xa.z, xb.z, xa.w, xb.w, wv[nt].z, wv[nt].w);
             }
         }
-        b = b + 1 == GM_STAGES ? 0 : b + 1;
     }
-    // the slice's partial (zeros for a slice past the last super-tile, the matvec's empty warp), then the tile's count
-    float4* const mine = reinterpret_cast<float4*>(part) + ((size_t)blockIdx.x * 128 + threadIdx.x) * 16;
 #pragma unroll
-    for (int mt = 0; mt < 4; ++mt)
-#pragma unroll
-        for (int nt = 0; nt < 4; ++nt)
-            mine[mt * 4 + nt] = make_float4(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3]);
-    __threadfence();
-    __syncthreads();
-    if (threadIdx.x == 0) last = atomicAdd(&cnt[tile], 1) == nw - 1;
-    __syncthreads();
-    if (!last) return;
-    __threadfence();
-    // the tile's planes in slice order, from this thread's own positions in each
-    const float4* const planes = reinterpret_cast<const float4*>(part) + ((size_t)tile * nw * 128 + threadIdx.x) * 16;
-#pragma unroll
-    for (int mt = 0; mt < 4; ++mt)
-#pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
-            const float4 v = __ldcg(&planes[mt * 4 + nt]);
-            acc[mt][nt][0] = v.x;
-            acc[mt][nt][1] = v.y;
-            acc[mt][nt][2] = v.z;
-            acc[mt][nt][3] = v.w;
-        }
-    for (int j = 1; j < nw; ++j) {
-        const float4* const pj = planes + (size_t)j * 128 * 16;
-#pragma unroll
-        for (int mt = 0; mt < 4; ++mt)
-#pragma unroll
-            for (int nt = 0; nt < 4; ++nt) {
-                const float4 v = __ldcg(&pj[mt * 4 + nt]);
-                acc[mt][nt][0] = acc[mt][nt][0] + v.x;
-                acc[mt][nt][1] = acc[mt][nt][1] + v.y;
-                acc[mt][nt][2] = acc[mt][nt][2] + v.z;
-                acc[mt][nt][3] = acc[mt][nt][3] + v.w;
-            }
-    }
-    if (threadIdx.x == 0) cnt[tile] = 0;
-#pragma unroll
-    for (int mt = 0; mt < 4; ++mt) {
+    for (int mt = 0; mt < MT; ++mt) {
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            const int m = m0 + wm * 64 + mt * 16 + gid + h * 8;
+            const int m = m0 + wm * MT * 16 + mt * 16 + gid + h * 8;
             if (m >= T) continue;
             bf16* const p = y + (size_t)m * R;
 #pragma unroll
-            for (int nt = 0; nt < 4; ++nt)
-                btb_mma_st2(p, r0 + wr * 32 + nt * 8 + tig * 2, R, acc[mt][nt][2 * h], acc[mt][nt][2 * h + 1]);
+            for (int nt = 0; nt < NT; ++nt)
+                btb_mma_st2(p, r0 + wr * NT * 8 + nt * 8 + tig * 2, R, acc[mt][nt][2 * h], acc[mt][nt][2 * h + 1]);
         }
     }
+}
+
+extern "C" __global__ void __launch_bounds__(128, GM_BIG_BLOCKS)
+    btb_gemm_mma_bf16(const bf16* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ y, int R, int C,
+                      int T) {
+    __shared__ __align__(16) bf16 sm[GM_BIG_STAGES * (128 + 64) * 32];
+    gm_mma<2, 2, 4, 4, GM_BIG_STAGES>(w, x, y, R, C, T, sm);
+}
+
+extern "C" __global__ void __launch_bounds__(128, GM_SMALL_BLOCKS)
+    btb_gemm_mma_small_bf16(const bf16* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ y, int R,
+                            int C, int T) {
+    __shared__ __align__(16) bf16 sm[GM_SMALL_STAGES * (64 + 64) * 32];
+    gm_mma<2, 2, 2, 4, GM_SMALL_STAGES>(w, x, y, R, C, T, sm);
 }
 
 // ---------------------------------------------------------------------------------------------------------

@@ -1454,22 +1454,18 @@ def test_the_widest_speculative_pass_is_held_to_what_the_family_verifies() -> No
     assert _CudaMixin._card_width(cast(Any, w), 3) == 4 and _CudaMixin._card_width(cast(Any, w), 41) == 41
 
 
-def test_a_prompt_gemm_splits_only_a_sparse_last_wave_of_long_k() -> None:
-    """`_card_gemm_plan` on a 60-SM card at two blocks an SM: a last wave of whole tiles that would leave most SMs
-    idle is split by slice where the k is long (Qwen3-0.6B's down at 512 rows, every tile; an 8B's down, the 16 past
-    two full waves), and nowhere else - a short k (Qwen3-0.6B's qkv), a long chunk (the same down at 4096 rows), a
-    last wave that fills the card, a wave that comes out even, a matvec of one warp a group"""
+def test_a_prompt_gemm_takes_the_tiles_its_shape_runs_fastest_on() -> None:
+    """`_card_gemm_plan` on a 60-SM card, as measured on one: the 64 x 64 tiles where the 128 x 64 would give the SMs
+    fewer than eight each (Qwen3-0.6B's down and an 8B's down at 512 rows) or the k is 1024 or less (the 0.6B's qkv
+    at 4096 rows), the 128 x 64 elsewhere (the 0.6B's down and an 8B's square weight at 4096 rows, the 8B's
+    24576-row gate/up at 512)"""
     from btb.engine.cuda import _CudaMixin
 
     plan = _CudaMixin._card_gemm_plan
-    assert plan(1024, 3072, 512, 4, 60, 2) == (0, 64)
-    assert plan(4096, 12288, 512, 4, 60, 2) == (240, 16)
-    assert plan(4096, 1024, 512, 4, 60, 2) == (256, 0)
-    assert plan(1024, 3072, 4096, 4, 60, 2) == (512, 0)
-    assert plan(6144, 4096, 300, 4, 60, 2) == (240, 48)  # 288 tiles: a last wave of 48
-    assert plan(1024, 3072, 896, 4, 60, 2) == (112, 0)  # 7 x 16 tiles: a last wave that nearly fills the card
-    assert plan(1024, 3072, 1920, 4, 60, 2) == (240, 0)  # 15 x 16 tiles: two waves exactly
-    assert plan(1024, 3072, 512, 1, 60, 2) == (64, 0)
+    assert plan(1024, 3072, 512, 60) == plan(4096, 12288, 512, 60) == "small"
+    assert plan(4096, 1024, 4096, 60) == "small"
+    assert plan(1024, 3072, 4096, 60) == plan(4096, 4096, 4096, 60) == plan(24576, 4096, 512, 60) == "big"
+    assert plan(151936, 4096, 1, 60) == "big"  # a head's one row: 2374 tiles of weight rows
 
 
 def test_one_burst_does_not_price_a_width_out_for_good() -> None:

@@ -95,11 +95,11 @@ def _captured(exec_id: int) -> None:
 
 class _Warm:
     """a pass's L2 warming (`_CudaMixin._card_warm`): called after each matvec is launched, it forks `side` from
-    the chain there and warms the next weight of `seq` - (weight, rows, cols, the warps its matvec cuts k into) -
-    with `btb_l2_warm`, the share of each warp's slice read on the card from `share` (the card state's switch,
-    moved between replays), so the warming runs beside the kernels between the two matvecs; `join()` brings `side`
-    back into the chain at the pass's end, which a capture needs. It holds the pass's weights and pointers and
-    nothing of the card's state, so nothing outlives the pass through it"""
+    the chain there and warms the next weight of `seq` - (weight, rows, cols) - with `btb_l2_warm`, the share of
+    each row read on the card from `share` (the card state's switch, moved between replays), so the warming runs
+    beside the kernels between the two matvecs; `join()` brings `side` back into the chain at the pass's end, which
+    a capture needs. It holds the pass's weights and pointers and nothing of the card's state, so nothing outlives
+    the pass through it"""
 
     __slots__ = ("blocks", "i", "k", "seq", "share", "side", "sink")
 
@@ -108,7 +108,7 @@ class _Warm:
         k: Any,
         side: torch.cuda.Stream | None,
         sink: torch.Tensor | None,
-        seq: list[tuple[torch.Tensor, int, int, int]],
+        seq: list[tuple[torch.Tensor, int, int]],
         blocks: int,
         share: ctypes.c_void_p | None = None,
     ) -> None:
@@ -117,7 +117,7 @@ class _Warm:
     def __call__(self) -> None:
         if self.side is None or self.i >= len(self.seq):
             return
-        W, R, C, nw = self.seq[self.i]
+        W, R, C = self.seq[self.i]
         self.i += 1
         self.side.wait_stream(torch.cuda.current_stream())
         c = ctypes.c_int
@@ -125,7 +125,7 @@ class _Warm:
             "btb_l2_warm",
             (self.blocks, 1, 1),
             (256, 1, 1),
-            [self.k.ptr(W), c(R), c(C), c(nw), self.share, self.k.ptr(self.sink)],
+            [self.k.ptr(W), c(R), c(C), self.share, self.k.ptr(self.sink)],
             stream=self.side,
         )
 
@@ -1287,29 +1287,28 @@ class _CudaMixin(_State):
             return bool(one), "past the widths the warm-up timed: the engine's kernel"
         return False, "not measured yet"
 
-    @staticmethod
-    def _card_mma_grid(R: int, C: int) -> int:
-        """the launch of btb_gemv_mma_bf16 for a [R, C] weight: one block per group of 16 rows (a shorter grid
-        strides the groups and is only slower, never wrong)"""
-        return (R + 15) // 16
+    # the tensor-core matvec's warps a block, each its own row group: 16 rows (btb_gemv_mma_bf16, the gate/up kernel)
+    # or 8 (btb_gemv_mma8_bf16) - the block's size moves no bit
+    MMA_WARPS = 4
+    MMA8_WARPS = 1
 
-    # the row groups at which two warps a group keep the card's DRAM streaming (`_card_mma_warps`)
-    MMA_WIDE_GROUPS = 512
+    @staticmethod
+    def _card_mma_narrow(R: int, sms: int) -> bool:
+        """a [R, C] weight's tensor-core matvec at a warp a group of 8 rows (btb_gemv_mma8_bf16) rather than 16: where
+        16 would not give each of the card's `sms` SMs two warps (Qwen3-0.6B's 1024-row o and down: 64 groups on 60
+        SMs, too few loads standing to stream them). Each output one chain over all of k in either, so the same bits"""
+        return (R + 15) // 16 < 2 * sms
 
     @classmethod
-    def _card_mma_warps(cls, R: int, C: int) -> int:
-        """the warps over one group of 16 weight rows in btb_gemv_mma_bf16, k split between them: two where the
-        groups fill the card, four on a weight too short to (Qwen3-0.6B's 1024-row o and down, 64 groups over 60
-        SMs, streamed at 350 GB/s against its head's 441). A function of the weight's shape alone - never of the
-        pass's rows - so a shape's one-row step and its verify pass sum alike, bit for bit"""
-        return 2 if (R + 15) // 16 >= cls.MMA_WIDE_GROUPS else 4
+    def _card_mma_kernel(cls, R: int, sms: int) -> str:
+        """the tensor-core matvec kernel for a [R, C] weight (`_card_mma_narrow`)"""
+        return "btb_gemv_mma8_bf16" if cls._card_mma_narrow(R, sms) else "btb_gemv_mma_bf16"
 
-    def _card_mma_narrow(self, R: int) -> bool:
-        """a [R, C] weight's tensor-core matvec at 8 rows a block (`btb_gemv_mma8_bf16`) rather than 16: where 16
-        would not give each of the card's SMs two blocks, a few SMs took a second block while the rest idled
-        through it (Qwen3-0.6B's 1024-row o and down, 64 groups over 60 SMs). The same bits either way"""
-        sms = int(torch.cuda.get_device_properties(self.dev).multi_processor_count)
-        return (R + 15) // 16 < 2 * sms
+    @classmethod
+    def _card_mma_launch(cls, R: int, sms: int) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+        """`_card_mma_kernel`'s launch (grid, block): its row groups, a block's warps each its own"""
+        rows, w = (8, cls.MMA8_WARPS) if cls._card_mma_narrow(R, sms) else (16, cls.MMA_WARPS)
+        return ((R + rows * w - 1) // (rows * w), 1, 1), (32 * w, 1, 1)
 
     # the card state's switches (`st["switch"]`, int32 on the card): the share of each matvec slice warmed into L2
     # ahead of it, in 256ths (`CARD_WARM`)
@@ -1481,29 +1480,18 @@ class _CudaMixin(_State):
             seq += [(L["qkv"], (Hq + 2 * Hk) * D, H), (L["o"], H, Hq * D), (L["gu"], 2 * I, H), (L["down"], H, I)]
         if tail and self.head is not None:
             seq.append((self.head.weight, int(self.head.weight.shape[0]), H))
-        warm = self._card_warm(st, mma, seq)
-        # the graph's kernel variant (`g["fused"]`, the step lanes' own): the gate, up and activation as one kernel
-        # and a short weight's matvec at 8 rows a block - fewer kernels, so fewer edges where another program on the
-        # card takes it and btb's L2 with it. The same bits as the plain ones; which is faster is the tuner's to find
+        warm = self._card_warm(st, seq)
+        # the graph's kernel variant (`g["fused"]`, the step lanes' own): the gate, up and activation as one kernel -
+        # one kernel fewer, so one edge fewer where another program on the card takes it and btb's L2 with it. The
+        # same bits as the plain ones; which is faster is the tuner's to find
         fused = bool(g.get("fused")) and mma
         glu = f"btb_gemv_mma_glu_{act}"
         glu_on = fused and glu in k.fn
 
         def matvec(W: torch.Tensor, xin: torch.Tensor, yout: torch.Tensor, R: int, C: int) -> None:
-            if fused and "btb_gemv_mma8_bf16" in k.fn and self._card_mma_narrow(R):
-                k.launch(
-                    "btb_gemv_mma8_bf16",
-                    ((R + 7) // 8, 1, 1),
-                    (32 * self._card_mma_warps(R, C), 1, 1),
-                    [P(W), P(xin), P(yout), ci(R), ci(C), ci(T)],
-                )
-            elif mma:
-                k.launch(
-                    "btb_gemv_mma_bf16",
-                    (self._card_mma_grid(R, C), 1, 1),
-                    (32 * self._card_mma_warps(R, C), 1, 1),
-                    [P(W), P(xin), P(yout), ci(R), ci(C), ci(T)],
-                )
+            if mma:
+                grid, block = self._card_mma_launch(R, k.sms)
+                k.launch(self._card_mma_kernel(R, k.sms), grid, block, [P(W), P(xin), P(yout), ci(R), ci(C), ci(T)])
             else:
                 k.launch(gemv, ((R + 3) // 4, 1, 1), (128, 1, 1), [P(W), P(xin), P(yout), ci(R), ci(C)])
             warm()
@@ -1598,8 +1586,8 @@ class _CudaMixin(_State):
                 # its loads and stalled the stream: Qwen3-0.6B's down 21.6 us against 1.7 + its GEMV apart)
                 k.launch(
                     glu,
-                    ((I + 15) // 16, 1, 1),
-                    (32 * self._card_mma_warps(2 * I, H), 1, 1),
+                    ((I + 16 * self.MMA_WARPS - 1) // (16 * self.MMA_WARPS), 1, 1),
+                    (32 * self.MMA_WARPS, 1, 1),
                     [P(L["gu"]), P(g["x"]), P(g["m"]), ci(I), ci(H), ci(T)],
                 )
                 warm()
@@ -1664,7 +1652,7 @@ class _CudaMixin(_State):
             self.CARD_FUSE
             and self.CARD_TUNE
             and self._card_mma_for(1)
-            and ("btb_gemv_mma8_bf16" in k.fn or any(f"btb_gemv_mma_glu_{a}" in k.fn for a in ("silu", "gelu")))
+            and any(f"btb_gemv_mma_glu_{a}" in k.fn for a in ("silu", "gelu"))
         )
 
     def _card_tuner(self, st: dict[str, Any], lanes: list[tuple[str, bool]]) -> _Tuner | None:
@@ -1687,10 +1675,10 @@ class _CudaMixin(_State):
     # the warming kernel's blocks beside the chain's: four loads standing a thread keep the DRAM fed at 24
     WARM_BLOCKS = 24
 
-    def _card_warm(self, st: dict[str, Any], mma: bool, seq: list[tuple[torch.Tensor, int, int]]) -> _Warm:
+    def _card_warm(self, st: dict[str, Any], seq: list[tuple[torch.Tensor, int, int]]) -> _Warm:
         """the pass's L2 warming (`_Warm`, `btb_l2_warm`) over its matvec weights `seq` in launch order, on the card
-        state's side stream: the share of every warp's slice of every row the switch names (`SW_WARM`), the slices as
-        each weight's matvec cuts them. Captured only where warming is on (`CARD_WARM`): at a share of 0 each warming
+        state's side stream: the share of every row the switch names (`SW_WARM`), where each matvec's warps begin.
+        Captured only where warming is on (`CARD_WARM`): at a share of 0 each warming
         kernel leaves at once, but a launch still costs its node. Nothing it does reaches a result: the bits are the
         chain's alone"""
         k = st["k"]
@@ -1703,10 +1691,7 @@ class _CudaMixin(_State):
                 "stream": torch.cuda.Stream(device=dev),
                 "sink": torch.zeros(1, dtype=torch.int32, device=dev),
             }
-        # the tensor-core kernel's warps each take a k slice of whole 32-element super-tiles; the fp32 kernel's one
-        # warp a row walks it from its start
-        plan = [(W, R, C, self._card_mma_warps(R, C) if mma else 1) for W, R, C in seq]
-        return _Warm(k, w["stream"], w["sink"], plan, self.WARM_BLOCKS, self._card_switch_ptr(st, self.SW_WARM))
+        return _Warm(k, w["stream"], w["sink"], seq, self.WARM_BLOCKS, self._card_switch_ptr(st, self.SW_WARM))
 
     def _card_record(self, st: dict[str, Any], g: dict[str, Any], body: Any, what: str) -> None:
         """`body` once eagerly on the arena's stream (the warm-up), then captured there, so the captured
@@ -2719,11 +2704,6 @@ class _CudaMixin(_State):
             cnt = buf("cnt", (T * Hq,), torch.int32)
         r0 = 0 if all_rows else T - 1
         tail_bufs = self._card_tail_buffers(T - r0, H) if tail else None
-        # the matmuls' split tails (`_card_gemm_plan`): the layer's four, and the head's where the pass carries it
-        gemms = [((Hq + 2 * Hk) * D, H, T), (H, Hq * D, T), (2 * I, H, T), (H, I, T)]
-        if tail_bufs is not None:
-            gemms.append((int(tail_bufs[1].shape[1]), H, T - r0))
-        self._card_gemm_ready(k, gemms)
         hb.copy_(h.reshape(T, H))
         for s in range(nsl):
             where[s : s + 1].fill_(past + s * self.GRID_Y)
@@ -2848,31 +2828,24 @@ class _CudaMixin(_State):
     # the most rows a launch takes on grid.y (the card's limit), where a chunk's rows ride it
     GRID_Y = 65535
 
-    # the tensor-core GEMM's last wave split by slice (`_card_gemm_plan`): where its tiles fill the card's SMs this
-    # many times at most (the wave a block an SM or not much past), the weight's k this many super-tiles at least (a
-    # slice's block outlasting the split's own cost: the second launch, its partials, the fold), and the chunk's
-    # tiles this many SMs' worth at most (past it the last wave is a small share of the chunk)
-    GEMM_TAIL_SPARSE = 1.5
-    GEMM_TAIL_MIN_K = 96
-    GEMM_TAIL_MAX_WAVES = 8
+    # the 64 x 64 tiles where the 128 x 64 ones would give the card's SMs fewer than this many each, or where the k is
+    # this many super-tiles or fewer (`_card_gemm_plan`)
+    GEMM_SMALL_TILES = 8
+    GEMM_SMALL_K = 32
 
     @classmethod
-    def _card_gemm_plan(cls, R: int, C: int, rows: int, nw: int, sms: int, per_sm: int) -> tuple[int, int]:
-        """a tensor-core prompt GEMM's tiles (btb_gemm.cuh: 128 x rows by 64 weight rows, `per_sm` blocks an SM on
-        `sms` SMs): (the whole tiles btb_gemm_mma_bf16 takes, the tail's btb_gemm_mma_tail_bf16 takes a slice a
-        block). A last wave of a few whole tiles held the card while most of its SMs idled (Qwen3-0.6B's down at 512
-        rows: 64 tiles on 60 SMs); split, its tiles' slices spread over every SM. Where a slice is short, or the last
-        wave a small share of a long chunk, the split's own cost outweighs it and every tile is whole"""
+    def _card_gemm_plan(cls, R: int, C: int, rows: int, sms: int) -> str:
+        """a tensor-core prompt GEMM's kernel (btb_gemm.cuh) on a card of `sms` SMs: "big" (128 x rows by 64 weight
+        rows a block) or "small" (64 x 64), the same bits either way. A chain can use no more SMs than there are
+        tiles, and a short one spends more of a big tile in its start and end: on the 4070 Ti (cycles at locked
+        clocks) the small tiles won every 512-row chunk of Qwen3-0.6B's and an 8B's shapes but the 8B's 24576-row
+        gate/up (1536 big tiles), and a 1024-k weight at 4096 rows (12% on the 0.6B's qkv); the big won or tied the
+        longer k at 4096 rows"""
         tiles = (rows + 127) // 128 * ((R + 63) // 64)
-        tail = tiles % (per_sm * sms)
-        if nw < 2 or (C + 31) // 32 < cls.GEMM_TAIL_MIN_K or tiles > cls.GEMM_TAIL_MAX_WAVES * sms:
-            return tiles, 0
-        if tail == 0 or tail > cls.GEMM_TAIL_SPARSE * sms:
-            return tiles, 0
-        return tiles - tail, tail
+        return "small" if tiles < cls.GEMM_SMALL_TILES * sms or (C + 31) // 32 <= cls.GEMM_SMALL_K else "big"
 
     @classmethod
-    def _card_gemm_launch(
+    def _card_gemm(
         cls,
         k: Any,
         mma: bool,
@@ -2882,82 +2855,20 @@ class _CudaMixin(_State):
         R: int,
         C: int,
         rows: int,
-        take: Callable[[str, tuple[int, ...], torch.dtype, bool], torch.Tensor],
-        plan: tuple[int, int] | None = None,
-        nw: int | None = None,
+        plan: str | None = None,
     ) -> None:
-        """y[:rows] = x[:rows] W^T [R, C] as the step's matvec sums each row (btb_gemm.cuh): the tensor cores' at the
-        matvec's warps for the weight's shape, or the fp32 chain - the one the warm-up picked (`mma`). `take(name,
-        shape, dtype, zeroed)`: the split tail's buffers (`_card_gemm_plan`). The engine's, the kernel tests' and the
-        bench's launch; `plan` and `nw` (the matvec's warps) forced only by the tests"""
+        """y[:rows] = x[:rows] W^T [R, C] as the step's matvec sums each row (btb_gemm.cuh): the tensor cores' chain
+        or the fp32 chain - the one the warm-up picked (`mma`). The engine's, the kernel tests' and the bench's launch;
+        `plan` (`_card_gemm_plan`'s answer) forced only by the tests"""
         P, ci = k.ptr, ctypes.c_int
+        args = [P(W), P(x), P(y), ci(R), ci(C), ci(rows)]
         if not mma:
             grid = ((rows + 7) // 8 * ((R + 31) // 32), 1, 1)  # a block 8 x rows by 32 weight rows, in groups
-            k.launch("btb_gemm_f32_bf16", grid, (128, 1, 1), [P(W), P(x), P(y), ci(R), ci(C), ci(rows)])
-            return
-        if nw is None:
-            nw = cls._card_mma_warps(R, C)
-        if plan is None:
-            plan = cls._card_gemm_plan(R, C, rows, nw, k.sms, k.blocks_per_sm("btb_gemm_mma_bf16", 128))
-        whole, tail = plan
-        args = [P(W), P(x), P(y), ci(R), ci(C), ci(rows), ci(nw)]
-        part = cnt = None
-        if tail:
-            # a slice's partial in each block's own fragment order; a tile's counter left at zero by its fold. Taken
-            # before either launch: refused, every tile is whole - the same bits
-            try:
-                part = take("card gemm parts", (tail * nw * 128 * 64,), torch.float32, False)
-                cnt = take("card gemm counts", (tail,), torch.int32, True)
-            except MemoryGrantError:
-                whole, tail = whole + tail, 0
-        if whole:
-            # the first `whole` tiles in group order (`gm_tile`)
-            k.launch("btb_gemm_mma_bf16", (whole, 1, 1), (128, 1, 1), args)
-        if tail:
-            k.launch("btb_gemm_mma_tail_bf16", (tail * nw, 1, 1), (128, 1, 1), args + [P(part), P(cnt), ci(whole)])
-
-    @staticmethod
-    def _card_gemm_takes(device: Any) -> Callable[[str, tuple[int, ...], torch.dtype, bool], torch.Tensor]:
-        """`_card_gemm_launch`'s buffers outside an engine (the kernel tests, the bench): each name's kept for the
-        next launch and grown as asked, zeros where made new for a `zeroed` one, as the engine's scratch keeps them"""
-        bufs: dict[str, torch.Tensor] = {}
-
-        def take(name: str, shape: tuple[int, ...], dtype: torch.dtype, zeroed: bool) -> torch.Tensor:
-            n = 1
-            for s in shape:
-                n *= int(s)
-            t = bufs.get(name)
-            if t is None or t.dtype != dtype or t.numel() < n:
-                t = bufs[name] = (torch.zeros if zeroed else torch.empty)(n, dtype=dtype, device=device)
-            return t[:n].view(*shape)
-
-        return take
-
-    def _card_gemm_take(self, name: str, shape: tuple[int, ...], dtype: torch.dtype, zeroed: bool) -> torch.Tensor:
-        """a split tail's buffer (`_card_gemm_launch`), the engine's scratch"""
-        who = "the card's prompt GEMM: its last wave's tiles split by slice"
-        return self.scratch.take(name, shape, dtype, self.dev, who, zeroed=zeroed)
-
-    def _card_gemm_ready(self, k: Any, gemms: Iterable[tuple[int, int, int]]) -> None:
-        """the split tails' buffers for a pass's matmuls (each [R, C] over `rows`): the widest any of them asks,
-        taken now - with the pass's other buffers, before a row of the cache is written - so no matmul asks the
-        ledger past the pass's first write"""
-        parts = counts = 0
-        for R, C, rows in gemms:
-            if not self._card_mma_for(rows):
-                continue
-            nw = self._card_mma_warps(R, C)
-            _, tail = self._card_gemm_plan(R, C, rows, nw, k.sms, k.blocks_per_sm("btb_gemm_mma_bf16", 128))
-            parts, counts = max(parts, tail * nw * 128 * 64), max(counts, tail)
-        if counts:
-            self._card_gemm_take("card gemm parts", (parts,), torch.float32, False)
-            self._card_gemm_take("card gemm counts", (counts,), torch.int32, True)
-
-    def _card_gemm(
-        self, k: Any, mma: bool, W: torch.Tensor, x: torch.Tensor, y: torch.Tensor, R: int, C: int, rows: int
-    ) -> None:
-        """`_card_gemm_launch` with the engine's scratch for the split tail's buffers"""
-        self._card_gemm_launch(k, mma, W, x, y, R, C, rows, self._card_gemm_take)
+            k.launch("btb_gemm_f32_bf16", grid, (128, 1, 1), args)
+        elif (plan or cls._card_gemm_plan(R, C, rows, k.sms)) == "small":
+            k.launch("btb_gemm_mma_small_bf16", ((rows + 63) // 64 * ((R + 63) // 64), 1, 1), (128, 1, 1), args)
+        else:
+            k.launch("btb_gemm_mma_bf16", ((rows + 127) // 128 * ((R + 63) // 64), 1, 1), (128, 1, 1), args)
 
     def _card_tail_ok(self) -> bool:
         """the card graph's kernels run the tail: the card graph on, the final norm and the head on the card, bf16"""
