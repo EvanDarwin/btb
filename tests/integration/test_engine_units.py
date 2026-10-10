@@ -1119,6 +1119,50 @@ def test_mlx_decodes_run_on_one_worker_thread_whichever_thread_asks() -> None:
     assert sm._worker is None
 
 
+def test_a_second_caller_waits_for_the_worker_the_first_is_still_making(monkeypatch: pytest.MonkeyPatch) -> None:
+    """two threads asking at once: the first held while it learns its new worker's thread, the second asks
+    meanwhile and waits for it - a worker published before its thread was named had the second read the thread
+    first (an AttributeError)"""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from btb.engine import text
+
+    entered, go = threading.Event(), threading.Event()
+
+    class Held(ThreadPoolExecutor):
+        def submit(self, fn: Any, /, *args: Any, **kw: Any) -> Any:
+            if not entered.is_set():
+                entered.set()
+                go.wait(10)
+            return super().submit(fn, *args, **kw)
+
+    monkeypatch.setattr(text, "ThreadPoolExecutor", Held)
+    sm = btb.load(fixture("tiny_qwen3"), device="cpu")
+    got: dict[str, Any] = {}
+
+    def ask(name: str) -> None:
+        try:
+            got[name] = sm._on_worker(lambda: threading.current_thread().name)
+        except BaseException as e:  # handed to the test's thread
+            got[name] = e
+
+    try:
+        first = threading.Thread(target=ask, args=("first",))
+        first.start()
+        assert entered.wait(10)
+        second = threading.Thread(target=ask, args=("second",))
+        second.start()
+        second.join(0.2)  # the second asks while the first is still making the worker
+        go.set()
+        first.join()
+        second.join()
+        assert got["first"] == got["second"] and str(got["first"]).startswith("btb-mlx"), got
+    finally:
+        go.set()
+        sm.close()
+
+
 def test_native_isa_is_a_tier_the_cert_matrix_knows() -> None:
     """the tier the library reports (what bench.yml banks a baseline under) is one of the `Isa` variants
     tests/cert/native_ops reads from the crate, so the two never disagree on a name"""

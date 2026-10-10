@@ -50,8 +50,8 @@ ATTN_KERNEL_HEADS = (128, 256)
 @dataclass
 class MlxState:
     """The MLX path's own state: its switches (shipped at these defaults; a caller may set one on the engine's
-    `mlx_state`), what it holds in unified memory, the read-ahead buffer, the pool blocks it took, and the
-    caches it fills on first use (the fused weights, the family check, the rope table, the embedding)."""
+    `mlx_state`), what it holds in unified memory, the read-ahead buffer, and the caches it fills on first use
+    (the fused weights, the family check, the rope table, the embedding)."""
 
     batch: bool = True
     pipeline: bool = True
@@ -62,7 +62,6 @@ class MlxState:
     delta_mode: str = "recurrent"
     bytes: int = 0
     ahead: Shared | None = None
-    pool_blocks: set[Any] = field(default_factory=set)
     weights: dict[Any, Any] | None = None
     family_ok: bool | None = None
     affine: bool = False  # linears bound as a GGUF's own quant blocks (their kernels): no megakernel, no fused step
@@ -136,9 +135,8 @@ class _MlxMixin(_State):
         """A `Shared` of `nbytes` for a layer's linears, filled on MLX's CPU stream with the next layer's buffer
         started before this layer's weights are read (one touch of fresh memory, overlapped with the read);
         a slice of a pool block when the pool has one. Returns (Shared, offset)."""
-        got = pool.POOL.take(nbytes)
+        got = pool.POOL.take(nbytes, self)
         if got is not None:
-            self.mlx_state.pool_blocks.add(got[0])
             return got
         m = mlxdev.mx()
         sh = self.mlx_state.ahead
@@ -593,6 +591,7 @@ class _MlxMixin(_State):
             isinstance(cl, GrowLayer)
             and cl.shared
             and cl._mx is not None
+            and (cl._mx[0].dtype == mlxdev.mx().bfloat16 or bool(cl.bits))
             and hd in ATTN_KERNEL_HEADS
             and Hq // Hk <= mlxdev.ATTN_MAXG
             and bool(getattr(self, "mlx_attn_kernel", True))
@@ -868,6 +867,12 @@ class _MlxMixin(_State):
             self._tag(PassTag.MLX_ATTN_KERNEL)
             a = mlxdev.attn_prefill(qh[0].transpose(1, 0, 2), cl._mx[0], cl._mx[1], cl._n - T, scale, odt=qh.dtype)
             return a.reshape(T, Hq * hd), attn_pa
+        if nodes is not None and isinstance(mask, str) and any(p != j - 1 for j, p in enumerate(nodes[1])):
+            # a causal mask would let a node attend its siblings as if they were its ancestors
+            raise RuntimeError(
+                "[mlx] a tree reached MLX's attention without its mask: `_mlx_tree_able` admitted a layer the node "
+                "kernel cannot take"
+            )
         if win is not None and (mask is None or isinstance(mask, str)):
             # SDPA over the whole cache, masked to a sliding window: row t (at past + t) keeps keys (p - win, p]
             n = int(K.shape[-2])

@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
-from .. import trace
+from .. import pool, trace
 from ..api import api
 from ..kinds import Log, PassTag
 from ..options import Device
@@ -1200,9 +1200,9 @@ class _MemoryMixin(_State):
     def _give_up_one(self, dev: torch.device, short: int, tried: set[str]) -> bool:
         """the cheapest thing btb holds on `dev`, given up toward `short` bytes: on a card the passes' scratch (made
         again by the next pass that wants it), the drafter, then layers from the top, then the head (each live cache
-        following its layer); on the host the prefix cache's free pages past its last held one (no row anyone reads,
-        `KvPool.trim`), MLX's cached buffers, the expert store's blocks, then a warm layer to the drive. False when
-        nothing is left"""
+        following its layer); on the host the pool's idle blocks, the prefix cache's free pages past its last held one
+        (no row anyone reads, `KvPool.trim`), MLX's cached buffers, the expert store's blocks, then a warm layer to the
+        drive. False when nothing is left"""
         log = self.log
         if dev.type == Device.CUDA and "scratch" not in tried:
             tried.add("scratch")
@@ -1214,6 +1214,8 @@ class _MemoryMixin(_State):
                 return False
             if not self.vram_watch:  # a running policy regrows what it sheds; none runs to regrow this
                 self._lent_shed("card")
+            return True
+        if pool.POOL.trim():
             return True
         pc = self.__dict__.get("_kv")
         if pc is not None and "kv" not in tried:

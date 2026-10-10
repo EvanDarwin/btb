@@ -576,63 +576,6 @@ class _TiersMixin(_State):
             cur += (nb + 63) // 64 * 64
         return items, cur
 
-    def bind_cpu_gemm(self) -> int:
-        """The CPU tier's host linears in shared torch/MLX memory: each layer's weights read once into one MLX byte
-        buffer, the torch weight a view of it, `cpu_gemm` a bf16 view for the prefill's GEMM. Cold and packed
-        layers are left alone. Returns the bytes bound."""
-        from concurrent.futures import ThreadPoolExecutor
-
-        rd = Native.read_direct
-        total = 0
-        pool = getattr(self, "_mlx_pool", None)
-        if pool is None:
-            pool = self._mlx_pool = ThreadPoolExecutor(max_workers=4)
-        groups = [
-            [m for m in layer.modules() if isinstance(m, _HostLinear)]
-            for i, layer in self.host.items()
-            if i not in self.cold
-        ]
-        if self.head_host is not None:
-            groups.append([self.head_host])
-        for lins in groups:
-            lins = [
-                m
-                for m in lins
-                if m.mx is None
-                and m.packed is None
-                and m.f8 is None
-                and m.cpu_gemm is None
-                and m.key in self.weight_map
-                and m.weight.dtype == torch.bfloat16
-            ]
-            if not lins:
-                continue
-            items, cur = self._layer_items(lins)
-            sh, base = self._shared_ahead(cur)
-            chunk = getattr(self, "cold_chunk", 16 << 20)
-
-            def read(it: Any) -> Any:
-                # consumed by pool.map within this iteration: `sh`, `base` and `chunk` are this layer's (B023)
-                m, path, off, nb, so = it
-                if rd is not None and path is not None:
-                    rd(path, off, nb, sh.torch[base + so : base + so + nb], chunk)  # noqa: B023
-                else:
-                    copy_bytes(sh.torch[base + so : base + so + nb], m.weight.data)  # noqa: B023
-                return nb
-
-            for nb in pool.map(read, items):
-                self.bytes_streamed += nb
-            for m, _path, _off, nb, so in items:
-                shape = tuple(m.weight.shape)
-                m.weight = torch.nn.Parameter(sh.view_torch(base + so, nb, torch.bfloat16, shape), requires_grad=False)
-                m.cpu_gemm = sh.view_mx(base + so, nb, mlxdev.mx().bfloat16, shape)
-                m._cpu_shared = sh
-            # the views evaluated here, on the loading thread: MLX keeps a lazy op's stream per thread, and a
-            # server's first prefill runs on a request thread, where the loader's stream does not exist
-            mlxdev.mx().eval(*[m.cpu_gemm for m, *_ in items])
-            total += cur
-        return total
-
     def _track(self, cache: KvCache) -> KvCache:
         """`cache` among those a layer's move reaches while it lives: an idle session's, a fork's, the running pass's"""
         live: weakref.WeakSet[KvCache] = self.__dict__.setdefault("_live_caches", weakref.WeakSet())

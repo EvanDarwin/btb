@@ -190,16 +190,19 @@ class _GenerateMixin(_State):
                 assert isinstance(have, dict)  # a layer keeps its states as its snapshot does
                 conv_slot = have is cl.conv_states
                 for k, v in snap_states.items():
-                    if have.get(k) is not None:
-                        have[k].copy_(v)
+                    cur = have.get(k)
+                    if cur is not None and cur.dtype == v.dtype and cur.shape == v.shape:
+                        cur.copy_(v)
                         continue
                     # a slot the layer has not filled yet (a host prefill leaves some to the first step; a fresh cache
-                    # opening on the tree's snapshot, all): filled through transformers' own setters, so the next pass
-                    # goes on from the state, not from none - a copy of its own, never a view of the snapshot's (a
-                    # later pass writes the layer's states in place)
+                    # opening on the tree's snapshot, all), or one a step has widened since (Qwen4's holds its states
+                    # float32): a copy of the snapshot's own, in its dtype, which the next pass computes in, on `dev`
+                    # - never a view of the snapshot's (a later pass writes the layer's states in place). One not
+                    # filled yet through transformers' own setters, so the next pass goes on from the state, not from
+                    # none
                     setter = getattr(cl, "update_conv_state" if conv_slot else "update_recurrent_state", None)
                     own = v.to(dev or v.device, copy=True)
-                    if setter is None:
+                    if cur is not None or setter is None:
                         have[k] = own
                     elif conv_slot:
                         setter(own, k, conv_kernel_size=int(v.shape[-1]))
@@ -208,6 +211,10 @@ class _GenerateMixin(_State):
             return
         assert isinstance(conv, torch.Tensor) and isinstance(rec, torch.Tensor)  # _lin_snap copies both alike
         c, r = _lin(cl)
+        if c.dtype != conv.dtype or r.dtype != rec.dtype or c.shape != conv.shape or r.shape != rec.shape:
+            cl.conv_states = conv.to(dev or conv.device, copy=True)
+            cl.recurrent_states = rec.to(dev or rec.device, copy=True)
+            return
         c.copy_(conv)
         r.copy_(rec)
 

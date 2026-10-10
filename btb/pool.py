@@ -168,14 +168,15 @@ class Pool:
     threads: Any
 
     def __init__(self) -> None:
-        self.blocks = []  # [mlx array, numpy view, bytes used, Shared or None]
+        self.blocks = []  # [mlx array, numpy view, bytes used, Shared or None, owner's id or None]
         self.lock = threading.Lock()
         self.threads = []  # seeds still filling
         self.streams = []  # the fills' own CPU streams, kept alive with their arrays
 
     def free_bytes(self) -> int:
+        """the idle blocks' bytes: what the next load can cut its buffers from"""
         with self.lock:
-            return sum(len(v) - used for _, v, used, _ in self.blocks)
+            return sum(len(e[1]) for e in self.blocks if e[4] is None)
 
     def seed(self, sizes: Iterable[int]) -> None:
         """Blocks cut so that the buffers of `sizes`, taken in order, never straddle one; only what the pool's
@@ -214,7 +215,7 @@ class Pool:
             for x in xs:
                 v = np.array(x, copy=False)
                 with self.lock:
-                    self.blocks.append([x, v, 0, None])
+                    self.blocks.append([x, v, 0, None, None])
 
         t = threading.Thread(target=run, name="btb-pool", daemon=True)
         self.threads.append(t)
@@ -225,28 +226,45 @@ class Pool:
         while self.threads:
             self.threads.pop(0).join()
 
-    def take(self, nbytes: int) -> tuple[Shared, int] | None:
-        """(Shared, offset) of `nbytes` in a block with room, or None; waits for a seed still filling"""
+    def take(self, nbytes: int, owner: object) -> tuple[Shared, int] | None:
+        """(Shared, offset) of `nbytes` in a block with room that is idle or already `owner`'s, or None; waits for
+        a seed still filling. A block serves one engine at a time, so one closing never frees another's bytes"""
         from .mlx import Shared
 
         self._settle()
         need = (int(nbytes) + ALIGN - 1) // ALIGN * ALIGN
         with self.lock:
             for e in self.blocks:
-                if len(e[1]) - e[2] >= need:
+                if e[4] in (None, id(owner)) and len(e[1]) - e[2] >= need:
                     if e[3] is None:
                         e[3] = Shared.wrap(e[0], e[1])
                     off = e[2]
                     e[2] += need
+                    e[4] = id(owner)
                     return e[3], off
         return None
 
-    def give(self, shared: Shared) -> None:
-        """a block back, whole, once the model that read into it is closed"""
+    def give(self, owner: object) -> None:
+        """`owner`'s blocks back, whole and idle, once it is closed; the torch view over each goes with it"""
         with self.lock:
             for e in self.blocks:
-                if e[3] is shared:
-                    e[2] = 0
+                if e[4] == id(owner):
+                    e[2], e[3], e[4] = 0, None, None
+
+    def trim(self) -> int:
+        """The idle blocks let go, back to the OS: the touched memory kept for a next load, given up when the room
+        is wanted now. Returns the bytes let go"""
+        with self.lock:
+            idle = [e for e in self.blocks if e[4] is None]
+            self.blocks = [e for e in self.blocks if e[4] is not None]
+        if not idle:
+            return 0
+        nb = sum(len(e[1]) for e in idle)
+        del idle
+        import mlx.core as mx
+
+        mx.clear_cache()  # a freed array's buffer stays in MLX's cache until cleared
+        return nb
 
 
 POOL = Pool()
@@ -256,9 +274,9 @@ POOL = Pool()
 MEM_START = None
 
 
-def seed_for(model_dir: str, log: Log | None = None, gguf_packed: bool = True) -> None:
-    """At the top of a load: cut and fault the model's buffers if it fits in free RAM with a margin; a no-op off
-    Apple silicon or with BTB_POOL=0."""
+def seed_for(model_dir: str, log: Log | None = None, gguf_packed: bool = True, cut: bool = True) -> None:
+    """At the top of a load: the RAM baseline sampled, and - `cut`, a load the MLX tier may run - the model's buffers
+    cut and faulted if it fits in free RAM with a margin; no cutting off Apple silicon or with BTB_POOL=0."""
     global MEM_START
     if sys.platform == "darwin":
         if "torch" in sys.modules and log:
@@ -270,7 +288,7 @@ def seed_for(model_dir: str, log: Log | None = None, gguf_packed: bool = True) -
             )
         # free-read: the MLX pool seeded at import, before any model or ledger exists
         MEM_START = darwin_available_bytes() + POOL.free_bytes()
-    if os.environ.get("BTB_POOL", "1") == "0" or not mlx_ok():
+    if not cut or os.environ.get("BTB_POOL", "1") == "0" or not mlx_ok():
         return
     try:
         sizes = sizes_for(model_dir, gguf_packed)

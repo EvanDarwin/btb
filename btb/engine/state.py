@@ -639,6 +639,9 @@ class _State:
     def _finish(self, h: torch.Tensor, last_only: bool, head: bool) -> torch.Tensor:
         raise NotImplementedError
 
+    def _norm_input(self, h: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
     def _final_norm(self, h: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
