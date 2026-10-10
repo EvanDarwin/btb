@@ -29,9 +29,12 @@ HK, D, L = 2, 8, 3
 ROW = HK * PAGE * D * 4  # one page of one float32 buffer (a layer's K, or its V)
 
 
-def prefix(grant: Callable[..., None] | None = None, card: tuple[int, ...] = ()) -> PrefixCache:
+def prefix(
+    grant: Callable[..., None] | None = None, card: tuple[int, ...] = (), types: list[LayerKind] | None = None
+) -> PrefixCache:
     """a prefix cache over L full-attention layers of HK heads of D, its growth asked of `grant`; the layers `card`
-    in a card region whose arenas lie on the host (the card's layout and bookkeeping, no card needed)"""
+    in a card region whose arenas lie on the host (the card's layout and bookkeeping, no card needed). `types`: the
+    layers' kinds instead (a hybrid's: its linear layers have no rows in the pool)"""
     cfg = Qwen3Config(
         num_hidden_layers=L,
         num_attention_heads=2 * HK,
@@ -45,7 +48,7 @@ def prefix(grant: Callable[..., None] | None = None, card: tuple[int, ...] = ())
         cfg=cfg,
         dev=torch.device("cpu"),
         resident={},
-        layer_types=[LayerKind.FULL] * L,
+        layer_types=types or [LayerKind.FULL] * L,
         host_kv_dtype=lambda: torch.float32,
         scheduler=SimpleNamespace(grant=grant) if grant is not None else None,
     )
@@ -645,3 +648,71 @@ def test_the_host_reads_the_park_only_once_the_copies_into_it_landed(monkeypatch
         got = read(a, i)
         assert torch.equal(got[0], bf(ka + i)) and torch.equal(got[1], bf(va - i))
     assert waits and waits[-1] is False and True in waits and not card._queued, waits
+
+
+def test_a_hybrids_commit_reaches_the_tree_as_far_as_a_snapshot_made_cold() -> None:
+    """a hybrid's rows go to the tree only as far as its deepest snapshot of states made cold reaches: a prefill call
+    starting at a block's end on the cold rows moves the frontier, one starting inside a block (a decode's step, a
+    feed after one) does not; the commit's snapshots past its rows are dropped, those within kept at their nodes'
+    ends; a cut takes back the frontier and the snapshots past it; a conversation opened on the tree's rows to a
+    snapshot is cold to there, and one let go is cold nowhere"""
+    pc = prefix(types=[LayerKind.LINEAR, LayerKind.FULL, LayerKind.FULL])
+    c = pc.new()
+    assert c.table.cold == 0 and not isinstance(c.layers[0], PagedLayer)
+    n = 3 * PAGE + 10
+    k, v = rows(n, 90)
+    for i in (1, 2):
+        cast(PagedLayer, c.layers[i]).append(k, v)
+    for a, b in ((0, PAGE), (PAGE, 2 * PAGE), (2 * PAGE, n)):
+        c.prefilled(a, b)
+    assert c.table.cold == n
+    c.prefilled(n, n + 5)  # on from the prompt's end, inside a block
+    c.prefilled(PAGE, n)  # behind the frontier
+    assert c.table.cold == n
+    snaps: list[Any] = [{"n": PAGE}, {"n": 2 * PAGE}, {"n": n + 1}]
+    c.commit(list(range(n)), snaps)
+    assert sorted(c.table.held_snaps or {}) == [PAGE, 2 * PAGE]
+    c.crop_to(2 * PAGE - 3)  # a cut below the second snapshot
+    assert sorted(c.table.held_snaps or {}) == [PAGE] and c.table.cold == 2 * PAGE - 3
+    c.flush()
+    m = pc.match(list(range(n)))
+    assert (m.length, m.snap_at, m.snap) == (PAGE, PAGE, snaps[0]), "the tree holds rows past the deepest snapshot"
+    d = pc.new(m.rows[: m.snap_at])
+    assert d.table.cold == PAGE
+    c.release()
+    assert c.table.cold == 0 and c.table.held_snaps is None
+    assert pc.new().table.cold == 0 and prefix().new().table.cold is None
+
+
+def test_a_snapshot_the_ram_has_no_room_for_lets_the_least_used_go_first() -> None:
+    """a hybrid's snapshot is granted its RAM before it is taken: refused, the tree's least recently used snapshot goes
+    (its node stays, read to the one before) and the grant is asked again; with none left to let go, it is not taken"""
+    refusals = [0]
+
+    def grant(nbytes: int, kind: str, **kw: Any) -> None:
+        if "block's end" in str(kw.get("requester", "")) and refusals[0]:
+            refusals[0] -= 1
+            raise MemoryGrantError("no room for a snapshot")
+
+    pc = prefix(grant, types=[LayerKind.LINEAR, LayerKind.FULL, LayerKind.FULL])
+    paths = [list(range(PAGE)), list(range(1000, 1000 + PAGE))]  # two conversations sharing nothing
+    held = []
+    for j, ids in enumerate(paths):
+        c = pc.new()
+        k, v = rows(PAGE, 91 + j)
+        for i in (1, 2):
+            cast(PagedLayer, c.layers[i]).append(k, v)
+        c.prefilled(0, PAGE)
+        c.commit(ids, [{"n": PAGE, "path": j}])
+        c.flush()
+        held.append(c)
+    assert len([n for n in pc.tree.nodes() if n.snap is not None]) == 2
+    pc.match(paths[0])
+    pc.match(paths[1])  # the second used last
+    refusals[0] = 1
+    assert pc.snap_room(1 << 20)
+    kept = [n.snap["path"] for n in pc.tree.nodes() if n.snap is not None]
+    assert kept == [1], f"the snapshot let go was not the least recently used: {kept} kept"
+    refusals[0] = 1 << 30
+    assert not pc.snap_room(1 << 20)
+    assert not [n for n in pc.tree.nodes() if n.snap is not None] and len(list(pc.tree.nodes())) == 2

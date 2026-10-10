@@ -27,6 +27,7 @@ import pytest
 import torch
 
 import btb
+from btb.engine.fused import DELTA_BLOCK
 from btb.engine.kvpool import PAGE
 from btb.kinds import FamilyKind, LayerKind, PassTag
 from tests.helpers import FIXTURES, GGUF_FIXTURES, assert_same_tokens, shared_key, shared_model
@@ -608,13 +609,22 @@ def _side(rows: int) -> list[int]:
     return [150 + i % 100 for i in range(rows)]
 
 
+def _lead(rows: int) -> list[int]:
+    """a system prompt `rows` long that a hybrid's conversations open on: its recurrent states resume only at a
+    block's end its prefill kept them at (`GenerateMixin._prefill_at_blocks`), so a turn needs blocks within the prefix
+    it shares"""
+    return [50 + (7 * i) % 90 for i in range(rows)]
+
+
 @pytest.mark.parametrize("stem,dev", _shape_cells(spec.Surface.PREFIX))
 def test_conversations_through_the_prefix_cache_answer_as_cold(stem: str, dev: spec.DeviceSubpath) -> None:
     """conversations as a server sees them, on one load: A's first turn (the oracle's prompt, held to its banked
     answer), an unrelated request on the same session, A's next turn - opening on every row A left - and B, a second
     session opening with A's first turn whole. Each later answer is its prompt's decoded cold (no session) on the
     other load, the two loads answer alike, and the axis's tags show (`spec.prefix_tags`): a miss, a hit, rows the
-    tree held read in place, through the pages"""
+    tree held read in place, through the pages. A hybrid's conversations open on a system prompt past two blocks
+    (`_lead`) - the oracle's prompt decoded alone, held to its answer - and its turns resume at the last block's end
+    within what they share, its states restored from the snapshot kept there"""
     if not _hardware_here(dev.hardware):
         pytest.skip(f"{dev.hardware.value} not available on this machine")
     path, knobs = _stem_load(stem, dev)
@@ -622,6 +632,8 @@ def test_conversations_through_the_prefix_cache_answer_as_cold(stem: str, dev: s
         pytest.skip(f"fixture {stem} not built")
     kind = spec.kind_of_stem(stem)
     assert kind is not None
+    hybrid = spec.recurrent(kind)
+    opening = [*_lead(2 * DELTA_BLOCK + 12), *PROMPT] if hybrid else list(PROMPT)
     runs = []
     asked: list[list[int]] = []
     # the side request past every slot either load's card region holds, the same tokens on both
@@ -640,22 +652,29 @@ def test_conversations_through_the_prefix_cache_answer_as_cold(stem: str, dev: s
             return out
 
         a = sm.session()
-        first = turn(list(PROMPT), a)
+        first = turn(opening, a)
         turn(side, a)
         missed = a.last_reuse
-        asked = [[*PROMPT, *first, *OTHER], [*PROMPT, *first, *side]]
+        asked = [[*opening, *first, *OTHER], [*opening, *first, *side]]
         second = turn(asked[0], a)
         hit = a.last_reuse
         b = sm.session()
         third = turn(asked[1], b)
         runs.append((first, second, third, missed, hit, b.last_reuse))
         if i == 0:
-            oracle.assert_matches(kind, first, dev.hardware.value)
+            oracle.assert_matches(kind, oracle.decode(sm, list(PROMPT)) if hybrid else first, dev.hardware.value)
             for want in sorted(spec.SURFACE_TAGS[spec.Surface.PREFIX](kind, dev)):
                 assert want in tags, f"{stem} on {dev.key}/prefix: {want} never engaged (got {sorted(tags)})"
             for bad in sorted(spec.SURFACE_FORBIDS[spec.Surface.PREFIX](kind, dev)):
                 assert bad not in tags, f"{stem} on {dev.key}/prefix: a pass took {bad}, its rows not its steps'"
-            assert (missed, hit, b.last_reuse) == (0, len(PROMPT) + len(first) - 1, len(PROMPT) + len(first)), (
+            if hybrid:
+                # both open at the last block's end within the opening: the answer and the request after it are
+                # shorter than a block, so neither turn's prefill crosses another
+                block = (len(opening) - 1) // DELTA_BLOCK * DELTA_BLOCK
+                want_reuse = (0, block, block)
+            else:
+                want_reuse = (0, len(opening) + len(first) - 1, len(opening) + len(first))
+            assert (missed, hit, b.last_reuse) == want_reuse, (
                 f"{stem} on {dev.key}/prefix: reused {missed}, {hit}, {b.last_reuse} rows"
             )
     assert runs[0] == runs[1], f"{stem} on {dev.key}: conversations answered differently across two loads"

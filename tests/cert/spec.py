@@ -381,16 +381,16 @@ CARD_HEAD_DIMS = (64, 128, 256)
 def paged(kind: FamilyKind, hw: Hardware, knobs: dict[str, object] | None = None) -> bool:
     """whether the prefix cache serves the family on this hardware and with these load options - its attention
     reading every one-sequence cache through the pages - by the engine's own rule (`PrefixCache.why_not`), in its
-    order: the host's tier and the card's, not MLX's yet; not a hybrid's recurrent layers, a family's own layer
-    (Qwen4) or its own attention module (gpt-oss); on the card, heads its kernels take and bf16 compute (`fp32` keeps
-    the card's layers wider than its kernels read)"""
+    order: the host's tier and the card's, not MLX's yet; a hybrid's recurrent layers on the host alone (its
+    snapshots); not a family's own layer (Qwen4) or its own attention module (gpt-oss); on the card, heads its kernels
+    take and bf16 compute (`fp32` keeps the card's layers wider than its kernels read)"""
     fl = core.flags(kind)
     if hw is Hardware.CUDA:
         hd = head_dim(kind)
         tier = not (knobs or {}).get("fp32") and (hd is None or hd in CARD_HEAD_DIMS)
     else:
         tier = hw is Hardware.CPU
-    return tier and not recurrent(kind) and Cap.OWN not in fl and Cap.FAST in fl
+    return tier and (hw is Hardware.CPU or not recurrent(kind)) and Cap.OWN not in fl and Cap.FAST in fl
 
 
 def kv_tag(kind: FamilyKind, hw: Hardware, knobs: dict[str, object] | None = None) -> PassTag:

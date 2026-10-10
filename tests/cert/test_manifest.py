@@ -417,7 +417,9 @@ def test_every_cell_asserts_the_reader_its_cache_rows_take() -> None:
     assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.CPU) is PassTag.KV_PAGED
     assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.CUDA) is PassTag.KV_PAGED
     assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.MLX) is PassTag.KV_CONTIGUOUS
-    assert spec.kv_tag(FamilyKind.QWEN3_5, spec.Hardware.CPU) is PassTag.KV_CONTIGUOUS
+    # a hybrid on the host's pages, its states resumed from its snapshots; not yet on the card's
+    assert spec.kv_tag(FamilyKind.QWEN3_5, spec.Hardware.CPU) is PassTag.KV_PAGED
+    assert spec.kv_tag(FamilyKind.QWEN3_5, spec.Hardware.CUDA) is PassTag.KV_CONTIGUOUS
     # the card's layers computing in float32 are wider than its paged kernels read
     assert PassTag.KV_CONTIGUOUS in spec.SUBPATH["cuda-torch"].expects(FamilyKind.QWEN3, bf16)
     for key in ("cuda-graph", "cuda-split", "cuda-kvhost", "cuda-prefill"):
@@ -483,8 +485,8 @@ def test_the_prefix_axis_runs_where_the_prefix_cache_serves_and_is_a_gap_elsewhe
     by = {(kind, key): why for _s, kind, key, why in prefix}
     cpu = {kind: why for (kind, key), why in by.items() if key == "cpu"}
     assert set(cpu) == {k for k in served if not spec.paged(k, spec.Hardware.CPU)}
-    assert {FamilyKind.QWEN3, FamilyKind.PHI3, FamilyKind.GEMMA3} <= served - set(cpu)
-    assert cpu[FamilyKind.QWEN3_5] is manifest.Missing.PREFIX_SNAPSHOT
+    # the host serves the hybrid too: its prefill keeps the recurrent states at its blocks' ends for the tree
+    assert {FamilyKind.QWEN3, FamilyKind.PHI3, FamilyKind.GEMMA3, FamilyKind.QWEN3_5} <= served - set(cpu)
     assert cpu[FamilyKind.GPT_OSS] is manifest.Missing.PREFIX_FAMILY
     # the card serves the dense families on every sub-path its bf16 kernels read - where the sub-path engages at all
     # (Phi-3's card graph is a gap of its own). A hit equals its cold decode where every layer runs the card graph's
@@ -530,7 +532,8 @@ def test_the_prefix_axis_runs_where_the_prefix_cache_serves_and_is_a_gap_elsewhe
         manifest.Missing.PREFIX_INVARIANCE,
     } <= missing
     found = delta.findings()
-    assert f"[manifest/prefix-snapshot] prefix/{FamilyKind.QWEN3_5.value}/cpu" in found
+    assert any(f.startswith(f"[manifest/prefix-snapshot] prefix/{FamilyKind.QWEN3_5.value}/cuda") for f in found)
+    assert not any(f.endswith(f"prefix/{FamilyKind.QWEN3_5.value}/cpu") for f in found)
     assert not any(f.endswith(f"prefix/{FamilyKind.QWEN3.value}/cpu") for f in found)
     assert f"[manifest/prefix-invariance] prefix/{FamilyKind.QWEN3.value}/cuda-split" in found
     assert not any(f.endswith(f"prefix/{FamilyKind.QWEN3.value}/cuda-graph") for f in found)

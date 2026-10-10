@@ -60,7 +60,7 @@ if TYPE_CHECKING:
     from ..mlx import Backend, Shared
     from ..mlx.mega import MegaPass
     from ..sampling import Sampling
-    from ..session import Session
+    from ..session import Anchor, Session
     from .cache import KvCache
     from .device import Device, DeviceSpec
     from .drafter import MTPDrafter
@@ -740,6 +740,21 @@ class _State:
     def _session_prefill(
         self, ids: torch.Tensor, cache: Any, reuse: int, session: Session | None, on_layer: Any = None
     ) -> tuple[Any, Any]:
+        raise NotImplementedError
+
+    def _anchor(self, cache: Any, at: int, logits: Any, h_last: torch.Tensor | None) -> Anchor:
+        raise NotImplementedError
+
+    def _prefill_at_blocks(
+        self,
+        ids: torch.Tensor,
+        cache: Any,
+        reuse: int,
+        tail: int,
+        hook: Any,
+        snap: Callable[[int, Any], Anchor],
+        last_only: bool = True,
+    ) -> tuple[Any, list[Anchor]]:
         raise NotImplementedError
 
     # -- families/__init__.py --

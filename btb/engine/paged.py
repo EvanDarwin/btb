@@ -28,6 +28,7 @@ from transformers.cache_utils import DynamicCache, DynamicLayer
 
 from ..kinds import LayerKind
 from .arena import KvArena, RowArena
+from .fused import DELTA_BLOCK
 from .kvpool import PAGE, Page, PagePool
 from .scheduler import MemoryGrantError
 
@@ -940,6 +941,11 @@ class Table:
         # were made off the route its steps take, never given to the tree (`PagedCache.off_route`)
         self.held_ids: list[int] | None = None
         self.exact: int | None = None
+        # a hybrid's: the positions its rows and recurrent states are the prompt's prefilled cold up to - a decode's
+        # step, a prompt's call starting inside a block, made others - and the snapshots of its states held back with
+        # the commit, by position (`PagedCache.prefilled`, `commit`). None for a model with no recurrent layer
+        self.cold: int | None = None
+        self.held_snaps: dict[int, Any] | None = None
         self._fin = weakref.finalize(self, Table._let_go, pool.pages, self.held, self.count)
         self._take(rows)
 
@@ -955,7 +961,9 @@ class Table:
         self._fin()
         self._fin = weakref.finalize(self, Table._let_go, self.pool.pages, self.held, self.count)
         self.n, self.tail, self.low = 0, None, 0
-        self.held_ids = self.exact = None
+        self.held_ids = self.exact = self.held_snaps = None
+        if self.cold is not None:
+            self.cold = 0
         self.version += 1
 
     def __len__(self) -> int:
@@ -1029,6 +1037,10 @@ class Table:
         n = max(0, int(n))
         if self.held_ids is not None and len(self.held_ids) > n:
             del self.held_ids[n:]  # the commit held back cut with the rows: what it cuts never reached the tree
+        if self.held_snaps:
+            self.held_snaps = {k: s for k, s in self.held_snaps.items() if k <= n} or None
+        if self.cold is not None:
+            self.cold = min(self.cold, n)
         if self.exact is not None and n <= self.exact:
             # every row made off the route cut: the rows made from here are the route's again (kept, the tree was
             # given nothing past them for the table's life)
@@ -1242,6 +1254,9 @@ class PagedCache(DynamicCache):
         super().__init__(config=prefix.cfg)
         self.prefix = prefix
         self.table = Table(prefix.pool, rows)
+        if LayerKind.LINEAR in prefix.layer_types:
+            # the tree's rows are a cold prefill's, up to the snapshot a hybrid opens on (`PrefixCache.put`)
+            self.table.cold = len(self.table)
         for i, lt in enumerate(prefix.layer_types):
             if lt != LayerKind.LINEAR:
                 pl = PagedLayer(self.table, prefix.pool, i)
@@ -1300,16 +1315,30 @@ class PagedCache(DynamicCache):
             self.prefix.pool.move(*moved)
         self.crop_to(base + len(path))
 
-    def commit(self, ids: Sequence[int]) -> None:
+    def prefilled(self, a: int, b: int) -> None:
+        """a hybrid's prompt prefilled from position `a` to `b` in one call: its rows and states the prompt's cold where
+        they went on from a cold prefill's at a block's end (`DELTA_BLOCK`, where the DeltaNet's chunked rule cuts its
+        blocks), as every call of the prompt taken whole does"""
+        t = self.table
+        if t.cold is not None and t.cold == a and a % DELTA_BLOCK == 0:
+            t.cold = int(b)
+
+    def commit(self, ids: Sequence[int], snaps: Sequence[Any] = ()) -> None:
         """the session's tokens and the rows holding them for the tree, what a later prompt opens on: held back on the
         table until the tree is next read (`PrefixCache.hold`) - the table, which holds the pages, not the cache, so a
-        session let go is collected - a later commit replacing it, a crop cutting it"""
+        session let go is collected - a later commit replacing it, a crop cutting it. A hybrid's `snaps` (anchors, by
+        their `n`) are held back with it, beside those an earlier commit held that it still holds the rows of"""
         n = min(len(ids), len(self.table))
-        self.table.held_ids = [int(t) for t in ids[:n]] if n else None
+        t = self.table
+        t.held_ids = [int(x) for x in ids[:n]] if n else None
+        if t.cold is not None:
+            kept = {k: s for k, s in (t.held_snaps or {}).items() if k <= n}
+            kept.update({int(s["n"]): s for s in snaps if 0 < int(s["n"]) <= n})
+            t.held_snaps = kept or None
         if n:
-            self.prefix.hold(self.table)
+            self.prefix.hold(t)
         else:
-            self.prefix.let_go(self.table)
+            self.prefix.let_go(t)
 
     def off_route(self, n: int) -> None:
         """the rows from position `n` on made off the route a step takes (a card layer the pass ran through torch,

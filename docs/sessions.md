@@ -64,7 +64,14 @@ with session._txn(eng) as t:  # the rollback point: len(ids), the state, recurre
   adds the session's tokens to: the prompt opens on the longest prefix any conversation left there, read in place.
   On a card, the rows of the layers it runs lie in its reserved room for the conversation it is decoding; a pass
   over another conversation leaves the first one's pages there until their room is wanted, then parks them in
-  pinned RAM, least recently used first, and its next turn brings them back.
+  pinned RAM, least recently used first, and its next turn brings them back. A hybrid's recurrent states resume
+  only where a snapshot of them was kept: its prefill is cut at block ends (64 rows, where the DeltaNet's chunked
+  rule cuts its blocks, so a cut there leaves the bits as they were), and it keeps the states at the last block end
+  before the prompt's last token and the last before where the next turn's re-rendering parts from it. The tree keeps
+  each snapshot at a node's end. A prompt opens at the deepest snapshot the tree holds within it and prefills the rest
+  as the cold prompt's later chunk. It never goes on from where a decode left the states, whose steps sum otherwise:
+  a turn prefills the previous answer again, and a hit decodes as the prompt cold. The host's prefix cache serves
+  hybrids so far; the card's does not yet.
 * **Every public mutator is a transaction:** `feed`, `sync`, `rewind`, `crop`, `generate(session=...)`, and a
   fork's or batch's write-back. `_open`/`_keep`/`_abandon`/`_whole`/`_back_to`/`_undo`/`_held` go away; `_open`
   becomes "the rollback point this prompt keeps", `_keep` becomes `commit`.

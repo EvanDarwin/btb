@@ -16,13 +16,15 @@ from ..draft import NGramProposer, SpanBank, Spans
 from ..kinds import PROPOSER_TAG, Json, LayerKind, PassTag, Proposer, TokenRows, Tokens
 from ..options import Device
 from ..sampling import GREEDY, Sampling, Verify
-from ..session import Session
+from ..session import TAIL_MAX, Session
 from .cache import linear_layer
 from .drafter import MTPDrafter
+from .fused import DELTA_BLOCK
 from .hooks import Hooks
 from .state import _State
 
 if TYPE_CHECKING:
+    from ..session import Anchor
     from .cache import CacheLayer
 
 # one of a DeltaNet layer's two states, as the layer holds it: a tensor, or a dict of them by index
@@ -45,6 +47,21 @@ def lin_layer(cl: CacheLayer) -> LinLayer:
     """`cl` as the helpers below take it; a TypeError for a layer that is not a DeltaNet's. transformers types its
     states dict[int, Tensor | None], and `_lin_snap` copies only the ones set."""
     return cast(LinLayer, linear_layer(cl))
+
+
+def _block(n: int) -> int:
+    """the last block's end (a multiple of `DELTA_BLOCK`) at or before position n"""
+    return max(0, int(n)) // DELTA_BLOCK * DELTA_BLOCK
+
+
+def _states_bytes(cl: LinLayer) -> int:
+    """what a snapshot of a DeltaNet layer's states copies (`_lin_snap`)"""
+    total = 0
+    for s in (cl.conv_states, cl.recurrent_states):
+        for v in s.values() if isinstance(s, dict) else (s,):
+            if isinstance(v, torch.Tensor):
+                total += v.numel() * v.element_size()
+    return total
 
 
 def _lin(cl: LinLayer) -> tuple[torch.Tensor, torch.Tensor]:
@@ -158,13 +175,22 @@ class _GenerateMixin(_State):
         if isinstance(conv, dict) and isinstance(rec, dict):
             for have, snap_states in ((cl.conv_states, conv), (cl.recurrent_states, rec)):
                 assert isinstance(have, dict)  # a layer keeps its states as its snapshot does
+                conv_slot = have is cl.conv_states
                 for k, v in snap_states.items():
-                    if have.get(k) is None:
-                        # a slot the layer has not filled yet (a host prefill leaves some to the first step): the
-                        # state becomes a copy of its own, never a view of the rows it came from
-                        have[k] = v.clone()
-                    else:
+                    if have.get(k) is not None:
                         have[k].copy_(v)
+                        continue
+                    # a slot the layer has not filled yet (a host prefill leaves some to the first step; a fresh cache
+                    # opening on the tree's snapshot, all): filled through transformers' own setters, so the next pass
+                    # goes on from the state, not from none - a copy of its own, never a view of the snapshot's (a
+                    # later pass writes the layer's states in place)
+                    setter = getattr(cl, "update_conv_state" if conv_slot else "update_recurrent_state", None)
+                    if setter is None:
+                        have[k] = v.clone()
+                    elif conv_slot:
+                        setter(v.clone(), k, conv_kernel_size=int(v.shape[-1]))
+                    else:
+                        setter(v.clone(), k)
             return
         assert isinstance(conv, torch.Tensor) and isinstance(rec, torch.Tensor)  # _lin_snap copies both alike
         c, r = _lin(cl)
@@ -188,17 +214,8 @@ class _GenerateMixin(_State):
             return (held if held is not None else self._prefill(ids[:, reuse:], cache, on_layer=on_layer)), None
         hs: list[torch.Tensor] = []
 
-        def snap(at: int, logits: Any) -> Any:
-            # the point's own next-token logits: an anchor is a state of its own (`Ready`), which a failed call
-            # goes back to
-            return {
-                "n": at,
-                "logits": logits[0, -1].float().cpu().clone(),
-                "states": {
-                    i: self._lin_snap(cache.layers[i]) for i in range(self.L) if self.layer_types[i] == LayerKind.LINEAR
-                },
-                "h_last": hs[-1][:, -1:].detach().clone() if hs else None,
-            }
+        def snap(at: int, logits: Any) -> Anchor:
+            return self._anchor(cache, at, logits, hs[-1][:, -1:].detach().clone() if hs else None)
 
         def gather(i: int, h: torch.Tensor) -> None:
             # the last layer's rows are gathered across the chunks for one call below; the others go straight on
@@ -208,21 +225,81 @@ class _GenerateMixin(_State):
                 on_layer(i, h)
 
         hook = gather if on_layer is not None else None
+        paged = getattr(cache, "paged", False)
         if held is not None:
-            return held, [snap(n, held)]
-        anchors = []
-        d = int(session.tail)
-        cut = n - d
-        if d > 0 and reuse < cut:
-            at_cut = self._prefill(ids[:, reuse:cut], cache, on_layer=hook)
-            anchors.append(snap(cut, at_cut))
-            logits = self._prefill(ids[:, cut:], cache, on_layer=hook)
+            # a paged cache keeps a hybrid's states at a block's end alone (`_prefill_at_blocks`): the prompt's is none
+            return held, ([] if paged else [snap(n, held)])
+        if paged:
+            logits, anchors = self._prefill_at_blocks(ids, cache, reuse, int(session.tail), hook, snap)
         else:
-            logits = self._prefill(ids[:, reuse:], cache, on_layer=hook)
-        anchors.append(snap(n, logits))
+            anchors = []
+            d = int(session.tail)
+            cut = n - d
+            if d > 0 and reuse < cut:
+                at_cut = self._prefill(ids[:, reuse:cut], cache, on_layer=hook)
+                anchors.append(snap(cut, at_cut))
+                logits = self._prefill(ids[:, cut:], cache, on_layer=hook)
+            else:
+                logits = self._prefill(ids[:, reuse:], cache, on_layer=hook)
+            anchors.append(snap(n, logits))
         if on_layer is not None:
             on_layer(self.L - 1, hs[0] if len(hs) == 1 else torch.cat(hs, dim=1))
         return logits, anchors
+
+    def _anchor(self, cache: Any, at: int, logits: Any, h_last: torch.Tensor | None) -> Anchor:
+        """a hybrid's point to resume from (`Anchor`): the DeltaNet layers' states at position `at`, copies, and the
+        next token's logits there - the last row of `logits` - so the point is a state of its own (`Ready`), which a
+        failed call goes back to"""
+        return {
+            "n": at,
+            "logits": logits[0, -1].float().cpu().clone(),
+            "states": {
+                i: self._lin_snap(cache.layers[i]) for i in range(self.L) if self.layer_types[i] == LayerKind.LINEAR
+            },
+            "h_last": h_last,
+        }
+
+    def _prefill_at_blocks(
+        self,
+        ids: torch.Tensor,
+        cache: Any,
+        reuse: int,
+        tail: int,
+        hook: Any,
+        snap: Callable[[int, Any], Anchor],
+        last_only: bool = True,
+    ) -> tuple[Any, list[Anchor]]:
+        """A hybrid's prompt into a paged cache from `reuse` - 0, or a block's end (`DELTA_BLOCK`) its states were kept
+        at - cut at the block ends a later prompt resumes from, its states kept at each for the tree (`snap`): the last
+        before the prompt's last token (the prompt again), and the last before where the next turn's re-rendering
+        parts from it (`tail` back; TAIL_MAX, the furthest a tail is learned, until it is known). Every call past the
+        prompt's first runs as a later chunk of the prompt (`_batched_cont`: its DeltaNet layers through their chunked
+        rule, not a step's), and each starts at a block's end, so its rows and states are the prompt's prefilled whole
+        and cold: what a snapshot handed to another conversation must be. A snapshot the RAM has no room for, even
+        with the tree's least used let go, is not kept (`PrefixCache.snap_room`): a later prompt resumes earlier.
+        The last row's logits, or every row's from `reuse` on (the calls' joined) without `last_only`"""
+        n = int(ids.shape[1])
+        back = int(tail) or TAIL_MAX
+        cuts = sorted({c for c in (_block(n - 1), _block(n - back)) if reuse < c < n})
+        linear = [i for i in range(self.L) if self.layer_types[i] == LayerKind.LINEAR]
+        anchors: list[Anchor] = []
+        outs: list[torch.Tensor] = []
+        a = int(reuse)
+        was = self._batched_cont
+        try:
+            for b in (*cuts, n):
+                self._batched_cont = a > 0
+                out = self._prefill(ids[:, a:b], cache, on_layer=hook, last_only=last_only)
+                outs.append(out)
+                cache.prefilled(a, b)
+                if b < n and cache.table.cold == b:
+                    size = sum(_states_bytes(lin_layer(cache.layers[i])) for i in linear)
+                    if cache.prefix.snap_room(size + 4 * int(out.shape[-1])):
+                        anchors.append(snap(b, out))
+                a = b
+        finally:
+            self._batched_cont = was
+        return (outs[-1] if last_only or len(outs) == 1 else torch.cat(outs, dim=1)), anchors
 
     @staticmethod
     def _path_tokens(j: int, guesses: Sequence[int], parents: Sequence[int] | None) -> list[int]:
@@ -383,6 +460,20 @@ class _GenerateMixin(_State):
             ours = session is not None and dr.follows is not None and dr.follows() is session
             dr.follows = None
             if (
+                session is not None
+                and session.dr is dr
+                and ours
+                and getattr(cache, "paged", False)
+                and LayerKind.LINEAR in self.layer_types
+                and reuse <= int(session.dr_len)
+            ):
+                # a paged hybrid resumed at or before where its own drafter's rows reach (`_open_snapshot` cut them
+                # to what the prompt shares): kept to there, the rest from the states the prompt's prefill made
+                dr_len = int(session.dr_len)
+                dr.crop(dr_len)
+                if n - 1 > dr_len:
+                    dr.extend(prompt[dr_len + 1 : n], h_new[:, dr_len - reuse : n - 1 - reuse], dr_len)
+            elif (
                 reuse
                 and session is not None
                 and session.dr is dr

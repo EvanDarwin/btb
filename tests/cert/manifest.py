@@ -242,10 +242,12 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "each prompt row as their step does; then narrow manifest.prefix_gap",
     ),
     Missing.PREFIX_SNAPSHOT: (
-        "a hybrid's recurrent layers resume only from a kept snapshot of their state, and none is kept at a message "
-        "boundary yet, so the prefix cache does not serve the family (btb/engine/prefix.py `why_not`)",
-        "keep the linear layers' snapshots at every message boundary in the prefill's sweep and store them on the "
-        "tree's nodes (plan phase P4), then take the hybrid out of `why_not` and spec.paged",
+        "a hybrid's recurrent layers resume only from a kept snapshot of their state, which the host's prefill keeps "
+        "at its blocks' ends and the card's does not yet, so the prefix cache does not serve the family on the card "
+        "(btb/engine/prefix.py `why_not`)",
+        "keep the card layers' snapshots in pinned RAM and restore them onto the card (`GenerateMixin._anchor`, "
+        "`_lin_restore`), with the card's linear layers prefilled through the chunked rule a cold prompt takes (plan "
+        "phase P4), then take the card out of the hybrid's refusal in `why_not` and spec.paged",
     ),
     Missing.PREFIX_FAMILY: (
         "the family reads its rows through attention of its own - Qwen4's card programs and indexed layers, "
@@ -555,8 +557,8 @@ def subpath_gap(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath
 def prefix_gap(kind: FamilyKind, dev: spec.DeviceSubpath) -> Missing | None:
     """why the prefix axis's conversations cannot hold on this family and sub-path, in the order the engine hits
     it: a sub-path that does not engage at all (its own gap), then the engine's own reasons (`PrefixCache.why_not`,
-    whose rule `spec.paged` is): a tier the prefix cache is not on yet, a hybrid's snapshots, a family's own
-    attention, then the card's own conditions (its kernels' widths). Served on the card, a hit equals its cold decode
+    whose rule `spec.paged` is): a tier the prefix cache is not on yet, a hybrid's snapshots on the card, a family's
+    own attention, then the card's own conditions (its kernels' widths). Served on the card, a hit equals its cold decode
     where every layer runs the card graph's kernels, whose prefill makes each row as the step does; elsewhere on the
     card it cannot yet (`PREFIX_INVARIANCE`)"""
     refused = subpath_gap(kind, spec.Storage.SAFE_BF16, dev)
@@ -568,7 +570,7 @@ def prefix_gap(kind: FamilyKind, dev: spec.DeviceSubpath) -> Missing | None:
         return Missing.PREFIX_INVARIANCE
     if dev.hardware not in (spec.Hardware.CPU, spec.Hardware.CUDA):
         return Missing.PREFIX_CACHE
-    if spec.recurrent(kind):
+    if spec.recurrent(kind) and dev.hardware is spec.Hardware.CUDA:
         return Missing.PREFIX_SNAPSHOT
     if spec.paged(kind, spec.Hardware.CPU):
         return Missing.PREFIX_WIDE  # served on the host, so the card's own conditions refuse it

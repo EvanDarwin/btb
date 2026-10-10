@@ -28,6 +28,7 @@ import torch
 from btb.engine import MemoryGrantError, StreamedTextModel
 from btb.engine.cache import ForkLayer
 from btb.engine.cuda import CardPassFailed
+from btb.engine.fused import DELTA_BLOCK
 from btb.engine.kvpool import PAGE
 from btb.engine.paged import PagedCache
 from btb.engine.prefix import PrefixCache
@@ -39,7 +40,8 @@ DENSE = ["tiny_gemma3", "tiny_phi3", "tiny_qwen3"]
 # the dense families the card graph serves, whose prompts take its kernels (`_forward_card_prefill`), by the cert's
 # own rule (`card_rows`): Phi-3's fused projections run its torch modules (`Missing.PREFIX_INVARIANCE`)
 GRAPHED = [s for s in DENSE if (k := kind_of_stem(s)) is not None and card_rows(k)]
-OTHERS = ["tiny_gpt_oss", "tiny_q35", "tiny_q4"]
+OTHERS = ["tiny_gpt_oss", "tiny_q4"]
+HYBRID = "tiny_q35"  # served on the host: its recurrent states resume from the snapshots its prefill keeps
 VOCAB = 200  # inside every fixture's vocabulary
 # where a conversation's rows lie: the host's region on the CPU; on the card, the card's region under the card graph
 # (`card`), beside a layer the host runs (`split`), or every row in RAM (`kvhost`), each placement pinned (`adapt` off);
@@ -593,10 +595,95 @@ def test_a_long_prompt_leaves_no_scratch_and_graphs_share_their_states(stem: str
         assert got is not None and g["part_m"] is got["part_m"] and g["cnt"] is got["cnt"], g["key"]
 
 
+def block(n: int) -> int:
+    """the last block's end at or before position n: where a hybrid's prefill keeps its states"""
+    return n // DELTA_BLOCK * DELTA_BLOCK
+
+
+def cold_turn(sm: StreamedTextModel, prompt: list[int], spec: bool) -> tuple[list[int], torch.Tensor]:
+    """`prompt` decoded on a session of its own with nothing kept: the answer, and the logits after it"""
+    prefix(sm)
+    s = sm.session()
+    out = list(sm.generate(prompt, 12, eos=(), session=s, speculate=spec).tokens)
+    assert s.last_reuse == 0
+    return out, s.next_logits()
+
+
+@pytest.mark.parametrize("stem", [HYBRID])
+def test_a_hybrids_hit_decodes_as_its_prompt_cold(stem: str) -> None:
+    """a hybrid's conversation through a side request: its next turn opens at the last block's end within the turn
+    before's prompt - the rows before it read from the tree, the recurrent states restored from the snapshot its
+    prefill kept there - never from where its decode left them, and answers as the same prompt decoded cold, every
+    token: the rest of the prompt prefilled as the cold prompt's later chunk. Whole or in chunks, greedy or
+    speculative; and a second conversation opening on the first's system prompt the same. Tokens, not logits: the
+    host's matmuls sum a row by how many rows its call holds, so a prompt's rows made in two calls part in the last
+    bits from the same rows made in one (test_prefill_layers' hybrid test), here as for every family on the host"""
+    sm = model(stem)
+    rng = random.Random(14)
+    a1, more, side, u2 = chatty(rng, 150), chatty(rng, 40), toks(rng, 70), toks(rng, 20)
+    keep = sm.prefill_chunk
+    try:
+        for chunk in (None, 16):
+            for spec in (False, True):
+                sm.prefill_chunk = chunk
+                prefix(sm)
+                s = sm.session()
+                out1 = list(sm.generate(a1, 12, eos=(), session=s, speculate=spec).tokens)
+                sm.generate(side, 4, eos=(), session=s, speculate=spec)
+                asked = [*a1, *out1, *more]
+                got = list(sm.generate(asked, 12, eos=(), session=s, speculate=spec).tokens)
+                what = f"chunks of {chunk}, speculative {spec}"
+                assert s.last_reuse == block(len(a1) - 1), f"{what}: reused {s.last_reuse} rows"
+                rep = sm.last_pass_report()
+                for tag in (PassTag.PREFIX_HIT, PassTag.PREFIX_SHARED, PassTag.SNAPSHOT_RESUME, PassTag.KV_PAGED):
+                    assert tag in rep, f"{what}: {tag} never engaged"
+                after = s.next_logits()
+                b = sm.session()
+                other = list(sm.generate([*a1, *u2], 12, eos=(), session=b, speculate=spec).tokens)
+                assert b.last_reuse == block(len(a1) - 1), f"{what}: the second conversation reused {b.last_reuse}"
+                b_after = b.next_logits()
+                want, want_after = cold_turn(sm, asked, spec)
+                assert got == want, f"{what}: the hit {got} against cold {want}"
+                assert int(after.argmax()) == int(want_after.argmax()), f"{what}: the next token apart"
+                want, want_after = cold_turn(sm, [*a1, *u2], spec)
+                assert other == want and int(b_after.argmax()) == int(want_after.argmax()), f"{what}: the second one"
+    finally:
+        sm.prefill_chunk = keep
+
+
+@pytest.mark.parametrize("stem", [HYBRID])
+def test_a_hybrid_opened_on_a_prompt_keeps_its_rows_and_its_snapshots(stem: str) -> None:
+    """a session opened on a prompt (`session(ids)`, a feed from nothing) decodes on from the prompt's logits, no row
+    prefilled again, and its feed kept the states at the block ends it crossed: a second conversation opening alike
+    resumes at the last one, reading the same rows - and both answer as cold. Rewound to a mark, the states put back
+    are never gone on from (a mark's could be a decode's): the next decode opens on the snapshot before it"""
+    sm = model(stem)
+    rng = random.Random(15)
+    system, u2 = chatty(rng, 150), toks(rng, 20)
+    pc = prefix(sm)
+    s = sm.session(system)
+    m = s.mark()
+    got = list(s.generate(12, eos=(), speculate=False).tokens)
+    assert s.last_reuse == len(system), "the prompt the session was opened on was prefilled again"
+    s2 = sm.session()
+    other = list(sm.generate([*system, *u2], 12, eos=(), session=s2, speculate=False).tokens)
+    assert s2.last_reuse == block(len(system) - 1)
+    c1, c2 = s.cache, s2.cache
+    assert isinstance(c1, PagedCache) and isinstance(c2, PagedCache)
+    at = block(len(system) - 1)
+    assert torch.equal(c1.table.rows()[:at], c2.table.rows()[:at]), "the second conversation's rows are not the first's"
+    assert all(p.refs >= 3 for p in pc.pool.pages.of(c2.table.rows()[:at].tolist()))
+    s.rewind(m)
+    again = list(s.generate(12, eos=(), speculate=False).tokens)
+    assert s.last_reuse == at, "a rewound session went on from the states its mark put back"
+    assert again == got
+    assert (got, other) == (cold_turn(sm, system, False)[0], cold_turn(sm, [*system, *u2], False)[0])
+
+
 @pytest.mark.parametrize("stem", OTHERS)
 def test_an_engine_the_prefix_cache_does_not_serve_says_why(stem: str) -> None:
-    """a hybrid, a family with its own layer, a family whose attention is its own module's: the reason, and its
-    sessions' caches contiguous ones of their own"""
+    """a family with its own layer, a family whose attention is its own module's: the reason, and its sessions'
+    caches contiguous ones of their own"""
     sm = model(stem)
     assert PrefixCache.why_not(sm) and sm._prefix_cache() is None
     s = sm.session([5, 6, 7, 8])

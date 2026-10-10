@@ -17,7 +17,7 @@ contiguous cache they always had, never a copied prefix.
 from __future__ import annotations
 
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -27,6 +27,7 @@ from ..options import Device
 from .native import Native
 from .paged import KvPool, PagedCache, Table
 from .radix import Match, RadixTree
+from .scheduler import MemoryGrantError
 
 if TYPE_CHECKING:
     from .state import _State
@@ -73,6 +74,7 @@ class PrefixCache:
             dev=sm.dev if on_card else None,
             ceiling=ceiling,
         )
+        self.grant = sched.grant if sched is not None else None
         self.tree = RadixTree(self.pool.pages)
         self.pool.tree = self.tree
         # the sessions' commits held back for the tree on their tables (`PagedCache.commit`), put in when it is next
@@ -92,8 +94,8 @@ class PrefixCache:
             return "MLX's attention reads no pages yet: the prefix cache serves the CPU's and the card's"
         if sm.dev.type not in (Device.CPU, Device.CUDA):
             return f"a {sm.dev.type} engine's attention reads no pages, only the host's and the card's do"
-        if LayerKind.LINEAR in sm.layer_types:
-            return "a hybrid's recurrent states resume only from snapshots at message boundaries, which come later"
+        if LayerKind.LINEAR in sm.layer_types and sm.dev.type != Device.CPU:
+            return "a hybrid's recurrent states resume from snapshots the host's prefill keeps; the card's come later"
         if sm.fam.own:
             return "a family that brings its own layer (Qwen4) reads its rows through programs of its own"
         if not sm.fam.fast:
@@ -134,8 +136,8 @@ class PrefixCache:
         """a cache over the pool, opened on `rows` - a prefix the tree holds, read in place - or empty"""
         return PagedCache(self, rows)
 
-    def insert(self, ids: Sequence[int], rows: Sequence[int]) -> None:
-        self.tree.insert(ids, rows)
+    def insert(self, ids: Sequence[int], rows: Sequence[int], snaps: Mapping[int, Any] | None = None) -> None:
+        self.tree.insert(ids, rows, snaps)
 
     def hold(self, table: Table) -> None:
         """the commit on `table` (`held_ids`) held back for the tree until it is read (`flush`): put in then, the rows
@@ -149,13 +151,35 @@ class PrefixCache:
         self._held.pop(id(table), None)
 
     def put(self, table: Table) -> None:
-        """the commit held back on `table` into the tree now: its rows made on the route alone (`Table.exact`)"""
+        """the commit held back on `table` into the tree now: its rows made on the route alone (`Table.exact`). A
+        hybrid's up to its deepest snapshot made cold (`Table.cold`), each snapshot at its node's end: the rows past
+        it no prompt resumes on - its states are kept nowhere further"""
         self._held.pop(id(table), None)
         ids, table.held_ids = table.held_ids, None
+        snaps, table.held_snaps = table.held_snaps, None
         if ids and table.exact is not None:
             ids = ids[: table.exact]
+        if ids and table.cold is not None:
+            snaps = {k: s for k, s in (snaps or {}).items() if k <= min(len(ids), table.cold)}
+            ids = ids[: max(snaps, default=0)]
         if ids:
-            self.insert(ids, table.rows()[: len(ids)].tolist())
+            self.insert(ids, table.rows()[: len(ids)].tolist(), snaps)
+
+    def snap_room(self, nbytes: int) -> bool:
+        """room in RAM for a hybrid's snapshot of `nbytes` for the tree: granted, the snapshots the tree keeps let go
+        least recently used first while the grant refuses it (their nodes stay, read to an earlier one). False where
+        none is left to let go: the snapshot is not kept, and a prompt resumes from an earlier one"""
+        if self.grant is None:
+            return True
+        while True:
+            try:
+                self.grant(
+                    nbytes, "kv", requester="a hybrid's states at a block's end, for the prefix tree", device="cpu"
+                )
+                return True
+            except MemoryGrantError:
+                if not self.tree.drop_snaps(lambda dropped: dropped >= 1):
+                    return False
 
     def reading(self, table: Table) -> None:
         """a pass over `table` begins: the row lists another conversation's pass left (`_lists`) let go. Made only by

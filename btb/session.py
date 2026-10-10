@@ -97,6 +97,17 @@ def _fresh_cache(eng: Any) -> KvCache:
     return pc.new() if pc is not None else eng.new_cache()
 
 
+def _cold_end(cache: KvCache | None) -> int | None:
+    """where a paged hybrid's rows and recurrent states stop being its prompt's prefilled cold (`Table.cold`, no further
+    than its rows made on the route reach, `Table.exact`); None for any other cache"""
+    if not getattr(cache, "paged", False):
+        return None
+    t = cast("PagedCache", cache).table
+    if t.cold is None:
+        return None
+    return t.cold if t.exact is None else min(t.cold, t.exact)
+
+
 def crop(cache: KvCache, engine: _State, n: int) -> None:
     """the attention layers of `cache` cut back to their first n rows"""
     from transformers.cache_utils import CacheLayerMixin, DynamicIndexedLayer, DynamicSlidingWindowLayer
@@ -183,8 +194,9 @@ class _Txn:
         s._pending, s.logits = (int(pending) if pending is not None else None), logits
         s.n_prompt = len(s.ids) if n_prompt is None else int(n_prompt)
         if getattr(s.cache, "paged", False):
-            # what the session made, into the engine's tree: a later prompt opens on it
-            cast("PagedCache", s.cache).commit(s.ids)
+            # what the session made, into the engine's tree: a later prompt opens on it - a hybrid's at the snapshots
+            # its prefill kept
+            cast("PagedCache", s.cache).commit(s.ids, anchors or ())
         if anchors is not None:
             s.anchor = list(anchors)
         dr, dr_len, pend_h = drafter
@@ -219,6 +231,12 @@ class _Txn:
                 crop(s.cache, eng, p.n)
                 for i, snap in (p.states or {}).items():
                     eng._lin_restore(lin_layer(s.cache.layers[i]), snap)
+            cold = _cold_end(s.cache)
+            if p.states and cold is not None and cold >= p.n:
+                # a paged hybrid's states put back from a point: a cold prefill's or a decode's, it cannot tell (a mark
+                # taken mid-decode, rewound to after the rows below it were prefilled again). Its prompts go on from
+                # the tree's snapshots, never from them (`_open_snapshot`)
+                cast("PagedCache", s.cache).table.cold = p.n - 1
         del s.ids[p.n :]
         s.anchor = [a for a in s.anchor if a["n"] <= p.n]
         s.n_prompt = min(p.n_prompt, p.n)
@@ -387,9 +405,21 @@ class Session:
         import torch
 
         from .engine.forward import PREFILL_MIN_ROWS
+        from .engine.fused import DELTA_BLOCK
 
         hook = keep if taps else None
-        if len(new) > min(PREFILL_MIN_ROWS, int(eng.prefill_chunk or PREFILL_MIN_ROWS)):
+        anchors: list[Anchor] | None = None
+        at = len(self.ids)
+        if _cold_end(cache) == at and at % DELTA_BLOCK == 0:
+            # a paged hybrid fed on from its cold prefill's end at a block's end (a session opened on a prompt): the
+            # prompt's later chunk, its states kept at the block ends it crosses for the tree, as a decode's prompt is
+            # (`_prefill_at_blocks`) - its next turn opens on them, and a decode of the prompt goes on from its end
+            full = torch.tensor([[*self.ids, *new]])
+            pc = cast("PagedCache", cache)
+            logits, anchors = eng._prefill_at_blocks(
+                full, pc, at, int(self.tail), hook, lambda n, lg: eng._anchor(pc, n, lg, None), last_only=last_only
+            )
+        elif len(new) > min(PREFILL_MIN_ROWS, int(eng.prefill_chunk or PREFILL_MIN_ROWS)):
             # a long feed goes in the chunks the free memory prices, as a prompt's prefill does
             logits = eng._prefill(torch.tensor([new]), cache, on_layer=hook, last_only=last_only)
         else:
@@ -397,7 +427,7 @@ class Session:
         assert logits is not None
         out = logits[0].float().cpu()
         # the drafter's rows no longer follow the cache: the commit lets them go
-        t.commit([*self.ids, *new], logits=out[-1].clone(), cache=cache)
+        t.commit([*self.ids, *new], logits=out[-1].clone(), cache=cache, anchors=anchors)
         return out, {i: hs[0] if len(hs) == 1 else _cat(hs) for i, hs in seen.items()}
 
     def _settle(self, eng: StreamedTextModel, owner: _Rows | None = None) -> None:
@@ -629,6 +659,8 @@ class Session:
         back to are `_reuse`'s"""
         eng = t.eng
         cur = cast("PagedCache", self.cache) if getattr(self.cache, "paged", False) else None
+        if LayerKind.LINEAR in eng.layer_types:
+            return self._open_snapshot(t, prompt, whole, pc, cur)
         if cur is not None and whole and self._pending is None and self.logits is not None and prompt == self.ids:
             self._held, self.logits = self.logits, None
             return cur, len(self.ids), None
@@ -674,6 +706,63 @@ class Session:
         else:
             t.keep(_Point(0, first, None, None, 0))
         return new, m, None
+
+    def _open_snapshot(
+        self, t: _Txn, prompt: list[int], whole: bool, pc: PrefixCache, cur: PagedCache | None
+    ) -> tuple[KvCache | None, int, Anchor | None]:
+        """`_open_paged` for a hybrid: the prompt opens where it prefills as it would cold from - the deepest snapshot
+        the tree holds within it (a block's end, `_prefill_at_blocks`), the rows before it read in place, its states
+        restored - and the rest is prefilled from there as the prompt's later chunk. Never from a decode's states, nor
+        a feed's past a block's end: their sums run otherwise than a prompt's prefill, and a hit would part from the
+        prompt cold. The session's commit goes in the tree first, so its own snapshots serve its next turn. A prompt
+        that is the session's tokens, with their logits in hand and the states a cold prefill's to its end
+        (`_cold_end`, a session opened on a prompt), keeps every row. The drafter's rows, which the session's own
+        tokens made, stay as far as the prompt shares them where they reach the point it resumes at (the decode goes on
+        from them, `_prefill_at_blocks`' states past it), else go"""
+        eng = t.eng
+        shared = 0
+        if cur is not None:
+            shared = self._match(prompt)  # and the tail: where the prompt's re-rendering parts from the last one's
+            if (
+                whole
+                and self._pending is None
+                and self.logits is not None
+                and prompt == self.ids
+                and _cold_end(cur) == len(self.ids)
+            ):
+                t.point.states = self._snap(eng)
+                self._held, self.logits = self.logits, None
+                return cur, len(self.ids), None
+            cur.flush()
+        held = pc.match(prompt[: len(prompt) - 1])
+        a, snap = held.snap_at, held.snap
+        toks = self.tokens
+        first = toks[0] if toks and prompt and prompt[0] == toks[0] else None
+        dr = self.dr
+        ref = getattr(dr, "follows", None)
+        keep = min(int(self.dr_len), shared - 1)
+        drafted = dr is not None and ref is not None and ref() is self and keep >= a
+        if cur is not None:
+            cur.release()
+        new = pc.new(held.rows[:a])
+        if snap is not None:
+            from .engine.generate import lin_layer
+
+            for i, states in snap["states"].items():
+                eng._lin_restore(lin_layer(new.layers[i]), states)
+        self.cache, self.anchor, self.ids, self.n_prompt = new, [], list(prompt[:a]), 0
+        self._pending, self.logits = None, None
+        if drafted:
+            self.dr_len, self.pend_h = keep, None
+        else:
+            self.dr, self.dr_len, self.pend_h = None, 0, None
+            _let_go(dr, self)
+        if snap is not None:
+            t.keep(_Point(a, None, snap["logits"], dict(snap["states"]), 0))
+            eng._tag(PassTag.PREFIX_SHARED)
+            return new, a, snap
+        t.keep(_Point(0, first, None, None, 0))
+        return new, 0, None
 
     # -- a decode over the session (`generate(session=...)`): the transaction spans the engine's decode loop --------
 
