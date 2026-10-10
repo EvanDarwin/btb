@@ -20,6 +20,7 @@ from .cache import GrowLayer, conv_states_as, forked
 from .device import where
 from .families.attention import CARD_ATTENTION, ChunkCausal
 from .fixed_rows import fixed_rows
+from .fused import DELTA_BLOCK
 from .native import Native
 from .scheduler import EPOCH, MemoryGrantError
 from .state import _State
@@ -1163,20 +1164,18 @@ class _ForwardMixin(_State):
         # drive's ring, a mixture's experts) is read once for the whole prompt instead of once per chunk (the
         # chunks of a 16k prompt read the 180B's experts 3.35 times over)
         sweep = on_layer is None and last_only and self.mlx is None and self.prefill_layers
-        # a hybrid's DeltaNet continues a chunk from the cache's states, but sums in float32 over blocks that split
-        # where its chunks do: chunks of a size the free memory picks would make the same prompt's bits depend on
-        # what else the machine holds. So the torch hybrid sweeps only chunks of the size `prefill_chunk` names, and
-        # otherwise takes its prompt whole, as it always has (the MLX path continues its chunks from the stored
-        # states)
-        whole_hybrid = (
-            LayerKind.LINEAR in self.layer_types
-            and not self.fam.own
-            and self.mlx is None
-            and not (sweep and self.prefill_chunk)
-        )
+        # a hybrid's DeltaNet continues a chunk from the cache's states and sums over blocks of DELTA_BLOCK rows from
+        # its start (`chunk_gated_delta_rule`): the chunks the free memory picks are whole blocks, so they cut where the
+        # blocks do and the prompt's bits are the prompt's taken whole, whatever else the machine holds (taken whole, a
+        # long prompt held its every row's activations at once). A size `prefill_chunk` names is taken as named
+        blocks = LayerKind.LINEAR in self.layer_types and not self.fam.own and self.mlx is None
+
+        def priced(C: int) -> int:
+            return max(DELTA_BLOCK, C // DELTA_BLOCK * DELTA_BLOCK) if blocks and not self.prefill_chunk else C
+
         past = int(cache.get_seq_length())
-        C = int(self.prefill_chunk or self._auto_chunk(past))
-        if T <= C or whole_hybrid:
+        C = int(self.prefill_chunk or priced(self._auto_chunk(past)))
+        if T <= C:
             return self.forward(ids, cache=cache, on_layer=on_layer, last_only=last_only)
         if sweep:
             if not self.prefill_chunk:
@@ -1185,7 +1184,7 @@ class _ForwardMixin(_State):
                 # - with everything else the sweep asks of the device beside it (`_sweep_bytes`)
                 room = self.prefill_room()
                 while C > PREFILL_MIN_ROWS and sum(self._sweep_bytes(C, past, ids.shape[0], T, cache)) > room:
-                    C //= 2
+                    C = priced(C // 2)
             return self._prefill_by_layer(ids, cache, C)
         self.log(f"[prefill] {T} tokens in chunks of {C} from position {past}")
         # a layer hook sees the last layer's rows for the whole prompt once, joined at the end, as it would from
@@ -1209,7 +1208,7 @@ class _ForwardMixin(_State):
             while True:
                 # each chunk priced at its own position: the keys it attends over grow with every chunk before it,
                 # and the room shrinks as the cache takes its share (a 32k-row turn sized once at its start swapped)
-                C = int(self.prefill_chunk or self._auto_chunk(past + a))
+                C = int(self.prefill_chunk or priced(self._auto_chunk(past + a)))
                 if C < 512 and not self.prefill_chunk:
                     self.log(
                         f"[prefill] memory-starved: {C} rows a chunk at position {past + a} "

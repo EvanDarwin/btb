@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 """Fused replacements for transformers' modules: the RMSNorm, rotary and MLP forwards the engine installs on the
-families' classes, and the DeltaNet's causal conv as shifted multiply-adds."""
+families' classes, the DeltaNet's causal conv as shifted multiply-adds, and its chunked rule a block at a time."""
 
 from __future__ import annotations
 
@@ -111,3 +111,65 @@ def fast_causal_conv1d(
     if activation is not None:
         out = ACT2FN[activation](out)
     return out.to(hidden_states.dtype)
+
+
+# the gated DeltaNet's block: its chunked rule sums a block's rows in one order, and carries the state from block to
+# block. A prompt cut where its blocks are cut - multiples of DELTA_BLOCK rows from a call's start - is the same bits
+DELTA_BLOCK = 64
+
+
+def chunk_gated_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    chunk_size: int = DELTA_BLOCK,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """The gated delta rule in its chunked form (transformers' `torch_chunk_gated_delta_rule`, its arguments and
+    results), a block at a time: every product batched over the heads alone, each block's operands tensors of their
+    own. transformers' batches each product over every block of the call, and the math library splits a batch of a
+    few blocks across its threads otherwise than one of many - a prompt resumed from a block's state, or swept in
+    chunks of blocks, parted from the prompt taken whole (by 3e-8 in a state). A block here is a function of its own
+    rows and the state it starts from: the same bits however the call is cut at its blocks, at any thread count.
+    query, key [B, n, H, Dk]; value [B, n, H, Dv]; g, beta [B, n, H]; the state [B, H, Dk, Dv]"""
+    dtype = query.dtype
+    B, n, H, Dk = key.shape
+    Dv = int(value.shape[-1])
+    C = int(chunk_size)
+    q, k, v, b, gl = (
+        x.transpose(1, 2).to(torch.float32, memory_format=torch.contiguous_format) for x in (query, key, value, beta, g)
+    )
+    if use_qk_l2norm_in_kernel:
+        q = q * torch.rsqrt((q * q).sum(dim=-1, keepdim=True) + 1e-6)
+        k = k * torch.rsqrt((k * k).sum(dim=-1, keepdim=True) + 1e-6)
+    q = q * Dk**-0.5
+    dev = q.device
+    if initial_state is None:
+        state = torch.zeros(B, H, Dk, Dv, dtype=torch.float32, device=dev)
+    else:
+        state = initial_state.to(device=dev, dtype=torch.float32, copy=True)
+    out = torch.empty(B, H, n, Dv, dtype=torch.float32, device=dev)
+    upper = torch.ones(C, C, dtype=torch.bool, device=dev).triu(1)
+    for a in range(0, n, C):
+        e = min(n, a + C)
+        pad = C - (e - a)
+        qc, kc, vc = (F.pad(x[:, :, a:e], (0, 0, 0, pad)).contiguous() for x in (q, k, v))
+        bc, gc = (F.pad(x[:, :, a:e], (0, pad)).contiguous() for x in (b, gl))
+        kb, vb = kc * bc[..., None], vc * bc[..., None]
+        cum = gc.cumsum(dim=-1)
+        pair = (cum[..., :, None] - cum[..., None, :]).masked_fill(upper, float("-inf")).exp()
+        ut = (kb @ kc.transpose(-1, -2)) * pair
+        intra = (qc @ kc.transpose(-1, -2)) * pair
+        new_v = torch.linalg.solve_triangular(ut, vb, upper=False, unitriangular=True)
+        k_cum = torch.linalg.solve_triangular(ut, kb * cum.exp()[..., None], upper=False, unitriangular=True)
+        v_new = new_v - k_cum @ state
+        o = (qc * cum.exp()[..., None]) @ state + intra @ v_new
+        kd = kc * (cum[..., -1:] - cum).exp()[..., None]
+        state = state * cum[..., -1].exp()[..., None, None] + kd.transpose(-1, -2) @ v_new
+        out[:, :, a:e] = o[:, :, : e - a]
+    return out.transpose(1, 2).to(dtype, memory_format=torch.contiguous_format), state if output_final_state else None
