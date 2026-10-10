@@ -457,7 +457,6 @@ class CardRegion:
             s = self._take()
             self.slots[s] = p
             self._set_slot(p, s)
-            p.where = "card"
 
     def freed(self, p: Page) -> None:
         """page `p` has no holder left: its slot on the card or in the park free again - once the slots moving now
@@ -482,7 +481,6 @@ class CardRegion:
                 self.parked[p.park] = None
                 heapq.heappush(self.pfree, p.park)
                 p.park = -1
-            p.where = "host"
 
     def _copy(self, src: dict[int, Any], dst: dict[int, Any], runs: list[tuple[int, int, int]]) -> None:
         """every layer's K and V rows of each run (from slot, to slot, pages) copied from `src`'s arenas to `dst`'s:
@@ -521,7 +519,7 @@ class CardRegion:
                 self.slots[s] = None
                 heapq.heappush(self.free, s)
                 self._set_slot(p, -1)
-                p.park, p.where = ps, "park"
+                p.park = ps
             self.version += 1
 
     def load(self, pages: Sequence[Page]) -> None:
@@ -542,7 +540,7 @@ class CardRegion:
                 self.parked[ps] = None
                 heapq.heappush(self.pfree, ps)
                 self._set_slot(p, s)
-                p.park, p.where = -1, "card"
+                p.park = -1
             self.version += 1
             if self.arenas:
                 self.loaded += len(pages)
@@ -598,9 +596,9 @@ class CardRegion:
                 s, ps = o.slot, b.park
                 self.slots[s], self.parked[ps] = b, o
                 self._set_slot(b, s)
-                b.park, b.where = -1, "card"
+                b.park = -1
                 self._set_slot(o, -1)
-                o.park, o.where = ps, "park"
+                o.park = ps
             self.version += 1
             if self.arenas:
                 self.loaded += len(pairs)

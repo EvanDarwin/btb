@@ -127,9 +127,7 @@ class PrefixCache:
         k = Native.card_kernels()
         if k is None:
             return f"the card's kernels are not loaded ({Native.cuda_reason})"
-        missing = [n for n in (k.flash_prefill_kernel(d), f"btb_attn_flash_d{d}") if n not in k.fn]
-        if missing:
-            return f"the card's kernels lack {', '.join(missing)}"
+        # loaded, they are all there (the loader takes every kernel or none), every head width above among them
         return None
 
     def new(self, rows: Sequence[int] = ()) -> PagedCache:

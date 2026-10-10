@@ -5,9 +5,9 @@ A page is `PAGE` rows of every attention layer. A conversation's cache is a list
 its logical positions in order - so a prefix two conversations share is the same pages, referenced by both and held
 once. A page counts its holders (`refs`: the conversations' tables and the prefix tree's nodes); with none it goes back
 to the free list. Its rows are written once, in order: `fill` is how many hold rows, `frozen` how many another holder
-references (never rewritten), and only its `writer` appends past `fill`. Where a page lives (`where`: the card, its
-parking in pinned RAM, or the host) is the pool's to move; this module is the bookkeeping, the regions holding the
-tensors are the engine's.
+references (never rewritten), and only its `writer` appends past `fill`. Where a page's rows lie (the card's slot,
+its parking in pinned RAM, the host's region) is the regions' to move (btb/engine/paged.py); this module is the
+bookkeeping.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any
 
 # rows a page: the unit allocated, moved and let go. The attention reads key j through the row map whatever its page,
 # so the size is memory's choice, never the answer's: a conversation wastes at most PAGE - 1 rows at its end
@@ -28,16 +27,15 @@ class PoolError(RuntimeError):
 
 @dataclass(eq=False)
 class Page:
-    """one page's bookkeeping: its holders, the rows written and frozen, its writer, where it lives, when it was last
-    used (the pool's clock), and on a card where the rows of the layers the card runs sit - the card's slot for it,
-    or the park's in pinned RAM (-1: none)"""
+    """one page's bookkeeping: its holders, the rows written and frozen, its writer, when it was last used (the pool's
+    clock), and on a card where the rows of the layers the card runs sit - the card's slot for it, or the park's in
+    pinned RAM (-1: none)"""
 
     id: int
     refs: int = 0
     fill: int = 0
     frozen: int = 0
     writer: object | None = None
-    where: str = "host"
     tick: int = 0
     slot: int = -1
     park: int = -1
@@ -49,13 +47,7 @@ class PagePool:
     raises leaves the pool as it was. `ref`/`unref` count holders; the last `unref` frees the page, and tells `freed`
     (the regions holding a page somewhere of their own let that go)."""
 
-    def __init__(
-        self,
-        grow: Callable[[int], None] | None = None,
-        rows: int = PAGE,
-        freed: Callable[[Page], None] | None = None,
-    ) -> None:
-        self.rows = int(rows)
+    def __init__(self, grow: Callable[[int], None] | None = None, freed: Callable[[Page], None] | None = None) -> None:
         self.pages: list[Page] = []
         self.free: list[int] = []
         self._grow = grow
@@ -114,7 +106,7 @@ class PagePool:
         """the distinct pages `rows` lie in, in the order first met"""
         seen: dict[int, Page] = {}
         for r in rows:
-            i = int(r) // self.rows
+            i = int(r) // PAGE
             if i not in seen:
                 seen[i] = self.pages[i]
         return list(seen.values())
@@ -122,19 +114,8 @@ class PagePool:
     def freeze(self, rows: Iterable[int]) -> None:
         """`rows` referenced by another holder from now on: never written again"""
         for r in rows:
-            p = self.pages[int(r) // self.rows]
-            p.frozen = max(p.frozen, int(r) % self.rows + 1)
-
-    def lru(self, where: str | None = None, keep: Callable[[Page], bool] | None = None) -> list[Page]:
-        """the held pages (on `where`, any when None), least recently used first, but those `keep` holds back"""
-        free = set(self.free)
-        out = [
-            p
-            for p in self.pages
-            if p.id not in free and (where is None or p.where == where) and (keep is None or not keep(p))
-        ]
-        out.sort(key=lambda p: p.tick)
-        return out
+            p = self.pages[int(r) // PAGE]
+            p.frozen = max(p.frozen, int(r) % PAGE + 1)
 
     def check(self) -> list[str]:
         """the bookkeeping's own consistency: what is wrong, or nothing"""
@@ -147,16 +128,6 @@ class PagePool:
                 bad.append(f"page {p.id} is free with {p.refs} holders")
             if p.id not in free and p.refs <= 0:
                 bad.append(f"page {p.id} is held by no one and not free")
-            if not 0 <= p.frozen <= p.fill <= self.rows and p.refs:
-                bad.append(f"page {p.id}: frozen {p.frozen}, fill {p.fill} of {self.rows}")
+            if not 0 <= p.frozen <= p.fill <= PAGE and p.refs:
+                bad.append(f"page {p.id}: frozen {p.frozen}, fill {p.fill} of {PAGE}")
         return bad
-
-
-def describe(pool: PagePool) -> dict[str, Any]:
-    """the pool's figures for a log line or a report: pages held, free, by where they live"""
-    where: dict[str, int] = {}
-    free = set(pool.free)
-    for p in pool.pages:
-        if p.id not in free:
-            where[p.where] = where.get(p.where, 0) + 1
-    return {"held": len(pool), "free": len(pool.free), "rows": pool.rows, "where": where}

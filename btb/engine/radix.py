@@ -43,12 +43,11 @@ class Node:
 
 @dataclass
 class Match:
-    """what the tree holds of a prompt: its first `length` tokens, their rows, the nodes it passes through (the last
-    perhaps only partly), and the deepest snapshot within it (`snap_at` its position, 0 and None when none)"""
+    """what the tree holds of a prompt: its first `length` tokens, their rows, and the deepest snapshot within it
+    (`snap_at` its position, 0 and None when none)"""
 
     length: int = 0
     rows: list[int] = field(default_factory=list)
-    path: list[Node] = field(default_factory=list)
     snap_at: int = 0
     snap: Any = None
 
@@ -74,13 +73,14 @@ class RadixTree:
         self._ready()
         toks = [int(t) for t in tokens]
         m = Match()
+        path: list[Node] = []  # the nodes passed, the last perhaps only partly: used now
         node, i = self.root, 0
         while i < len(toks):
             kid = node.kids.get(toks[i])
             if kid is None:
                 break
             k = _common(kid.key, toks, i)
-            m.path.append(kid)
+            path.append(kid)
             m.rows.extend(kid.rows[:k])
             i += k
             if k < len(kid.key):
@@ -89,7 +89,7 @@ class RadixTree:
                 m.snap_at, m.snap = kid.end, kid.snap
             node = kid
         m.length = i
-        self._touch(m.path)
+        self._touch(path)
         return m
 
     def nodes(self) -> Iterator[Node]:
@@ -102,10 +102,10 @@ class RadixTree:
 
     # -- writing -------------------------------------------------------------------------------------------------
 
-    def insert(self, tokens: Sequence[int], rows: Sequence[int], snaps: Mapping[int, Any] | None = None) -> list[Node]:
+    def insert(self, tokens: Sequence[int], rows: Sequence[int], snaps: Mapping[int, Any] | None = None) -> None:
         """`tokens` and the rows holding them (a conversation's table) into the tree, and the snapshots of the state
-        after `tokens[:n]` for each position n of `snaps`: the path walked. What the tree holds already keeps its
-        own rows - the same tokens' rows, made once - and a snapshot already kept at a position stays"""
+        after `tokens[:n]` for each position n of `snaps`, the path walked used now. What the tree holds already keeps
+        its own rows - the same tokens' rows, made once - and a snapshot already kept at a position stays"""
         toks = [int(t) for t in tokens]
         rws = [int(r) for r in rows]
         if len(toks) != len(rws):
@@ -132,7 +132,6 @@ class RadixTree:
                 kid.snap = snaps[i]
             node = kid
         self._touch(path)
-        return path
 
     def _add(self, parent: Node, key: Sequence[int], rows: Sequence[int]) -> Node:
         n = Node(key, rows, parent, parent.end + len(key))

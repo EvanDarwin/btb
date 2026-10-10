@@ -2696,9 +2696,6 @@ class _CudaMixin(_State):
         parents = getattr(self, "ap", None) if T > 1 else None
         if parents is not None and T > self.CARD_T_MAX:
             raise RuntimeError(f"[card] a tree of {T} rows is past the attention's {self.CARD_T_MAX}")
-        attn = f"btb_attn_flash_d{D}" if parents is not None else k.flash_prefill_kernel(D)
-        if nrk not in k.fn or attn not in k.fn:
-            raise RuntimeError(f"[card] no kernel for head_dim {D}")
         if tail and not self._card_tail_ok():
             raise RuntimeError("[card] the tail needs the final norm and the head on the card in bf16")
         # the chunk's buffers, the engine's scratch (granted as they grow, kept for the next chunk), every one taken

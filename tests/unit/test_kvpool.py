@@ -1,12 +1,12 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 """The KV pages' bookkeeping (btb/engine/kvpool.py): holders counted, a page freed with its last, growth asked of the
-ledger before a page is made, rows frozen once another holder reads them, the least recently used first."""
+ledger before a page is made, rows frozen once another holder reads them, each page's last use on the pool's clock."""
 
 from __future__ import annotations
 
 import pytest
 
-from btb.engine.kvpool import PAGE, PagePool, PoolError, describe
+from btb.engine.kvpool import PAGE, PagePool, PoolError
 
 
 def test_a_page_lives_while_anyone_holds_it() -> None:
@@ -66,15 +66,12 @@ def test_rows_frozen_once_another_holder_reads_them() -> None:
     assert not pool.check()
 
 
-def test_the_least_recently_used_come_first() -> None:
-    """`lru` orders the held pages by their last use, on a tier or any, without those held back"""
+def test_a_pages_last_use_is_the_pools_clock() -> None:
+    """a page is stamped with the pool's clock when it is made and each time it is used (`tick`, a conversation
+    bound): the card parks the least recently used first by these stamps"""
     pool = PagePool()
     a, b, c = pool.alloc(), pool.alloc(), pool.alloc()
-    b.where = "card"
-    pool.tick([a])
-    assert [p.id for p in pool.lru()] == [b.id, c.id, a.id]
-    assert [p.id for p in pool.lru("card")] == [b.id]
-    assert [p.id for p in pool.lru(keep=lambda p: p is c)] == [b.id, a.id]
-    pool.unref(b)
-    assert [p.id for p in pool.lru()] == [c.id, a.id], "a free page is listed as held"
-    assert describe(pool) == {"held": 2, "free": 1, "rows": PAGE, "where": {"host": 2}}
+    assert a.tick < b.tick < c.tick
+    pool.tick([a, b])
+    assert a.tick == b.tick > c.tick
+    assert min((a, b, c), key=lambda p: p.tick) is c
