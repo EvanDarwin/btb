@@ -114,6 +114,28 @@ def test_a_fresh_layers_first_rows_serve_a_module_as_they_came() -> None:
         PagedLayer(Table(pool), pool, 0).append(wide, wide)
 
 
+def test_a_hop_given_up_leaves_the_layer_reading_its_region() -> None:
+    """a host layer hopped onto a prefill's buffers whose sweep failed before landing it gives the hop up: its rows
+    read and written in the host's region again, the chunks' rows in the buffers never made (the failed pass's, cut by
+    its rollback) - left hopped, every later pass appended into the dead buffers and was refused"""
+    pool = KvPool([0], HK, D, dtype=torch.float32)
+    table = Table(pool)
+    layer = PagedLayer(table, pool, 0)
+    k, v = rows(5, 60)
+    layer.update(k, v)
+    kb, vb = torch.zeros(1, HK, 16, D), torch.zeros(1, HK, 16, D)
+    layer.hop(kb, vb)
+    layer.append(*rows(3, 61))  # a chunk into the hop's buffers
+    layer.unhop()
+    table.crop(5)  # the rollback's cut
+    assert layer._hop is None and layer.get_seq_length() == 5
+    k2, v2 = rows(2, 62)
+    gk, _ = layer.append(k2, v2)
+    assert gk.untyped_storage().data_ptr() != kb.untyped_storage().data_ptr(), "still appending into the hop's buffers"
+    got = layer.gather()
+    assert torch.equal(got[0], torch.cat([k, k2], -2)) and torch.equal(got[1], torch.cat([v, v2], -2))
+
+
 def test_a_shared_prefix_is_the_same_rows_held_once() -> None:
     """a cache opened on the tree's rows reads the very rows another conversation wrote - a page counted once
     however many hold it - and each goes on in pages of its own, never over the rows the other reads"""

@@ -1201,6 +1201,14 @@ class PagedLayer(DynamicLayer):
             vb[..., :n, :].copy_(v)
         self._hop = (kb, vb, n)
 
+    def unhop(self) -> None:
+        """a hop given up (the prefill failed before `land`): the layer's rows read and written in the host's region
+        again, the buffers the caller's - the chunks' rows past the hop's start never made, as a failed pass's rows
+        are not (the session's rollback cuts them)"""
+        if self._hop is not None:
+            self.n = min(self.n, self._hop[2])
+            self._hop = None
+
     def land(self, *_: Any) -> None:
         """the rows the hop's chunks made, back into the host's region through the table; the buffers the caller's
         again"""

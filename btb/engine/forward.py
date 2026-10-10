@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from transformers.cache_utils import DynamicCache
 
     from .device import Placement
+    from .paged import PagedLayer
 
 
 # a rope table (cos, sin) over a pass's positions
@@ -1403,6 +1404,8 @@ class _ForwardMixin(_State):
         kv_heads = int(getattr(self.cfg, "num_key_value_heads", None) or hq)
         head_dim = int(getattr(self.cfg, "head_dim", None) or self.cfg.hidden_size // hq)
         hop_buf: list[torch.Tensor | None] = [None]
+        # the host layer whose rows are in it now, until it lands: a sweep failing before then gives up its hop
+        hop_at: list[int] = []
 
         def hop_rows(dt: torch.dtype, b: int) -> torch.Tensor:
             """the sweep's one buffer for a host layer's rows on the card - keys and values, every row the prompt
@@ -1420,6 +1423,9 @@ class _ForwardMixin(_State):
         frames: list[dict[str, Any]] = []
         scores_open = False
         last_on_card = False  # the last layer ran the card graph's kernels (`_forward_card_prefill`)
+        # the chunks' buffers the passes take (`Scratch.take`) are the working set the sweep's reservation holds room
+        # for: they draw on it
+        self.scratch.draws = PREFILL
         try:
             if on_cuda:
                 # the allocator's cached blocks given back first, so what the ledger reads as free is memory the card
@@ -1463,13 +1469,20 @@ class _ForwardMixin(_State):
                     # the rows are allocated), and taken for the sweep where no epoch reserved any
                     self.device.reserve(EPOCH, growth, self.dev)
                     own_epoch = epoch == 0
-                if B == 1 and not forked(cache) and self._card_ready() and not getattr(cache, "paged", False):
+                if (
+                    B == 1
+                    and not forked(cache)
+                    and self._card_ready(capture=False)
+                    and not getattr(cache, "paged", False)
+                ):
                     # the prompt's rows made once, in the card graphs' arena grown to the sequence's reach, where no
                     # other live cache holds it: the decode's graphs read them there with nothing moved (`presize`
                     # then passes the arena's layers over). Taken here, after the room is made - the growth priced
                     # above is these rows, and a layer shed for them frees nothing once the one arena is allocated -
                     # and drawn from the epoch's room reserved for them. Refused, the layers keep rows of their own.
-                    # A paged cache's are the prefix cache's region's, reserved before the sweep (`_bind_kv`)
+                    # A paged cache's are the prefix cache's region's, reserved before the sweep (`_bind_kv`). Taken
+                    # while the card graph's capture waits out a refusal too (`_card_oom`): the arena is no graph, and
+                    # without it the layers ran through torch, other bits than the same prompt made a minute later
                     self._card_arena_take(cache, T)
                 self._presize_kv(cache, past0 + T, B)
                 if self.fam.moe and os.environ.get("BTB_PREFILL_DEPOT", "1") != "0":
@@ -1573,8 +1586,9 @@ class _ForwardMixin(_State):
                                     if not self._is_card_oom(e):
                                         raise
                                     # no room for the chunk's buffers: the layer's chunks from this one on the torch
-                                    # layer over the rows the ones before wrote, the layers after it as the card graph
-                                    # off has them (`_card_oom`)
+                                    # layer over the rows the ones before wrote. The layers after it try the card's
+                                    # kernels again (they take no graph's room); a refusal there again is the same
+                                    # one, inside the window this one opened (`_card_oom`)
                                     self._card_oom(e)
                                     graph_layer = last_on_card = False
                                     tmpl = self._card_layer(i, proto)
@@ -1587,6 +1601,7 @@ class _ForwardMixin(_State):
                                 if hopped:
                                     cache.layers[i].land(where(Device.CPU), self.host_kv_dtype())
                                     hopped = False
+                                    hop_at.clear()
                                 if h.device.type != "cpu" or h.dtype != torch.float32:
                                     # widened on the host, where the host chunk's share was asked for it
                                     h = h.detach().cpu().float()
@@ -1614,6 +1629,7 @@ class _ForwardMixin(_State):
                                     kv = hop_rows(h.dtype, h.shape[0])
                                     cl.hop(kv[0], kv[1])
                                     hopped = True
+                                    hop_at[:] = [i]
                             elif host and frames[c]["past"] > 0:
                                 self._cache_to(cache, i, self.dev)
                             pas = chunk_pass(c, i, lt, True, h)
@@ -1636,6 +1652,7 @@ class _ForwardMixin(_State):
                             # back on the host in its own dtype, as long as its growth is priced: the answer's
                             # first token appends in place (GrowLayer.land)
                             cache.layers[i].land(where(Device.CPU), self.host_kv_dtype())
+                            hop_at.clear()
                         if self._cold_held is not None:
                             self._cold_held = None
                             self._cold_release(i)
@@ -1700,7 +1717,15 @@ class _ForwardMixin(_State):
                 self._sweep_keep = self._sweep_ahead = False
                 if store is not None:
                     store.sweep_end()
+            for j in hop_at:
+                # a paged layer hopped when the sweep failed: its rows read and written in the host's region again,
+                # the buffer let go with the sweep's - left, its every later pass appended into the dead buffer and
+                # was refused. A contiguous one's rows are the buffer's: its next append moves them (`GrowLayer`)
+                cl = cache.layers[j]
+                if getattr(cl, "paged", False):
+                    cast("PagedLayer", cl).unhop()
             hop_buf[0] = None
+            self.scratch.draws = None
             self.device.release(PREFILL)
             if own_epoch:
                 self.device.release(EPOCH)

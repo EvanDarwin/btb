@@ -884,7 +884,12 @@ class _CudaMixin(_State):
     def _card_oom(self, e: BaseException) -> None:
         """a card-graph build the card had no room for (another program took it mid-pass): the graphs let go, the
         card graph off - the pass runs the torch path - until the placement moves or its retry is due (CARD_RETRY_S,
-        doubling at one placement): a program that took the card and left moved no placement"""
+        doubling at one placement): a program that took the card and left moved no placement. Refused again inside
+        the window it opened - the card's kernels a prompt's next layer tries (they take no graph's room) - it is the
+        same refusal: the window stands as it is, the graphs already let go (doubling each time, one prompt's sweep took
+        the window to its cap and synced the card at every layer)"""
+        if self._card_off_now():
+            return
         self._card_let_go()
         ver = self.device.snapshot().version
         off = getattr(self, "_card_off", None)
@@ -959,15 +964,8 @@ class _CudaMixin(_State):
             return L
         tmpl = self.resident[i]
         at, mlp = tmpl.self_attn, tmpl.mlp
-        H, Hq, Hk, D, I = self._card_dims()
-        nq, nk = Hq * D, Hk * D
-        W = torch.cat([at.q_proj.weight, at.k_proj.weight, at.v_proj.weight], 0).contiguous()
-        self._set_param(at.q_proj, "weight", W[:nq])
-        self._set_param(at.k_proj, "weight", W[nq : nq + nk])
-        self._set_param(at.v_proj, "weight", W[nq + nk :])
-        G = torch.cat([mlp.gate_proj.weight, mlp.up_proj.weight], 0).contiguous()
-        self._set_param(mlp.gate_proj, "weight", G[:I])
-        self._set_param(mlp.up_proj, "weight", G[I:])
+        W = self._card_merged(i, "q/k/v", [(at.q_proj, "weight"), (at.k_proj, "weight"), (at.v_proj, "weight")])
+        G = self._card_merged(i, "gate/up", [(mlp.gate_proj, "weight"), (mlp.up_proj, "weight")])
         for t in (W, G, at.o_proj.weight, mlp.down_proj.weight):
             if t.dtype != torch.bfloat16 or t.device.type != "cuda":
                 raise RuntimeError(
@@ -991,6 +989,41 @@ class _CudaMixin(_State):
             L["post_ff"] = tmpl.post_feedforward_layernorm.weight
         st["layers"][i] = L
         return L
+
+    def _card_merged(self, i: int, what: str, parts: list[tuple[Any, str]]) -> torch.Tensor:
+        """layer i's weights `parts` (module, name) as one row block, the modules left viewing it: the block they view
+        already where they lie whole in one storage, in order - merged before, the graphs that held it let go since
+        (copied again, a card out of room re-merged every layer of a refused prompt) - else a copy, asked of the
+        scheduler first (it is the card's memory twice until the modules' own go)"""
+        ts = [getattr(m, n) for m, n in parts]
+        rows, cols = sum(int(t.shape[0]) for t in ts), int(ts[0].shape[1])
+        st, at = ts[0].untyped_storage(), ts[0].storage_offset()
+        whole = True
+        for t in ts:
+            whole = (
+                whole
+                and t.is_contiguous()
+                and int(t.shape[1]) == cols
+                and t.untyped_storage().data_ptr() == st.data_ptr()
+                and t.storage_offset() == at
+            )
+            at += t.numel()
+        if whole:
+            return torch.empty(0, dtype=ts[0].dtype, device=ts[0].device).set_(
+                st, ts[0].storage_offset(), (rows, cols), (cols, 1)
+            )
+        sched = getattr(self, "scheduler", None)
+        if sched is not None:
+            nbytes = rows * cols * ts[0].element_size()
+            who = f"layer {i}'s {what} merged for the card's kernels"
+            sched.grant(nbytes, "weights", requester=who, device=ts[0].device, held=nbytes)
+        W = torch.cat([t.detach() for t in ts], 0).contiguous()
+        a = 0
+        for (m, n), t in zip(parts, ts, strict=True):
+            b = a + int(t.shape[0])
+            self._set_param(m, n, W[a:b])
+            a = b
+        return W
 
     def _card_tables(self, st: dict[str, Any], cap: int) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
         """the rope's cos/sin over `cap` positions on the card in bf16, by layer type: a dual-rope family's own
