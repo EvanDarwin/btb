@@ -29,10 +29,11 @@ from btb.engine import MemoryGrantError, StreamedTextModel
 from btb.engine.cache import ForkLayer
 from btb.engine.cuda import CardPassFailed
 from btb.engine.fused import DELTA_BLOCK
+from btb.engine.generate import lin_layer
 from btb.engine.kvpool import PAGE
 from btb.engine.paged import PagedCache
 from btb.engine.prefix import PrefixCache
-from btb.kinds import PassTag
+from btb.kinds import LayerKind, PassTag
 from tests.cert.spec import card_rows, kind_of_stem
 from tests.helpers import FIXTURES, fixture, shared_key, shared_model
 
@@ -712,6 +713,55 @@ def test_a_hybrid_opened_on_a_prompt_keeps_its_rows_and_its_snapshots(stem: str,
     assert s.last_reuse == at, "a rewound session went on from the states its mark put back"
     assert again == got
     assert (got, other) == (cold_turn(sm, system, False)[0], cold_turn(sm, [*system, *u2], False)[0])
+
+
+@pytest.mark.parametrize("stem", [HYBRID])
+def test_a_conversations_cache_is_among_those_a_layers_move_reaches(stem: str) -> None:
+    """every cache over the pool - a session's, a decode's with no session - is among the caches a layer's move reaches
+    (`_track`): its attention pages move with the pool, but a hybrid's recurrent states are the cache's own"""
+    sm = model(stem)
+    prefix(sm)
+    s = sm.session([5, 6, 7, 8])
+    assert isinstance(s.cache, PagedCache) and s.cache in sm._live_caches
+    other = sm._decode_cache(16)
+    assert isinstance(other, PagedCache) and other in sm._live_caches
+
+
+@CARD
+@pytest.mark.parametrize("place", ["card"])
+@pytest.mark.parametrize("stem", [HYBRID])
+def test_a_hybrids_states_follow_a_linear_layer_the_card_gives_up_and_back(stem: str, place: str) -> None:
+    """an idle hybrid session's recurrent states go with a linear layer the card gives up and takes back - its paged
+    cache among those a layer's move reaches - and it goes on there: left on the card, its next pass handed the host's
+    step card addresses. Last on its load: the placement it leaves is another load's"""
+    sm = model(stem, place)
+    rng = random.Random(16)
+    prefix(sm)
+    s = sm.session()
+    s.feed(chatty(rng, 150))
+    before = sorted(sm.resident)
+    lin = max(i for i in sm.resident if sm.layer_types[i] == LayerKind.LINEAR)
+
+    def states() -> set[str]:
+        cl = lin_layer(s.cache.layers[lin]) if s.cache is not None else None
+        assert cl is not None
+        held = [*dict(cl.conv_states).values(), *dict(cl.recurrent_states).values()]
+        return {t.device.type for t in held if isinstance(t, torch.Tensor)}
+
+    assert states() == {"cuda"}
+    for _ in range(sm.L):  # from the top, a layer a shed
+        if lin not in sm.resident:
+            break
+        sm.device.request("shed", sm.vram_shed)
+    assert lin in sm.host and states() == {"cpu"}, "the session's states stayed where the layer left"
+    s.feed(toks(rng, 10))
+    assert list(s.generate(4, eos=(), speculate=False).tokens)
+    for _ in range(sm.L):
+        if len(sm.resident) >= len(before):
+            break
+        sm.device.request("regrow", sm.vram_regrow)
+    assert sorted(sm.resident) == before and states() == {"cuda"}
+    assert list(s.generate(4, eos=(), speculate=True).tokens)
 
 
 @pytest.mark.parametrize("stem", OTHERS)

@@ -19,6 +19,7 @@ import pytest
 import torch
 from transformers import Qwen3Config
 
+from btb.engine.arena import RowArena
 from btb.engine.kvpool import PAGE
 from btb.engine.paged import CardRegion, HostRegion, KvPool, PagedCache, PagedError, PagedKV, PagedLayer, Table
 from btb.engine.prefix import PrefixCache
@@ -786,6 +787,62 @@ def test_a_trim_refused_part_way_gives_the_rest_back_at_the_next_ask() -> None:
     assert pc.pool.trimmable() == pc.pool.nbytes()["cpu"] - floor > 0, "the buffers left long are not counted"
     assert pc.pool.trim() == grown - floor - part and pc.pool.nbytes()["cpu"] == floor
     assert pc.pool.trimmable() == 0 and pc.pool.host.cap == first
+
+
+def test_the_card_region_prices_what_its_arenas_map(monkeypatch: pytest.MonkeyPatch) -> None:
+    """an arena mapped in place takes whole chunks of the driver's - a page's K or V rounded up to the chunk - and the
+    card region prices its growth, what it holds and its park by what the arenas take (`RowArena.nbytes`), not by
+    pages: priced as pages, a growth the ledger passed took more than it asked for (16 to 24 pages a layer took 4 MiB
+    where 2 were priced). Here every arena rounds to 1 MiB chunks"""
+    chunk = 1 << 20
+    monkeypatch.setattr(RowArena, "_whole", lambda self, n: -(-int(n) // chunk) * chunk)
+    asked: list[tuple[str, int, int]] = []
+
+    def grant(nbytes: int, kind: str, **kw: Any) -> None:
+        asked.append((str(kw.get("requester", "")), int(nbytes), int(kw.get("held", 0))))
+
+    def mapped(pages: int) -> int:
+        """one layer's K and V for `pages` pages, each rounded up to the chunk"""
+        return 2 * -(-(pages * PAGE * HK * D * 2) // chunk) * chunk
+
+    pc = prefix(grant, card=(0, 1))
+    card = pc.pool.card
+    assert card is not None
+    card._grow(HostRegion.MIN_PAGES)
+    old = card.cap
+    price = card.growth(old + 1)
+    card._grow(old + 1)
+    new = card.cap
+    beside = mapped(old)  # the CPU's arenas regrow: one layer's old one beside its new
+    assert price == 2 * (mapped(new) - mapped(old)) + beside and asked[-1][1:] == (price, beside), asked[-1]
+    assert card.nbytes() == 2 * mapped(new) and card.layer_bytes() == mapped(new)
+    card._grow_park(4)
+    have = len(card.parked)
+    assert card.park_nbytes() == 2 * mapped(have)
+    price = card.park_growth(have + 1)
+    card._grow_park(have + 1)
+    assert price == 2 * (mapped(len(card.parked)) - mapped(have)) + mapped(have) and asked[-1][1] == price
+
+
+def test_a_card_growth_failing_part_way_still_moves_the_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """an arena grown before a later one's growth failed may sit at new addresses: the region's layout moves all the
+    same, so no graph captured over the old addresses is taken again (moved on success alone, a request after the
+    failure reused a graph that read and wrote the arena where it no longer was)"""
+    pc = prefix(card=(0, 1))
+    card = pc.pool.card
+    assert card is not None
+    card._grow(HostRegion.MIN_PAGES)
+    layout, cap = card.layout, card.cap
+    first, second = list(card.arenas.values())
+
+    def boom(rows: int, moved: Any = None) -> None:
+        raise RuntimeError("out of memory")
+
+    monkeypatch.setattr(second, "grow", boom)
+    with pytest.raises(RuntimeError):
+        card._grow(cap + 1)
+    assert first.cap > cap * PAGE, "the first arena did not grow before the second failed"
+    assert card.layout != layout and card.cap == cap
 
 
 def test_a_host_region_refused_part_way_is_made_whole_at_the_next_write() -> None:

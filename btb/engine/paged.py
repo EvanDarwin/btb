@@ -369,11 +369,31 @@ class CardRegion:
 
     def layer_bytes(self) -> int:
         """what one layer's arena holds on the card: a layer leaving it frees that, one coming takes it"""
-        return self.cap * self._page_bytes()
+        return self._arena_bytes(self.cap)
 
     def park_nbytes(self) -> int:
         """what the park holds in RAM"""
-        return len(self.arenas) * len(self.parked) * self._page_bytes()
+        return len(self.arenas) * self._park_bytes(len(self.parked))
+
+    def _arena_bytes(self, slots: int) -> int:
+        """one layer's arena of `slots` slots as it takes the card (`RowArena.nbytes`): whole chunks of the driver's
+        where it maps in place - a page's K or V rounded up to the chunk - its rows' bytes where it is regrown. Priced
+        as pages, a growth the grant passed could take more than it asked for"""
+        if not slots:
+            return 0
+        a = next(iter(self.arenas.values()), None)
+        if a is None:  # no layer on the card yet: an arena not grown, only to size one
+            a = self._sizer = getattr(self, "_sizer", None) or self._arena()
+        return int(a.nbytes(slots * PAGE))
+
+    def _park_bytes(self, slots: int) -> int:
+        """one layer's park of `slots` slots as it takes RAM, as the arenas' (`_arena_bytes`)"""
+        if not slots:
+            return 0
+        p = next(iter(self.parks.values()), None)
+        if p is None:
+            p = self._park_sizer = getattr(self, "_park_sizer", None) or self._park_arena()
+        return int(p.nbytes(slots * PAGE))
 
     def _target(self, have: int, slots: int) -> int:
         return max(int(slots), int(have * self.GROW), self.MIN_SLOTS)
@@ -384,7 +404,7 @@ class CardRegion:
         if slots <= self.cap or not self.arenas:
             return 0
         new = self._target(self.cap, slots)
-        return len(self.arenas) * (new - self.cap) * self._page_bytes() + self._beside()
+        return len(self.arenas) * (self._arena_bytes(new) - self._arena_bytes(self.cap)) + self._beside()
 
     def park_growth(self, slots: int) -> int:
         """the RAM a growth of the park to `slots` slots takes at its peak: what the parks add, and regrown rather
@@ -393,19 +413,19 @@ class CardRegion:
         if slots <= have or not self.arenas:
             return 0
         new = self._target(have, slots)
-        return len(self.arenas) * (new - have) * self._page_bytes() + self._park_beside()
+        return len(self.arenas) * (self._park_bytes(new) - self._park_bytes(have)) + self._park_beside()
 
     def _park_beside(self) -> int:
         """the old park a park's growth holds beside its new one: one layer's, where the parks are regrown rather than
         mapped in place"""
         p = next(iter(self.parks.values()), None)
-        return 0 if p is None or p.in_place else len(self.parked) * self._page_bytes()
+        return 0 if p is None or p.in_place else self._park_bytes(len(self.parked))
 
     def _beside(self) -> int:
         """the old arena an arenas' growth holds beside its new one: one layer's, where they are regrown rather than
         mapped in place"""
         a = next(iter(self.arenas.values()), None)
-        return 0 if a is None or a.in_place else self.cap * self._page_bytes()
+        return 0 if a is None or a.in_place else self._arena_bytes(self.cap)
 
     def _counts(self, table: Table) -> tuple[int, int]:
         """(the table's pages in the park, the pages on the card it does not read): what binding it moves - a page is
@@ -470,12 +490,17 @@ class CardRegion:
                 device=self.dev,
                 held=self._beside(),
             )
-        for a in self.arenas.values():
-            a.grow(new * PAGE)
+        try:
+            for a in self.arenas.values():
+                a.grow(new * PAGE)
+        finally:
+            # the arenas longer, perhaps at new addresses - those grown before a later one's growth failed among them:
+            # every graph captured over the old addresses made again (moved on success alone, a request after the
+            # failure took a graph that read and wrote the arena where it no longer was)
+            self.layout += 1
         for s in range(len(self.slots), new):
             heapq.heappush(self.free, s)
         self.slots.extend([None] * (new - len(self.slots)))
-        self.layout += 1  # the arenas longer, perhaps at new addresses
 
     @_kept
     def _grow_park(self, slots: int) -> None:
@@ -798,16 +823,15 @@ class CardRegion:
         if i in self.arenas:
             return
         with self._move():
-            pb = self._page_bytes()
             rows = i in host.k
             on = [p for p in live if p.slot >= 0] if rows else []
             parked = [p for p in live if p.slot < 0 and p.park >= 0] if rows else []
             if self.grant is not None:
                 who = f"the prefix cache's card arena for layer {i}"
-                self.grant(self.cap * pb, "kv", requester=who, device=self.dev)
+                self.grant(self._arena_bytes(self.cap), "kv", requester=who, device=self.dev)
                 if self.parked:
                     who = f"the prefix cache's park for layer {i}"
-                    self.grant(len(self.parked) * pb, "kv", requester=who, device="cpu")
+                    self.grant(self._park_bytes(len(self.parked)), "kv", requester=who, device="cpu")
             self._stage(min(MOVE_PAGES, max(len(on), len(parked))), f"layer {i}'s rows onto the card", host)
             a = self._arena()
             pk = self._park_arena() if self.parked else None

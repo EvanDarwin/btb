@@ -49,6 +49,12 @@ def card_runs(sm: Any, i: int) -> bool:
 class PrefixCache:
     def __init__(self, sm: _State) -> None:
         self.cfg = c = sm.cfg
+        # the engine, to put the caches it makes among those a layer's move reaches (`new`); held weakly, the engine
+        # holding this. A stand-in engine (a test's namespace) takes no weak reference, and moves no layer
+        try:
+            self._sm: Callable[[], Any] = weakref.ref(sm)
+        except TypeError:
+            self._sm = lambda: None
         self.layer_types = list(sm.layer_types)
         sched = getattr(sm, "scheduler", None)
         layers = [i for i, lt in enumerate(self.layer_types) if lt != LayerKind.LINEAR]
@@ -131,8 +137,14 @@ class PrefixCache:
         return None
 
     def new(self, rows: Sequence[int] = ()) -> PagedCache:
-        """a cache over the pool, opened on `rows` - a prefix the tree holds, read in place - or empty"""
-        return PagedCache(self, rows)
+        """a cache over the pool, opened on `rows` - a prefix the tree holds, read in place - or empty: among the caches
+        a layer's move reaches (`_track`). Its attention pages move with the pool (`place`), but a hybrid's recurrent
+        states are the cache's own: left out, an idle session's stayed on the card as a layer the card gave up went to
+        the host, and its next pass handed the host's step card addresses"""
+        cache = PagedCache(self, rows)
+        sm = self._sm()
+        track = getattr(sm, "_track", None) if sm is not None else None
+        return track(cache) if track is not None else cache
 
     def insert(self, ids: Sequence[int], rows: Sequence[int], snaps: Mapping[int, Any] | None = None) -> None:
         self.tree.insert(ids, rows, snaps)
