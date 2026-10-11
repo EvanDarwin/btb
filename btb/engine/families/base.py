@@ -180,6 +180,11 @@ class Family:
         plain block's checkpoints carry no such head)"""
         return None
 
+    def drafting_names(self, cfg: Any) -> list[str]:
+        """the drafting head's tensors its drafter reads, by checkpoint name: what a GGUF file's NextN blocks are
+        matched against (a safetensors checkpoint names its own). None for the plain block"""
+        return []
+
     def attn_index_bytes(self, cfg: Any, rows: int) -> tuple[int, int]:
         """what a resident attention layer's index adds to its cache at `rows` positions, as the placement prices
         it: (the bytes that stay on the card wherever the rows live - what every pass reads whole; the bytes that

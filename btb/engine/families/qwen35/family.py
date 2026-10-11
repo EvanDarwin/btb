@@ -7,10 +7,12 @@ from __future__ import annotations
 import importlib
 from typing import TYPE_CHECKING, Any, Self
 
-from ....kinds import FamilyKind
+import torch
+
+from ....kinds import FamilyKind, LayerKind
 from ...fused import _fuse_norm_cls, chunk_gated_delta_rule, fast_causal_conv1d
 from ..base import Family, _flags
-from .drafter import Qwen35Drafter
+from .drafter import FC, LAYER, NORM, NORM_E, NORM_H, Qwen35Drafter
 
 if TYPE_CHECKING:
     from ...drafter import MTPDrafter
@@ -47,3 +49,11 @@ class Qwen35Family(Family):
 
     def drafter_cls(self) -> type[MTPDrafter] | None:
         return Qwen35Drafter
+
+    def drafting_names(self, cfg: Any) -> list[str]:
+        # the head's own tensors, and its layer's: one of the trunk's full-attention kind (a mixture's experts stacked,
+        # as the store reads them)
+        idx = [LayerKind.of(t) for t in cfg.layer_types].index(LayerKind.FULL)
+        with torch.device("meta"):
+            layer = self.layer(cfg, idx)
+        return [FC, NORM_E, NORM_H, NORM] + [LAYER + n for n, _ in (*layer.named_parameters(), *layer.named_buffers())]

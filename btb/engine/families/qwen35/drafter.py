@@ -30,8 +30,13 @@ if TYPE_CHECKING:
     from ....sampling import Sampling
     from ...drafter import MxAppend, MxAttend
 
-# the drafting head's layer
+# the drafting head's layer, and its own tensors around it: the fc over [embedding; hidden], their two norms, and
+# the norm before the head
 LAYER = "mtp.layers.0."
+FC = "mtp.fc.weight"
+NORM_E = "mtp.pre_fc_norm_embedding.weight"
+NORM_H = "mtp.pre_fc_norm_hidden.weight"
+NORM = "mtp.norm.weight"
 
 
 class _Norms(TypedDict):
@@ -70,7 +75,7 @@ class Qwen35Drafter(MTPDrafter):
                 )
             sm._set_param(self.layer, name, t.to(self.dev, dtype=self.cd))
         self.layer.self_attn.layer_idx = 0
-        self.fc = get("mtp.fc.weight").to(self.dev, dtype=self.cd)
+        self.fc = get(FC).to(self.dev, dtype=self.cd)
         self.fc_host = None
         if self.dev.type == Device.CPU and not train and (Native.gemv is not None or sm.mlx is not None):
             for mname, m in list(self.layer.named_modules()):
@@ -82,9 +87,9 @@ class Qwen35Drafter(MTPDrafter):
             sm.fam.finish_host_layer(sm, self.layer, L, base=LAYER)
             if getattr(sm, "_packed", None):
                 sm._bind_host_packed_layer(self.layer)
-            self.fc_host = _HostLinear(self.fc, key="mtp.fc.weight")
+            self.fc_host = _HostLinear(self.fc, key=FC)
             if getattr(sm, "_packed", None):
-                pk = sm._get_packed("mtp.fc.weight")
+                pk = sm._get_packed(FC)
                 if pk is not None:
                     blob, tbl, e = pk
                     a1 = e["lo"]
@@ -98,16 +103,20 @@ class Qwen35Drafter(MTPDrafter):
                         blob[a3:] if e["esc"] else torch.zeros(0, dtype=torch.uint8),
                         int(e["esc"]),
                     )
+            if sm.mlx is None and weights is None:
+                # a GGUF's stored types multiplied in their blocks, as a host layer's are (MLX's binder takes them)
+                heads = (*self.layer.modules(), self.fc_host)
+                sm._bind_stored({m.key: m for m in heads if isinstance(m, _HostLinear) and m.key})
             self.cd = torch.float32
             if sm.mlx is not None:
                 sm._bind_mlx_resident(self.layer, checkpoint=weights is None)
                 sm._bind_mlx_linears([self.fc_host], checkpoint=weights is None)
         self.norm_e = Qwen3_5RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
-        self.norm_e.weight.data = get("mtp.pre_fc_norm_embedding.weight").to(self.dev, dtype=self.cd)
+        self.norm_e.weight.data = get(NORM_E).to(self.dev, dtype=self.cd)
         self.norm_h = Qwen3_5RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
-        self.norm_h.weight.data = get("mtp.pre_fc_norm_hidden.weight").to(self.dev, dtype=self.cd)
+        self.norm_h.weight.data = get(NORM_H).to(self.dev, dtype=self.cd)
         self.norm = Qwen3_5RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
-        self.norm.weight.data = get("mtp.norm.weight").to(self.dev, dtype=self.cd)
+        self.norm.weight.data = get(NORM).to(self.dev, dtype=self.cd)
         # the rope over the drafter's own positions, on its device: a drafter on the host (shed there, or the plan put
         # none on the card) handed the card engine's rope its positions in RAM
         self.rotary = sm.fam.rotary(config=cfg).to(self.dev)
@@ -134,13 +143,13 @@ class Qwen35Drafter(MTPDrafter):
     def named_tensors(self) -> dict[str, torch.Tensor]:
         out = {f"{LAYER}{n}": p for n, p in self.layer.named_parameters()}
         if self.fc is not None:
-            out["mtp.fc.weight"] = self.fc
+            out[FC] = self.fc
         else:
             fc8 = self.fc8
-            out["mtp.fc.weight"] = (fc8.w8.float() * fc8.scale[:, None]).to(self.cd)
-        out["mtp.pre_fc_norm_embedding.weight"] = self.norm_e.weight
-        out["mtp.pre_fc_norm_hidden.weight"] = self.norm_h.weight
-        out["mtp.norm.weight"] = self.norm.weight
+            out[FC] = (fc8.w8.float() * fc8.scale[:, None]).to(self.cd)
+        out[NORM_E] = self.norm_e.weight
+        out[NORM_H] = self.norm_h.weight
+        out[NORM] = self.norm.weight
         return out
 
     def _mlx_ready(self) -> bool:

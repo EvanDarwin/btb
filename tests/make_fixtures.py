@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 from collections.abc import Sequence
@@ -141,9 +142,14 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
     L = int(cfg["num_hidden_layers"])
     heads = int(cfg["num_attention_heads"])
     head_dim = int(cfg.get("head_dim") or cfg["hidden_size"] // heads)
+    state = safetensors_state(model_dir)
+    # a Qwen3.5 drafting head's layers, kept as NextN blocks past the trunk's (the converter's default, no --no-mtp)
+    nextn = len({k.split(".")[2] for k in state if k.startswith("mtp.layers.")}) if qwen35 else 0
     w = GGUFWriter(out, MODEL_ARCH_NAMES[arch])
     w.add_name(os.path.basename(model_dir))
-    w.add_block_count(L)
+    w.add_block_count(L + nextn)
+    if nextn:
+        w.add_nextn_predict_layers(nextn)
     w.add_context_length(int(cfg.get("max_position_embeddings", 4096)))
     w.add_embedding_length(int(cfg["hidden_size"]))
     if cfg.get("intermediate_size"):
@@ -193,10 +199,12 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
     tcfg = json.load(open(os.path.join(model_dir, "tokenizer_config.json"), encoding="utf-8"))
     if tcfg.get("chat_template"):
         w.add_chat_template(tcfg["chat_template"])
-    state = safetensors_state(model_dir)
     if qwen35:
         state = _qwen35_converted(cfg, state)
-    tmap = TensorNameMap(arch, L)
+    tmap = TensorNameMap(arch, L + nextn)
+    # the head's own tensors on its first NextN block: the package's names for its members, which its tables for
+    # these architectures do not list
+    head = {f"model.layers.{L}.{k}": TENSOR_NAMES[MODEL_TENSOR[m]].format(bid=L) for k, m in NEXTN_MEMBERS.items()}
     qtype = {
         "f16": None,
         "bf16": GGMLQuantizationType.BF16,
@@ -211,6 +219,7 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
             continue  # the MXFP4 experts below, in ggml's layout
         base, suffix = name.rsplit(".", 1)
         gname = tmap.get_name(base) if suffix in ("weight", "bias") else tmap.get_name(name)
+        gname = gname or head.get(base)
         if gname is None:
             raise RuntimeError(f"no GGUF name for {name}")
         if suffix not in ("weight", "bias"):  # a bare parameter (gpt-oss's attention sinks, Qwen3.5's A_log)
@@ -219,7 +228,7 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
         arr = state[name].float().numpy()
         if arch is MODEL_ARCH.GEMMA3 and name.endswith("norm.weight"):
             arr = arr + 1  # Gemma3Model.modify_tensors: llama.cpp's RMSNorm scales by the weight, Gemma's by 1 + it
-        if gname in conv or name.endswith(".mlp.gate.weight"):  # llama.cpp keeps a router f32 too
+        if gname in conv or name.endswith((".mlp.gate.weight", ".mlp.shared_expert_gate.weight")):  # routers f32 too
             w.add_tensor(f"{gname}.{suffix}", arr.astype(np.float32))
         elif arr.ndim >= 2 and qtype is not None and arr.shape[-1] % 32 == 0:
             q = GGMLQuantizationType.MXFP4 if outtype == "mxfp4" and arr.ndim == 3 else qtype
@@ -263,15 +272,52 @@ def _qwen35_metadata(w: GGUFWriter, cfg: Json, head_dim: int) -> None:
     w.add_rope_dimension_sections((sections + [0] * 4)[:4])
 
 
+# llama.cpp's renames of a Qwen3.5 drafting head's own tensors onto its first NextN block (the remapper in
+# `_QwenMtpMixin.filter_tensors`), and the gguf package's member each is then stored as
+QWEN35_NEXTN = {
+    "fc": "eh_proj",
+    "pre_fc_norm_embedding": "enorm",
+    "pre_fc_norm_hidden": "hnorm",
+    "norm": "shared_head.norm",
+}
+NEXTN_MEMBERS = {
+    "eh_proj": "NEXTN_EH_PROJ",
+    "enorm": "NEXTN_ENORM",
+    "hnorm": "NEXTN_HNORM",
+    "shared_head.norm": "NEXTN_SHARED_HEAD_NORM",
+}
+
+
 def _qwen35_converted(cfg: Json, state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """the checkpoint as llama.cpp's Qwen3.5 converter hands it to the writer (Qwen3_5TextModel.modify_tensors,
-    in float32 as it runs): the MTP head left out (its --no-mtp), the value heads reordered from grouped by key
-    head to tiled, A_log as -exp(A_log), dt_bias renamed dt_proj.bias, conv1d squeezed, the norms as 1 + w; and
-    Qwen3.5-MoE's: the stacked experts' gate_up_proj split in two, the shared expert's gate squeezed to a vector"""
+    in float32 as it runs): the MTP head kept as its NextN block past the trunk's (`_QwenMtpMixin.filter_tensors`:
+    its layer's tensors that block's, its fc and norms renamed onto it, `QWEN35_NEXTN`), the value heads reordered
+    from grouped by key head to tiled, A_log as -exp(A_log), dt_bias renamed dt_proj.bias, conv1d squeezed, the
+    norms as 1 + w; and Qwen3.5-MoE's: the stacked experts' gate_up_proj split in two, a layer's experts kept one
+    tensor an expert stacked (Qwen2MoeModel.modify_tensors); the routers, the shared expert's gate among them, kept
+    float32 by the writer (FFN_GATE_INP, FFN_GATE_INP_SHEXP)"""
     import torch
 
     nk, nv = int(cfg["linear_num_key_heads"]), int(cfg["linear_num_value_heads"])
     hk, hv = int(cfg["linear_key_head_dim"]), int(cfg["linear_value_head_dim"])
+    L = int(cfg["num_hidden_layers"])
+
+    def renamed(name: str) -> str:
+        parts = name.split(".", 3)
+        if len(parts) == 4 and parts[1] == "layers" and parts[2].isdecimal():
+            return f"model.layers.{L + int(parts[2])}.{parts[3]}"
+        if len(parts) == 3 and parts[1] in QWEN35_NEXTN:
+            return f"model.layers.{L}.{QWEN35_NEXTN[parts[1]]}.{parts[2]}"
+        return name
+
+    state = dict(state)
+    per_expert: dict[str, dict[int, torch.Tensor]] = {}
+    for name in list(state):
+        m = re.fullmatch(r"(mtp\.layers\.\d+\.mlp\.experts\.)(\d+)\.(\w+\.weight)", name)
+        if m is not None:
+            per_expert.setdefault(m[1] + m[3], {})[int(m[2])] = state.pop(name)
+    for stem, ts in per_expert.items():
+        state[stem] = torch.stack([ts[e] for e in sorted(ts)])
 
     def tiled(t: torch.Tensor, dim: int, width: int) -> torch.Tensor:  # _reorder_v_heads
         if nk == nv:
@@ -283,8 +329,7 @@ def _qwen35_converted(cfg: Json, state: dict[str, torch.Tensor]) -> dict[str, to
     out: dict[str, torch.Tensor] = {}
     qk = 2 * nk * hk
     for name, t in state.items():
-        if name.startswith("mtp."):
-            continue
+        name = renamed(name) if name.startswith("mtp.") else name
         t = t.float()
         if name.endswith(".mlp.experts.gate_up_proj"):
             half, stem = int(t.shape[-2]) // 2, name.removesuffix("gate_up_proj")
@@ -293,8 +338,6 @@ def _qwen35_converted(cfg: Json, state: dict[str, torch.Tensor]) -> dict[str, to
         if name.endswith(".mlp.experts.down_proj"):
             out[name + ".weight"] = t
             continue
-        if name.endswith(".mlp.shared_expert_gate.weight"):
-            t = t.squeeze(0)
         if ".in_proj_qkv." in name or ".conv1d." in name:
             t = t.squeeze() if ".conv1d." in name else t
             t = torch.cat([t[:qk], tiled(t[qk:], 0, hv)])

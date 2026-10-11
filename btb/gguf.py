@@ -36,6 +36,15 @@ NameMap = Callable[[str], str | None]
 REWRITTEN = frozenset({"qwen35", "qwen35moe", QWEN4EXP, "gemma3"})
 # the architectures whose converter splits the checkpoint's stacked experts' gate_up_proj in two (`_rebuild_experts`)
 SPLIT_EXPERTS = frozenset({"qwen35moe", QWEN4EXP})
+# a drafting head's own tensors (`mtp.<name>`) as llama.cpp's converter renames them onto the first NextN block
+# (`_QwenMtpMixin.filter_tensors`), and the gguf package's member each is stored as; the head's layers are those
+# blocks' ordinary tensors
+NEXTN_HEAD: dict[str, tuple[str, str]] = {
+    "fc": ("eh_proj", "NEXTN_EH_PROJ"),
+    "pre_fc_norm_embedding": ("enorm", "NEXTN_ENORM"),
+    "pre_fc_norm_hidden": ("hnorm", "NEXTN_HNORM"),
+    "norm": ("shared_head.norm", "NEXTN_SHARED_HEAD_NORM"),
+}
 
 # btb's own names for an architecture the installed gguf package does not know yet, modelled on llama.cpp's tree
 # (gguf-py's constants.py and tensor_mapping.py; MIT, Copyright (c) 2023 Georgi Gerganov): the checkpoint name
@@ -144,6 +153,19 @@ def meta_key(arch: str, path: str) -> str:
     for part in path.split("."):
         obj = getattr(obj, part, None)
     return (obj if isinstance(obj, str) else OWN_KEYS[path]).format(arch=arch)
+
+
+def converted(hf: str, n_layers: int) -> str:
+    """checkpoint tensor `hf` as llama.cpp's converter names it before its tensor map (`_QwenMtpMixin`): a drafting
+    head's layer `mtp.layers.i.*` block `n_layers + i`, its own tensors that first block's NextN ones (`NEXTN_HEAD`);
+    any other name as it is"""
+    if not hf.startswith("mtp."):
+        return hf
+    parts = hf.split(".", 3)
+    if len(parts) == 4 and parts[1] == "layers" and parts[2].isdecimal():
+        return f"model.layers.{n_layers + int(parts[2])}.{parts[3]}"
+    name, _, suffix = hf.removeprefix("mtp.").rpartition(".")
+    return f"model.layers.{n_layers}.{NEXTN_HEAD[name][0]}.{suffix}" if name in NEXTN_HEAD else hf
 
 
 def _plus_one(hf: str) -> bool:
@@ -360,7 +382,7 @@ class GGUFModel:
         eps = self._num(att.LAYERNORM_RMS_EPS)
         if eps is not None:
             out["rms_norm_eps"] = eps
-        n = (self._ints(llm.BLOCK_COUNT) or [0])[0] - (self._ints(llm.NEXTN_PREDICT_LAYERS) or [0])[0]
+        n = (self._ints(llm.BLOCK_COUNT) or [0])[0] - self.nextn()
         every = (self._ints(llm.FULL_ATTENTION_INTERVAL) or [4])[0]  # llama.cpp's qwen35 loader default
         out["num_hidden_layers"] = n
         out["layer_types"] = ["full_attention" if (i + 1) % every == 0 else "linear_attention" for i in range(n)]
@@ -609,24 +631,29 @@ class GGUFModel:
         """The family's tensor names (HF's, `model.layers.0.self_attn.q_proj.weight`) against the file's through
         llama.cpp's table: returns (HF name -> the file's tensor name, for the names the file holds) and a
         safetensors-shaped header (shape, bf16 byte span) the engine's size readers take as they take a shard's.
-        `stored_experts` (`stored_experts()`'s answer): the experts are the file's spans, read as stored."""
-        get_name = name_map(self.arch, n_layers)
+        `stored_experts` (`stored_experts()`'s answer): the experts are the file's spans, read as stored. A drafting
+        head (`mtp.*`) is matched as the converter wrote it, onto the NextN blocks past the trunk's `n_layers`."""
+        get_name = name_map(self.arch, n_layers + self.nextn())
+        # the head's own tensors: no name in the package's table for the architecture, their members' names instead
+        head = {f"model.layers.{n_layers}.{conv}": member for conv, member in NEXTN_HEAD.values()}
         rewritten = self.arch in REWRITTEN
         hf_names = list(hf_names)
         names: dict[str, str] = {}
         hdr: Json = {}
         for hf in hf_names:
-            base, suffix = hf, ""
+            conv = converted(hf, n_layers)
+            base, suffix = conv, ""
             # llama.cpp stores the linear attention's dt_bias as its dt projection's bias
-            src = hf.removesuffix(".dt_bias") + ".dt_proj.bias" if hf.endswith(".linear_attn.dt_bias") else hf
+            src = conv.removesuffix(".dt_bias") + ".dt_proj.bias" if conv.endswith(".linear_attn.dt_bias") else conv
             if src.endswith((".weight", ".bias")):
                 base, suffix = src.rsplit(".", 1)
                 suffix = "." + suffix
-            g = get_name(base)
+            g = get_name(base) or (tensor_name(self.arch, head[base], n_layers) if base in head else None)
             if g is None or g + suffix not in self.tensors:
                 continue
             file = g + suffix
-            undo = self._undo(hf, self._shape(file)) if rewritten else None
+            # the converter's rewrites by the name it gave the tensor (a head's norm is renamed, then made 1 + w)
+            undo = self._undo(conv, self._shape(file)) if rewritten else None
             if undo is None:
                 names[hf], hdr[hf] = file, self._entry(file)
                 continue
@@ -644,10 +671,15 @@ class GGUFModel:
         if self.arch == QWEN4EXP:
             self._map_qwen4exp(hf_names, get_name, names, hdr)
         if spans or not self.split_experts():
-            self._map_experts(hf_names, n_layers, names, hdr, stored_experts)
+            self._map_experts(hf_names, n_layers + self.nextn(), names, hdr, stored_experts)
         else:
-            self._rebuild_experts(hf_names, get_name, names, hdr)
+            self._rebuild_experts(hf_names, n_layers, get_name, names, hdr)
         return names, hdr
+
+    def nextn(self) -> int:
+        """the drafting head's layers the converter kept as NextN blocks past the trunk's (`block_count` counts
+        them)"""
+        return (self._ints(gguf_lib().Keys.LLM.NEXTN_PREDICT_LAYERS) or [0])[0]
 
     def split_experts(self) -> bool:
         """whether the file's experts are llama.cpp's split gate and up (`ffn_gate_exps`, `ffn_up_exps`) of a family
@@ -655,11 +687,13 @@ class GGUFModel:
         Qwen3.5-MoE's, against gpt-oss's interleaved rows (always MXFP4, so always the store's spans)"""
         return self.arch in SPLIT_EXPERTS and any(n.endswith("ffn_gate_exps.weight") for n in self.tensors)
 
-    def _rebuild_experts(self, hf_names: list[str], get_name: NameMap, names: dict[str, str], hdr: Json) -> None:
+    def _rebuild_experts(
+        self, hf_names: list[str], n_layers: int, get_name: NameMap, names: dict[str, str], hdr: Json
+    ) -> None:
         """the experts the store dequantizes, under the checkpoint's stacked names: gate/up joined from the file's two
-        tensors on read, the down projection the file's own"""
+        tensors on read, the down projection the file's own; a drafting layer's from its NextN block"""
         for hf in hf_names:
-            layer, _, rest = hf.removeprefix("model.layers.").partition(".")
+            layer, _, rest = converted(hf, n_layers).removeprefix("model.layers.").partition(".")
             pre = f"model.layers.{layer}.mlp.experts."
             if rest == "mlp.experts.gate_up_proj":
                 gu = tuple(f"{get_name(pre + k)}.weight" for k in ("gate_proj", "up_proj"))
@@ -727,8 +761,6 @@ class GGUFModel:
             undo = Undo(rows=qkv, shape=(shape[0], 1, shape[-1]))
         elif hf.endswith(".ple.conv1d.weight"):
             undo = Undo(shape=(shape[0], 1, shape[-1]))
-        elif hf.endswith(".mlp.shared_expert_gate.weight") and len(shape) == 1:
-            undo = Undo(shape=(1, shape[0]))  # the shared expert's gate, a one-row linear, squeezed
         elif hf.endswith(lin + "out_proj.weight"):
             undo = Undo(cols=heads)
         elif _plus_one(hf):

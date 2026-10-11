@@ -487,18 +487,33 @@ def _need_q35(stem: str = "tiny_q35") -> None:
 
 
 def _q35_trunk(stem: str = "tiny_q35") -> dict[str, torch.Tensor]:
-    """the checkpoint without its MTP head, which llama.cpp's converter leaves out under --no-mtp"""
+    """the checkpoint's trunk, its MTP head aside"""
     state = safetensors_state(os.path.join(FIXTURES, stem))
     return {k: v for k, v in state.items() if not k.startswith("mtp.")}
+
+
+def _q35_named(stem: str) -> dict[str, torch.Tensor]:
+    """the checkpoint as the family names its tensors (`_family_tensor_names`): the trunk's and the drafting head's,
+    a mixture head's one-tensor-an-expert matrices stacked as the store reads them (gate's rows, then up's)"""
+    state = safetensors_state(os.path.join(FIXTURES, stem))
+    pre = "mtp.layers.0.mlp.experts."
+    n = len({k.split(".")[5] for k in state if k.startswith(pre)})
+    if n:
+        get = lambda e, p: state.pop(f"{pre}{e}.{p}.weight")
+        state[pre + "gate_up_proj"] = torch.stack(
+            [torch.cat([get(e, "gate_proj"), get(e, "up_proj")]) for e in range(n)]
+        )
+        state[pre + "down_proj"] = torch.stack([get(e, "down_proj") for e in range(n)])
+    return state
 
 
 @pytest.mark.parametrize("stem", Q35_STEMS)
 def test_a_qwen35_gguf_reads_back_its_checkpoint(stem: str) -> None:
     """Qwen3.5 through llama.cpp's converter and back: the config off the typed keys (the hybrid's layer pattern,
-    linear attention widths, partial MRoPE, a mixture's experts), every trunk tensor found and equal as bf16 once
-    the converter's rewrites are inverted (the tiled value heads, -exp(A_log), 1 + norm, the squeezed conv, the
-    split experts and squeezed shared-expert gate), and a quantized file's reordered blocks (what the packed
-    kernels bind) the same numbers as its reordered dequantization"""
+    linear attention widths, partial MRoPE, a mixture's experts), every tensor - the drafting head's too, kept as a
+    NextN block past the trunk's - found and equal as bf16 once the converter's rewrites are inverted (the tiled
+    value heads, -exp(A_log), 1 + norm, the squeezed conv, the split experts, the head's renames), and a quantized
+    file's reordered blocks (what the packed kernels bind) the same numbers as its reordered dequantization"""
     _need_q35(stem)
     from gguf import dequantize
 
@@ -527,7 +542,8 @@ def test_a_qwen35_gguf_reads_back_its_checkpoint(stem: str) -> None:
         assert getattr(cfg, k) == want[k], (k, getattr(cfg, k), want[k])
     for k in ("rope_theta", "mrope_section", "mrope_interleaved"):
         assert cfg.rope_parameters[k] == want["rope_parameters"][k], k
-    state = _q35_trunk(stem)
+    state = _q35_named(stem)
+    assert g.nextn() == 1 and any(k.startswith("mtp.") for k in state)
     names, hdr = g.weight_map(list(state), cfg.num_hidden_layers)
     assert set(names) == set(state), set(state) ^ set(names)
     for hf, gn in names.items():

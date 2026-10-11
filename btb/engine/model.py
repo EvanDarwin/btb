@@ -682,9 +682,9 @@ class StreamedTextModel(
         return len(cost)
 
     def _family_tensor_names(self, cfg: Any) -> list[str]:
-        """every tensor the family's layers, embedding, norm (Qwen4's closing mixer) and head are loaded from, by
-        its HF name: what a GGUF file's tensors are matched against. Each layer is its own: a hybrid family's
-        layers differ in kind."""
+        """every tensor the family's layers, embedding, norm (Qwen4's closing mixer), head and drafting head are
+        loaded from, by its HF name: what a GGUF file's tensors are matched against. Each layer is its own: a hybrid
+        family's layers differ in kind."""
         names = ["model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"]
         with torch.device("meta"):
             closing, last = self.fam.closing(cfg)
@@ -692,7 +692,7 @@ class StreamedTextModel(
             names += [n for t, _, _ in self._named_tensors(last) if (n := f"model.{closing}.{t}") not in names]
             for i in range(self.L):
                 names += [f"model.layers.{i}.{n}" for n, _, _ in self._named_tensors(self.fam.layer(cfg, i))]
-        return names
+        return names + self.fam.drafting_names(cfg)
 
     def close(self) -> None:
         """Stop any decode in flight and let go of everything the engine holds (`holdings`): the threads writing

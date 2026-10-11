@@ -8,7 +8,7 @@ from __future__ import annotations
 import mmap
 import threading
 import weakref
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
@@ -303,6 +303,9 @@ class _State:
         raise NotImplementedError
 
     def _bind_host_stored(self, i: int, layer: Any) -> None:
+        raise NotImplementedError
+
+    def _bind_stored(self, lins: Mapping[str, _HostLinear]) -> None:
         raise NotImplementedError
 
     def _head_stored(self) -> str | None:

@@ -255,6 +255,23 @@ def has_mtp_head(kind: FamilyKind) -> bool:
     return any(str(k).startswith("mtp.") for k in _read_once(index, _json).get("weight_map", {}))
 
 
+def _nextn(path: str) -> int:
+    """a GGUF file's NextN layers: the drafting head's, by the count llama.cpp's converter writes"""
+    from gguf import GGUFReader, Keys
+
+    r = GGUFReader(path)
+    arch = str(r.fields[Keys.General.ARCHITECTURE].contents())
+    f = r.fields.get(Keys.LLM.NEXTN_PREDICT_LAYERS.format(arch=arch))
+    return int(f.contents()) if f is not None else 0
+
+
+def gguf_has_mtp_head(kind: FamilyKind, storage: Storage) -> bool:
+    """whether every GGUF twin a cell binds keeps the drafting head as NextN layers, which the engine maps to its
+    `mtp.*` (btb/gguf.py `converted`), read from the files, never from a stem list"""
+    paths = fixture_paths(kind, storage)
+    return bool(paths) and all(os.path.isfile(p) and _read_once(p, _nextn) > 0 for p in paths)
+
+
 def gguf_name(stem: str, q: Quant) -> str:
     """the tiny GGUF twin's file name for one stored type (tests/make_fixtures.py's rule)."""
     return f"{stem}-{q.value.lower()}.gguf"

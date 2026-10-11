@@ -153,11 +153,12 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "spec.has_mtp_head reads the fixture, so the cells follow with no list to edit",
     ),
     Missing.GGUF_MTP_HEAD: (
-        "the GGUF reader maps no MTP drafting head: llama.cpp keeps a checkpoint's head as NextN layers "
-        "(blk.N.nextn.*, counted into block_count), which btb/gguf.py does not map to the engine's `mtp.*`, and "
-        "the tiny twins are written without them (write_gguf drops mtp.*, as the converter's --no-mtp does)",
-        "map the NextN layers to `mtp.*` in GGUFModel.weight_map (inverting what the converter wrote), keep them "
-        "in the twins write_gguf writes, and the MTP cells run on the GGUF storages",
+        "the family's GGUF twins keep no MTP drafting head: llama.cpp's converter keeps a checkpoint's head as "
+        "NextN layers (blk.N.nextn.*, counted into block_count), which btb/gguf.py maps to the engine's `mtp.*`, "
+        "but it exports none for this architecture (qwen4exp's `supports_mtp_export = False`), so the twins are "
+        "converted without it",
+        "once llama.cpp's converter exports the family's head, convert its twins with it (tests/make_fixtures.py) "
+        "and map any NextN tensor of its own; spec.gguf_has_mtp_head reads the files, so the cells follow",
     ),
     Missing.SPEC_OWN_LAYER: (
         "a family that brings its own layer (Qwen4) verifies a speculative pass only through btb's own node steps "
@@ -663,7 +664,7 @@ def gap_reason(
     if proposer is not None and proposer.mtp:
         if not spec.has_mtp_head(kind):
             return Missing.SPEC_MTP_HEAD
-        if info.container is spec.Container.GGUF:
+        if info.container is spec.Container.GGUF and not spec.gguf_has_mtp_head(kind, storage):
             return Missing.GGUF_MTP_HEAD
     return None
 

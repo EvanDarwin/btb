@@ -12,7 +12,7 @@ import struct
 import threading
 import time
 import weakref
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import CancelledError
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -453,20 +453,23 @@ class _TiersMixin(_State):
             },
         }
 
+    def _stored_name(self, key: str) -> str | None:
+        """the GGUF tensor of checkpoint weight `key` the host's native kernels multiply in its blocks: a stored
+        type the library has the gemv for, under `gguf_packed`; None for any other"""
+        gg, gq = self.gguf, Native.gemv_quant
+        if gg is None or gq is None or not self.gguf_packed:
+            return None
+        name = self._gguf_names.get(key)
+        return name if name is not None and gg.storable(name) and gg.tensors[name].tensor_type.name in gq else None
+
     def _host_stored_keys(self, i: int, linears: Iterable[str]) -> dict[str, str]:
         """layer `i`'s linear weights (`linears`, named in the layer) that its native kernels multiply in their GGUF
-        blocks, by checkpoint key -> file tensor: a stored type the library has the gemv for, under `gguf_packed`.
-        None on an MLX layer, whose binders take the blocks to its own kernels (`_bind_mlx_linears`)"""
-        gg, gq = self.gguf, Native.gemv_quant
-        if gg is None or gq is None or not self.gguf_packed or (self.mlx is not None and i in self.mlx_layers):
+        blocks (`_stored_name`), by checkpoint key -> file tensor. None on an MLX layer, whose binders take the
+        blocks to its own kernels (`_bind_mlx_linears`)"""
+        if self.mlx is not None and i in self.mlx_layers:
             return {}
         base = f"{self.prefix}layers.{i}."
-        out: dict[str, str] = {}
-        for n in linears:
-            name = self._gguf_names.get(base + n)
-            if name is not None and gg.storable(name) and gg.tensors[name].tensor_type.name in gq:
-                out[base + n] = name
-        return out
+        return {base + n: name for n in linears if (name := self._stored_name(base + n)) is not None}
 
     def _mlx_slot_keys(self, i: int, linears: Iterable[str]) -> dict[str, str]:
         """MLX layer `i`'s linear weights (`linears`, named in the layer) a cold slot holds as their GGUF blocks for
@@ -489,18 +492,23 @@ class _TiersMixin(_State):
 
     def _bind_host_stored(self, i: int, layer: Any) -> None:
         """host layer `i`'s linears its native kernels multiply as stored (`_host_stored_keys`) bound to the file's
-        blocks (`_HostLinear.quant`), each weight a shape with no bytes behind it"""
+        blocks (`_bind_stored`)"""
         lins = {n + ".weight": m for n, m in layer.named_modules() if isinstance(m, _HostLinear)}
         keys = self._host_stored_keys(i, lins)
-        if not keys:
-            return
-        assert self.gguf is not None  # stored keys are a GGUF's
-        for n, m in lins.items():
-            name = keys.get(f"{self.prefix}layers.{i}.{n}")
-            if name is not None:
-                m.quant, m.scratch = self.gguf.stored(name), self.scratch
-                shape = m.weight.shape
-                m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*shape), requires_grad=False)
+        base = f"{self.prefix}layers.{i}."
+        self._bind_stored({base + n: m for n, m in lins.items() if base + n in keys})
+
+    def _bind_stored(self, lins: Mapping[str, _HostLinear]) -> None:
+        """host linears, by checkpoint key, bound to the GGUF blocks their native kernels multiply (`_stored_name`,
+        `_HostLinear.quant`), each weight a shape with no bytes behind it; a key with none keeps its weight"""
+        for key, m in lins.items():
+            name = self._stored_name(key)
+            if name is None:
+                continue
+            assert self.gguf is not None  # a stored name is a GGUF's
+            m.quant, m.scratch = self.gguf.stored(name), self.scratch
+            shape = m.weight.shape
+            m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*shape), requires_grad=False)
 
     def _bind_host_packed_layer(self, layer: Any) -> Any:
         n_b = n_all = 0
