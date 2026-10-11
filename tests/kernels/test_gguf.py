@@ -217,9 +217,9 @@ def test_joined_stored_weights_are_their_members_in_one_launch(q: Quant) -> None
 
 @pytest.mark.parametrize("q", stored_quants(), ids=lambda q: q.value)
 def test_each_stored_types_dequant_feeds_the_prefills_gemm(q: Quant) -> None:
-    """the native decode of a whole matrix a CPU prefill's GEMM takes, every stored type: float32 the package's
-    dequantization to f32 rounding, bf16 torch's cast of it; and `stored_matmul` over 64 rows (the GEMM over
-    those weights) `x @ dequantize(blocks)` to bf16 rounding against each output's conditioning"""
+    """the native decode of a whole matrix a CPU prefill's GEMM takes, every stored type: the package's
+    dequantization to f32 rounding; and `stored_matmul` over 64 rows (the GEMM over those weights)
+    `x @ dequantize(blocks)` to bf16 rounding against each output's conditioning"""
     from gguf import GGMLQuantizationType, dequantize
 
     from btb.engine.host import stored_matmul
@@ -233,12 +233,10 @@ def test_each_stored_types_dequant_feeds_the_prefills_gemm(q: Quant) -> None:
     raw = stored_blocks(q, rows, cols, stored_quants().index(q))
     w = QuantWeight.of(torch.from_numpy(raw), q, rows, cols)
     ref = dequantize(raw.reshape(rows, -1), GGMLQuantizationType[q.value]).astype(np.float64).reshape(rows, cols)
-    f32, bf = torch.empty(rows, cols), torch.empty(rows, cols, dtype=torch.bfloat16)
+    f32 = torch.empty(rows, cols)
     gq.dequant(w, f32)
-    gq.dequant(w, bf)
     err = np.abs(f32.numpy() - ref).max(axis=1) / np.maximum(np.abs(ref).max(axis=1), 1e-30)
     assert float(err.max()) < 1e-6, q.value
-    assert torch.equal(bf, f32.to(torch.bfloat16)), f"{q.value}: bf16 is not the f32 rounded as torch casts"
     x = np.random.default_rng(2).standard_normal((64, cols)).astype(np.float32)
     y = stored_matmul(w, torch.from_numpy(x), None).numpy()
     want, mag = x.astype(np.float64) @ ref.T, np.abs(x.astype(np.float64)) @ np.abs(ref.T)
@@ -262,9 +260,9 @@ def test_a_long_gguf_prefill_takes_the_gemm_as_a_bf16_one_does(device: str, monk
     decoded: list[int] = []
     deq, sdq = QuantGemv.dequant, backend.stored_dequant
 
-    def native_dequant(gq: QuantGemv, w: QuantWeight, out: torch.Tensor, threads: int | None = None) -> None:
+    def native_dequant(gq: QuantGemv, w: QuantWeight, out: torch.Tensor) -> None:
         decoded.append(w.shape[0])
-        deq(gq, w, out, threads)
+        deq(gq, w, out)
 
     def mlx_dequant(q: Quant, streams: tuple[object, ...], rows: int, cols: int) -> object:
         decoded.append(rows)

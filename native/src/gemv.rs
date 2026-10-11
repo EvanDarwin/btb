@@ -4405,61 +4405,41 @@ impl_widen!(Iq1s, widen_iq1s, widen_iq1s_neon);
 impl_widen!(Iq3s, widen_iq3s, widen_iq3s_neon);
 impl_widen!(Iq1m, widen_iq1m, widen_iq1m_neon);
 
-/// One dequantization: the weights, where the rows go, and their element type.
+/// One dequantization: the weights and where the rows go.
 #[derive(Clone, Copy)]
 struct Dequant<W> {
     w: W,
-    out: *mut u8,
+    out: *mut f32,
     cols: usize,
-    bf16: bool,
 }
 // SAFETY: a chunk writes only its own rows of `out`; the caller's buffers do not overlap (the C ABI's contract)
 unsafe impl<W: Widen> Send for Dequant<W> {}
 unsafe impl<W: Widen> Sync for Dequant<W> {}
 
 impl<W: Widen> Dequant<W> {
-    /// rows `r0..r1` decoded, as f32 or rounded to bf16 as torch casts
+    /// rows `r0..r1` decoded
     unsafe fn rows(self, isa: Isa, r0: usize, r1: usize) {
-        let mut buf = if self.bf16 {
-            vec![0.0f32; self.cols]
-        } else {
-            Vec::new()
-        };
         for r in r0..r1 {
-            if !self.bf16 {
-                let dst = (self.out as *mut f32).add(r * self.cols);
-                self.w.widen_row(isa, dst, r, self.cols);
-                continue;
-            }
-            self.w.widen_row(isa, buf.as_mut_ptr(), r, self.cols);
-            let dst = (self.out as *mut u16).add(r * self.cols);
-            for (c, v) in buf.iter().enumerate() {
-                *dst.add(c) = (round_bf16(*v).to_bits() >> 16) as u16;
-            }
+            self.w
+                .widen_row(isa, self.out.add(r * self.cols), r, self.cols);
         }
     }
 }
 
-/// `out` (`[rows, cols]`, f32 or `bf16` bit patterns) = a stored matrix decoded as its gemv widens it, its rows
-/// spread over the pool: the weights a prefill's GEMM takes in place of the type's gemv.
+/// `out` (`[rows, cols]` f32) = a stored matrix decoded as its gemv widens it, its rows spread over the pool: the
+/// weights a prefill's GEMM takes in place of the type's gemv.
 unsafe fn dequant<W: Widen>(
     w: W,
     rows: usize,
     cols: usize,
     blk: usize,
-    out: *mut u8,
-    bf16: bool,
+    out: *mut f32,
     threads: usize,
 ) -> i32 {
     if out.is_null() {
         return ERR_NULL;
     }
-    let ok_out = if bf16 {
-        aligned(out as *const u16)
-    } else {
-        aligned(out as *const f32)
-    };
-    if !blk_shape_ok(rows, cols, 1, blk) || !ok_out {
+    if !blk_shape_ok(rows, cols, 1, blk) || !aligned(out as *const f32) {
         return ERR_DOMAIN;
     }
     let isa = isa();
@@ -4468,7 +4448,7 @@ unsafe fn dequant<W: Widen>(
         Some(v) => v,
         None => return ERR_DOMAIN,
     };
-    let job = Dequant { w, out, cols, bf16 };
+    let job = Dequant { w, out, cols };
     if nt <= 1 {
         job.rows(isa, 0, rows);
         return OK;
@@ -4487,14 +4467,13 @@ macro_rules! quant_dequant_core {
             raw: *const u8,
             rows: usize,
             cols: usize,
-            out: *mut u8,
-            bf16: bool,
+            out: *mut f32,
             threads: usize,
         ) -> i32 {
             if raw.is_null() {
                 return ERR_NULL;
             }
-            dequant($w(raw), rows, cols, $blk, out, bf16, threads)
+            dequant($w(raw), rows, cols, $blk, out, threads)
         }
     };
 }
@@ -4512,29 +4491,19 @@ quant_dequant_core!(dequant_q80_core, Q80, AFFINE_BLK);
 /// [`dequant`] for a lattice type, with its grid and (`$ks`) sign table.
 macro_rules! latt_dequant_core {
     ($name:ident, $w:ident, $ks:literal) => {
-        #[allow(clippy::too_many_arguments)]
         pub(crate) unsafe fn $name(
             raw: *const u8,
             grid: *const i8,
             ksigns: *const u8,
             rows: usize,
             cols: usize,
-            out: *mut u8,
-            bf16: bool,
+            out: *mut f32,
             threads: usize,
         ) -> i32 {
             if raw.is_null() || grid.is_null() || ($ks && ksigns.is_null()) {
                 return ERR_NULL;
             }
-            dequant(
-                $w { raw, grid, ksigns },
-                rows,
-                cols,
-                KQ_SB,
-                out,
-                bf16,
-                threads,
-            )
+            dequant($w { raw, grid, ksigns }, rows, cols, KQ_SB, out, threads)
         }
     };
 }

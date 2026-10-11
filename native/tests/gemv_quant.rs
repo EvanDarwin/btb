@@ -271,8 +271,7 @@ fn malformed_groups_return_their_codes() {
 
 #[test]
 fn dequant_is_the_gemvs_weights() {
-    // every weight the f64 reference decodes, to f32 rounding; bf16 the f32 rounded to nearest even (torch's
-    // cast); the bits the same for every thread count
+    // every weight the f64 reference decodes, to f32 rounding; the bits the same for every thread count
     for f in FORMATS {
         let t = tables(f, 0xDE0);
         for (idx, &(rows, cols)) in [(1usize, 256usize), (13, 512), (40, 768)]
@@ -280,7 +279,7 @@ fn dequant_is_the_gemvs_weights() {
             .enumerate()
         {
             let raw = blocks(f, rows, cols, 0xDE1 + idx as u64);
-            let (w, h) = run_dequant(f, &raw, &t, rows, cols, 1);
+            let w = run_dequant(f, &raw, &t, rows, cols, 1);
             let per_row = cols / f.block;
             for r in 0..rows {
                 for c in 0..cols {
@@ -292,20 +291,11 @@ fn dequant_is_the_gemvs_weights() {
                         "{} {rows}x{cols} [{r}, {c}]: got {got} want {want}",
                         f.name
                     );
-                    let b = w[r * cols + c].to_bits();
-                    let rne = (b.wrapping_add(0x7FFF + ((b >> 16) & 1)) >> 16) as u16;
-                    assert_eq!(
-                        h[r * cols + c],
-                        rne,
-                        "{} [{r}, {c}]: bf16 is not the f32 rounded",
-                        f.name
-                    );
                 }
             }
             for threads in [3usize, 0] {
-                let (w2, h2) = run_dequant(f, &raw, &t, rows, cols, threads);
+                let w2 = run_dequant(f, &raw, &t, rows, cols, threads);
                 assert_eq!(bits(&w2), bits(&w), "{} threads={threads}", f.name);
-                assert_eq!(h2, h, "{} threads={threads} bf16", f.name);
             }
         }
     }
@@ -318,56 +308,42 @@ fn malformed_dequants_return_their_codes() {
         let t = tables(f, 0xBAD7);
         let raw = blocks(f, rows, cols, 0xBAD7);
         let mut out = vec![0.0f32; rows * cols + 1];
-        let op = out.as_mut_ptr() as *mut u8;
+        let op = out.as_mut_ptr();
         let (rp, gp, kp, n) = (raw.as_ptr(), t.grid.as_ptr(), ksigns_ptr(&t), f.name);
-        let code = |raw: *const u8,
-                    grid: *const i8,
-                    ks: *const u8,
-                    cols: usize,
-                    out: *mut u8,
-                    bf16: bool| unsafe {
-            call_dequant(f, raw, grid, ks, rows, cols, out, bf16, 0)
+        let code = |raw: *const u8, grid: *const i8, ks: *const u8, cols: usize, out: *mut f32| unsafe {
+            call_dequant(f, raw, grid, ks, rows, cols, out, 0)
         };
         assert_eq!(
-            code(std::ptr::null(), gp, kp, cols, op, false),
+            code(std::ptr::null(), gp, kp, cols, op),
             ERR_NULL,
             "{n}: null raw"
         );
         assert_eq!(
-            code(rp, gp, kp, cols, std::ptr::null_mut(), false),
+            code(rp, gp, kp, cols, std::ptr::null_mut()),
             ERR_NULL,
             "{n}: null out"
         );
         assert_eq!(
-            code(rp, gp, kp, f.block + 1, op, false),
+            code(rp, gp, kp, f.block + 1, op),
             ERR_DOMAIN,
             "{n}: a partial block"
         );
+        assert_eq!(code(rp, gp, kp, 0, op), ERR_DOMAIN, "{n}: no columns");
+        let off = unsafe { (op as *mut u8).add(1) as *mut f32 };
         assert_eq!(
-            code(rp, gp, kp, 0, op, false),
+            code(rp, gp, kp, cols, off),
             ERR_DOMAIN,
-            "{n}: no columns"
-        );
-        let off = unsafe { op.add(1) };
-        assert_eq!(
-            code(rp, gp, kp, cols, off, false),
-            ERR_DOMAIN,
-            "{n}: a misaligned f32 out"
-        );
-        assert_eq!(
-            code(rp, gp, kp, cols, off, true),
-            ERR_DOMAIN,
-            "{n}: a misaligned bf16 out"
+            "{n}: a misaligned out"
         );
         if let Call::Latt(..) = f.call {
             assert_eq!(
-                code(rp, std::ptr::null(), kp, cols, op, false),
+                code(rp, std::ptr::null(), kp, cols, op),
                 ERR_NULL,
                 "{n}: null grid"
             );
             if f.ksigns {
                 assert_eq!(
-                    code(rp, gp, std::ptr::null(), cols, op, false),
+                    code(rp, gp, std::ptr::null(), cols, op),
                     ERR_NULL,
                     "{n}: null ksigns"
                 );

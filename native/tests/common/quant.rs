@@ -44,18 +44,9 @@ pub type LattGroupFn = unsafe extern "C" fn(
     *mut *mut f32,
     usize,
 ) -> i32;
-pub type PlainDequantFn =
-    unsafe extern "C" fn(*const u8, usize, usize, *mut u8, bool, usize) -> i32;
-pub type LattDequantFn = unsafe extern "C" fn(
-    *const u8,
-    *const i8,
-    *const u8,
-    usize,
-    usize,
-    *mut u8,
-    bool,
-    usize,
-) -> i32;
+pub type PlainDequantFn = unsafe extern "C" fn(*const u8, usize, usize, *mut f32, usize) -> i32;
+pub type LattDequantFn =
+    unsafe extern "C" fn(*const u8, *const i8, *const u8, usize, usize, *mut f32, usize) -> i32;
 
 /// A format's C-ABI entries, its rows call, its group call and its dequantization: plain, or a lattice type taking its grid and
 /// sign table.
@@ -419,7 +410,7 @@ pub unsafe fn call_group(
     }
 }
 
-/// The format's dequantization of a `[rows, cols]` matrix into `out` (f32, or bf16 bits with `bf16`).
+/// The format's dequantization of a `[rows, cols]` matrix into `out`.
 ///
 /// # Safety
 /// The pointers valid for the shape, as the C ABI states.
@@ -431,17 +422,16 @@ pub unsafe fn call_dequant(
     ks: *const u8,
     rows: usize,
     cols: usize,
-    out: *mut u8,
-    bf16: bool,
+    out: *mut f32,
     threads: usize,
 ) -> i32 {
     match f.call {
-        Call::Plain(_, _, d) => d(raw, rows, cols, out, bf16, threads),
-        Call::Latt(_, _, d) => d(raw, grid, ks, rows, cols, out, bf16, threads),
+        Call::Plain(_, _, d) => d(raw, rows, cols, out, threads),
+        Call::Latt(_, _, d) => d(raw, grid, ks, rows, cols, out, threads),
     }
 }
 
-/// The dequantization on plain buffers, asserting OK: (f32 weights, bf16 bit patterns).
+/// The dequantization on plain buffers, asserting OK: the weights.
 pub fn run_dequant(
     f: &Format,
     raw: &[u8],
@@ -449,29 +439,22 @@ pub fn run_dequant(
     rows: usize,
     cols: usize,
     threads: usize,
-) -> (Vec<f32>, Vec<u16>) {
+) -> Vec<f32> {
     let mut w = vec![poison_f32(); rows * cols];
-    let mut h = vec![0xFFFFu16; rows * cols];
-    for (out, bf16) in [
-        (w.as_mut_ptr() as *mut u8, false),
-        (h.as_mut_ptr() as *mut u8, true),
-    ] {
-        let code = unsafe {
-            call_dequant(
-                f,
-                raw.as_ptr(),
-                t.grid.as_ptr(),
-                ksigns_ptr(t),
-                rows,
-                cols,
-                out,
-                bf16,
-                threads,
-            )
-        };
-        assert_eq!(code, OK, "{} {rows}x{cols} dequant bf16={bf16}", f.name);
-    }
-    (w, h)
+    let code = unsafe {
+        call_dequant(
+            f,
+            raw.as_ptr(),
+            t.grid.as_ptr(),
+            ksigns_ptr(t),
+            rows,
+            cols,
+            w.as_mut_ptr(),
+            threads,
+        )
+    };
+    assert_eq!(code, OK, "{} {rows}x{cols} dequant", f.name);
+    w
 }
 
 /// One task of a group call on plain buffers: (raw, rows, cols, x, b).
@@ -852,44 +835,30 @@ pub fn fenced_sweep(label: &str, shapes: &[(usize, usize)], ts: &[usize], thread
                     }
                 }
             }
-            // the dequantization into an output fenced at its end, f32 and bf16, the plain call's bits
+            // the dequantization into an output fenced at its end, the plain call's bits
             for &threads in threads_set {
                 let ctx = format!("{label} {} {rows}x{cols} dequant threads={threads}", f.name);
-                let (w, h) = run_dequant(f, &host, &t, rows, cols, threads);
+                let w = run_dequant(f, &host, &t, rows, cols, threads);
                 let mut wf = Fence::<f32>::new("w", rows * cols, Align::End);
-                let mut hf = Fence::<u16>::new("w16", rows * cols, Align::End);
                 wf.fill(poison_f32());
-                hf.fill(0xFFFF);
-                for (out, bf16) in [
-                    (wf.mut_ptr() as *mut u8, false),
-                    (hf.mut_ptr() as *mut u8, true),
-                ] {
-                    let code = unsafe {
-                        call_dequant(
-                            f,
-                            raw.ptr(),
-                            grid.ptr(),
-                            ks_ptr,
-                            rows,
-                            cols,
-                            out,
-                            bf16,
-                            threads,
-                        )
-                    };
-                    assert_eq!(code, OK, "{ctx} bf16={bf16}");
-                }
+                let code = unsafe {
+                    call_dequant(
+                        f,
+                        raw.ptr(),
+                        grid.ptr(),
+                        ks_ptr,
+                        rows,
+                        cols,
+                        wf.mut_ptr(),
+                        threads,
+                    )
+                };
+                assert_eq!(code, OK, "{ctx}");
                 wf.check_borders(&ctx);
-                hf.check_borders(&ctx);
                 assert_eq!(
                     bits(wf.as_slice()),
                     bits(&w),
-                    "{ctx}: fenced f32 differs from the plain call"
-                );
-                assert_eq!(
-                    hf.as_slice(),
-                    &h[..],
-                    "{ctx}: fenced bf16 differs from the plain call"
+                    "{ctx}: fenced differs from the plain call"
                 );
             }
         }

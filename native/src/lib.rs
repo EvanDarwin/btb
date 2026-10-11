@@ -429,26 +429,24 @@ latt_group!(btb_gemv_iq2s_group, gemv_iq2s_group_core);
 latt_group!(btb_gemv_iq1s_group, gemv_iq1s_group_core);
 latt_group!(btb_gemv_iq1m_group, gemv_iq1m_group_core);
 
-/// A type's whole `[rows, cols]` matrix decoded as its `_rows` matvec widens it, into `out`: f32, or with
-/// `bf16` each value rounded to the nearest bf16 (ties to even, as torch casts) and written as its bit pattern.
-/// A prefill's GEMM takes these weights in place of the type's matvec. Bit-identical for every `threads`.
+/// A type's whole `[rows, cols]` matrix decoded as its `_rows` matvec widens it, into `out` (f32). A prefill's
+/// GEMM takes these weights in place of the type's matvec. Bit-identical for every `threads`.
 macro_rules! quant_dequant {
     ($name:ident, $core:ident) => {
         /// A GGUF stored type's dequantization: see `quant_dequant!`.
         ///
         /// # Safety
         /// `raw` readable for the type's `rows * cols / block * block_bytes`, `out` writable for `rows * cols`
-        /// f32 (or u16 with `bf16`) and not overlapping `raw`.
+        /// f32 and not overlapping `raw`.
         #[no_mangle]
         pub unsafe extern "C" fn $name(
             raw: *const u8,
             rows: usize,
             cols: usize,
-            out: *mut u8,
-            bf16: bool,
+            out: *mut f32,
             threads: usize,
         ) -> i32 {
-            guard(|| unsafe { gemv::$core(raw, rows, cols, out, bf16, threads) })
+            guard(|| unsafe { gemv::$core(raw, rows, cols, out, threads) })
         }
     };
 }
@@ -471,18 +469,16 @@ macro_rules! latt_dequant {
         /// # Safety
         /// As `quant_dequant!`, with `grid` and (where read) `ksigns` valid for the type.
         #[no_mangle]
-        #[allow(clippy::too_many_arguments)]
         pub unsafe extern "C" fn $name(
             raw: *const u8,
             grid: *const i8,
             ksigns: *const u8,
             rows: usize,
             cols: usize,
-            out: *mut u8,
-            bf16: bool,
+            out: *mut f32,
             threads: usize,
         ) -> i32 {
-            guard(|| unsafe { gemv::$core(raw, grid, ksigns, rows, cols, out, bf16, threads) })
+            guard(|| unsafe { gemv::$core(raw, grid, ksigns, rows, cols, out, threads) })
         }
     };
 }

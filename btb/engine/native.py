@@ -429,16 +429,15 @@ class QuantGemv:
         self,
         fns: dict[Quant, Callable[[QuantWeight, torch.Tensor, torch.Tensor], None]],
         groups: dict[Quant, Callable[[Sequence[QuantWeight], Sequence[torch.Tensor], Sequence[torch.Tensor]], None]],
-        dequants: dict[Quant, Callable[[QuantWeight, torch.Tensor, int | None], None]],
+        dequants: dict[Quant, Callable[[QuantWeight, torch.Tensor], None]],
     ) -> None:
         self.fns = fns
         self.groups = groups
         self.dequants = dequants
 
-    def dequant(self, w: QuantWeight, out: torch.Tensor, threads: int | None = None) -> None:
-        """`out` ([rows, cols] float32, or bfloat16 rounded as torch casts) = `w` decoded as its gemv widens it, on
-        `threads` of the pool where given"""
-        self.dequants[w.q](w, out, threads)
+    def dequant(self, w: QuantWeight, out: torch.Tensor) -> None:
+        """`out` ([rows, cols] float32) = `w` decoded as its gemv widens it"""
+        self.dequants[w.q](w, out)
 
     def __contains__(self, q: object) -> bool:
         return q in self.fns
@@ -461,7 +460,7 @@ class QuantGemv:
         fns: dict[Quant, Callable[[QuantWeight, torch.Tensor, torch.Tensor], None]] = {}
         groups: dict[Quant, Callable[[Sequence[QuantWeight], Sequence[torch.Tensor], Sequence[torch.Tensor]], None]]
         groups = {}
-        dequants: dict[Quant, Callable[[QuantWeight, torch.Tensor, int | None], None]] = {}
+        dequants: dict[Quant, Callable[[QuantWeight, torch.Tensor], None]] = {}
         for q in stored_quants():
             sym, gsym = f"btb_gemv_{quant_key(q)}_rows", f"btb_gemv_{quant_key(q)}_group"
             if not hasattr(lib, sym):
@@ -471,21 +470,17 @@ class QuantGemv:
             if hasattr(lib, dsym):
                 d = getattr(lib, dsym)
                 d.restype = ctypes.c_int32
-                B = ctypes.c_bool
-                d.argtypes = [P, P, P, S, S, P, B, S] if latt else [P, S, S, P, B, S]
+                d.argtypes = [P, P, P, S, S, P, S] if latt else [P, S, S, P, S]
 
-                def run_dequant(
-                    w: QuantWeight, out: torch.Tensor, nt: int | None, d: Any = d, dsym: str = dsym
-                ) -> None:
-                    if out.shape != w.shape or out.dtype not in (torch.float32, torch.bfloat16):
+                def run_dequant(w: QuantWeight, out: torch.Tensor, d: Any = d, dsym: str = dsym) -> None:
+                    if out.shape != w.shape or out.dtype != torch.float32 or not out.is_contiguous():
                         raise ValueError(f"[native] {dsym}: out {tuple(out.shape)} {out.dtype} for {w.shape}")
-                    (rows, cols), raw, o, bf = w.shape, w.raw.data_ptr(), out.data_ptr(), out.dtype == torch.bfloat16
-                    nt = threads if nt is None else nt
+                    (rows, cols), raw, o = w.shape, w.raw.data_ptr(), out.data_ptr()
                     if w.grid is not None:
                         ks = 0 if w.ksigns is None else w.ksigns.data_ptr()
-                        rc = d(raw, w.grid.data_ptr(), ks, rows, cols, o, bf, nt)
+                        rc = d(raw, w.grid.data_ptr(), ks, rows, cols, o, threads)
                     else:
-                        rc = d(raw, rows, cols, o, bf, nt)
+                        rc = d(raw, rows, cols, o, threads)
                     if rc != 0:
                         raise NativeError(dsym, rc)
 
