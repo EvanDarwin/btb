@@ -29,6 +29,7 @@ from .state import P, R, _State
 if TYPE_CHECKING:
     from .branches import Batch
     from .model import StreamedTextModel
+    from .prefix import PrefixCache
 
 
 class GenerateStats(TypedDict, total=False):
@@ -705,6 +706,28 @@ class _TextMixin(_State):
         else:
             ids = self._reply_ids(cast("str | Messages", prompt), thinking, prefill)
         return Stream(self, ids, max_new, session, spans, sampling, **hooks)
+
+    def _prefix_cache(self) -> PrefixCache | None:
+        """the engine's prefix cache, made on its sessions' first use: every session's rows in one pool of pages,
+        a prompt opening on the longest prefix any conversation left (btb/engine/prefix.py). None where it serves
+        no session of this engine yet (`PrefixCache.why_not`): they keep contiguous caches of their own"""
+        if "_kv" not in self.__dict__:
+            from .holdings import Stage
+            from .prefix import PrefixCache
+
+            kv = PrefixCache(self) if PrefixCache.why_not(self) is None else None
+            self._kv = kv
+            holdings = getattr(self, "holdings", None)
+            if kv is not None and holdings is not None:
+                holdings.own(Stage.MEMORY, "the prefix cache's pages", kv.close)
+        return cast("PrefixCache | None", self.__dict__["_kv"])
+
+    def _decode_cache(self, max_len: int) -> Any:
+        """one sequence's cache for a decode no session lends one to: over the prefix cache's pool where the engine
+        has one - its attention reads pages as a session's does, nothing goes into the tree, and the pages go back
+        with the cache - else a contiguous one reaching `max_len`"""
+        pc = self._prefix_cache()
+        return pc.new() if pc is not None else self.new_cache(max_len=max_len)
 
     def session(self, ids: Tokens = ()) -> Session:
         """A sequence of this engine's to drive by hand - `feed`, `mark`, `rewind`, `fork`, `generate` - fed `ids`

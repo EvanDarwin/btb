@@ -59,12 +59,14 @@ class KeyRows:
     a speculative pass's node (the prefix - its window's worth under a window - its ancestors and itself) as the
     greedy step at its position reads them once its path is committed (`forward.py` `node_mask`), so its attention
     makes the step's own call (`families/attention.py` `attend_one`, gpt-oss's sinks). `idx` a long tensor on the
-    rows' device"""
+    rows' device; `pos` the node's position once committed (where given): the card's kernels walk its rows at the
+    positions the step will (`_card_attention`)"""
 
-    __slots__ = ("idx",)
+    __slots__ = ("idx", "pos")
 
-    def __init__(self, idx: torch.Tensor) -> None:
+    def __init__(self, idx: torch.Tensor, pos: int | None = None) -> None:
         self.idx = idx
+        self.pos = pos
 
 
 class RowLinear(torch.nn.Linear):

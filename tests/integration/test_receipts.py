@@ -54,23 +54,29 @@ def run(packed: bool, device: str = "cpu", cold: tuple[int, ...] = ()) -> tuple[
 
 
 def run_dense(tag: str, packed: bool, device: str = "cpu", cold: tuple[int, ...] = ()) -> tuple[float, bool, bool]:
-    """a dense family: the prompt's logits, the tree pass, the next step and every layer's K/V against the receipts"""
+    """a dense family: the prompt's logits, the tree pass, the next step and every layer's K/V against the receipts -
+    over a contiguous cache, and where the engine has a prefix cache over its pages too, the rows read back through
+    the table"""
     from btb.engine import pack_model
+    from btb.engine.cache import attention_rows
 
     fx = fixture(f"tiny_{tag}")
     fxp = os.path.join(FIXTURES, f"tiny_{tag}-pack12")
     if packed and not os.path.exists(fxp):
         pack_model(fx, log=NO_LOG)
     B = receipts(tag)["p12" if packed else "bf16"]
+    d: list[float] = []
     with torch.inference_mode():
         sm = host_model(fxp if packed else fx, device=device, packed=packed, cold_layers=cold)
-        cache = sm.new_cache()
-        lg0 = forward_logits(sm, PROMPT_DENSE, cache)[0, -1]
-        lg, _ = tree_pass(sm, cache)
-        nxt = tree_next(sm, cache)
-        d = [max_abs(lg0, B["prompt_logits"]), max_abs(lg, B["chunk_logits"]), max_abs(nxt, B["next"])]
-        for i in range(sm.L):
-            d.append(max_abs(cache.layers[i].keys, B["keys"][i][0]) + max_abs(cache.layers[i].values, B["keys"][i][1]))
+        pc = sm._prefix_cache()
+        for cache in [sm.new_cache(), *([pc.new()] if pc is not None else [])]:
+            lg0 = forward_logits(sm, PROMPT_DENSE, cache)[0, -1]
+            lg, _ = tree_pass(sm, cache)
+            nxt = tree_next(sm, cache)
+            d += [max_abs(lg0, B["prompt_logits"]), max_abs(lg, B["chunk_logits"]), max_abs(nxt, B["next"])]
+            for i in range(sm.L):
+                k, v = attention_rows(cache.layers[i])
+                d.append(max_abs(k, B["keys"][i][0]) + max_abs(v, B["keys"][i][1]))
         speculation(sm, tree_budget=0, tree_min_prob=0.0, ngram_p=0.0, tree_read="step")
         g = sm.generate_greedy(PROMPT_DENSE, 10)
         same = sm.generate_speculative(PROMPT_DENSE, 10, proposer="ngram", v_max=4)[0] == g

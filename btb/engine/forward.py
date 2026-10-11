@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -18,8 +18,9 @@ from ..options import Device
 from ..sampling import as_pick
 from .cache import GrowLayer, conv_states_as, forked
 from .device import where
-from .families.attention import ChunkCausal
+from .families.attention import CARD_ATTENTION, ChunkCausal
 from .fixed_rows import fixed_rows
+from .fused import DELTA_BLOCK
 from .native import Native
 from .scheduler import EPOCH, MemoryGrantError
 from .state import _State
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
     from transformers.cache_utils import DynamicCache
 
     from .device import Placement
+    from .paged import PagedLayer
 
 
 # a rope table (cos, sin) over a pass's positions
@@ -46,7 +48,11 @@ PREFILL_MIN_ROWS = 64
 
 def _kv_on_card(cache: Any, host: Any) -> int:
     """the bytes the resident layers' KV takes on the card in `cache` (each layer's whole buffer, as its growth was
-    granted), the host layers' passed over: their rows on the card are a prefill's hop, its own working set"""
+    granted), the host layers' passed over: their rows on the card are a prefill's hop, its own working set. A paged
+    cache's are the prefix cache's card arenas, every conversation's room there"""
+    if getattr(cache, "paged", False):
+        card = cache.prefix.pool.card
+        return card.nbytes() if card is not None else 0
     n = 0
     for i, cl in enumerate(cache.layers):
         if i in host:
@@ -267,6 +273,8 @@ class _ForwardMixin(_State):
         # the placement tiers this pass runs layers on, and its stored-weight path, recorded whatever branch
         # takes them below (the per-op MLX host path bypasses the fused forwards, so record here too)
         self._tag_tiers(n_layers)
+        self._tag_kv(cache)
+        self._bind_kv(cache, T)
         self._tag_quant()
         if (
             attention_mask is None
@@ -312,20 +320,38 @@ class _ForwardMixin(_State):
         else:
             text_pos, rope_pos = self._positions(B, T, past, am)
         n_layers = self.L if stop_after is None else min(self.L, int(stop_after))
+        # a caller's own positions for a chain's rows (a verify tree's, `ap`, are its depths, which the card reads): the
+        # card's own kernels rotate a chain at the cache's next positions from `past`, so a pass at others takes the
+        # torch layers, which rotate by them - a cold prompt at its own positions came out at `past + t`'s
+        odd = (
+            positions is not None
+            and getattr(self, "ap", None) is None
+            and not torch.equal(text_pos, torch.arange(past, past + T, device=text_pos.device).expand_as(text_pos))
+        )
         # a pass the card graph takes whole (every layer one resident run) needs none of the preamble below:
         # the graph carries its own rotary tables and its attention needs no mask, and the rotary and the
         # mask together cost more host time than the graph's replay on a small model
         # and only where the cache's rows sit in the graphs' arena, bound now if not: where the arena cannot take
-        # them, the torch layers read them where they are. Never a chunked prefill's chunk (`_batched_cont`): a
-        # prompt's rows are the torch layers' whatever its chunks - a chunk of 32 rows or fewer (a short last one,
-        # or chunks the free memory made that small) took the graph's kernels where a longer one and the
-        # layer-by-layer sweep took torch's, so the same prompt's cache parted by a bf16 step with how it was cut
+        # them, the torch layers read them where they are. Never a chunked prefill's chunk (`_batched_cont`): its
+        # chunks take the prefill's launches below whatever their width, as the layer-by-layer sweep's do - the
+        # graph's rows are the same bits, but a chunk's width picking the path is a fork no prompt needs
         graph_ok = (
-            not getattr(self, "_batched_cont", False)
+            not odd
+            and not getattr(self, "_batched_cont", False)
             and self._card_pass_ok(cache, B, T, past, am, on_layer, stop_after)
             and self._card_arena_holds(cache, T)
         )
-        if graph_ok and self._card_segment_at(0, n_layers) == (0, n_layers) and n_layers == self.L:
+        # a pass the graph does not take - a prompt, or a chunk of one, at any width and position, a hooked step or
+        # verify pass - runs the same kernels as they come where the card graph serves its layers
+        # (`_forward_card_prefill`): each row the row its step makes, so a prompt's rows are its steps' whatever its
+        # chunks, a cache hit decodes as the prompt cold, and a hooked verify pass's tree as its hooked steps
+        prefill_ok = (
+            not odd
+            and not graph_ok
+            and self._card_prefill_ok(cache, B, T, am, stop_after)
+            and self._card_arena_holds(cache, T)
+        )
+        if (graph_ok or prefill_ok) and self._card_segment_at(0, n_layers) == (0, n_layers) and n_layers == self.L:
             self._attn_ctx = cache
             pas = _Pass(
                 cache=cache,
@@ -341,19 +367,23 @@ class _ForwardMixin(_State):
                 own=own,
                 card_pass=False,
                 n_layers=n_layers,
-                on_layer=None,
+                on_layer=on_layer,  # the graph takes no hook (`_card_pass_ok`); the prefill's kernels hand it each layer
             )
             try:
                 with self.device.hold() as place:
                     pas.place = place
                     tail = head and self.head is not None and self.norm is not None
-                    hcard, logits = self._forward_card_segment(0, n_layers, h, pas, tail)
-            except RuntimeError as e:
+                    if graph_ok:
+                        hcard, logits = self._forward_card_segment(0, n_layers, h, pas, tail)
+                    else:
+                        hcard, logits = self._forward_card_prefill(0, n_layers, h, pas, tail, all_rows=not last_only)
+            except (RuntimeError, MemoryGrantError) as e:
                 if not self._is_card_oom(e):
                     raise
-                # the graph's build found no room (another program took the card): this pass on the torch path
+                # the graph's build (or the prefill's buffers) found no room - another program took the card, or the
+                # ledger refused them: this pass on the torch path, over the cache as the pass found it
                 self._card_oom(e)
-                graph_ok = False
+                graph_ok = prefill_ok = False
             else:
                 if logits is not None:
                     return logits[:, -1:] if last_only else logits
@@ -399,11 +429,16 @@ class _ForwardMixin(_State):
         if card_pass and cache is not None and past > 0:
             # every host layer's rows onto the card for the pass, granted together before any moves: refused (a
             # context the card has no room for - its rows kept in RAM, `kv_host`), the host layers run on the host
-            # this pass, over their rows where they are
-            try:
-                self._rows_to([cache], [i for i in self.host if i < n_layers], self.dev)
-            except MemoryGrantError:
+            # this pass, over their rows where they are. A paged cache's host layers' rows are the pool's, every
+            # conversation's: they stay, and the host layers run on the host over them (the layer-by-layer sweep
+            # hops them a layer at a time instead)
+            if getattr(cache, "paged", False):
                 card_pass = False
+            else:
+                try:
+                    self._rows_to([cache], [i for i in self.host if i < n_layers], self.dev)
+                except MemoryGrantError:
+                    card_pass = False
         if card_pass:
             self._tag(PassTag.PREFILL_CARD)  # the host layers prefill on the card for this pass
 
@@ -431,11 +466,12 @@ class _ForwardMixin(_State):
         # (the move and the cast), and holds the placement for the pass, so a shed asked for meanwhile waits.
         # A run of resident attention layers replays as one captured graph when the pass has the shape for it
         # (the one-token step, a verify pass); the head rides in the last run's graph when it ends the model
+        logits = None
         with self.device.hold() as place:
             pas.place = place
             i = 0
             while i < n_layers:
-                seg = self._card_segment_at(i, n_layers) if graph_ok else None
+                seg = self._card_segment_at(i, n_layers) if (graph_ok or prefill_ok) else None
                 if seg is None:
                     h = self.device.run_layer(i, h, pas)
                     i += 1
@@ -443,25 +479,32 @@ class _ForwardMixin(_State):
                 a, b = seg
                 tail = b == self.L and head and self.head is not None and self.norm is not None
                 try:
-                    hcard, logits = self._forward_card_segment(a, b, h, pas, tail)
-                except RuntimeError as e:
+                    if graph_ok:
+                        hcard, logits = self._forward_card_segment(a, b, h, pas, tail)
+                    else:
+                        hcard, logits = self._forward_card_prefill(a, b, h, pas, tail, all_rows=not last_only)
+                except (RuntimeError, MemoryGrantError) as e:
                     if not self._is_card_oom(e):
                         raise
-                    # no room for the run's graph (another program took the card): its layers on the torch path
+                    # no room for the run's graph or the prefill's buffers (another program took the card, or the
+                    # ledger refused them): its layers on the torch path
                     self._card_oom(e)
-                    graph_ok = False
+                    graph_ok = prefill_ok = False
                     continue
                 if logits is not None:
-                    self._flush_events()
-                    return logits[:, -1:] if last_only else logits
+                    break
                 assert hcard is not None  # logits None means the segment returned (h, None)
                 h = hcard
                 i = b
         self._flush_events()
         if card_pass and cache is not None:
+            # the host layers' rows back where they live, the pass's too - a pass whose last run carried the head
+            # as much as one that ends here
             for i in self.host:
                 if i < n_layers:
                     self._cache_to(cache, i, "cpu")
+        if logits is not None:
+            return logits[:, -1:] if last_only else logits
         if n_layers < self.L:
             return None
         h = self._norm_input(h)
@@ -592,7 +635,12 @@ class _ForwardMixin(_State):
         lt = self.layer_types[i]
         spec = getattr(self, "aq", False) and cache is not None and T > 1 and past > 0
         step1 = Native.delta_step is not None and cache is not None and T == 1 and past > 0 and am is None
-        cont = cache is not None and T > 1 and past > 0 and am is None and not pas.batched
+        # a prompt's later chunks (`pas.batched`) too, an attention layer's: its rows through the host's native
+        # attention as every pass past a cache's first rows reads them (a paged cache has no other reader, and a
+        # contiguous one takes the same so the two keep one set of bits); a linear layer's chunk through the module's
+        # chunked rule, and MLX's host layers as they were
+        chunk_ok = not pas.batched or (lt != LayerKind.LINEAR and self.mlx is None)
+        cont = cache is not None and T > 1 and past > 0 and am is None and chunk_ok
         # `ai` is the single-sequence host path (it also serves speculative decode, always one row); it stores
         # k/v as [1, heads, ...] and would merge a real batch into the head dim, so a batched decode takes the
         # standard module forward instead - which stores [B, heads, ...] as prefill does and is the streaming
@@ -628,51 +676,66 @@ class _ForwardMixin(_State):
 
     def _run_card_layer(self, i: int, tmpl: Any, h: torch.Tensor, pas: Any) -> torch.Tensor:
         """layer `i` on the card (or the compute device), `h` already there in the layer's dtype"""
+        lt = self.layer_types[i]
+        cache, T, past, am = pas.cache, pas.T, pas.past, pas.am
         if self.dev.type == Device.CUDA:
             # a card layer through the torch modules, not a captured card graph: btb's kernels are absent or the
             # family is not one they serve, so the pass runs like torch
             self._tag(PassTag.CUDA_TORCH_FALLBACK)
-        lt = self.layer_types[i]
-        cache, T, past, am = pas.cache, pas.T, pas.past, pas.am
+            if getattr(cache, "paged", False) and self._card_off_route(i):
+                # a layer the card's kernels serve, run through torch (the pass out of room on the card): its rows are
+                # not the ones a step makes, and the tree never shares them (`PagedCache.off_route`)
+                cache.off_route(past)
         if cache is not None and i < len(cache.layers):
             conv_states_as(cache.layers[i], h.dtype)  # a state left by the layer's run elsewhere, in its dtype here
         t0 = time.time()
         if self.dev.type == Device.CUDA:
             e0 = torch.cuda.Event(enable_timing=True)
             e0.record()
-        if (
-            getattr(self, "kv_host", False)
-            and cache is not None
-            # a sliding layer too: the one-row step (`_forward_fast`) runs every attention layer's rows through btb's
-            # native attention over its window, so a verify's must (`_kv_split` reads the window) - Gemma 3's sliding
-            # layers went through the module's sdpa here, and every verify row parted from its step
-            and lt in (LayerKind.FULL, LayerKind.SLIDING)
-            and i in self.resident
-            and am is None
-            and not pas.own
-            and self.fam.fast
-        ):
-            h = self._kv_split(tmpl, i, h, pas.pe, cache)
-        elif (
-            cache is not None
-            and T > 1
-            and past > 0
-            and am is None
-            and not pas.batched
-            and not pas.own
-            and (self.fam.fast or self.mlx is None)
-        ):
-            # a verify pass a row at a time, each row the greedy step's own call (a node's rows as `KeyRows` on the
-            # card, which gpt-oss's sinks take there too): through every module a row meets the step's shapes
-            h = self.ac(tmpl, i, h, pas.pe, pas.text_pos, cache)
-        else:
-            h = tmpl(
-                h,
-                position_embeddings=pe_for(pas.pe, lt),
-                past_key_values=cache,
-                use_cache=cache is not None,
-                **self.fam.layer_kw(lt, pas.causal, pas.linear_mask, pas.text_pos, pas.ple_ids),
-            )
+        # the module's attention on btb's kernels (`_card_attention`), a prompt's first rows too: a paged cache's rows
+        # through the card's row map, and a contiguous one's alike, so the two caches keep one set of bits
+        attending = CARD_ATTENTION.set(self if self.dev.type == Device.CUDA else None)
+        try:
+            if (
+                getattr(self, "kv_host", False)
+                and cache is not None
+                # a sliding layer too: the one-row step (`_forward_fast`) runs every attention layer's rows through
+                # btb's native attention over its window, so a verify's must (`_kv_split` reads the window) - Gemma
+                # 3's sliding layers went through the module's sdpa here, and every verify row parted from its step
+                and lt in (LayerKind.FULL, LayerKind.SLIDING)
+                and i in self.resident
+                and am is None
+                and not pas.own
+                and self.fam.fast
+            ):
+                h = self._kv_split(tmpl, i, h, pas.pe, cache)
+            elif (
+                cache is not None
+                and T > 1
+                and past > 0
+                and am is None
+                and not pas.batched
+                and not pas.own
+                and (self.fam.fast or self.mlx is None)
+                # a prompt continuing the cache takes its attention layers' rows in one call - btb's prefill kernel
+                # over every row before them (`_card_attention`) - as its later chunks do: a row at a time, a turn's
+                # prompt after a prefix the cache held ran as many passes through every layer as it had rows. A
+                # linear layer's, and a family's whose attention is its own module, keep the rows apart
+                and (bool(getattr(self, "aq", False)) or lt == LayerKind.LINEAR or not self.fam.fast)
+            ):
+                # a verify pass a row at a time, each row the greedy step's own call (a node's rows as `KeyRows` on
+                # the card, which gpt-oss's sinks take there too): through every module a row meets the step's shapes
+                h = self.ac(tmpl, i, h, pas.pe, pas.text_pos, cache)
+            else:
+                h = tmpl(
+                    h,
+                    position_embeddings=pe_for(pas.pe, lt),
+                    past_key_values=cache,
+                    use_cache=cache is not None,
+                    **self.fam.layer_kw(lt, pas.causal, pas.linear_mask, pas.text_pos, pas.ple_ids),
+                )
+        finally:
+            CARD_ATTENTION.reset(attending)
         if self.dev.type == Device.CUDA:
             e1 = torch.cuda.Event(enable_timing=True)
             e1.record()
@@ -900,6 +963,35 @@ class _ForwardMixin(_State):
                 per_key = 2 * Hq * d * nb
         return per_token, scores, per_key
 
+    def _bind_kv(self, cache: Any, T: int) -> None:
+        """A paged cache's conversation onto the card before a pass of `T` rows, its room made (`cache_room`): this
+        one's pages in RAM brought back - which the pass records (`KV_PARK`) - into free slots, or trading places with
+        the least recently used pages it does not read, and its `T` rows reserved, so nothing of the region grows
+        mid-pass; another conversation's pages stay on the card while there is room for both. A growth refused
+        though the room was made (another program took the card's memory since) gives up the cheapest thing the card
+        holds - the top layer first, its rows taken to the host's region - and asks again, as a presize does; a park
+        refused in RAM gives up the host's cheapest instead (a card layer shed for it would only add rows to RAM). With
+        `adapt` off the placement is pinned and the refusal stands. Nothing for a contiguous cache, or a pool with no
+        card. Every pass over a paged cache lets go of the row lists another conversation's pass left (`reading`)"""
+        if getattr(cache, "paged", False):
+            cache.prefix.reading(cache.table)
+        card = cache.prefix.pool.card if getattr(cache, "paged", False) else None
+        if card is None:
+            return
+        loaded = card.loaded
+        tried: set[str] = set()
+        while True:
+            try:
+                cache.bind(T)
+                break
+            except MemoryGrantError as e:
+                short = torch.device(e.device) if e.device is not None else self.dev
+                if not getattr(self, "adapt", True) or not self._give_up_one(short, 0, tried):
+                    self.device.refused()  # what was shed on the way grows back once there is room
+                    raise
+        if card.loaded > loaded:
+            self._tag(PassTag.KV_PARK)
+
     def _presize_kv(self, cache: Any, rows: int, B: int) -> None:
         """each resident attention layer's KV made `rows` long at once (`GrowLayer.presize`), granted from the epoch's
         room, before a layer-by-layer prefill cuts its working set: a cache growing mid-sweep would split it. The
@@ -1061,8 +1153,24 @@ class _ForwardMixin(_State):
         last_only: bool = True,
     ) -> Any:
         """`ids` into `cache` in chunks the free memory prices: the last row's logits, or every row's (the chunks'
-        joined) without `last_only`"""
+        joined) without `last_only`. A prompt past a step's rows lets the card's scratch go after it (its chunks'
+        buffers, a width no step takes): kept, they held the prompt's width for every step after - half a gigabyte
+        past a 70k-row prompt"""
         ids = self._ids(ids)
+        try:
+            return self._prefill_chunks(ids, cache, on_layer, attention_mask, last_only)
+        finally:
+            if self.dev.type == Device.CUDA and int(ids.shape[1]) > PREFILL_MIN_ROWS:
+                self.scratch.release("card", self.dev)
+
+    def _prefill_chunks(
+        self,
+        ids: torch.Tensor,
+        cache: Any,
+        on_layer: Any,
+        attention_mask: torch.Tensor | None,
+        last_only: bool,
+    ) -> Any:
         T = ids.shape[1]
         if cache is None or attention_mask is not None or getattr(self, "aq", False):
             return self.forward(ids, cache=cache, on_layer=on_layer, attention_mask=attention_mask, last_only=last_only)
@@ -1070,20 +1178,18 @@ class _ForwardMixin(_State):
         # drive's ring, a mixture's experts) is read once for the whole prompt instead of once per chunk (the
         # chunks of a 16k prompt read the 180B's experts 3.35 times over)
         sweep = on_layer is None and last_only and self.mlx is None and self.prefill_layers
-        # a hybrid's DeltaNet continues a chunk from the cache's states, but sums in float32 over blocks that split
-        # where its chunks do: chunks of a size the free memory picks would make the same prompt's bits depend on
-        # what else the machine holds. So the torch hybrid sweeps only chunks of the size `prefill_chunk` names, and
-        # otherwise takes its prompt whole, as it always has (the MLX path continues its chunks from the stored
-        # states)
-        whole_hybrid = (
-            LayerKind.LINEAR in self.layer_types
-            and not self.fam.own
-            and self.mlx is None
-            and not (sweep and self.prefill_chunk)
-        )
+        # a hybrid's DeltaNet continues a chunk from the cache's states and sums over blocks of DELTA_BLOCK rows from
+        # its start (`chunk_gated_delta_rule`): the chunks the free memory picks are whole blocks, so they cut where the
+        # blocks do and the prompt's bits are the prompt's taken whole, whatever else the machine holds (taken whole, a
+        # long prompt held its every row's activations at once). A size `prefill_chunk` names is taken as named
+        blocks = LayerKind.LINEAR in self.layer_types and not self.fam.own and self.mlx is None
+
+        def priced(C: int) -> int:
+            return max(DELTA_BLOCK, C // DELTA_BLOCK * DELTA_BLOCK) if blocks and not self.prefill_chunk else C
+
         past = int(cache.get_seq_length())
-        C = int(self.prefill_chunk or self._auto_chunk(past))
-        if T <= C or whole_hybrid:
+        C = int(self.prefill_chunk or priced(self._auto_chunk(past)))
+        if T <= C:
             return self.forward(ids, cache=cache, on_layer=on_layer, last_only=last_only)
         if sweep:
             if not self.prefill_chunk:
@@ -1092,7 +1198,7 @@ class _ForwardMixin(_State):
                 # - with everything else the sweep asks of the device beside it (`_sweep_bytes`)
                 room = self.prefill_room()
                 while C > PREFILL_MIN_ROWS and sum(self._sweep_bytes(C, past, ids.shape[0], T, cache)) > room:
-                    C //= 2
+                    C = priced(C // 2)
             return self._prefill_by_layer(ids, cache, C)
         self.log(f"[prefill] {T} tokens in chunks of {C} from position {past}")
         # a layer hook sees the last layer's rows for the whole prompt once, joined at the end, as it would from
@@ -1116,7 +1222,7 @@ class _ForwardMixin(_State):
             while True:
                 # each chunk priced at its own position: the keys it attends over grow with every chunk before it,
                 # and the room shrinks as the cache takes its share (a 32k-row turn sized once at its start swapped)
-                C = int(self.prefill_chunk or self._auto_chunk(past + a))
+                C = int(self.prefill_chunk or priced(self._auto_chunk(past + a)))
                 if C < 512 and not self.prefill_chunk:
                     self.log(
                         f"[prefill] memory-starved: {C} rows a chunk at position {past + a} "
@@ -1183,6 +1289,10 @@ class _ForwardMixin(_State):
         self.lend_policy()
         self.cache_room(cache, B, T)
         self._tag_tiers(self.L)
+        self._tag_kv(cache)
+        # a paged cache's prompt rows reserved in the card's region before the sweep cuts its working set: grown
+        # mid-sweep, the region's arenas would sit inside it
+        self._bind_kv(cache, T)
         self._tag_quant()
         self._attn_ctx = cache
         cd = self.compute_dtype
@@ -1306,6 +1416,8 @@ class _ForwardMixin(_State):
         kv_heads = int(getattr(self.cfg, "num_key_value_heads", None) or hq)
         head_dim = int(getattr(self.cfg, "head_dim", None) or self.cfg.hidden_size // hq)
         hop_buf: list[torch.Tensor | None] = [None]
+        # the host layer whose rows are in it now, until it lands: a sweep failing before then gives up its hop
+        hop_at: list[int] = []
 
         def hop_rows(dt: torch.dtype, b: int) -> torch.Tensor:
             """the sweep's one buffer for a host layer's rows on the card - keys and values, every row the prompt
@@ -1322,6 +1434,10 @@ class _ForwardMixin(_State):
         hs: list[torch.Tensor] = []
         frames: list[dict[str, Any]] = []
         scores_open = False
+        last_on_card = False  # the last layer ran the card graph's kernels (`_forward_card_prefill`)
+        # the chunks' buffers the passes take (`Scratch.take`) are the working set the sweep's reservation holds room
+        # for: they draw on it
+        self.scratch.draws = PREFILL
         try:
             if on_cuda:
                 # the allocator's cached blocks given back first, so what the ledger reads as free is memory the card
@@ -1365,12 +1481,20 @@ class _ForwardMixin(_State):
                     # the rows are allocated), and taken for the sweep where no epoch reserved any
                     self.device.reserve(EPOCH, growth, self.dev)
                     own_epoch = epoch == 0
-                if B == 1 and not forked(cache) and self._card_ready():
+                if (
+                    B == 1
+                    and not forked(cache)
+                    and self._card_ready(capture=False)
+                    and not getattr(cache, "paged", False)
+                ):
                     # the prompt's rows made once, in the card graphs' arena grown to the sequence's reach, where no
                     # other live cache holds it: the decode's graphs read them there with nothing moved (`presize`
                     # then passes the arena's layers over). Taken here, after the room is made - the growth priced
                     # above is these rows, and a layer shed for them frees nothing once the one arena is allocated -
-                    # and drawn from the epoch's room reserved for them. Refused, the layers keep rows of their own
+                    # and drawn from the epoch's room reserved for them. Refused, the layers keep rows of their own.
+                    # A paged cache's are the prefix cache's region's, reserved before the sweep (`_bind_kv`). Taken
+                    # while the card graph's capture waits out a refusal too (`_card_oom`): the arena is no graph, and
+                    # without it the layers ran through torch, other bits than the same prompt made a minute later
                     self._card_arena_take(cache, T)
                 self._presize_kv(cache, past0 + T, B)
                 if self.fam.moe and os.environ.get("BTB_PREFILL_DEPOT", "1") != "0":
@@ -1430,17 +1554,66 @@ class _ForwardMixin(_State):
                         lt = self.layer_types[i]
                         tl, es = time.perf_counter(), float(self.expert_stat.get("s", 0.0))
                         host = place.tier(i) in (LayerTier.HOST, LayerTier.COLD)
-                        tmpl = self._card_layer(i, proto) if (not host or any(card)) else None
+                        # a layer the card graph runs takes each chunk through its kernels, each row its step's
+                        # (`_forward_card_prefill`), where the arena or the card's region holds the conversation's rows
+                        # - reserved before the first layer, so nothing more is bound (`_card_arena_has`): a bind here
+                        # would take a refused arena from the cache holding it, at the length the cache has, short of
+                        # the prompt's rows
+                        graph_layer = (
+                            not host
+                            and self._card_prefill_ok(cache, B, T, None, None)
+                            and self._card_runs_layer(i)
+                            and self._card_arena_has(cache, past0 + T)
+                        )
+                        tmpl = self._card_layer(i, proto) if (not graph_layer and (not host or any(card))) else None
                         if ring and i in self.cold:
                             self._cold_wait(i)
                             self._cold_held = i
                         hopped = False  # a host layer's rows on the card, in the sweep's one buffer for them
+                        last_on_card = graph_layer
                         for c in range(len(spans)):
                             h = hs[c]
+                            if graph_layer:
+                                f, (ca, cb) = frames[c], spans[c]
+                                pas = _Pass(
+                                    cache=cache,
+                                    pe=None,
+                                    text_pos=f["text_pos"],
+                                    causal=None,
+                                    linear_mask=None,
+                                    ple_ids=None,
+                                    T=cb - ca,
+                                    past=f["past"],
+                                    am=None,
+                                    batched=True,
+                                    own=own,
+                                    card_pass=True,
+                                    n_layers=self.L,
+                                    on_layer=None,
+                                )
+                                pas.place = place
+                                try:
+                                    hcard, _ = self._forward_card_prefill(i, i + 1, h, pas, False, bind_rows=0)
+                                except (RuntimeError, MemoryGrantError) as e:
+                                    if not self._is_card_oom(e):
+                                        raise
+                                    # no room for the chunk's buffers: the layer's chunks from this one on the torch
+                                    # layer over the rows the ones before wrote. The layers after it try the card's
+                                    # kernels again (they take no graph's room); a refusal there again is the same
+                                    # one, inside the window this one opened (`_card_oom`)
+                                    self._card_oom(e)
+                                    graph_layer = last_on_card = False
+                                    tmpl = self._card_layer(i, proto)
+                                else:
+                                    assert hcard is not None  # a run without the tail hands its rows back
+                                    # into the sweep's own buffer: the prefill's comes back for the next chunk's rows
+                                    hs[c] = keep(c, hcard)
+                                    continue
                             if host and not card[c]:
                                 if hopped:
                                     cache.layers[i].land(where(Device.CPU), self.host_kv_dtype())
                                     hopped = False
+                                    hop_at.clear()
                                 if h.device.type != "cpu" or h.dtype != torch.float32:
                                     # widened on the host, where the host chunk's share was asked for it
                                     h = h.detach().cpu().float()
@@ -1453,7 +1626,11 @@ class _ForwardMixin(_State):
                             if h.device != self.dev or (wd is not None and h.dtype != wd):
                                 h = h.to(self.dev, wd) if wd is not None else h.to(self.dev)
                             cl = cache.layers[i] if host else None
-                            if isinstance(cl, GrowLayer) and not cl.shared:
+                            # a paged host layer's rows hop as a contiguous one's do: the conversation's rows of the
+                            # layer gathered into the sweep's buffer, the chunks' own put back into its pages at land
+                            if cl is not None and (
+                                (isinstance(cl, GrowLayer) and not cl.shared) or getattr(cl, "paged", False)
+                            ):
                                 if not hopped:
                                     # the layer's rows onto the card once for all its card chunks, into one buffer
                                     # the sweep keeps for every host layer in turn (`_hop_bytes`, in the prefill's
@@ -1464,6 +1641,7 @@ class _ForwardMixin(_State):
                                     kv = hop_rows(h.dtype, h.shape[0])
                                     cl.hop(kv[0], kv[1])
                                     hopped = True
+                                    hop_at[:] = [i]
                             elif host and frames[c]["past"] > 0:
                                 self._cache_to(cache, i, self.dev)
                             pas = chunk_pass(c, i, lt, True, h)
@@ -1486,6 +1664,7 @@ class _ForwardMixin(_State):
                             # back on the host in its own dtype, as long as its growth is priced: the answer's
                             # first token appends in place (GrowLayer.land)
                             cache.layers[i].land(where(Device.CPU), self.host_kv_dtype())
+                            hop_at.clear()
                         if self._cold_held is not None:
                             self._cold_held = None
                             self._cold_release(i)
@@ -1550,7 +1729,15 @@ class _ForwardMixin(_State):
                 self._sweep_keep = self._sweep_ahead = False
                 if store is not None:
                     store.sweep_end()
+            for j in hop_at:
+                # a paged layer hopped when the sweep failed: its rows read and written in the host's region again,
+                # the buffer let go with the sweep's - left, its every later pass appended into the dead buffer and
+                # was refused. A contiguous one's rows are the buffer's: its next append moves them (`GrowLayer`)
+                cl = cache.layers[j]
+                if getattr(cl, "paged", False):
+                    cast("PagedLayer", cl).unhop()
             hop_buf[0] = None
+            self.scratch.draws = None
             self.device.release(PREFILL)
             if own_epoch:
                 self.device.release(EPOCH)
@@ -1564,6 +1751,12 @@ class _ForwardMixin(_State):
             if depot is not None:
                 depot.close()
         self._flush_events()
+        if last_on_card:
+            # the last layer ran the card graph's kernels: its norm and head too, as the graph's tail makes a step's
+            # logits (the run ends the model where the card graph runs its last layer)
+            logits = self._card_tail(last)
+            if logits is not None:
+                return logits
         h = self._norm_input(last)
         h = self._final_norm(h)
         return self._apply_head(h.to(cd if cd is not None else h.dtype))
@@ -1577,7 +1770,12 @@ class _ForwardMixin(_State):
         vf: torch.Tensor,
         past: int,
         scale: float,
+        rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """a prompt chunk's attention on the card over its rows kept in RAM: the prefix staged onto the card a block
+        at a time through pinned buffers, each block's softmax folded into the last, then the chunk's own rows.
+        `rows`: a paged layer's, the prefix's rows in its host region (`kf`/`vf` the region), gathered into the
+        stage block by block"""
         B, Hq, T, d = q.shape
         Hk = k.shape[1]
         g = Hq // Hk
@@ -1622,8 +1820,12 @@ class _ForwardMixin(_State):
                     st[2].synchronize()
                 sk = st[0][: B * Hk * n * d].view(B, Hk, n, d)
                 sv = st[1][: B * Hk * n * d].view(B, Hk, n, d)
-                sk.copy_(kf[:, :, a : a + n])
-                sv.copy_(vf[:, :, a : a + n])
+                if rows is not None:
+                    torch.index_select(kf[0], 1, rows[a : a + n], out=sk[0])
+                    torch.index_select(vf[0], 1, rows[a : a + n], out=sv[0])
+                else:
+                    sk.copy_(kf[:, :, a : a + n])
+                    sv.copy_(vf[:, :, a : a + n])
                 kb = sk.to(self.dev, non_blocking=True)
                 vb = sv.to(self.dev, non_blocking=True)
                 ev = torch.cuda.Event()
@@ -1638,11 +1840,21 @@ class _ForwardMixin(_State):
         fold(o, l)
         return acc.to(q.dtype)
 
+    def _drop_kv_stage(self) -> None:
+        """the pinned buffers `_attn_card_blocks` stages the rows through, let go with the engine: kept from one
+        prompt chunk to the next, they were held past its close"""
+        self._kv_stage = None
+
     def _kv_split(self, tmpl: Any, i: int, h: torch.Tensor, pe: PassRope, cache: Any) -> torch.Tensor:
         apply_rotary_pos_emb = self._rope_fn()  # the one-row step's own (its graph rotates with it)
         B, T, _ = h.shape
         cl = cache.layers[i]
-        past = cl.keys.shape[-2] if getattr(cl, "keys", None) is not None and cl.keys.numel() else 0
+        # a paged layer's rows are the host's region's, read through the conversation's row map
+        paged = bool(getattr(cl, "paged", False))
+        if paged:
+            past = cl.get_seq_length()
+        else:
+            past = cl.keys.shape[-2] if getattr(cl, "keys", None) is not None and cl.keys.numel() else 0
         lt = self.layer_types[i]
         win = layer_window(self.cfg, lt)
         rope = pe_for(pe, lt)
@@ -1673,18 +1885,16 @@ class _ForwardMixin(_State):
         q, k = apply_rotary_pos_emb(q.transpose(1, 2), k.transpose(1, 2), rope[0], rope[1])
         v = v.transpose(1, 2)
         kc, vc = k.cpu(), v.cpu()
-        kf, vf = cache.update(kc, vc, i)
+        kf, vf = cl.append(kc, vc) if paged else cache.update(kc, vc, i)
         probe = getattr(self, "_probe", None)
         if probe is not None:
-            probe(i, q, kf, vf, at.scaling)
+            probe(i, q, *(cl.gather() if paged else (kf, vf)), at.scaling)
         parents: Any = getattr(self, "ap", None) if getattr(self, "aq", False) else None
         tree = parents is not None and any(parents[j] != j - 1 for j in range(T))
         # a one-row step, or a verify pass (between `aa` and `ab`) whose rows must be the steps' own; a prefill's rows
         # need no step's bits (plain and speculative decodes prefill alike) and keep the card's blocks
-        native = (
-            (T == 1 or bool(getattr(self, "aq", False)))
-            and B == 1
-            and Native.attn_decode is not None
+        fits = (
+            B == 1
             and kf.device.type == "cpu"
             and kf.dtype in (torch.bfloat16, torch.float32)
             and vf.dtype == kf.dtype
@@ -1693,7 +1903,33 @@ class _ForwardMixin(_State):
             and vf.stride(-1) == 1
             and vf.stride(-2) == vf.shape[-1]
         )
-        if native:
+        native = (T == 1 or bool(getattr(self, "aq", False))) and fits and Native.attn_decode is not None
+        by_row = native or tree or bool(win) or q.device.type != "cuda"
+        if (
+            by_row
+            and (paged or not native)
+            and fits
+            and Native.attn_spans is not None
+            and Native.attn_nodes is not None
+        ):
+            # the rows by row, each over the keys its step reads in the order it reads them: a chain's rows each a
+            # span of one map (`attn_spans`), a tree's each a list of its own (`attn_nodes`) - `attn_decode`'s bits
+            # row for row. A paged layer's through the conversation's map; a contiguous one's prompt chunk under a
+            # window alike, so the two caches keep one set of bits
+            qf = q[0].transpose(0, 1).float().cpu().contiguous()  # [T, hq, d]
+            out = torch.empty(qf.shape, dtype=torch.float32)
+            if tree:
+                offs, idx = self._node_lists(cache if paged else None, past, T, parents, win)
+                Native.attn_nodes(qf, kf[0], vf[0], offs, idx, float(at.scaling), out)
+            else:
+                amap, starts, ends = self._span_lists(cache if paged else None, past, T, win)
+                Native.attn_spans(qf, kf[0], vf[0], amap, starts, ends, float(at.scaling), out)
+            attn = out.view(1, T, qf.shape[1], qf.shape[2])
+        elif paged:
+            # a prompt's chunk on the card over the prefix staged from the host's region through the map
+            prefix_rows = cl.table.rows()[:past]
+            attn = self._attn_card_blocks(q, k, v, kf, vf, past, at.scaling, rows=prefix_rows).transpose(1, 2)
+        elif native:
             # every row as a one-row step computes it: btb's kernel over the row's own keys in order - the prefix (its
             # last `win` under a window), then its ancestors (the chain before it), then itself - so a verify pass
             # gives each row the bits of the steps along its path and a speculative decode is the plain loop's (the

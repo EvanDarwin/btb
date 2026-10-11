@@ -4,6 +4,7 @@ modules run through, and gpt-oss's sinks (`btb_sinks`, gpt_oss/sinks.py)."""
 
 from __future__ import annotations
 
+import contextvars
 from typing import Any
 
 import torch
@@ -11,6 +12,11 @@ import torch.nn.functional as F
 
 from ..fixed_rows import KeyRows
 from .gpt_oss.sinks import attention_sinks
+
+# the engine whose card layer's module attends now (`_run_card_layer`): its attention runs on btb's kernels
+# (`_card_attention`), a prompt's first rows too - a paged layer's rows through the card's row map, a contiguous one's
+# where they lie, one set of bits for the two
+CARD_ATTENTION: contextvars.ContextVar[Any] = contextvars.ContextVar("btb_card_attention", default=None)
 
 
 class ChunkCausal:
@@ -154,6 +160,19 @@ def attention(
     is_causal: bool | None = None,
     **kw: Any,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    from ..paged import PagedError, PagedKV
+
+    paged = isinstance(key, PagedKV)
+    sm = CARD_ATTENTION.get()
+    if (paged or sm is not None) and query.device.type == "cuda" and dropout == 0.0 and not kw.get("softcap"):
+        out = sm._card_attention(module, query, key, value, attention_mask, scaling) if sm is not None else None
+        if out is not None:
+            return out, None
+    if paged:
+        raise PagedError(
+            f"layer {getattr(module, 'layer_idx', '?')}: a paged card layer's rows reached an attention that cannot "
+            "read them through the card's row map"
+        )
     if query.device.type != "cuda":
         from transformers.integrations.sdpa_attention import sdpa_attention_forward
 

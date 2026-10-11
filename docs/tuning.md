@@ -63,10 +63,10 @@ window; past the model's own window btb applies YaRN automatically.
   chunks (a 16k prompt on the 180B: a third of the reads, 528 s to 288 s). Same bits as the chunks one at a time;
   `BTB_PREFILL_LAYERS=0` and `BTB_PREFILL_DEPOT=0` turn the two halves off. `btb.load(..., prefill_chunk=N)`
   fixes the rows a prefill takes at once; unset (the default), the free memory prices the chunk. A hybrid
-  (Qwen3.5's DeltaNet) sums over blocks that split where its chunks do, so it sweeps only chunks `prefill_chunk`
-  names and otherwise takes a long prompt whole: its bits never depend on the machine's free memory. Qwen4's
-  DeltaNet splits the same way, but its long prompts are too big to take whole, so it sweeps chunks the free memory
-  prices: set `prefill_chunk` for bits that are the same run to run.
+  (Qwen3.5's DeltaNet) sums over 64-row blocks, a block at a time: the chunks the free memory prices are whole
+  blocks, so they cut where its blocks do, and its bits never depend on the machine's free memory (or its thread
+  count). Qwen4's DeltaNet splits where its chunks do, so it sweeps chunks the free memory prices: set
+  `prefill_chunk` for bits that are the same run to run.
 - `--sparse 1` (Qwen4): the sparse attention scores every row's blocks in one pass - opt-in, since a near-tie may
   keep a different block than the reference's indexer.
 - `btb pack` writes a lossless [12-bit copy](./pack-12.md) at 0.75× the bytes, so more experts stay cached and

@@ -8,7 +8,7 @@ import importlib
 from typing import TYPE_CHECKING, Any, Self
 
 from ....kinds import FamilyKind
-from ...fused import _fuse_norm_cls, fast_causal_conv1d
+from ...fused import _fuse_norm_cls, chunk_gated_delta_rule, fast_causal_conv1d
 from ..base import Family, _flags
 from .drafter import Qwen35Drafter
 
@@ -38,6 +38,9 @@ class Qwen35Family(Family):
         )
 
     def prepare(self, sm: _State) -> None:
+        # the DeltaNet's chunked rule a block at a time (`chunk_gated_delta_rule`): a prompt's bits whatever its chunks
+        # where they cut at its blocks, and whatever the thread count
+        self.mod.torch_chunk_gated_delta_rule = chunk_gated_delta_rule
         if sm.mlx is not None:
             # the DeltaNet's convolution as shifted multiply-adds, not F.conv1d at its cost on the CPU build
             self.mod.causal_conv1d_fn = fast_causal_conv1d

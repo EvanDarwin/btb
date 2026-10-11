@@ -153,6 +153,18 @@ _WANTS: dict[str, tuple[str, Callable[..., dict[str, Want]]]] = {
             "out": (out, (_F32,)),
         },
     ),
+    "attn_spans": (
+        "btb_attn_spans",
+        lambda q, k, v, rows, starts, ends, scale, out: {
+            "q": (q, (_F32,)),
+            "k": (k, (_BF16, _F32)),
+            "v": (v, (k.dtype,)),
+            "rows": (rows, (_I32,)),
+            "starts": (starts, (_I32,)),
+            "ends": (ends, (_I32,)),
+            "out": (out, (_F32,)),
+        },
+    ),
 }
 
 
@@ -209,6 +221,7 @@ class Native(metaclass=_Binding):
         "gemv_fp8_group",
         "attn_decode",
         "attn_nodes",
+        "attn_spans",
         "delta_step",
         "sample_pick",
         "read_direct",
@@ -230,6 +243,7 @@ class Native(metaclass=_Binding):
     gemv_fp8_group: Any
     attn_decode: Any
     attn_nodes: Any
+    attn_spans: Any
     delta_step: Any
     sample_pick: Any
     read_direct: Any
@@ -759,6 +773,57 @@ class Native(metaclass=_Binding):
                     raise NativeError("btb_attn_nodes", rc)
 
             cls.attn_nodes = attn_nodes
+        cls.attn_spans = None
+        if hasattr(lib, "btb_attn_spans_bf16") and hasattr(lib, "btb_attn_spans_f32"):
+            P = ctypes.c_void_p
+            S = ctypes.c_size_t
+            sfns = {}
+            for name, dt in (("btb_attn_spans_bf16", torch.bfloat16), ("btb_attn_spans_f32", torch.float32)):
+                fn = getattr(lib, name)
+                fn.restype = ctypes.c_int32
+                fn.argtypes = [P, P, P, P, S, P, P, S, S, S, S, S, S, S, ctypes.c_float, P, S]
+                sfns[dt] = fn
+
+            def attn_spans(
+                q: torch.Tensor,
+                k: torch.Tensor,
+                v: torch.Tensor,
+                rows: torch.Tensor,
+                starts: torch.Tensor,
+                ends: torch.Tensor,
+                scale: float,
+                out: torch.Tensor,
+            ) -> None:
+                """`attn_nodes` with every query's rows a span of one map: `q` and `out` [T, hq, d] float32,
+                `k`/`v` [hk, n_rows, d] as `attn_decode` takes them, `rows` the map and `starts`/`ends` [T] int32,
+                query t attending the rows `rows[starts[t]:ends[t]]` in map order. The spans may overlap (a chunk's
+                rows each over the rows before them), and row t is `attn_nodes` over that span as a list, bit for
+                bit"""
+                fn = sfns[k.dtype]
+                hk, n_rows, d = k.shape
+                rc = fn(
+                    q.data_ptr(),
+                    k.data_ptr(),
+                    v.data_ptr(),
+                    rows.data_ptr(),
+                    rows.shape[0],
+                    starts.data_ptr(),
+                    ends.data_ptr(),
+                    starts.shape[0],
+                    n_rows,
+                    q.shape[1],
+                    hk,
+                    d,
+                    k.stride(0),
+                    v.stride(0),
+                    float(scale),
+                    out.data_ptr(),
+                    threads,
+                )
+                if rc != 0:
+                    raise NativeError("btb_attn_spans", rc)
+
+            cls.attn_spans = attn_spans
         if checked:
             for name in _WANTS:
                 bound = getattr(cls, name)
@@ -849,27 +914,35 @@ class _Cuda:
         "btb_gemv_mma8_bf16",
         "btb_gemv_mma_glu_silu",
         "btb_gemv_mma_glu_gelu",
+        # a prompt's matmuls in the step's bits (btb_gemm.cuh): one for each matvec the warm-up may pick
+        "btb_gemm_mma_bf16",
+        "btb_gemm_mma_small_bf16",
+        "btb_gemm_f32_bf16",
         "btb_l2_warm",
-        "btb_attn_split_d64",
-        "btb_attn_split_d128",
-        "btb_attn_split_d256",
-        "btb_attn_split_gqa2_d64",
-        "btb_attn_split_gqa2_d128",
-        "btb_attn_split_gqa2_d256",
-        "btb_attn_split_gqa4_d64",
-        "btb_attn_split_gqa4_d128",
-        "btb_attn_split_gqa4_d256",
-        "btb_attn_split_gqa8_d64",
-        "btb_attn_split_gqa8_d128",
         "btb_norm_rope_kv_d64",
         "btb_norm_rope_kv_d128",
         "btb_norm_rope_kv_d256",
-        "btb_attn_rows_d64",
-        "btb_attn_rows_d128",
-        "btb_attn_rows_d256",
         "btb_norm_rope_kv_rows_d64",
         "btb_norm_rope_kv_rows_d128",
         "btb_norm_rope_kv_rows_d256",
+        # the write through a cache's row map: a paged cache's rows wherever their pages lie
+        "btb_norm_rope_kv_tbl_d64",
+        "btb_norm_rope_kv_tbl_d128",
+        "btb_norm_rope_kv_tbl_d256",
+        # the one attention of every pass (btb_attn_flash.cuh): a row's bits its own, a prompt's rows its steps'
+        "btb_attn_flash_d64",
+        "btb_attn_flash_d128",
+        "btb_attn_flash_d256",
+        "btb_attn_flash_rows_d64",
+        "btb_attn_flash_rows_d128",
+        "btb_attn_flash_rows_d256",
+        "btb_attn_flash_prefill_d64",
+        "btb_attn_flash_prefill_d128",
+        "btb_attn_flash_prefill_d256",
+        "btb_attn_flash_prefill_kq_d64",
+        "btb_attn_flash_prefill_kq_d128",
+        "btb_attn_flash_prefill_kq_d256",
+        "btb_mma_roles",
         "btb_add_rmsnorm",
         "btb_sandwich_add",
         "btb_silu_mul",
@@ -966,6 +1039,62 @@ class _Cuda:
         self._call("cuCtxGetDevice", ctypes.byref(dev))
         self.device = int(dev.value)
         self.sms = self.attr(16)  # CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT
+        # the one attention's prefill form takes its block's shared memory dynamically, past the 48 KB a launch may
+        # take without the kernel's ceiling raised to it
+        for d in (64, 128, 256):
+            for kq in (False, True):
+                self.smem_ceiling(self.flash_prefill_kernel(d, kq), self.flash_prefill_smem(d, kq))
+        # the prefill's rows-as-M form gives the decode form's bits only where a tensor-core output element is its own
+        # whatever operand holds which factor and wherever in the tile it sits: checked on this card, once
+        # (`btb_mma_roles`); where it fails, the decode form's own orientation serves the prefill
+        self.mma_roles = self._mma_roles_hold()
+
+    def _mma_roles_hold(self) -> bool:
+        """whether this card's mma passes `btb_mma_roles` (2048 trials, each D = A B + C against its transpose with
+        the operands' roles swapped, the transposed rows at the top of the tile and at the bottom): every bit alike"""
+        bad = ctypes.c_uint64()
+        self._call("cuMemAlloc_v2", ctypes.byref(bad), ctypes.c_size_t(4))
+        try:
+            self._call("cuMemsetD32_v2", bad, ctypes.c_uint(0), ctypes.c_size_t(1))
+            self.launch("btb_mma_roles", (256, 1, 1), (256, 1, 1), [ctypes.c_void_p(bad.value)])
+            torch.cuda.synchronize()
+            n = ctypes.c_int()
+            self._call("cuMemcpyDtoH_v2", ctypes.byref(n), bad, ctypes.c_size_t(4))
+        finally:
+            self._call("cuMemFree_v2", bad)
+        return n.value == 0
+
+    def flash_prefill_kernel(self, D: int, kq: bool | None = None) -> str:
+        """the one attention's prefill kernel at head width D: the rows the mma's M where this card's tensor cores
+        pass `btb_mma_roles`, else (or `kq`) the decode form's orientation - the same launch either way but for
+        `flash_prefill_smem`"""
+        if kq is None:
+            kq = not self.mma_roles
+        return f"btb_attn_flash_prefill_{'kq_' if kq else ''}d{D}"
+
+    def flash_prefill_smem(self, D: int, kq: bool | None = None) -> int:
+        """the shared memory, bytes, a block of the prefill kernel `flash_prefill_kernel(D, kq)` takes (btb_attn_flash.cuh):
+        a key tile's K and V rows - unpadded where the rows are the mma's M (`FaRmSmem`, with the warp pairs' traded
+        scores at the widest head), V's padded in the decode form's orientation (`FaPfSmem`)"""
+        if kq is None:
+            kq = not self.mma_roles
+        bn = 32 if D >= 256 else 64
+        if kq:
+            return bn * D * 2 + bn * (D + 8) * 2
+        spl = 2 if D >= 256 else 1
+        trade = 4 * (bn // 8 // spl * 4) * 32 * 4 if spl > 1 else 0  # four warps' traded scores
+        return 2 * bn * D * 2 + trade
+
+    @staticmethod
+    def flash_prefill_rows(D: int) -> int:
+        """the rows a block of the one attention's prefill form takes, either orientation (FaPick: four warps, 16 rows
+        to SPL of them, or NR row tiles of 8 a warp): a token's G heads must fit in them"""
+        return 32 if D >= 256 else 64
+
+    def smem_ceiling(self, name: str, nbytes: int) -> None:
+        """kernel `name` may be launched with up to `nbytes` of dynamic shared memory
+        (CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES)"""
+        self._call("cuFuncSetAttribute", self.fn[name], ctypes.c_int(8), ctypes.c_int(int(nbytes)))
 
     def _call(self, name: str, *args: Any) -> None:
         f = getattr(self.lib, name)
@@ -1623,13 +1752,13 @@ class _Cuda:
     QSA_THREADS = 512  # btb_qsa_select's block (QSA_THREADS in btb_kernels.cu)
     QSA_MAX_FLIGHT = 33  # blocks a node pools in flight (QSA_MAX_FLIGHT): 32 // ratio + 1 at T <= 32
     WALK_MAX_T = 32  # the rows an ancestor walk follows (the kernels' anc[32])
-    ATTN_SPLIT = 1024  # keys a split of the attention walks (ATTN_SPLIT in btb_kernels.cu)
+    QSA_SPLIT = 1024  # a node's list keys a split of its attention walks (QSA_SPLIT in btb_kernels.cu)
     _SMEM = 48 * 1024  # the shared memory a block gets without opting in
 
     @classmethod
     def qsa_splits(cls, ratio: int, k_top: int) -> int:
         """the splits of `btb_qsa_attn_split`'s grid: a node's list holds at most k_top * ratio + ratio - 1 keys"""
-        return ((int(k_top) + 1) * int(ratio) + cls.ATTN_SPLIT - 1) // cls.ATTN_SPLIT
+        return ((int(k_top) + 1) * int(ratio) + cls.QSA_SPLIT - 1) // cls.QSA_SPLIT
 
     @staticmethod
     def _qsa_keys(
@@ -1807,9 +1936,9 @@ class _Cuda:
         """The attention of a pass's T nodes over their QSA picks (`btb_qsa_attn_split_d{128,256}`): `q` [T, Hq, D]
         bf16 over `K`/`V` [Hk, cap, D] bf16, node t's keys its picked blocks (`sel`/`nsel` from `qsa_select`, blocks
         of `ratio` positions) then its partial tail, into `out` [T, Hq, D] (padding rows, par -2, left as they are).
-        `n0` [1] and `par` [T] int32 the tree as `btb_attn_split` walks it. The splits' states: `part_m`/`part_l`
-        [S * T * Hq] and `part_acc` [S * T * Hq * D] float32, `cnt` [T * Hq] int32 (zero; the kernel leaves it zero),
-        S = `qsa_splits(ratio, k_top)`."""
+        `n0` [1] and `par` [T] int32 the pass's tree (node u at slot n0 + u, parented to par[u]). The splits' states:
+        `part_m`/`part_l` [S * T * Hq] and `part_acc` [S * T * Hq * D] float32, `cnt` [T * Hq] int32 (zero; the kernel
+        leaves it zero), S = `qsa_splits(ratio, k_top)`."""
         self._want("qsa_attn_split", torch.bfloat16, q=q, out=out)
         self._want_kv_rows("qsa_attn_split", K, V)
         self._want("qsa_attn_split", torch.int32, n0=n0, par=par, sel=sel, nsel=nsel, cnt=cnt)
@@ -1869,7 +1998,6 @@ class _Cuda:
                 P(part_l),
                 P(part_acc),
                 P(cnt),
-                ci(S),
             ],
         )
 

@@ -59,7 +59,19 @@ with session._txn(eng) as t:  # the rollback point: len(ids), the state, recurre
   `m`, not to the call's start: the rows past `m` are overwritten by the new prompt's, and keeping both would cost a
   copy of the tail. The state at `m` is `Pending` on the token at `m - 1` (a dense cache crops to it; a hybrid
   restores the anchor it opened from). This is the one place a failure leaves the session shorter than it was, and
-  it is shorter by exactly what the call was replacing.
+  it is shorter by exactly what the call was replacing. Where the engine's prefix cache serves it
+  (btb/engine/prefix.py), the rows past `m` are not overwritten but stay in the engine's tree, which every commit
+  adds the session's tokens to: the prompt opens on the longest prefix any conversation left there, read in place.
+  On a card, the rows of the layers it runs lie in its reserved room for the conversation it is decoding; a pass
+  over another conversation leaves the first one's pages there until their room is wanted, then parks them in
+  pinned RAM, least recently used first, and its next turn brings them back. A hybrid's recurrent states resume
+  only where a snapshot of them was kept: its prefill is cut at block ends (64 rows, where the DeltaNet's chunked
+  rule cuts its blocks, so a cut there leaves the bits as they were), and it keeps the states at the last block end
+  before the prompt's last token and the last before where the next turn's re-rendering parts from it. The tree keeps
+  each snapshot at a node's end. A prompt opens at the deepest snapshot the tree holds within it and prefills the rest
+  as the cold prompt's later chunk. It never goes on from where a decode left the states, whose steps sum otherwise:
+  a turn prefills the previous answer again, and a hit decodes as the prompt cold. The snapshots are kept in RAM,
+  and a card layer's states are restored onto the card.
 * **Every public mutator is a transaction:** `feed`, `sync`, `rewind`, `crop`, `generate(session=...)`, and a
   fork's or batch's write-back. `_open`/`_keep`/`_abandon`/`_whole`/`_back_to`/`_undo`/`_held` go away; `_open`
   becomes "the rollback point this prompt keeps", `_keep` becomes `commit`.

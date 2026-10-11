@@ -6,6 +6,7 @@ same path. Needs a CUDA card and the built fatbin; skipped otherwise."""
 from __future__ import annotations
 
 import ctypes
+import itertools
 import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
@@ -15,6 +16,7 @@ import torch
 import torch.nn.functional as F
 from pytest import CaptureFixture
 
+from btb.engine.cuda import _CudaMixin
 from tests.helpers import need_card_kernels
 
 if TYPE_CHECKING:
@@ -70,135 +72,59 @@ def _attn_ref(q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, rows: Sequence[
     return torch.einsum("hn,hnd->hd", torch.softmax(s, -1), vv).to(bf)
 
 
+PAGE = 64  # the prefix cache's page: rows a page of every layer (btb/engine/kvpool.py)
+
+
+def _paged(K: torch.Tensor, V: torch.Tensor, seed: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`K`/`V` [Hk, cap, D]'s rows moved into PAGE-row pages of a position-major buffer twice the size (the pool's
+    layout) in a shuffled order, the rest of it noise: (the row map, the paged K, the paged V)"""
+    g = torch.Generator().manual_seed(seed)
+    Hk, cap, D = K.shape
+    pages = cap // PAGE
+    order = torch.randperm(2 * pages, generator=g)[:pages]
+    tbl = (order[:, None] * PAGE + torch.arange(PAGE)[None]).flatten().to(dev, torch.int32)
+    Kp = _position_major(torch.randn(Hk, 2 * cap, D, device=dev, dtype=bf))
+    Vp = _position_major(torch.randn(Hk, 2 * cap, D, device=dev, dtype=bf))
+    Kp[:, tbl.long()], Vp[:, tbl.long()] = K, V
+    return tbl, Kp, Vp
+
+
 @pytest.mark.parametrize("D", [64, 128, 256])
-def test_attention_chain_matches_reference_and_one_row_steps(cu: _Cuda, D: int) -> None:
-    torch.manual_seed(1)
-    Hq, Hk, cap, n0, T = 8, 4, 640, 300, 6
-    K = torch.randn(Hk, cap, D, device=dev, dtype=bf)
-    V = torch.randn(Hk, cap, D, device=dev, dtype=bf)
-    q = torch.randn(T, Hq, D, device=dev, dtype=bf)
-    scale = 1.0 / math.sqrt(D)
-    chain = list(range(-1, T - 1))
-    out = _attn_split(cu, q, K, V, n0, chain, scale)
-    for t in range(T):
-        ref = _attn_ref(q[t], K, V, list(range(n0 + t + 1)), scale)
-        assert (out[t].float() - ref.float()).abs().max().item() < 4e-3
-        # the same row reached by a one-row step at that position
-        one = _attn_split(cu, q[t : t + 1], K, V, n0 + t, [-1], scale)
-        assert torch.equal(one[0], out[t])
-    assert torch.equal(out, _attn_split(cu, q, K, V, n0, chain, scale))
-
-
-def test_attention_tree_masks_siblings(cu: _Cuda) -> None:
-    torch.manual_seed(2)
-    Hq, Hk, D, cap, n0 = 16, 8, 128, 512, 200
-    K = torch.randn(Hk, cap, D, device=dev, dtype=bf)
-    V = torch.randn(Hk, cap, D, device=dev, dtype=bf)
-    q = torch.randn(5, Hq, D, device=dev, dtype=bf)
-    scale = 1.0 / math.sqrt(D)
-    # nodes 3 and 4 are both children of 2: node 4 sees the prefix, 0, 1, 2 and itself - never node 3
-    out = _attn_split(cu, q, K, V, n0, [-1, 0, 1, 2, 2], scale)
-    ref4 = _attn_ref(q[4], K, V, list(range(n0 + 3)) + [n0 + 4], scale)
-    assert (out[4].float() - ref4.float()).abs().max().item() < 4e-3
-    chain = _attn_split(cu, q, K, V, n0, [-1, 0, 1, 2, 3], scale)
-    assert torch.equal(out[:4], chain[:4])
-    # the branch node's bits are those of a one-row step at its position: the same rows laid out as that
-    # step would have them (node 4's row at slot n0 + 3, where the step at depth 3 writes its own)
-    K2, V2 = K.clone(), V.clone()
-    K2[:, n0 + 3], V2[:, n0 + 3] = K[:, n0 + 4], V[:, n0 + 4]
-    one = _attn_split(cu, q[4:5], K2, V2, n0 + 3, [-1], scale)
-    assert torch.equal(one[0], out[4])
-    # and a second branch that repeats the first branch's rows at other slots gives the first branch's bits
-    K3, V3 = K.clone(), V.clone()
-    K3[:, n0 + 3], V3[:, n0 + 3] = K[:, n0 + 1], V[:, n0 + 1]
-    K3[:, n0 + 4], V3[:, n0 + 4] = K[:, n0 + 2], V[:, n0 + 2]
-    q3 = q.clone()
-    q3[3], q3[4] = q[1], q[2]
-    twin = _attn_split(cu, q3, K3, V3, n0, [-1, 0, 1, 0, 3], scale)
-    assert torch.equal(twin[3], out[1]) and torch.equal(twin[4], out[2])
-
-
-def _attn_split(
-    cu: _Cuda,
-    q: torch.Tensor,
-    K: torch.Tensor,
-    V: torch.Tensor,
-    n0: int,
-    par: Sequence[int],
-    scale: float,
-    split: int = 1024,
-    win: int = 0,
-    shared: int | None = None,
-) -> torch.Tensor:
-    """the tree walk `btb_attn_split_d{D}`, or with `shared` its grouped-query form: a block a KV group from a
-    prefix of `shared` keys on, a block a head below"""
-    T, Hq, D = q.shape
-    Hk, cap = K.shape[0], K.shape[1]
-    G = Hq // Hk
-    S = (cap + split - 1) // split
-    out = torch.empty(T, Hq, D, device=dev, dtype=bf)
+def test_a_row_map_writes_each_row_into_its_page(cu: _Cuda, D: int) -> None:
+    """the norm/rope write through a row map (`btb_norm_rope_kv_tbl_d{D}`): each of the pass's rows lands at the
+    slot its map names - the bits the plain write leaves at its logical slot, every other row untouched - and the
+    query rows are the plain write's"""
+    torch.manual_seed(14)
+    Hq, Hk, cap, n0, T, eps = 8, 4, 512, 100, 5, 1e-6
+    wq = torch.rand(D, device=dev, dtype=bf) + 0.5
+    wk = torch.rand(D, device=dev, dtype=bf) + 0.5
+    cos_t, sin_t = _rope_tables(cap, D)
+    qkv = torch.randn(T, (Hq + 2 * Hk) * D, device=dev, dtype=bf)
+    depth = torch.tensor([0, 1, 2, 3, 3], dtype=torch.int32, device=dev)
     n0t = torch.tensor([n0], dtype=torch.int32, device=dev)
-    pt = torch.tensor(par, dtype=torch.int32, device=dev)
-    pm = torch.zeros(S * T * Hq, device=dev)
-    pl = torch.zeros(S * T * Hq, device=dev)
-    pa = torch.zeros(S * T * Hq * D, device=dev)
-    cnt = torch.zeros(T * Hq, dtype=torch.int32, device=dev)
-    # the grouped form reads its threshold on the card, as the passes' switch holds it
-    sh = torch.tensor([shared if shared is not None else 0], dtype=torch.int32, device=dev)
-    cu.launch(
-        f"btb_attn_split_d{D}" if shared is None else f"btb_attn_split_gqa{G}_d{D}",
-        (Hq, T, S),
-        (256, 1, 1),
-        [
-            P(q),
-            P(K),
-            P(V),
-            P(out),
-            P(n0t),
-            P(pt),
-            I(T),
-            I(Hq),
-            I(Hk),
-            # where head g's row r lies: g * hs + r * rs, read off K's [Hk, cap, D] view (either layout)
-            I(K.stride(0)),
-            I(K.stride(1)),
-            Fl(scale),
-            P(pm),
-            P(pl),
-            P(pa),
-            P(cnt),
-            I(S),
-            # the kernel's last parameter (0: the whole prefix, no sliding window); left off, the driver read the
-            # argument array past its end - an access violation on Windows
-            I(win),
-            *([] if shared is None else [P(sh)]),
-        ],
-    )
-    assert int(cnt.abs().sum()) == 0, "every (head, row) count is reset by its last block"
-    return out
-
-
-@pytest.mark.parametrize("n0", [300, 1500, 3000])
-def test_split_attention_matches_the_reference_across_splits_and_reproduces_one_row_steps(cu: _Cuda, n0: int) -> None:
-    torch.manual_seed(7)
-    Hq, Hk, D, cap, T = 16, 8, 128, 4096, 4
-    K = torch.randn(Hk, cap, D, device=dev, dtype=bf)
-    V = torch.randn(Hk, cap, D, device=dev, dtype=bf)
-    q = torch.randn(T, Hq, D, device=dev, dtype=bf)
-    scale = 1.0 / math.sqrt(D)
-    # a tree: root, a wrong branch 1 -> 2, the right node 3 off the root
-    par = [-1, 0, 1, 0]
-    out = _attn_split(cu, q, K, V, n0, par, scale)
-    ref0 = _attn_ref(q[0], K, V, list(range(n0 + 1)), scale)
-    ref3 = _attn_ref(q[3], K, V, list(range(n0)) + [n0, n0 + 3], scale)
-    assert (out[0].float() - ref0.float()).abs().max().item() < 4e-3
-    assert (out[3].float() - ref3.float()).abs().max().item() < 4e-3
-    # repeat-identical, and node 3's bits are a one-row step's at position n0 + 1 with its row at slot n0 + 1
-    assert torch.equal(out, _attn_split(cu, q, K, V, n0, par, scale))
-    K2, V2 = K.clone(), V.clone()
-    K2[:, n0 + 1], V2[:, n0 + 1] = K[:, n0 + 3], V[:, n0 + 3]
-    one = _attn_split(cu, q[3:4], K2, V2, n0 + 1, [-1], scale)
-    assert torch.equal(one[0], out[3])
+    zeros = torch.zeros(Hk, cap, D, device=dev, dtype=bf)
+    tbl, Kp, Vp = _paged(zeros, zeros, D)
+    Kp.zero_()
+    Vp.zero_()
+    out: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    for K, V, mapped in ((zeros.clone(), zeros.clone(), None), (Kp, Vp, tbl)):
+        qo = torch.empty(T, Hq, D, device=dev, dtype=bf)
+        cu.launch(
+            f"btb_norm_rope_kv{'_tbl' if mapped is not None else ''}_d{D}",
+            (Hq + 2 * Hk, T, 1),
+            (32, 1, 1),
+            [P(qkv), P(wq), P(wk), Fl(eps), P(cos_t), P(sin_t), P(n0t), P(depth), P(K), P(V), P(qo)]
+            + [I(T), I(Hq), I(Hk), I(K.stride(0)), I(K.stride(1)), I(0)]
+            + ([] if mapped is None else [P(mapped)]),
+        )
+        out.append((K, V, qo))
+    (k0, v0, q0), (k1, v1, q1) = out
+    assert torch.equal(q0, q1)
+    rows = tbl[n0 : n0 + T].long()
+    assert torch.equal(k1[:, rows], k0[:, n0 : n0 + T]) and torch.equal(v1[:, rows], v0[:, n0 : n0 + T])
+    touched = torch.zeros(Kp.shape[1], dtype=torch.bool, device=dev)
+    touched[rows] = True
+    assert bool((k1[:, ~touched] == 0).all()) and bool((v1[:, ~touched] == 0).all()), "no other row is touched"
 
 
 def _position_major(K: torch.Tensor) -> torch.Tensor:
@@ -208,28 +134,14 @@ def _position_major(K: torch.Tensor) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("Hq,Hk,D", [(16, 8, 128), (32, 8, 128), (16, 8, 64)])
-def test_position_major_rows_are_read_and_written_as_head_major_ones(cu: _Cuda, Hq: int, Hk: int, D: int) -> None:
-    """The card arena keeps its rows position-major so they grow at its end alone. The tree walk, its grouped-query
-    form, the rows walk and the norm/rope write take head g's row r at g * hs + r * rs, and over either layout give
-    the same bits at the same logical rows."""
+def test_position_major_rows_are_written_as_head_major_ones(cu: _Cuda, Hq: int, Hk: int, D: int) -> None:
+    """The card arena keeps its rows position-major so they grow at its end alone. The norm/rope write takes head g's
+    row r at g * hs + r * rs, and over either layout lands a pass's rows at the same logical slots, the same bits (the
+    one attention reads either layout alike: `test_one_attention_reads_rows_where_they_lie`)"""
     torch.manual_seed(11)
     cap, n0, T, eps = 4096, 1500, 4, 1e-6
-    K = torch.randn(Hk, cap, D, device=dev, dtype=bf)
-    V = torch.randn(Hk, cap, D, device=dev, dtype=bf)
-    Kp, Vp = _position_major(K), _position_major(V)
-    assert (Kp.stride(0), Kp.stride(1)) == (D, Hk * D) and torch.equal(Kp, K)
-    q = torch.randn(T, Hq, D, device=dev, dtype=bf)
-    scale = 1.0 / math.sqrt(D)
-    par = [-1, 0, 1, 0]
-    assert torch.equal(_attn_split(cu, q, Kp, Vp, n0, par, scale), _attn_split(cu, q, K, V, n0, par, scale))
-    if Hq // Hk > 1:
-        grouped = _attn_split(cu, q, Kp, Vp, n0, par, scale, shared=0)
-        assert torch.equal(grouped, _attn_split(cu, q, K, V, n0, par, scale, shared=0))
-    base, step, W, rows = FORK
-    rw = _rows_layout(base, step, W, rows)
-    qr = torch.randn(len(rows), Hq, D, device=dev, dtype=bf)
-    assert torch.equal(_attn_rows(cu, qr, Kp, Vp, rw, scale), _attn_rows(cu, qr, K, V, rw, scale))
-    # the write: a pass's rows land at the same logical slots whichever layout holds them
+    Kp = _position_major(torch.zeros(Hk, cap, D, device=dev, dtype=bf))
+    assert (Kp.stride(0), Kp.stride(1)) == (D, Hk * D)
     wq = torch.rand(D, device=dev, dtype=bf) + 0.5
     wk = torch.rand(D, device=dev, dtype=bf) + 0.5
     cos_t, sin_t = _rope_tables(cap, D)
@@ -252,32 +164,11 @@ def test_position_major_rows_are_read_and_written_as_head_major_ones(cu: _Cuda, 
     assert torch.equal(k0, k1) and torch.equal(v0, v1) and torch.equal(q0, q1)
 
 
-@pytest.mark.parametrize("win", [0, 128])
-@pytest.mark.parametrize("n0", [300, 1500, 3000])
-@pytest.mark.parametrize("Hq,Hk,D", [(16, 8, 128), (32, 8, 128), (64, 8, 64), (16, 8, 256)])
-def test_the_grouped_query_split_attention_is_the_one_head_kernel_bit_for_bit(
-    cu: _Cuda, Hq: int, Hk: int, D: int, n0: int, win: int
-) -> None:
-    """a KV group's G heads in one block, each key's K and V read once for all of them
-    (`btb_attn_split_gqa{G}_d{D}`): every head's row is the one-head kernel's bit for bit - its keys in the same
-    warps and order, its splits folded in the same order - over a tree pass, across splits, under a window; and
-    below its threshold the kernel is the one-head kernel"""
-    torch.manual_seed(11)
-    cap, T = 4096, 5
-    K = torch.randn(Hk, cap, D, device=dev, dtype=bf)
-    V = torch.randn(Hk, cap, D, device=dev, dtype=bf)
-    q = torch.randn(T, Hq, D, device=dev, dtype=bf)
-    scale = 1.0 / math.sqrt(D)
-    par = [-1, 0, 1, 0, 3]
-    want = _attn_split(cu, q, K, V, n0, par, scale, win=win)
-    for shared in (0, n0, n0 + 1, 1 << 30):
-        assert torch.equal(_attn_split(cu, q, K, V, n0, par, scale, win=win, shared=shared), want), shared
-
-
 # ---------------------------------------------------------------------------------------------------------
-# the rows kernels: T sequences a token each over one cache - a prefix per row (shared by a fork's rows, end to
+# the rows layout: T sequences a token each over one cache - a prefix per row (shared by a fork's rows, end to
 # end for a batch's), then every row's step i in the stretch base + i * W, row at its column. Each row must
-# come out as its own one-row step over its keys laid end to end, whatever rows step beside it.
+# come out as its own one-row step over its keys laid end to end, whatever rows step beside it: the norm/rope write
+# below, the one attention's rows form further down (`test_one_attention_takes_each_rows_own_keys`).
 # ---------------------------------------------------------------------------------------------------------
 
 RowSpec = tuple[int, int, int] | None  # (column, prefix offset, prefix length); None a padding row
@@ -296,83 +187,10 @@ def _row_slots(base: int, step: int, W: int, r: tuple[int, int, int]) -> list[in
     return list(range(off, off + n)) + [base + i * W + col for i in range(step + 1)]
 
 
-def _attn_rows(
-    cu: _Cuda, q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, rw: torch.Tensor, scale: float, win: int = 0
-) -> torch.Tensor:
-    T, Hq, D = q.shape
-    Hk, cap = K.shape[0], K.shape[1]
-    S = (cap + 1023) // 1024
-    out = torch.full((T, Hq, D), 7.0, device=dev, dtype=bf)  # a padding row's stays as it was
-    pm = torch.zeros(S * T * Hq, device=dev)
-    pl = torch.zeros(S * T * Hq, device=dev)
-    pa = torch.zeros(S * T * Hq * D, device=dev)
-    cnt = torch.zeros(T * Hq, dtype=torch.int32, device=dev)
-    cu.launch(
-        f"btb_attn_rows_d{D}",
-        (Hq, T, S),
-        (256, 1, 1),
-        [
-            P(q),
-            P(K),
-            P(V),
-            P(out),
-            P(rw),
-            I(T),
-            I(Hq),
-            I(Hk),
-            I(K.stride(0)),
-            I(K.stride(1)),
-            Fl(scale),
-            P(pm),
-            P(pl),
-            P(pa),
-            P(cnt),
-            I(S),
-            I(win),
-        ],
-    )
-    assert int(cnt.abs().sum()) == 0, "every (head, row) count is reset by its last block"
-    return out
-
-
 # a fork: one prefix across two splits, the rows' columns shuffled (rows left and a beam reordered), a padding
 # row last; a batch: three prompts end to end, their steps past 2K keys, one row padding in the middle
 FORK = (1500, 37, 4, [(2, 0, 1500), (0, 0, 1500), (3, 0, 1500), (1, 0, 1500), None])
 BATCH = (1900, 700, 3, [(0, 0, 700), None, (1, 700, 1100), (2, 1800, 90)])
-
-
-@pytest.mark.parametrize("D", [64, 128, 256])
-@pytest.mark.parametrize("layout", [FORK, BATCH], ids=["fork", "batch"])
-@pytest.mark.parametrize("win", [0, 512])
-def test_rows_attention_is_each_rows_own_one_row_step(
-    cu: _Cuda, D: int, layout: tuple[int, int, int, list[RowSpec]], win: int
-) -> None:
-    torch.manual_seed(8)
-    base, step, W, rows = layout
-    Hq, Hk, T = 8, 4, len(rows)
-    cap = (base + (step + 1) * W + 1023) // 1024 * 1024
-    K = torch.randn(Hk, cap, D, device=dev, dtype=bf)
-    V = torch.randn(Hk, cap, D, device=dev, dtype=bf)
-    q = torch.randn(T, Hq, D, device=dev, dtype=bf)
-    scale = 1.0 / math.sqrt(D)
-    rw = _rows_layout(base, step, W, rows)
-    out = _attn_rows(cu, q, K, V, rw, scale, win)
-    assert torch.equal(out, _attn_rows(cu, q, K, V, rw, scale, win))
-    for t, r in enumerate(rows):
-        if r is None:
-            assert bool((out[t] == 7.0).all()), "a padding row computes nothing"
-            continue
-        slots = _row_slots(base, step, W, r)
-        seen = slots[-win:] if win else slots
-        ref = _attn_ref(q[t], K, V, seen, scale)
-        assert (out[t].float() - ref.float()).abs().max().item() < 4e-3
-        # the row alone: its keys end to end from slot 0, the one-row step at its position
-        n = len(slots)
-        K1 = torch.zeros(Hk, (n + 1023) // 1024 * 1024, D, device=dev, dtype=bf)
-        V1 = torch.zeros_like(K1)
-        K1[:, :n], V1[:, :n] = K[:, slots], V[:, slots]
-        one = _attn_split(cu, q[t : t + 1], K1, V1, n - 1, [-1], scale, win=win)
-        assert torch.equal(one[0], out[t])
 
 
 @pytest.mark.parametrize("D", [64, 128])
@@ -558,91 +376,134 @@ def test_scheduler_reports_the_hierarchy(cu: _Cuda) -> None:
 
 # ---------------------------------------------------------------------------------------------------------
 # the tensor-core matvec: one kernel for every row count, the caller padding x to the 32 rows it always
-# carries. A row group is 16 weight rows to a block of 2 to 8 warps (k split between them), so the grid is
-# ceil(R / 16).
+# carries. Each output one chain over all of k; a warp a group of 16 weight rows (8 in btb_gemv_mma8_bf16), a
+# block `warps` of them, so the grid is ceil(R / 16 warps) - the block's size the launch's to choose, never a bit.
 # ---------------------------------------------------------------------------------------------------------
 
 MMA_SHAPES = [(151936, 1024), (19456, 2560), (2560, 9728), (4096, 1024), (6144, 1024), (1024, 3072), (6144, 2560)]
 
 
-def _mma(cu: _Cuda, W: torch.Tensor, x: torch.Tensor, warps: int = 2) -> torch.Tensor:
+def _mma(cu: _Cuda, W: torch.Tensor, x: torch.Tensor, warps: int = 1, rows: int = 16) -> torch.Tensor:
+    """the tensor-core matvec over x's rows: btb_gemv_mma_bf16 (rows 16) or btb_gemv_mma8_bf16 (8), `warps` a block"""
     M, C = x.shape
     R = W.shape[0]
     xp = x if M == 32 else torch.cat([x, torch.zeros(32 - M, C, device=dev, dtype=x.dtype)])
     y = torch.empty(32, R, device=dev, dtype=bf)
-    cu.launch("btb_gemv_mma_bf16", ((R + 15) // 16, 1, 1), (32 * warps, 1, 1), [P(W), P(xp), P(y), I(R), I(C), I(M)])
+    name = "btb_gemv_mma_bf16" if rows == 16 else "btb_gemv_mma8_bf16"
+    grid = ((R + rows * warps - 1) // (rows * warps), 1, 1)
+    cu.launch(name, grid, (32 * warps, 1, 1), [P(W), P(xp), P(y), I(R), I(C), I(M)])
     return y[:M]
 
 
-@pytest.mark.parametrize("warps", [2, 4, 8])
-@pytest.mark.parametrize("R,C", MMA_SHAPES + [(1020, 1032), (17, 8), (16, 32)])
-def test_gemv_mma_matches_linear_within_one_ulp(cu: _Cuda, R: int, C: int, warps: int) -> None:
+@pytest.mark.parametrize("R,C", MMA_SHAPES + [(1020, 1032), (17, 8), (16, 32), (24, 4136)])
+def test_gemv_mma_matches_linear_within_one_ulp(cu: _Cuda, R: int, C: int) -> None:
     torch.manual_seed(0)
     W = torch.randn(R, C, device=dev, dtype=bf)
     x = torch.randn(32, C, device=dev, dtype=bf)
     ref = F.linear(x, W).float()
     # within one bf16 ulp of cuBLAS at the outputs' magnitude - the k inside a super-tile is permuted, so the
     # fp32 sums differ from cuBLAS's in the last bits and can round to the neighbouring bf16
-    assert (_mma(cu, W, x, warps).float() - ref).abs().max().item() <= ref.abs().max().item() * 2**-7
+    assert (_mma(cu, W, x).float() - ref).abs().max().item() <= ref.abs().max().item() * 2**-7
 
 
-@pytest.mark.parametrize("warps", [2, 4, 8])
 @pytest.mark.parametrize("R,C", [(151936, 1024), (2560, 9728), (1024, 3072), (1020, 1032)])
-def test_gemv_mma_is_repeat_identical_and_carries_no_row_across(cu: _Cuda, R: int, C: int, warps: int) -> None:
+def test_gemv_mma_is_repeat_identical_and_carries_no_row_across(cu: _Cuda, R: int, C: int) -> None:
     torch.manual_seed(1)
     W = torch.randn(R, C, device=dev, dtype=bf)
     x = torch.randn(32, C, device=dev, dtype=bf)
-    y = _mma(cu, W, x, warps)
-    assert torch.equal(y, _mma(cu, W, x, warps))
+    y = _mma(cu, W, x)
+    assert torch.equal(y, _mma(cu, W, x))
     # row 0 is the one-row step's bits whatever stands in the other 31: mma accumulates each output element
     # from its own row of x, so a 1-row step and a 32-row verify pass agree bit for bit
     zeros = x.clone()
     zeros[1:] = 0
-    assert torch.equal(y[:1], _mma(cu, W, zeros, warps)[:1])
+    assert torch.equal(y[:1], _mma(cu, W, zeros)[:1])
     other = x.clone()
     other[1:] = torch.randn(31, C, device=dev, dtype=bf)
-    assert torch.equal(y[:1], _mma(cu, W, other, warps)[:1])
+    assert torch.equal(y[:1], _mma(cu, W, other)[:1])
     # and a 4-row pass is the first four rows of the 32-row one
-    assert torch.equal(y[:4], _mma(cu, W, x[:4], warps))
+    assert torch.equal(y[:4], _mma(cu, W, x[:4]))
 
 
 @pytest.mark.parametrize("M", [1, 5, 32])
-@pytest.mark.parametrize("warps", [2, 4, 8])
-@pytest.mark.parametrize("R,C", [(1024, 2048), (1024, 3072), (1020, 1032), (17, 8), (4096, 1024)])
-def test_the_eight_row_matvec_is_the_sixteen_row_one_bit_for_bit(cu: _Cuda, R: int, C: int, warps: int, M: int) -> None:
-    """`btb_gemv_mma8_bf16`, a block 8 weight rows, against btb_gemv_mma_bf16's 16: each output the same mma, k
-    slices and fold, so the same bits at any warps and any live rows"""
+@pytest.mark.parametrize("R,C", [(1024, 2048), (1024, 3072), (1020, 1032), (17, 8), (4096, 1024), (24, 4136)])
+def test_every_launch_of_the_matvec_gives_its_bits(cu: _Cuda, R: int, C: int, M: int) -> None:
+    """btb_gemv_mma_bf16 and btb_gemv_mma8_bf16 (a warp 16 rows, or 8), one to four warps a block: each output the
+    same chain, so the same bits whichever launch - at any live rows, a k not a whole number of bursts or of
+    super-tiles"""
     torch.manual_seed(12)
     W = torch.randn(R, C, device=dev, dtype=bf)
     x = torch.randn(M, C, device=dev, dtype=bf)
-    xp = x if M == 32 else torch.cat([x, torch.zeros(32 - M, C, device=dev, dtype=bf)])
-    y = torch.empty(32, R, device=dev, dtype=bf)
-    cu.launch("btb_gemv_mma8_bf16", ((R + 7) // 8, 1, 1), (32 * warps, 1, 1), [P(W), P(xp), P(y), I(R), I(C), I(M)])
-    assert torch.equal(y[:M], _mma(cu, W, x, warps))
+    want = _mma(cu, W, x)
+    for rows, warps in itertools.product((16, 8), (1, 2, 4)):
+        assert torch.equal(_mma(cu, W, x, warps, rows), want), (rows, warps)
 
 
 @pytest.mark.parametrize("act", ["silu", "gelu"])
 @pytest.mark.parametrize("M", [1, 5, 32])
-@pytest.mark.parametrize("warps", [2, 4, 8])
-@pytest.mark.parametrize("Ii,C", [(3072, 1024), (1000, 1032), (24, 64)])
+@pytest.mark.parametrize("warps", [1, 4])
+@pytest.mark.parametrize("Ii,C", [(3072, 1024), (1000, 1032), (24, 64), (40, 4136)])
 def test_the_glu_matvec_is_the_matvec_and_the_activation_bit_for_bit(
     cu: _Cuda, Ii: int, C: int, warps: int, M: int, act: str
 ) -> None:
     """`btb_gemv_mma_glu_{act}`, gate and up in one kernel and the activation in its epilogue, against
     btb_gemv_mma_bf16 over the merged [2I, C] weight and btb_{act}_mul over its output - at any I (a row group's
-    gate and up rows need not line up with the plain kernel's groups), any warps, any live rows"""
+    gate and up rows need not line up with the plain kernel's groups), any warps a block, any live rows"""
     torch.manual_seed(9)
     W = torch.randn(2 * Ii, C, device=dev, dtype=bf)
     x = torch.randn(M, C, device=dev, dtype=bf)
-    gu = _mma(cu, W, x, warps)
+    gu = _mma(cu, W, x)
     want = torch.empty(M, Ii, device=dev, dtype=bf)
     cu.launch(f"btb_{act}_mul", (min(4096, (M * Ii + 255) // 256), 1, 1), (256, 1, 1), [P(gu), P(want), I(M), I(Ii)])
     xp = x if M == 32 else torch.cat([x, torch.zeros(32 - M, C, device=dev, dtype=bf)])
     m = torch.empty(32, Ii, device=dev, dtype=bf)
-    cu.launch(
-        f"btb_gemv_mma_glu_{act}", ((Ii + 15) // 16, 1, 1), (32 * warps, 1, 1), [P(W), P(xp), P(m), I(Ii), I(C), I(M)]
-    )
+    grid = ((Ii + 16 * warps - 1) // (16 * warps), 1, 1)
+    cu.launch(f"btb_gemv_mma_glu_{act}", grid, (32 * warps, 1, 1), [P(W), P(xp), P(m), I(Ii), I(C), I(M)])
     assert torch.equal(m[:M], want)
+
+
+# ---------------------------------------------------------------------------------------------------------
+# a prompt's matmuls (btb_gemm.cuh): each row of a chunk computed as the step's matvec computes it, so a prompt
+# prefilled on the card makes the rows its steps would have made
+# ---------------------------------------------------------------------------------------------------------
+
+
+def _gemm(cu: _Cuda, W: torch.Tensor, x: torch.Tensor, mma: bool = True, plan: str | None = None) -> torch.Tensor:
+    """the engine's launch (`_card_gemm`) over every row of x: the tensor cores' chain (the kernel the card's plan
+    picks, or `plan`'s: "big", "small"), or `btb_gemm_f32_bf16`"""
+    T, C = x.shape
+    R = W.shape[0]
+    y = torch.full((T, R), float("nan"), device=dev, dtype=bf)
+    _CudaMixin._card_gemm(cu, mma, W, x, y, R, C, T, plan=plan)
+    return y
+
+
+@pytest.mark.parametrize("plan", ["big", "small"])
+@pytest.mark.parametrize("R,C", [(4096, 1024), (1024, 3072), (6144, 1024), (2560, 9728), (1020, 1032), (17, 8)])
+def test_a_prompts_matmul_gives_the_steps_rows_on_tensor_cores(cu: _Cuda, R: int, C: int, plan: str) -> None:
+    """each of the tensor-core GEMM's kernels - 128 x 64 tiles, 64 x 64 - gives every row of a chunk bit for bit the
+    row btb_gemv_mma_bf16 gives a step, whatever the chunk's length and wherever in a tile the row falls"""
+    torch.manual_seed(13)
+    W = torch.randn(R, C, device=dev, dtype=bf)
+    x = torch.randn(300, C, device=dev, dtype=bf)
+    y = _gemm(cu, W, x, plan=plan)
+    for a in range(0, 300, 32):
+        assert torch.equal(y[a : a + 32], _mma(cu, W, x[a : a + 32])), a
+    assert torch.equal(_gemm(cu, W, x[:1], plan=plan), y[:1])
+    assert torch.equal(_gemm(cu, W, x[100:229], plan=plan), y[100:229])
+
+
+@pytest.mark.parametrize("R,C", [(4096, 1024), (1024, 3072), (2560, 9728), (1020, 1032), (17, 8)])
+def test_a_prompts_matmul_gives_the_steps_rows_in_the_fp32_chain(cu: _Cuda, R: int, C: int) -> None:
+    """`btb_gemm_f32_bf16`: every row of a chunk bit for bit the row btb_gemv_bf16_m{M} gives a step - its lanes'
+    chains and its butterfly - whatever the chunk's length"""
+    torch.manual_seed(14)
+    W = torch.randn(R, C, device=dev, dtype=bf)
+    x = torch.randn(77, C, device=dev, dtype=bf)
+    y = _gemm(cu, W, x, mma=False)
+    for a in range(0, 77, 32):
+        assert torch.equal(y[a : a + 32], _gemv(cu, W, x[a : a + 32])), a
+    assert torch.equal(_gemm(cu, W, x[5:6], mma=False), y[5:6])
 
 
 def test_gemv_mma_streams_the_weights_at_the_cards_ceiling(cu: _Cuda, capsys: CaptureFixture[str]) -> None:
@@ -665,9 +526,10 @@ def test_gemv_mma_streams_the_weights_at_the_cards_ceiling(cu: _Cuda, capsys: Ca
         ) -> float:
             def body() -> None:
                 assert Ws is not None
+                grid, block = _CudaMixin._card_mma_launch(R, cu.sms)  # the engine's launch for the shape
                 for W in Ws:
                     cu.launch(
-                        "btb_gemv_mma_bf16", ((R + 15) // 16, 1, 1), (64, 1, 1), [P(W), P(xs), P(y), I(R), I(C), I(m)]
+                        _CudaMixin._card_mma_kernel(R, cu.sms), grid, block, [P(W), P(xs), P(y), I(R), I(C), I(m)]
                     )
 
             for _ in range(3):
@@ -696,3 +558,274 @@ def test_gemv_mma_streams_the_weights_at_the_cards_ceiling(cu: _Cuda, capsys: Ca
         print("\n[mma gemv] weights streamed from DRAM, 40 distinct matrices where they fit:")
         for r in rows:
             print(r)
+
+
+# ---------------------------------------------------------------------------------------------------------
+# the one attention (btb_attn_flash.cuh): every pass's rows - a step, a verify chain or tree, a fork's or a batch's
+# rows, a prompt's chunk - each the same operations over its own keys. Its bits are the row's alone: a prompt's chunk
+# gives the rows the steps at those positions give, so a cached conversation's next turn decodes as the prompt cold.
+# ---------------------------------------------------------------------------------------------------------
+
+
+# the decode form's shape as the engine launches it (FaPick in btb_attn_flash.cuh): a group's keys, a block's threads
+_fa_group = _CudaMixin._attn_group
+
+
+def _fa_threads(D: int) -> int:
+    return 32 * _CudaMixin._attn_warps(D)
+
+
+def _flash(
+    cu: _Cuda,
+    q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    n0: int,
+    par: Sequence[int],
+    scale: float,
+    win: int = 0,
+    tbl: torch.Tensor | ctypes.c_void_p | None = None,
+    cap: int | None = None,
+) -> torch.Tensor:
+    """the decode form `btb_attn_flash_d{D}`: T tokens after n0 rows, token t parented to par[t], every row's group
+    states stored and folded by the last of its groups to arrive; `cap` the positions the launch's groups cover (the
+    graph's), K's own by default; `tbl` a row map, or a pointer to one (a node's map set back to its window's start)"""
+    T, Hq, D = q.shape
+    Hk = K.shape[0]
+    G = Hq // Hk
+    S = ((cap or K.shape[1]) + _fa_group(D) - 1) // _fa_group(D)
+    out = torch.full((T, Hq, D), float("nan"), device=dev, dtype=bf)
+    n0t = torch.tensor([n0], dtype=torch.int32, device=dev)
+    pt = torch.tensor(par, dtype=torch.int32, device=dev)
+    pm = torch.zeros(S * T * Hq, device=dev)
+    pl = torch.zeros(S * T * Hq, device=dev)
+    pa = torch.zeros(S * T * Hq * D, device=dev)
+    cnt = torch.zeros(T * Hq, dtype=torch.int32, device=dev)
+    cu.launch(
+        f"btb_attn_flash_d{D}",
+        ((T * G + 7) // 8, S, Hk),  # a block 8 rows of a group, its warps its tiles (four at the widest head)
+        (_fa_threads(D), 1, 1),
+        [P(q), P(K), P(V), P(out), P(n0t), P(pt), I(T), I(Hq), I(Hk), I(K.stride(0)), I(K.stride(1)), Fl(scale)]
+        + [P(pm), P(pl), P(pa), P(cnt), I(win), tbl if isinstance(tbl, ctypes.c_void_p) else P(tbl)],
+    )
+    assert int(cnt.abs().sum()) == 0, "every row's count is reset by the block that folds it"
+    return out
+
+
+def _flash_rows(
+    cu: _Cuda, q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, rw: torch.Tensor, scale: float, win: int = 0
+) -> torch.Tensor:
+    """the decode form over a fork's or a batch's rows, `btb_attn_flash_rows_d{D}`: a block 8 heads of a token a group"""
+    T, Hq, D = q.shape
+    Hk, cap = K.shape[0], K.shape[1]
+    S = (cap + _fa_group(D) - 1) // _fa_group(D)
+    out = torch.full((T, Hq, D), 7.0, device=dev, dtype=bf)  # a padding row's stays as it was
+    pm = torch.zeros(S * T * Hq, device=dev)
+    pl = torch.zeros(S * T * Hq, device=dev)
+    pa = torch.zeros(S * T * Hq * D, device=dev)
+    cnt = torch.zeros(T * Hq, dtype=torch.int32, device=dev)
+    cu.launch(
+        f"btb_attn_flash_rows_d{D}",
+        (T * ((Hq // Hk + 7) // 8), S, Hk),
+        (_fa_threads(D), 1, 1),
+        [P(q), P(K), P(V), P(out), P(rw), I(T), I(Hq), I(Hk), I(K.stride(0)), I(K.stride(1)), Fl(scale)]
+        + [P(pm), P(pl), P(pa), P(cnt), I(win)],
+    )
+    assert int(cnt.abs().sum()) == 0, "every row's count is reset by the block that folds it"
+    return out
+
+
+def _flash_prefill(
+    cu: _Cuda,
+    q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    n0: int,
+    scale: float,
+    win: int = 0,
+    tbl: torch.Tensor | None = None,
+    kq: bool = False,
+) -> torch.Tensor:
+    """the prefill form: a chunk's T tokens at positions n0 .., four warps a block, the tiles and groups folded as the
+    walk goes, the row states in a float32 buffer of the chunk's rows - the rows as the mma's M
+    (`btb_attn_flash_prefill_d{D}`), or `kq` the decode form's orientation (`btb_attn_flash_prefill_kq_d{D}`, a
+    card's whose tensor cores fail `btb_mma_roles`), whichever this card picks: both are tested on every card"""
+    T, Hq, D = q.shape
+    Hk = K.shape[0]
+    tpb = cu.flash_prefill_rows(D) // (Hq // Hk)
+    out = torch.full((T, Hq, D), float("nan"), device=dev, dtype=bf)
+    run = torch.empty(T * Hq * D, device=dev)
+    cu.launch(
+        cu.flash_prefill_kernel(D, kq),
+        ((T + tpb - 1) // tpb, Hk, 1),
+        (128, 1, 1),
+        [P(q), P(K), P(V), P(out), I(n0), I(T), I(Hq), I(Hk), I(K.stride(0)), I(K.stride(1)), Fl(scale), I(win)]
+        + [P(tbl), P(run)],
+        shared=cu.flash_prefill_smem(D, kq),
+    )
+    return out
+
+
+def _prefill_forms(cu: _Cuda) -> list[bool]:
+    """the prefill's orientations this card may run (`kq` for `_flash_prefill`): the decode form's always, the
+    rows-as-M one where its tensor cores pass `btb_mma_roles` - elsewhere the card never takes it"""
+    return [True, False] if cu.mma_roles else [True]
+
+
+def test_the_prefill_takes_the_form_its_card_passes(cu: _Cuda) -> None:
+    """the card's prefill kernel is the rows-as-M form where its mma passed `btb_mma_roles` at bind, else the decode
+    form's orientation; launched again the check gives the same verdict"""
+    for D in (64, 128, 256):
+        want = "btb_attn_flash_prefill_kq_d" if not cu.mma_roles else "btb_attn_flash_prefill_d"
+        assert cu.flash_prefill_kernel(D) == f"{want}{D}"
+        assert cu.flash_prefill_smem(D) == cu.flash_prefill_smem(D, not cu.mma_roles)
+    assert cu._mma_roles_hold() == cu.mma_roles
+
+
+def _close_to_reference(out: torch.Tensor, ref: torch.Tensor) -> bool:
+    """within the bf16 weights' rounding at the row's magnitude (a row of two keys averages to values near 3)"""
+    return (out.float() - ref.float()).abs().max().item() <= 2**-6 * max(1.0, ref.float().abs().max().item())
+
+
+@pytest.mark.parametrize("win", [0, 300])
+@pytest.mark.parametrize("Hq,Hk,D", [(16, 8, 128), (32, 8, 64), (8, 2, 256), (12, 12, 128), (40, 8, 128)])
+def test_one_attention_matches_the_reference_and_a_prompt_gives_the_steps_rows(
+    cu: _Cuda, Hq: int, Hk: int, D: int, win: int
+) -> None:
+    """a prompt's rows through the prefill form are each within bf16 of the float32 reference, and bit for bit the
+    row a one-row step at that position computes - across splits, under a window, whatever chunk the row came in
+    and wherever in it, in either orientation the card may take - so the rows a conversation's steps made are the
+    rows its prompt cold would make"""
+    torch.manual_seed(31)
+    cap = 2304
+    K = torch.randn(Hk, cap, D, device=dev, dtype=bf)
+    V = torch.randn(Hk, cap, D, device=dev, dtype=bf)
+    q = torch.randn(cap, Hq, D, device=dev, dtype=bf)
+    scale = 1.0 / math.sqrt(D)
+    steps = {
+        p: _flash(cu, q[p : p + 1], K, V, p, [-1], scale, win)[0] for p in (0, 1, 63, 64, 511, 512, 513, 1100, 2099)
+    }
+    for kq in _prefill_forms(cu):
+        whole = _flash_prefill(cu, q[:2100], K, V, 0, scale, win, kq=kq)
+        for p, step in steps.items():
+            first = max(0, p + 1 - win) if win else 0
+            assert _close_to_reference(whole[p], _attn_ref(q[p], K, V, list(range(first, p + 1)), scale)), (kq, p)
+            assert torch.equal(step, whole[p]), f"row {p} (kq {kq}): the prompt's row is not its step's"
+        # the same prompt cut in chunks anywhere: the same rows
+        for cuts in ([0, 64, 700, 2100], [0, 1, 37, 513, 514, 2100], [0, 2100]):
+            parts = [_flash_prefill(cu, q[a:b], K, V, a, scale, win, kq=kq) for a, b in itertools.pairwise(cuts)]
+            assert torch.equal(torch.cat(parts), whole), (kq, cuts)
+        assert torch.equal(_flash_prefill(cu, q[:2100], K, V, 0, scale, win, kq=kq), whole)
+
+
+@pytest.mark.parametrize("win", [0, 200])
+@pytest.mark.parametrize("Hq,Hk,D", [(16, 8, 128), (32, 8, 64), (8, 2, 256), (40, 8, 128)])
+def test_one_attention_verifies_a_tree_as_its_steps(cu: _Cuda, Hq: int, Hk: int, D: int, win: int) -> None:
+    """a verify pass's chain and tree: each node bit for bit the one-row step at its committed position over its
+    committed path's rows, whatever splits the prefix spans - the speculation's answer is the plain loop's"""
+    torch.manual_seed(32)
+    cap, T = 3072, 8
+    K = torch.randn(Hk, cap, D, device=dev, dtype=bf)
+    V = torch.randn(Hk, cap, D, device=dev, dtype=bf)
+    q = torch.randn(T, Hq, D, device=dev, dtype=bf)
+    scale = 1.0 / math.sqrt(D)
+    tree = [-1, 0, 1, 0, 3, 4, 1, 6]
+    for n0 in (40, 500, 1020, 2500):
+        out = _flash(cu, q, K, V, n0, tree, scale, win)
+        assert torch.equal(out, _flash(cu, q, K, V, n0, tree, scale, win))
+        for t in range(T):
+            path = [t]  # node t's path, root first
+            while tree[path[0]] >= 0:
+                path.insert(0, tree[path[0]])
+            d = len(path) - 1
+            K1, V1 = K.clone(), V.clone()
+            K1[:, n0 : n0 + d + 1], V1[:, n0 : n0 + d + 1] = K[:, [n0 + a for a in path]], V[:, [n0 + a for a in path]]
+            one = _flash(cu, q[t : t + 1], K1, V1, n0 + d, [-1], scale, win)
+            assert torch.equal(one[0], out[t]), (n0, t)
+            first = max(0, n0 + d + 1 - win) if win else 0
+            ref = _attn_ref(q[t], K1, V1, list(range(first, n0 + d + 1)), scale)
+            assert _close_to_reference(out[t], ref), (n0, t)
+        # a chain's rows are the prompt's: the prefill form over the same positions, either orientation
+        chain = _flash(cu, q, K, V, n0, list(range(-1, T - 1)), scale, win)
+        for kq in _prefill_forms(cu):
+            assert torch.equal(chain, _flash_prefill(cu, q, K, V, n0, scale, win, kq=kq)), (n0, kq)
+
+
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("layout", [FORK, BATCH], ids=["fork", "batch"])
+@pytest.mark.parametrize("win", [0, 512])
+@pytest.mark.parametrize("Hq,Hk", [(8, 4), (40, 4)], ids=["G2", "G10"])
+def test_one_attention_takes_each_rows_own_keys(
+    cu: _Cuda, D: int, layout: tuple[int, int, int, list[RowSpec]], win: int, Hq: int, Hk: int
+) -> None:
+    """a fork's or a batch's rows: each within bf16 of the float32 reference over its own keys, and its own
+    sequence's one-row step, bit for bit, whatever rows step beside it - the same bits again; a token's heads past
+    the 8 rows of a block (G 10) in blocks of their own"""
+    torch.manual_seed(33)
+    base, step, W, rows = layout
+    T = len(rows)
+    cap = (base + (step + 1) * W + 1023) // 1024 * 1024
+    K = torch.randn(Hk, cap, D, device=dev, dtype=bf)
+    V = torch.randn(Hk, cap, D, device=dev, dtype=bf)
+    q = torch.randn(T, Hq, D, device=dev, dtype=bf)
+    scale = 1.0 / math.sqrt(D)
+    rw = _rows_layout(base, step, W, rows)
+    out = _flash_rows(cu, q, K, V, rw, scale, win)
+    assert torch.equal(out, _flash_rows(cu, q, K, V, rw, scale, win))
+    for t, r in enumerate(rows):
+        if r is None:
+            assert bool((out[t] == 7.0).all()), "a padding row computes nothing"
+            continue
+        slots = _row_slots(base, step, W, r)
+        assert _close_to_reference(out[t], _attn_ref(q[t], K, V, slots[-win:] if win else slots, scale)), t
+        n = len(slots)
+        K1 = torch.zeros(Hk, (n + 1023) // 1024 * 1024, D, device=dev, dtype=bf)
+        V1 = torch.zeros_like(K1)
+        K1[:, :n], V1[:, :n] = K[:, slots], V[:, slots]
+        one = _flash(cu, q[t : t + 1], K1, V1, n - 1, [-1], scale, win)
+        assert torch.equal(one[0], out[t]), t
+
+
+@pytest.mark.parametrize("win", [0, 128])
+@pytest.mark.parametrize("Hq,Hk,D", [(16, 8, 128), (8, 2, 256), (32, 8, 64)])
+def test_one_attention_reads_rows_where_they_lie(cu: _Cuda, Hq: int, Hk: int, D: int, win: int) -> None:
+    """a row's bits are its keys' and nothing else: through a paged row map over a position-major pool (an identity
+    map the plain read), through either layout, under a window, and whichever query heads share its key head's tiles
+    (a head's row alone, its group's G - 1 others dropped, is the same row)"""
+    torch.manual_seed(34)
+    cap, n0, T = 2048, 1100, 5
+    K = torch.randn(Hk, cap, D, device=dev, dtype=bf)
+    V = torch.randn(Hk, cap, D, device=dev, dtype=bf)
+    q = torch.randn(T, Hq, D, device=dev, dtype=bf)
+    scale = 1.0 / math.sqrt(D)
+    tbl, Kp, Vp = _paged(K, V, D + win)
+    ident = torch.arange(cap, dtype=torch.int32, device=dev)
+    par = [-1, 0, 1, 0, 3]
+    want = _flash(cu, q, K, V, n0, par, scale, win)
+    assert torch.equal(_flash(cu, q, Kp, Vp, n0, par, scale, win, tbl=tbl, cap=cap), want)
+    assert torch.equal(_flash(cu, q, K, V, n0, par, scale, win, tbl=ident), want)
+    assert torch.equal(_flash(cu, q, _position_major(K), _position_major(V), n0, par, scale, win), want)
+    G = Hq // Hk
+    for kq in _prefill_forms(cu):
+        pf = _flash_prefill(cu, q, K, V, n0, scale, win, kq=kq)
+        assert torch.equal(_flash_prefill(cu, q, Kp, Vp, n0, scale, win, tbl=tbl, kq=kq), pf)
+        assert torch.equal(_flash_prefill(cu, q, K, V, n0, scale, win, tbl=ident, kq=kq), pf)
+        assert torch.equal(_flash_prefill(cu, q[:, ::G].contiguous(), K, V, n0, scale, win, kq=kq), pf[:, ::G])
+    # one head of each group alone, its key head's rows its own
+    alone = _flash(cu, q[:, ::G].contiguous(), K, V, n0, par, scale, win)
+    assert torch.equal(alone, want[:, ::G])
+    # a prompt over several of the prefill's blocks through the map, and a one-row chunk through it - the step's row
+    qp = torch.randn(150, Hq, D, device=dev, dtype=bf)
+    for kq in _prefill_forms(cu):
+        pf = _flash_prefill(cu, qp, K, V, n0, scale, win, kq=kq)
+        assert torch.equal(_flash_prefill(cu, qp, Kp, Vp, n0, scale, win, tbl=tbl, kq=kq), pf), kq
+        one = _flash_prefill(cu, qp[:1], Kp, Vp, n0, scale, win, tbl=tbl, kq=kq)
+        assert torch.equal(one, _flash(cu, qp[:1], K, V, n0, [-1], scale, win)), kq
+    # a node's keys named one by one from its window's start (`_card_attention`'s KeyRows): the map's pointer set back
+    # by the window's first position, never read before it - the node's row as its step's through the whole map
+    pos = n0 + 3
+    first = max(0, pos + 1 - win) if win else 0
+    rows = tbl[first : pos + 1].clone()
+    via = ctypes.c_void_p(int(rows.data_ptr()) - 4 * first)
+    node = _flash(cu, q[:1], Kp, Vp, pos, [-1], scale, win, tbl=via, cap=cap)
+    assert torch.equal(node, _flash(cu, q[:1], K, V, pos, [-1], scale, win)), "a node through its named keys"

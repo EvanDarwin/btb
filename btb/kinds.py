@@ -314,6 +314,9 @@ class PassTag(StrEnum):
     # prefill), read from the buffer itself rather than the views an append hands back
     MLX_ATTN_KERNEL = "mlx_attn_kernel"
     CUDA_GRAPH = "cuda_graph"  # a captured card graph ran the pass (_forward_card_segment/_forward_fast/step graph)
+    # a prompt's chunk through the card graph's kernels as they come, each row the row its step makes
+    # (_forward_card_prefill)
+    CARD_PREFILL = "card_prefill"
     CUDA_TORCH_FALLBACK = "cuda_torch_fallback"  # a card layer through torch modules, btb's kernels absent
     CPU_NATIVE = "cpu_native"  # a host layer through the native CPU gemv kernels
     MLX_PEROP = "mlx_perop"  # a host layer's linears through Native.mlx.linear (the non-fused MLX path: MoE, offload)
@@ -345,6 +348,15 @@ class PassTag(StrEnum):
     ROWS_FLAT = "rows_flat"  # a fork's or a batch's rows on the MLX batched step, over one flat buffer
     ROWS_JOINED = "rows_joined"  # a fork's or a batch's rows on the torch pass, prefix and own rows joined
     ROWS_CARD = "rows_card"  # a fork's or a batch's rows on the card graph's rows pass, read in place in its arena
+    # the reader a pass's attention took its cache rows through (btb/engine/state.py `_tag_kv`)
+    KV_CONTIGUOUS = "kv_contiguous"  # the conversation's own buffers, its rows in order from the first
+    KV_PAGED = "kv_paged"  # the engine's pool of pages, read through the conversation's row map (btb/engine/paged.py)
+    KV_PARK = "kv_park"  # the conversation's pages brought back onto the card from pinned RAM (`CardRegion.bind`)
+    # what a decode over a session kept of the cache for its prompt (btb/session.py `_begin_decode`)
+    PREFIX_HIT = "prefix_hit"  # rows of the prompt the cache held: prefilled from there on
+    PREFIX_MISS = "prefix_miss"  # nothing kept: the whole prompt prefilled
+    PREFIX_SHARED = "prefix_shared"  # the prompt opened on rows the prefix tree holds, read in place (`_open_paged`)
+    SNAPSHOT_RESUME = "snapshot_resume"  # a hybrid's recurrent states restored from a kept snapshot to resume
     # the placement tiers a pass ran layers on (btb/engine/device.py Placement.tier)
     TIER_RESIDENT = "tier_resident"
     TIER_HOST = "tier_host"

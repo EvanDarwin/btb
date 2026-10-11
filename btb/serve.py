@@ -22,7 +22,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from . import available_models, load, model_stem, resolve, serve_name
 from .draft import SpanBank
@@ -180,7 +180,9 @@ class Engine:
         for r in rows:
             self.bank.add("answer", r)
         self.bank.add("prompt", ids)
-        return rows, ended, gen.stats, lp
+        # the fork's counts are its rows'; the prompt's reuse is the `sync` that opened it
+        stats = cast("GenerateStats", {**gen.stats, "reused": s.last_reuse})
+        return rows, ended, stats, lp
 
     def text(self, toks: Tokens) -> tuple[str, str]:
         """(answer, reasoning) of a generated token list: gpt-oss's final channel and its analysis, every
@@ -1151,15 +1153,23 @@ class Handler(BaseHTTPRequestHandler):
                     for j, c in enumerate(calls)
                 ]
 
-            def usage(reply: Reply) -> Json:
+            def usage(reply: Reply, c: GenerateStats) -> Json:
                 out = sum(row.spent for row in reply.rows)
-                return {"prompt_tokens": len(ids), "completion_tokens": out, "total_tokens": len(ids) + out}
+                return {
+                    "prompt_tokens": len(ids),
+                    "completion_tokens": out,
+                    "total_tokens": len(ids) + out,
+                    # the prompt's tokens the session's cache held already: OpenAI's cached prompt count
+                    "prompt_tokens_details": {"cached_tokens": int(c.get("reused", 0))},
+                }
 
             reply = Reply(engine.tok, engine.eos, n, stops, tools, fmt)
             t0 = time.perf_counter()
             if not stream:
                 c, t_first = self._answer(engine, reply, ids, max_new, smp, procs, top, messages)
-                self._flex(engine, [t for row in reply.rows for t in row.tokens], c, t0, t_first, time.perf_counter())
+                self._flex(
+                    engine, ids, [t for row in reply.rows for t in row.tokens], c, t0, t_first, time.perf_counter()
+                )
                 choices = []
                 for row in reply.rows:
                     msg: Message = {"role": "assistant", "content": (row.content or None) if row.calls else row.content}
@@ -1179,7 +1189,7 @@ class Handler(BaseHTTPRequestHandler):
                         "created": created,
                         "model": engine.name,
                         "choices": choices,
-                        "usage": usage(reply),
+                        "usage": usage(reply, c),
                     },
                 )
             self._stream_head("text/event-stream")
@@ -1219,9 +1229,9 @@ class Handler(BaseHTTPRequestHandler):
             with self._stream(reply, render, keepalive=": \n\n") as w:
                 c, t_first = self._answer(engine, reply, ids, max_new, smp, procs, top, messages)
                 if want_usage:  # OpenAI's include_usage: a last chunk with no choices carries the counts
-                    w.put(chunk([], usage=usage(reply)))
+                    w.put(chunk([], usage=usage(reply, c)))
                 w.put("data: [DONE]\n\n")
-            self._flex(engine, [t for row in reply.rows for t in row.tokens], c, t0, t_first, time.perf_counter())
+            self._flex(engine, ids, [t for row in reply.rows for t in row.tokens], c, t0, t_first, time.perf_counter())
             return None
 
     def _limit(self, req: Request) -> int | None:
@@ -1253,6 +1263,7 @@ class Handler(BaseHTTPRequestHandler):
     def _flex(
         self,
         engine: Engine,
+        ids: Tokens,
         toks: Tokens,
         c: GenerateStats,
         t0: float,
@@ -1260,13 +1271,14 @@ class Handler(BaseHTTPRequestHandler):
         t_end: float,
     ) -> Any:
         """One line to the console after a request: the generation rate (decode only, the number to show
-        off), first-token latency, and tokens per weight pass when speculation ran."""
+        off), the prompt and how much of it the cache held, first-token latency, and tokens per weight pass when
+        speculation ran."""
         n = len(toks)
         if not n:
             return
         gen = t_end - (t_first if t_first is not None else t0)
         tps = n / gen if gen > 0 else 0.0
-        bits = [f"{engine.name}: {n} tok, {tps:.1f} tok/s"]
+        bits = [f"{engine.name}: {n} tok, {tps:.1f} tok/s", f"prompt {len(ids)}, {int(c.get('reused', 0))} cached"]
         if t_first is not None:
             bits.append(f"first {t_first - t0:.2f}s")
         fwd = c.get("forwards") if c else None
@@ -1297,7 +1309,7 @@ class Handler(BaseHTTPRequestHandler):
         if not stream:
             c, t_first = self._answer(engine, reply, ids, max_new, smp, procs, messages=messages)
             t_end = time.perf_counter()
-            self._flex(engine, row.tokens, c, tg, t_first, t_end)
+            self._flex(engine, ids, row.tokens, c, tg, t_first, t_end)
             end = {"done": True, **self._stats(ids, row, t0, t_first, t_end)}
             return self._json(200, {"model": name, "created_at": _now(), **whole(row), **end})
         self._stream_head("application/x-ndjson")
@@ -1312,7 +1324,7 @@ class Handler(BaseHTTPRequestHandler):
             t_end = time.perf_counter()
             end = {"done": True, **self._stats(ids, row, t0, t_first, t_end)}
             w.put(json.dumps({"model": name, "created_at": _now(), **last, **end}) + "\n")
-        self._flex(engine, row.tokens, c, tg, t_first, t_end)
+        self._flex(engine, ids, row.tokens, c, tg, t_first, t_end)
         return None
 
     def _ollama_chat(self, req: Request) -> Any:

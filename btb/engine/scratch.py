@@ -24,10 +24,16 @@ class Scratch:
     def __init__(self, sm: Any) -> None:
         self._sm = weakref.ref(sm)
         self._bufs: dict[tuple[str, str], torch.Tensor] = {}
+        # the reservation the takes draw on while one holds room for them (the layer-by-layer prefill's, its chunks'
+        # working set): None, none
+        self.draws: str | None = None
         sm.holdings.own(Stage.MEMORY, "the passes' scratch buffers", self.clear)
 
     def take(self, name: str, shape: Sequence[int], dtype: torch.dtype, device: Any, requester: str) -> torch.Tensor:
-        """buffer `name` on `device` as `shape` of `dtype` (its contents whatever the last user left)"""
+        """buffer `name` on `device` as `shape` of `dtype` (its contents whatever the last user left), asked of the
+        scheduler out of the reservation `draws` names: inside the sweep, the room it holds for its chunks' buffers
+        (priced past it, a chunk's buffer was refused the room reserved for it, and the layer ran in torch out of that
+        very room)"""
         dev = torch.device(device)
         key = (name, str(dev))
         n = math.prod(int(s) for s in shape)
@@ -39,10 +45,20 @@ class Scratch:
             sm = self._sm()
             assert sm is not None
             nbytes = n * torch.empty(0, dtype=dtype).element_size()
-            sm.scheduler.grant(nbytes, "scratch", requester=requester, device=dev)
+            sm.scheduler.grant(nbytes, "scratch", requester=requester, device=dev, draws=self.draws)
             t = torch.empty(n, dtype=dtype, device=dev)
             self._bufs[key] = t
         return t[:n].view(*shape)
+
+    def release(self, prefix: str = "", device: Any = None) -> int:
+        """the buffers whose names start with `prefix` (every one where empty) on `device` (every device where None)
+        let go - a view a pass still holds keeps its memory until the pass lets it go - and the bytes they held"""
+        dev = str(torch.device(device)) if device is not None else None
+        gone = 0
+        for key in [k for k in self._bufs if k[0].startswith(prefix) and (dev is None or k[1] == dev)]:
+            t = self._bufs.pop(key)
+            gone += t.numel() * t.element_size()
+        return gone
 
     def clear(self) -> None:
         self._bufs.clear()

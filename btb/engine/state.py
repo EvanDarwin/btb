@@ -60,7 +60,7 @@ if TYPE_CHECKING:
     from ..mlx import Backend, Shared
     from ..mlx.mega import MegaPass
     from ..sampling import Sampling
-    from ..session import Session
+    from ..session import Anchor, Session
     from .cache import KvCache
     from .device import Device, DeviceSpec
     from .drafter import MTPDrafter
@@ -411,7 +411,18 @@ class _State:
     def _card_segment_at(self, i: int, n_layers: int) -> tuple[int, int] | None:
         raise NotImplementedError
 
-    def _card_ready(self) -> bool:  # an engine without the card mixin runs no card graph
+    def _card_prefill_ok(
+        self, cache: Any, B: int, T: int, am: torch.Tensor | None, stop_after: int | None
+    ) -> bool:  # an engine without the card mixin runs no prompt on the card graph's kernels
+        return False
+
+    def _card_runs_layer(self, i: int) -> bool:  # an engine without the card mixin runs no layer in a card graph
+        return False
+
+    def _card_ready(self, capture: bool = True) -> bool:  # an engine without the card mixin runs no card graph
+        return False
+
+    def _card_off_route(self, i: int) -> bool:  # an engine without the card mixin has no card route to leave
         return False
 
     def _card_let_go(self) -> None:  # an engine without the card mixin holds no card graph
@@ -428,6 +439,9 @@ class _State:
         return False
 
     def _card_arena_take(self, cache: Any, T: int) -> bool:
+        return False
+
+    def _card_arena_has(self, cache: Any, n: int) -> bool:
         return False
 
     def _card_program(
@@ -489,6 +503,21 @@ class _State:
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         raise NotImplementedError
 
+    def _forward_card_prefill(
+        self,
+        a: int,
+        b: int,
+        h: torch.Tensor,
+        pas: Any,
+        tail: bool,
+        all_rows: bool = False,
+        bind_rows: int | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        raise NotImplementedError
+
+    def _card_tail(self, h: torch.Tensor) -> torch.Tensor | None:  # an engine without the card mixin has no card head
+        return None
+
     def _forward_fast(self, h: torch.Tensor, pe: Any, cache: Any, last_only: bool, head: bool) -> torch.Tensor:
         raise NotImplementedError
 
@@ -517,6 +546,14 @@ class _State:
         raise NotImplementedError
 
     def ai(self, layer: Any, i: int, h: torch.Tensor, pe: Any, text_pos: Any, cache: Any) -> torch.Tensor:
+        raise NotImplementedError
+
+    @staticmethod
+    def _span_lists(paged: Any, base: int, T: int, win: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        raise NotImplementedError
+
+    @staticmethod
+    def _node_lists(paged: Any, base: int, T: int, parents: Parents, win: int) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
     # -- mlx_forward.py --
@@ -649,11 +686,14 @@ class _State:
         raise NotImplementedError
 
     @staticmethod
-    def _lin_snap(cl: LinLayer) -> LinSnap:
+    def _lin_snap(cl: LinLayer, dev: torch.device | None = None) -> LinSnap:
+        raise NotImplementedError
+
+    def _lin_home(self, i: int) -> torch.device:
         raise NotImplementedError
 
     @staticmethod
-    def _lin_restore(cl: LinLayer, snap: LinSnap) -> None:
+    def _lin_restore(cl: LinLayer, snap: LinSnap, dev: torch.device | None = None) -> None:
         raise NotImplementedError
 
     def generate_greedy(
@@ -708,6 +748,21 @@ class _State:
     ) -> tuple[Any, Any]:
         raise NotImplementedError
 
+    def _anchor(self, cache: Any, at: int, logits: Any, h_last: torch.Tensor | None) -> Anchor:
+        raise NotImplementedError
+
+    def _prefill_at_blocks(
+        self,
+        ids: torch.Tensor,
+        cache: Any,
+        reuse: int,
+        tail: int,
+        hook: Any,
+        snap: Callable[[int, Any], Anchor],
+        last_only: bool = True,
+    ) -> tuple[Any, list[Anchor]]:
+        raise NotImplementedError
+
     # -- families/__init__.py --
     def _make_host_layer(self, i: int) -> Any:
         raise NotImplementedError
@@ -726,6 +781,10 @@ class _State:
     def new_cache(self, max_len: int | None = None) -> Any:
         raise NotImplementedError
 
+    # -- text.py --
+    def _decode_cache(self, max_len: int) -> Any:
+        raise NotImplementedError
+
     # -- memory.py --
     def lend_policy(self) -> None:
         raise NotImplementedError
@@ -736,7 +795,9 @@ class _State:
     def cache_growth(self, cache: KvCache | None, B: int, T: int, peak: bool = False) -> dict[Where, int]:
         raise NotImplementedError
 
-    def _make_room(self, dev: torch.device, nbytes: int, what: str, own: str | None = None) -> set[str]:
+    def _make_room(
+        self, dev: torch.device, nbytes: int | Callable[[], int], what: str, own: str | None = None
+    ) -> set[str]:
         raise NotImplementedError
 
     def _give_up_one(self, dev: torch.device, short: int, tried: set[str]) -> bool:
@@ -784,6 +845,13 @@ class _State:
         self._tag(*{_TIER_TAG[place.tier(i)] for i in range(n_layers)})
         if self.fp8_widened:
             self._tag(PassTag.FP8_WIDENED)
+
+    def _tag_kv(self, cache: Any) -> None:
+        """record the reader the pass's attention takes the cache's rows through: the engine's pool of pages through
+        the conversation's row map (a session's cache where the prefix cache serves the engine), or a cache's own
+        buffers, its rows in order from the first (none for a pass with no cache)"""
+        if cache is not None:
+            self._tag(PassTag.KV_PAGED if getattr(cache, "paged", False) else PassTag.KV_CONTIGUOUS)
 
     def _tag_quant(self) -> None:
         """record the stored-weight path on MLX: as-stored quant bytes (`mlx_state.affine`) vs a bf16 slot"""

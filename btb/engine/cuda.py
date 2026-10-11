@@ -31,8 +31,8 @@ from .families import act_name
 from .fixed_rows import KeyRows
 from .forward import chain_of, layer_window, node_mask, pe_for
 from .fused import _fused_rope
-from .native import Native, kernels_path
-from .scheduler import _size
+from .native import Native, _Cuda, kernels_path
+from .scheduler import MemoryGrantError, _size
 from .spec_cost import SpecCost
 from .state import _State
 
@@ -40,6 +40,12 @@ if TYPE_CHECKING:
     from .forward import PassRope, Rope
 
 _KERNELS_WARNED = False
+
+
+class CardPassFailed(RuntimeError):
+    """A card pass that failed once its layer hook had seen a layer: no other path runs it again, or the hook would
+    see those layers twice (`_forward_card_prefill`). Never the card out of memory (`_is_card_oom`), whatever the
+    failure under it"""
 
 
 def _card_warning(reason: str) -> None:
@@ -89,11 +95,11 @@ def _captured(exec_id: int) -> None:
 
 class _Warm:
     """a pass's L2 warming (`_CudaMixin._card_warm`): called after each matvec is launched, it forks `side` from
-    the chain there and warms the next weight of `seq` - (weight, rows, cols, the warps its matvec cuts k into) -
-    with `btb_l2_warm`, the share of each warp's slice read on the card from `share` (the card state's switch,
-    moved between replays), so the warming runs beside the kernels between the two matvecs; `join()` brings `side`
-    back into the chain at the pass's end, which a capture needs. It holds the pass's weights and pointers and
-    nothing of the card's state, so nothing outlives the pass through it"""
+    the chain there and warms the next weight of `seq` - (weight, rows, cols) - with `btb_l2_warm`, the share of
+    each row read on the card from `share` (the card state's switch, moved between replays), so the warming runs
+    beside the kernels between the two matvecs; `join()` brings `side` back into the chain at the pass's end, which
+    a capture needs. It holds the pass's weights and pointers and nothing of the card's state, so nothing outlives
+    the pass through it"""
 
     __slots__ = ("blocks", "i", "k", "seq", "share", "side", "sink")
 
@@ -102,7 +108,7 @@ class _Warm:
         k: Any,
         side: torch.cuda.Stream | None,
         sink: torch.Tensor | None,
-        seq: list[tuple[torch.Tensor, int, int, int]],
+        seq: list[tuple[torch.Tensor, int, int]],
         blocks: int,
         share: ctypes.c_void_p | None = None,
     ) -> None:
@@ -111,7 +117,7 @@ class _Warm:
     def __call__(self) -> None:
         if self.side is None or self.i >= len(self.seq):
             return
-        W, R, C, nw = self.seq[self.i]
+        W, R, C = self.seq[self.i]
         self.i += 1
         self.side.wait_stream(torch.cuda.current_stream())
         c = ctypes.c_int
@@ -119,7 +125,7 @@ class _Warm:
             "btb_l2_warm",
             (self.blocks, 1, 1),
             (256, 1, 1),
-            [self.k.ptr(W), c(R), c(C), c(nw), self.share, self.k.ptr(self.sink)],
+            [self.k.ptr(W), c(R), c(C), self.share, self.k.ptr(self.sink)],
             stream=self.side,
         )
 
@@ -355,7 +361,13 @@ class _CudaMixin(_State):
             pre = tuple(x.clone() for x in self._lin(layer))
         base: Any = None
         if lt != LayerKind.LINEAR and (tree or win):
-            base = layer.keys.shape[-2] if getattr(layer, "keys", None) is not None else 0
+            if getattr(layer, "paged", False):
+                base = layer.get_seq_length()
+            else:
+                base = layer.keys.shape[-2] if getattr(layer, "keys", None) is not None else 0
+        depth = [0] * T  # each node's depth: its position once committed is base + depth
+        for p in range(T):
+            depth[p] = 0 if parents[p] < 0 else depth[parents[p]] + 1
         for p in range(T):
             hp = h[:, p : p + 1]
             pos_p = text_pos[:, p : p + 1]
@@ -377,7 +389,7 @@ class _CudaMixin(_State):
                 elif dev.type == Device.CUDA or not self.fam.fast:
                     # on the card, and wherever the attention is the family's own module (gpt-oss's sinks take
                     # `KeyRows` on the host too; the host sdpa of the others takes the bool row)
-                    mask_p = KeyRows(rows.nonzero()[:, 0].to(dev, non_blocking=True))
+                    mask_p = KeyRows(rows.nonzero()[:, 0].to(dev, non_blocking=True), base + depth[p])
                 else:
                     mask_p = rows.view(1, 1, 1, -1).to(dev)
             outs.append(
@@ -397,6 +409,142 @@ class _CudaMixin(_State):
             if tree:
                 self.am[i] = pre
         return torch.cat(outs, dim=1)
+
+    def _card_attention(
+        self, module: Any, query: torch.Tensor, key: Any, value: Any, mask: Any, scaling: float | None
+    ) -> torch.Tensor | None:
+        """A card layer's attention on btb's one attention (btb_attn_flash.cuh), as its module hands it over
+        (`families/attention.py`, the module run by `_run_card_layer`): a prompt's chunk (T > 1) on its prefill form,
+        each row over every key before it; a one-row call - a step, or a verify pass's node, its rows named
+        (`KeyRows`) - on its decode form, the card graph's, the node's keys walked at the positions its committed step
+        will read them from. Each row's bits are its own, so a prompt's rows are the rows its steps make. A paged
+        layer's rows (`PagedKV`) through the card's row map; a contiguous layer's where they lie, through the same
+        kernels, so the two caches keep one set of bits. Returns [1, T, Hq, D], or None where the call is not one these
+        take - a caller's mask, a shape the kernels lack - for the module's own sdpa, which a paged layer's rows never
+        reach"""
+        from transformers.cache_utils import DynamicSlidingWindowLayer
+
+        from .paged import PagedKV
+
+        ctx = getattr(self, "_attn_ctx", None)
+        if int(query.shape[0]) != 1 or query.dtype != torch.bfloat16 or ctx is None or self.fam.own:
+            return None
+        # loaded here if nothing before loaded them: a family the card graph does not serve asks no other gate, and
+        # read unloaded, its first prompt took the module's sdpa and every later one these kernels
+        k = self._card_kernels()
+        if k is None:
+            return None
+        _, Hq, T, D = (int(x) for x in query.shape)
+        i = int(getattr(module, "layer_idx", -1))
+        if (
+            k.flash_prefill_kernel(D) not in k.fn  # the orientation this card takes (`btb_mma_roles`)
+            or f"btb_attn_flash_d{D}" not in k.fn
+            or not 0 <= i < min(self.L, len(ctx.layers))
+            # a layer that lets its rows past the window go holds no position's row where the walk looks for it
+            or isinstance(ctx.layers[i], DynamicSlidingWindowLayer)
+        ):
+            return None
+        win = layer_window(self.cfg, self.layer_types[i])
+        tbl: torch.Tensor | None = None
+        if isinstance(key, PagedKV):
+            card = key.layer.pool.card
+            assert card is not None  # a PagedKV is a card layer's
+            kb, vb = card.view(key.layer.i)
+            n0, tbl = key.n0, card.tbl
+        else:
+            kb, vb = key, value
+            if not (
+                isinstance(kb, torch.Tensor)
+                and isinstance(vb, torch.Tensor)
+                and kb.is_cuda
+                and kb.dtype == torch.bfloat16
+                and vb.dtype == torch.bfloat16
+            ):
+                return None
+            if kb.stride(-1) != 1 or kb.stride() != vb.stride():
+                # rows laid out apart (a fused projection's slices): the kernels read K and V at one pair of strides,
+                # so both as one layout - the same values, never the module's sdpa and its bits
+                kb, vb = kb.contiguous(), vb.contiguous()
+            n0 = int(kb.shape[-2]) - T
+            if n0 < 0:
+                return None
+        Hk = int(kb.shape[1])
+        if Hq % Hk or (T > 1 and Hq // Hk > k.flash_prefill_rows(D)):
+            # a prompt's block of the prefill form holds a token's heads whole (`_card_family_ok` asks the same)
+            return None
+        hs, rs = int(kb.stride(1)), int(kb.stride(2))
+        scale = float(scaling if scaling is not None else D**-0.5)
+        P, ci, cf = k.ptr, ctypes.c_int, ctypes.c_float
+        q = query[0].transpose(0, 1).contiguous()  # [T, Hq, D]
+        out = torch.empty(T, Hq, D, dtype=torch.bfloat16, device=query.device)
+        if T > 1:
+            if isinstance(mask, KeyRows):
+                return None
+            # the prefill form: 64 rows a block (32 at the widest head), the rows' states in a float32 buffer of the
+            # chunk's rows, its block's shared memory dynamic
+            who = "the card's attention: a prompt chunk's row states"
+            run = self.scratch.take("card attention rows", (T * Hq * D,), torch.float32, query.device, who)
+            tpb = k.flash_prefill_rows(D) // (Hq // Hk)
+            k.launch(
+                k.flash_prefill_kernel(D),
+                ((T + tpb - 1) // tpb, Hk, 1),
+                (128, 1, 1),
+                [P(q), P(kb), P(vb), P(out), ci(n0), ci(T), ci(Hq), ci(Hk), ci(hs), ci(rs), cf(scale), ci(win)]
+                + [P(tbl), P(run)],
+                shared=k.flash_prefill_smem(D),
+            )
+            return out[None]
+        rows: torch.Tensor | None = None
+        first = 0
+        if isinstance(mask, KeyRows):
+            # the node's keys in the order its step reads them, at the positions the step reads them from: the walk's
+            # position j (first <= j <= pos) at row rows[j - first], the map's pointer set back by `first` entries
+            idx = mask.idx
+            pos = int(mask.pos) if mask.pos is not None else int(idx.numel()) - 1
+            first = pos + 1 - int(idx.numel())
+            rows = (tbl[idx] if tbl is not None else idx).to(torch.int32)
+            n0 = pos
+        walk = self.scratch.take("card attention walk", (2,), torch.int32, query.device, "the card's attention")
+        walk[0:1].fill_(n0)
+        walk[1:2].fill_(-1)
+        GK = self._attn_group(D)
+        S = (n0 + 1 + GK - 1) // GK
+        who = "the card's attention: its groups' states"
+        part_m = self.scratch.take("card attention m", (S * Hq,), torch.float32, query.device, who)
+        part_l = self.scratch.take("card attention l", (S * Hq,), torch.float32, query.device, who)
+        part_acc = self.scratch.take("card attention acc", (S * Hq * D,), torch.float32, query.device, who)
+        cnt = self.scratch.take("card attention cnt", (Hq,), torch.int32, query.device, who)
+        cnt.zero_()  # the last group of each row folds and leaves its count at 0; a buffer made new holds anything
+        if rows is not None:
+            via = ctypes.c_void_p(int(rows.data_ptr()) - 4 * first)
+        else:
+            via = P(tbl)
+        k.launch(
+            f"btb_attn_flash_d{D}",
+            ((Hq // Hk + 7) // 8, S, Hk),
+            (self._attn_warps(D) * 32, 1, 1),
+            [
+                P(q),
+                P(kb),
+                P(vb),
+                P(out),
+                P(walk[0:1]),
+                P(walk[1:2]),
+                ci(1),
+                ci(Hq),
+                ci(Hk),
+                ci(hs),
+                ci(rs),
+                cf(scale),
+                P(part_m),
+                P(part_l),
+                P(part_acc),
+                P(cnt),
+                ci(win),
+                via,
+            ],
+        )
+        return out[None]
 
     def _fast_ok(
         self, cache: Any, B: int, T: int, past: int, am: torch.Tensor | None, on_layer: Any, stop_after: int | None
@@ -546,7 +694,18 @@ class _CudaMixin(_State):
     # by index, so a verify pass reproduces the one-token steps of the same path bit for bit
     _cg: Any
     CARD_T_MAX = 32
-    ATTN_SPLIT = 1024  # keys per attention block along the sequence (ATTN_SPLIT in btb_kernels.cu)
+
+    @staticmethod
+    def _attn_group(D: int) -> int:
+        """the keys of a group of the one attention (btb_attn_flash.cuh): GT tiles of BN, a decode block's"""
+        return 8 * (32 if D >= 256 else 64)
+
+    @staticmethod
+    def _attn_warps(D: int) -> int:
+        """the warps of a block of the one attention's decode form (FaPick::WPB): the tile states it folds sit in
+        shared memory, four at the widest head"""
+        return 4 if D >= 256 else 8
+
     PROGRAM_SAMPLES = 5  # the timed replays of each width a card program's warm-up keeps the fastest of
 
     def _card_kernels(self) -> Any:
@@ -578,13 +737,18 @@ class _CudaMixin(_State):
             )
             if ok:
                 H, Hq, Hk, D, I = self._card_dims()
-                # the kernels' shapes: a lane holds D/32 dims of a head, the rows load 16 bytes at a time
+                # the kernels' shapes: a lane holds D/32 dims of a head, the rows load 16 bytes at a time, and a
+                # prompt's block of the one attention holds a token's heads whole
                 ok = D in (64, 128, 256) and H % 8 == 0 and I % 8 == 0 and (Hq * D) % 8 == 0 and Hq % Hk == 0
+                ok = ok and Hq // Hk <= _Cuda.flash_prefill_rows(D)
             self._card_family = ok
         return bool(ok)
 
-    def _card_ready(self) -> bool:
-        """the engine can run the card graph at all: the card, the cache on it, a family the kernels know"""
+    def _card_ready(self, capture: bool = True) -> bool:
+        """the engine can run the card graph at all: the card, the cache on it, a family the kernels know - and, for
+        a graph to capture (`capture`), no build the card had no room for at this placement and not long ago
+        (`_card_oom`). The kernels launched as they come (`_forward_card_prefill`) take no graph's room: they run
+        through that while, so the rows stay the steps' own"""
         return (
             self.dev.type == Device.CUDA
             and not getattr(self, "kv_host", False)
@@ -593,9 +757,14 @@ class _CudaMixin(_State):
             and getattr(self, "_probe", None) is None
             and self._card_family_ok()
             and self._card_kernels() is not None
-            # a build the card had no room for, at this placement and not long ago (`_card_oom`)
-            and not self._card_off_now()
+            and not (capture and self._card_off_now())
         )
+
+    def _card_off_route(self, i: int) -> bool:
+        """whether layer `i` run through torch's modules is off the route its rows take: the card graph serves the
+        family and runs the layer, so a step - and a prompt cold - makes its rows on the card's kernels (a pass that
+        fell back, out of room, made other bits)"""
+        return self._card_ready(capture=False) and self._card_runs_layer(i)
 
     # a card graph a build found no room for is tried again this long after, doubling with each refusal at one
     # placement up to CARD_RETRY_MAX_S: the program that took the card may have gone, with no placement move to say so
@@ -688,6 +857,7 @@ class _CudaMixin(_State):
                 graph.reset()
             st["graphs"].clear()
             st["layers"].clear()
+            st.pop("parts", None)
             # the step graph's embedding table too - a granted copy, or a tied head's weight a shed would free
             # otherwise for nothing: made again by the next step graph (`_card_table`)
             st.pop("table", None)
@@ -702,16 +872,24 @@ class _CudaMixin(_State):
 
     @staticmethod
     def _is_card_oom(e: BaseException) -> bool:
-        """whether `e` is the card out of memory: torch's allocator's error, or the driver's from a graph's
-        instantiation or launch (raised as another RuntimeError, an AcceleratorError)"""
-        return isinstance(e, torch.OutOfMemoryError) or (
+        """whether `e` is the card out of memory: torch's allocator's error, the driver's from a graph's
+        instantiation or launch (raised as another RuntimeError, an AcceleratorError), or the scheduler's refusal of
+        a pass's buffers (`MemoryGrantError`) - never a pass no other path may run again (`CardPassFailed`)"""
+        if isinstance(e, CardPassFailed):
+            return False
+        return isinstance(e, (torch.OutOfMemoryError, MemoryGrantError)) or (
             isinstance(e, RuntimeError) and "out of memory" in str(e).lower()
         )
 
     def _card_oom(self, e: BaseException) -> None:
         """a card-graph build the card had no room for (another program took it mid-pass): the graphs let go, the
         card graph off - the pass runs the torch path - until the placement moves or its retry is due (CARD_RETRY_S,
-        doubling at one placement): a program that took the card and left moved no placement"""
+        doubling at one placement): a program that took the card and left moved no placement. Refused again inside
+        the window it opened - the card's kernels a prompt's next layer tries (they take no graph's room) - it is the
+        same refusal: the window stands as it is, the graphs already let go (doubling each time, one prompt's sweep took
+        the window to its cap and synced the card at every layer)"""
+        if self._card_off_now():
+            return
         self._card_let_go()
         ver = self.device.snapshot().version
         off = getattr(self, "_card_off", None)
@@ -759,6 +937,10 @@ class _CudaMixin(_State):
         self._cg = st
         return st
 
+    def _card_runs_layer(self, i: int) -> bool:
+        """whether the card graph runs layer `i`: it lies in one of the graph's runs of resident layers"""
+        return any(a <= i < b for a, b in self._card_state()["segments"])
+
     def _card_segment_at(self, i: int, n_layers: int) -> tuple[int, int] | None:
         for a, b in self._card_state()["segments"]:
             if a == i:
@@ -782,15 +964,8 @@ class _CudaMixin(_State):
             return L
         tmpl = self.resident[i]
         at, mlp = tmpl.self_attn, tmpl.mlp
-        H, Hq, Hk, D, I = self._card_dims()
-        nq, nk = Hq * D, Hk * D
-        W = torch.cat([at.q_proj.weight, at.k_proj.weight, at.v_proj.weight], 0).contiguous()
-        self._set_param(at.q_proj, "weight", W[:nq])
-        self._set_param(at.k_proj, "weight", W[nq : nq + nk])
-        self._set_param(at.v_proj, "weight", W[nq + nk :])
-        G = torch.cat([mlp.gate_proj.weight, mlp.up_proj.weight], 0).contiguous()
-        self._set_param(mlp.gate_proj, "weight", G[:I])
-        self._set_param(mlp.up_proj, "weight", G[I:])
+        W = self._card_merged(i, "q/k/v", [(at.q_proj, "weight"), (at.k_proj, "weight"), (at.v_proj, "weight")])
+        G = self._card_merged(i, "gate/up", [(mlp.gate_proj, "weight"), (mlp.up_proj, "weight")])
         for t in (W, G, at.o_proj.weight, mlp.down_proj.weight):
             if t.dtype != torch.bfloat16 or t.device.type != "cuda":
                 raise RuntimeError(
@@ -814,6 +989,41 @@ class _CudaMixin(_State):
             L["post_ff"] = tmpl.post_feedforward_layernorm.weight
         st["layers"][i] = L
         return L
+
+    def _card_merged(self, i: int, what: str, parts: list[tuple[Any, str]]) -> torch.Tensor:
+        """layer i's weights `parts` (module, name) as one row block, the modules left viewing it: the block they view
+        already where they lie whole in one storage, in order - merged before, the graphs that held it let go since
+        (copied again, a card out of room re-merged every layer of a refused prompt) - else a copy, asked of the
+        scheduler first (it is the card's memory twice until the modules' own go)"""
+        ts = [getattr(m, n) for m, n in parts]
+        rows, cols = sum(int(t.shape[0]) for t in ts), int(ts[0].shape[1])
+        st, at = ts[0].untyped_storage(), ts[0].storage_offset()
+        whole = True
+        for t in ts:
+            whole = (
+                whole
+                and t.is_contiguous()
+                and int(t.shape[1]) == cols
+                and t.untyped_storage().data_ptr() == st.data_ptr()
+                and t.storage_offset() == at
+            )
+            at += t.numel()
+        if whole:
+            return torch.empty(0, dtype=ts[0].dtype, device=ts[0].device).set_(
+                st, ts[0].storage_offset(), (rows, cols), (cols, 1)
+            )
+        sched = getattr(self, "scheduler", None)
+        if sched is not None:
+            nbytes = rows * cols * ts[0].element_size()
+            who = f"layer {i}'s {what} merged for the card's kernels"
+            sched.grant(nbytes, "weights", requester=who, device=ts[0].device, held=nbytes)
+        W = torch.cat([t.detach() for t in ts], 0).contiguous()
+        a = 0
+        for (m, n), t in zip(parts, ts, strict=True):
+            b = a + int(t.shape[0])
+            self._set_param(m, n, W[a:b])
+            a = b
+        return W
 
     def _card_tables(self, st: dict[str, Any], cap: int) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
         """the rope's cos/sin over `cap` positions on the card in bf16, by layer type: a dual-rope family's own
@@ -841,12 +1051,14 @@ class _CudaMixin(_State):
         change of the layers on the card makes a new arena, the common layers' rows copied over. Its front lies in a
         persisting-L2 window, so a short context's attention reads hit L2 under the weights' evict-first loads"""
         ar = st["arena"]
-        if ar is not None and ar["cap"] >= need:
-            return ar
-        H, Hq, Hk, D, I = self._card_dims()
         layers = [i for a, b in st["segments"] for i in range(a, b)]
         slot = {i: j for j, i in enumerate(layers)}
         same = ar is not None and ar["slot"] == slot
+        # deep enough, and over the layers the card runs now: an arena made before a layer was regrown onto the card
+        # has no region for it, and its graphs read past the slots it has
+        if ar is not None and ar["cap"] >= need and same:
+            return ar
+        H, Hq, Hk, D, I = self._card_dims()
         store = ar["A"] if same else KvArena(len(layers), Hk, D, self.dev, self._card_ceiling())
         cap = store.rows_for((max(int(need), int(reach), 4096) + 1023) // 1024 * 1024)
         sched = getattr(self, "scheduler", None)
@@ -898,6 +1110,7 @@ class _CudaMixin(_State):
         new = {"A": store, "cap": store.cap, "slot": slot, "owner": ar["owner"] if ar is not None else None}
         st["arena"] = new
         st["graphs"].clear()
+        self._card_prune_parts(st)
         # how much of the arena's front sits in persisting L2 is the scheduler's call (it holds the
         # hierarchy's sizes); the driver call is only the mechanism
         k = st["k"]
@@ -933,6 +1146,8 @@ class _CudaMixin(_State):
         st = getattr(self, "_cg", None)
         if st is None or st["arena"] is None or st["version"] != self.device.snapshot().version:
             return
+        if getattr(cache, "paged", False):
+            return  # its rows are the prefix cache's region's, never the arena's
         ar = st["arena"]
         owner = ar["owner"]() if ar["owner"] is not None else None
         if owner is not None and owner is not cache:
@@ -946,16 +1161,25 @@ class _CudaMixin(_State):
         the arena grown to the cache's reach as the ledger grants it. Refused, the cache keeps its rows in buffers of
         its own (a long prompt's, presized before the arena could take them, would need a second whole copy there)
         and its passes take the torch layers over them: the arena is the graphs' speed, never a pass's condition.
-        A refused cache is not asked again - its rows only grow"""
-        from .scheduler import MemoryGrantError
-
+        A refused cache is not asked again - its rows only grow. A paged cache's rows are the prefix cache's card
+        region's whichever layers read them: bound there for the pass, or the pass's own appends meet the refusal"""
+        paged = bool(getattr(cache, "paged", False))
         refused = self.__dict__.setdefault("_arena_refused", weakref.WeakSet())
-        if cache in refused:
+        if not paged and cache in refused:
+            return False
+        st = self._card_state()
+        if not st["segments"]:
+            # no layer the card graph runs is on the card (another program took it and every one was shed to the
+            # host): no run's rows for an arena to hold, and the passes take the host's layers. An arena over no
+            # layers has no regions, and its front was read past an empty list
             return False
         try:
-            self._card_bind(cache, self._card_state(), T)
+            self._card_bind(cache, st, T)
             return True
         except MemoryGrantError as e:
+            if paged:
+                self.log(f"[card] the card's region cannot take this conversation's next {T} rows ({e})")
+                return False
             refused.add(cache)
             self.log(f"[card] the arena cannot take this cache's rows ({e}); its passes take the torch layers")
             return False
@@ -971,19 +1195,34 @@ class _CudaMixin(_State):
             return False
         return self._card_arena_holds(cache, T)
 
+    def _card_arena_has(self, cache: Any, n: int) -> bool:
+        """whether `cache`'s first `n` rows have their places on the card already, nothing bound to ask it: a paged
+        cache's in the card's region (its rows reserved before the pass), a contiguous one's in the arena it holds,
+        every run layer's slot in it and its rows reaching `n`. A layer-by-layer sweep's layers ask it - binding
+        there would take the arena from the cache that holds it, at the length the cache has, short of the prompt"""
+        if getattr(cache, "paged", False):
+            return True
+        st = self._card_state()
+        ar = st["arena"]
+        if ar is None or ar["owner"] is None or ar["owner"]() is not cache or int(ar["cap"]) < n:
+            return False
+        return all(i in ar["slot"] for a, b in st["segments"] for i in range(a, b))
+
     def _card_bind(self, cache: Any, st: dict[str, Any], T: int) -> dict[str, Any]:
         import weakref
 
+        if getattr(cache, "paged", False):
+            return self._card_bind_paged(cache, st, T)
         ar = st["arena"]
+        layers = [i for a, b in st["segments"] for i in range(a, b)]
         if ar is not None:
             owner = ar["owner"]() if ar["owner"] is not None else None
             same = owner is not None and owner is cache
-            if cache is not None and same:
+            if cache is not None and same and len(ar["slot"]) == len(layers) and all(i in ar["slot"] for i in layers):
                 # the common step: this cache holds the arena and every run layer sits at its front
                 n = cache.get_seq_length()
                 if n + T <= ar["cap"] and all(cache.layers[i]._an is not None for i in ar["slot"]):
                     return ar
-        layers = [i for a, b in st["segments"] for i in range(a, b)]
         need = 0
         for i in layers:
             layer = cache.layers[i]
@@ -1007,6 +1246,29 @@ class _CudaMixin(_State):
             ):
                 layer.attach(kb, vb)
         return ar
+
+    def _card_bind_paged(self, cache: Any, st: dict[str, Any], T: int) -> dict[str, Any]:
+        """A paged cache on the card for a pass of `T` rows: its table's rows reserved, its pages in the card's region
+        (another conversation's parked where their slots are wanted), its row map uploaded (`PagedCache.bind`). Every
+        conversation's graphs are the same ones - the arenas and the map's buffer are the region's, the map in it the
+        bound table's - made again only when the region's layout moves (its arenas grown past their addresses, the
+        map's buffer longer)"""
+        from .kvpool import PAGE
+
+        card = cache.prefix.pool.card
+        assert card is not None  # a card engine's prefix cache makes its region with its pool
+        cache.bind(T)
+        pg = st.get("pg")
+        if pg is None or pg["card"] is not card or pg["layout"] != card.layout:
+            for key in [key for key, g in st["graphs"].items() if g.get("paged")]:
+                del st["graphs"][key]
+            self._card_prune_parts(st)
+            pg = st["pg"] = {"card": card, "layout": card.layout, "cap": max(card.cap * PAGE, PAGE)}
+        layers = [i for a, b in st["segments"] for i in range(a, b)]
+        off = [i for i in layers if i not in card.arenas]
+        if off:
+            raise RuntimeError(f"[card] layers {off} run on the card with their rows off its region")
+        return pg
 
     @staticmethod
     def _card_m(T: int) -> int:
@@ -1057,54 +1319,35 @@ class _CudaMixin(_State):
             return bool(one), "past the widths the warm-up timed: the engine's kernel"
         return False, "not measured yet"
 
+    # the tensor-core matvec's warps a block, each its own row group: 16 rows (btb_gemv_mma_bf16, the gate/up kernel)
+    # or 8 (btb_gemv_mma8_bf16) - the block's size moves no bit
+    MMA_WARPS = 4
+    MMA8_WARPS = 1
+
     @staticmethod
-    def _card_mma_grid(R: int, C: int) -> int:
-        """the launch of btb_gemv_mma_bf16 for a [R, C] weight: one block per group of 16 rows (a shorter grid
-        strides the groups and is only slower, never wrong)"""
-        return (R + 15) // 16
-
-    # the row groups at which two warps a group keep the card's DRAM streaming (`_card_mma_warps`)
-    MMA_WIDE_GROUPS = 512
-
-    @classmethod
-    def _card_mma_warps(cls, R: int, C: int) -> int:
-        """the warps over one group of 16 weight rows in btb_gemv_mma_bf16, k split between them: two where the
-        groups fill the card, four on a weight too short to (Qwen3-0.6B's 1024-row o and down, 64 groups over 60
-        SMs, streamed at 350 GB/s against its head's 441). A function of the weight's shape alone - never of the
-        pass's rows - so a shape's one-row step and its verify pass sum alike, bit for bit"""
-        return 2 if (R + 15) // 16 >= cls.MMA_WIDE_GROUPS else 4
-
-    def _card_mma_narrow(self, R: int) -> bool:
-        """a [R, C] weight's tensor-core matvec at 8 rows a block (`btb_gemv_mma8_bf16`) rather than 16: where 16
-        would not give each of the card's SMs two blocks, a few SMs took a second block while the rest idled
-        through it (Qwen3-0.6B's 1024-row o and down, 64 groups over 60 SMs). The same bits either way"""
-        sms = int(torch.cuda.get_device_properties(self.dev).multi_processor_count)
+    def _card_mma_narrow(R: int, sms: int) -> bool:
+        """a [R, C] weight's tensor-core matvec at a warp a group of 8 rows (btb_gemv_mma8_bf16) rather than 16: where
+        16 would not give each of the card's `sms` SMs two warps (Qwen3-0.6B's 1024-row o and down: 64 groups on 60
+        SMs, too few loads standing to stream them). Each output one chain over all of k in either, so the same bits"""
         return (R + 15) // 16 < 2 * sms
 
-    # the prefix from which a tree pass's attention reads each KV group's keys once for its heads
-    # (`_card_attn_shared`)
-    ATTN_SHARED_FROM = 8192
+    @classmethod
+    def _card_mma_kernel(cls, R: int, sms: int) -> str:
+        """the tensor-core matvec kernel for a [R, C] weight (`_card_mma_narrow`)"""
+        return "btb_gemv_mma8_bf16" if cls._card_mma_narrow(R, sms) else "btb_gemv_mma_bf16"
 
     @classmethod
-    def _card_attn_shared(cls, T: int) -> int:
-        """the prefix length from which btb_attn_split_gqa{G} runs a block a KV group - each key read once for
-        the group's heads - where below it a block a head: a tree pass's T rows each re-read the group's keys,
-        which the L2 stops absorbing past a few thousand (Qwen3-0.6B, 5 rows: even at 4k, 11% off the attention
-        at 8k, 26% at 16k, 27% at 40k); a one-row step's re-reads it absorbs, and there the fewer blocks lose.
-        Read on the card from the live prefix, so one graph serves every length; both give the same bits"""
-        return cls.ATTN_SHARED_FROM if T > 1 else 1 << 30
+    def _card_mma_launch(cls, R: int, sms: int) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+        """`_card_mma_kernel`'s launch (grid, block): its row groups, a block's warps each its own"""
+        rows, w = (8, cls.MMA8_WARPS) if cls._card_mma_narrow(R, sms) else (16, cls.MMA_WARPS)
+        return ((R + rows * w - 1) // (rows * w), 1, 1), (32 * w, 1, 1)
 
-    # the card state's switches (`st["switch"]`, int32 on the card): the prefix from which a one-row step's
-    # attention reads each KV group's keys once, and a tree pass's (`_card_attn_shared`), and the share of each
-    # matvec slice warmed into L2 ahead of it, in 256ths (`CARD_WARM`)
-    SW_ATTN_ONE, SW_ATTN_TREE, SW_WARM = 0, 1, 2
+    # the card state's switches (`st["switch"]`, int32 on the card): the share of each weight row warmed into L2 ahead
+    # of its matvec, in 256ths, from the row's start (`CARD_WARM`)
+    SW_WARM = 0
 
     def _card_switch_init(self) -> torch.Tensor:
-        return torch.tensor(
-            [self._card_attn_shared(1), self._card_attn_shared(2), round(256 * float(self.CARD_WARM))],
-            dtype=torch.int32,
-            device=self.dev,
-        )
+        return torch.tensor([round(256 * float(self.CARD_WARM))], dtype=torch.int32, device=self.dev)
 
     @staticmethod
     def _card_switch_ptr(st: dict[str, Any], i: int) -> ctypes.c_void_p:
@@ -1112,14 +1355,23 @@ class _CudaMixin(_State):
         return ctypes.c_void_p(int(st["switch"].data_ptr()) + 4 * i)
 
     def _card_buffers(
-        self, st: dict[str, Any], a: int, b: int, T: int, tail: bool, mma: bool | None = None, rows: bool = False
+        self,
+        st: dict[str, Any],
+        a: int,
+        b: int,
+        T: int,
+        tail: bool,
+        mma: bool | None = None,
+        rows: bool = False,
+        paged: bool = False,
     ) -> dict[str, Any]:
         """the static buffers of the (run, T, GEMV) graph, made once; the graph itself is captured by
         `_card_capture` on the first pass, after that pass's inputs are in place. `rows`: the T rows are sequences
-        of their own (a fork's or a batch's), laid out by `st["rw"]`, and the key carries it"""
+        of their own (a fork's or a batch's), laid out by `st["rw"]`, and the key carries it. `paged`: the rows are
+        the prefix cache's card region's, read and written through its row map (`st["pg"]`), and the key carries it"""
         if mma is None:
             mma = self._card_mma_for(T)
-        key = (a, b, T, tail, bool(mma), "rows") if rows else (a, b, T, tail, bool(mma))
+        key = self._card_key(a, b, T, tail, bool(mma), rows, paged)
         g = st["graphs"].get(key)
         if g is not None:
             return g
@@ -1132,9 +1384,16 @@ class _CudaMixin(_State):
         if tail:
             assert self.head is not None  # the tail runs the head, so it is on the card
             V = int(self.head.weight.shape[0])
-        S = (int(st["arena"]["cap"]) + self.ATTN_SPLIT - 1) // self.ATTN_SPLIT
+        cap = int(st["pg"]["cap"]) if paged else int(st["arena"]["cap"])
+        S = (cap + self._attn_group(D) - 1) // self._attn_group(D)
+        # the graph's own buffers, asked of the ledger first (the GEMV-facing ones at M rows, the tail's logits)
+        el = 2
+        own = M * (H * 3 + (Hq + 2 * Hk) * D + 2 * Hq * D + 2 * I + (I if mma else 0)) * el + M * V * el + V * 4
+        who = f"the card graph's buffers for {T} rows, layers {a}..{b - 1}"
+        self.scheduler.grant(own, "scratch", requester=who, device=dev)
         g = {
             "key": key,
+            "paged": paged,
             "mma": mma,
             "m": torch.zeros(M, I, dtype=bf, device=dev) if mma else None,
             "h": torch.zeros(M, H, dtype=bf, device=dev),
@@ -1144,13 +1403,11 @@ class _CudaMixin(_State):
             "q": torch.zeros(M, Hq, D, dtype=bf, device=dev),
             "att": torch.zeros(M, Hq * D, dtype=bf, device=dev),
             "gu": torch.zeros(M, 2 * I, dtype=bf, device=dev),
-            # the attention's per-split states and arrival counts (the split length is the kernel's; the
-            # count of splits covers the arena, so one graph serves every length)
+            # the attention's per-group states and arrival counts (the group's keys are the kernel's; the count of
+            # groups covers the arena, so one graph serves every length): one set for every graph of T rows over S
+            # groups (`_card_parts`)
             "S": S,
-            "part_m": torch.zeros(S * T * Hq, dtype=torch.float32, device=dev),
-            "part_l": torch.zeros(S * T * Hq, dtype=torch.float32, device=dev),
-            "part_acc": torch.zeros(S * T * Hq * D, dtype=torch.float32, device=dev),
-            "cnt": torch.zeros(T * Hq, dtype=torch.int32, device=dev),
+            **self._card_parts(st, T, S),
             "n0": torch.zeros(1, dtype=torch.int32, device=dev),
             "depth": torch.arange(T, dtype=torch.int32, device=dev),
             # a chain until a pass says otherwise (the warm-up run reads it: a row parented to itself
@@ -1163,6 +1420,43 @@ class _CudaMixin(_State):
         st["graphs"][key] = g
         return g
 
+    def _card_parts(self, st: dict[str, Any], T: int, S: int) -> dict[str, torch.Tensor]:
+        """the one attention's group states for passes of `T` rows over `S` groups (its decode form: a row's state a
+        group it reaches, `cnt` its groups' arrivals), one set for every graph of the card state that takes them -
+        graphs replay one at a time, and each launch leaves `cnt` at zero - asked of the ledger first. A set a graph
+        was the arena's every group again for each run, tail and kernel variant: a gigabyte a graph at a million rows
+        and 32 of them"""
+        parts: dict[tuple[int, int], dict[str, torch.Tensor]] = st.setdefault("parts", {})
+        got = parts.get((T, S))
+        if got is None:
+            _, Hq, _, D, _ = self._card_dims()
+            n, dev = S * T * Hq, self.dev
+            who = f"the card graph's attention states, {T} rows over {S} groups"
+            self.scheduler.grant(4 * (n * (D + 2) + T * Hq), "scratch", requester=who, device=dev)
+            got = parts[(T, S)] = {
+                "part_m": torch.zeros(n, dtype=torch.float32, device=dev),
+                "part_l": torch.zeros(n, dtype=torch.float32, device=dev),
+                "part_acc": torch.zeros(n * D, dtype=torch.float32, device=dev),
+                "cnt": torch.zeros(T * Hq, dtype=torch.int32, device=dev),
+            }
+        return got
+
+    @staticmethod
+    def _card_prune_parts(st: dict[str, Any]) -> None:
+        """the attention states no graph reads any more let go (their graphs made again over another arena)"""
+        used = {(int(g["key"][2]), int(g["S"])) for g in st["graphs"].values()}
+        parts = st.get("parts", {})
+        for key in [key for key in parts if key not in used]:
+            del parts[key]
+
+    @staticmethod
+    def _card_key(
+        a: int, b: int, T: int, tail: bool, mma: bool, rows: bool = False, paged: bool = False
+    ) -> tuple[Any, ...]:
+        """a pass graph's key: its run, width, tail and GEMV, and how it reads the rows - a fork's or a batch's rows
+        layout, the prefix cache's row map, or the arena's front"""
+        return (a, b, T, tail, bool(mma), *(("rows",) if rows else ()), *(("paged",) if paged else ()))
+
     def _card_body(self, st: dict[str, Any], g: dict[str, Any]) -> None:
         """the pass's kernels over `g`'s buffers, layers a..b-1 and the tail when the key carries it: run
         eagerly for the warm-up, then recorded by the capture"""
@@ -1170,11 +1464,22 @@ class _CudaMixin(_State):
 
         a, b, T, tail = g["key"][:4]
         k = st["k"]
-        ar = st["arena"]
         H, Hq, Hk, D, I = self._card_dims()
         M = 32 if g.get("mma") else self._card_m(T)
-        tables = self._card_tables(st, ar["cap"])
         P, ci, cf = k.ptr, ctypes.c_int, ctypes.c_float
+        # the rows' arenas: the prefix cache's card region, read and written through its row map (the map's pointer
+        # the kernels' last argument), or the card graph's own arena at its front
+        paged = bool(g.get("paged"))
+        if paged:
+            card = st["pg"]["card"]
+            tables = self._card_tables(st, st["pg"]["cap"])
+            tbl = [P(card.tbl)]
+            arenas = {i: (card.arenas[i][0, 0], card.arenas[i][0, 1]) for i in range(a, b)}
+        else:
+            ar = st["arena"]
+            tables = self._card_tables(st, ar["cap"])
+            tbl = []
+            arenas = {i: (ar["A"][ar["slot"][i], 0], ar["A"][ar["slot"][i], 1]) for i in range(a, b)}
         Ls = [self._card_weights(st, i) for i in range(a, b)]
         mma = bool(g.get("mma"))
         rows = g["key"][5:] == ("rows",)
@@ -1183,17 +1488,18 @@ class _CudaMixin(_State):
         act = "gelu" if act_name(self.cfg) == "gelu_pytorch_tanh" else "silu"
         gemv = f"btb_gemv_bf16_m{M}"
         gemv_act = f"btb_gemv_{act}_bf16_m{M}"
-        attn = f"btb_attn_rows_d{D}" if rows else f"btb_attn_split_d{D}"
-        nrk = f"btb_norm_rope_kv_rows_d{D}" if rows else f"btb_norm_rope_kv_d{D}"
+        via = "_tbl" if paged else ""
+        # the one attention every pass takes (btb_attn_flash.cuh): a row's bits its own, so a prompt's chunk makes the
+        # rows these steps make. A block a row tile of 8 and a group of the keys, its warps the group's tiles
+        attn = f"btb_attn_flash_rows_d{D}" if rows else f"btb_attn_flash_d{D}"
+        nrk = f"btb_norm_rope_kv_rows_d{D}" if rows else f"btb_norm_rope_kv{via}_d{D}"
         if attn not in k.fn or nrk not in k.fn:
             raise RuntimeError(f"[card] no kernel for head_dim {D}")
-        # the attention in its grouped-query form where the build has one for the model's group width, from the
-        # prefix the card state's switch names for this pass's width (a one-row step's, or a tree's)
-        shared: list[Any] = []
-        gqa = f"btb_attn_split_gqa{Hq // Hk}_d{D}"
-        if not rows and Hq // Hk > 1 and gqa in k.fn:
-            attn, shared = gqa, [self._card_switch_ptr(st, self.SW_ATTN_ONE if T == 1 else self.SW_ATTN_TREE)]
+        G = Hq // Hk
         S = int(g["S"])
+        attn_grid = (T * ((G + 7) // 8), S, Hk) if rows else ((T * G + 7) // 8, S, Hk)
+        attn_block = (self._attn_warps(D) * 32, 1, 1)
+        attn_map = [] if rows else [tbl[0] if tbl else P(None)]  # the tree form's row map (null: none)
         # where each row's keys lie: the tree's (its prefix length, the rows' depths and parents), or the rows'
         # layout, one array for every rows graph
         where = [P(st["rw"])] if rows else [P(g["n0"]), P(g["depth"])]
@@ -1206,29 +1512,18 @@ class _CudaMixin(_State):
             seq += [(L["qkv"], (Hq + 2 * Hk) * D, H), (L["o"], H, Hq * D), (L["gu"], 2 * I, H), (L["down"], H, I)]
         if tail and self.head is not None:
             seq.append((self.head.weight, int(self.head.weight.shape[0]), H))
-        warm = self._card_warm(st, mma, seq)
-        # the graph's kernel variant (`g["fused"]`, the step lanes' own): the gate, up and activation as one kernel
-        # and a short weight's matvec at 8 rows a block - fewer kernels, so fewer edges where another program on the
-        # card takes it and btb's L2 with it. The same bits as the plain ones; which is faster is the tuner's to find
+        warm = self._card_warm(st, seq)
+        # the graph's kernel variant (`g["fused"]`, the step lanes' own): the gate, up and activation as one kernel -
+        # one kernel fewer, so one edge fewer where another program on the card takes it and btb's L2 with it. The
+        # same bits as the plain ones; which is faster is the tuner's to find
         fused = bool(g.get("fused")) and mma
         glu = f"btb_gemv_mma_glu_{act}"
         glu_on = fused and glu in k.fn
 
         def matvec(W: torch.Tensor, xin: torch.Tensor, yout: torch.Tensor, R: int, C: int) -> None:
-            if fused and "btb_gemv_mma8_bf16" in k.fn and self._card_mma_narrow(R):
-                k.launch(
-                    "btb_gemv_mma8_bf16",
-                    ((R + 7) // 8, 1, 1),
-                    (32 * self._card_mma_warps(R, C), 1, 1),
-                    [P(W), P(xin), P(yout), ci(R), ci(C), ci(T)],
-                )
-            elif mma:
-                k.launch(
-                    "btb_gemv_mma_bf16",
-                    (self._card_mma_grid(R, C), 1, 1),
-                    (32 * self._card_mma_warps(R, C), 1, 1),
-                    [P(W), P(xin), P(yout), ci(R), ci(C), ci(T)],
-                )
+            if mma:
+                grid, block = self._card_mma_launch(R, k.sms)
+                k.launch(self._card_mma_kernel(R, k.sms), grid, block, [P(W), P(xin), P(yout), ci(R), ci(C), ci(T)])
             else:
                 k.launch(gemv, ((R + 3) // 4, 1, 1), (128, 1, 1), [P(W), P(xin), P(yout), ci(R), ci(C)])
             warm()
@@ -1236,8 +1531,7 @@ class _CudaMixin(_State):
         warm()
         y_prev = None
         for n, L in enumerate(Ls):
-            j = ar["slot"][a + n]
-            kb, vb = ar["A"][j, 0], ar["A"][j, 1]
+            kb, vb = arenas[a + n]
             # where head g's row r lies (elements): g * hs + r * rs, read off the arena's [Hk, cap, D] view
             kv_strides = (ci(int(kb.stride(0))), ci(int(kb.stride(1))))
             cos_t, sin_t = tables[self.layer_types[a + n]]
@@ -1269,12 +1563,13 @@ class _CudaMixin(_State):
                     ci(Hk),
                     *kv_strides,
                     cen,
+                    *tbl,
                 ],
             )
             k.launch(
                 attn,
-                (Hq, T, S),
-                (256, 1, 1),
+                attn_grid,
+                attn_block,
                 [
                     P(g["q"]),
                     P(kb),
@@ -1290,9 +1585,8 @@ class _CudaMixin(_State):
                     P(g["part_l"]),
                     P(g["part_acc"]),
                     P(g["cnt"]),
-                    ci(S),
                     ci(L["win"]),
-                    *shared,
+                    *attn_map,
                 ],
             )
             matvec(L["o"], g["att"], g["y"], H, Hq * D)
@@ -1319,13 +1613,13 @@ class _CudaMixin(_State):
                 )
             if glu_on:
                 # gate, up and the activation in one kernel, the activation in its epilogue - the plain matvec's
-                # and btb_{act}_mul's bits at the plain kernel's warps for the merged weight (folded into the down
+                # and btb_{act}_mul's bits, each output one chain over all of k whatever the block (folded into the down
                 # projection's x load instead, each row group recomputed the whole row's act(gate) * up before
                 # its loads and stalled the stream: Qwen3-0.6B's down 21.6 us against 1.7 + its GEMV apart)
                 k.launch(
                     glu,
-                    ((I + 15) // 16, 1, 1),
-                    (32 * self._card_mma_warps(2 * I, H), 1, 1),
+                    ((I + 16 * self.MMA_WARPS - 1) // (16 * self.MMA_WARPS), 1, 1),
+                    (32 * self.MMA_WARPS, 1, 1),
                     [P(L["gu"]), P(g["x"]), P(g["m"]), ci(I), ci(H), ci(T)],
                 )
                 warm()
@@ -1374,7 +1668,7 @@ class _CudaMixin(_State):
             g["h"][:T].add_(y_prev[:T])
         warm.join()
 
-    # the share of each warp's k slice of a matvec's weights warmed into L2 ahead of it (`_card_warm`); 0: none
+    # the share of each weight row of a matvec warmed into L2 ahead of it, from the row's start (`_card_warm`); 0: none
     CARD_WARM = 0.0
     # the step loop picks among the switches' settings as it runs, by their measured speed (`_Tuner`)
     CARD_TUNE = True
@@ -1390,7 +1684,7 @@ class _CudaMixin(_State):
             self.CARD_FUSE
             and self.CARD_TUNE
             and self._card_mma_for(1)
-            and ("btb_gemv_mma8_bf16" in k.fn or any(f"btb_gemv_mma_glu_{a}" in k.fn for a in ("silu", "gelu")))
+            and any(f"btb_gemv_mma_glu_{a}" in k.fn for a in ("silu", "gelu"))
         )
 
     def _card_tuner(self, st: dict[str, Any], lanes: list[tuple[str, bool]]) -> _Tuner | None:
@@ -1413,10 +1707,10 @@ class _CudaMixin(_State):
     # the warming kernel's blocks beside the chain's: four loads standing a thread keep the DRAM fed at 24
     WARM_BLOCKS = 24
 
-    def _card_warm(self, st: dict[str, Any], mma: bool, seq: list[tuple[torch.Tensor, int, int]]) -> _Warm:
+    def _card_warm(self, st: dict[str, Any], seq: list[tuple[torch.Tensor, int, int]]) -> _Warm:
         """the pass's L2 warming (`_Warm`, `btb_l2_warm`) over its matvec weights `seq` in launch order, on the card
-        state's side stream: the share of every warp's slice of every row the switch names (`SW_WARM`), the slices as
-        each weight's matvec cuts them. Captured only where warming is on (`CARD_WARM`): at a share of 0 each warming
+        state's side stream: the share of every row the switch names (`SW_WARM`), where each matvec's warps begin.
+        Captured only where warming is on (`CARD_WARM`): at a share of 0 each warming
         kernel leaves at once, but a launch still costs its node. Nothing it does reaches a result: the bits are the
         chain's alone"""
         k = st["k"]
@@ -1429,10 +1723,7 @@ class _CudaMixin(_State):
                 "stream": torch.cuda.Stream(device=dev),
                 "sink": torch.zeros(1, dtype=torch.int32, device=dev),
             }
-        # the tensor-core kernel's warps each take a k slice of whole 32-element super-tiles; the fp32 kernel's one
-        # warp a row walks it from its start
-        plan = [(W, R, C, self._card_mma_warps(R, C) if mma else 1) for W, R, C in seq]
-        return _Warm(k, w["stream"], w["sink"], plan, self.WARM_BLOCKS, self._card_switch_ptr(st, self.SW_WARM))
+        return _Warm(k, w["stream"], w["sink"], seq, self.WARM_BLOCKS, self._card_switch_ptr(st, self.SW_WARM))
 
     def _card_record(self, st: dict[str, Any], g: dict[str, Any], body: Any, what: str) -> None:
         """`body` once eagerly on the arena's stream (the warm-up), then captured there, so the captured
@@ -1557,13 +1848,21 @@ class _CudaMixin(_State):
     CARD_CONTEND = True
 
     def _card_step_lane(
-        self, st: dict[str, Any], table: torch.Tensor, U: int, smp: Any, past: int, first: int, fused: bool = False
+        self,
+        st: dict[str, Any],
+        table: torch.Tensor,
+        U: int,
+        smp: Any,
+        past: int,
+        first: int,
+        fused: bool = False,
+        paged: bool = False,
     ) -> dict[str, Any]:
         """the step graph at `U` steps a replay as a lane of the step loop: captured on first use - `_card_depth()`
         execs of the same steps, launched in turn (an exec launched again while its last launch still runs waits
         for it), each writing its own pinned token slots - its length and token set to the answer's start, its
         sampling configured, and its execs' bookkeeping for this answer fresh"""
-        g, body = self._card_step_graph(st, table, U, smp, fused)
+        g, body = self._card_step_graph(st, table, U, smp, fused, paged)
         g["n0"].fill_(past)
         g["ids"].fill_(first)
         if g["graph"] is None:
@@ -1630,23 +1929,31 @@ class _CudaMixin(_State):
         return max(2, min(8, int(self.CARD_DEPTH)))
 
     def _card_step_graph(
-        self, st: dict[str, Any], table: torch.Tensor, U: int, sampling: Any = None, fused: bool = False
+        self,
+        st: dict[str, Any],
+        table: torch.Tensor,
+        U: int,
+        sampling: Any = None,
+        fused: bool = False,
+        paged: bool = False,
     ) -> tuple[dict[str, Any], Callable[[int], None]]:
         """U one-row steps as one graph: each step's token embedding, every layer, the head, the pick (the argmax,
         or the sample drawn inside the replay from the card's generator, its temperature and top-p read off
         device buffers, its top-k part of the key) written back as the next token, the cache's length advanced
-        and the token published - the host only replays, and streams the tokens as they land"""
+        and the token published - the host only replays, and streams the tokens as they land. `paged`: the rows
+        through the prefix cache's row map, every row the replays reach reserved and mapped before the first"""
         mma = self._card_mma_for(1)
         U = int(U)
         # sampling is None only on a greedy step; `sampled` gates every sampling.* read below
         sampled = sampling is not None and not sampling.greedy
         top_k = int(sampling.top_k) if sampled else 0
         top_p_on = bool(sampled and sampling.top_p < 1.0)
-        key = (0, self.L, 1, True, mma, "step", U, sampled, top_k, top_p_on, bool(fused))
+        key: tuple[Any, ...] = (0, self.L, 1, True, mma, "step", U, sampled, top_k, top_p_on, bool(fused))
+        key += ("paged",) if paged else ()
         g = st["graphs"].get(key)
         if g is not None and g["graph"] is not None:
             return g, _captured  # replayed as captured: the body is never run again
-        g = dict(self._card_buffers(st, 0, self.L, 1, True, mma))
+        g = dict(self._card_buffers(st, 0, self.L, 1, True, mma, paged=paged))
         g["key"] = key
         g["graph"] = None
         g["U"] = U
@@ -1774,7 +2081,10 @@ class _CudaMixin(_State):
         max_new = int(max_new)
         smp = sampling or GREEDY
         target_len = int(ids.shape[1]) + max_new
-        cache = self.new_cache(max_len=target_len)
+        # the prefix cache's pages where the engine has them, as every decode's (`_decode_cache`): the step graph then
+        # reads them through the card's row map, every row its replays reach reserved and mapped before the first
+        cache = self._decode_cache(target_len)
+        paged = bool(getattr(cache, "paged", False))
         logits = self._prefill(ids, cache)
         self.vram_trim("prefill")
         first = int(smp.pick_torch(logits[0, -1:], [smp.key_for(int(ids.shape[1]) - 1)])[0])
@@ -1807,7 +2117,7 @@ class _CudaMixin(_State):
         # goes on through the torch layers
         if not self._card_arena_holds(cache, ((steps + U - 1) // U + 1) * U + 1):
             return torch_steps()
-        ar = st["arena"]
+        layers = [i for a, b in st["segments"] for i in range(a, b)]
         table = self._card_table(st)
         if table is None:
             return torch_steps()
@@ -1829,8 +2139,9 @@ class _CudaMixin(_State):
         for kind, Uk in kinds:
             for fz in variants:
                 try:
-                    lanes[(kind, fz)] = {**self._card_step_lane(st, table, Uk, smp, past, first, fz), "kind": kind}
-                except RuntimeError as err:
+                    lane = self._card_step_lane(st, table, Uk, smp, past, first, fz, paged)
+                    lanes[(kind, fz)] = {**lane, "kind": kind}
+                except (RuntimeError, MemoryGrantError) as err:
                     if not self._is_card_oom(err):
                         raise
                     if (kind, fz) == ("usual", False):
@@ -1944,8 +2255,10 @@ class _CudaMixin(_State):
         # the rows the sequence's processed tokens occupy: the prompt and every token fed to a replay whose
         # output was kept (the one after an eos is not part of the answer)
         n = past + max(0, len(out) - 1)
-        for i in ar["slot"]:
+        for i in layers:
             cache.layers[i].set_front(n)
+        if paged:
+            cache.crop_to(n)  # the rows reserved past the answer's end let go
         self.log(
             f"[stream] generated {len(out)} tokens over 1 rows in {time.time() - t0:.1f}s "
             f"({(time.time() - t0) / max(1, len(out)):.3f} s/step incl. prefill; the step graph, host {done} behind by one)"
@@ -1974,7 +2287,10 @@ class _CudaMixin(_State):
         t_max = max(1, min(t_max, self.CARD_T_MAX))
         n = 0
         with torch.inference_mode():
-            cache = self.new_cache(max_len=int(ids_t.shape[1]) + t_max + 2)
+            # the cache the answers decode over (`_decode_cache`): the prefix cache's pages where the engine has them,
+            # so the graphs captured are the ones its passes replay
+            cache = self._decode_cache(int(ids_t.shape[1]) + t_max + 2)
+            paged = bool(getattr(cache, "paged", False))
             self._prefill(ids_t, cache)
             tok = int(ids_t[0, -1])
             before = len(self._card_state()["graphs"]) if getattr(self, "_cg", None) is not None else 0
@@ -2014,7 +2330,9 @@ class _CudaMixin(_State):
                     moved = True
                     break
                 timed: dict[bool, float] = {m: float("inf") for m in variants}
-                keys = {m: [(*sg, T, tails[sg], m) for sg in segs] for m in variants}
+                keys = {
+                    m: [self._card_key(sg[0], sg[1], T, tails[sg], m, paged=paged) for sg in segs] for m in variants
+                }
                 if any(
                     key not in st["graphs"] or st["graphs"][key].get("graph") is None
                     for ks in keys.values()
@@ -2062,7 +2380,7 @@ class _CudaMixin(_State):
                     for mma in variants:
                         if mma != pick:
                             for sg in segs:
-                                st["graphs"].pop((*sg, T, tails[sg], mma), None)
+                                st["graphs"].pop(self._card_key(sg[0], sg[1], T, tails[sg], mma, paged=paged), None)
                 if len(variants) > 1:
                     self.log(
                         f"[card] one GEMV for every width: {'tensor cores' if pick else 'fp32 chain'} "
@@ -2081,6 +2399,8 @@ class _CudaMixin(_State):
                     + ", ".join(f"{T}:{c / c1:.2f}x" for T, c in cost.items() if T in (1, 2, 4, 8, 16, t_max))
                     + f" (one row {c1 * 1e3:.2f} ms)"
                 )
+            if paged:
+                cache.release()  # the throwaway's pages back to the pool now, not when it is collected
         return n
 
     def _card_program_warm(self, ids_t: torch.Tensor, t_max: int) -> int:
@@ -2273,7 +2593,7 @@ class _CudaMixin(_State):
         cache, T, past = pas.cache, pas.T, pas.past
         st = self._card_state()
         self._card_bind(cache, st, T)
-        g = self._card_buffers(st, a, b, T, tail)
+        g = self._card_buffers(st, a, b, T, tail, paged=bool(getattr(cache, "paged", False)))
         # the pass's inputs first: a first pass captures the graph after them, and its eager run then writes
         # only the cache slots this pass owns
         g["n0"].fill_(past)
@@ -2301,6 +2621,333 @@ class _CudaMixin(_State):
             # 17 rows of the vocabulary to fp32 a pass cost more than the argmax that followed
             return None, g["logits"][:T].view(1, T, -1)
         return g["h"][:T].view(1, T, -1), None
+
+    def _card_prefill_ok(self, cache: Any, B: int, T: int, am: torch.Tensor | None, stop_after: int | None) -> bool:
+        """a prompt's chunk the card graph's kernels take as its steps' rows (`_forward_card_prefill`): one sequence's
+        cache, no caller's mask or early stop, an engine the card graph serves (its kernels loaded, the GEMMs that sum
+        a row as the steps' matvecs do among them) - any width, any position, the first rows of a cache too, a layer
+        hook's pass as well (it reads each layer's residual as the run leaves it), a verify pass's tree of the graph's
+        widths"""
+        return (
+            B == 1
+            and T >= 1
+            and am is None
+            and stop_after is None
+            and cache is not None
+            and not forked(cache)
+            and (T <= self.CARD_T_MAX or getattr(self, "ap", None) is None)
+            and self._card_ready(capture=False)
+        )
+
+    def _forward_card_prefill(
+        self,
+        a: int,
+        b: int,
+        h: torch.Tensor,
+        pas: Any,
+        tail: bool,
+        all_rows: bool = False,
+        bind_rows: int | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """layers a..b-1 over a prompt's chunk `h` [1, T, H] on the card graph's own kernels, launched as they come:
+        the norms, the rope and the cache write, the attention (its prefill form) and the activation each the step's
+        kernel over the chunk's rows, and every matvec a GEMM that sums a row as the step's does (btb_gemm.cuh, the
+        kernel the warm-up picked for the engine's every width) - so each row is the row a step at its position makes,
+        bit for bit, whatever the chunk's width, wherever it starts, and a conversation's next turn read from the
+        cache decodes as the same prompt cold. Returns (h, None), or (None, logits) where the run carries the tail:
+        the last row's [1, 1, V] (every row's with `all_rows`), as the graph's head writes them, bf16, the caller's
+        own. `bind_rows`: the rows the cache is bound for past its length (the chunk's own by default; 0 for a
+        layer-by-layer sweep, which reserved the prompt's rows before its first layer). The pass's layer hook
+        (`pas.on_layer`) reads each layer's residual [1, T, H] as it leaves the layer.
+
+        A verify pass's tree (its parents `self.ap`, its rows' depths the pass's positions, as the graph reads them)
+        takes the attention's decode form, which walks a tree; a chain - a prompt's chunk - its prefill form, the same
+        bits. Every buffer is taken before a row is written, so a refusal (`MemoryGrantError`) or a card out of memory
+        leaves the cache as it was for the torch path to run the pass; once the hook has seen a layer, a failure is
+        never run again (`CardPassFailed`): the hook would see the layers twice"""
+        self._tag(PassTag.CARD_PREFILL)
+        cache, T, past = pas.cache, pas.T, pas.past
+        st = self._card_state()
+        k = st["k"]
+        paged = bool(getattr(cache, "paged", False))
+        self._card_bind(cache, st, T if bind_rows is None else bind_rows)
+        H, Hq, Hk, D, I = self._card_dims()
+        P, ci, cf = k.ptr, ctypes.c_int, ctypes.c_float
+        if paged:
+            card = st["pg"]["card"]
+            cap = int(st["pg"]["cap"])
+            tbl = [P(card.tbl)]
+            arenas = {i: (card.arenas[i][0, 0], card.arenas[i][0, 1]) for i in range(a, b)}
+        else:
+            ar = st["arena"]
+            cap = int(ar["cap"])
+            tbl = []
+            arenas = {i: (ar["A"][ar["slot"][i], 0], ar["A"][ar["slot"][i], 1]) for i in range(a, b)}
+        if past + T > cap:
+            # never past the rows the arena holds: the kernels write through no bound of their own
+            raise RuntimeError(f"[card] the prefill's rows {past}..{past + T} lie past the card's {cap} rows")
+        tables = self._card_tables(st, cap)
+        Ls = [self._card_weights(st, i) for i in range(a, b)]
+        mma = self._card_mma_for(T)
+        sandwich = self.fam.sandwich
+        cen = ci(1 if self.fam.norm_centered else 0)
+        act = "gelu" if act_name(self.cfg) == "gelu_pytorch_tanh" else "silu"
+        nrk = f"btb_norm_rope_kv{'_tbl' if paged else ''}_d{D}"
+        parents = getattr(self, "ap", None) if T > 1 else None
+        if parents is not None and T > self.CARD_T_MAX:
+            raise RuntimeError(f"[card] a tree of {T} rows is past the attention's {self.CARD_T_MAX}")
+        if tail and not self._card_tail_ok():
+            raise RuntimeError("[card] the tail needs the final norm and the head on the card in bf16")
+        # the chunk's buffers, the engine's scratch (granted as they grow, kept for the next chunk), every one taken
+        # before a row of the cache is written
+        dev, bf = self.dev, torch.bfloat16
+        who = "the card's prefill: a prompt chunk's rows through the card graph's kernels"
+
+        def buf(name: str, shape: tuple[int, ...], dt: torch.dtype = bf) -> torch.Tensor:
+            return self.scratch.take(f"card prefill {name}", shape, dt, dev, who)
+
+        hb = buf("h", (T, H))
+        x, y = buf("x", (T, H)), buf("y", (T, H))
+        qkv = buf("qkv", (T, (Hq + 2 * Hk) * D))
+        q, att = buf("q", (T, Hq, D)), buf("att", (T, Hq * D))
+        gu, m = buf("gu", (T, 2 * I)), buf("m", (T, I))
+        # the launch's rows ride the norm/rope write's grid.y, which the card caps: a longer chunk writes in slices,
+        # each from its own start (a chain's depths from 0 in every slice)
+        nsl = (T + self.GRID_Y - 1) // self.GRID_Y
+        where = buf("where", (nsl + T,), torch.int32)  # each slice's start, then the rows' depths
+        if parents is None:
+            # the row states, the buffer the module attention's prefill form takes too (`_card_attention`): one of a
+            # chunk's width, never both at once
+            run = self.scratch.take("card attention rows", (T * Hq * D,), torch.float32, dev, who)
+        else:
+            # the decode form's group states: the groups the card's rows reach, as a graph's cover the arena - the set
+            # the graphs of this width hold where they hold one (`_card_parts`: a hooked verify runs here beside them,
+            # and a set of its own held the arena's every group twice, a gigabyte at a million rows), else the chunk's
+            S = (cap + self._attn_group(D) - 1) // self._attn_group(D)
+            run = buf("par", (T,), torch.int32)
+            held = st.get("parts", {}).get((T, S))
+            if held is not None:
+                part_m, part_l, part_acc, cnt = held["part_m"], held["part_l"], held["part_acc"], held["cnt"]
+            else:
+                part_m = buf("part m", (S * T * Hq,), torch.float32)
+                part_l = buf("part l", (S * T * Hq,), torch.float32)
+                part_acc = buf("part acc", (S * T * Hq * D,), torch.float32)
+                cnt = buf("cnt", (T * Hq,), torch.int32)
+        r0 = 0 if all_rows else T - 1
+        tail_bufs = self._card_tail_buffers(T - r0, H) if tail else None
+        hb.copy_(h.reshape(T, H))
+        for s in range(nsl):
+            where[s : s + 1].fill_(past + s * self.GRID_Y)
+        n0p, depth = where[:1], where[nsl:]
+        if parents is None:
+            torch.arange(T, out=depth)  # a slice's rows read the depths from the first: 0, 1, ... from its start
+        else:
+            # the tree in one slice (CARD_T_MAX rows at most): its rows' depths, their parents, as the graph reads them
+            depth.copy_((pas.text_pos[0] - past).to(torch.int32))
+            run.copy_(torch.as_tensor(list(parents), dtype=torch.int32))
+            cnt.zero_()  # the last group of each row folds and leaves its count at 0; a buffer made new holds anything
+
+        def gemm(W: torch.Tensor, xin: torch.Tensor, yout: torch.Tensor, R: int, C: int, rows: int) -> None:
+            self._card_gemm(k, mma, W, xin, yout, R, C, rows)
+
+        G = Hq // Hk
+        tpb = k.flash_prefill_rows(D) // G
+        smem = k.flash_prefill_smem(D)
+        y_prev: torch.Tensor | None = None
+        hooked = False
+        try:
+            for n, L in enumerate(Ls):
+                kb, vb = arenas[a + n]
+                hs, rs = int(kb.stride(0)), int(kb.stride(1))
+                cos_t, sin_t = tables[self.layer_types[a + n]]
+                k.launch(
+                    "btb_add_rmsnorm",
+                    (T, 1, 1),
+                    (256, 1, 1),
+                    [P(hb), P(y_prev), P(L["ln1"]), cf(L["eps"]), P(x), ci(H), cen],
+                )
+                gemm(L["qkv"], x, qkv, (Hq + 2 * Hk) * D, H, T)
+                # q normed and rotated into its own buffer, k and v into the cache at positions past .. past + T - 1
+                for s in range(nsl):
+                    s0 = s * self.GRID_Y
+                    rows = min(self.GRID_Y, T - s0)
+                    k.launch(
+                        nrk,
+                        (Hq + 2 * Hk, rows, 1),
+                        (32, 1, 1),
+                        [P(qkv[s0:]), P(L["wq"]), P(L["wk"]), cf(L["eps"]), P(cos_t), P(sin_t), P(where[s:])]
+                        + [P(depth), P(kb), P(vb), P(q[s0:]), ci(rows), ci(Hq), ci(Hk), ci(hs), ci(rs), cen, *tbl],
+                    )
+                if parents is None:
+                    k.launch(
+                        k.flash_prefill_kernel(D),
+                        ((T + tpb - 1) // tpb, Hk, 1),
+                        (128, 1, 1),
+                        [P(q), P(kb), P(vb), P(att), ci(past), ci(T), ci(Hq), ci(Hk), ci(hs), ci(rs), cf(L["scale"])]
+                        + [ci(L["win"]), tbl[0] if tbl else P(None), P(run)],
+                        shared=smem,
+                    )
+                else:
+                    k.launch(
+                        f"btb_attn_flash_d{D}",
+                        ((T * G + 7) // 8, S, Hk),
+                        (self._attn_warps(D) * 32, 1, 1),
+                        [P(q), P(kb), P(vb), P(att), P(n0p), P(run), ci(T), ci(Hq), ci(Hk), ci(hs), ci(rs)]
+                        + [cf(L["scale"]), P(part_m), P(part_l), P(part_acc), P(cnt), ci(L["win"])]
+                        + [tbl[0] if tbl else P(None)],
+                    )
+                gemm(L["o"], att, y, H, Hq * D, T)
+                if sandwich:
+                    k.launch(
+                        "btb_sandwich_add", (T, 1, 1), (256, 1, 1), [P(hb), P(y), P(L["ln2"]), cf(L["eps"]), ci(H), cen]
+                    )
+                    k.launch(
+                        "btb_add_rmsnorm",
+                        (T, 1, 1),
+                        (256, 1, 1),
+                        [P(hb), P(None), P(L["pre_ff"]), cf(L["eps"]), P(x), ci(H), cen],
+                    )
+                else:
+                    k.launch(
+                        "btb_add_rmsnorm",
+                        (T, 1, 1),
+                        (256, 1, 1),
+                        [P(hb), P(y), P(L["ln2"]), cf(L["eps"]), P(x), ci(H), cen],
+                    )
+                # gate and up, the activation times up, down: the plain kernels' bits, which the step's fused ones
+                # (the activation in the gate's epilogue, or folded into the down matvec's load) give as well
+                gemm(L["gu"], x, gu, 2 * I, H, T)
+                k.launch(
+                    f"btb_{act}_mul", (min(4096, (T * I + 255) // 256), 1, 1), (256, 1, 1), [P(gu), P(m), ci(T), ci(I)]
+                )
+                gemm(L["down"], m, y, H, I, T)
+                if sandwich:
+                    k.launch(
+                        "btb_sandwich_add",
+                        (T, 1, 1),
+                        (256, 1, 1),
+                        [P(hb), P(y), P(L["post_ff"]), cf(L["eps"]), ci(H), cen],
+                    )
+                else:
+                    y_prev = y
+                if pas.on_layer is not None:
+                    # the residual leaving the layer, a copy, as a stretch of the graph ending there leaves it (its
+                    # add rounded as the next layer's norm rounds it): a hooked pass makes the rows an unhooked one does
+                    hooked = True
+                    pas.on_layer(a + n, (hb + y_prev if y_prev is not None else hb.clone()).view(1, T, H))
+            logits = None
+            if tail_bufs is not None:
+                # the rows the head reads: the last alone, or every one - each row's norm and logits its own either way
+                logits = self._card_tail(
+                    hb[r0:].view(1, T - r0, H), y_prev[r0:] if y_prev is not None else None, bufs=tail_bufs
+                )
+        except (RuntimeError, MemoryError) as e:
+            if hooked and self._is_card_oom(e):
+                # what would send the pass down the torch path, its hook fed already
+                raise CardPassFailed(f"[card] a hooked pass ran out of room past its first layer: {e}") from e
+            raise
+        # the rows the cache holds now, once nothing of the pass can fail: a pass run again on the torch path finds
+        # the cache as it was
+        for i in range(a, b):
+            cache.layers[i].set_front(past + T)
+        if logits is not None:
+            return None, logits
+        if y_prev is not None:
+            hb.add_(y_prev)
+        return hb.view(1, T, H), None
+
+    # the most rows a launch takes on grid.y (the card's limit), where a chunk's rows ride it
+    GRID_Y = 65535
+
+    # the 64 x 64 tiles where the 128 x 64 ones would give the card's SMs fewer than this many each, or where the k is
+    # this many super-tiles or fewer (`_card_gemm_plan`)
+    GEMM_SMALL_TILES = 8
+    GEMM_SMALL_K = 32
+
+    @classmethod
+    def _card_gemm_plan(cls, R: int, C: int, rows: int, sms: int) -> str:
+        """a tensor-core prompt GEMM's kernel (btb_gemm.cuh) on a card of `sms` SMs: "big" (128 x rows by 64 weight
+        rows a block) or "small" (64 x 64), the same bits either way. A chain can use no more SMs than there are
+        tiles, and a short one spends more of a big tile in its start and end: on the 4070 Ti (cycles at locked
+        clocks) the small tiles won every 512-row chunk of Qwen3-0.6B's and an 8B's shapes but the 8B's 24576-row
+        gate/up (1536 big tiles), and a 1024-k weight at 4096 rows (12% on the 0.6B's qkv); the big won or tied the
+        longer k at 4096 rows"""
+        tiles = (rows + 127) // 128 * ((R + 63) // 64)
+        return "small" if tiles < cls.GEMM_SMALL_TILES * sms or (C + 31) // 32 <= cls.GEMM_SMALL_K else "big"
+
+    @classmethod
+    def _card_gemm(
+        cls,
+        k: Any,
+        mma: bool,
+        W: torch.Tensor,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        R: int,
+        C: int,
+        rows: int,
+        plan: str | None = None,
+    ) -> None:
+        """y[:rows] = x[:rows] W^T [R, C] as the step's matvec sums each row (btb_gemm.cuh): the tensor cores' chain
+        or the fp32 chain - the one the warm-up picked (`mma`). The engine's, the kernel tests' and the bench's launch;
+        `plan` (`_card_gemm_plan`'s answer) forced only by the tests"""
+        P, ci = k.ptr, ctypes.c_int
+        args = [P(W), P(x), P(y), ci(R), ci(C), ci(rows)]
+        if not mma:
+            grid = ((rows + 7) // 8 * ((R + 31) // 32), 1, 1)  # a block 8 x rows by 32 weight rows, in groups
+            k.launch("btb_gemm_f32_bf16", grid, (128, 1, 1), args)
+        elif (plan or cls._card_gemm_plan(R, C, rows, k.sms)) == "small":
+            k.launch("btb_gemm_mma_small_bf16", ((rows + 63) // 64 * ((R + 63) // 64), 1, 1), (128, 1, 1), args)
+        else:
+            k.launch("btb_gemm_mma_bf16", ((rows + 127) // 128 * ((R + 63) // 64), 1, 1), (128, 1, 1), args)
+
+    def _card_tail_ok(self) -> bool:
+        """the card graph's kernels run the tail: the card graph on, the final norm and the head on the card, bf16"""
+        if not self._card_ready(capture=False) or self.head is None or self.norm is None:
+            return False
+        norm_w, head_w = self.norm.weight, self.head.weight
+        return norm_w.device.type == "cuda" and head_w.device.type == "cuda" and head_w.dtype == torch.bfloat16
+
+    def _card_tail_buffers(self, R: int, H: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """the tail's buffers for R rows: their norm (scratch), and the logits [R, V] - the caller's own, as the
+        head's matmul makes them on the torch path: a pass's logits outlive it (a prompt fed in chunks keeps every
+        chunk's for its rows), so never a buffer the next pass writes again"""
+        assert self.head is not None  # `_card_tail_ok`
+        x = self.scratch.take("card tail x", (R, H), torch.bfloat16, self.dev, "the card's tail over a prompt's rows")
+        logits = torch.empty(R, int(self.head.weight.shape[0]), dtype=torch.bfloat16, device=self.dev)
+        return x, logits
+
+    def _card_tail(
+        self, h: torch.Tensor, y: torch.Tensor | None = None, bufs: tuple[torch.Tensor, torch.Tensor] | None = None
+    ) -> torch.Tensor | None:
+        """the final norm and the head over `h`'s rows [1, R, H] (bf16 on the card; `y` the last layer's output the
+        norm adds in first, as the graph's tail does) on the card graph's kernels: each row's logits [1, R, V], bf16,
+        as a step's tail makes them - the norm its kernel, the head the GEMM that sums a row as its matvec does. None
+        where the card graph does not run the tail (`_card_tail_ok`). `bufs`: the buffers, taken already
+        (`_card_tail_buffers`)"""
+        if not self._card_tail_ok():
+            return None
+        k = self._card_kernels()
+        assert k is not None and self.norm is not None and self.head is not None  # `_card_tail_ok`
+        norm_w, head_w = self.norm.weight, self.head.weight
+        P, ci, cf = k.ptr, ctypes.c_int, ctypes.c_float
+        R, H, V = int(h.shape[1]), int(h.shape[2]), int(head_w.shape[0])
+        hb = h.reshape(R, H)
+        if hb.dtype != torch.bfloat16 or hb.device != self.dev or not hb.is_contiguous():
+            hb = self.scratch.take(
+                "card tail h", (R, H), torch.bfloat16, self.dev, "the card's tail over a prompt's rows"
+            )
+            hb.copy_(h.reshape(R, H))
+        x, logits = bufs if bufs is not None else self._card_tail_buffers(R, H)
+        k.launch(
+            "btb_add_rmsnorm",
+            (R, 1, 1),
+            (256, 1, 1),
+            [P(hb), P(y), P(norm_w), cf(float(self.cfg.rms_norm_eps)), P(x), ci(H)]
+            + [ci(1 if self.fam.norm_centered else 0)],
+        )
+        self._card_gemm(k, self._card_mma_for(R), head_w, x, logits, V, H, R)
+        return logits.view(1, R, V)
 
     # -- a family's card program: its layers as graphs replayed in turn, the host between them ------------------
 
@@ -2633,15 +3280,35 @@ class _CudaMixin(_State):
             sin.copy_(rope[lt][1][:, -1:, :])
         hk, d = g["hk"], g["d"]
         stream = torch.cuda.current_stream()
+        paged = bool(getattr(cache, "paged", False))
         for i in range(self.L):
             g["A"][i].replay()
             stream.synchronize()
-            kf, vf = cache.update(g["kv_pin"][:hk].view(1, hk, 1, d), g["kv_pin"][hk:].view(1, hk, 1, d), i)
+            kn, vn = g["kv_pin"][:hk].view(1, hk, 1, d), g["kv_pin"][hk:].view(1, hk, 1, d)
             win = layer_window(self.cfg, self.layer_types[i])
-            first = max(0, int(kf.shape[-2]) - win) if win else 0  # a sliding layer reads its last rows alone
-            Native.attn_decode(
-                g["q_pin"], kf[0][:, first:], vf[0][:, first:], self.resident[i].self_attn.scaling, g["out_pin"]
-            )
+            scale = self.resident[i].self_attn.scaling
+            if paged:
+                # the rows in the host's region, read through the conversation's map: the step's span, `attn_decode`'s
+                # bits (`attn_spans`)
+                cl = cache.layers[i]
+                n = cl.get_seq_length()
+                kf, vf = cl.append(kn, vn)
+                amap, starts, ends = self._span_lists(cache, n, 1, win)
+                hq = int(g["q_pin"].shape[0])
+                Native.attn_spans(
+                    g["q_pin"].view(1, hq, d),
+                    kf[0],
+                    vf[0],
+                    amap,
+                    starts,
+                    ends,
+                    float(scale),
+                    g["out_pin"].view(1, hq, d),
+                )
+            else:
+                kf, vf = cache.update(kn, vn, i)
+                first = max(0, int(kf.shape[-2]) - win) if win else 0  # a sliding layer reads its last rows alone
+                Native.attn_decode(g["q_pin"], kf[0][:, first:], vf[0][:, first:], scale, g["out_pin"])
             g["B"][i].replay()
         return self._finish(g["h"].clone(), last_only, head)
 
@@ -2649,10 +3316,17 @@ class _CudaMixin(_State):
         keep = list(range(base_len)) + [base_len + j for j in path]
         lazy: list[Any] = []
         flags: list[Any] = []
+        paged = bool(getattr(cache, "paged", False))
+        if paged:
+            # a paged cache's accepted rows copied down into its own pages, every attention layer's at once, and the
+            # rest let go (`PagedCache.keep_path`)
+            cache.keep_path(base_len, list(path))
         for i, layer in enumerate(cache.layers):
             # every attention layer's keys and values are cropped to the accepted path; a sliding layer
             # keeps the whole cache (its window is a mask, not a shorter cache), so it is cropped too, and a
             # sparse layer's indexer keys with its rows
+            if getattr(layer, "paged", False):
+                continue
             if self.layer_types[i] in (LayerKind.FULL, LayerKind.SLIDING, LayerKind.QWEN_SPARSE):
                 keep_path = getattr(layer, "keep_path", None)
                 if keep_path is not None:
@@ -3056,11 +3730,20 @@ class _CudaMixin(_State):
             k_all = at.k_norm(at.k_proj(x).view(1, T, -1, hd))
             v_all = at.v_proj(x).view(1, T, -1, hd)
             gate_all = None
-        base = cl.keys.shape[-2] if getattr(cl, "keys", None) is not None else 0
+        # a paged layer's rows lie in the engine's pool wherever their pages do: appended through the layer, read
+        # through the conversation's row map (btb/engine/paged.py)
+        paged = bool(getattr(cl, "paged", False))
+        if paged:
+            base = cl.get_seq_length()
+        else:
+            base = cl.keys.shape[-2] if getattr(cl, "keys", None) is not None else 0
         win = layer_window(self.cfg, self.layer_types[i])
         attn_fn = ALL_ATTENTION_FUNCTIONS.get_interface(self.cfg._attn_implementation, eager_attention_forward)
         q_rot, k_rot = apply_rotary_pos_emb(q_all.transpose(1, 2), k_all.transpose(1, 2), pe[0], pe[1])
-        k_full, v_full = cache.update(k_rot, v_all.transpose(1, 2), i)
+        if paged:
+            k_full, v_full = cl.append(k_rot, v_all.transpose(1, 2))
+        else:
+            k_full, v_full = cache.update(k_rot, v_all.transpose(1, 2), i)
         native = (
             k_full.shape[0] == 1
             and k_full.device.type == "cpu"
@@ -3071,12 +3754,22 @@ class _CudaMixin(_State):
             and v_full.stride(-1) == 1
             and v_full.stride(-2) == hd
         )
-        kernel = native and T == 1 and not tree and Native.attn_decode is not None
-        # a verify pass's rows (a chain's or a tree's) through the step's own arithmetic: each row over the cache rows
-        # its committed step will read, in the order it reads them (`attn_nodes`, row for row `attn_decode` bit for
-        # bit). Through sdpa a row at a time, a verify rounded a bf16 tie apart from the step - Qwen3-0.6B with
-        # eleven host layers took ':' where its greedy step took '.', speculation then no longer the greedy answer
-        nodes = native and not kernel and Native.attn_nodes is not None
+        # a paged layer's one-row step too: its rows are the table's, which `attn_spans` reads with `attn_decode`'s bits
+        kernel = native and T == 1 and not tree and Native.attn_decode is not None and not paged
+        # a pass's rows past the first (a verify's chain or tree, a prompt's later chunk) through the step's own
+        # arithmetic: each row over the cache rows its committed step will read, in the order it reads them, row for
+        # row `attn_decode` bit for bit - a chain's rows each a span of one map (`attn_spans`: the cache's rows, a
+        # paged layer's through its table), a tree's each a list of its own (`attn_nodes`). Through sdpa a row at a
+        # time, a verify rounded a bf16 tie apart from the step - Qwen3-0.6B with eleven host layers took ':' where
+        # its greedy step took '.', speculation then no longer the greedy answer
+        spans = native and not kernel and not tree and Native.attn_spans is not None
+        nodes = native and not kernel and not spans and Native.attn_nodes is not None
+        if paged and not (spans or nodes):
+            from .paged import PagedError
+
+            raise PagedError(
+                f"layer {i}: the paged rows are read by the native attention alone, and it cannot run here"
+            )
         if kernel:
             qf = q_rot[0, :, 0].float().contiguous()
             out = torch.empty(qf.shape, dtype=torch.float32)
@@ -3084,21 +3777,22 @@ class _CudaMixin(_State):
             Native.attn_decode(qf, k_full[0][:, first:], v_full[0][:, first:], at.scaling, out)
             a1 = out.view(1, 1, -1).to(h.dtype)
             outs.append(a1 if gate_all is None else a1 * torch.sigmoid(gate_all[:, 0:1]))
-        elif nodes:
-            lists = []
-            for p in range(T):
-                rows = node_mask(base, p, parents, win)
-                lists.append(torch.arange(base + p + 1) if rows is None else rows.nonzero()[:, 0])
-            idx = torch.cat(lists).to(torch.int32).contiguous()
-            offs = torch.zeros(T + 1, dtype=torch.int32)
-            offs[1:] = torch.tensor([len(x) for x in lists]).cumsum(0).to(torch.int32)
+        elif spans or nodes:
             qf = q_rot[0].transpose(0, 1).float().contiguous()  # [T, hq, d]
             out = torch.empty(qf.shape, dtype=torch.float32)
-            Native.attn_nodes(qf, k_full[0], v_full[0], offs, idx, float(at.scaling), out)
-            for p in range(T):  # a row at a time, as each step casts and gates its one
-                a1 = out[p].view(1, 1, -1).to(h.dtype)
-                outs.append(a1 if gate_all is None else a1 * torch.sigmoid(gate_all[:, p : p + 1]))
-        for p in range(T) if not (kernel or nodes) else range(0):
+            if spans:
+                amap, starts, ends = self._span_lists(cache if paged else None, base, T, win)
+                Native.attn_spans(qf, k_full[0], v_full[0], amap, starts, ends, float(at.scaling), out)
+            else:
+                offs, idx = self._node_lists(cache if paged else None, base, T, parents, win)
+                Native.attn_nodes(qf, k_full[0], v_full[0], offs, idx, float(at.scaling), out)
+            if gate_all is None:
+                outs.append(out.view(1, T, -1).to(h.dtype))  # a cast: each element its own, whatever its neighbours
+            else:
+                for p in range(T):  # a row at a time, as each step gates its one
+                    a1 = out[p].view(1, 1, -1).to(h.dtype)
+                    outs.append(a1 * torch.sigmoid(gate_all[:, p : p + 1]))
+        for p in range(T) if not (kernel or spans or nodes) else range(0):
             qs = q_rot[:, :, p : p + 1]
             ks = k_full[..., : base + p + 1, :]
             vs = v_full[..., : base + p + 1, :]
@@ -3111,6 +3805,64 @@ class _CudaMixin(_State):
         if self.fam.sandwich:
             mix = layer.post_attention_layernorm(mix)  # the sandwich block norms the delta before its add
         return self._ai_mlp(layer, residual + mix)
+
+    @staticmethod
+    def _pass_lists(paged: Any) -> dict[Any, Any]:
+        """a paged cache's lists for the pass (`_span_lists`, `_node_lists`): those of its row map's present version
+        alone, which every change to the map moves - a window's and the whole prefix's (Gemma 3's layers alternate)
+        side by side, made once for every layer that reads them alike. One set for the engine's prefix cache, the last
+        conversation's: kept on each conversation, an idle one held its last pass's. Let go as another conversation's
+        pass begins (`PrefixCache.reading`): replaced only by a pass that builds its own, one whose layers build none
+        (the card's, under a split placement or kv_host) left an idle conversation's held"""
+        pc, table = paged.prefix, paged.table
+        ref, ver, memo = pc._lists or (None, None, {})
+        if ref is None or ref() is not table or ver != table.version:
+            memo = {}
+            pc._lists = (weakref.ref(table), table.version, memo)
+        return cast("dict[Any, Any]", memo)
+
+    @staticmethod
+    def _span_lists(paged: Any, base: int, T: int, win: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """a chain's T rows after `base` as `attn_spans` takes them: (rows, starts, ends) int32, row p over the rows
+        before it and itself - the last `win` of them under a window - each a span of one map: the cache's rows in
+        order, a paged cache's (`paged`) through its table"""
+        memo = _CudaMixin._pass_lists(paged) if paged is not None else None
+        key = ("spans", base, T, win)
+        got = memo.get(key) if memo is not None else None
+        if got is not None:
+            return cast("tuple[torch.Tensor, torch.Tensor, torch.Tensor]", got)
+        ends = torch.arange(base + 1, base + T + 1, dtype=torch.int32)
+        starts = (ends - win).clamp_(min=0) if win else torch.zeros(T, dtype=torch.int32)
+        if paged is None:
+            return torch.arange(base + T, dtype=torch.int32), starts, ends
+        rows = paged.table.rows()[: base + T].to(torch.int32)
+        assert memo is not None
+        memo[key] = (rows, starts, ends)
+        return rows, starts, ends
+
+    @staticmethod
+    def _node_lists(paged: Any, base: int, T: int, parents: Parents, win: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """each of a pass's T rows' cache rows, in the order its committed step reads them, as `attn_nodes` takes
+        them: (offs [T + 1], idx) int32. `paged` (a paged cache): the rows are its pool's, through its row map, made
+        once a pass (`_pass_lists`)"""
+        memo = _CudaMixin._pass_lists(paged) if paged is not None else None
+        key = (base, T, tuple(parents), win)
+        got = memo.get(key) if memo is not None else None
+        if got is not None:
+            return cast("tuple[torch.Tensor, torch.Tensor]", got)
+        lists = []
+        for p in range(T):
+            rows = node_mask(base, p, parents, win)
+            lists.append(torch.arange(base + p + 1) if rows is None else rows.nonzero()[:, 0])
+        flat = torch.cat(lists)
+        if paged is not None:
+            flat = paged.table.rows()[flat]
+        idx = flat.to(torch.int32).contiguous()
+        offs = torch.zeros(T + 1, dtype=torch.int32)
+        offs[1:] = torch.tensor([len(x) for x in lists]).cumsum(0).to(torch.int32)
+        if memo is not None:
+            memo[key] = (offs, idx)
+        return offs, idx
 
     def _ai_mlp(self, layer: Any, h: torch.Tensor) -> torch.Tensor:
         residual = h

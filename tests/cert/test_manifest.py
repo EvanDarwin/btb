@@ -282,11 +282,12 @@ def test_the_residency_fork_is_a_cell_per_hardware() -> None:
     no store the knob selects nothing at all - so those cells are a DNR, not a claim of coverage."""
     bf16 = spec.Storage.SAFE_BF16
     for hw, default, riders in (("cpu", "cpu", "cpu-riders"), ("mlx", "mlx-step", "mlx-riders")):
-        assert spec.SUBPATH[riders].knobs == {"device": hw, "bus_pass": 0}
+        assert spec.SUBPATH[riders].knobs == {"device": hw, "bus_pass": 0, "adapt": 0}
         assert PassTag.EXPERT_BUS_PASS in spec.SUBPATH[default].expects(FamilyKind.GPT_OSS, bf16)
         assert PassTag.EXPERT_LINE in spec.SUBPATH[riders].expects(FamilyKind.GPT_OSS, bf16)
         assert spec.SUBPATH[default].expects(FamilyKind.QWEN3, bf16) == {
-            spec.SUBPATH[default].expect(FamilyKind.QWEN3, bf16)
+            spec.SUBPATH[default].expect(FamilyKind.QWEN3, bf16),
+            spec.kv_tag(FamilyKind.QWEN3, spec.SUBPATH[default].hardware),
         }
     assert {d.hardware for d in spec.DEVICE_SUBPATHS if d.needs is Cap.MOE} == set(spec.Hardware) - spec.NO_BACKEND
     dense = manifest.dnr(FamilyKind.QWEN3, bf16, spec.SUBPATH["cpu-riders"], spec.DecodePath.GREEDY)
@@ -404,6 +405,157 @@ def test_fixture_gaps_sees_an_unbound_gguf_twin(tmp_path: Path, monkeypatch: Mon
         monkeypatch.setattr(mod, "FIXTURES", str(tmp_path))
         monkeypatch.setattr(mod, "GGUF_DIR", str(gguf))
     assert manifest.fixture_gaps() == ["gguf/tiny_qwen3-q9_9.gguf"]
+
+
+def test_every_cell_asserts_the_reader_its_cache_rows_take() -> None:
+    """the KV reader is part of every cell's expectations (`spec.kv_tag`): when a tier's attention moves to the
+    paged reader, the line flips and every receipt banked on the old reader stops proving the cell"""
+    bf16 = spec.Storage.SAFE_BF16
+    for dev in spec.DEVICE_SUBPATHS:
+        for kind in core.served_kinds():
+            assert spec.kv_tag(kind, dev.hardware, dev.knobs) in dev.expects(kind, bf16), (dev.key, kind)
+    assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.CPU) is PassTag.KV_PAGED
+    assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.CUDA) is PassTag.KV_PAGED
+    assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.MLX) is PassTag.KV_CONTIGUOUS
+    # a hybrid on the pages too, its states resumed from its snapshots
+    assert spec.kv_tag(FamilyKind.QWEN3_5, spec.Hardware.CPU) is PassTag.KV_PAGED
+    assert spec.kv_tag(FamilyKind.QWEN3_5, spec.Hardware.CUDA) is PassTag.KV_PAGED
+    # the card's layers computing in float32 are wider than its paged kernels read
+    assert PassTag.KV_CONTIGUOUS in spec.SUBPATH["cuda-torch"].expects(FamilyKind.QWEN3, bf16)
+    for key in ("cuda-graph", "cuda-split", "cuda-kvhost", "cuda-prefill"):
+        assert PassTag.KV_PAGED in spec.SUBPATH[key].expects(FamilyKind.QWEN3, bf16), key
+
+
+def test_the_cert_reads_the_engines_own_rule_for_the_paged_reader(monkeypatch: MonkeyPatch) -> None:
+    """`spec.paged` - the reader every cell asserts, the prefix axis's gaps - is the engine's `PrefixCache.why_not`
+    on each family's fixture, on each hardware: the cert expects pages exactly where the engine reads them"""
+    import types
+
+    import torch
+
+    from btb.engine.families.base import _flags
+    from btb.engine.native import Native
+    from btb.engine.prefix import PrefixCache
+    from btb.kinds import LayerKind
+
+    for name in ("attn_spans", "attn_nodes"):
+        monkeypatch.setattr(Native, name, object())  # the native library as a built one has it
+    # the card's kernels as a built fatbin has them: the one attention's forms at every width, and the prefill form a
+    # card whose tensor cores pass `btb_mma_roles` takes (`_Cuda.flash_prefill_kernel`)
+    kernels = types.SimpleNamespace(
+        fn={f"btb_attn_flash_{k}d{d}": object() for k in ("", "prefill_") for d in spec.CARD_HEAD_DIMS},
+        flash_prefill_kernel=lambda d, kq=None: f"btb_attn_flash_prefill_d{d}",
+    )
+    monkeypatch.setattr(Native, "card_kernels", classmethod(lambda cls: kernels))
+    devices = {spec.Hardware.CPU: torch.device("cpu"), spec.Hardware.CUDA: torch.device("cuda")}
+    for kind in core.served_kinds():
+        if kind not in spec.FIXTURE_STEM:
+            continue
+        cfg = spec.fixture_config(kind)
+        types_ = [LayerKind.of(t) for t in cfg.get("layer_types") or [LayerKind.FULL]]
+        options: tuple[dict[str, object], ...] = ({}, {"fp32": 1})
+        for hw, dev in devices.items():
+            for knobs in options:
+                sm = types.SimpleNamespace(
+                    dev=dev,
+                    mlx=None,
+                    layer_types=types_,
+                    fam=types.SimpleNamespace(**_flags(kind)),
+                    flat_cache=lambda: True,
+                    cfg=types.SimpleNamespace(**{**cfg, "_attn_implementation": "btb_sdpa"}),
+                    compute_dtype=torch.float32 if knobs else None,
+                    resident_fp32=bool(knobs),
+                    shadow={},
+                )
+                why = PrefixCache.why_not(sm)
+                assert (why is None) is spec.paged(kind, hw, knobs), (kind, hw, knobs, why)
+
+
+def test_the_prefix_axis_runs_where_the_prefix_cache_serves_and_is_a_gap_elsewhere() -> None:
+    """the prefix axis - a conversation through other requests, prompts sharing a prefix - runs exactly where the
+    prefix cache serves the family (`spec.paged`), and is a gap of its own everywhere else, its reason the engine's:
+    a tier it is not on yet, a family's own attention. A gap is never a runnable id, and is a
+    GAP in the gate's missing list and in the delta's findings alike, so each phase shows as closed when it lands. A
+    sub-path that cannot engage at all keeps its own reason; a family with recurrent layers must show a resume from a
+    kept snapshot"""
+    from . import delta
+
+    served = {k for k in core.served_kinds() if k in spec.FIXTURE_STEM}
+    prefix = [g for g in manifest.shape_gaps() if g[0] is spec.Surface.PREFIX]
+    by = {(kind, key): why for _s, kind, key, why in prefix}
+    cpu = {kind: why for (kind, key), why in by.items() if key == "cpu"}
+    assert set(cpu) == {k for k in served if not spec.paged(k, spec.Hardware.CPU)}
+    # the host serves the hybrid too: its prefill keeps the recurrent states at its blocks' ends for the tree
+    assert {FamilyKind.QWEN3, FamilyKind.PHI3, FamilyKind.GEMMA3, FamilyKind.QWEN3_5} <= served - set(cpu)
+    assert cpu[FamilyKind.GPT_OSS] is manifest.Missing.PREFIX_FAMILY
+    # the card serves the dense families on every sub-path its bf16 kernels read - where the sub-path engages at all
+    # (Phi-3's card graph is a gap of its own). A hit equals its cold decode where every layer runs the card graph's
+    # kernels, whose prefill makes each row as the step does (the card graph's families on its own sub-path); a host
+    # layer, the kv_host tier or a family's torch modules cannot yet - the hybrid's DeltaNet among them. Its fp32
+    # sub-path is a gap of its own; the families the host does not serve keep the host's reasons there
+    for key in ("cuda-graph", "cuda-split", "cuda-kvhost"):
+        for kind in (FamilyKind.QWEN3, FamilyKind.PHI3, FamilyKind.GEMMA3, FamilyKind.QWEN3_5):
+            own = manifest.subpath_gap(kind, spec.Storage.SAFE_BF16, spec.SUBPATH[key])
+            whole = key == "cuda-graph" and spec.card_rows(kind)
+            gap = own or (None if whole else manifest.Missing.PREFIX_INVARIANCE)
+            assert by.get((kind, key)) is gap, (kind, key, by.get((kind, key)))
+        assert by[(FamilyKind.GPT_OSS, key)] in (
+            manifest.Missing.PREFIX_FAMILY,
+            manifest.subpath_gap(FamilyKind.GPT_OSS, spec.Storage.SAFE_BF16, spec.SUBPATH[key]),
+        )
+    assert spec.card_rows(FamilyKind.QWEN3) and spec.card_rows(FamilyKind.GEMMA3)
+    assert by[(FamilyKind.QWEN3, "cuda-torch")] is manifest.Missing.PREFIX_WIDE
+    for (kind, key), why in by.items():
+        dev = spec.SUBPATH[key]
+        own = manifest.subpath_gap(kind, spec.Storage.SAFE_BF16, dev)
+        if own is not None or dev.hardware is spec.Hardware.MLX:
+            assert why is (own or manifest.Missing.PREFIX_CACHE), (kind, key, why)
+    ran = {i for i in manifest.runnable_ids() if i.startswith(f"{spec.Surface.PREFIX.value}/")}
+    want = {
+        manifest.stem_id(spec.Surface.PREFIX, spec.FIXTURE_STEM[k], key)
+        for k in served
+        for key in spec.SURFACE_SUBPATHS[spec.Surface.PREFIX]
+        if manifest.prefix_gap(k, spec.SUBPATH[key]) is None
+    }
+    assert ran == want
+    assert manifest.stem_id(spec.Surface.PREFIX, spec.FIXTURE_STEM[FamilyKind.QWEN3], "cpu") in ran
+    missing = {kind for kind, _n, _f in manifest.missing_items()}
+    assert {
+        manifest.Missing.PREFIX_CACHE,
+        manifest.Missing.PREFIX_FAMILY,
+        manifest.Missing.PREFIX_WIDE,
+        manifest.Missing.PREFIX_INVARIANCE,
+    } <= missing
+    found = delta.findings()
+    assert f"[manifest/prefix-invariance] prefix/{FamilyKind.QWEN3_5.value}/cuda-split" in found
+    assert not any(f.endswith(f"prefix/{FamilyKind.QWEN3_5.value}/cpu") for f in found)
+    assert not any(f.endswith(f"prefix/{FamilyKind.QWEN3.value}/cpu") for f in found)
+    assert f"[manifest/prefix-invariance] prefix/{FamilyKind.QWEN3.value}/cuda-split" in found
+    assert not any(f.endswith(f"prefix/{FamilyKind.QWEN3.value}/cuda-graph") for f in found)
+    assert spec.recurrent(FamilyKind.QWEN3_5) and not spec.recurrent(FamilyKind.QWEN3)
+    on = spec.SUBPATH["cpu"]
+    assert PassTag.SNAPSHOT_RESUME in spec.SURFACE_TAGS[spec.Surface.PREFIX](FamilyKind.QWEN3_5, on)
+    assert PassTag.SNAPSHOT_RESUME not in spec.SURFACE_TAGS[spec.Surface.PREFIX](FamilyKind.QWEN3, on)
+    assert {PassTag.KV_PAGED, PassTag.PREFIX_SHARED} <= spec.SURFACE_TAGS[spec.Surface.PREFIX](FamilyKind.QWEN3, on)
+
+
+def test_a_cell_never_forbids_what_it_expects() -> None:
+    """the card graph's sub-path forbids a family whose rows it makes the torch layers (`spec.forbidden_tags`), and no
+    other - a family it does not serve, the torch sub-path, the host's - is held to it; whatever a cell forbids, no cell
+    of its sub-path and family must show, on the cartesian or an axis beside it"""
+    graph, torch_ = spec.SUBPATH["cuda-graph"], spec.SUBPATH["cuda-torch"]
+    assert spec.forbidden_tags(FamilyKind.QWEN3, graph) == {PassTag.CUDA_TORCH_FALLBACK}
+    assert spec.forbidden_tags(FamilyKind.PHI3, graph) == spec.forbidden_tags(FamilyKind.QWEN3, torch_) == set()
+    assert spec.forbidden_tags(FamilyKind.QWEN3, spec.SUBPATH["cpu"]) == set()
+    for dev in spec.DEVICE_SUBPATHS:
+        for kind in core.served_kinds():
+            bad = spec.forbidden_tags(kind, dev)
+            for st in spec.Storage:
+                assert not bad & dev.expects(kind, st), (dev.key, kind, st)
+            for surface, forbids in spec.SURFACE_FORBIDS.items():
+                if dev.key in spec.SURFACE_SUBPATHS[surface]:
+                    assert not forbids(kind, dev) & spec.SURFACE_TAGS[surface](kind, dev), (surface, dev.key, kind)
+    assert "cuda-graph" in spec.SURFACE_SUBPATHS[spec.Surface.HOOKED]
 
 
 def test_every_open_gap_is_explained() -> None:

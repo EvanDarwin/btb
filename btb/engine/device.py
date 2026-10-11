@@ -416,11 +416,12 @@ class Device:
     def spend(self, tag: str, nbytes: int, device: Any = None) -> None:
         """what a reservation on `device` was for, allocated now: `nbytes` off the reservation `tag` (never below
         nothing), so the memory is counted once - as the allocation the device's free reading sees - and not also as
-        still spoken for; nothing where `tag` holds nothing there"""
+        still spoken for; nothing where `tag` holds nothing there, nor where its measure (`reserve`'s `used`) sees the
+        allocation itself - taken off it too, the bytes came off it twice"""
         t = (self.sm.dev if device is None else torch_device(device)).type
         with self.lock:
             hit = self._reserved.get((tag, t))
-            if hit is not None:
+            if hit is not None and (tag, t) not in self._uses:
                 self._reserved[(tag, t)] = max(0, hit - int(nbytes))
 
     def spoken_for(self, device: Any = None) -> dict[str, int]:

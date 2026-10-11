@@ -470,6 +470,112 @@ pub unsafe extern "C" fn btb_attn_nodes_f32(
     })
 }
 
+/// [`btb_attn_nodes_bf16`] with every query's rows a span of one map instead of a list of its own: query `i`
+/// attends the cache rows `map[starts[i]..ends[i]]` in map order (`map` `u32[n_map]`, each below `n_rows`;
+/// `starts` and `ends` `u32[t]`, `starts[i] < ends[i] <= n_map`). The spans may overlap, so a chunk of a
+/// prompt - row `i` over the rows before it and itself - costs one map of `base + t` rows, not a list per
+/// row. A span splits as a list of its length does, so row `i` is bit-identical to [`btb_attn_nodes_bf16`]
+/// over the list `map[starts[i]..ends[i]]` and to [`btb_attn_decode_bf16`] over those rows copied out, at
+/// the same `threads`; a map of `0..n` and a span of all of it is that decode step itself.
+///
+/// # Safety
+/// `q` readable for `t * hq * d` f32, `k` for `hk * k_head_stride` and `v` for `hk * v_head_stride` u16,
+/// `map` for `n_map` u32, `starts` and `ends` for `t` u32, `out` writable for `t * hq * d` f32; `out` must
+/// not overlap an input.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn btb_attn_spans_bf16(
+    q: *const f32,
+    k: *const u16,
+    v: *const u16,
+    map: *const u32,
+    n_map: usize,
+    starts: *const u32,
+    ends: *const u32,
+    t: usize,
+    n_rows: usize,
+    hq: usize,
+    hk: usize,
+    d: usize,
+    k_head_stride: usize,
+    v_head_stride: usize,
+    scale: f32,
+    out: *mut f32,
+    threads: usize,
+) -> i32 {
+    guard(|| unsafe {
+        attn::spans_core_bf16(
+            q,
+            k,
+            v,
+            map,
+            n_map,
+            starts,
+            ends,
+            t,
+            n_rows,
+            hq,
+            hk,
+            d,
+            k_head_stride,
+            v_head_stride,
+            scale,
+            out,
+            threads,
+        )
+    })
+}
+
+/// [`btb_attn_spans_bf16`] over an f32 cache: same map, spans, shapes and strides, bit-identical to
+/// [`btb_attn_nodes_f32`] and [`btb_attn_decode_f32`] as the bf16 form is to its own, `k` and `v` readable
+/// for `hk * k_head_stride` and `hk * v_head_stride` f32 instead of u16.
+///
+/// # Safety
+/// As [`btb_attn_spans_bf16`], `k` and `v` f32.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn btb_attn_spans_f32(
+    q: *const f32,
+    k: *const f32,
+    v: *const f32,
+    map: *const u32,
+    n_map: usize,
+    starts: *const u32,
+    ends: *const u32,
+    t: usize,
+    n_rows: usize,
+    hq: usize,
+    hk: usize,
+    d: usize,
+    k_head_stride: usize,
+    v_head_stride: usize,
+    scale: f32,
+    out: *mut f32,
+    threads: usize,
+) -> i32 {
+    guard(|| unsafe {
+        attn::spans_core_f32(
+            q,
+            k,
+            v,
+            map,
+            n_map,
+            starts,
+            ends,
+            t,
+            n_rows,
+            hq,
+            hk,
+            d,
+            k_head_stride,
+            v_head_stride,
+            scale,
+            out,
+            threads,
+        )
+    })
+}
+
 /// One gated DeltaNet position for every head, f32 throughout: the causal conv update (`conv_state`
 /// `[C, K]`, `conv_w` `[C, K]`, `conv_b` `[C]` or null) with silu, the `q | k | v` split of `mixed_qkv`
 /// `[C]` (`C = 2 * hk * dk + hv * dv`), q/k l2-normalised, the gated delta rule on `state` `[hv, dk, dv]`

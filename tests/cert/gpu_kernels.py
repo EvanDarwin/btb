@@ -32,7 +32,7 @@ def _mlx_src() -> str:
 
 _METAL_NAME = re.compile(r'metal_kernel\(\s*name=f?"([^"]+)"')
 _METAL_HELPER = re.compile(r'\b_kernel\(\s*"(btb_\w+)"')  # fused.py builds through one cached helper
-# a name stamped by a macro may carry several `##` parts (`btb_attn_split_gqa##G##_d##D`)
+# a name stamped by a macro may carry several `##` parts (`btb_gemv_lane16_mx4_f32_m##M`, `btb_x##A##_d##D`)
 _CUDA_NAME = re.compile(r"__global__\s+void\s+(?:__launch_bounds__\s*\([^)]*\)\s*)?(\w+?)((?:##\w+)*)\s*\(")
 
 # op category -> the stem pattern that claims it, first match wins
@@ -41,7 +41,9 @@ CATEGORIES: tuple[tuple[str, str], ...] = (
     ("Matrix-vector: bf16", r"gemv_(bf16|silu|gelu|mma|sgate|lane16)|gemm16"),
     ("Matrix-vector: 12-bit", r"p12"),
     ("Matrix-vector: GGUF quants", r"<kind>|q\dk|iq4nl"),
+    ("Matrix-matrix: bf16", r"gemm_(mma|f32)"),
     ("Attention", r"attn"),
+    ("Tensor-core self-check", r"mma_roles"),
     ("Sparse attention indexer", r"qsa_"),
     ("Norm and RoPE", r"norm|rope|sandwich"),
     ("Hyper-connections", r"hc_"),
@@ -74,11 +76,12 @@ def mlx_kernels() -> set[str]:
 
 
 def cuda_kernels() -> set[str]:
-    """the `__global__` names; a macro-stamped one (`btb_gemv_bf16_m##M`) loses the stamped letter"""
+    """the `__global__` names; a macro-stamped one (`btb_gemv_bf16_m##M`) loses the stamped letter. A macro's lines
+    folded first, so a name on the line after its launch bounds is read as one declaration"""
     out: set[str] = set()
     for fn in glob.glob(os.path.join(CUDA_SRC, "*.cu*")):
         with open(fn, encoding="utf-8") as f:
-            for name, stamped in _CUDA_NAME.findall(f.read()):
+            for name, stamped in _CUDA_NAME.findall(f.read().replace("\\\n", " ")):
                 out.add(re.sub(r"_[A-Za-z]$", "", name) if stamped else name)
     return out
 
