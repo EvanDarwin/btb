@@ -549,8 +549,8 @@ def test_bench_is_the_machine_report_without_a_model(capsys: CaptureFixture[str]
 
 
 def test_a_models_bench_prints_its_record_as_json(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
-    """a model's bench with --json: stdout is the one record --out appends (the same record in the file), the
-    per-row lines go to stderr. One load of the tiny fixture on the CPU"""
+    """A model bench with --json prints its record to stdout, the same record --out writes, with progress on
+    stderr."""
     from btb.cli import main
 
     fx = fixture("tiny_q35")
