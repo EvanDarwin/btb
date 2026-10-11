@@ -1,0 +1,23 @@
+Beyond the Box (btb)
+Third-Party Software Notices
+
+This file lists the third-party software that btb incorporates or depends
+on. Each component remains the property of its respective copyright holders
+and is used under the license indicated. Licenses are given as SPDX
+identifiers (https://spdx.org/licenses/).
+
+
+Apache-2.0
+  huggingface-hub    Copyright 2020 The HuggingFace Team
+  safetensors        Copyright (c) the safetensors authors
+  transformers       Copyright 2018- The Hugging Face team
+
+BSD-3-Clause
+  numpy              Copyright (c) 2005-2025, NumPy Developers
+  setproctitle       Copyright (c) 2009, Daniele Varrazzo
+  torch              Copyright (c) 2016- Facebook, Inc (Adam Paszke) and others
+
+MIT
+  gguf               Copyright (c) 2023 Georgi Gerganov
+  mlx                Copyright (c) 2023 Apple Inc.
+  rayon              Copyright (c) 2010 The Rust Project Developers

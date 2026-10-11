@@ -9,7 +9,7 @@ description = "Convenient LLM inference on consumer PCs"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "LicenseRef-FSL-1.1-ALv2"
-license-files = ["LICENSE.md", "NOTICE"]
+license-files = ["LICENSE.md", "NOTICE", "THIRD-PARTY-NOTICES"]
 authors = [{ name = "Evan Darwin" }]
 keywords = ["llm", "inference", "cpu", "cuda", "mlx", "speculative-decoding", "openai-api", "ollama"]
 classifiers = [

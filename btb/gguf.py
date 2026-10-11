@@ -33,8 +33,9 @@ NameMap = Callable[[str], str | None]
 REWRITTEN = frozenset({"qwen35", QWEN4EXP})
 
 # btb's own names for an architecture the installed gguf package does not know yet, modelled on llama.cpp's tree
-# (gguf-py's constants.py and tensor_mapping.py): the checkpoint name the converter hands its TensorNameMap -> the
-# file's. The package's table replaces it once a release has the architecture; test_gguf holds the two equal.
+# (gguf-py's constants.py and tensor_mapping.py; MIT, Copyright (c) 2023 Georgi Gerganov): the checkpoint name
+# the converter hands its TensorNameMap -> the file's. The package's table replaces it once a release has the
+# architecture; test_gguf holds the two equal.
 OWN_NAMES: dict[str, dict[str, str]] = {
     QWEN4EXP: {
         "model.embed_tokens": "token_embd",

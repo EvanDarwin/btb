@@ -454,10 +454,11 @@ def attn_params(
 
 _ROPE_ROWS_SRC = """
     // x [B, H, D] (T), freqs [half] float32 as rope_fast passes them (1 / inv_freq), pos [B] uint32: row b
-    // rotated at position pos[b]. The arithmetic of MLX's own rope kernel line for line - the reciprocal of
-    // the frequency, theta = position * inv_freq in float32, fast cos and sin, the half-split pairs
-    // (i, i + half), x1 cos - x2 sin and x1 sin + x2 cos in float32, cast back - so a row here is the bits
-    // rope_fast gives the one-row step at that position, and B rows at B positions are one launch.
+    // rotated at position pos[b]. The arithmetic of MLX's own rope kernel (ml-explore/mlx, MIT, Copyright (c)
+    // 2023 Apple Inc.) line for line - the reciprocal of the frequency, theta = position * inv_freq in
+    // float32, fast cos and sin, the half-split pairs (i, i + half), x1 cos - x2 sin and x1 sin + x2 cos in
+    // float32, cast back - so a row here is the bits rope_fast gives the one-row step at that position, and
+    // B rows at B positions are one launch.
     uint i = thread_position_in_grid.x;
     uint h = thread_position_in_grid.y;
     uint b = thread_position_in_grid.z;
