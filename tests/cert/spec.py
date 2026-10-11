@@ -171,6 +171,7 @@ class Decode(StrEnum):
 FIXTURE_STEM: dict[FamilyKind, str] = {
     FamilyKind.QWEN3: "tiny_qwen3",
     FamilyKind.QWEN3_5: "tiny_q35",
+    FamilyKind.QWEN3_5_MOE: "tiny_q35moe",
     FamilyKind.PHI3: "tiny_phi3",
     FamilyKind.QWEN4: "tiny_q4",
     FamilyKind.GPT_OSS: "tiny_gpt_oss",
@@ -345,13 +346,14 @@ def fused_step(kind: FamilyKind) -> bool:
 
 
 def mlx_compute_tag(kind: FamilyKind, *, fused: bool) -> PassTag:
-    """the MLX compute tag a step-path pass must show: a hybrid family runs the DeltaNet forward, a MoE family
-    the per-op host path, and the rest the step - fused where the layout and the bf16 state allow it."""
+    """the MLX compute tag a step-path pass must show, by the engine's own order (`Family.mlx_path`): a MoE family -
+    a hybrid one too - the per-op host path, a hybrid family the DeltaNet forward, and the rest the step - fused
+    where the layout and the bf16 state allow it."""
     fl = core.flags(kind)
+    if Cap.MOE in fl:
+        return PassTag.MLX_PEROP  # its experts are picked on the host between layers: no fused step, no hybrid graph
     if Cap.HYBRID in fl:
         return PassTag.MLX_HYBRID
-    if Cap.MOE in fl:
-        return PassTag.MLX_PEROP  # MoE has no fused step; its layers run the per-op host path on MLX
     return PassTag.MLX_STEP_FUSED if fused and fused_step(kind) else PassTag.MLX_STEP_UNFUSED
 
 

@@ -15,6 +15,7 @@ import torch
 from btb import fp8
 from btb.engine.native import Native
 from btb.fp8 import F8Weight
+from tests.cert import spec
 from tests.helpers import PROMPT_DENSE, fixture, forward_logits, host_model, native_library, safetensors_state
 
 
@@ -93,7 +94,7 @@ def _widened_checkpoint(base: str, twin: str, out: str) -> str:
     return out
 
 
-@pytest.mark.parametrize("stem", ["tiny_qwen3", "tiny_phi3", "tiny_q35", "tiny_q4", "tiny_gpt_oss", "tiny_gemma3"])
+@pytest.mark.parametrize("stem", sorted(spec.FIXTURE_STEM.values()))
 def test_an_fp8_checkpoint_decodes_as_transformers_over_its_held_weights(stem: str, tmp_path: Path) -> None:
     """the FP8 twin on the engine's CPU tier - its linears, fused experts and n-gram tables multiplied as stored -
     gives transformers' float32 logits over the same checkpoint's held weights (`fp8.held`), and its greedy tokens"""

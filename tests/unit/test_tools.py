@@ -33,6 +33,7 @@ def test_each_family_gets_its_own_format_and_an_unknown_one_gets_them_all() -> N
     assert isinstance(tool_format("qwen3"), HermesJson)
     assert isinstance(tool_format("qwen4"), HermesJson)
     assert isinstance(tool_format("qwen3_5"), QwenXml)
+    assert isinstance(tool_format("qwen3_5_moe"), QwenXml)
     assert isinstance(tool_format("phi3"), PhiJson)
     assert isinstance(tool_format("gpt_oss"), Harmony)
     assert isinstance(tool_format("gemma3"), GemmaJson)

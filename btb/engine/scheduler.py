@@ -281,6 +281,24 @@ class SchedulerHost(Protocol):
     def log(self, *a: Any, **k: Any) -> Any: ...
 
 
+class Route(Protocol):
+    """What the expert store reads its experts through: the scheduler's drive queue (`BatchScheduler.disk_read`),
+    or a test's stand-in recording the reads"""
+
+    def disk_read(
+        self,
+        path: str,
+        off: int,
+        n: int,
+        dst: torch.Tensor,
+        priority: int = 0,
+        key: object = None,
+        on_done: Callable[[int], None] | None = None,
+        chunk: int = 0,
+        cached: bool = False,
+    ) -> Future[float]: ...
+
+
 @dataclass
 class _Host:
     """A `SchedulerHost` over a model that is not the engine's."""

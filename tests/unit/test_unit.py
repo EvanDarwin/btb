@@ -601,17 +601,27 @@ def test_the_indexers_masks_are_told_apart_by_shape() -> None:
 def test_the_shared_drafter_leaves_its_steps_to_each_family() -> None:
     """btb/engine/drafter.py's base: no MLX graph of its own, and the step and the MLX graph's parts each family's
     drafter supplies - asked of the base, they refuse"""
+    from btb import mlx_available
     from btb.engine.drafter import MTPDrafter
+    from btb.sampling import Sampling
 
     dr = MTPDrafter(types.SimpleNamespace(dev=torch.device("cpu")))
     assert not dr._mlx_ready() and not dr._tree_kernel()
-    for call in (
+    calls: list[Callable[[], object]] = [
+        lambda: dr._pass(torch.zeros(1, 1, dtype=torch.long), torch.zeros(1, 1, 4), 0, True),
         lambda: dr._step(torch.zeros(1, 1, dtype=torch.long), torch.zeros(1, 1, 4), 0),
         dr._mx_dtype,
-        lambda: dr._mlx_body(None, None, 0, None),
-        lambda: dr._mlx_draw(None, 1, None, ()),
-        lambda: dr._mlx_topk(None, 1),
-    ):
+    ]
+    if mlx_available():  # the graph's parts take MLX rows, which only an MLX machine makes
+        import mlx.core as mx
+
+        rows = mx.zeros((1, 1, 4))
+        calls += [
+            lambda: dr._mlx_body(rows, rows, 0, None),
+            lambda: dr._mlx_draw(rows, 1, Sampling(), ()),
+            lambda: dr._mlx_topk(rows, 1),
+        ]
+    for call in calls:
         with pytest.raises(NotImplementedError):
             call()
 

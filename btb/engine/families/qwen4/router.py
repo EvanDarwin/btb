@@ -60,13 +60,19 @@ def install_card(mlp: Any) -> None:
         bind_forward(gate, _fixed_forward)
 
 
+def _normalizes(gate: Any) -> bool:
+    """whether a reference router renormalizes its top k: Qwen4's by its config, Qwen3.5-MoE's (which has no flag)
+    always"""
+    return bool(getattr(gate, "norm_topk_prob", True))
+
+
 def _fixed_forward(self: Any, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # the reference's arithmetic (`Qwen4ExpTextTopKRouter.forward`), its matmul at the fixed shape
     hidden_states = hidden_states.reshape(-1, self.hidden_dim)
     router_logits = fixed_rows(lambda c: F.linear(c, self.weight), hidden_states)
     router_probs = F.softmax(router_logits, dtype=torch.float, dim=-1)
     router_top_value, router_indices = torch.topk(router_probs, self.top_k, dim=-1)
-    if self.norm_topk_prob:
+    if _normalizes(self):
         router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
     return router_logits, router_top_value.to(router_logits.dtype), router_indices
 
@@ -84,4 +90,4 @@ def install(mlp: Any, key: str) -> None:
         gate.weight.data = w.float()
         compute_fp32(gate)
         return
-    mlp.gate = Qwen4Router(_HostLinear(w, key=key), int(gate.top_k), bool(gate.norm_topk_prob))
+    mlp.gate = Qwen4Router(_HostLinear(w, key=key), int(gate.top_k), _normalizes(gate))

@@ -58,6 +58,7 @@ packages = [
   "btb.engine.families.phi3",
   "btb.engine.families.qwen3",
   "btb.engine.families.qwen35",
+  "btb.engine.families.qwen35moe",
   "btb.engine.families.qwen4",
   "btb.mlx",
 ]

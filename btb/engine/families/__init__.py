@@ -24,6 +24,7 @@ from .phi3.family import Phi3Family
 from .qwen3.family import Qwen3Family
 from .qwen4.family import Qwen4Family
 from .qwen35.family import Qwen35Family
+from .qwen35moe.family import Qwen35MoeFamily
 
 
 def act_name(cfg: Any) -> str:
@@ -38,7 +39,8 @@ SUPPORTED_MODEL_TYPES = tuple(KIND_OF)  # the served model_types, from the one d
 
 # each family's class, by the kind it builds
 FAMILIES: dict[FamilyKind, type[Family]] = {
-    cls.KIND: cls for cls in (Qwen3Family, Qwen35Family, Phi3Family, Qwen4Family, GptOssFamily, Gemma3Family)
+    cls.KIND: cls
+    for cls in (Qwen3Family, Qwen35Family, Qwen35MoeFamily, Phi3Family, Qwen4Family, GptOssFamily, Gemma3Family)
 }
 
 

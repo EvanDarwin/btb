@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from pytest import MonkeyPatch
     from transformers.cache_utils import DynamicCache
 
-    from btb.engine.experts import _ExpertStore
+    from btb.engine.experts import RecipePart, _ExpertStore
     from btb.engine.model import StreamedTextModel
     from btb.engine.native import _Cuda
     from btb.serve import Message, ModelRegistry, Server
@@ -573,7 +573,7 @@ def expert_store(
     st.block_max = 64 * per
     st.margin = st.block_max
 
-    def recipe(layer: int, base: str) -> list[tuple[str, int, int, tuple[int, ...]]]:
+    def recipe(layer: int, base: str) -> list[RecipePart]:
         r = st.recipes.get(layer)
         if r is None:
             r = st.recipes[layer] = [

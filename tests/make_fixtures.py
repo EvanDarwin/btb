@@ -5,17 +5,19 @@ byte-level tokenizer, the 12-bit sibling where one is used, its fp16/fp32/fp8 pr
 suite holds the engine to.
 
 Four families (qwen3, q35, phi3, q4) bank the ENGINE's own float32 output (transformers is a bank-time gate: we
-bank only where the engine reproduces it); gpt_oss banks transformers' float32 forward directly. The engine's
-native gemv kernel is loaded first so the receipts match the tolerance the suite uses.
+bank only where the engine reproduces it); gpt_oss banks transformers' float32 forward directly; q35moe passes the
+same gate and banks only the oracle's tokens. The engine's native gemv kernel is loaded first so the receipts match
+the tolerance the suite uses.
 
     python tests/make_fixtures.py            # all families
     python tests/make_fixtures.py qwen3 q4   # a subset
     python tests/make_fixtures.py twins      # only the precision twins of every cert fixture
     python tests/make_fixtures.py q4_mtp     # tiny_q4's drafting head added to the built fixture and its twins
     python tests/make_fixtures.py gguf_stored  # each GGUF family's k-quant and i-quant twins (`stored_twin`)
+    python tests/make_fixtures.py gguf_q35moe  # tiny_q35moe's GGUF twins, every type
     python -m tests.make_fixtures seed phi3  # a family's first draw the oracle's margin floor accepts (its *_SEED)
 
-Families: qwen3, q35, phi3, q4, gpt_oss. `build_q4_card` draws a Qwen4 at the card kernels' shapes, which
+Families: qwen3, q35, q35moe, phi3, q4, gpt_oss. `build_q4_card` draws a Qwen4 at the card kernels' shapes, which
 tests/integration/test_qwen4_card.py builds where it runs (it banks no receipts, and the cert's manifest binds every
 directory here).
 """
@@ -132,8 +134,10 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
         "phi3": MODEL_ARCH.PHI3,
         "gpt_oss": MODEL_ARCH.GPT_OSS,
         "qwen3_5_text": MODEL_ARCH.QWEN35,
+        "qwen3_5_moe_text": MODEL_ARCH.QWEN35MOE,
         "gemma3_text": MODEL_ARCH.GEMMA3,
     }[cfg["model_type"]]
+    qwen35 = arch in (MODEL_ARCH.QWEN35, MODEL_ARCH.QWEN35MOE)
     L = int(cfg["num_hidden_layers"])
     heads = int(cfg["num_attention_heads"])
     head_dim = int(cfg.get("head_dim") or cfg["hidden_size"] // heads)
@@ -142,7 +146,8 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
     w.add_block_count(L)
     w.add_context_length(int(cfg.get("max_position_embeddings", 4096)))
     w.add_embedding_length(int(cfg["hidden_size"]))
-    w.add_feed_forward_length(int(cfg["intermediate_size"]))
+    if cfg.get("intermediate_size"):
+        w.add_feed_forward_length(int(cfg["intermediate_size"]))
     w.add_head_count(heads)
     w.add_head_count_kv(int(cfg.get("num_key_value_heads") or heads))
     rope = cfg.get("rope_parameters") or {}
@@ -151,9 +156,14 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
     w.add_layer_norm_rms_eps(float(cfg.get("rms_norm_eps", 1e-6)))
     w.add_key_length(head_dim)
     w.add_value_length(head_dim)
-    if cfg.get("num_local_experts"):
-        w.add_expert_count(int(cfg["num_local_experts"]))
+    experts = cfg.get("num_local_experts") or cfg.get("num_experts")  # gpt-oss's name, then Qwen's
+    if experts:
+        w.add_expert_count(int(experts))
         w.add_expert_used_count(int(cfg["num_experts_per_tok"]))
+    if cfg.get("moe_intermediate_size"):
+        w.add_expert_feed_forward_length(int(cfg["moe_intermediate_size"]))
+    if cfg.get("shared_expert_intermediate_size"):
+        w.add_expert_shared_feed_forward_length(int(cfg["shared_expert_intermediate_size"]))
     if cfg.get("sliding_window"):
         w.add_sliding_window(int(cfg["sliding_window"]))
     scaling = cfg.get("rope_scaling") or rope
@@ -163,7 +173,7 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
         w.add_rope_scaling_orig_ctx_len(int(scaling["original_max_position_embeddings"]))
         w.add_rope_scaling_yarn_beta_fast(float(scaling.get("beta_fast", 32.0)))
         w.add_rope_scaling_yarn_beta_slow(float(scaling.get("beta_slow", 1.0)))
-    if arch is MODEL_ARCH.QWEN35:
+    if qwen35:
         _qwen35_metadata(w, cfg, head_dim)
     tok = json.load(open(os.path.join(model_dir, "tokenizer.json"), encoding="utf-8"))
     vocab = tok["model"]["vocab"]
@@ -184,7 +194,7 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
     if tcfg.get("chat_template"):
         w.add_chat_template(tcfg["chat_template"])
     state = safetensors_state(model_dir)
-    if arch is MODEL_ARCH.QWEN35:
+    if qwen35:
         state = _qwen35_converted(cfg, state)
     tmap = TensorNameMap(arch, L)
     qtype = {
@@ -193,10 +203,11 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
         "q8_0": GGMLQuantizationType.Q8_0,
         "q4_0": GGMLQuantizationType.Q4_0,
         "q4_1": GGMLQuantizationType.Q4_1,
+        "mxfp4": GGMLQuantizationType.Q8_0,  # llama.cpp's MXFP4_MOE: the 3-D expert tensors MXFP4, the rest Q8_0
     }[outtype]
     conv = {TENSOR_NAMES[MODEL_TENSOR.SSM_CONV1D].format(bid=i) for i in range(L)}  # llama.cpp keeps these f32
     for name in sorted(state):
-        if ".mlp.experts." in name:
+        if ".mlp.experts." in name and arch is MODEL_ARCH.GPT_OSS:
             continue  # the MXFP4 experts below, in ggml's layout
         base, suffix = name.rsplit(".", 1)
         gname = tmap.get_name(base) if suffix in ("weight", "bias") else tmap.get_name(name)
@@ -208,11 +219,12 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
         arr = state[name].float().numpy()
         if arch is MODEL_ARCH.GEMMA3 and name.endswith("norm.weight"):
             arr = arr + 1  # Gemma3Model.modify_tensors: llama.cpp's RMSNorm scales by the weight, Gemma's by 1 + it
-        if gname in conv:
+        if gname in conv or name.endswith(".mlp.gate.weight"):  # llama.cpp keeps a router f32 too
             w.add_tensor(f"{gname}.{suffix}", arr.astype(np.float32))
-        elif arr.ndim == 2 and qtype is not None and arr.shape[-1] % 32 == 0:
-            w.add_tensor(f"{gname}.{suffix}", quantize(arr, qtype), raw_dtype=qtype)
-        elif arr.ndim == 2:
+        elif arr.ndim >= 2 and qtype is not None and arr.shape[-1] % 32 == 0:
+            q = GGMLQuantizationType.MXFP4 if outtype == "mxfp4" and arr.ndim == 3 else qtype
+            w.add_tensor(f"{gname}.{suffix}", quantize(arr, q), raw_dtype=q)
+        elif arr.ndim >= 2:
             w.add_tensor(f"{gname}.{suffix}", arr.astype(np.float16))  # f16: bf16's small values lose bits here
         else:
             w.add_tensor(f"{gname}.{suffix}", arr.astype(np.float32))
@@ -254,7 +266,8 @@ def _qwen35_metadata(w: GGUFWriter, cfg: Json, head_dim: int) -> None:
 def _qwen35_converted(cfg: Json, state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """the checkpoint as llama.cpp's Qwen3.5 converter hands it to the writer (Qwen3_5TextModel.modify_tensors,
     in float32 as it runs): the MTP head left out (its --no-mtp), the value heads reordered from grouped by key
-    head to tiled, A_log as -exp(A_log), dt_bias renamed dt_proj.bias, conv1d squeezed, the norms as 1 + w"""
+    head to tiled, A_log as -exp(A_log), dt_bias renamed dt_proj.bias, conv1d squeezed, the norms as 1 + w; and
+    Qwen3.5-MoE's: the stacked experts' gate_up_proj split in two, the shared expert's gate squeezed to a vector"""
     import torch
 
     nk, nv = int(cfg["linear_num_key_heads"]), int(cfg["linear_num_value_heads"])
@@ -273,6 +286,15 @@ def _qwen35_converted(cfg: Json, state: dict[str, torch.Tensor]) -> dict[str, to
         if name.startswith("mtp."):
             continue
         t = t.float()
+        if name.endswith(".mlp.experts.gate_up_proj"):
+            half, stem = int(t.shape[-2]) // 2, name.removesuffix("gate_up_proj")
+            out[stem + "gate_proj.weight"], out[stem + "up_proj.weight"] = t[:, :half], t[:, half:]
+            continue
+        if name.endswith(".mlp.experts.down_proj"):
+            out[name + ".weight"] = t
+            continue
+        if name.endswith(".mlp.shared_expert_gate.weight"):
+            t = t.squeeze(0)
         if ".in_proj_qkv." in name or ".conv1d." in name:
             t = t.squeeze() if ".conv1d." in name else t
             t = torch.cat([t[:qk], tiled(t[qk:], 0, hv)])
@@ -293,9 +315,9 @@ def _qwen35_converted(cfg: Json, state: dict[str, torch.Tensor]) -> dict[str, to
 
 
 def make_gguf() -> None:
-    """the GGUF fixtures: tiny_qwen3, tiny_phi3 and tiny_gemma3 in every storage type gguf-py writes, tiny_q35 in
-    the float and affine types (make_gguf_q35), tiny_q4 as llama.cpp's converter writes it (make_q4_gguf), and each
-    family's k-quant and i-quant twins (make_gguf_stored)"""
+    """the GGUF fixtures: tiny_qwen3, tiny_phi3 and tiny_gemma3 in every storage type gguf-py writes, tiny_q35 and
+    tiny_q35moe in the float and affine types and the mixture in MXFP4_MOE (make_gguf_q35), tiny_q4 as llama.cpp's
+    converter writes it (make_q4_gguf), and each family's k-quant and i-quant twins (make_gguf_stored)"""
     out = os.path.join(FIXTURES, "gguf")
     os.makedirs(out, exist_ok=True)
     for t in GGUF_TYPES:
@@ -307,21 +329,25 @@ def make_gguf() -> None:
             write_gguf(os.path.join(FIXTURES, stem), os.path.join(out, f"{stem}-{t}.gguf"), t)
     write_gguf(os.path.join(FIXTURES, "tiny_gpt_oss"), os.path.join(out, "tiny_gpt_oss-mxfp4.gguf"), "bf16")
     make_gguf_q35()
+    make_gguf_q35("tiny_q35moe")
     make_q4_gguf()
     make_gguf_stored()
     print("[fixture] gguf twins regenerated")
 
 
-def make_gguf_q35() -> None:
-    """tiny_q35 in every float and affine type (the storage cells gguf-py can write a twin for), its linear
-    attention through the converter's rewrites the reader must invert"""
+def make_gguf_q35(stem: str = "tiny_q35") -> None:
+    """a Qwen3.5 fixture (tiny_q35, or tiny_q35moe and its experts) in every float and affine type (the storage
+    cells gguf-py can write a twin for), and a mixture's MXFP4_MOE too, its linear attention through the
+    converter's rewrites the reader must invert"""
     from btb.kinds import QuantClass, quants_of
 
     out = os.path.join(FIXTURES, "gguf")
     os.makedirs(out, exist_ok=True)
-    for q in (*quants_of(QuantClass.FLOAT), *quants_of(QuantClass.AFFINE)):
+    cfg = json.load(open(os.path.join(FIXTURES, stem, "config.json"), encoding="utf-8"))
+    moe = quants_of(QuantClass.MXFP4) if cfg.get("num_experts") else ()
+    for q in (*quants_of(QuantClass.FLOAT), *quants_of(QuantClass.AFFINE), *moe):
         t = q.value.lower()
-        write_gguf(os.path.join(FIXTURES, "tiny_q35"), os.path.join(out, f"tiny_q35-{t}.gguf"), t)
+        write_gguf(os.path.join(FIXTURES, stem), os.path.join(out, f"{stem}-{t}.gguf"), t)
 
 
 # --- the qwen4exp twins, written by llama.cpp's own converter (a checkout named by $LLAMA_CPP) --------------
@@ -430,15 +456,15 @@ def stored_twin(src: str, like: str, out: str, q: Quant) -> bool:
     return True
 
 
-def make_gguf_stored() -> None:
-    """each GGUF family's twins in every type a linear multiplies as stored that gguf-py cannot write (the k-quants
-    and i-quants, `stored_twin`), from its q8_0 twin's layout and a float twin's spreads; a type no matrix of the
-    family fits has no twin"""
+def make_gguf_stored(stems: Sequence[str] | None = None) -> None:
+    """each GGUF family's twins (`stems`, every fixture's by default) in every type a linear multiplies as stored that
+    gguf-py cannot write (the k-quants and i-quants, `stored_twin`), from its q8_0 twin's layout and a float twin's
+    spreads; a type no matrix of the family fits has no twin"""
     from tests.cert import spec
 
     out = os.path.join(FIXTURES, "gguf")
     written = set(GGUF_TYPES)
-    for stem in spec.FIXTURE_STEM.values():
+    for stem in spec.FIXTURE_STEM.values() if stems is None else stems:
         like = os.path.join(out, spec.gguf_name(stem, Quant.Q8_0))
         floats = (os.path.join(out, spec.gguf_name(stem, f)) for f in quants_of(QuantClass.FLOAT))
         src = next((p for p in floats if os.path.isfile(p)), None)
@@ -834,31 +860,107 @@ def build_q35(out_dir: str, seed: int = Q35_SEED, over: Json | None = None) -> N
     os.makedirs(out_dir, exist_ok=True)
     m.save_pretrained(out_dir, max_shard_size="100KB" if over is None else "2GB", safe_serialization=True)
     sd = {k: v.detach().contiguous() for k, v in m.state_dict().items()}
-    sd.update(_mtp_head(cfg))  # the speculative drafter head, appended to the trunk (not a transformers module)
+    sd.update(_mtp_head(cfg, sd))  # the speculative drafter head, appended to the trunk (not a transformers module)
     _reshard(out_dir, sd, cap=100_000 if over is None else 1 << 30)
 
 
-def _mtp_head(cfg: PretrainedConfig) -> dict[str, torch.Tensor]:
+# a draw whose oracle decodes (base and FP8 twin) keep every greedy top-2 gap above the oracle's margin floor
+Q35MOE_SEED = 17
+
+
+def _q35moe_model(
+    seed: int = Q35MOE_SEED, over: Json | None = None
+) -> tuple[PretrainedConfig, GenerativePreTrainedModel]:
+    """tiny_q35moe in bf16: tiny_q35's trunk with each layer's MLP a mixture - four experts, two a token, and the
+    shared expert behind its gate - transformers' own init under `seed`; `over` replaces config fields"""
+    import torch
+    from transformers import Qwen3_5MoeForCausalLM
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
+
+    cfg0, _ = _q35_model(seed)
+    kw: Json = {k: v for k, v in cfg0.to_dict().items() if k in Qwen3_5MoeTextConfig().to_dict() and k != "model_type"}
+    kw.update(
+        {"num_experts": 4, "num_experts_per_tok": 2, "moe_intermediate_size": 64, "shared_expert_intermediate_size": 64}
+    )
+    kw.update(over or {})
+    torch.manual_seed(seed)
+    cfg = Qwen3_5MoeTextConfig(**kw)
+    return cfg, Qwen3_5MoeForCausalLM(cfg).eval().to(torch.bfloat16)
+
+
+def build_q35moe(out_dir: str, seed: int = Q35MOE_SEED, over: Json | None = None) -> None:
+    """tiny_q35moe with its drafting head; `over` replaces config fields"""
+    cfg, m = _q35moe_model(seed, over)
+    os.makedirs(out_dir, exist_ok=True)
+    m.save_pretrained(out_dir, max_shard_size="100KB" if over is None else "2GB", safe_serialization=True)
+    sd = {k: v.detach().contiguous() for k, v in m.state_dict().items()}
+    sd.update(_mtp_head(cfg, sd))  # the speculative drafter head, appended to the trunk (not a transformers module)
+    _reshard(out_dir, sd, cap=100_000 if over is None else 1 << 30)
+
+
+def gate_q35moe(base_dir: str) -> None:
+    """tiny_q35moe held to transformers' float32 forward before it is kept, as bank_q35 holds tiny_q35: the engine's
+    next-token logits on the host within 1e-4 and its greedy decode the reference's. The oracle banks its tokens"""
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    with torch.inference_mode():
+        ref = AutoModelForCausalLM.from_pretrained(base_dir, dtype=torch.float32).eval()
+        ref_next = ref(torch.tensor(PROMPT_Q35)).logits[0, -1]
+        ref_greedy = _greedy_hf(ref, PROMPT_Q35)
+        sm = host_model(base_dir)
+        lg = forward_logits(sm, PROMPT_Q35, sm.new_cache())
+        g = sm.generate_greedy(PROMPT_Q35, 10)
+        sm.close()
+    d = float((lg.float().reshape(-1, lg.shape[-1])[-1] - ref_next).abs().max())
+    assert g == ref_greedy, f"[q35moe] engine greedy {g} != transformers {ref_greedy}"
+    assert d < 1e-4, f"[q35moe] engine next vs transformers {d:.2e}"
+    print(f"[q35moe] gate ok: next vs transformers {d:.2e}, greedy matches")
+
+
+def _mtp_head(cfg: PretrainedConfig, trunk: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """The q35 MTP drafter: one gated-attention decoder layer over `[embedding; hidden]`, its `fc` folding the
-    pair back to the hidden size, with the pre-fc and final norms. Random bf16 in the trunk's shapes - the
-    verify pass makes speculation exact whatever the drafter proposes, so the weights need only be well-formed."""
+    pair back to the hidden size, with the pre-fc and final norms; a Qwen3.5-MoE config's layer a mixture as its
+    checkpoints keep the drafting layer's (the router, each routed expert's own three matrices, the shared expert
+    behind its gate). Random bf16 in the trunk's shapes, its query's (and gate's) width the trunk's own attention's
+    in `trunk` - the verify pass makes speculation exact whatever the drafter proposes, so the weights need only be
+    well-formed."""
     import torch
 
     torch.manual_seed(1)
-    h, hd, inter = int(cfg.hidden_size), int(cfg.head_dim), int(cfg.intermediate_size)
+    h, hd = int(cfg.hidden_size), int(cfg.head_dim)
     nq, nkv = int(cfg.num_attention_heads), int(cfg.num_key_value_heads)
-    gate = 2 if getattr(cfg, "attn_output_gate", False) else 1
+    q_rows = next(int(t.shape[0]) for k, t in trunk.items() if k.endswith(".self_attn.q_proj.weight"))
 
     def r(*shape: int) -> torch.Tensor:
         return (torch.randn(*shape) * 0.02).bfloat16()
 
+    def mlp() -> dict[str, torch.Tensor]:
+        E = int(getattr(cfg, "num_experts", 0) or 0)
+        if not E:
+            inter = int(cfg.intermediate_size)
+            return {
+                "mlp.gate_proj.weight": r(inter, h),
+                "mlp.up_proj.weight": r(inter, h),
+                "mlp.down_proj.weight": r(h, inter),
+            }
+        i, s = int(cfg.moe_intermediate_size), int(cfg.shared_expert_intermediate_size)
+        out = {"mlp.gate.weight": r(E, h)}
+        for e in range(E):
+            for k, shp in (("gate_proj", (i, h)), ("up_proj", (i, h)), ("down_proj", (h, i))):
+                out[f"mlp.experts.{e}.{k}.weight"] = r(*shp)
+        for k, shp in (("gate_proj", (s, h)), ("up_proj", (s, h)), ("down_proj", (h, s))):
+            out[f"mlp.shared_expert.{k}.weight"] = r(*shp)
+        out["mlp.shared_expert_gate.weight"] = r(1, h)
+        return out
+
     a = {
-        "self_attn.q_proj.weight": r(gate * nq * hd, h), "self_attn.k_proj.weight": r(nkv * hd, h),
+        "self_attn.q_proj.weight": r(q_rows, h), "self_attn.k_proj.weight": r(nkv * hd, h),
         "self_attn.v_proj.weight": r(nkv * hd, h), "self_attn.o_proj.weight": r(h, nq * hd),
         "self_attn.q_norm.weight": r(hd), "self_attn.k_norm.weight": r(hd),
-        "mlp.gate_proj.weight": r(inter, h), "mlp.up_proj.weight": r(inter, h), "mlp.down_proj.weight": r(h, inter),
-        "input_layernorm.weight": r(h), "post_attention_layernorm.weight": r(h),
     }  # fmt: skip
+    a |= mlp()
+    a |= {"input_layernorm.weight": r(h), "post_attention_layernorm.weight": r(h)}
     out = {f"mtp.layers.0.{k}": v for k, v in a.items()}
     out["mtp.fc.weight"] = r(h, 2 * h)
     out["mtp.norm.weight"] = r(h)
@@ -1203,6 +1305,7 @@ class Builder(Protocol):
 BUILDERS: dict[str, Builder] = {
     "qwen3": build_qwen3,
     "q35": build_q35,
+    "q35moe": build_q35moe,
     "phi3": build_phi3,
     "q4": build_q4,
     "gpt_oss": build_gpt_oss,
@@ -1270,6 +1373,10 @@ def make(name: str) -> None:
     if name == "gguf_q35":
         make_gguf_q35()
         return
+    if name == "gguf_q35moe":
+        make_gguf_q35("tiny_q35moe")
+        make_gguf_stored(("tiny_q35moe",))
+        return
     if name == "gguf_stored":
         make_gguf_stored()
         return
@@ -1293,6 +1400,8 @@ def make(name: str) -> None:
         bank_dense(name, base, pack, os.path.join(FIXTURES, f"receipts_{name}.pt"))
     elif name == "q35":
         bank_q35(base, os.path.join(FIXTURES, "receipts.pt"))
+    elif name == "q35moe":
+        gate_q35moe(base)
     elif name == "q4":
         bank_q4(base, os.path.join(FIXTURES, "receipts_q4.pt"))
     elif name == "gpt_oss":

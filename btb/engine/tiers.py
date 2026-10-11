@@ -32,7 +32,7 @@ from .device import where
 from .fixed_rows import RowLinear, fix_linears, fix_rows_cls
 from .host import _Experts, _HostLinear, _NGramRows, bf16_in_place, copy_bytes
 from .native import Native
-from .state import DRAFT_VOCAB, _State
+from .state import DRAFT_VOCAB, Shard, _State
 from .stored import CardStored, held_bytes
 
 if TYPE_CHECKING:
@@ -1255,21 +1255,23 @@ class _TiersMixin(_State):
             self._card_ms_min = ms if prev is None else min(prev, ms)
             self._events = []
 
-    def _new_layer(self, idx: int) -> Any:
+    def _new_layer(self, idx: int, base: str | None = None, at: int | None = None) -> Any:
+        """a layer of trunk layer `idx`'s kind; `base` and `at` one whose tensors sit under another prefix (a
+        drafting head's `mtp.layers.0.`), its experts the store's layer `at`"""
         with self._meta:
             layer = self.fam.layer(self.cfg, idx).eval()
-        layer = self.fam.shape_layer(self, layer, idx)
+        layer = self.fam.shape_layer(self, layer, idx if at is None else at, base=base)
         # a card layer's torch path row-invariant: its matmuls and norms at the fixed shape for a small pass, so a
         # step and a verify pass over the same token agree to the bit (fixed_rows.py); a no-op off the card
         fix_linears(layer)
         fix_rows_cls(self.fam.norm)
-        base = f"{self.prefix}layers.{idx}."
+        base = f"{self.prefix}layers.{idx}." if base is None else base
         for name, _b in layer.named_buffers():
             if base + name not in self.weight_map:
                 raise RuntimeError(f"[stream] layer has a buffer {name!r} the loader would not fill")
         return layer
 
-    def _shard(self, shard: str) -> tuple[Any, dict[str, Any], Any]:
+    def _shard(self, shard: str) -> Shard:
         if shard not in self._maps:
             gg = getattr(self, "gguf", None)
             if gg is not None and shard == gg.file:

@@ -1,14 +1,16 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 """Qwen3.5's MTP drafter: its drafting head (`mtp.fc` over the normed embedding and hidden state, one full-attention
 layer, `mtp.norm`) as the step the shared drafter (btb/engine/drafter.py) grows its trees from, on torch or as one
-MLX graph."""
+MLX graph. Qwen3.5-MoE's layer is the family's own, a mixture's: its experts are the expert store's, read under
+`mtp.layers.0.mlp.experts.` (one tensor an expert in its checkpoints) as the store's layer `L`, one past the trunk's,
+as Qwen4's drafter reads its own."""
 
 from __future__ import annotations
 
 import copy
 import time
-from collections.abc import Callable, Sequence
-from typing import Any
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import torch
 
@@ -21,6 +23,27 @@ from ...drafter import MTPDrafter, _Int8Linear, mlx_topk_ids
 from ...host import _HostLinear
 from ...native import Native
 
+if TYPE_CHECKING:
+    import mlx.core as mx_
+
+    from ....mlx.backend import Weight
+    from ....sampling import Sampling
+    from ...drafter import MxAppend, MxAttend
+
+# the drafting head's layer
+LAYER = "mtp.layers.0."
+
+
+class _Norms(TypedDict):
+    """the drafter's own norm weights (1 + w) in its MLX activation dtype `dt`: the embedding's, the hidden rows' and
+    the output's, and their epsilon"""
+
+    eps: float
+    dt: mx_.Dtype
+    e: mx_.array
+    h: mx_.array
+    n: mx_.array
+
 
 class Qwen35Drafter(MTPDrafter):
     """the drafting head of Qwen3.5 and the families sharing its `mtp.*` layout"""
@@ -30,24 +53,33 @@ class Qwen35Drafter(MTPDrafter):
     ) -> None:
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm
 
+        if train and sm.fam.moe:
+            raise ValueError("btb does not train Qwen3.5-MoE's drafting head: its experts are the expert store's")
         super().__init__(sm, train=train, weights=weights, dev=dev)
         cfg = sm.cfg
         idx = sm.layer_types.index(LayerKind.FULL)
-        self.layer = sm._new_layer(idx)
+        L = int(sm.L)
+        self.layer = sm._new_layer(idx, base=LAYER, at=L)
         src = {} if weights is None else torch.load(weights, map_location="cpu", weights_only=True)
         get = lambda k: src[k] if k in src else sm._get(k)
-        for name, _ in list(self.layer.named_parameters()):
-            sm._set_param(self.layer, name, get(f"mtp.layers.0.{name}").to(self.dev, dtype=self.cd))
+        for name, p in list(self.layer.named_parameters()):
+            t = get(f"{LAYER}{name}")
+            if t.shape != p.shape:
+                raise RuntimeError(
+                    f"[mtp] {LAYER}{name} is {tuple(t.shape)}; the drafter's layer takes {tuple(p.shape)}"
+                )
+            sm._set_param(self.layer, name, t.to(self.dev, dtype=self.cd))
         self.layer.self_attn.layer_idx = 0
         self.fc = get("mtp.fc.weight").to(self.dev, dtype=self.cd)
         self.fc_host = None
         if self.dev.type == Device.CPU and not train and (Native.gemv is not None or sm.mlx is not None):
-            base = "mtp.layers.0."
             for mname, m in list(self.layer.named_modules()):
                 for cname, child in list(m.named_children()):
                     if isinstance(child, torch.nn.Linear) and child.weight.dtype == torch.bfloat16:
-                        key = base + (f"{mname}.{cname}" if mname else cname) + ".weight"
+                        key = LAYER + (f"{mname}.{cname}" if mname else cname) + ".weight"
                         setattr(m, cname, _HostLinear(child.weight.data, key=key))
+            # the family's own part of a host layer: a mixture's router through the host's gemv
+            sm.fam.finish_host_layer(sm, self.layer, L, base=LAYER)
             if getattr(sm, "_packed", None):
                 sm._bind_host_packed_layer(self.layer)
             self.fc_host = _HostLinear(self.fc, key="mtp.fc.weight")
@@ -100,7 +132,7 @@ class Qwen35Drafter(MTPDrafter):
         self.cache = None
 
     def named_tensors(self) -> dict[str, torch.Tensor]:
-        out = {f"mtp.layers.0.{n}": p for n, p in self.layer.named_parameters()}
+        out = {f"{LAYER}{n}": p for n, p in self.layer.named_parameters()}
         if self.fc is not None:
             out["mtp.fc.weight"] = self.fc
         else:
@@ -122,7 +154,7 @@ class Qwen35Drafter(MTPDrafter):
             and sm._mlx_act() is not None
         )
 
-    def _mx_dtype(self) -> Any:
+    def _mx_dtype(self) -> mx_.Dtype:
         """The drafter's activation dtype on MLX: bf16 where the tree runs through the node kernel (it reads bf16
         rows), float32 otherwise (faster end to end). The verified output does not depend on it."""
         m = mlxdev.mx()
@@ -139,7 +171,7 @@ class Qwen35Drafter(MTPDrafter):
         Hk = int(getattr(sm.cfg, "num_key_value_heads", None) or Hq)
         return hd in (64, 128, 256) and Hq // Hk <= mlxdev.ATTN_MAXG
 
-    def _mm(self, x: Any, w: Any) -> Any:
+    def _mm(self, x: mx_.array, w: Weight) -> mx_.array:
         """x [b, cols] against the drafter's weight `w`: the engine's matmul, or, with `draft_bits` 4 or 8, MLX's
         quantized matmul over a copy of the weight packed in memory at first use (groups of 64, affine) - the
         model's files untouched, the drafter's output only ever verified"""
@@ -158,7 +190,7 @@ class Qwen35Drafter(MTPDrafter):
         wq, sc, bi = packed
         return m.quantized_matmul(x, wq, sc, bi, transpose=True, group_size=64, bits=bits)
 
-    def _mx_head(self) -> Any:
+    def _mx_head(self) -> Weight:
         """The drafter's head: the model's, or its first `draft_vocab` rows (ids follow frequency rank). A proposal
         outside them is a missed draft; the verified output is unchanged."""
         w = getattr(self, "_mx_head_w", None)
@@ -171,19 +203,24 @@ class Qwen35Drafter(MTPDrafter):
             self._mx_head_w = w
         return w
 
-    def _mx_norms(self) -> dict[str, Any]:
+    def _mx_norms(self) -> _Norms:
         """the drafter's own norm weights (1 + w) in its activation dtype, made once"""
         m = mlxdev.mx()
         dt = self._mx_dtype()
-        wd = getattr(self, "_mx_consts", None)
+        wd: _Norms | None = getattr(self, "_mx_consts", None)
         if wd is None or wd["dt"] != dt:
-            wd = self._mx_consts = {"eps": float(self.sm.cfg.rms_norm_eps), "dt": dt}
-            for name, mod in (("e", self.norm_e), ("h", self.norm_h), ("n", self.norm)):
-                wd[name] = mlxdev.to_mx((1.0 + mod.weight.data.detach().float()).contiguous()).astype(dt)
-            m.eval(wd["e"], wd["h"], wd["n"])
+            e, h, n = (
+                mlxdev.to_mx((1.0 + mod.weight.data.detach().float()).contiguous()).astype(dt)
+                for mod in (self.norm_e, self.norm_h, self.norm)
+            )
+            m.eval(e, h, n)
+            wd = _Norms(eps=float(self.sm.cfg.rms_norm_eps), dt=dt, e=e, h=h, n=n)
+            self._mx_consts = wd
         return wd
 
-    def _mlx_step(self, tok_ids: torch.Tensor, h: torch.Tensor, pos0: int, need_logits: bool = True) -> tuple[Any, Any]:
+    def _mlx_step(
+        self, tok_ids: torch.Tensor, h: torch.Tensor, pos0: int, need_logits: bool
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """The drafter's step as one MLX graph (norms, fc, the attention layer over its shared cache, the head)
         over bf16 weights in the drafter's dtype."""
         m = mlxdev.mx()
@@ -197,12 +234,12 @@ class Qwen35Drafter(MTPDrafter):
         em = mlxdev.to_mx(e).astype(dt)
         hm = mlxdev.to_mx(h.detach().contiguous()).astype(dt)
         cl = self.cache.layers[0]
-        append: Callable[[Any, Any], tuple[Any, Any]]
+        append: MxAppend
         if isinstance(cl, GrowLayer) and cl.shared:
             append = cl.mx_update
         else:
 
-            def _append(kh: Any, vh: Any) -> tuple[Any, Any]:
+            def _append(kh: mx_.array, vh: mx_.array) -> tuple[mx_.array, mx_.array]:
                 m.eval(kh, vh)
                 kf, vf = self.cache.update(mlxdev.from_mx(kh), mlxdev.from_mx(vh), 0)
                 return mlxdev.to_mx(kf), mlxdev.to_mx(vf)
@@ -218,9 +255,9 @@ class Qwen35Drafter(MTPDrafter):
         hn = m.fast.rms_norm(out, wd["n"], wd["eps"])
         H = int(c.hidden_size)
         if sm.head_host is not None and sm.head_host.mx is not None:
-            logits = self._mm(hn.reshape(B * T, H), self._mx_head()).reshape(B, T, -1).astype(m.float32)
-            m.eval(logits, out)
-            logits = mlxdev.from_mx(logits)
+            lm = self._mm(hn.reshape(B * T, H), self._mx_head()).reshape(B, T, -1).astype(m.float32)
+            m.eval(lm, out)
+            logits = mlxdev.from_mx(lm)
         else:
             m.eval(hn, out)
             logits = sm._head_host()(mlxdev.from_mx(hn)).float()
@@ -228,7 +265,15 @@ class Qwen35Drafter(MTPDrafter):
         self.steps += 1
         return logits, mlxdev.from_mx(out)
 
-    def _mlx_body(self, em: Any, hm: Any, pos0: int, append: Any, attn: Any = None, layer: Any = None) -> Any:
+    def _mlx_body(
+        self,
+        em: mx_.array,
+        hm: mx_.array,
+        pos0: int,
+        append: MxAppend | None,
+        attn: MxAttend | None = None,
+        layer: GrowLayer | None = None,
+    ) -> mx_.array:
         """The drafter's layer over `em`/`hm` [B, T, H] MLX arrays in the drafter's dtype: returns `out` [B, T, H],
         lazily; `append(kh, vh)` gives the attention its K/V (the cache's append), or `attn(qh, kh, vh)` computes
         the attention itself (the tree's node kernel over the shared cache) and returns [B, Hq, T, D]; `layer` the
@@ -284,8 +329,9 @@ class Qwen35Drafter(MTPDrafter):
         if attn is not None:
             a = attn(qh, kh, vh)
         else:
+            assert append is not None  # the attention's K/V from the caller's cache when it computes none itself
             K, V = append(kh, vh)
-            if B == 1 and sm._mlx_prefill_able(layer, T, hd, Hq, Hk):
+            if B == 1 and layer is not None and sm._mlx_prefill_able(layer, T, hd, Hq, Hk):
                 a = mlxdev.attn_prefill(
                     qh[0].transpose(1, 0, 2), layer._mx[0], layer._mx[1], layer._n - T, float(at.scaling), odt=qh.dtype
                 )
@@ -296,6 +342,14 @@ class Qwen35Drafter(MTPDrafter):
                 )
         a = a.transpose(0, 2, 1, 3).reshape(B, T, Hq * hd) * m.sigmoid(gate)
         o = self._mm(a.reshape(B * T, -1), at.o_proj.mx)
+        if sm.fam.moe:
+            # a mixture's block through its modules, as the trunk's run on MLX: the router and the shared expert's
+            # linears on MLX, the experts the store's (layer L), between the graph's halves
+            x = x + o.reshape(B, T, H)
+            x2 = m.fast.rms_norm(x, w["ln2"], w["eps2"]).astype(m.float32)
+            m.eval(x2)
+            y = mlp(mlxdev.from_mx(x2))
+            return x + mlxdev.to_mx(y.float().contiguous()).astype(x.dtype)
         gu_w = getattr(mlp, "_mx_gu", None)
         if fuse:
             x_flat, x2 = fk.add_rmsnorm(x.reshape(B * T, H), o, w["ln2"], w["eps2"])
@@ -310,7 +364,9 @@ class Qwen35Drafter(MTPDrafter):
         mid = act(self._mm(x2, mlp.gate_proj.mx)) * self._mm(x2, mlp.up_proj.mx)
         return x + self._mm(mid, mlp.down_proj.mx).reshape(B, T, H)
 
-    def _mlx_draw(self, out: Any, k: int, sampling: Any, keys: Sequence[int]) -> tuple[Any, Any, Any]:
+    def _mlx_draw(
+        self, out: mx_.array, k: int, sampling: Sampling, keys: Sequence[int]
+    ) -> tuple[mx_.array, mx_.array, mx_.array]:
         """The drafter's head over `out` [B, 1, H] under `sampling`: `k` children a row drawn without replacement
         from the sampled distribution (in draw order), their log-probabilities, and the distribution itself
         [B, Vd]; lazily."""
@@ -325,7 +381,7 @@ class Qwen35Drafter(MTPDrafter):
         vals = m.log(m.take_along_axis(q, ids, axis=-1))
         return vals, ids, q
 
-    def _mlx_topk(self, out: Any, k: int) -> tuple[Any, Any]:
+    def _mlx_topk(self, out: mx_.array, k: int) -> tuple[mx_.array, mx_.array]:
         """The drafter's head over `out` [B, 1, H]: the top-k log-probs and ids [B, k], sorted, lazily - the
         whole reduction on the graph, so a tree depth reads k numbers a node instead of the logits."""
         m = mlxdev.mx()
@@ -339,7 +395,9 @@ class Qwen35Drafter(MTPDrafter):
         ids = mlx_topk_ids(lp, k)
         return m.take_along_axis(lp, ids, axis=-1), ids
 
-    def _step(self, tok_ids: torch.Tensor, h: torch.Tensor, pos0: int, need_logits: bool = True) -> tuple[Any, Any]:
+    def _pass(
+        self, tok_ids: torch.Tensor, h: torch.Tensor, pos0: int, need_logits: bool
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
         if self._mlx_ready():
             return self._mlx_step(tok_ids, h, pos0, need_logits)
         from transformers.masking_utils import create_causal_mask

@@ -623,6 +623,9 @@ class GrowLayer(_DynamicLayer):
         m = mlxdev.mx()
         mdt = m.int8 if self.bits else mlxdev._dtypes()[dtype]
         old = self._mx
+        if old is not None and self._n and old[0].dtype != mdt:
+            # a new buffer starts empty: rows of another dtype would drop the ones held
+            raise RuntimeError(f"[cache] rows of {mdt} for a layer holding {self._n} rows of {old[0].dtype}")
         same = old is not None and self._shape[1] == Hk and self._shape[-1] == d and old[0].dtype == mdt
         if same and self._shape[0] >= B and self._shape[2] >= need:
             # the buffer holds the largest batch seen; a smaller batch uses its first rows
@@ -913,6 +916,11 @@ class GrowLayer(_DynamicLayer):
         if not self.is_initialized:
             self.lazy_initialization(key_states, value_states)
         if self.shared and key_states.device.type == "cpu":
+            if self._mx is not None and not self.bits and self._n:
+                # the rows stay in the dtype the buffer keeps them in: a host layer's float32 step after an MLX
+                # prefill's bf16 rows is cast to them (`_ensure` would make a new buffer for another dtype)
+                kept = mlxdev.torch_dtype(self._mx[0].dtype)
+                key_states, value_states = key_states.to(kept), value_states.to(kept)
             B, Hk, T, d = key_states.shape
             n = self.get_seq_length()
             self._ensure(B, Hk, n + T, d, key_states.dtype)

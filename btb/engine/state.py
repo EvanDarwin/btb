@@ -5,6 +5,7 @@ engine reads as `getattr(self, name, default)` is declared without a value: unse
 
 from __future__ import annotations
 
+import mmap
 import threading
 import weakref
 from collections.abc import Callable, Iterable, Sequence
@@ -14,11 +15,15 @@ from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 import torch
 
 from .. import trace
-from ..kinds import LayerTier, PassReport, PassTag, Proposer
+from ..kinds import Json, LayerTier, PassReport, PassTag, Proposer
 from .device import Where
 
 # rows of the lm_head the drafter proposes from
 DRAFT_VOCAB = 32768
+
+# a checkpoint file as the engine maps it (`_shard`): its pages (none of a GGUF file's, which the gguf package maps),
+# its header (a tensor's name to its dtype, shape and data offsets), and where the data starts past the header
+Shard = tuple[mmap.mmap | None, Json, int]
 
 # an API call's record in _calls: made from any thread
 _CALLS_LOCK = threading.Lock()
@@ -169,7 +174,7 @@ class _State:
     _events: list[tuple[torch.cuda.Event, torch.cuda.Event]]
     _host_cost: dict[int, float]
     _kv_stage: list[Any] | None
-    _maps: dict[Any, Any]
+    _maps: dict[str, Shard]
     _packed: Any
     _packed_maps: dict[Any, Any]
     _pending: Any
@@ -373,7 +378,7 @@ class _State:
     def _load_layer(self, i: int, tmpl: Any, first: bool = False) -> None:
         raise NotImplementedError
 
-    def _new_layer(self, idx: int) -> Any:
+    def _new_layer(self, idx: int, base: str | None = None, at: int | None = None) -> Any:
         raise NotImplementedError
 
     def _next_template(self, lt: str) -> Any:
@@ -392,7 +397,7 @@ class _State:
     def _set_param(module: Any, dotted: str, t: torch.Tensor, buffer: bool = False) -> None:
         raise NotImplementedError
 
-    def _shard(self, shard: str) -> tuple[Any, dict[str, Any], Any]:
+    def _shard(self, shard: str) -> Shard:
         raise NotImplementedError
 
     def _start_prefetch(self, i: int, tmpl: Any) -> None:

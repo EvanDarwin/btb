@@ -475,35 +475,43 @@ def test_a_quantized_gguf_decodes_as_its_dequantized_weights(tmp_path: Path) -> 
         _agrees_where_decisive(path, str(twin))
 
 
-def _need_q35() -> None:
-    if not os.path.isfile(os.path.join(GGUF, "tiny_q35-bf16.gguf")):
-        pytest.skip("the Qwen3.5 GGUF fixtures are not here (tests/make_fixtures.py gguf_q35)")
+# Qwen3.5 and its mixture, both through the Qwen3.5 converter's rewrites
+Q35_STEMS = ("tiny_q35", "tiny_q35moe")
+# the mixture's MLP widths, in place of the dense one's intermediate_size
+MOE_KEYS = ("num_experts", "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size")
 
 
-def _q35_trunk() -> dict[str, torch.Tensor]:
-    """the tiny_q35 checkpoint without its MTP head, which llama.cpp's converter leaves out under --no-mtp"""
-    state = safetensors_state(os.path.join(FIXTURES, "tiny_q35"))
+def _need_q35(stem: str = "tiny_q35") -> None:
+    if not os.path.isfile(os.path.join(GGUF, f"{stem}-bf16.gguf")):
+        pytest.skip(f"the {stem} GGUF fixtures are not here (tests/make_fixtures.py gguf_{stem.removeprefix('tiny_')})")
+
+
+def _q35_trunk(stem: str = "tiny_q35") -> dict[str, torch.Tensor]:
+    """the checkpoint without its MTP head, which llama.cpp's converter leaves out under --no-mtp"""
+    state = safetensors_state(os.path.join(FIXTURES, stem))
     return {k: v for k, v in state.items() if not k.startswith("mtp.")}
 
 
-def test_a_qwen35_gguf_reads_back_its_checkpoint() -> None:
+@pytest.mark.parametrize("stem", Q35_STEMS)
+def test_a_qwen35_gguf_reads_back_its_checkpoint(stem: str) -> None:
     """Qwen3.5 through llama.cpp's converter and back: the config off the typed keys (the hybrid's layer pattern,
-    linear attention widths, partial MRoPE), every trunk tensor found and equal as bf16 once the converter's
-    rewrites are inverted (the tiled value heads, -exp(A_log), 1 + norm, the squeezed conv), and a quantized
-    file's reordered blocks (what the packed kernels bind) the same numbers as its reordered dequantization"""
-    _need_q35()
+    linear attention widths, partial MRoPE, a mixture's experts), every trunk tensor found and equal as bf16 once
+    the converter's rewrites are inverted (the tiled value heads, -exp(A_log), 1 + norm, the squeezed conv, the
+    split experts and squeezed shared-expert gate), and a quantized file's reordered blocks (what the packed
+    kernels bind) the same numbers as its reordered dequantization"""
+    _need_q35(stem)
     from gguf import dequantize
 
     from btb.gguf import GGUFModel
 
-    g = GGUFModel(os.path.join(GGUF, "tiny_q35-bf16.gguf"))
+    g = GGUFModel(os.path.join(GGUF, f"{stem}-bf16.gguf"))
     cfg = g.config()
-    want = json.load(open(os.path.join(FIXTURES, "tiny_q35", "config.json")))
+    want = json.load(open(os.path.join(FIXTURES, stem, "config.json")))
     assert cfg.model_type == want["model_type"] == g.model_type
     for k in (
+        *(MOE_KEYS if want.get("num_experts") else ("intermediate_size",)),
         "num_hidden_layers",
         "hidden_size",
-        "intermediate_size",
         "num_attention_heads",
         "num_key_value_heads",
         "head_dim",
@@ -519,7 +527,7 @@ def test_a_qwen35_gguf_reads_back_its_checkpoint() -> None:
         assert getattr(cfg, k) == want[k], (k, getattr(cfg, k), want[k])
     for k in ("rope_theta", "mrope_section", "mrope_interleaved"):
         assert cfg.rope_parameters[k] == want["rope_parameters"][k], k
-    state = _q35_trunk()
+    state = _q35_trunk(stem)
     names, hdr = g.weight_map(list(state), cfg.num_hidden_layers)
     assert set(names) == set(state), set(state) ^ set(names)
     for hf, gn in names.items():
@@ -527,7 +535,7 @@ def test_a_qwen35_gguf_reads_back_its_checkpoint() -> None:
         assert t.dtype == torch.bfloat16 and tuple(t.shape) == tuple(state[hf].shape) == tuple(hdr[hf]["shape"]), hf
         assert torch.equal(t, state[hf].to(torch.bfloat16)), hf
     for qt in ("q8_0", "q4_0", "q4_1"):
-        q = GGUFModel(os.path.join(GGUF, f"tiny_q35-{qt}.gguf"))
+        q = GGUFModel(os.path.join(GGUF, f"{stem}-{qt}.gguf"))
         qnames, _ = q.weight_map(list(state), cfg.num_hidden_layers)
         reordered = [gn for gn in qnames.values() if gn in q.undo and gn in q.tensors]
         assert any(q.undo[gn][1].cols is not None for gn in reordered), qt  # out_proj binds as stored too
@@ -537,32 +545,35 @@ def test_a_qwen35_gguf_reads_back_its_checkpoint() -> None:
             assert torch.equal(torch.from_numpy(np.array(got, dtype=np.float32)).bfloat16(), q.get(gn)), (qt, gn)
 
 
-def test_a_qwen35_bf16_gguf_decodes_as_its_safetensors_twin() -> None:
-    _need_q35()
-    twin = os.path.join(FIXTURES, "tiny_q35")
-    assert _tokens(os.path.join(GGUF, "tiny_q35-bf16.gguf")) == _tokens(twin)
+@pytest.mark.parametrize("stem", Q35_STEMS)
+def test_a_qwen35_bf16_gguf_decodes_as_its_safetensors_twin(stem: str) -> None:
+    _need_q35(stem)
+    twin = os.path.join(FIXTURES, stem)
+    assert _tokens(os.path.join(GGUF, f"{stem}-bf16.gguf")) == _tokens(twin)
 
 
-def test_a_qwen35_bf16_gguf_decodes_as_its_safetensors_twin_on_mlx() -> None:
-    _need_q35()
+@pytest.mark.parametrize("stem", Q35_STEMS)
+def test_a_qwen35_bf16_gguf_decodes_as_its_safetensors_twin_on_mlx(stem: str) -> None:
+    _need_q35(stem)
     need_mlx()
-    twin = os.path.join(FIXTURES, "tiny_q35")
-    assert _tokens(os.path.join(GGUF, "tiny_q35-bf16.gguf"), "mlx") == _tokens(twin, "mlx")
+    twin = os.path.join(FIXTURES, stem)
+    assert _tokens(os.path.join(GGUF, f"{stem}-bf16.gguf"), "mlx") == _tokens(twin, "mlx")
 
 
-def test_a_quantized_qwen35_gguf_decodes_as_its_dequantized_weights(tmp_path: Path) -> None:
-    """each affine type: the file read as bf16 slots (`gguf_packed=0`) decodes exactly as a safetensors model built
-    from the numbers the reader dequantizes and un-rewrites, and as stored agrees wherever a step is decisive; those
-    numbers differ from the bf16 twin's as a quantization does"""
-    _need_q35()
+@pytest.mark.parametrize("stem", Q35_STEMS)
+def test_a_quantized_qwen35_gguf_decodes_as_its_dequantized_weights(tmp_path: Path, stem: str) -> None:
+    """each affine type: the file read as bf16 slots (`gguf_packed=0`, a mixture's experts too) decodes exactly as a
+    safetensors model built from the numbers the reader dequantizes and un-rewrites, and as stored agrees wherever
+    a step is decisive; those numbers differ from the bf16 twin's as a quantization does"""
+    _need_q35(stem)
     from safetensors.torch import save_file
 
     from btb.gguf import GGUFModel
 
-    src = os.path.join(FIXTURES, "tiny_q35")
-    state = _q35_trunk()
+    src = os.path.join(FIXTURES, stem)
+    state = _q35_trunk(stem)
     for qt in ("q8_0", "q4_0", "q4_1"):
-        path = os.path.join(GGUF, f"tiny_q35-{qt}.gguf")
+        path = os.path.join(GGUF, f"{stem}-{qt}.gguf")
         g = GGUFModel(path)
         names, _ = g.weight_map(list(state), g.config().num_hidden_layers)
         deq = {hf: g.get(gn).contiguous() for hf, gn in names.items()}
@@ -576,14 +587,15 @@ def test_a_quantized_qwen35_gguf_decodes_as_its_dequantized_weights(tmp_path: Pa
         _agrees_where_decisive(path, str(twin))
 
 
-def test_a_qwen35_gguf_multiplies_its_reordered_blocks_as_stored_on_mlx() -> None:
+@pytest.mark.parametrize("stem", Q35_STEMS)
+def test_a_qwen35_gguf_multiplies_its_reordered_blocks_as_stored_on_mlx(stem: str) -> None:
     """the value-head reordering applied to the stored blocks (rows of in_proj_*, whole blocks of out_proj's
     columns): the packed path's first-step logits sit within bf16 rounding of the dequantized path's"""
-    _need_q35()
+    _need_q35(stem)
     need_mlx()
     logits = {}
     for packed in (1, 0):
-        with loaded_model(os.path.join(GGUF, "tiny_q35-q8_0.gguf"), device="mlx", gguf_packed=packed) as sm:
+        with loaded_model(os.path.join(GGUF, f"{stem}-q8_0.gguf"), device="mlx", gguf_packed=packed) as sm:
             rep = sm.report()["model"]["gguf"]
             assert (rep["packed"] > 0) == bool(packed), rep
             lg = sm.forward([PROMPT], cache=sm.new_cache())

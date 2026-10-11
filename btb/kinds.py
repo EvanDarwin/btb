@@ -92,6 +92,7 @@ class FamilyKind(StrEnum):
 
     QWEN3 = "qwen3"
     QWEN3_5 = "qwen3_5"
+    QWEN3_5_MOE = "qwen3_5_moe"
     QWEN4 = "qwen4"
     PHI3 = "phi3"
     GPT_OSS = "gpt_oss"
@@ -102,6 +103,7 @@ class FamilyKind(StrEnum):
 FAMILY_NAMES: dict[FamilyKind, str] = {
     FamilyKind.QWEN3: "Qwen3",
     FamilyKind.QWEN3_5: "Qwen3.5",
+    FamilyKind.QWEN3_5_MOE: "Qwen3.5-MoE",
     FamilyKind.PHI3: "Phi-3",
     FamilyKind.QWEN4: "Qwen4",
     FamilyKind.GPT_OSS: "GPT-OSS",
@@ -117,6 +119,8 @@ class ModelType(StrEnum):
     QWEN3 = "qwen3"
     QWEN3_5 = "qwen3_5"
     QWEN3_5_TEXT = "qwen3_5_text"
+    QWEN3_5_MOE = "qwen3_5_moe"
+    QWEN3_5_MOE_TEXT = "qwen3_5_moe_text"
     PHI3 = "phi3"
     QWEN4_EXP = "qwen4_exp"
     QWEN4_EXP_TEXT = "qwen4_exp_text"
@@ -153,6 +157,8 @@ KIND_OF: dict[ModelType, FamilyKind] = {
     ModelType.QWEN3: FamilyKind.QWEN3,
     ModelType.QWEN3_5: FamilyKind.QWEN3_5,
     ModelType.QWEN3_5_TEXT: FamilyKind.QWEN3_5,
+    ModelType.QWEN3_5_MOE: FamilyKind.QWEN3_5_MOE,
+    ModelType.QWEN3_5_MOE_TEXT: FamilyKind.QWEN3_5_MOE,
     ModelType.PHI3: FamilyKind.PHI3,
     ModelType.QWEN4_EXP: FamilyKind.QWEN4,
     ModelType.QWEN4_EXP_TEXT: FamilyKind.QWEN4,
@@ -166,6 +172,7 @@ KIND_OF: dict[ModelType, FamilyKind] = {
 CAPS: dict[FamilyKind, frozenset[Cap]] = {
     FamilyKind.QWEN3: frozenset({Cap.DENSE, Cap.KERNEL_LAYOUT, Cap.FAST}),
     FamilyKind.QWEN3_5: frozenset({Cap.HYBRID, Cap.MROPE, Cap.ATTN_GATE, Cap.NORM_CENTERED, Cap.FAST}),
+    FamilyKind.QWEN3_5_MOE: frozenset({Cap.HYBRID, Cap.MOE, Cap.MROPE, Cap.ATTN_GATE, Cap.NORM_CENTERED, Cap.FAST}),
     FamilyKind.PHI3: frozenset({Cap.DENSE, Cap.FAST}),
     FamilyKind.QWEN4: frozenset({Cap.MOE, Cap.MROPE, Cap.ATTN_GATE, Cap.OWN, Cap.FAST}),
     FamilyKind.GPT_OSS: frozenset({Cap.MOE, Cap.MXFP4, Cap.EAGER, Cap.FLAT_CACHE}),

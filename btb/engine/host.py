@@ -5,6 +5,7 @@ the MoE router and experts, and the n-gram proposer's row table."""
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from itertools import accumulate
 from typing import TYPE_CHECKING, Any
 
@@ -22,8 +23,20 @@ from .native import Native
 from .pack import unpack_bf16
 
 if TYPE_CHECKING:
+    from ..mlx.backend import Backend, Weight
     from .experts import StoreCall
     from .scratch import Scratch
+
+# one expert's gate_up as its form multiplies it - bf16 [2I, H], MXFP4's blocks, FP8's bytes and grid, a GGUF's
+# stored gate and up - and its down
+ExpertGateUp = torch.Tensor | MxWeight | F8Weight | GateUp
+ExpertDown = torch.Tensor | MxWeight | F8Weight | QuantWeight
+# a layer's experts held whole (`_Experts._tables`): the checkpoint's bf16 tensor [E, ...] taken an expert at a time,
+# or a stored form's weights, one an expert
+GateUpTable = torch.Tensor | Sequence[ExpertGateUp]
+DownTable = torch.Tensor | Sequence[ExpertDown]
+# one expert as the MLX step multiplies it: gate_up one weight, or a GGUF's stored (gate, up); and down
+MxExpert = tuple["Weight | tuple[Weight, Weight]", "Weight"]
 
 
 def copy_bytes(dst: torch.Tensor, t: torch.Tensor) -> None:
@@ -278,6 +291,17 @@ def group_picks(top_k_index: torch.Tensor, num_experts: int) -> tuple[torch.Tens
     return order // T, order % T, offs, [int(n) for n in counts]
 
 
+# a stacked expert tensor's per-expert pieces, where a checkpoint keeps a layer's experts one tensor each (Qwen3.5-MoE's
+# drafting layer, `mtp.layers.0.mlp.experts.{e}.gate_proj.weight`): gate's rows then up's make gate_up's, a scale
+# grid's likewise
+PIECES: dict[str, tuple[str, ...]] = {
+    "gate_up_proj": ("gate_proj.weight", "up_proj.weight"),
+    "down_proj": ("down_proj.weight",),
+    "gate_up_proj_scale_inv": ("gate_proj.weight_scale_inv", "up_proj.weight_scale_inv"),
+    "down_proj_scale_inv": ("down_proj.weight_scale_inv",),
+}
+
+
 class _Experts(torch.nn.Module):
     # MXFP4 or FP8 experts widened on the card at a time in a grouped call: gpt-oss-120b's are 50 MB a piece widened
     WIDEN_BATCH = 16
@@ -286,10 +310,10 @@ class _Experts(torch.nn.Module):
     act_fn: Any
     alpha: float
     base: str
-    down: Any
+    down: DownTable | None
     down_proj_bias: Any
     gate: Any
-    gate_up: Any
+    gate_up: GateUpTable | None
     gate_up_proj_bias: Any
     layer: int
     limit: float
@@ -333,7 +357,7 @@ class _Experts(torch.nn.Module):
             self.gate_up_proj_bias = torch.nn.Parameter(torch.zeros(0), requires_grad=False)
             self.down_proj_bias = torch.nn.Parameter(torch.zeros(0), requires_grad=False)
 
-    def _tables(self) -> Any:
+    def _tables(self) -> tuple[GateUpTable, DownTable]:
         if self.gate_up is None:
             if self.ggml:
                 # the file's tensors as they are, one weight per expert (the store does this from its slots)
@@ -359,13 +383,28 @@ class _Experts(torch.nn.Module):
                         MxWeight(b[e].reshape(-1), s[e].reshape(-1), rows, g * BLOCK) for e in range(int(b.shape[0]))
                     ]
                 self.gate_up, self.down = parts["gate_up_proj"], parts["down_proj"]
-            elif self.f8:
-                self.gate_up = self.sm._f8_weights(self.base + "gate_up_proj")
-                self.down = self.sm._f8_weights(self.base + "down_proj")
             else:
-                self.gate_up = self.sm._get(self.base + "gate_up_proj")
-                self.down = self.sm._get(self.base + "down_proj")
-        return self.gate_up, self.down
+                self.gate_up, self.down = self._whole("gate_up_proj"), self._whole("down_proj")
+        gu, dn = self.gate_up, self.down
+        assert gu is not None and dn is not None  # both made above, once
+        return gu, dn
+
+    def _whole(self, name: str) -> torch.Tensor | list[F8Weight]:
+        """stacked expert tensor `name` as `_tables` holds it - a tensor [E, ...], or an FP8 one's F8Weight an
+        expert: the checkpoint's own, or each expert's pieces joined where it keeps them one tensor each
+        (`PIECES`), a copy"""
+        sm, key = self.sm, self.base + name
+        if key in sm.weight_map:
+            return sm._f8_weights(key) if self.f8 else sm._get(key)
+        keys = [[f"{self.base}{e}.{p}" for p in PIECES[name]] for e in range(self.num_experts)]
+        if not self.f8:
+            return torch.stack([torch.cat([sm._get(k) for k in ks]) for ks in keys])
+        out = []
+        for ks in keys:
+            ws = [sm._f8_weights(k)[0] for k in ks]
+            rows = sum(w.shape[0] for w in ws)
+            out.append(F8Weight(torch.cat([w.w for w in ws]), torch.cat([w.scales for w in ws]), rows, ws[0].shape[1]))
+        return out
 
     def _act(self, gate_up: torch.Tensor, rows: Any = None) -> torch.Tensor:
         """The expert's middle: `gate_up` [n, 2 * intermediate] to [n, intermediate]; `rows` names the expert behind
@@ -538,7 +577,7 @@ class _Experts(torch.nn.Module):
         # every active expert's two matmuls in one MLX graph over the store's slots (or copies of the
         # checkpoint's tables when there is no store), summed in expert order; one eval per layer
         be = self.sm.mlx
-        tables: Any = self._tables() if store is None else None
+        tables = self._tables() if store is None else None
 
         def rows(e: int) -> Any:
             top_k_pos, token_idx = torch.where(expert_mask[e])
@@ -576,7 +615,7 @@ class _Experts(torch.nn.Module):
                     (
                         e,
                         *rows(e),
-                        store._views_mx(store.last_slots[e]) if store is not None else self._mlx_table(be, tables, e),
+                        store._views_mx(store.last_slots[e]) if tables is None else self._mlx_table(be, tables, e),
                     )
                 )
         for batch in store.landed(pending) if pending else ():
@@ -587,12 +626,14 @@ class _Experts(torch.nn.Module):
         final += out.to(final.dtype)
 
     @staticmethod
-    def _mlx_table(be: Any, tables: Any, e: int) -> Any:
+    def _mlx_table(be: Backend, tables: tuple[GateUpTable, DownTable], e: int) -> MxExpert:
         """expert `e` of the whole tables as the MLX step takes it: bf16 weights, or a GGUF's stored (gate, up), down"""
         gu, dn = tables[0][e], tables[1][e]
         if isinstance(dn, QuantWeight):
+            assert isinstance(gu, GateUp) and isinstance(gu.gate, QuantWeight) and isinstance(gu.up, QuantWeight)
             st = lambda w: be.weight_stored(w.q, w.raw.numpy(), w.shape)
             return (st(gu.gate), st(gu.up)), st(dn)
+        assert isinstance(gu, torch.Tensor) and isinstance(dn, torch.Tensor)  # bf16, an expert's slice of the stack
         return be.weight(gu), be.weight(dn)
 
     def _mx_biases(self) -> Any:
@@ -1014,13 +1055,18 @@ class _Experts(torch.nn.Module):
             self.sm._tag(PassTag.EXPERT_TABLES)  # no store: the checkpoint's expert tables, held whole
             gu, dn = self._tables()
             if self.ggml and not self.mx:
-                self.sm._tag(PassTag.EXPERT_QUANT_ASSTORED, *(quant_tag(w.q) for w in (gu[0].gate, gu[0].up, dn[0])))
+                g0, d0 = gu[0], dn[0]
+                # a GGUF's stored types other than MXFP4: gate and up apart, each a QuantWeight
+                assert isinstance(g0, GateUp) and isinstance(g0.gate, QuantWeight) and isinstance(g0.up, QuantWeight)
+                assert isinstance(d0, QuantWeight)
+                self.sm._tag(PassTag.EXPERT_QUANT_ASSTORED, *(quant_tag(w.q) for w in (g0.gate, g0.up, d0)))
             views = {e: (gu[e], dn[e]) for e in hit}
             call = None
             seated = set()
             if self.mx or self.f8 or self.ggml:
                 per_expert = gu[0].nbytes + dn[0].nbytes
             else:
+                assert isinstance(gu, torch.Tensor) and isinstance(dn, torch.Tensor)  # bf16: the stacked tensors
                 per_expert = (gu.shape[1] * gu.shape[2] + dn.shape[1] * dn.shape[2]) * gu.element_size()
         # the experts of this wave (the call's whole, unless the store serves it in turn)
         left = set(call.rest) if call is not None else set()

@@ -4100,11 +4100,16 @@ class _CudaMixin(_State):
         sandwich = self.fam.sandwich
         x2 = layer.pre_feedforward_layernorm(h) if sandwich else layer.post_attention_layernorm(h)
         mlp = layer.mlp
-        if hasattr(mlp, "gate_up_proj"):  # gate and up as one projection (Phi-3's layout)
-            gate, up = mlp.gate_up_proj(x2).chunk(2, dim=-1)
-            fn = mlp.activation_fn
+        if self.fam.moe:
+            # a mixture's block whole: its router, experts and shared expert the engine's, each row as its own
+            out = mlp(x2)
+            out = out[0] if isinstance(out, tuple) else out
         else:
-            gate, up = mlp.gate_proj(x2), mlp.up_proj(x2)
-            fn = mlp.act_fn
-        out = mlp.down_proj(fn(gate) * up)
+            if hasattr(mlp, "gate_up_proj"):  # gate and up as one projection (Phi-3's layout)
+                gate, up = mlp.gate_up_proj(x2).chunk(2, dim=-1)
+                fn = mlp.activation_fn
+            else:
+                gate, up = mlp.gate_proj(x2), mlp.up_proj(x2)
+                fn = mlp.act_fn
+            out = mlp.down_proj(fn(gate) * up)
         return residual + (layer.post_feedforward_layernorm(out) if sandwich else out)

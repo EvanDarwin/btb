@@ -362,7 +362,7 @@ def test_card_family_predicate_matches_cuda_source() -> None:
     assert "self.fam.card_graph" in body, "cuda.py's card gate no longer asks the family"
     assert f"D in {manifest.CARD_HEAD_DIMS}" in body, "the card's head widths moved; CARD_HEAD_DIMS is stale"
     rejected = sorted(k.value for k in core.served_kinds() if not core.card_family_ok(k))
-    assert rejected == ["gpt_oss", "phi3", "qwen3_5", "qwen4"]
+    assert rejected == ["gpt_oss", "phi3", "qwen3_5", "qwen3_5_moe", "qwen4"]
 
 
 def test_own_layer_speculation_gate_matches_its_source() -> None:

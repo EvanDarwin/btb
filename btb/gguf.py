@@ -31,9 +31,11 @@ Derived = tuple[tuple[str, ...], Invert]
 NameMap = Callable[[str], str | None]
 
 # the architectures whose converter rewrites tensors: the linear attention and the norms (Qwen3_5TextModel's
-# modify_tensors, which qwen4exp's converter runs under its own), the norms alone (Gemma3Model's, + 1: llama.cpp's
-# RMSNorm scales by the weight, Gemma's by 1 + weight)
-REWRITTEN = frozenset({"qwen35", QWEN4EXP, "gemma3"})
+# modify_tensors, which Qwen3.5-MoE's and qwen4exp's converters run under their own), the norms alone (Gemma3Model's,
+# + 1: llama.cpp's RMSNorm scales by the weight, Gemma's by 1 + weight)
+REWRITTEN = frozenset({"qwen35", "qwen35moe", QWEN4EXP, "gemma3"})
+# the architectures whose converter splits the checkpoint's stacked experts' gate_up_proj in two (`_rebuild_experts`)
+SPLIT_EXPERTS = frozenset({"qwen35moe", QWEN4EXP})
 
 # btb's own names for an architecture the installed gguf package does not know yet, modelled on llama.cpp's tree
 # (gguf-py's constants.py and tensor_mapping.py; MIT, Copyright (c) 2023 Georgi Gerganov): the checkpoint name
@@ -331,7 +333,8 @@ class GGUFModel:
     def _qwen35_fields(self) -> Json:
         """Qwen3.5's config off its typed keys (transformers has no GGUF table for it), inverting what llama.cpp's
         converter writes: MTP blocks counted into block_count, the value head width folded into ssm.inner_size,
-        the rotary as a dimension count and the layer pattern as full_attention_interval"""
+        the rotary as a dimension count and the layer pattern as full_attention_interval; Qwen3.5-MoE's experts
+        and shared expert besides"""
         g = gguf_lib()
         llm, att, ssm, rope = g.Keys.LLM, g.Keys.Attention, g.Keys.SSM, g.Keys.Rope
         out: Json = {}
@@ -340,6 +343,10 @@ class GGUFModel:
             (llm.EMBEDDING_LENGTH, "hidden_size"),
             (llm.FEED_FORWARD_LENGTH, "intermediate_size"),
             (llm.VOCAB_SIZE, "vocab_size"),
+            (llm.EXPERT_COUNT, "num_experts"),
+            (llm.EXPERT_USED_COUNT, "num_experts_per_tok"),
+            (llm.EXPERT_FEED_FORWARD_LENGTH, "moe_intermediate_size"),
+            (llm.EXPERT_SHARED_FEED_FORWARD_LENGTH, "shared_expert_intermediate_size"),
             (att.HEAD_COUNT, "num_attention_heads"),
             (att.HEAD_COUNT_KV, "num_key_value_heads"),
             (ssm.CONV_KERNEL, "linear_conv_kernel_dim"),
@@ -379,7 +386,7 @@ class GGUFModel:
         from transformers import AutoConfig
 
         fields = self._parsed()["config"]
-        if self.model_type is ModelType.QWEN3_5_TEXT:
+        if self.model_type in (ModelType.QWEN3_5_TEXT, ModelType.QWEN3_5_MOE_TEXT):
             fields.update(self._qwen35_fields())
         if self.arch == QWEN4EXP:
             fields.update(self._qwen4exp_config())
@@ -635,10 +642,42 @@ class GGUFModel:
             hdr[hf] = self._entry(file, list(undo.shape or self._shape(file)), None if name == file else "undone")
         spans = stored_experts or self.mxfp4_experts()
         if self.arch == QWEN4EXP:
-            self._map_qwen4exp(hf_names, get_name, names, hdr, rebuild_experts=not spans)
-        if self.arch != QWEN4EXP or spans:
+            self._map_qwen4exp(hf_names, get_name, names, hdr)
+        if spans or not self.split_experts():
             self._map_experts(hf_names, n_layers, names, hdr, stored_experts)
+        else:
+            self._rebuild_experts(hf_names, get_name, names, hdr)
         return names, hdr
+
+    def split_experts(self) -> bool:
+        """whether the file's experts are llama.cpp's split gate and up (`ffn_gate_exps`, `ffn_up_exps`) of a family
+        whose checkpoint stacks them as one `gate_up_proj` [experts, gate rows then up rows, hidden] - qwen4exp's and
+        Qwen3.5-MoE's, against gpt-oss's interleaved rows (always MXFP4, so always the store's spans)"""
+        return self.arch in SPLIT_EXPERTS and any(n.endswith("ffn_gate_exps.weight") for n in self.tensors)
+
+    def _rebuild_experts(self, hf_names: list[str], get_name: NameMap, names: dict[str, str], hdr: Json) -> None:
+        """the experts the store dequantizes, under the checkpoint's stacked names: gate/up joined from the file's two
+        tensors on read, the down projection the file's own"""
+        for hf in hf_names:
+            layer, _, rest = hf.removeprefix("model.layers.").partition(".")
+            pre = f"model.layers.{layer}.mlp.experts."
+            if rest == "mlp.experts.gate_up_proj":
+                gu = tuple(f"{get_name(pre + k)}.weight" for k in ("gate_proj", "up_proj"))
+                if gu[0] not in self.tensors:
+                    continue  # a dense layer between MoE ones
+                e, i, h = self._shape(gu[0])
+                names[hf] = hf
+                hdr[hf] = {
+                    "dtype": "BF16",
+                    "shape": [e, 2 * i, h],
+                    "data_offsets": [0, 2 * e * 2 * i * h],
+                    "gguf": {"type": "derived", "offset": 0, "nbytes": 0},
+                }
+                self.derived[hf] = (gu, lambda a: np.concatenate(a, axis=-2))
+            elif rest == "mlp.experts.down_proj":
+                f = f"{get_name(pre + 'down_proj')}.weight"
+                if f in self.tensors:
+                    names[hf], hdr[hf] = f, self._entry(f)
 
     def mxfp4_experts(self) -> bool:
         """whether the file stores its experts as MXFP4 (gpt-oss's, or llama.cpp's MXFP4_MOE of any MoE)"""
@@ -688,6 +727,8 @@ class GGUFModel:
             undo = Undo(rows=qkv, shape=(shape[0], 1, shape[-1]))
         elif hf.endswith(".ple.conv1d.weight"):
             undo = Undo(shape=(shape[0], 1, shape[-1]))
+        elif hf.endswith(".mlp.shared_expert_gate.weight") and len(shape) == 1:
+            undo = Undo(shape=(1, shape[0]))  # the shared expert's gate, a one-row linear, squeezed
         elif hf.endswith(lin + "out_proj.weight"):
             undo = Undo(cols=heads)
         elif _plus_one(hf):
@@ -711,14 +752,11 @@ class GGUFModel:
             b = b.reshape(rows, -1, size)[:, blocks].reshape(rows, -1)
         return np.ascontiguousarray(b)
 
-    def _map_qwen4exp(
-        self, hf_names: list[str], get_name: NameMap, names: dict[str, str], hdr: Json, rebuild_experts: bool
-    ) -> None:
+    def _map_qwen4exp(self, hf_names: list[str], get_name: NameMap, names: dict[str, str], hdr: Json) -> None:
         """qwen4exp's checkpoint tensors that are not one file tensor each (conversion/qwen4exp.py): the indexer's
-        projection and (`rebuild_experts`: experts the store dequantizes) the experts' gate/up, each split in two
-        by the converter and joined on read, the experts' down projection under its stacked name, and the n-gram
-        table as its one shard with its hash constants off the metadata. Its per-tensor rewrites are the Qwen3.5
-        converter's, inverted in `weight_map`; experts read as stored are `_map_experts`' spans."""
+        projection, split in two by the converter and joined on read, and the n-gram table as its one shard with its
+        hash constants off the metadata. Its per-tensor rewrites are the Qwen3.5 converter's, inverted in
+        `weight_map`; its experts are `_map_experts`' spans or `_rebuild_experts`'."""
 
         def rows(a: list[np.ndarray]) -> np.ndarray:
             return np.concatenate(a, axis=-2)
@@ -751,13 +789,6 @@ class GGUFModel:
                     tensor_name(self.arch, m, int(layer)) + ".weight" for m in ("INDEXER_Q_PROJ", "INDEXER_K_PROJ")
                 )
                 derive(hf, qk_proj, rows, [shape(qk_proj[0])[0] + shape(qk_proj[1])[0], shape(qk_proj[0])[1]])
-            elif rest == "mlp.experts.gate_up_proj" and rebuild_experts:
-                gu = tuple(f"{get_name(pre + 'mlp.experts.' + k)}.weight" for k in ("gate_proj", "up_proj"))
-                e, i, h = shape(gu[0])
-                derive(hf, gu, rows, [e, 2 * i, h])
-            elif rest == "mlp.experts.down_proj" and rebuild_experts:
-                f = f"{get_name(pre + 'mlp.experts.down_proj')}.weight"
-                names[hf], hdr[hf] = f, self._entry(f)
             elif rest.startswith("ple.ple_embedding.") and rest.rpartition(".")[2] in consts:
                 c = const(consts[rest.rpartition(".")[2]])
                 derive(hf, (), c, [len(c([]))], "I64")

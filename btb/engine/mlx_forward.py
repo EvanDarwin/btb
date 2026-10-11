@@ -7,7 +7,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 import numpy as np
 import torch
@@ -574,7 +574,7 @@ class _MlxMixin(_State):
             return m.fast.rms_norm(a.astype(wt.dtype), wt, eps).astype(a.dtype)
         return m.fast.rms_norm(a, wt, eps)
 
-    def _mlx_prefill_able(self, cl: Any, T: int, hd: int, Hq: int, Hk: int) -> bool:
+    def _mlx_prefill_able(self, cl: object, T: int, hd: int, Hq: int, Hk: int) -> TypeGuard[GrowLayer]:
         """The fused prefill kernel's gate: a causal chunk of more than 16 rows at head size 256 (the size MLX's own
         fused attention lacks) over a shared bf16 cache layer with no row selected, `mlx_attn_prefill` on."""
         return (

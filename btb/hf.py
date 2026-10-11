@@ -84,6 +84,7 @@ ARCH_MODEL_TYPES = {
     "phi3": ModelType.PHI3,
     "gpt-oss": ModelType.GPT_OSS,
     "qwen35": ModelType.QWEN3_5_TEXT,
+    "qwen35moe": ModelType.QWEN3_5_MOE_TEXT,
     "gemma3": ModelType.GEMMA3_TEXT,
 }
 # llama.cpp's architecture for transformers' qwen4_exp, which the gguf package's releases (0.19) do not know yet:
