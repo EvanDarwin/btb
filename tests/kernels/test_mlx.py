@@ -357,6 +357,76 @@ def check_attn_tree() -> str:
     )
 
 
+def check_attn_paged() -> str:
+    """the node and prefill kernels over a paged cache: a conversation's rows scattered (`kv_scatter`) over a pool's
+    pages in shuffled order, the rows before a pass read through its row map and the pass's own beside them, bit for
+    bit as the same rows held in one contiguous buffer - the decode, a tree's nodes and a prefill chunk (the fold goes
+    by the conversation's rows, never where they lie)"""
+    import mlx.core as mx
+
+    from btb import mlx as mlxdev
+    from btb.engine.kvpool import PAGE
+    from btb.mlx.attn import ATTN_PF_BLOCK
+
+    mx.random.seed(13)
+    rng = np.random.default_rng(13)
+    bad = []
+    for Hq, Hk, d, past, parents in (
+        (32, 8, 128, 3000, [-1, 0, 0, 1, 2, 2, 4]),
+        (16, 4, 256, 73, [-1, 0, 0, 1, 1, 2, 3, 5]),
+        (8, 2, 256, 1500, [-1, 0, 1, 2]),
+    ):
+        T = len(parents)
+        n = past + T
+        pages = -(-n // PAGE)
+        pool = 2 * pages + 3
+        order = rng.permutation(pool)[:pages]
+        rows = (order[:, None] * PAGE + np.arange(PAGE)[None]).reshape(-1)[:n]
+        # the contiguous buffer padded to whole prefill blocks, so its last block starts where the paged one's does
+        cap = -(-n // ATTN_PF_BLOCK) * ATTN_PF_BLOCK + ATTN_PF_BLOCK
+        kb = mx.zeros((1, Hk, cap, d), dtype=mx.bfloat16)
+        vb = mx.zeros((1, Hk, cap, d), dtype=mx.bfloat16)
+        kb[:, :, :n] = (mx.random.normal((1, Hk, n, d)) * 2).astype(mx.bfloat16)
+        vb[:, :, :n] = mx.random.normal((1, Hk, n, d)).astype(mx.bfloat16)
+        rk = mx.zeros((1, Hk, pool * PAGE, d), dtype=mx.bfloat16)
+        rv = mx.zeros((1, Hk, pool * PAGE, d), dtype=mx.bfloat16)
+        q1 = mx.random.normal((Hq, d))
+        qt = mx.random.normal((T, Hq, d))
+        mx.eval(kb, vb, rk, rv, q1, qt)
+        at = mx.array(rows.astype(np.uint32))
+        mx.eval(mlxdev.kv_scatter(rk, rv, kb[:, :, :n], vb[:, :, :n], at))
+        old, step = at[: n - 1], at[:past]
+        pairs = [
+            (
+                "decode",
+                mlxdev.attn_decode(q1, kb, vb, n, 0.088),
+                mlxdev.attn_decode(q1, rk, rv, n, 0.088, rmap=old, k2=kb[:, :, n - 1 : n], v2=vb[:, :, n - 1 : n]),
+            ),
+            (
+                "tree",
+                mlxdev.attn_tree(qt, kb, vb, past, parents, 0.088),
+                mlxdev.attn_tree(qt, rk, rv, past, parents, 0.088, rmap=step, k2=kb[:, :, past:n], v2=vb[:, :, past:n]),
+            ),
+        ]
+        if d == 256:
+            qp = mx.random.normal((T, Hq, d)).astype(mx.bfloat16)
+            pairs.append(
+                (
+                    "prefill",
+                    mlxdev.attn_prefill(qp, kb, vb, past, d**-0.5, odt=mx.float32),
+                    mlxdev.attn_prefill(
+                        qp, rk, rv, past, d**-0.5, odt=mx.float32, rmap=step, k2=kb[:, :, past:n], v2=vb[:, :, past:n]
+                    ),
+                )
+            )
+        for name, want, got in pairs:
+            mx.eval(want, got)
+            if not mx.array_equal(want, got):
+                bad.append((name, Hq, Hk, d, past, float(mx.max(mx.abs(want - got)))))
+    assert not bad, f"paged reads differ from contiguous ones: {bad}"
+    return "decode, tree and prefill through a shuffled row map bit-exact against contiguous rows (heads 128, 256)"
+
+
 def check_attn_int8() -> str:
     """the node kernel over an int8 cache (a float32 scale per row): the decode against a float32 reference
     over the dequantized rows, and a tree's nodes bit for bit as one-row decodes over the same int8 rows"""
@@ -1104,6 +1174,7 @@ def main() -> int:
         check_causal,
         check_attn_kernel,
         check_attn_tree,
+        check_attn_paged,
         check_attn_int8,
         check_delta_tree,
         check_mxfp4_table,

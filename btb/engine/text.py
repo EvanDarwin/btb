@@ -722,10 +722,10 @@ class _TextMixin(_State):
                 holdings.own(Stage.MEMORY, "the prefix cache's pages", kv.close)
         return cast("PrefixCache | None", self.__dict__["_kv"])
 
-    def _decode_cache(self, max_len: int) -> Any:
+    def _decode_cache(self, max_len: int | None = None) -> Any:
         """one sequence's cache for a decode no session lends one to: over the prefix cache's pool where the engine
         has one - its attention reads pages as a session's does, nothing goes into the tree, and the pages go back
-        with the cache - else a contiguous one reaching `max_len`"""
+        with the cache - else a contiguous one reaching `max_len` (the context's, None)"""
         pc = self._prefix_cache()
         return pc.new() if pc is not None else self.new_cache(max_len=max_len)
 

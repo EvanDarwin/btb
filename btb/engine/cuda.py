@@ -4039,18 +4039,9 @@ class _CudaMixin(_State):
 
     @staticmethod
     def _pass_lists(paged: Any) -> dict[Any, Any]:
-        """a paged cache's lists for the pass (`_span_lists`, `_node_lists`): those of its row map's present version
-        alone, which every change to the map moves - a window's and the whole prefix's (Gemma 3's layers alternate)
-        side by side, made once for every layer that reads them alike. One set for the engine's prefix cache, the last
-        conversation's: kept on each conversation, an idle one held its last pass's. Let go as another conversation's
-        pass begins (`PrefixCache.reading`): replaced only by a pass that builds its own, one whose layers build none
-        (the card's, under a split placement or kv_host) left an idle conversation's held"""
-        pc, table = paged.prefix, paged.table
-        ref, ver, memo = pc._lists or (None, None, {})
-        if ref is None or ref() is not table or ver != table.version:
-            memo = {}
-            pc._lists = (weakref.ref(table), table.version, memo)
-        return cast("dict[Any, Any]", memo)
+        """a paged cache's lists for the pass (`_span_lists`, `_node_lists`), its prefix cache's for its table
+        (`PrefixCache.lists`): a window's and the whole prefix's (Gemma 3's layers alternate) side by side"""
+        return cast("dict[Any, Any]", paged.prefix.lists(paged.table))
 
     @staticmethod
     def _span_lists(paged: Any, base: int, T: int, win: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

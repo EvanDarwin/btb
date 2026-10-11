@@ -43,11 +43,9 @@ FIXTURES = spec.FIXTURES
 GGUF_DIR = spec.GGUF_DIR
 
 # the shapes the card's step-graph kernels are written for (btb/engine/cuda.py:295: a lane holds D/32 dims of a
-# head), the megakernel's head multiple (btb/mlx/mega.py:599), and the heads the engine sends to its MLX attention
-# kernels (mlx_forward.ATTN_KERNEL_HEADS). None is reachable from a torch-free module, so test_manifest holds
-# each against the source it is quoted from.
+# head) and the heads the engine sends to its MLX attention kernels (mlx_forward.ATTN_KERNEL_HEADS). Neither is
+# reachable from a torch-free module, so test_manifest holds each against the source it is quoted from.
 CARD_HEAD_DIMS: tuple[int, ...] = (64, 128, 256)
-MEGA_HEAD_MULTIPLE = 64
 MLX_ATTN_HEAD_DIMS: tuple[int, ...] = (128, 256)
 # a family that brings its own layer (Qwen4) verifies a speculative pass exactly through btb's own kernels for the
 # layers that carry state - the host's node steps, the card's DeltaNet node kernel - and the rest row-invariant
@@ -203,12 +201,13 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "add the family's fixture stem to spec.FIXTURE_STEM and generate the twin in tests/make_fixtures.py",
     ),
     Missing.PREFIX_CACHE: (
-        "this tier's attention reads no pages yet (btb/engine/prefix.py `why_not`): its sessions keep one "
+        "MLX's megakernel reads each conversation's own arena, not the pool's pages, so where it serves an engine's "
+        "passes the prefix cache stands aside for it (btb/engine/prefix.py `why_not`): its sessions keep one "
         "conversation's cache each and drop it whole for a prompt that shares nothing with it, so a conversation's "
         "next turn after another request is prefilled again from its first token, and a prefix two conversations "
         "share is computed and held once each",
-        "land the paged prefix cache on this tier - MLX's per-op kernels and megakernel over one pool buffer (plan "
-        "phase P8) - then take the tier out of `why_not` and spec.paged; the runner's prefix cells run there",
+        "have the megakernel read the pool's regions through the conversation's row map, as the per-token graph's "
+        "kernels do (mlx_forward.py `_mlx_attend_paged`), then take its refusal out of `why_not` and spec.paged",
     ),
     Missing.PREFIX_WIDE: (
         "the card's paged attention kernels read bf16 rows with heads of 64, 128 or 256 dims, and this sub-path's "
@@ -542,19 +541,17 @@ def dnr(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath, decode
     return None
 
 
+MEGA_GAP: dict[spec.MegaRefusal, Missing] = {
+    spec.MegaRefusal.LAYOUT: Missing.MEGAKERNEL,
+    spec.MegaRefusal.STORAGE: Missing.MEGA_STORAGE,
+    spec.MegaRefusal.SHAPE: Missing.MEGA_SHAPE,
+}
+
+
 def _mega_gap(kind: FamilyKind, storage: spec.Storage) -> Missing | None:
-    """why the megakernel cannot engage, by the engine's own gates: the family's layout (mlx_forward.py:1320
-    takes kernel_layout and refuses a sandwich), the weight binding it reads through, then the head width."""
-    fl = core.flags(kind)
-    if Cap.KERNEL_LAYOUT not in fl or Cap.SANDWICH in fl:
-        return Missing.MEGAKERNEL
-    qc = spec.quant_class(storage)
-    if spec.STORAGE[storage].container is spec.Container.PACK12 or qc not in (None, QuantClass.FLOAT):
-        return Missing.MEGA_STORAGE
-    hd = spec.head_dim(kind)
-    if hd is None or hd % MEGA_HEAD_MULTIPLE:
-        return Missing.MEGA_SHAPE
-    return None
+    """why the megakernel cannot engage, by the engine's own gates (`spec.mega_refusal`)"""
+    why = spec.mega_refusal(kind, storage)
+    return MEGA_GAP[why] if why is not None else None
 
 
 def _card_graph_gap(kind: FamilyKind) -> Missing | None:
@@ -590,7 +587,7 @@ def subpath_gap(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath
 def prefix_gap(kind: FamilyKind, dev: spec.DeviceSubpath) -> Missing | None:
     """why the prefix axis's conversations cannot hold on this family and sub-path, in the order the engine hits
     it: a sub-path that does not engage at all (its own gap), then the engine's own reasons (`PrefixCache.why_not`,
-    whose rule `spec.paged` is): a tier the prefix cache is not on yet, a family's own attention, then the card's own
+    whose rule `spec.paged` is): a family's own attention, MLX's megakernel where it serves, then the card's own
     conditions (its kernels' widths). Served on the card, a hit equals its cold decode where every layer runs the card
     graph's kernels, whose prefill makes each row as the step does; elsewhere on the card it cannot yet
     (`PREFIX_INVARIANCE`), a hybrid's resumed from the snapshots its prefill kept among them"""
@@ -601,11 +598,10 @@ def prefix_gap(kind: FamilyKind, dev: spec.DeviceSubpath) -> Missing | None:
         if dev.hardware is not spec.Hardware.CUDA or (dev.card_graph and spec.card_rows(kind)):
             return None
         return Missing.PREFIX_INVARIANCE
-    if dev.hardware not in (spec.Hardware.CPU, spec.Hardware.CUDA):
-        return Missing.PREFIX_CACHE
-    if spec.paged(kind, spec.Hardware.CPU):
-        return Missing.PREFIX_WIDE  # served on the host, so the card's own conditions refuse it
-    return Missing.PREFIX_FAMILY
+    if not spec.paged(kind, spec.Hardware.CPU):
+        return Missing.PREFIX_FAMILY
+    # served on the host, so the sub-path's own conditions refuse it: MLX's megakernel, the card's widths
+    return Missing.PREFIX_CACHE if dev.hardware is spec.Hardware.MLX else Missing.PREFIX_WIDE
 
 
 def shape_gap(surface: spec.Surface, kind: FamilyKind, dev: spec.DeviceSubpath) -> Missing | None:

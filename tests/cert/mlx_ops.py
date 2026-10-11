@@ -115,8 +115,8 @@ class Op:
 # new launcher or a new `btb_*` kernel that no family covers is a reported gap - the table cannot fall behind.
 OPS: tuple[Op, ...] = (
     Op("rope", "attn", ("btb_rope_rows", "btb_rope_rows2"), "kernels/test_mlx.py"),
-    Op("attn_decode", "attn", ("btb_attn_nodes_**_d*_g*_n*", "btb_attn_fold"), "kernels/test_mlx.py"),
-    Op("attn_prefill", "attn", ("btb_attn_prefill_d256_g*",), "kernels/test_mlx.py"),
+    Op("attn_decode", "attn", ("btb_attn_nodes_***_d*_g*_n*", "btb_attn_fold"), "kernels/test_mlx.py"),
+    Op("attn_prefill", "attn", ("btb_attn_prefill_d256_g**",), "kernels/test_mlx.py"),
     Op("delta", "delta", ("btb_delta_recurrent*", "btb_delta_tree"), "kernels/test_mlx.py"),
     Op(
         "fused_dense",
@@ -205,7 +205,7 @@ OPS: tuple[Op, ...] = (
         "kernels/test_gguf.py",
         funcs=("repack_lattice", "matvec_lattice", "dequant_lattice"),
     ),
-    Op("kv", "kv", ("btb_kv_store",), "kernels/test_kv.py"),
+    Op("kv", "kv", ("btb_kv_store", "btb_kv_scatter"), "kernels/test_kv.py"),
     Op("mega", "mega", ("btb_mega_*_*_*_*",), "kernels/test_mega.py"),
     Op("sample", "sample", ("btb_sample_pick", "btb_sample_verify"), "kernels/test_sampling.py"),
     Op(

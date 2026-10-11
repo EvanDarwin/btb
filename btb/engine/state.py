@@ -811,7 +811,7 @@ class _State:
         raise NotImplementedError
 
     # -- text.py --
-    def _decode_cache(self, max_len: int) -> Any:
+    def _decode_cache(self, max_len: int | None = None) -> Any:
         raise NotImplementedError
 
     # -- memory.py --
