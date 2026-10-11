@@ -16,14 +16,13 @@ import pytest
 import torch
 
 from btb.engine import StreamedTextModel
-from btb.engine import device as device_mod
 from btb.engine.cache import ForkLayer, GrantedIndexedLayer, GrowLayer
 from btb.engine.device import Device
 from btb.engine.host import _HostLinear
 from btb.engine.memory import Room
 from btb.engine.scheduler import EPOCH, MemoryGrantError
 from btb.pool import POOL
-from tests.helpers import fixture, loaded_model, need_cuda, need_mlx
+from tests.helpers import fixture, loaded_model, need_cuda, need_mlx, squeeze
 
 if TYPE_CHECKING:
     from btb.engine.cache import KvCache
@@ -39,20 +38,6 @@ def sm(request: pytest.FixtureRequest) -> Iterator[StreamedTextModel]:
         need_mlx()
     with loaded_model(fixture("tiny_qwen3"), device=request.param) as m:
         yield m
-
-
-def squeeze(sm: StreamedTextModel, left: int, mp: pytest.MonkeyPatch) -> None:
-    """leave `left` bytes free on the host, as btb counts it: the host's free RAM and the commit left (the ledger's
-    host figure is the smaller of the two) pinned at their readings here, as MLX's ledger is its own already -
-    measured against a live reading, any other process's allocation took the last bytes, or gave some back, and a
-    decode the test expects to run was refused, or one it expects refused ran"""
-    if sm.mlx is not None:
-        sm.ram_reserve = int(sm.mem_start) - int(sm.mlx.held_bytes()) - left
-    else:
-        now, commit = device_mod.host_free_bytes(), device_mod.host_commit_bytes()
-        mp.setattr(device_mod, "host_free_bytes", lambda: now)
-        mp.setattr(device_mod, "host_commit_bytes", lambda: commit)
-        sm.ram_reserve += max(0, sm.memory()["cpu"].free - left)
 
 
 def test_rooms_add_up_and_come_back(sm: StreamedTextModel) -> None:

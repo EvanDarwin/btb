@@ -10,6 +10,8 @@ every row in RAM under `kv_host`):
 * a side request between two turns leaves the conversation where it was: the next turn opens on its rows - on the
   card brought back from the RAM they were parked in meanwhile - and answers as the uninterrupted conversation does;
 * two conversations opening alike read the same rows of one set of pages, held once;
+* RAM with no room for the pool to grow lets the tree's least recently used conversation go for a new prompt's rows,
+  it alone: asked again it is prefilled from nothing, the others still open on their rows;
 * a layer the card gives up takes every conversation's rows to the host and back, the answers as a contiguous
   cache's;
 * an engine the prefix cache does not serve yet says why, and its sessions keep contiguous caches."""
@@ -35,7 +37,7 @@ from btb.engine.paged import PagedCache
 from btb.engine.prefix import PrefixCache
 from btb.kinds import LayerKind, PassTag
 from tests.cert.spec import card_rows, kind_of_stem
-from tests.helpers import FIXTURES, fixture, shared_key, shared_model
+from tests.helpers import FIXTURES, fixture, shared_key, shared_model, squeeze
 
 DENSE = ["tiny_gemma3", "tiny_phi3", "tiny_qwen3"]
 # the dense families the card graph serves, whose prompts take its kernels (`_forward_card_prefill`), by the cert's
@@ -237,6 +239,47 @@ def test_two_conversations_opening_alike_read_the_same_rows(stem: str, place: st
         alone.feed([*system, *u1])
         assert list(sm.generate([*system, *u2], 6, eos=(), session=alone, speculate=False).tokens) == got
         assert alone.last_reuse == len(system) and torch.equal(after, alone.next_logits())
+
+
+@pytest.mark.parametrize("stem", DENSE)
+def test_ram_short_of_a_prompts_rows_lets_the_least_recently_used_conversation_go(
+    stem: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """three conversations the tree holds - the second used longest ago - and the RAM with no room for the pool to
+    grow (`squeeze`): a prompt past the pool's free pages takes the second's pages, it alone let go and the RAM asked
+    for nothing more. With room again, the conversation let go is a miss, prefilled from nothing, and answers as it
+    did; the others open on every row of their prompts the tree kept, and answer as they did"""
+    sm = model(stem)
+    pc = prefix(sm)
+    pc.pool.trim()  # the region at its floor: what these conversations leave free all it holds spare
+    rng = random.Random(16)
+    convs = [toks(rng, 300) for _ in range(3)]
+    for j, p in enumerate(convs):
+        p[0] = 3 + j  # nothing in common with one another, nor with the prompt after
+    a, b, c = convs
+    s = sm.session()
+    outs = [list(sm.generate(p, 4, eos=(), session=s, speculate=False).tokens) for p in convs]
+    sm.generate([*a, *outs[0], *toks(rng, 8)], 4, eos=(), session=s, speculate=False)  # a used last, b longest ago
+    assert s.last_reuse == len(a) + len(outs[0]) - 1
+    pages, cap = pc.pool.pages, pc.pool.host.cap
+    spare = len(pages.free) + cap - len(pages.pages)
+    d = toks(rng, spare * PAGE + PAGE // 2)  # a page past the spare ones, its answer within it
+    d[0] = 6
+    assert len(d) + 4 <= int(sm.cfg.max_position_embeddings), f"{spare} spare pages: the prompt past them too long"
+    probe = pc.new()
+    need = probe.growth(len(d) + 4).get("cpu", 0)
+    probe.release()
+    assert need > 0, "the prompt fit the pool's free pages: nothing to make room for"
+    with monkeypatch.context() as mp:
+        squeeze(sm, need - 1, mp)
+        sm.generate(d, 4, eos=(), session=s, speculate=False)
+        assert s.last_reuse == 0
+    assert pc.pool.host.cap == cap, "the pool grew in RAM with no room for it"
+    assert set(pc.tree.root.kids) == {a[0], c[0]}, "not the least recently used conversation alone let go"
+    for p, out, kept in ((b, outs[1], 0), (a, outs[0], len(a) - 1), (c, outs[2], len(c) - 1)):
+        assert list(sm.generate(p, 4, eos=(), session=s, speculate=False).tokens) == out, f"conversation {p[0]}"
+        assert s.last_reuse == kept, f"conversation {p[0]}: reused {s.last_reuse} rows, not {kept}"
+        assert (PassTag.PREFIX_HIT if kept else PassTag.PREFIX_MISS) in sm.last_pass_report()
 
 
 @CARD

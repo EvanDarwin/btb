@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 """What a request may ask of its answer beyond the sampling: OpenAI's `n`, `logprobs`, `stop`, `logit_bias`, the
 penalties and `response_format`, and Ollama's `format` and `options.stop` - served from the tiny fixture on the
-CPU, plus the processors they map to on their own."""
+CPU, plus the processors they map to on their own; and the prompt tokens usage says the cache held, the hybrid
+fixture's too."""
 
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ import pytest
 import torch
 
 from btb.engine.constrain import JsonObjectPrefix, LogitBias, Penalties, PrefixConstraint
+from btb.engine.fused import DELTA_BLOCK
 from btb.kinds import Json
 from btb.serve import Server
 from tests.helpers import CharTokenizer, fixture, request, request_json
@@ -22,11 +24,10 @@ from tests.helpers import CharTokenizer, fixture, request, request_json
 MSGS = [{"role": "user", "content": "hi"}]
 
 
-@pytest.fixture(scope="module")
-def served() -> Iterator[tuple[Server, str]]:
+def _serve(stem: str) -> Iterator[tuple[Server, str]]:
     from btb.serve import start
 
-    fx = fixture("tiny_qwen3")
+    fx = fixture(stem)
     only = f"^{re.escape(os.path.basename(fx))}$"
     server = start(None, host="127.0.0.1", port=0, device="cpu", extra_paths=[fx], pattern=only).start()
     try:
@@ -34,6 +35,17 @@ def served() -> Iterator[tuple[Server, str]]:
         yield server, name
     finally:
         server.close()
+
+
+@pytest.fixture(scope="module")
+def served() -> Iterator[tuple[Server, str]]:
+    yield from _serve("tiny_qwen3")
+
+
+@pytest.fixture(scope="module")
+def served_hybrid() -> Iterator[tuple[Server, str]]:
+    """the hybrid fixture (Qwen3.5's), for what its prefix cache keeps: its states at its blocks' ends"""
+    yield from _serve("tiny_q35")
 
 
 def chat(served: tuple[Server, str], **fields: object) -> Json:
@@ -149,6 +161,31 @@ def test_a_side_request_between_turns_leaves_the_conversation_cached(served: tup
     nxt = [*first, {"role": "assistant", "content": answer}, {"role": "user", "content": "and the south"}]
     u2, _ = _usage(served, stream, nxt)
     assert u2["prompt_tokens_details"]["cached_tokens"] >= u1["prompt_tokens"] - eng.session.tail, (u1, side, u2)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_hybrids_usage_counts_the_rows_its_block_states_resume_at(
+    served_hybrid: tuple[Server, str], stream: bool
+) -> None:
+    """a hybrid's recurrent states resume only from the snapshots its prefill keeps at its blocks' ends
+    (`DELTA_BLOCK`): after a side request, a conversation's next turn opens at the last block's end within the turn
+    before's prompt, and the same request again at the last within its own - `cached_tokens` counts those rows, the
+    rest prefilled again. The side request, shorter than a block, opens on none"""
+    sheep = "count the streamed sheep, " if stream else "count the sheep, "
+    first = [{"role": "user", "content": sheep * 8}]
+    u1, answer = _usage(served_hybrid, stream, first)
+    title = f"a short {'streamed ' if stream else ''}title"
+    side, _ = _usage(served_hybrid, stream, [{"role": "user", "content": title}])
+    nxt = [*first, {"role": "assistant", "content": answer}, {"role": "user", "content": "and the goats"}]
+    u2, _ = _usage(served_hybrid, stream, nxt)
+    u3, _ = _usage(served_hybrid, stream, nxt)
+    n1, n3 = u1["prompt_tokens"], u3["prompt_tokens"]
+    c2, c3 = (u["prompt_tokens_details"]["cached_tokens"] for u in (u2, u3))
+    assert n1 > 2 * DELTA_BLOCK and side["prompt_tokens"] < DELTA_BLOCK, (u1, side)
+    assert side["prompt_tokens_details"]["cached_tokens"] == 0, side
+    # the turn before's prompt opens the next whole: its last block's end, or its own end where that is one
+    assert c2 % DELTA_BLOCK == 0 and (n1 - 1) // DELTA_BLOCK * DELTA_BLOCK <= c2 <= n1, (u1, u2)
+    assert c3 == (n3 - 1) // DELTA_BLOCK * DELTA_BLOCK, (u2, u3)
 
 
 @pytest.mark.parametrize("stream", [False, True])
