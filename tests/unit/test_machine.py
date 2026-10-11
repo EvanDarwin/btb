@@ -20,7 +20,7 @@ from pytest import CaptureFixture, MonkeyPatch
 
 from btb import machine, sysinfo
 from btb.kinds import Json
-from tests.helpers import KB, MB
+from tests.helpers import KB, MB, fixture
 
 
 def test_the_median_interval_is_the_order_statistics_around_it() -> None:
@@ -546,3 +546,20 @@ def test_bench_is_the_machine_report_without_a_model(capsys: CaptureFixture[str]
     for bad in (["--ci", "0"], ["--ci", "1.5"], ["--max-seconds", "0"], ["--max-seconds", "-3"]):
         with pytest.raises(SystemExit):
             main(["bench", *bad])
+
+
+def test_a_models_bench_prints_its_record_as_json(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    """a model's bench with --json: stdout is the one record --out appends (the same record in the file), the
+    per-row lines go to stderr. One load of the tiny fixture on the CPU"""
+    from btb.cli import main
+
+    fx = fixture("tiny_q35")
+    prompts, out = tmp_path / "prompts.jsonl", tmp_path / "out.jsonl"
+    prompts.write_text('{"prompt": "hi"}\n', encoding="utf-8")
+    rc = main(["bench", fx, "-d", "cpu", "--prompts", str(prompts), "--new", "4", "--json", "--out", str(out)])
+    got = capsys.readouterr()
+    assert rc == 0, got.err
+    record = json.loads(got.out)
+    assert record["label"] == "tiny_q35" and [c["new"] for c in record["cells"]] == [4], record
+    assert json.loads(out.read_text(encoding="utf-8")) == record
+    assert "[bench] tiny_q35 new=4" in got.err

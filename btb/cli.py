@@ -271,7 +271,8 @@ def _open(a: argparse.Namespace) -> Any:
         draft_notice(a._model)
     a.path = resolve(a.path)
     kw, nat = _kw(a)
-    out = _e if a.cmd == "run" else _p  # run keeps stdout for the model's text
+    # run keeps stdout for the model's text, and a --json run for its JSON
+    out = _e if a.cmd == "run" or getattr(a, "as_json", False) else _p
     sm = load(a.path, device=a.device, native=nat, log=_log_for(a, out), **kw)
     if getattr(a, "profile", None):
         from .engine.experts import ExpertProfile
@@ -802,7 +803,7 @@ def cmd_machine(a: argparse.Namespace) -> None:
 
 # each `bench` form's own flags (their dests): the other form refuses them rather than leave them unread
 MODEL_BENCH = ("prompts", "rows", "new", "label")
-MACHINE_BENCH = ("ci", "max_seconds", "drive", "skip", "as_json")
+MACHINE_BENCH = ("ci", "max_seconds", "drive", "skip")
 NEW_DEFAULT = [64, 256, 1024]
 
 
@@ -835,6 +836,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
     ).seeded()
     label = a.label or os.path.basename(os.path.normpath(a.path))
     cells = {}
+    say = _e if a.as_json else _p  # a JSON run's stdout carries the record alone
     from .sysinfo import hard_page_faults, page_faults, process_read_bytes
 
     for n_new in counts:
@@ -870,7 +872,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
                 line += f" | speculative {ts:.3f} s/token, {tpp[-1]:.2f} tokens/pass, identical {o == g}"
             # the process's peak so far on every row: a leak shows as a figure that climbs row after row
             line += f" | peak RSS {peak_memory(sm)[0] / 2**30:.1f} GB"
-            _p(line)
+            say(line)
         k = len(pick)
         rss, vram = peak_memory(sm)
         cell: Json = {
@@ -887,7 +889,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
             "read_gb": (process_read_bytes() - read0) / 2**30,
         }
         cells[n_new] = cell
-        _p(
+        say(
             f"[bench] {label} new={n_new}: first token {cell['first_s']:.2f}s; baseline {cell['base_s_tok']:.3f} s/token "
             f"= {1 / cell['base_s_tok']:.2f} tok/s"
             + (
@@ -899,28 +901,28 @@ def cmd_bench(a: argparse.Namespace) -> None:
             + f"; peak RAM {cell['peak_ram_gb']:.1f} GB, peak VRAM {cell['peak_vram_gb']:.1f} GB, "
             f"page faults {cell['page_faults']} ({cell['hard_faults']} hard), read {cell['read_gb']:.1f} GB"
         )
-    if a.out:
+    if a.out or a.as_json:
         # the engine's ledger beside the timings; never at the cost of the record itself
         try:
             rep = sm.report()
         except Exception as e:
-            _p(f"[report] failed: {e!r}")
+            say(f"[report] failed: {e!r}")
             rep = None
         from .hf import cache_repo_id
 
-        with open(a.out, "a", encoding="utf-8") as f:
-            f.write(
-                json.dumps(
-                    {
-                        "label": label,
-                        "path": a.path,
-                        "model": cache_repo_id(a.path) or os.path.basename(os.path.normpath(a.path)),
-                        "report": rep,
-                        "cells": list(cells.values()),
-                    }
-                )
-                + "\n"
-            )
+        record = {
+            "label": label,
+            "path": a.path,
+            "model": cache_repo_id(a.path) or os.path.basename(os.path.normpath(a.path)),
+            "report": rep,
+            "cells": list(cells.values()),
+        }
+        text = json.dumps(record)
+        if a.as_json:
+            _p(text)
+        if a.out:
+            with open(a.out, "a", encoding="utf-8") as f:
+                f.write(text + "\n")
     sm.close()
 
 
@@ -1183,12 +1185,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         metavar="LIST",
         help="sections to leave out: memory, cpu, card, bus, mlx, drive (comma-separated)",
     )
-    m.add_argument(
-        "--json",
-        dest="as_json",
-        action="store_true",
-        help="the report as one JSON object on stdout (the lines as they land go to stderr)",
-    )
     mb = p.add_argument_group("a model's bench")
     mb.add_argument("--prompts", default=None, type=_file, metavar="JSONL", help='one {"prompt": ...} per line')
     mb.add_argument("--rows", type=_ints(0), default=None, metavar="I,J,...", help="which rows to run (default: all)")
@@ -1205,6 +1201,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         metavar="PATH",
         help="a model's bench: append the cells as JSON lines; the machine report: write it as JSON",
+    )
+    p.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="the result as one JSON object on stdout - the machine report, or a model's bench record as --out "
+        "appends it - and the lines as they land on stderr",
     )
     p.set_defaults(fn=cmd_bench)
     p = sub.add_parser(

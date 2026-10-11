@@ -194,7 +194,7 @@ Each command's own arguments (`btb <command> --help` lists them):
 
 - `run PATH`: `-p, --prompt` (else stdin, else a sample prompt), `--file JSONL` (one `{"prompt": ...}` per line, a fresh context each), `--new N`, `--raw` (keep special tokens), `-q, --quiet`, `--json` (one record per prompt), `--out PATH`.
 - `chat PATH`: `--file JSONL` (scripted turns, one `{"user": ...}` per line), `--new N`; `/reset` clears, `/quit` exits.
-- `bench PATH --prompts JSONL`: `--rows I,J,...` (default all), `--new N,N,...` (default `64,256,1024`), `--label LABEL`, `--out JSONL`; always greedy.
+- `bench PATH --prompts JSONL`: `--rows I,J,...` (default all), `--new N,N,...` (default `64,256,1024`), `--label LABEL`, `--out JSONL`, `--json` (the record on stdout); always greedy.
 - `serve [PATH]`: `--host` (default `127.0.0.1`), `--port` (default `8000`), `--new N` (a ceiling per request), `--api-key KEY` (required on every request as `Authorization: Bearer KEY`; default `BTB_API_KEY` from the environment, else none), `--models-dir DIR` (repeatable), `--models-filter REGEX`; no path starts empty.
 - `ollama [PATH]`: `serve`'s arguments, `--port` default `11435`, `--gui` (the desktop app instead of the terminal chat); anything unrecognized goes to `ollama run`.
 - `pi [PATH]`: `serve`'s arguments (`--api-key` included, written into the provider entry), `--no-configure` (print the provider entry instead of writing `~/.pi/agent/models.json`), `--config PATH` (write it elsewhere).

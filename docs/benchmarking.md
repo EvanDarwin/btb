@@ -101,7 +101,9 @@ btb bench Qwen/Qwen3-4B --prompts bench/questions.jsonl
 Times each prompt at 64 / 256 / 1024 new tokens (`--new`). When the model speculates it times both the
 one-token-at-a-time baseline and the speculative run, reporting both rates, first-token latency, tokens per pass,
 peak RAM/VRAM, and how many prompts the two decoded identically (`identical N/M`; speculation is exact, so a
-healthy run is `N/N` and anything less is a bug). Other flags: `--rows I,J`, `--label`, `--out JSONL`.
+healthy run is `N/N` and anything less is a bug). Other flags: `--rows I,J`, `--label`, `--out JSONL`, and
+`--json`, which prints the record `--out` appends (the cells and the engine's report) as one JSON object on stdout,
+with the per-row lines on stderr.
 
 The placement and speed knobs that move these numbers are in [Tuning btb](./tuning.md).
 
