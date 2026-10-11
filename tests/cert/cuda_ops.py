@@ -351,6 +351,12 @@ def launch_sites(sources: list[tuple[str, ast.Module]] | None = None) -> list[Si
 
 
 def _where(path: str, line: int) -> str:
+    """a launch's `file:line`: a module of the package (`_sources`, absolute) by its path from the package's parent
+    - `btb/engine/cuda.py` from the checkout and the installed wheel alike - and one handed by name (a test's own
+    module) as named: taken from the package's parent, a name resolved against the working directory, which the wheel
+    job's is not (`../../../../../../__w/btb/btb/mod.py`)"""
+    if not os.path.isabs(path):
+        return f"{path}:{line}"
     return f"{os.path.relpath(path, os.path.dirname(BTB_SRC))}:{line}"
 
 
