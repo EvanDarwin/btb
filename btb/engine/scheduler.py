@@ -425,12 +425,12 @@ class BatchScheduler:
 
     def caches(self) -> dict[str, int]:
         """The memory hierarchy's sizes, read once and held here: the card's L2, the most of it the driver
-        sets aside as persisting, the widest persisting window one stream may name, and the host's L2 and L3
+        sets aside as persisting, the widest persisting window one stream may name, and the host's L1d, L2 and L3
         (bytes; 0 where the level does not exist or cannot be read). The engine's placement and pinning
         decisions read these; nothing else queries the driver or the OS for them."""
         if self._caches is not None:
             return self._caches
-        cs = {"gpu_l2": 0, "gpu_l2_persist": 0, "gpu_l2_window": 0, "host_l2": 0, "host_l3": 0}
+        cs = {"gpu_l2": 0, "gpu_l2_persist": 0, "gpu_l2_window": 0, "host_l1d": 0, "host_l2": 0, "host_l3": 0}
         from .native import Native
 
         k = Native.cuda

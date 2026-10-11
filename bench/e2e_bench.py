@@ -41,6 +41,7 @@ import btb
 from btb import mlx as mlxdev
 from btb.engine.native import Native
 from btb.kinds import Quant, QuantClass, latt_backend_key, quants_of
+from btb.machine import Pool  # the one pool the machine report and these benches share
 from btb.mxfp4 import MxWeight
 from btb.mxfp4_torch import dequant_blocks
 from tests.cert.spec import FIXTURE_STEM, Hardware
@@ -355,8 +356,40 @@ def test_cuda_gemv_mma(benchmark: object, shape: str, warps: int, rows: int) -> 
 
     benchmark.group = f"cuda-gemv-mma-{shape}"  # type: ignore[attr-defined]
     benchmark(run)  # type: ignore[operator]
-    mean = float(benchmark.stats.stats.mean)  # type: ignore[attr-defined]
-    benchmark.extra_info["gbps"] = round(n * R * C * 2 / mean / 1e9, 1)  # type: ignore[attr-defined]
+    _gbps(benchmark, n * R * C * 2)
+
+
+def _gbps(benchmark: Any, nbytes: float) -> None:
+    """the bench's rate over its mean round, `nbytes` a round, as `gbps` in its record; none where nothing was timed
+    (a run under --benchmark-disable checks each answer and times none)"""
+    if benchmark.stats is not None:
+        benchmark.extra_info["gbps"] = round(nbytes / float(benchmark.stats.stats.mean) / 1e9, 1)
+
+
+def _attn_reference(q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, keys: list[list[int]]) -> torch.Tensor:
+    """each row of `q` [T, Hq, D] over its own cache slots of `K`/`V` [Hk, cap, D], in float32 through torch's
+    SDPA: what an attention kernel's `out` is held to before it is timed"""
+    Hq, D = q.shape[1:]
+    rows = []
+    for t, slots in enumerate(keys):
+        idx = torch.tensor(slots, device=K.device)
+        k, v = K.index_select(1, idx).float().unsqueeze(0), V.index_select(1, idx).float().unsqueeze(0)
+        y = F.scaled_dot_product_attention(q[t].float().view(1, Hq, 1, D), k, v, scale=D**-0.5, enable_gqa=True)
+        rows.append(y.view(Hq, D))
+    return torch.stack(rows)
+
+
+def _tree_keys(n: int, par: list[int]) -> list[list[int]]:
+    """the slots each row of a tree reads: the prefix's `n`, then its ancestors' from the root to itself at n + row"""
+    out = []
+    for t in range(len(par)):
+        chain = []
+        p = t
+        while p >= 0:
+            chain.append(n + p)
+            p = par[p]
+        out.append([*range(n), *reversed(chain)])
+    return out
 
 
 @cuda_only
@@ -369,7 +402,8 @@ def test_cuda_attn_gqa(benchmark: object, n: int, T: int, how: str) -> None:
     head, against `btb_attn_split_gqa2_d128`, a block a KV group reading each key once for its two heads - the same
     bits (tests/kernels) - and against that kernel below its threshold (`gqa-off`: a block a head, what its
     registers cost the one-head walk). A round runs one launch a layer over distinct caches past the L2, as a step does, and the
-    rate is the caches' live K/V bytes over the round (`gbps`)."""
+    rate is the caches' live K/V bytes over the round (`gbps`). The first layer's answer is held to torch's attention
+    over the same slots before the round is timed."""
     k = _cuda_kernels()
     if "btb_attn_split_gqa2_d128" not in k.fn:
         pytest.skip("the grouped-query attention is not in this build")
@@ -386,19 +420,20 @@ def test_cuda_attn_gqa(benchmark: object, n: int, T: int, how: str) -> None:
     pa = torch.zeros(S * T * Hq * D, device="cuda")
     cnt = torch.zeros(T * Hq, dtype=torch.int32, device="cuda")
     n0 = torch.tensor([n], dtype=torch.int32, device="cuda")
-    par = torch.tensor([-1, 0, 1, 0, 3][:T], dtype=torch.int32, device="cuda")
-    P, I, F = k.ptr, ctypes.c_int, ctypes.c_float
+    tree = [-1, 0, 1, 0, 3][:T]
+    par = torch.tensor(tree, dtype=torch.int32, device="cuda")
     name = "btb_attn_split_d128" if how == "split" else "btb_attn_split_gqa2_d128"
-    tail = [I(T), I(Hq), I(Hk), I(cap), F(D**-0.5), P(pm), P(pl), P(pa), P(cnt), I(S), I(0)]
     # the grouped form's threshold, read on the card as the passes' switch holds it
     shared = torch.tensor([0 if how == "gqa" else 1 << 30], dtype=torch.int32, device="cuda")
-    tail += [] if how == "split" else [P(shared)]
-    args = [[P(q), P(kv[0]), P(kv[1]), P(out), P(n0), P(par), *tail] for kv in KV]
+    grouped = None if how == "split" else shared
+    args = [k.attn_args(q, K, V, out, [n0, par], T, Hq, Hk, D**-0.5, pm, pl, pa, cnt, S, 0, grouped) for K, V in KV]
 
     def body() -> None:
         for a in args:
             k.launch(name, (Hq, T, S), (256, 1, 1), a)
 
+    k.launch(name, (Hq, T, S), (256, 1, 1), args[0])
+    _check(f"{name} ({how}) at {n} rows, {T} rows", out, _attn_reference(q, KV[0][0], KV[0][1], _tree_keys(n, tree)))
     body()
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
@@ -411,8 +446,7 @@ def test_cuda_attn_gqa(benchmark: object, n: int, T: int, how: str) -> None:
 
     benchmark.group = f"cuda-attn-gqa-n{n}-t{T}"  # type: ignore[attr-defined]
     benchmark(run)  # type: ignore[operator]
-    mean = float(benchmark.stats.stats.mean)  # type: ignore[attr-defined]
-    benchmark.extra_info["gbps"] = round(layers * live / mean / 1e9, 1)  # type: ignore[attr-defined]
+    _gbps(benchmark, layers * live)
 
 
 @cuda_only
@@ -422,8 +456,9 @@ def test_cuda_attn_gqa(benchmark: object, n: int, T: int, how: str) -> None:
 @pytest.mark.parametrize("rows", [1, 8, 32])
 def test_cuda_attn_rows(benchmark: object, rows: int, n: int, how: str) -> None:
     """a fork's decode attention at Qwen3-0.6B's heads (16 q, 8 kv, d 128), each row 16 steps past a shared prefix:
-    `btb_attn_rows_d128` over all rows in one launch, against one `btb_attn_split_d128` launch a row over the same
-    keys (the one-row steps the rows would take one session at a time)."""
+    `btb_attn_rows_d128` over all rows in one launch, against one `btb_attn_split_d128` launch a row over as many
+    keys (the one-row steps the rows would take one session at a time). Each launch's answer is held to torch's
+    attention over the same slots before it is timed."""
     k = _cuda_kernels()
     Hq, Hk, D, steps = 16, 8, 128, 16
     cap = (n + (steps + 1) * rows + 1023) // 1024 * 1024
@@ -440,27 +475,25 @@ def test_cuda_attn_rows(benchmark: object, rows: int, n: int, how: str) -> None:
     rw = torch.tensor([n, steps, rows, *[x for c in range(rows) for x in (c, 0, n)]], dtype=torch.int32, device="cuda")
     n0 = torch.tensor([n + steps], dtype=torch.int32, device="cuda")
     root = torch.tensor([-1], dtype=torch.int32, device="cuda")
-    P, I, F = k.ptr, ctypes.c_int, ctypes.c_float
-    scale = F(D**-0.5)
-    tail = [P(pm), P(pl), P(pa), P(cnt), I(S), I(0)]
+    parts = (pm, pl, pa, cnt)
     if how == "rows":
-        launches = [
-            ((Hq, rows, S), [P(q), P(K), P(V), P(out), P(rw), I(rows), I(Hq), I(Hk), I(cap), scale, *tail], "rows")
-        ]
+        launches = [((Hq, rows, S), k.attn_args(q, K, V, out, [rw], rows, Hq, Hk, D**-0.5, *parts, S), "rows")]
+        # row c: the shared prefix, then its own steps + 1 keys, interleaved `rows` wide from slot n
+        keys = [[*range(n), *(n + j * rows + c for j in range(steps + 1))] for c in range(rows)]
     else:
         launches = [
-            (
-                (Hq, 1, S),
-                [P(q[r]), P(K), P(V), P(out[r]), P(n0), P(root), I(1), I(Hq), I(Hk), I(cap), scale, *tail],
-                "split",
-            )
+            ((Hq, 1, S), k.attn_args(q[r], K, V, out[r], [n0, root], 1, Hq, Hk, D**-0.5, *parts, S), "split")
             for r in range(rows)
         ]
+        keys = [list(range(n + steps + 1))] * rows
 
     def run() -> None:
         for grid, args, kind in launches:
             k.launch(f"btb_attn_{kind}_d{D}", grid, (256, 1, 1), args)
         torch.cuda.synchronize()
+
+    run()
+    _check(f"btb_attn ({how}) at {n} rows, {rows} rows", out, _attn_reference(q, K, V, keys))
 
     benchmark.group = f"cuda-attn-rows/n{n}/rows{rows}"  # type: ignore[attr-defined]
     benchmark(run)  # type: ignore[operator]
@@ -565,29 +598,6 @@ POINTS: dict[tuple[str, str], Point] = {
         Point("pick", "151936-t0.8-p0.9", (151936,), (1, 16), LANES[:2]),
     )
 }
-
-
-class Pool:
-    """copies of one operand, enough to pass `nbytes`, handed out in turn: a call reads its weights from memory,
-    never from a cache the last call filled"""
-
-    def __init__(self, make: Callable[[], Any], each: int, nbytes: int, cap: int = 64) -> None:
-        n = max(2, min(cap, -(-nbytes // max(1, each))))
-        self.items = [make() for _ in range(n)]
-        self.i = 0
-
-    @classmethod
-    def one(cls, item: Any) -> Pool:
-        """one operand handed out every call: the glue's small weights, which a cache holds whatever the bench does"""
-        return cls(lambda: item, 0, 0, cap=1)
-
-    def next(self) -> Any:
-        self.i = (self.i + 1) % len(self.items)
-        return self.items[self.i]
-
-    @property
-    def first(self) -> Any:
-        return self.items[0]
 
 
 class _Operands:

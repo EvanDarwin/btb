@@ -537,6 +537,34 @@ def test_gemv_with_silu_folded_in_matches_the_two_kernels(cu: _Cuda, M: int) -> 
     assert torch.equal(one, two)
 
 
+def test_a_launch_is_held_to_the_kernels_parameters(cu: _Cuda) -> None:
+    """every kernel the engine loads has its parameters from the driver, and a launch whose arguments do not match
+    them - one short, as two benches launched the attention after it took a second stride, or a 4-byte int where a
+    pointer goes on the kernel's first launch - is refused before it reaches the card, the output left as it was;
+    a count once held is not held again, a change of count always is"""
+    if cu.param_sizes("btb_silu_mul") is None:
+        pytest.skip("this driver cannot report a kernel's parameters (cuFuncGetParamInfo is CUDA 12.4's)")
+    for name in cu.KERNELS:
+        sizes = cu.param_sizes(name)
+        assert sizes and all(s in (4, 8) for s in sizes), (name, sizes)
+    assert cu.param_sizes("btb_silu_mul") == (8, 8, 4, 4)
+    T, Ii = 2, 512
+    gu = torch.randn(T, 2 * Ii, device=dev, dtype=bf)
+    m = torch.zeros(T, Ii, device=dev, dtype=bf)
+    grid, block = ((T * Ii + 255) // 256, 1, 1), (256, 1, 1)
+    cu._held.pop("btb_silu_mul", None)  # as the process's first launch of it: the module's earlier tests launched it
+    with pytest.raises(ValueError, match="btb_silu_mul takes 4 parameters"):
+        cu.launch("btb_silu_mul", grid, block, [P(gu), P(m), I(T)])
+    with pytest.raises(ValueError, match="btb_silu_mul takes 4 parameters"):
+        cu.launch("btb_silu_mul", grid, block, [P(gu), I(0), I(T), I(Ii)])
+    torch.cuda.synchronize()
+    assert not m.any(), "a refused launch never ran"
+    cu.launch("btb_silu_mul", grid, block, [P(gu), P(m), I(T), I(Ii)])
+    assert torch.equal(m, F.silu(gu[:, :Ii]).mul_(gu[:, Ii:]))
+    with pytest.raises(ValueError, match="btb_silu_mul takes 4 parameters"):
+        cu.launch("btb_silu_mul", grid, block, [P(gu), P(m), I(T), I(Ii), I(0)])
+
+
 def test_silu_mul_is_bit_exact(cu: _Cuda) -> None:
     torch.manual_seed(5)
     T, Ii = 4, 3072
@@ -552,7 +580,7 @@ def test_scheduler_reports_the_hierarchy(cu: _Cuda) -> None:
     lim, win = cu.persist_limit()
     assert 0 < lim <= cu.l2_bytes() <= win or win == 0
     hc = host_cache_sizes()
-    assert set(hc) == {"host_l2", "host_l3"}
+    assert set(hc) == {"host_l1d", "host_l2", "host_l3"}
     assert all(v >= 0 for v in hc.values())
 
 

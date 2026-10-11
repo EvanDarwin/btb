@@ -1376,6 +1376,73 @@ fn detect_isa() -> Isa {
     }
 }
 
+/// The CPU features this machine has, by the names `is_x86_feature_detected!` / `is_aarch64_feature_detected!`
+/// take: the ones the tiers are chosen from and the ones a hardware report names beside the tier
+/// (`btb_cpu_features`). AMX is read from CPUID with the OS's tile state, which std detects on nightly only.
+pub fn cpu_features() -> Vec<&'static str> {
+    #[allow(unused_mut)]
+    let mut out: Vec<&'static str> = Vec::new();
+    #[cfg(target_arch = "x86_64")]
+    {
+        macro_rules! probe {
+            ($($name:tt),*) => { $( if std::is_x86_feature_detected!($name) { out.push($name); } )* };
+        }
+        probe!(
+            "sse4.2",
+            "avx",
+            "avx2",
+            "fma",
+            "f16c",
+            "bmi2",
+            "avxvnni",
+            "avx512f",
+            "avx512bw",
+            "avx512vl",
+            "avx512dq",
+            "avx512vnni",
+            "avx512bf16",
+            "avx512fp16"
+        );
+        // SAFETY: CPUID and XGETBV only read; XGETBV runs only where CPUID says the OS enabled it (OSXSAVE)
+        out.extend(unsafe { amx() });
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        macro_rules! probe {
+            ($($name:tt),*) => { $( if std::arch::is_aarch64_feature_detected!($name) { out.push($name); } )* };
+        }
+        probe!("neon", "fp16", "dotprod", "i8mm", "bf16", "sve", "sve2");
+    }
+    out
+}
+
+/// AMX's tile units the CPU has and the OS saves (XCR0's TILECFG and TILEDATA bits): CPUID leaf 7's EDX.
+///
+/// # Safety
+/// x86_64 only; XGETBV is reached only once CPUID reports OSXSAVE.
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_unsafe)]
+unsafe fn amx() -> Vec<&'static str> {
+    use std::arch::x86_64::{__cpuid, __cpuid_count};
+    #[target_feature(enable = "xsave")]
+    unsafe fn xcr0() -> u64 {
+        std::arch::x86_64::_xgetbv(0)
+    }
+    if unsafe { __cpuid(0) }.eax < 7 || unsafe { __cpuid(1) }.ecx & (1 << 27) == 0 {
+        return Vec::new();
+    }
+    let tiles = 0b11u64 << 17;
+    if unsafe { xcr0() } & tiles != tiles {
+        return Vec::new();
+    }
+    let edx = unsafe { __cpuid_count(7, 0) }.edx;
+    [("amx-tile", 24), ("amx-bf16", 22), ("amx-int8", 25)]
+        .into_iter()
+        .filter(|&(_, bit)| edx & (1 << bit) != 0)
+        .map(|(name, _)| name)
+        .collect()
+}
+
 /// The kernel path for this machine, decided once. `BTB_NATIVE_ISA=scalar` (or `avx2` on a
 /// machine that has it) in the environment at the first call pins a narrower path.
 pub fn isa() -> Isa {

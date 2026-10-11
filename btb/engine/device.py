@@ -29,8 +29,13 @@ def _physical_free_bytes(dev: torch.device) -> int | None:
     `torch.cuda.mem_get_info` is a per-process figure on Windows - WDDM virtualizes VRAM, so it reads high while
     another process holds the card - and only NVML sees the true physical free: read from NVML's own library, fresh
     each time (microseconds), for the card at this one's PCI address"""
+    return nvml_free_bytes(pci_bus_id(dev))
+
+
+def pci_bus_id(dev: torch.device | int) -> str:
+    """the card's PCI address as NVML names it ("00000000:01:00.0"), which numbers the cards in its own order"""
     p: Any = torch.cuda.get_device_properties(dev)  # its PCI ids are there, not in torch's stubs
-    return nvml_free_bytes(f"{p.pci_domain_id:08X}:{p.pci_bus_id:02X}:{p.pci_device_id:02X}.0")
+    return f"{p.pci_domain_id:08X}:{p.pci_bus_id:02X}:{p.pci_device_id:02X}.0"
 
 
 def card_ids(dev: torch.device) -> tuple[str, int, int]:

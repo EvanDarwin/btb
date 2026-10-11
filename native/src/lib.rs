@@ -49,6 +49,17 @@ pub extern "C" fn btb_isa() -> *const std::ffi::c_char {
     .as_ptr()
 }
 
+/// The CPU features this machine has (`gemv::cpu_features()`), space-separated by the names the detection macros
+/// take (`avx2 fma avxvnni ...`, `neon dotprod ...`) - what a hardware report lists beside the tier `btb_isa`
+/// picked. A static NUL-terminated string.
+#[no_mangle]
+pub extern "C" fn btb_cpu_features() -> *const std::ffi::c_char {
+    static NAMES: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+    NAMES
+        .get_or_init(|| std::ffi::CString::new(gemv::cpu_features().join(" ")).expect("no NUL"))
+        .as_ptr()
+}
+
 /// `y[i][r] = sum_c bf16(w[r][c]) * x[i][c]` in f32. `w` is `[rows, cols]` row-major bf16 bit patterns,
 /// `x` is `[b, cols]` f32, `y` is `[b, rows]` f32. `threads == 0` uses every core. The result is
 /// bit-identical for every `threads` and every `b`.

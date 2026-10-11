@@ -1189,15 +1189,15 @@ class _CudaMixin(_State):
             raise RuntimeError(f"[card] no kernel for head_dim {D}")
         # the attention in its grouped-query form where the build has one for the model's group width, from the
         # prefix the card state's switch names for this pass's width (a one-row step's, or a tree's)
-        shared: list[Any] = []
+        shared: ctypes.c_void_p | None = None
         gqa = f"btb_attn_split_gqa{Hq // Hk}_d{D}"
         if not rows and Hq // Hk > 1 and gqa in k.fn:
-            attn, shared = gqa, [self._card_switch_ptr(st, self.SW_ATTN_ONE if T == 1 else self.SW_ATTN_TREE)]
+            attn, shared = gqa, self._card_switch_ptr(st, self.SW_ATTN_ONE if T == 1 else self.SW_ATTN_TREE)
         S = int(g["S"])
         # where each row's keys lie: the tree's (its prefix length, the rows' depths and parents), or the rows'
         # layout, one array for every rows graph
         where = [P(st["rw"])] if rows else [P(g["n0"]), P(g["depth"])]
-        walk = [P(st["rw"])] if rows else [P(g["n0"]), P(g["par"])]
+        walk = [st["rw"]] if rows else [g["n0"], g["par"]]
 
         # the pass's matvec weights in launch order, each warmed into L2 on the side stream once the one before it is
         # launched (`_card_warm`): through the kernels between them the chain leaves the DRAM idle
@@ -1271,30 +1271,9 @@ class _CudaMixin(_State):
                     cen,
                 ],
             )
-            k.launch(
-                attn,
-                (Hq, T, S),
-                (256, 1, 1),
-                [
-                    P(g["q"]),
-                    P(kb),
-                    P(vb),
-                    P(g["att"]),
-                    *walk,
-                    ci(T),
-                    ci(Hq),
-                    ci(Hk),
-                    *kv_strides,
-                    cf(L["scale"]),
-                    P(g["part_m"]),
-                    P(g["part_l"]),
-                    P(g["part_acc"]),
-                    P(g["cnt"]),
-                    ci(S),
-                    ci(L["win"]),
-                    *shared,
-                ],
-            )
+            parts = (g["part_m"], g["part_l"], g["part_acc"], g["cnt"])
+            args = k.attn_args(g["q"], kb, vb, g["att"], walk, T, Hq, Hk, L["scale"], *parts, S, L["win"], shared)
+            k.launch(attn, (Hq, T, S), (256, 1, 1), args)
             matvec(L["o"], g["att"], g["y"], H, Hq * D)
             if sandwich:
                 # the attention output normed, then added; the MLP reads its own input norm of the sum

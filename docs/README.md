@@ -8,7 +8,8 @@ Documentation of implementation and behavior for various components within btb.
   - [Building btb](./building.md)
     - Building from source: prerequisites (Rust, CUDA/`nvcc`, MLX), the dev checks and tests, and cross-building.
   - [Benchmarking](./benchmarking.md)
-    - `btb bench`, the device/model matrix, and the `.venv-compare` setup with the rival engines.
+    - `btb bench` (the machine's hardware and every op timed on it, or one model), the device/model matrix, and
+      the `.venv-compare` setup with the rival engines.
 - **Behavior**
   - [Bus Pass Scheduler](./disk-scheduler.md)
     - How a mixture-of-experts model streams experts from disk: the Route, the Bus Pass, and the Timetable.

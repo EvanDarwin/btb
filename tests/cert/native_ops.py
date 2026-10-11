@@ -184,8 +184,9 @@ OPS: tuple[Op, ...] = (
     Op("read_at", (Stored.BYTES,), ("btb_read_at", "btb_open_cached"), "handle.rs", "guard_direct.rs", "direct.rs"),
 )
 
-# crate exports that are not kernels, so no Op claims them: the tier probe the bench records its numbers under
-META_EXPORTS: tuple[str, ...] = ("btb_isa",)
+# crate exports that are not kernels, so no Op claims them: the tier probe the bench records its numbers under,
+# and the CPU features the hardware report lists beside it
+META_EXPORTS: tuple[str, ...] = ("btb_isa", "btb_cpu_features")
 
 
 def op_families() -> list[str]:

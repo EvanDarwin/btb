@@ -132,6 +132,26 @@ def _port(s: str) -> int:
     return n
 
 
+def _fraction(s: str) -> float:
+    try:
+        x = float(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{s!r}: a share between 0 and 1, such as 0.02") from None
+    if not 0 < x < 1:
+        raise argparse.ArgumentTypeError(f"{s!r}: a share between 0 and 1, such as 0.02")
+    return x
+
+
+def _seconds(s: str) -> float:
+    try:
+        x = float(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{s!r}: seconds above 0") from None
+    if not x > 0:
+        raise argparse.ArgumentTypeError(f"{s!r}: seconds above 0")
+    return x
+
+
 def _ints(least: int) -> Callable[[str], list[int]]:
     """a comma-separated list of whole numbers, each at least `least`"""
 
@@ -269,7 +289,7 @@ def _open(a: argparse.Namespace) -> Any:
     return sm, sm.tokenizer
 
 
-def _common(ap: argparse.ArgumentParser, path_required: bool = True) -> None:
+def _common(ap: argparse.ArgumentParser, path_required: bool = True, path_help: str | None = None) -> None:
     if path_required:
         ap.add_argument(
             "path",
@@ -281,7 +301,8 @@ def _common(ap: argparse.ArgumentParser, path_required: bool = True) -> None:
             "path",
             nargs="?",
             default=None,
-            help="model directory, Hugging Face repo id, 12-bit model or GGUF file (.gguf, or repo/id:file.gguf) "
+            help=path_help
+            or "model directory, Hugging Face repo id, 12-bit model or GGUF file (.gguf, or repo/id:file.gguf) "
             "to load at startup; omit to start with "
             "nothing loaded and serve whatever is already on the machine, on request",
         )
@@ -738,17 +759,74 @@ def cmd_chat(a: argparse.Namespace) -> None:
     sm.close()
 
 
+def _sections(s: str) -> list[str]:
+    """--skip's comma-separated sections, each one the report has"""
+    from .machine import SECTIONS
+
+    out = [x.strip().lower() for x in s.split(",") if x.strip()]
+    bad = [x for x in out if x not in SECTIONS]
+    if bad:
+        raise argparse.ArgumentTypeError(f"{', '.join(bad)}: the sections are {', '.join(SECTIONS)}")
+    return out
+
+
+def cmd_machine(a: argparse.Namespace) -> None:
+    """`btb bench` without a model: the machine report (btb/machine.py)"""
+    import torch
+
+    from .engine.native import Native
+    from .machine import Sampler, default_drive, run
+
+    if a.native is not None:  # the library the ops run on, as a load would bind it
+        nat = a.native.strip()
+        if nat.lower() in ("", "none", "off"):
+            Native.unbind()
+        else:
+            Native.load_gemv(nat)
+    card = None
+    if torch.cuda.is_available() and (a.device is None or a.device.kind is Device.CUDA):
+        card = a.device.index if a.device is not None and a.device.index is not None else 0
+        if card >= torch.cuda.device_count():
+            raise BadValue("device", f"this machine has {torch.cuda.device_count()} card(s)", str(a.device))
+    sampler = Sampler(ci=a.ci or Sampler.ci, budget_s=a.max_seconds or Sampler.budget_s)
+    say = _e if a.as_json else _p  # a JSON run's stdout carries the report alone
+    rep = run(sampler, say, card=card, drives=a.drive or [default_drive()], skip=a.skip or [])
+    text = json.dumps(rep, ensure_ascii=False, default=str)
+    if a.as_json:
+        _p(text)
+    if a.out:
+        with open(a.out, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+        say(f"[bench] the report as JSON -> {a.out}")
+
+
+# each `bench` form's own flags (their dests): the other form refuses them rather than leave them unread
+MODEL_BENCH = ("prompts", "rows", "new", "label")
+MACHINE_BENCH = ("ci", "max_seconds", "drive", "skip", "as_json")
+NEW_DEFAULT = [64, 256, 1024]
+
+
 def cmd_bench(a: argparse.Namespace) -> None:
     from . import peak_memory
     from .sampling import GREEDY, Sampling
 
+    if a.path is None:
+        stray = [d for d in MODEL_BENCH if getattr(a, d) is not None]
+        if stray:
+            raise BadValue(stray[0], "times a model's prompt set: name the model (btb bench MODEL --prompts JSONL)")
+        return cmd_machine(a)
+    stray = [d for d in MACHINE_BENCH if getattr(a, d) not in (None, False)]
+    if stray:
+        raise BadValue(stray[0], "is the machine report's: run `btb bench` without a model for it")
+    if a.prompts is None:
+        raise BadValue("prompts", 'a model\'s bench times a prompt set: a JSONL of {"prompt": ...} lines')
     sm, _tok = _open(a)
     rows = [json.loads(l) for l in open(a.prompts, encoding="utf-8") if l.strip()]
     pick = list(a.rows) if a.rows else list(range(len(rows)))
     bad = [i for i in pick if i >= len(rows)]
     if bad:
         raise BadValue("rows", f"{a.prompts} has {len(rows)} rows (0..{len(rows) - 1})", ",".join(str(i) for i in bad))
-    counts = list(a.new)
+    counts = list(a.new or NEW_DEFAULT)
     spec = sm.v_max > 0
     # both passes run at the cell's sampling (greedy unless --temperature was given), seeded so the baseline
     # and the speculative pass agree token for token and `identical` stays meaningful at any temperature
@@ -1055,22 +1133,79 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.set_defaults(fn=cmd_chat)
     p = sub.add_parser(
         "bench",
-        help="time a prompt set at several answer lengths",
-        description="Time greedy (and speculative, when configured) decoding over a prompt set, "
-        "reporting first-token latency, s/token, peak RAM and peak VRAM per answer length.",
+        help="report this machine and time every op btb runs on it (or, given a model, time a prompt set)",
+        description="Without a model: the machine report - the CPU, its cores and features, the memory and its "
+        "modules' speed, each card, its memory and its PCIe link, the drives - then every op btb runs timed where it "
+        "runs and swept across the sizes it runs at: the host's memory from its caches to DRAM and its native "
+        "kernels by weight size, rows and context; the card's memory, kernels and bus by the same; Apple's GPU; and "
+        "the drive under the models by read size and depth, read through btb's own reader. Each point is sampled "
+        "until its median's 95%% interval is within --ci of it, or for --max-seconds, whichever comes first. With a "
+        "model and --prompts: "
+        "greedy (and speculative, when configured) decoding timed over the prompt set, reporting first-token "
+        "latency, s/token, peak RAM and peak VRAM per answer length.",
     )
-    _common(p)
-    p.add_argument("--prompts", required=True, type=_file, metavar="JSONL", help='one {"prompt": ...} per line')
-    p.add_argument("--rows", type=_ints(0), default=None, metavar="I,J,...", help="which rows to run (default: all)")
-    p.add_argument(
+    _common(
+        p,
+        path_required=False,
+        path_help="the model to time over --prompts (a directory, Hugging Face repo id, 12-bit model or GGUF file); "
+        "omit it for the machine report",
+    )
+    m = p.add_argument_group("the machine report (no model)")
+    m.add_argument(
+        "--ci",
+        type=_fraction,
+        default=None,
+        metavar="FRAC",
+        help="a point is sampled until its median's 95%% interval is within this share of the median (default 0.02: "
+        "+-2%%)",
+    )
+    m.add_argument(
+        "--max-seconds",
+        dest="max_seconds",
+        type=_seconds,
+        default=None,
+        metavar="S",
+        help="the most one point is sampled for, its interval reported as it stands then (default 15)",
+    )
+    m.add_argument(
+        "--drive",
+        action="append",
+        type=_dir,
+        default=None,
+        metavar="DIR",
+        help="time the drive under DIR through a file written there and removed (repeatable; default: the Hugging "
+        "Face cache, where models are read from)",
+    )
+    m.add_argument(
+        "--skip",
+        type=_sections,
+        default=None,
+        metavar="LIST",
+        help="sections to leave out: memory, cpu, card, bus, mlx, drive (comma-separated)",
+    )
+    m.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="the report as one JSON object on stdout (the lines as they land go to stderr)",
+    )
+    mb = p.add_argument_group("a model's bench")
+    mb.add_argument("--prompts", default=None, type=_file, metavar="JSONL", help='one {"prompt": ...} per line')
+    mb.add_argument("--rows", type=_ints(0), default=None, metavar="I,J,...", help="which rows to run (default: all)")
+    mb.add_argument(
         "--new",
         type=_ints(1),
-        default=[64, 256, 1024],
+        default=None,
         metavar="N,N,...",
         help="answer lengths to time (default: 64,256,1024)",
     )
-    p.add_argument("--label", default=None, help="name for this configuration in the output")
-    p.add_argument("--out", default=None, metavar="JSONL", help="append the cells as JSON lines")
+    mb.add_argument("--label", default=None, help="name for this configuration in the output")
+    p.add_argument(
+        "--out",
+        default=None,
+        metavar="PATH",
+        help="a model's bench: append the cells as JSON lines; the machine report: write it as JSON",
+    )
     p.set_defaults(fn=cmd_bench)
     p = sub.add_parser(
         "serve",

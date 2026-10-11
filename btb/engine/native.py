@@ -18,15 +18,34 @@ from ..native_files import kernels_path, native_path
 from ..sysinfo import raise_file_limit
 
 
-def isa() -> str:
-    """the kernel tier the native library selected for this process (avx512/avx2/neon/scalar; `BTB_NATIVE_ISA`
-    honored) - what a benchmark's numbers belong to"""
+def _library(lib: Any) -> Any:
+    """`lib`, a loaded native library (the one `Native` bound, say), or the install's where it is None"""
+    if lib is not None:
+        return lib
     p = native_path()
-    if p is None:
+    return ctypes.CDLL(p) if p is not None else None
+
+
+def isa(lib: Any = None) -> str:
+    """the kernel tier the native library `lib` (the install's by default) selected for this process
+    (avx512/avx2/neon/scalar; `BTB_NATIVE_ISA` honored) - what a benchmark's numbers belong to"""
+    loaded = _library(lib)
+    if loaded is None:
         raise NativeError("btb_isa", -1, ": no native library in this install")
-    f = ctypes.CDLL(p).btb_isa
+    f = loaded.btb_isa
     f.restype = ctypes.c_char_p
     return f().decode()
+
+
+def cpu_features(lib: Any = None) -> list[str] | None:
+    """the CPU features the native library `lib` (the install's by default) detects on this machine
+    (`btb_cpu_features`: avx2, fma, avxvnni, avx512bf16, amx-tile, neon, i8mm, ...); None where there is no library
+    or it predates the probe"""
+    f = getattr(_library(lib), "btb_cpu_features", None)
+    if f is None:
+        return None
+    f.restype = ctypes.c_char_p
+    return f().decode().split()
 
 
 class NativeError(RuntimeError):
@@ -966,6 +985,13 @@ class _Cuda:
         self._call("cuCtxGetDevice", ctypes.byref(dev))
         self.device = int(dev.value)
         self.sms = self.attr(16)  # CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT
+        # each kernel's parameters as the driver reports them, read on its first launch (`param_sizes`), and the
+        # argument count a launch of it has already been held to them with (`_hold`)
+        self._param_info = getattr(self.lib, "cuFuncGetParamInfo", None)
+        if self._param_info is not None:
+            self._param_info.restype = ctypes.c_int
+        self._params: dict[str, tuple[int, ...] | None] = {}
+        self._held: dict[str, int] = {}
 
     def _call(self, name: str, *args: Any) -> None:
         f = getattr(self.lib, name)
@@ -1017,13 +1043,17 @@ class _Cuda:
         shared: int = 0,
     ) -> None:
         """Launch kernel `name` with `args` - each a ctypes value (c_void_p for a pointer, c_int, c_float) - on
-        `stream` (the current torch stream by default)."""
+        `stream` (the current torch stream by default). The arguments are held to the kernel's parameters as the
+        driver reports them (`_hold`) before anything reaches the card: the driver reads as many as the kernel
+        declares from the array it is handed, so one too few or one of the wrong width would launch on garbage."""
         if self.module is None:
             raise RuntimeError(
                 f"[cuda] {name}: the card's kernels were let go with the last engine on the card "
                 "(`Native.unload_cuda`); `Native.card_kernels()` loads them again"
             )
         n = len(args)
+        if self._held.get(name) != n:
+            self._hold(name, args)
         params = (ctypes.c_void_p * n)(*[ctypes.addressof(a) for a in args])
         st = (stream or torch.cuda.current_stream()).cuda_stream
         self._call(
@@ -1041,6 +1071,49 @@ class _Cuda:
             None,
         )
 
+    def _hold(self, name: str, args: Sequence[Any]) -> None:
+        """`args` held to kernel `name`'s parameters (`param_sizes`), a ValueError naming a mismatch; their count is
+        remembered once they pass, so a launch with that count is not held again - every change of count is (the
+        drift a caller's stale list makes), a swap of one width for another at the same count only on the kernel's
+        first launch. Where the driver cannot report parameters at all, nothing is held"""
+        sizes = self.param_sizes(name)
+        if sizes is None:
+            if self._param_info is None:
+                self._held[name] = len(args)
+            return
+        got = tuple(ctypes.sizeof(a) for a in args)
+        if got != sizes:
+            raise ValueError(
+                f"[cuda] {name} takes {len(sizes)} parameters of {list(sizes)} bytes; the launch passed "
+                f"{len(got)} of {list(got)}"
+            )
+        self._held[name] = len(args)
+
+    # cuFuncGetParamInfo's answer past a kernel's last parameter
+    _ERROR_INVALID_VALUE = 1
+
+    def param_sizes(self, name: str) -> tuple[int, ...] | None:
+        """kernel `name`'s parameters, each one's size in bytes in order, as the driver reports them
+        (cuFuncGetParamInfo, CUDA 12.4's drivers on); None where the driver cannot say. A whole answer is kept for the
+        process; a failed one (the driver unable to answer on this thread now) is not, and is asked again next time"""
+        if name in self._params:
+            return self._params[name]
+        f = self._param_info
+        if f is None:
+            self._params[name] = None
+            return None
+        out: list[int] = []
+        off, size = ctypes.c_size_t(), ctypes.c_size_t()
+        while len(out) < 256:
+            rc = f(self.fn[name], ctypes.c_size_t(len(out)), ctypes.byref(off), ctypes.byref(size))
+            if rc == self._ERROR_INVALID_VALUE:  # past the last parameter: the list is whole
+                sizes = self._params[name] = tuple(out)
+                return sizes
+            if rc != 0:
+                return None
+            out.append(int(size.value))
+        return None
+
     def close(self) -> None:
         """The module unloaded - its code and the driver's copy of the image - and the primary context's retain
         given back; the function handles go with it. Safe to call twice"""
@@ -1054,6 +1127,40 @@ class _Cuda:
     @staticmethod
     def ptr(t: torch.Tensor | None) -> ctypes.c_void_p:
         return ctypes.c_void_p(0 if t is None else t.data_ptr())
+
+    def attn_args(
+        self,
+        q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        out: torch.Tensor,
+        walk: Sequence[torch.Tensor],
+        T: int,
+        Hq: int,
+        Hk: int,
+        scale: float,
+        part_m: torch.Tensor,
+        part_l: torch.Tensor,
+        part_acc: torch.Tensor,
+        cnt: torch.Tensor,
+        S: int,
+        win: int = 0,
+        shared: torch.Tensor | ctypes.c_void_p | None = None,
+    ) -> list[Any]:
+        """The decode attention's arguments in its kernels' order - `btb_attn_split_d{D}`, its grouped forms
+        `btb_attn_split_gqa{G}_d{D}` and `btb_attn_rows_d{D}` - the one list the engine and the benches all launch
+        them with, so a change of their parameters is one edit here. `walk` where each row's keys lie: the tree's
+        [n0, par] or the rows' [rw]; a head's and a row's stride read off `K` [Hk, cap, D] as the kernels index the
+        cache (V laid out as K); the splits' states; `win` a sliding layer's window (0: none); `shared` the grouped
+        forms' alone, the prefix from which a block reads its KV group's keys once (a tensor, or a pointer into
+        one)."""
+        P, ci = self.ptr, ctypes.c_int
+        args = [P(q), P(K), P(V), P(out), *[P(w) for w in walk], ci(T), ci(Hq), ci(Hk)]
+        args += [ci(int(K.stride(0))), ci(int(K.stride(1))), ctypes.c_float(scale)]
+        args += [P(part_m), P(part_l), P(part_acc), P(cnt), ci(S), ci(win)]
+        if shared is not None:
+            args.append(P(shared) if isinstance(shared, torch.Tensor) else shared)
+        return args
 
     def mx4_widen(
         self, blocks: torch.Tensor, scales: torch.Tensor, seats: torch.Tensor, out: torch.Tensor | None = None
