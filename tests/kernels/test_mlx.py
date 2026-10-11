@@ -475,23 +475,26 @@ def check_rope_nodes() -> str:
 
 
 def check_gemv_rows() -> str:
-    """the matvec is batch-invariant: a row alone and inside a 15-row tile, bf16 and float32, bit for bit"""
+    """the matvec is batch-invariant: a row alone, in a tile of any width and in a pass split over launches (past
+    `TILE_ROWS`, every width the engine's passes under `gemm_rows` take), bf16 and float32, bit for bit"""
     import mlx.core as mx
 
     from btb import mlx as mlxdev
 
     mx.random.seed(4)
     W = (mx.random.normal((1536, 2560)) * 0.05).astype(mx.bfloat16)
-    bad = 0
+    bad = []
     for dt in (mx.bfloat16, mx.float32):
-        X = mx.random.normal((15, 2560)).astype(dt)
+        X = mx.random.normal((63, 2560)).astype(dt)
         mx.eval(W, X)
-        full = mlxdev.gemv(W, X)
-        rows = mx.concatenate([mlxdev.gemv(W, X[i : i + 1]) for i in range(15)])
-        mx.eval(full, rows)
-        bad += int(not mx.array_equal(full, rows))
-    assert bad == 0, "a row's product depends on its company"
-    return "rows alone and in a tile bit-exact (bf16, float32)"
+        rows = mx.concatenate([mlxdev.gemv(W, X[i : i + 1]) for i in range(63)])
+        for t in range(2, 64):
+            full = mlxdev.gemv(W, X[:t])
+            mx.eval(full, rows)
+            if not mx.array_equal(full, rows[:t]):
+                bad.append((str(dt), t))
+    assert not bad, f"a row's product depends on its company: {bad}"
+    return "rows alone and in passes of 2-63 rows bit-exact (bf16, float32)"
 
 
 _FP4 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]

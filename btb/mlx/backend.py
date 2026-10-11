@@ -13,7 +13,7 @@ import numpy as np
 
 from ..kinds import QUANT_KIND, Log, Quant, QuantClass, quant_key
 from .core import bf16_weight, from_mx, info, mx, to_mx
-from .gemv import GEMV_ROWS, gemv, matmul_mxfp4, matmul_mxfp4_pair, unpack_bf16
+from .gemv import gemv, matmul_mxfp4, matmul_mxfp4_pair, unpack_bf16
 from .iquant import (
     dequant_iq4nl,
     dequant_iq4xs,
@@ -131,7 +131,6 @@ class Weight:
     off: int
     nb: int
     a: Any
-    host: Any  # a slot weight's bytes as a bf16 torch view, for the host's gemv over a few rows (`_HostLinear`)
 
     q: Quant | None  # a GGUF type multiplied as stored, its kernels' arrays in `streams` (`stored_streams`)
     streams: tuple[Any, ...]
@@ -310,15 +309,15 @@ class Backend:
         if w.q is not None:
             rows, cols = (int(s) for s in w.shape)
             # the type's kernel reads the weight once a 16 rows, so a prefill of `gemm_rows` rows or more widens it
-            # once to bf16 for MLX's gemm (4x faster at 512 rows), as a bf16 weight takes the gemm past 16
+            # once to bf16 for MLX's gemm (4x faster at 512 rows), as a bf16 weight's prefill takes the gemm
             if int(x.shape[0]) < self.gemm_rows:
                 return stored_matvec(w.q, w.streams, x, rows, cols)
             W = stored_dequant(w.q, w.streams, rows, cols)
             return m.matmul(x, (W.astype(m.float32) if x.dtype == m.float32 else W).T)
         W = w.get()
-        # up to 16 rows: the engine's kernel, one weight read for the tile and batch-invariant rows (a verify
-        # pass computes each row as the one-row step does); past that (prefill) MLX's gemm
-        if int(x.shape[0]) <= GEMV_ROWS and int(W.shape[1]) % 8 == 0 and x.dtype in (m.float32, m.bfloat16):
+        # under `gemm_rows`: the engine's kernel, each row's bits its own whatever the width (a verify pass or a batch
+        # computes each row as the one-row step does); from there (prefill) MLX's gemm
+        if int(x.shape[0]) < self.gemm_rows and int(W.shape[1]) % 8 == 0 and x.dtype in (m.float32, m.bfloat16):
             return gemv(W, x)
         if x.dtype == m.float32:
             return m.matmul(x, W.astype(m.float32).T)
@@ -398,8 +397,8 @@ class Backend:
         """One MXFP4 expert over its rows as its own graph (`async_eval`): `xm` [T, H], `token_idx`/`wts` its rows and
         router weights, `pair` = (gu, dn) uint8 slot views with `gu_shape`/`dn_shape` (`ggml`: a GGUF's, gu the
         (gate, up) views in ggml's layout), the bias tables (None for a family without them), and the gate:
-        gpt-oss's clamped GLU with `alpha`/`limit`, or `act(gate) * up` where `act` is given. Up to 16 rows through
-        the batch-invariant matvec, more through a gemm. Returns (idx, y): the rows' indices (None for the whole
+        gpt-oss's clamped GLU with `alpha`/`limit`, or `act(gate) * up` where `act` is given. Under `gemm_rows` rows
+        through the batch-invariant matvec, from there a gemm. Returns (idx, y): the rows' indices (None for the whole
         input) and the weighted output in x's dtype."""
         m = mx()
         gu, dn = pair
@@ -407,10 +406,11 @@ class Backend:
         whole = T == 1 and len(token_idx) == 1
         idx = None if whole else m.array(np.asarray(token_idx, dtype=np.int32))
         cur = xm if whole else m.take(xm, idx, axis=0)
+        g = self.gemm_rows
         if ggml:
-            y = matmul_mxfp4_pair(gu[0], gu[1], gu_shape[0] // 2, gu_shape[1], cur)
+            y = matmul_mxfp4_pair(gu[0], gu[1], gu_shape[0] // 2, gu_shape[1], cur, gemm_rows=g)
         else:
-            y = matmul_mxfp4(gu, gu_shape[0], gu_shape[1], cur)
+            y = matmul_mxfp4(gu, gu_shape[0], gu_shape[1], cur, gemm_rows=g)
         if gu_bias is not None:
             y = y + gu_bias[e].astype(xm.dtype)
         if act is not None:  # the pair's rows interleave gate and up
@@ -419,7 +419,7 @@ class Backend:
             gate = m.minimum(y[..., 0::2], limit)
             up = m.clip(y[..., 1::2], -limit, limit)
             h = ((up + 1) * (gate * m.sigmoid(alpha * gate))).astype(xm.dtype)
-        o = matmul_mxfp4(dn, dn_shape[0], dn_shape[1], h, ggml=ggml)
+        o = matmul_mxfp4(dn, dn_shape[0], dn_shape[1], h, ggml=ggml, gemm_rows=g)
         if dn_bias is not None:
             o = o + dn_bias[e].astype(xm.dtype)
         y = o * m.array(np.asarray(wts, dtype=np.float32)).astype(xm.dtype)[:, None]
