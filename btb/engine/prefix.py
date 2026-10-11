@@ -100,6 +100,13 @@ class PrefixCache:
             return "MLX's attention reads no pages yet: the prefix cache serves the CPU's and the card's"
         if sm.dev.type not in (Device.CPU, Device.CUDA):
             return f"a {sm.dev.type} engine's attention reads no pages, only the host's and the card's do"
+        if sm.dev.type == Device.CPU:
+            placed = {*getattr(sm, "host", {}), *getattr(sm, "cold", ())}
+            off = [i for i in range(int(getattr(sm, "L", 0))) if i not in placed]
+            if off:
+                # a CPU engine built with layers outside its host tier (`cpu_layers` short of the model): those run
+                # their modules, which read one buffer; the host tier's native attention is what reads the pages
+                return f"{len(off)} of the CPU engine's layers run their own modules, which read no pages"
         if sm.fam.own:
             return "a family that brings its own layer (Qwen4) reads its rows through programs of its own"
         if not sm.fam.fast:
