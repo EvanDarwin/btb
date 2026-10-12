@@ -35,7 +35,7 @@ import torch.nn.functional as F
 
 from . import sysinfo
 from .feedback import btb_version
-from .kinds import Json
+from .kinds import HostCache, Json
 
 Z95 = 1.959964  # the normal quantile of a two-sided 95% interval
 KB, MB, GB = 1 << 10, 1 << 20, 1 << 30
@@ -348,10 +348,10 @@ def card_free(dev: torch.device) -> int:
 
 
 def host_past() -> int:
-    """the bytes a host pool passes: four of the L3 (the L2 where there is none), 64 MB at least, held to 1/16 of
-    the RAM available so the bench never presses on the machine"""
+    """The bytes a host pool cycles through: 4x the total L3 (the total L2 where there's no L3), so it outgrows
+    every cache. At least 64 MB, and at most 1/16 of the available RAM so the bench never presses on the machine."""
     c = sysinfo.host_cache_sizes()
-    want = max(4 * (c["host_l3"] or c["host_l2"]), 64 * MB)
+    want = max(4 * (c[HostCache.L3_TOTAL] or c[HostCache.L2_TOTAL]), 64 * MB)
     return int(max(16 * MB, min(want, host_free() // 16)))
 
 
@@ -516,12 +516,21 @@ def _exact(b: int) -> str:
 
 
 def _cache_lines(groups: list[Json]) -> list[str]:
-    """each cache level's instances - how many, their size, the threads sharing one - and the level's total"""
+    """Each cache level's instances (how many, their size, the threads sharing one), its total, and the smallest
+    share a thread gets with every thread busy."""
     if not groups:
         return ["           caches   not readable here"]
+    sizes = sysinfo.cache_sizes(groups)
     lines = []
-    for lvl, name in ((1, "L1d"), (2, "L2"), (3, "L3")):
+    for lvl, name, per_thread in (
+        (1, "L1d", HostCache.L1D_PER_THREAD),
+        (2, "L2", HostCache.L2_PER_THREAD),
+        (3, "L3", HostCache.L3_PER_THREAD),
+    ):
         gs = [g for g in groups if g["level"] == lvl]
+        if not gs:
+            lines.append(f"           {name:<4}none listed")
+            continue
         parts = [
             (f"{g['count']} x " if g["count"] > 1 else "")
             + f"{_exact(g['size'])} ({g['threads']} thread{'s' if g['threads'] > 1 else ''}"
@@ -530,7 +539,8 @@ def _cache_lines(groups: list[Json]) -> list[str]:
         ]
         total = sum(g["size"] * g["count"] for g in gs)
         tail = f" = {_exact(total)}" if lvl > 1 and sum(g["count"] for g in gs) > 1 else ""
-        lines.append(f"           {name:<4}{' + '.join(parts) + tail if gs else 'none listed'}")
+        busy = f"; {_exact(sizes[per_thread])} a thread with all busy"
+        lines.append(f"           {name:<4}{' + '.join(parts)}{tail}{busy}")
     return lines
 
 

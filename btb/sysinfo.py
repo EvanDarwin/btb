@@ -20,7 +20,7 @@ from functools import lru_cache
 from typing import Any
 
 from . import pool
-from .kinds import Json
+from .kinds import HostCache, Json
 
 # macOS: sysctlbyname through libc, bound once - a read is microseconds, where spawning `sysctl` from a process
 # with the model mapped was milliseconds a call inside the decode loop's once-a-second policy check
@@ -974,21 +974,31 @@ def _host_caches() -> tuple[tuple[int, int, int], ...]:
 
 
 def host_cache_sizes() -> dict[str, int]:
-    """The host CPU's caches as three figures in bytes, from `host_cache_groups`: `host_l1d` one core's L1 data
-    cache (the largest, on a hybrid), `host_l2` and `host_l3` every instance of the level together - what the
-    level holds when every core reads its own part, as `lscpu` and Task Manager count it (a two-chiplet Ryzen's
-    two 32 MB L3s are 64 MB). 0 where a level is missing or cannot be read."""
+    """The host CPU's cache sizes in bytes, from `host_cache_groups`, keyed by `HostCache`.
+
+    Each level has the smallest single instance (a thread running alone, on any core: a 7950X3D's L3 is 32 MB, not
+    96) and the smallest per-thread share with every thread busy (a 13700K's L2 is 1 MB a thread: 2 MB per P-core
+    over its 2 hyperthreads, 4 MB per E-core cluster over 4 cores). A consumer picks by how many threads it runs.
+    The L2 and L3 totals add up every instance: what a working set must pass to miss every cache. 0 where a level is
+    missing or can't be read."""
     return cache_sizes(host_cache_groups())
 
 
 def cache_sizes(groups: list[Json]) -> dict[str, int]:
-    """`host_cache_sizes`'s three figures from `host_cache_groups`' form"""
-    out = {"host_l1d": 0, "host_l2": 0, "host_l3": 0}
-    for g in groups:
-        if g["level"] == 1:
-            out["host_l1d"] = max(out["host_l1d"], g["size"])
-        elif g["level"] in (2, 3):
-            out[f"host_l{g['level']}"] += g["size"] * g["count"]
+    """`host_cache_sizes`' figures from `host_cache_groups`' form."""
+    out: dict[str, int] = dict.fromkeys(HostCache, 0)
+    levels = (
+        (1, HostCache.L1D, HostCache.L1D_PER_THREAD, None),
+        (2, HostCache.L2, HostCache.L2_PER_THREAD, HostCache.L2_TOTAL),
+        (3, HostCache.L3, HostCache.L3_PER_THREAD, HostCache.L3_TOTAL),
+    )
+    for level, one, per_thread, total in levels:
+        gs = [g for g in groups if g["level"] == level]
+        if gs:
+            out[one] = min(g["size"] for g in gs)
+            out[per_thread] = min(g["size"] // g["threads"] for g in gs)
+            if total is not None:
+                out[total] = sum(g["size"] * g["count"] for g in gs)
     return out
 
 

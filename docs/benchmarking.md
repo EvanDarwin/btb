@@ -24,9 +24,10 @@ The report runs without a model, in two parts.
 - **CPU features**: what the native library detects (AVX2, FMA, AVX-VNNI, AVX-512 and its BF16/VNNI parts, AMX,
   NEON, dotprod, i8mm, SVE), the kernel tier it picked, and torch's own tier.
 - **Caches**: each level's instances: how many, their size, and how many threads share one (a P-core's own L2,
-  an efficiency cluster's shared L2, each chiplet's L3), and the level's total. Every OS is read to the same
-  form, so a CPU reports the same on Windows, Linux and macOS. The totals count every instance, as `lscpu` and
-  Task Manager do: a two-chiplet Ryzen's L3 is 64 MB.
+  an efficiency cluster's shared L2, each chiplet's L3), the level's total, and the smallest share a thread gets
+  with every thread busy (a 13700K's L2: 1 MB a thread). Every OS is read to the same form, so a CPU reports the
+  same on Windows, Linux and macOS. The totals count every instance, as `lscpu` and Task Manager do: a
+  two-chiplet Ryzen's L3 is 64 MB.
 - **Memory**: total and available. The modules the firmware lists (SMBIOS): their type, form, size, rated and
   running speed in MT/s, and maker and part. Where the board names the channels, the channel count and the peak
   rate they make. Linux's SMBIOS table is readable by root only; without root the modules come from the copy

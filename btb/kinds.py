@@ -272,6 +272,24 @@ class LayerTier(StrEnum):
     STREAMED = "streamed"
 
 
+class HostCache(StrEnum):
+    """The host CPU's cache figures in bytes (`sysinfo.host_cache_sizes`).
+
+    A bare level is its smallest single instance: what one thread running alone can count on, on any core.
+    `_PER_THREAD` is the smallest share a thread gets with every thread busy: an instance divided by the threads
+    sharing it, hyperthreads included. `_TOTAL` adds up every instance: what a working set must pass to miss every
+    cache. None of them assumes where the OS places a thread."""
+
+    L1D = "host_l1d"
+    L2 = "host_l2"
+    L3 = "host_l3"
+    L1D_PER_THREAD = "host_l1d_per_thread"
+    L2_PER_THREAD = "host_l2_per_thread"
+    L3_PER_THREAD = "host_l3_per_thread"
+    L2_TOTAL = "host_l2_total"
+    L3_TOTAL = "host_l3_total"
+
+
 class Proposer(StrEnum):
     """what proposes a speculative pass's drafts (btb/engine/generate.py): the n-gram continuations, or a
     drafting head as a chain, a fixed tree or the dynamic tree it draws itself. A sibling draft model is not a

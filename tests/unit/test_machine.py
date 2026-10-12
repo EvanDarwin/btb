@@ -19,7 +19,7 @@ import pytest
 from pytest import CaptureFixture, MonkeyPatch
 
 from btb import machine, sysinfo
-from btb.kinds import Json
+from btb.kinds import HostCache, Json
 from tests.helpers import KB, MB, fixture
 
 
@@ -211,6 +211,16 @@ def test_udev_memory_devices_read_as_modules(tmp_path: Path, monkeypatch: Monkey
     assert sysinfo._udev_modules() is None
 
 
+def _sizes(l1d: tuple[int, int], l2: tuple[int, int, int], l3: tuple[int, int, int] = (0, 0, 0)) -> dict[str, int]:
+    """`cache_sizes`' figures: (smallest instance, per-thread share with all busy) for L1d, and the total too for L2
+    and L3"""
+    return {
+        HostCache.L1D: l1d[0], HostCache.L1D_PER_THREAD: l1d[1],
+        HostCache.L2: l2[0], HostCache.L2_PER_THREAD: l2[1], HostCache.L2_TOTAL: l2[2],
+        HostCache.L3: l3[0], HostCache.L3_PER_THREAD: l3[1], HostCache.L3_TOTAL: l3[2],
+    }  # fmt: skip
+
+
 def _sysfs(root: Path, files: dict[str, str]) -> str:
     for rel, text in files.items():
         p = root / rel
@@ -245,7 +255,9 @@ def test_linux_sysfs_reads_as_cores_and_caches(tmp_path: Path) -> None:
         {"level": 2, "size": 4 * MB, "threads": 2, "count": 1}, {"level": 2, "size": 2 * MB, "threads": 2, "count": 2},
         {"level": 3, "size": 30 * MB, "threads": 6, "count": 1},
     ]  # fmt: skip
-    assert sysinfo.cache_sizes(groups) == {"host_l1d": 48 * KB, "host_l2": 8 * MB, "host_l3": 30 * MB}
+    assert sysinfo.cache_sizes(groups) == _sizes(
+        l1d=(32 * KB, 24 * KB), l2=(2 * MB, MB, 8 * MB), l3=(30 * MB, 5 * MB, 30 * MB)
+    )
     assert sysinfo._linux_topology(root) == {
         "logical": 6, "physical": 4, "base_mhz": 3400, "max_mhz": 5400,
         "classes": [
@@ -314,7 +326,7 @@ def test_macos_sysctl_reads_as_cores_and_caches(monkeypatch: MonkeyPatch) -> Non
         {"level": 1, "size": 128 * KB, "threads": 1, "count": 8}, {"level": 1, "size": 64 * KB, "threads": 1, "count": 4},
         {"level": 2, "size": 16 * MB, "threads": 4, "count": 2}, {"level": 2, "size": 4 * MB, "threads": 4, "count": 1},
     ]  # fmt: skip
-    assert sysinfo.cache_sizes(groups) == {"host_l1d": 128 * KB, "host_l2": 36 * MB, "host_l3": 0}
+    assert sysinfo.cache_sizes(groups) == _sizes(l1d=(64 * KB, 64 * KB), l2=(4 * MB, MB, 36 * MB))
     # perflevels that give the L1d and L2 but no L3: the L3 still read, from hw.l3cachesize
     _sysctl(monkeypatch, {
         "hw.nperflevels": 1, "hw.logicalcpu": 4, "hw.l3cachesize": 8 * MB, "hw.cacheconfig": _cacheconfig(4, 1, 1, 4),
@@ -335,7 +347,35 @@ def test_macos_sysctl_reads_as_cores_and_caches(monkeypatch: MonkeyPatch) -> Non
         "classes": [{"name": "cores", "cores": 6, "threads": 12, "base_mhz": 0, "max_mhz": 2600}],
     }  # fmt: skip
     groups = sysinfo._cache_groups(sysinfo._darwin_caches())
-    assert sysinfo.cache_sizes(groups) == {"host_l1d": 32 * KB, "host_l2": 1536 * KB, "host_l3": 12 * MB}
+    assert sysinfo.cache_sizes(groups) == _sizes(
+        l1d=(32 * KB, 16 * KB), l2=(256 * KB, 128 * KB, 1536 * KB), l3=(12 * MB, MB, 12 * MB)
+    )
+
+
+# (level, size, threads sharing it) for every cache instance, as the OS readers return them
+_I7_13700K = (
+    [(1, 48 * KB, 2)] * 8 + [(1, 32 * KB, 1)] * 8 + [(2, 2 * MB, 2)] * 8 + [(2, 4 * MB, 4)] * 2 + [(3, 30 * MB, 24)]
+)
+_R9_7950X = [(1, 32 * KB, 2)] * 16 + [(2, MB, 2)] * 16 + [(3, 32 * MB, 16)] * 2
+_R9_7950X3D = [(1, 32 * KB, 2)] * 16 + [(2, MB, 2)] * 16 + [(3, 96 * MB, 16), (3, 32 * MB, 16)]
+
+
+def test_a_level_reports_its_smallest_instance_share_and_total(monkeypatch: MonkeyPatch) -> None:
+    """A thread can run on any core or chiplet, so each level reports its smallest instance (a thread alone) and its
+    smallest per-thread share (every thread busy: an instance over the threads sharing it, hyperthreads included).
+    The totals size the bench's pools, which must outgrow every cache."""
+    sizes = {name: sysinfo.cache_sizes(sysinfo._cache_groups(c)) for name, c in (
+        ("13700K", _I7_13700K), ("7950X", _R9_7950X), ("7950X3D", _R9_7950X3D))}  # fmt: skip
+    # 13700K: L2 per thread 1 MB either way (2 MB over a P-core's 2 hyperthreads, 4 MB over an E-cluster's 4 cores)
+    assert sizes["13700K"] == _sizes(l1d=(32 * KB, 24 * KB), l2=(2 * MB, MB, 24 * MB), l3=(30 * MB, 1280 * KB, 30 * MB))
+    assert sizes["7950X"] == _sizes(l1d=(32 * KB, 16 * KB), l2=(MB, 512 * KB, 16 * MB), l3=(32 * MB, 2 * MB, 64 * MB))
+    assert sizes["7950X3D"][HostCache.L3] == 32 * MB, "the smaller chiplet's L3, not the 96 MB V-cache"
+    assert (sizes["7950X3D"][HostCache.L3_PER_THREAD], sizes["7950X3D"][HostCache.L3_TOTAL]) == (2 * MB, 128 * MB)
+    assert sysinfo.cache_sizes([]) == dict.fromkeys(sizes["7950X"], 0)
+    # the pools: 4x the total L3, while the RAM allows
+    monkeypatch.setattr(sysinfo, "host_cache_groups", lambda: sysinfo._cache_groups(_R9_7950X3D))
+    monkeypatch.setattr(machine, "host_free", lambda: 64 * 1024 * MB)
+    assert machine.host_past() == 512 * MB
 
 
 def _win_cache(level: int, kind: int, size: int, lps: list[int], groups: int = 1, wide: bool = True) -> bytes:
@@ -396,11 +436,13 @@ def test_a_cpu_reads_the_same_on_every_os(tmp_path: Path, monkeypatch: MonkeyPat
     })  # fmt: skip
     new_mac = sysinfo._cache_groups(sysinfo._darwin_caches())
     assert linux == windows == windows32 == old_mac == new_mac == want, (linux, windows, windows32, old_mac, new_mac)
-    assert sysinfo.cache_sizes(want) == {"host_l1d": 32 * KB, "host_l2": 4 * MB, "host_l3": 64 * MB}
+    assert sysinfo.cache_sizes(want) == _sizes(
+        l1d=(32 * KB, 16 * KB), l2=(MB, 512 * KB, 4 * MB), l3=(32 * MB, 8 * MB, 64 * MB)
+    )
     assert machine._cache_lines(want) == [
-        "           L1d 4 x 32 KB (2 threads each)",
-        "           L2  4 x 1 MB (2 threads each) = 4 MB",
-        "           L3  2 x 32 MB (4 threads each) = 64 MB",
+        "           L1d 4 x 32 KB (2 threads each); 16 KB a thread with all busy",
+        "           L2  4 x 1 MB (2 threads each) = 4 MB; 512 KB a thread with all busy",
+        "           L3  2 x 32 MB (4 threads each) = 64 MB; 8 MB a thread with all busy",
     ]
     assert machine._exact(1280 * KB) == "1.25 MB", "an Alder Lake P-core's L2, not rounded to 1 MB"
 
@@ -421,7 +463,8 @@ def test_the_cores_add_up() -> None:
     for lvl in (1, 2, 3):
         assert sum(g["threads"] * g["count"] for g in groups if g["level"] == lvl) <= topo["logical"], groups
     if groups:
-        assert sysinfo.host_cache_sizes()["host_l1d"] > 0, groups
+        c = sysinfo.host_cache_sizes()
+        assert 0 < c[HostCache.L1D_PER_THREAD] <= c[HostCache.L1D], groups
 
 
 def test_the_features_hold_the_tier_the_library_picked() -> None:

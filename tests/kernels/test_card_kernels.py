@@ -393,12 +393,13 @@ def test_silu_mul_is_bit_exact(cu: _Cuda) -> None:
 
 
 def test_scheduler_reports_the_hierarchy(cu: _Cuda) -> None:
+    from btb.kinds import HostCache
     from btb.sysinfo import host_cache_sizes
 
     lim, win = cu.persist_limit()
     assert 0 < lim <= cu.l2_bytes() <= win or win == 0
     hc = host_cache_sizes()
-    assert set(hc) == {"host_l1d", "host_l2", "host_l3"}
+    assert set(hc) == set(HostCache)
     assert all(v >= 0 for v in hc.values())
 
 
