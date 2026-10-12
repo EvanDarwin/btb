@@ -722,6 +722,23 @@ def loaded_model(path: str, **load_kw: Any) -> Iterator[StreamedTextModel]:
         sm.close()
 
 
+def squeeze(sm: StreamedTextModel, left: int, mp: pytest.MonkeyPatch) -> None:
+    """leave `left` bytes free on the host, as btb counts it: the host's free RAM and the commit left (the ledger's
+    host figure is the smaller of the two) pinned at their readings here, as MLX's ledger is its own already -
+    measured against a live reading, any other process's allocation took the last bytes, or gave some back, and a
+    decode the test expects to run was refused, or one it expects refused ran. The reserve raised through `mp`, put
+    back with the rest: a load shared with the tests after (`shared_model`) left as it was found"""
+    if sm.mlx is not None:
+        mp.setattr(sm, "ram_reserve", int(sm.mem_start) - int(sm.mlx.held_bytes()) - left)
+    else:
+        from btb.engine import device as device_mod
+
+        now, commit = device_mod.host_free_bytes(), device_mod.host_commit_bytes()
+        mp.setattr(device_mod, "host_free_bytes", lambda: now)
+        mp.setattr(device_mod, "host_commit_bytes", lambda: commit)
+        mp.setattr(sm, "ram_reserve", sm.ram_reserve + max(0, sm.memory()["cpu"].free - left))
+
+
 # --- models shared by the tests that load the same file with the same options -------------------------------
 #
 # A test module that loads one model file with one set of options in many tests declares each test's models in a

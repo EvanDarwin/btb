@@ -179,6 +179,9 @@ class _StubEngine(_GenerateMixin):
     def new_cache(self, max_len: int | None = None) -> _StubCache:
         return _StubCache(max_len)
 
+    def _decode_cache(self, max_len: int) -> _StubCache:
+        return self.new_cache(max_len)  # an engine with no prefix cache: a cache of the call's own
+
     def _logits(self, rows: TokenRows, k: int) -> torch.Tensor:
         out = torch.zeros(len(rows), 1, V)
         for b, r in enumerate(rows):
@@ -1437,6 +1440,44 @@ def test_a_shed_whose_host_copy_is_refused_leaves_the_layer_on_the_card() -> Non
     assert 3 in stub.resident and not stub.host
 
 
+def test_a_layer_move_undone_puts_the_prefix_caches_rows_back_with_it() -> None:
+    """a shed or a regrow whose live caches' rows are refused after the prefix cache's moved (`_caches_to` places
+    the pool's first) puts the layer back - and asks the pool to place its rows where the layer runs again: left, a
+    layer back on the card read rows on the host (or back on the host, rows on the card) until its next move"""
+    placed: list[tuple[int, bool]] = []
+
+    def refuse(i: int, dev: Any, cache: Any = None) -> None:
+        raise MemoryGrantError("the fork's rows refused")
+
+    stub = types.SimpleNamespace(
+        aj=None,
+        resident={3: object()},
+        host={},
+        dev=torch.device("cpu"),
+        resident_head=False,
+        _shed=[],
+        log=lambda *a: None,
+        _layer_bytes=lambda i: GB,
+        _card_let_go=lambda: None,
+        _make_host_layer=lambda i: object(),
+        _caches_to=refuse,
+        _new_layer=lambda i: object(),
+        _load_layer=lambda i, tmpl, first=False: None,
+        resident_fp32=False,
+        compute_dtype=None,
+    )
+    stub._kv = types.SimpleNamespace(place=lambda sm, i: placed.append((i, i in sm.resident)))
+    stub._kv_back = lambda i: _MemoryMixin._kv_back(cast(Any, stub), i)
+    with pytest.raises(MemoryGrantError):
+        _MemoryMixin.vram_shed(cast(Any, stub))
+    assert 3 in stub.resident and not stub.host and placed == [(3, True)], placed
+    stub.resident, stub.host, stub._shed = {}, {3: object()}, ["layer 3"]
+    with pytest.raises(MemoryGrantError):
+        _MemoryMixin.vram_regrow(cast(Any, stub))
+    assert 3 in stub.host and not stub.resident and stub._shed == ["layer 3"]
+    assert placed == [(3, True), (3, False)], placed
+
+
 def test_the_widest_speculative_pass_is_held_to_what_the_family_verifies() -> None:
     """a tree budget past what the family verifies exactly (Qwen4's card program: 32 rows) is held to it - a wider
     pass took the torch path, and its pricing raised past the program's widths - and a pass the pricer is handed past
@@ -1449,6 +1490,20 @@ def test_the_widest_speculative_pass_is_held_to_what_the_family_verifies() -> No
     assert _CudaMixin._spec_full(cast(Any, stub)) == 41
     w = types.SimpleNamespace(CARD_T_MAX=32, _card_m=_CudaMixin._card_m)
     assert _CudaMixin._card_width(cast(Any, w), 3) == 4 and _CudaMixin._card_width(cast(Any, w), 41) == 41
+
+
+def test_a_prompt_gemm_takes_the_tiles_its_shape_runs_fastest_on() -> None:
+    """`_card_gemm_plan` on a 60-SM card, as measured on one: the 64 x 64 tiles where the 128 x 64 would give the SMs
+    fewer than eight each (Qwen3-0.6B's down and an 8B's down at 512 rows) or the k is 1024 or less (the 0.6B's qkv
+    at 4096 rows), the 128 x 64 elsewhere (the 0.6B's down and an 8B's square weight at 4096 rows, the 8B's
+    24576-row gate/up at 512)"""
+    from btb.engine.cuda import _CudaMixin
+
+    plan = _CudaMixin._card_gemm_plan
+    assert plan(1024, 3072, 512, 60) == plan(4096, 12288, 512, 60) == "small"
+    assert plan(4096, 1024, 4096, 60) == "small"
+    assert plan(1024, 3072, 4096, 60) == plan(4096, 4096, 4096, 60) == plan(24576, 4096, 512, 60) == "big"
+    assert plan(151936, 4096, 1, 60) == "big"  # a head's one row: 2374 tiles of weight rows
 
 
 def test_one_burst_does_not_price_a_width_out_for_good() -> None:
@@ -1477,7 +1532,10 @@ def test_one_burst_does_not_price_a_width_out_for_good() -> None:
 def test_a_card_graph_the_card_had_no_room_for_is_tried_again(monkeypatch: MonkeyPatch) -> None:
     """an out-of-memory build turned the card graph off until the placement moved - for the engine's life where none
     did (adapt off, a budget a trim answered, a model wholly on the card). It is tried again after CARD_RETRY_S,
-    doubling with each refusal at one placement; the driver's own out-of-memory errors count as torch's do"""
+    doubling with each refusal at one placement; the driver's own out-of-memory errors count as torch's do. Refused
+    again inside the window - the next layer of the prompt that opened it trying the card's kernels - it is the same
+    refusal: the window stands, the graphs are not let go again (one sweep took the window to its cap, a sync and an
+    emptied cache at every layer)"""
     from btb.engine import cuda as cuda_mod
     from btb.engine.cuda import _CudaMixin
 
@@ -1486,22 +1544,57 @@ def test_a_card_graph_the_card_had_no_room_for_is_tried_again(monkeypatch: Monke
     monkeypatch.setattr(cuda_mod, "time", types.SimpleNamespace(monotonic=lambda: now[0]))
     dev = types.SimpleNamespace(version=3)
     dev.snapshot = lambda: types.SimpleNamespace(version=dev.version)
+    let_go: list[float] = []
     stub = types.SimpleNamespace(
-        device=dev, CARD_RETRY_S=10.0, CARD_RETRY_MAX_S=300.0, _card_let_go=lambda: None, log=lambda *a: None
+        device=dev,
+        CARD_RETRY_S=10.0,
+        CARD_RETRY_MAX_S=300.0,
+        _card_let_go=lambda: let_go.append(now[0]),
+        log=lambda *a: None,
     )
     e = cast(Any, stub)
+    stub._card_off_now = lambda: _CudaMixin._card_off_now(e)
     oom = RuntimeError("CUDA error: out of memory (cudaGraphInstantiate)")
     assert _CudaMixin._is_card_oom(oom) and _CudaMixin._is_card_oom(torch.OutOfMemoryError("x"))
     assert not _CudaMixin._is_card_oom(RuntimeError("an index out of range"))
     _CudaMixin._card_oom(e, oom)
     assert _CudaMixin._card_off_now(e)
-    now[0] += 11
+    for _ in range(6):  # a sweep's later layers refused the same way, a second apart
+        now[0] += 1
+        _CudaMixin._card_oom(e, oom)
+    assert stub._card_off[2] == 10.0 and len(let_go) == 1, (stub._card_off, let_go)
+    now[0] += 5
     assert not _CudaMixin._card_off_now(e), "not tried again once its retry was due"
     _CudaMixin._card_oom(e, oom)
     now[0] += 11
     assert _CudaMixin._card_off_now(e), "a second refusal at one placement waits twice as long"
     dev.version += 1
     assert not _CudaMixin._card_off_now(e), "a placement moved: tried at once"
+
+
+def test_a_layers_merged_weights_are_made_once_and_asked_for() -> None:
+    """the card's kernels read a layer's q/k/v and gate/up as one row block each, the modules viewing it: merged once,
+    asked of the scheduler first (the card's memory twice until the modules' own go), and found again where it lies
+    once the graphs that held it are let go - copied again, a card out of room re-merged every layer of a prompt it
+    refused"""
+    from btb.engine.cuda import _CudaMixin
+    from btb.engine.tiers import _TiersMixin
+
+    asked: list[tuple[int, str]] = []
+    stub = types.SimpleNamespace(
+        scheduler=types.SimpleNamespace(grant=lambda n, kind, **kw: asked.append((n, kind))),
+        _set_param=_TiersMixin._set_param,
+    )
+    e = cast(Any, stub)
+    q, k, v = (torch.nn.Linear(8, r, bias=False).to(torch.bfloat16) for r in (16, 4, 4))
+    ws = [m.weight.detach().clone() for m in (q, k, v)]
+    parts = [(q, "weight"), (k, "weight"), (v, "weight")]
+    W = _CudaMixin._card_merged(e, 0, "q/k/v", parts)
+    assert asked == [(24 * 8 * 2, "weights")] and torch.equal(W, torch.cat(ws))
+    assert q.weight.data_ptr() == W.data_ptr() and v.weight.data_ptr() == W[20:].data_ptr()
+    again = _CudaMixin._card_merged(e, 0, "q/k/v", parts)
+    assert len(asked) == 1, "a merged block copied again"
+    assert again.data_ptr() == W.data_ptr() and again.shape == W.shape and torch.equal(again, W)
 
 
 def test_a_let_go_drops_the_step_graphs_embedding_table(monkeypatch: MonkeyPatch) -> None:
@@ -2972,6 +3065,39 @@ def test_a_reservation_allocated_out_of_piecemeal_holds_only_what_is_not_in_use(
         e.device.reserve("pass", 4 * GB, "cuda", used=lambda: live[0])
         e.device.release("pass")
         assert e.device.reserved("cuda") == 0 and not e.device._uses, "a released tag's measure goes with it"
+
+
+def test_a_sweeps_chunk_buffers_draw_on_its_reservation() -> None:
+    """the layer-by-layer prefill's chunk buffers are the working set its reservation holds room for: a scratch take
+    while the sweep holds it draws on it - its room the take's, never priced past it (a chunk's buffer was refused
+    the room reserved for it, and the layer ran in torch out of that very room) - and comes off it once, as its
+    measure sees the buffer allocated, never again by the grant"""
+    from btb.engine.forward import PREFILL
+    from btb.engine.scratch import Scratch
+
+    e = _StubEngine()
+    e.device = Device(e)
+    live = [0]
+    with cuda_stats(free=8 * GB):
+        e.device.reserve(PREFILL, 7 * GB, "cuda", used=lambda: live[0])
+        with pytest.raises(MemoryGrantError):
+            e.scheduler.grant(2 * GB, "scratch", requester="a chunk's buffer", device="cuda")
+        e.scheduler.grant(2 * GB, "scratch", requester="a chunk's buffer", device="cuda", draws=PREFILL)
+        assert e.device.reserved("cuda") == 7 * GB, "the grant took the bytes off a reservation its measure counts"
+        live[0] = 2 * GB  # allocated: the measure sees it
+        assert e.device.reserved("cuda") == 5 * GB
+    asked: list[str | None] = []
+
+    class _Engine:  # held weakly by its scratch
+        holdings = types.SimpleNamespace(own=lambda *a: None)
+        scheduler = types.SimpleNamespace(grant=lambda n, kind, **kw: asked.append(kw.get("draws")))
+
+    sm = _Engine()
+    sc = Scratch(sm)
+    sc.take("a", (4,), torch.float32, "cpu", "a pass's buffer")
+    sc.draws = PREFILL  # as the sweep sets it while it holds its room
+    sc.take("b", (4,), torch.float32, "cpu", "a chunk's buffer")
+    assert asked == [None, PREFILL], asked
 
 
 def test_a_grant_draws_on_the_reservation_it_names() -> None:

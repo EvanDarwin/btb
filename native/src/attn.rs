@@ -843,6 +843,138 @@ unsafe fn nodes<E: Element>(
     attend(job, &spans, hk, width, out, nt)
 }
 
+/// `t` queries each over a span of one map of cache rows: query `i` attends the rows
+/// `map[starts[i]..ends[i]]` in map order. The spans may overlap - a chunk of a prompt, each row over the
+/// rows before it and itself, is one map of `base + t` rows - so a call costs its map, not a list per query.
+/// A span splits as a list of its length does (`nodes`), so each row is the one-row step's bits over its rows.
+#[allow(clippy::too_many_arguments)]
+unsafe fn over_spans<E: Element>(
+    query: *const f32,
+    key: *const E,
+    value: *const E,
+    map: *const u32,
+    n_map: usize,
+    starts: *const u32,
+    ends: *const u32,
+    t: usize,
+    n_rows: usize,
+    hq: usize,
+    hk: usize,
+    d: usize,
+    key_stride: usize,
+    value_stride: usize,
+    scale: f32,
+    out: *mut f32,
+    threads: usize,
+) -> i32 {
+    if query.is_null()
+        || key.is_null()
+        || value.is_null()
+        || map.is_null()
+        || starts.is_null()
+        || ends.is_null()
+        || out.is_null()
+    {
+        return ERR_NULL;
+    }
+    if t == 0 || n_map == 0 || n_rows == 0 || hq == 0 || hk == 0 || d == 0 || !hq.is_multiple_of(hk)
+    {
+        return ERR_DOMAIN;
+    }
+    // as decode's: a finite scale, and every buffer naturally aligned (the map and the spans read as u32)
+    if !scale.is_finite()
+        || !aligned(query)
+        || !aligned(key)
+        || !aligned(value)
+        || !aligned(map)
+        || !aligned(starts)
+        || !aligned(ends)
+        || !aligned(out)
+    {
+        return ERR_DOMAIN;
+    }
+
+    let rows = match n_rows.checked_mul(d) {
+        Some(v) => v,
+        None => return ERR_DOMAIN,
+    };
+    if key_stride < rows || value_stride < rows {
+        return ERR_DOMAIN;
+    }
+    // the element counts fit usize and their byte sizes a pointer offset: `t` query and output rows of
+    // `hq * d` f32, `t` starts and ends, and the map
+    if hq
+        .checked_mul(d)
+        .and_then(|v| v.checked_mul(t))
+        .is_none_or(|v| v > MAX_ELEMS)
+        || t > MAX_ELEMS
+        || n_map > MAX_ELEMS
+        || hk.checked_mul(key_stride).is_none_or(|v| v > MAX_ELEMS)
+        || hk.checked_mul(value_stride).is_none_or(|v| v > MAX_ELEMS)
+    {
+        return ERR_DOMAIN;
+    }
+
+    // every span holds at least one row and lies inside the map, and every row of the map is one the caller
+    // vouched for: one past `n_rows` would read keys outside the cache
+    let lo = std::slice::from_raw_parts(starts, t);
+    let hi = std::slice::from_raw_parts(ends, t);
+    if lo
+        .iter()
+        .zip(hi)
+        .any(|(&s, &e)| e <= s || e as usize > n_map)
+    {
+        return ERR_DOMAIN;
+    }
+    if std::slice::from_raw_parts(map, n_map)
+        .iter()
+        .any(|&r| r as usize >= n_rows)
+    {
+        return ERR_DOMAIN;
+    }
+
+    let group = hq / hk;
+    let width = match d.checked_add(2).and_then(|w| group.checked_mul(w)) {
+        Some(v) => v,
+        None => return ERR_DOMAIN,
+    };
+
+    let nt = match resolve_threads(threads) {
+        Some(v) => v,
+        None => return ERR_DOMAIN,
+    };
+    let mut spans = Vec::with_capacity(t);
+    let mut first = 0usize;
+    for (&s, &e) in lo.iter().zip(hi) {
+        let len = (e - s) as usize;
+        let (chunk, parts) = split(len, nt, hk);
+        spans.push(Span {
+            start: s as usize,
+            len,
+            chunk,
+            parts,
+            first,
+        });
+        first = match parts.checked_mul(hk).and_then(|x| x.checked_add(first)) {
+            Some(v) => v,
+            None => return ERR_DOMAIN,
+        };
+    }
+
+    let job = Job {
+        query,
+        key,
+        value,
+        index: map,
+        d,
+        group,
+        key_stride,
+        value_stride,
+        scale,
+    };
+    attend(job, &spans, hk, width, out, nt)
+}
+
 /// One decode step of grouped-query attention over a bf16 key/value cache.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn decode_core_bf16(
@@ -972,6 +1104,92 @@ pub(crate) unsafe fn nodes_core_f32(
         v,
         offs,
         idx,
+        t,
+        n_rows,
+        hq,
+        hk,
+        d,
+        k_head_stride,
+        v_head_stride,
+        scale,
+        out,
+        threads,
+    )
+}
+
+/// `t` single-token queries of grouped-query attention over a bf16 key/value cache, each over a span of one
+/// map of cache rows.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn spans_core_bf16(
+    q: *const f32,
+    k: *const u16,
+    v: *const u16,
+    map: *const u32,
+    n_map: usize,
+    starts: *const u32,
+    ends: *const u32,
+    t: usize,
+    n_rows: usize,
+    hq: usize,
+    hk: usize,
+    d: usize,
+    k_head_stride: usize,
+    v_head_stride: usize,
+    scale: f32,
+    out: *mut f32,
+    threads: usize,
+) -> i32 {
+    over_spans::<u16>(
+        q,
+        k,
+        v,
+        map,
+        n_map,
+        starts,
+        ends,
+        t,
+        n_rows,
+        hq,
+        hk,
+        d,
+        k_head_stride,
+        v_head_stride,
+        scale,
+        out,
+        threads,
+    )
+}
+
+/// `t` single-token queries of grouped-query attention over an f32 key/value cache, each over a span of one
+/// map of cache rows.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn spans_core_f32(
+    q: *const f32,
+    k: *const f32,
+    v: *const f32,
+    map: *const u32,
+    n_map: usize,
+    starts: *const u32,
+    ends: *const u32,
+    t: usize,
+    n_rows: usize,
+    hq: usize,
+    hk: usize,
+    d: usize,
+    k_head_stride: usize,
+    v_head_stride: usize,
+    scale: f32,
+    out: *mut f32,
+    threads: usize,
+) -> i32 {
+    over_spans::<f32>(
+        q,
+        k,
+        v,
+        map,
+        n_map,
+        starts,
+        ends,
         t,
         n_rows,
         hq,

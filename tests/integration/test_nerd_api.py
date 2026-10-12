@@ -703,17 +703,19 @@ def test_a_keep_whose_write_fails_part_way_leaves_the_fork_open(stem: str) -> No
     cache = s.cache
     assert cache is not None
     attn = [cl for cl in cache.layers if isinstance(cl, CacheLayerMixin)]
-    real = attn[1].update
+    # the method a row's rows are written back through: a paged layer's own append, else the layer's update
+    write = "append" if getattr(attn[1], "paged", False) else "update"
+    real = getattr(attn[1], write)
 
     def failing(*a: object, **k: object) -> object:
         raise Boom("the second layer's write")
 
-    attn[1].update = failing  # type: ignore[method-assign,assignment]
+    setattr(attn[1], write, failing)
     try:
         with pytest.raises(Boom):
             br.keep(0)
     finally:
-        attn[1].update = real  # type: ignore[method-assign]
+        setattr(attn[1], write, real)
     assert s.forked is br and s.tokens == PROMPT
     br.close()
     in_step(sm, s)

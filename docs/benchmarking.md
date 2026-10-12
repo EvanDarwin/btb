@@ -57,16 +57,16 @@ compute's.
   - The card's read by working set (1 MB to 1 GB, its L2 against its DRAM) and copy.
   - btb's gemv by rows (1 to 32), plain and on the tensor cores.
   - The one-row gemv by weight size, streamed and held in the L2, and the tensor-core gemv at 16 and 8 rows a
-    block on a short weight.
+    warp on a short weight.
   - The fused gate and up, the down projection with the activation folded in, the host's bit-exact gemvs, and
     the MXFP4 widening.
-  - Decode attention by context a head a block, a tree's verify a head a block and a KV group a block, and a
-    fork's rows by count.
+  - Decode attention by context, a tree's verify over long contexts, and a fork's rows by count.
   - The q/k norm with rope and cache write, the norms, the activations, the router and the shared-expert
     combine, Qwen4's output gate (alone and folded into o_proj), the DeltaNet step, and the sampler by
     vocabulary.
-  - cuBLAS by rows (1 to 4096) and square by size, torch's prefill attention by rows, and grouped experts by
-    the rows each takes.
+  - btb's prompt GEMM by rows (64 to 4096), on the tensor cores and on the fp32 chain, beside cuBLAS by rows
+    (1 to 4096) and square by size.
+  - btb's prefill attention by rows beside torch's, and grouped experts by the rows each takes.
 - **bus**: copies each way by size (4 KB to 256 MB), pinned and pageable, as the engine pays them (the copy and
   the wait). They are held to the PCIe link, read while a copy is in flight because a card trains its link down
   when idle. Then a hidden row's round trip.

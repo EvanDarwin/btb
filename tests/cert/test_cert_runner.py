@@ -27,6 +27,8 @@ import pytest
 import torch
 
 import btb
+from btb.engine.fused import DELTA_BLOCK
+from btb.engine.kvpool import PAGE
 from btb.kinds import FamilyKind, LayerKind, PassTag
 from tests.helpers import FIXTURES, GGUF_FIXTURES, assert_same_tokens, shared_key, shared_model
 
@@ -157,6 +159,7 @@ _LOADS: dict[str, tuple[Callable[[dict[str, Any]], Load], tuple[int, ...]]] = {
             "test_fork_and_batch_are_deterministic",
             "test_the_models_calls_are_deterministic",
             "test_a_sessions_calls_are_deterministic",
+            "test_conversations_through_the_prefix_cache_answer_as_cold",
         )
     },
 }
@@ -256,6 +259,8 @@ def _assert_path_engaged(
             f"{subject} on {dev.key} ({storage.value}): {want} never engaged (got {sorted(report.tags)}); "
             f"a fallback ran"
         )
+    for bad in sorted(spec.forbidden_tags(kind, dev)):
+        assert bad not in report, f"{subject} on {dev.key} ({storage.value}): a pass took {bad}, a fallback"
 
 
 # The GGUF storage axis: each tiny GGUF fixture crossed with the sub-paths the GGUF surface runs (dequant to
@@ -362,8 +367,9 @@ def test_pack12_cell_loads_and_is_deterministic(kind: FamilyKind, stem: str, dev
 
 # input-shape axes beyond the single short stream: a batch of ragged rows (the batched decode loop) and a longer
 # prompt (cache growth, and gemma3's sliding_window=32 eviction). One per backend here (cpu, mlx-step) - the loop
-# is device-specific, family-orthogonal enough that a representative device per backend exercises it. The 1024+
-# attention split (ATTN_SPLIT) still needs a real model: tiny fixtures cap at max_position_embeddings=512.
+# is device-specific, family-orthogonal enough that a representative device per backend exercises it. The card
+# attention's groups past the first (512 keys, 256 at the widest head) are the kernel tests' to cover: tiny fixtures
+# cap at max_position_embeddings=512.
 BATCH_ROWS = [[1, 2, 3, 4], [5, 6, 7, 8]]  # two rows through the batched loop (rectangular: one tensor)
 # 96 tokens: past gemma3's sliding_window (32), real cache growth, and two of cuda-prefill's 64-row chunks
 LONG_PROMPT = list(range(1, 97))
@@ -376,7 +382,11 @@ def _shape_cells(surface: spec.Surface) -> list[ParameterSet]:
         if stem is None:
             continue
         for dev in _subpaths(surface):
-            why = _why_not(kind, None, dev, os.path.join(FIXTURES, stem), None)
+            # an axis cell the engine cannot hold as the axis means it never runs: it would bank a receipt for
+            # what it did not do (the manifest's shape_gap, its --check failing on the same cell)
+            gap = manifest.shape_gap(surface, kind, dev)
+            why = f"GAP (manifest --check fails on this): {gap.value}" if gap is not None else None
+            why = why or _why_not(kind, None, dev, os.path.join(FIXTURES, stem), None)
             out.append(_cell(stem, dev, cid=f"{kind.value}-{surface.value}-{dev.key}", why=why))
     return out
 
@@ -413,7 +423,8 @@ def test_context_growth_is_deterministic(stem: str, dev: spec.DeviceSubpath) -> 
 def _axis_tags(
     sm: StreamedTextModel, surface: spec.Surface, stem: str, dev: spec.DeviceSubpath, calls: bool = True
 ) -> None:
-    """the surface's tags in the report: the last pass's forks, and (`calls`) every API call made on the model"""
+    """the surface's tags in the report: the last decode's forks, and (`calls`) every API call made on the model - and
+    none it must never show (`spec.SURFACE_FORBIDS`)"""
     kind = next(k for k, s in spec.FIXTURE_STEM.items() if s == stem)
     report = sm.last_pass_report()
     for want in sorted(spec.SURFACE_TAGS[surface](kind, dev)):
@@ -421,22 +432,31 @@ def _axis_tags(
             assert want in report, (
                 f"{stem} on {dev.key}/{surface.value}: {want} never engaged (got {sorted(report.tags)})"
             )
+    forbids = spec.SURFACE_FORBIDS.get(surface)
+    for bad in sorted(forbids(kind, dev) if forbids is not None else ()):
+        assert bad not in report, f"{stem} on {dev.key}/{surface.value}: a pass took {bad}, a fallback"
 
 
 @pytest.mark.parametrize("stem,dev", _shape_cells(spec.Surface.HOOKED))
 def test_hooked_decode_is_the_plain_one(stem: str, dev: spec.DeviceSubpath) -> None:
     """a decode with every hook on (a processor, logprobs, a tapped layer) picks over the logits in hand, the
-    in-graph picks standing aside, and draws the plain decode's tokens - reproducibly across two loads"""
+    in-graph picks standing aside, and draws the plain decode's tokens - reproducibly across two loads; speculative
+    too (the plain answer offered as a span to draft from), its verify passes hooked as its steps are"""
     if not _hardware_here(dev.hardware):
         pytest.skip(f"{dev.hardware.value} not available on this machine")
     path, knobs = _stem_load(stem, dev)
     if not os.path.isdir(path):
         pytest.skip(f"fixture {stem} not built")
     runs = []
+    hooks: dict[str, Any] = {"processors": [lambda ids, lg: lg], "logprobs": 2, "taps": [-1]}
     for i in TWO:
         sm = shared_model(path, i, **knobs)
         plain = oracle.decode(sm, PROMPT)
-        g = sm.generate(list(PROMPT), N, speculate=False, processors=[lambda ids, lg: lg], logprobs=2, taps=[-1])
+        drafted = sm.generate(list(PROMPT), N, speculate=True, spans=[("plain", [*PROMPT, *plain])], **hooks)
+        if i == 0:
+            _axis_tags(sm, spec.Surface.HOOKED, stem, dev)
+        assert_same_tokens(plain, list(drafted.tokens), f"{stem} on {dev.key}: the hooked speculative decode left it")
+        g = sm.generate(list(PROMPT), N, speculate=False, **hooks)
         if i == 0:
             _axis_tags(sm, spec.Surface.HOOKED, stem, dev)
         toks = list(g.tokens)
@@ -608,6 +628,88 @@ def test_a_sessions_calls_are_deterministic(stem: str, dev: spec.DeviceSubpath) 
         )
     assert runs[0] == runs[1], f"{stem} on {dev.key}: a session's calls answered differently across two loads"
     receipt.record(manifest.stem_id(spec.Surface.SESSION, stem, dev.key))
+
+
+def _side(rows: int) -> list[int]:
+    """a request sharing nothing with PROMPT's conversation, `rows` long: on the card longer than its region holds, so
+    its rows want the conversation's slots and park it in RAM for the next turn to bring back - the card parks a
+    conversation only when its slots are wanted"""
+    return [150 + i % 100 for i in range(rows)]
+
+
+def _lead(rows: int) -> list[int]:
+    """a system prompt `rows` long that a hybrid's conversations open on: its recurrent states resume only at a
+    block's end its prefill kept them at (`GenerateMixin._prefill_at_blocks`), so a turn needs blocks within the prefix
+    it shares"""
+    return [50 + (7 * i) % 90 for i in range(rows)]
+
+
+@pytest.mark.parametrize("stem,dev", _shape_cells(spec.Surface.PREFIX))
+def test_conversations_through_the_prefix_cache_answer_as_cold(stem: str, dev: spec.DeviceSubpath) -> None:
+    """conversations as a server sees them, on one load: A's first turn (the oracle's prompt, held to its banked
+    answer), an unrelated request on the same session, A's next turn - opening on every row A left - and B, a second
+    session opening with A's first turn whole. Each later answer is its prompt's decoded cold (no session) on the
+    other load, the two loads answer alike, and the axis's tags show (`spec.prefix_tags`): a miss, a hit, rows the
+    tree held read in place, through the pages. A hybrid's conversations open on a system prompt past two blocks
+    (`_lead`) - the oracle's prompt decoded alone, held to its answer - and its turns resume at the last block's end
+    within what they share, its states restored from the snapshot kept there"""
+    if not _hardware_here(dev.hardware):
+        pytest.skip(f"{dev.hardware.value} not available on this machine")
+    path, knobs = _stem_load(stem, dev)
+    if not os.path.isdir(path):
+        pytest.skip(f"fixture {stem} not built")
+    kind = spec.kind_of_stem(stem)
+    assert kind is not None
+    hybrid = spec.recurrent(kind)
+    opening = [*_lead(2 * DELTA_BLOCK + 12), *PROMPT] if hybrid else list(PROMPT)
+    runs = []
+    asked: list[list[int]] = []
+    # the side request past every slot either load's card region holds, the same tokens on both
+    caps = [pc.pool.card.cap for i in TWO if (pc := shared_model(path, i, **knobs)._prefix_cache()) and pc.pool.card]
+    side = _side((max(caps, default=0) + 1) * PAGE + 5)
+    for i in TWO:
+        sm = shared_model(path, i, **knobs)
+        pc = sm._prefix_cache()
+        if pc is not None:
+            pc.tree.evict()  # the conversations earlier cells on this load left: each load starts from none
+        tags: set[PassTag] = set()
+
+        def turn(prompt: list[int], s: Any, sm: StreamedTextModel = sm, tags: set[PassTag] = tags) -> list[int]:
+            out = [int(t) for t in sm.generate(prompt, N, session=s, speculate=False).tokens]
+            tags.update(sm.last_pass_report().tags)
+            return out
+
+        a = sm.session()
+        first = turn(opening, a)
+        turn(side, a)
+        missed = a.last_reuse
+        asked = [[*opening, *first, *OTHER], [*opening, *first, *side]]
+        second = turn(asked[0], a)
+        hit = a.last_reuse
+        b = sm.session()
+        third = turn(asked[1], b)
+        runs.append((first, second, third, missed, hit, b.last_reuse))
+        if i == 0:
+            oracle.assert_matches(kind, oracle.decode(sm, list(PROMPT)) if hybrid else first, dev.hardware.value)
+            for want in sorted(spec.SURFACE_TAGS[spec.Surface.PREFIX](kind, dev)):
+                assert want in tags, f"{stem} on {dev.key}/prefix: {want} never engaged (got {sorted(tags)})"
+            for bad in sorted(spec.SURFACE_FORBIDS[spec.Surface.PREFIX](kind, dev)):
+                assert bad not in tags, f"{stem} on {dev.key}/prefix: a pass took {bad}, its rows not its steps'"
+            if hybrid:
+                # both open at the last block's end within the opening: the answer and the request after it are
+                # shorter than a block, so neither turn's prefill crosses another
+                block = (len(opening) - 1) // DELTA_BLOCK * DELTA_BLOCK
+                want_reuse = (0, block, block)
+            else:
+                want_reuse = (0, len(opening) + len(first) - 1, len(opening) + len(first))
+            assert (missed, hit, b.last_reuse) == want_reuse, (
+                f"{stem} on {dev.key}/prefix: reused {missed}, {hit}, {b.last_reuse} rows"
+            )
+    assert runs[0] == runs[1], f"{stem} on {dev.key}: conversations answered differently across two loads"
+    cold = shared_model(path, TWO[-1], **knobs)
+    for prompt, got in zip(asked, runs[0][1:3], strict=True):
+        assert_same_tokens(oracle.decode(cold, prompt), got, f"{stem} on {dev.key}: a prefix hit left the cold decode")
+    receipt.record(manifest.stem_id(spec.Surface.PREFIX, stem, dev.key))
 
 
 def test_cross_process_determinism() -> None:

@@ -379,7 +379,7 @@ def test_an_answer_no_width_pays_for_is_the_greedy_answer_in_plain_steps(
 
 def _stepped(sm: StreamedTextModel, prompt: Sequence[int], toks: Sequence[int]) -> torch.Tensor:
     """the logits after `toks` fed one at a time to a session of `prompt`: the one-row steps a row's own rows were
-    written by (a prefill of them would write the same rows through other kernels)"""
+    written by (a prefill of them writes the same rows, every bit: `_forward_card_prefill`)"""
     s = sm.session(list(prompt))
     lg = None
     for t in toks:
@@ -446,10 +446,9 @@ def test_a_batchs_rows_are_each_sessions_own_steps(engine: EngineTok, prompt_ids
             assert torch.equal(lg[r], _stepped(sm, ps[r], [r + 1, r + 4])), r
             want = sm.session(ps[r] + [r + 1]).feed([r + 4], taps=(0, sm.L // 2, sm.L - 1)).hidden
             for i in (0, sm.L // 2, sm.L - 1):
-                ref = want[i][-1].float()
-                # the session's tapped feed runs the torch modules (a tap stands the graph aside): a tolerance,
-                # the one test_nerd_api holds a fork's taps to
-                assert (hid[i][r] - ref).abs().max().item() <= 3e-2 * max(1.0, ref.abs().max().item()), (r, i)
+                # the session's tapped feed on the card graph's kernels (`_forward_card_prefill` hands its hook each
+                # layer's residual): the row's states are its own step's, every bit
+                assert torch.equal(hid[i][r], want[i][-1].float().cpu()), (r, i)
     for r in range(3):
         assert sessions[r].tokens == ps[r] + [r + 1, r + 4]
 

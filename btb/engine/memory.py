@@ -10,10 +10,10 @@ import math
 import threading
 import time
 import weakref
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -49,6 +49,7 @@ from .tiers import ColdRing
 if TYPE_CHECKING:
     from .cache import KvCache
     from .device import Device as DeviceLedger
+    from .paged import PagedCache
 
 
 @dataclass
@@ -244,12 +245,20 @@ class _MemoryMixin(_State):
             self._card_let_go()
             i = max(self.resident)
             # the host's copy made before the card's leaves: one that raises leaves the layer where it was, never in
-            # neither tier
+            # neither tier. Its rows follow it (`_caches_to`, the prefix cache's region for every conversation): a
+            # move refused - the host's region not granted the room - puts the layer back with them, never a layer
+            # on the host whose rows stayed on the card
             host = self._make_host_layer(i)
             tmpl = self.resident.pop(i)
-            del tmpl
             self.host[i] = host
-            self._caches_to(i, "cpu", cache)
+            try:
+                self._caches_to(i, "cpu", cache)
+            except BaseException:
+                self.host.pop(i, None)
+                self.resident[i] = tmpl
+                self._kv_back(i)
+                raise
+            del tmpl
             moved = f"layer {i}"
         elif self.resident_head and self.dev.type == Device.CUDA:
             self._head_host()
@@ -286,10 +295,28 @@ class _MemoryMixin(_State):
                 for p in tmpl.parameters():
                     p.data = p.data.to(self.compute_dtype)
             self.resident[i] = tmpl
-            self.host.pop(i, None)
-            self._caches_to(i, self.dev, cache)
+            host = self.host.pop(i, None)
+            try:
+                self._caches_to(i, self.dev, cache)
+            except BaseException:
+                # its rows refused the card (the region's arena for it not granted): the layer stays shed, its rows
+                # with it on the host
+                self.resident.pop(i, None)
+                if host is not None:
+                    self.host[i] = host
+                self._shed.append(what)
+                self._kv_back(i)
+                raise
         log(f"[vram] REGROW {what} -> {self.dev} (still shed: {self._shed}); " + vram_pressure_line())
         return what
+
+    def _kv_back(self, i: int) -> None:
+        """a layer's move undone: the prefix cache's rows of it back in the region where it runs again. `_caches_to`
+        moves them before the live caches' rows, which may still be refused; left, a layer back on the host read its
+        rows on the card (or one back on the card, its rows on the host) until the next move"""
+        pc = self.__dict__.get("_kv")
+        if pc is not None:
+            pc.place(self, i)
 
     def vram_trim(self, tag: str = "") -> Any:
         if self.dev.type != Device.CUDA:
@@ -387,8 +414,9 @@ class _MemoryMixin(_State):
             return  # the warm-up's own passes: answered once it is done (model.py `_warming`)
         self.vram_state.asked = False  # the budget read here, by the pass
         # a batched decode is sized by the scheduler (the one OOM guard), so the per-step streaming policy stands
-        # aside: shedding mid-batch only slows it, and the triggers fire on a large batch's legitimate KV growth
-        if cache is not None and getattr(cache, "layers", None):
+        # aside: shedding mid-batch only slows it, and the triggers fire on a large batch's legitimate KV growth. A
+        # paged cache holds one sequence, its rows read through the map alone
+        if cache is not None and not getattr(cache, "paged", False) and getattr(cache, "layers", None):
             k0 = getattr(cache.layers[0], "keys", None)
             if k0 is not None and k0.numel() and int(k0.shape[0]) > 1:
                 return
@@ -751,8 +779,9 @@ class _MemoryMixin(_State):
         return mapped + own - grow, own - grow
 
     def ram_yield(self, log: Log | None = None) -> int:
-        """The host given back to another program at once: the expert store's blocks first (their bytes are on the
-        drive, read again on a miss), then host layers to the drive (`_shed_warm`) while a shed frees what is short -
+        """The host given back to another program at once: the prefix cache's free pages past its last held one first
+        (no row anyone reads, `KvPool.trim`), then the expert store's blocks (their bytes are on the drive, read again
+        on a miss), then host layers to the drive (`_shed_warm`) while a shed frees what is short -
         RAM, or commit, each counted down by what the shed let go (a layer on the checkpoint's mapping frees RAM and
         no commit, and its ring slot takes both), not read again from the OS, whose figures move only as it gets round
         to the pages - until the reserve and a launch's headroom are free, or no shed frees what is short without
@@ -768,6 +797,8 @@ class _MemoryMixin(_State):
         # free-read: the yield's own log line (what it gained), never a decision
         before = min(int(host_free_bytes()), int(host_commit_bytes()))
         log(f"[ram] another program wants memory: {short / 2**30:.2f} GB to give back")
+        pc = self.__dict__.get("_kv")
+        trimmed = pc.pool.trim() if pc is not None else 0
         store = getattr(self, "expert_store", None)
         blocks = 0
         if store is not None:
@@ -796,8 +827,9 @@ class _MemoryMixin(_State):
         gained = min(int(host_free_bytes()), int(host_commit_bytes())) - before
         still = max(need_ram, need_commit)
         log(
-            f"[ram] gave back {gained / 2**30:.2f} GB ({blocks} store slots, host layers {layers or 'none'} to the "
-            f"drive; the store holds off growing back for {self.RAM_HOLD_S:.0f} s)"
+            f"[ram] gave back {gained / 2**30:.2f} GB ({trimmed / 2**30:.2f} GB of free KV pages, {blocks} store "
+            f"slots, host layers {layers or 'none'} to the drive; the store holds off growing back for "
+            f"{self.RAM_HOLD_S:.0f} s)"
             + (f"; {still / 2**30:.2f} GB short of the headroom, nothing more a shed frees" if still > 0 else "")
         )
         st.spent = max(1, self._ram_short())
@@ -1030,36 +1062,62 @@ class _MemoryMixin(_State):
             f"(model.memory() shows the room)"
         )
 
-    def _make_room(self, dev: torch.device, nbytes: int, what: str, own: str | None = None) -> set[str]:
+    def _make_room(
+        self, dev: torch.device, nbytes: int | Callable[[], int], what: str, own: str | None = None
+    ) -> set[str]:
         """room for `nbytes` on `dev` above the margin and what is spoken for (all but the caller's `own`
         reservation), cheapest first; MemoryGrantError when everything btb can give leaves too little. Nothing to
-        make where btb holds nothing (a card it does not run on). Returns the one-off steps taken, for a retry to
-        skip"""
+        make where btb holds nothing (a card it does not run on). `nbytes` a callable: the need priced again after
+        each step given up - a step can take the need off `dev` (a layer shed takes its rows to the host), and a
+        need gone is room made. Returns the one-off steps taken, for a retry to skip"""
         tried: set[str] = set()
         while True:
+            need = int(nbytes() if callable(nbytes) else nbytes)
+            if need <= 0:
+                return tried
             room = self.device.free(dev, unreserved=True, own=own)
-            if room is None or room >= nbytes:
+            if room is None or room >= need:
                 # room there only counting torch's cached blocks: they go back to the driver now, so what is made in
                 # it comes from free memory and not from the allocator failing and emptying its cache to retry
-                if dev.type == Device.CUDA and nbytes > int(
+                if dev.type == Device.CUDA and need > int(
                     self.device.free(dev, unreserved=True, own=own, pooled=True) or 0
                 ):
                     self.vram_trim("room")
                 return tried
-            if not self._give_up_one(dev, nbytes - room, tried):
+            if not self._give_up_one(dev, need - room, tried):
                 self.device.refused()  # what was shed on the way grows back once there is room
-                raise MemoryGrantError(self._short(dev, nbytes, what))
+                raise MemoryGrantError(self._short(dev, need, what))
 
     def cache_room(self, cache: KvCache | None, B: int, T: int) -> None:
         """Room made, before a pass, for the buffers its cache appends will allocate. The scheduler's grant is
         asked for them inside the pass, where nothing may move, so a refusal there could only fail; here btb gives
-        up what it holds, cheapest first, as `empty` does. Priced as the grant prices them. With `adapt` off the
-        placement is pinned: nothing is given up, and the grant refuses what does not fit."""
+        up what it holds, cheapest first, as `empty` does. Priced as the grant prices them, and priced again after
+        each step given up: another program holding the card past btb's margin, every layer shed there takes its
+        rows to the host - the growth is the host's then, and the card has nothing left to make room for (priced once,
+        the card's figure stood after the rows had gone, and a pass of a few rows was refused once the whole model
+        was off the card). With `adapt` off the placement is pinned: nothing is given up, and the grant refuses what
+        does not fit."""
         if cache is None or not getattr(self, "adapt", True):
             return
-        for dev, nbytes in self.cache_growth(cache, B, T).items():
-            if nbytes:
-                self._make_room(dev, nbytes, f"the cache's growth for {B}x{T} rows", own=EPOCH)
+        if getattr(cache, "paged", False):
+            # the pool's growth: the conversations the prefix cache's tree holds go first, their pages taking the
+            # rows, before anything else btb holds is given up for them
+            pc = cast("PagedCache", cache)
+            host = torch.device(Device.CPU)
+            pc.prefix.room(pc, B * T, lambda: self.scheduler.free_for(host))
+        done: set[Where] = set()
+        while True:
+            # the devices still to make room on: a shed can add the host to them, its rows' growth now there
+            todo = [d for d, n in self.cache_growth(cache, B, T).items() if n and d not in done]
+            if not todo:
+                return
+            dev = todo[0]
+            done.add(dev)
+
+            def need(d: Where = dev) -> int:
+                return self.cache_growth(cache, B, T).get(d, 0)
+
+            self._make_room(dev, need, f"the cache's growth for {B}x{T} rows", own=EPOCH)
 
     def cache_growth(self, cache: KvCache | None, B: int, T: int, peak: bool = False) -> dict[Where, int]:
         """the bytes the cache's appends of `T` rows to `B` sequences will allocate, by the device each layer's
@@ -1069,6 +1127,14 @@ class _MemoryMixin(_State):
         so the largest layer's growth once more (a doubling's room holds a concatenation's copy already)"""
         need: dict[Where, int] = {}
         if cache is None:
+            return need
+        if getattr(cache, "paged", False):
+            # every attention layer's rows in the engine's pool, one sequence's: its growth where its free pages, slots
+            # and park do not hold them - the host's region and the park in RAM, the card's arenas on the card - the
+            # buffer in flight counted in (`PagedCache.growth`)
+            for at, g in cast("PagedCache", cache).growth(B * T).items():
+                if g:
+                    need[where(torch.device(at))] = g
             return need
         first = next(((i, cl) for i, cl in enumerate(cache.layers) if isinstance(cl, GrowLayer)), None)
         if first is None and not any(isinstance(cl, GrantedIndexedLayer) for cl in cache.layers):
@@ -1132,10 +1198,17 @@ class _MemoryMixin(_State):
         return torch.bfloat16 if card_bf16 else torch.float32
 
     def _give_up_one(self, dev: torch.device, short: int, tried: set[str]) -> bool:
-        """the cheapest thing btb holds on `dev`, given up toward `short` bytes: on a card the drafter, then layers
-        from the top, then the head (each live cache following its layer); on the host the pool's idle blocks,
-        MLX's cached buffers, the expert store's blocks, then a warm layer to the drive. False when nothing is left"""
+        """the cheapest thing btb holds on `dev`, given up toward `short` bytes: on a card the passes' scratch (made
+        again by the next pass that wants it), the drafter, then layers from the top, then the head (each live cache
+        following its layer); on the host the pool's idle blocks, the prefix cache's free pages past its last held one
+        (no row anyone reads, `KvPool.trim`), MLX's cached buffers, the expert store's blocks, then a warm layer to the
+        drive. False when nothing is left"""
         log = self.log
+        if dev.type == Device.CUDA and "scratch" not in tried:
+            tried.add("scratch")
+            if self.scratch.release(device=self.dev):
+                torch.cuda.empty_cache()
+                return True
         if dev.type == Device.CUDA:
             if self.dev.type != Device.CUDA or self.device.request("lend", lambda: self.vram_shed(None, log)) is None:
                 return False
@@ -1144,6 +1217,11 @@ class _MemoryMixin(_State):
             return True
         if pool.POOL.trim():
             return True
+        pc = self.__dict__.get("_kv")
+        if pc is not None and "kv" not in tried:
+            tried.add("kv")
+            if pc.pool.trim():
+                return True
         mlx = getattr(self, "mlx", None)
         if mlx is not None and mlx.held_bytes() > mlx.active_bytes():
             mlx.clear_cache()
@@ -1213,9 +1291,17 @@ class _MemoryMixin(_State):
             aj = getattr(self, "aj", None)
             if aj is not None and aj.dev.type == Device.CUDA:
                 n += self._drafter_bytes()
+            pc = self.__dict__.get("_kv")
+            card = pc.pool.card if pc is not None else None
+            if card is not None:
+                # the prefix cache's arenas of the resident layers: a layer shed takes its rows to the host's region
+                n += sum(card.layer_bytes() for i in resident if i in card.arenas)
             return n + sum(_bytes_on(c, dev, resident) for c in list(self.__dict__.get("_live_caches", ())))
         packed = bool(getattr(self, "_packed", None))
         n = sum(self._layer_bytes_stored(i, packed) for i in list(self.host) if i not in self.cold)
+        pc = self.__dict__.get("_kv")
+        if pc is not None:
+            n += pc.pool.trimmable()
         store = getattr(self, "expert_store", None)
         if store is not None and store.per:
             n += store.live() * int(store.per)
@@ -1229,7 +1315,10 @@ _LOANS: Iterator[int] = itertools.count(1)
 
 
 def _bytes_on(cache: KvCache, dev: torch.device, layers: Iterable[int]) -> int:
-    """the bytes `cache` holds on `dev` for `layers`"""
+    """the bytes `cache` holds on `dev` for `layers`: none of a paged cache's, whose rows are the pool's (counted once,
+    for every conversation, in `_sheddable`)"""
+    if getattr(cache, "paged", False):
+        return 0
     n = 0
     for i in layers:
         if i >= len(cache.layers):

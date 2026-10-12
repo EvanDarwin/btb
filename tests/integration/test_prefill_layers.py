@@ -63,6 +63,15 @@ def _prefill(layers: bool, ids: list[int], **kw: Any) -> tuple[torch.Tensor, dic
                 lg = out[0, -1].float().cpu()
             else:
                 lg = sm._prefill(t, cache)[0, -1].float().cpu()
+            # a host layer's rows where it runs once the prompt is in, whichever path took it: a card pass that hopped
+            # them onto the card puts them back, its last run carrying the head as much as one ending short of it
+            away = [
+                i
+                for i in sm.host
+                if isinstance(getattr(cache.layers[i], "keys", None), torch.Tensor)
+                and cache.layers[i].keys.device.type != "cpu"
+            ]
+            assert not away, f"host layers {away}: their rows left on the card past the prefill"
             got = {name: t.detach().float().cpu().clone() for name, t in _tensors(cache)}
     finally:
         sm.close()
@@ -135,8 +144,9 @@ def test_drive_layers_by_layer_hold_their_ring_slot(fx: str) -> None:
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("fx", DENSE)
 def test_dense_card_pass_by_layer_is_the_chunks_bits(fx: str, dtype: torch.dtype) -> None:
-    """in bf16 too: the chunks' resident layers, 3 rows past a cache, would fit the card graph, and its kernels
-    round a key a bf16 step from torch's - a chunked prefill's chunk runs the torch layers, as the sweep's does"""
+    """in bf16 too: the chunks' resident layers take the card graph's kernels (`_forward_card_prefill`), the
+    chunked loop's a run of them a chunk, the sweep's a layer at a time - each row its step's either way, an engine's
+    first chunk too (its kernels were read before they were loaded, and its first chunk took torch's)"""
     dev = need_cuda()
     L = layer_count(fixture(fx))
     StreamedTextModel.register_attention()
@@ -641,5 +651,57 @@ def test_a_card_sweep_under_store_pressure_is_the_chunks_bits(monkeypatch: pytes
                 assert torch.equal(got, ref), f"{n_slots} slots: logits part by {float((got - ref).abs().max()):.3e}"
                 for name, t in _tensors(cache):
                     assert torch.equal(t.float().cpu(), ref_cache[name]), f"{n_slots} slots: {name} parts"
+    finally:
+        sm.close()
+
+
+def test_a_hybrids_prompt_in_chunks_the_free_memory_prices_answers_as_the_prompt_whole() -> None:
+    """a hybrid's long prompt in the chunks the free memory prices - whole DeltaNet blocks, cut where its blocks are
+    (`chunk_gated_delta_rule`) - through the chunks one at a time and layer by layer: the two take the same calls, the
+    same bits, logits and every layer's cache (attention rows, convolution and DeltaNet states); and they answer as the
+    prompt taken whole, its states carried from block to block. Not its bits: the host's matmuls sum a row by how many
+    rows its call holds (torch's GEMM off the card, `fixed_rows` passing the rows through), so whole and chunked part
+    in the last bits from the first layer on - the rule's own bits are a block's alone (tests/unit/test_delta_chunks.py).
+    The hybrid took a long prompt whole before, whatever the free memory"""
+    ids = _ids(300)
+    log: list[str] = []
+    sm = StreamedTextModel(
+        fixture("tiny_q35"),
+        device="cpu",
+        resident_head=True,
+        compute_dtype=torch.float32,
+        log=lambda *a, **k: log.append(" ".join(str(x) for x in a)),
+    )
+    try:
+        assert sm.prefill_chunk is None, "the free memory prices this engine's chunks"
+        runs: dict[tuple[bool, int], tuple[torch.Tensor, dict[str, torch.Tensor], list[str]]] = {}
+        for layers in (False, True):
+            sm.prefill_layers = layers
+            for rows in (1 << 20, 64):
+
+                def priced(past: int = 0, rows: int = rows) -> int:
+                    return rows  # the chunk the free memory would price: the prompt whole, or a block
+
+                sm._auto_chunk = priced  # type: ignore[method-assign]
+                log.clear()
+                with torch.inference_mode():
+                    cache = sm.new_cache()
+                    lg = sm._prefill(torch.tensor([ids]), cache)[0, -1].float().cpu()
+                    got = {name: t.detach().float().cpu().clone() for name, t in _tensors(cache)}
+                runs[(layers, rows)] = (lg, got, list(log))
+        for (layers, rows), (lg, got, lines) in runs.items():
+            if rows == 64:
+                said = "layer by layer" if layers else "in chunks of 64"
+                assert any(said in line for line in lines), (layers, lines)
+            same, same_cache, _ = runs[(False, rows)]  # the chunks one at a time: the sweep's calls, its bits
+            assert torch.equal(lg, same), (layers, rows, float((lg - same).abs().max()))
+            assert set(got) == set(same_cache)
+            for name, t in same_cache.items():
+                assert torch.equal(got[name], t), (layers, rows, name, float((got[name] - t).abs().max()))
+        ref, ref_cache, _ = runs[(False, 1 << 20)]
+        lg, got, _ = runs[(False, 64)]
+        assert int(lg.argmax()) == int(ref.argmax()) and torch.allclose(lg, ref, rtol=1e-4, atol=1e-5)
+        for name, t in ref_cache.items():
+            assert torch.allclose(got[name], t, rtol=1e-4, atol=1e-5), (name, float((got[name] - t).abs().max()))
     finally:
         sm.close()

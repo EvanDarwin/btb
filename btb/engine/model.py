@@ -471,6 +471,7 @@ class StreamedTextModel(
         self.holdings.own(Stage.STOP, "the cold ring's reader", self._cold_stop)
         self.holdings.own(Stage.RECORD, "the expert profile", self._save_profile)
         self.holdings.own(Stage.MEMORY, "a verify pass's recurrent-state checkpoints", self._drop_spec_state)
+        self.holdings.own(Stage.MEMORY, "the pinned buffers RAM's rows are staged through", self._drop_kv_stage)
         # free-read: the load's log line
         res = torch.cuda.memory_allocated(self.dev) / 2**30 if self.dev.type == DeviceKind.CUDA else 0.0
         n_templates = sum(len(v) for v in self.templates.values())
@@ -821,19 +822,27 @@ class StreamedTextModel(
         self.cold_ring.fh = {}
         self.gguf = None
 
+    def _reach(self) -> int:
+        """the positions a sequence can reach: the context, else the model's own position limit"""
+        return max(int(getattr(self.cfg, "max_position_embeddings", 0) or 0), int(self.context or 0))
+
+    def flat_cache(self) -> bool:
+        """whether `new_cache` keeps every row of a sliding layer, its window a mask: the family's own layer (Gemma 3),
+        or a window the model can never fill (Phi-4-mini: 262144 against a 131072 context) - else the layer is
+        transformers' evicting one, its rows past the window let go as they age (Phi-3-mini-4k's 2047)"""
+        win = getattr(self.cfg, "sliding_window", None)
+        span = self._reach()
+        return bool(self.fam.flat_cache) or bool(win and span and int(win) >= span)
+
     def new_cache(self, max_len: int | None = None) -> Any:
         from transformers.cache_utils import DynamicCache, DynamicIndexedLayer, DynamicLayer
 
         cache = DynamicCache(config=self.cfg)
         # the engine's layer keeps every row of a sliding layer (the window lives in the mask), so every layer crops,
-        # rolls back and reads alike
-        flat = bool(self.fam.flat_cache)
-        # a window the model can never fill (Phi-4-mini: 262144 against a 131072 context) is no window; transformers'
-        # evicting layer would cost a torch round trip per layer per token (78 -> 68 ms/token)
-        win = getattr(self.cfg, "sliding_window", None)
-        span = max(int(getattr(self.cfg, "max_position_embeddings", 0) or 0), int(self.context or 0))
-        if win and span and int(win) >= span:
-            flat = True
+        # rolls back and reads alike. A window the model can never fill is no window; transformers' evicting layer
+        # would cost a torch round trip per layer per token (78 -> 68 ms/token)
+        flat = self.flat_cache()
+        span = self._reach()
         # the ceiling a row of this cache can reach: what the caller reserved for, else the context (or the
         # model's own position limit). A buffer growing past it is a bug the scheduler refuses before it is
         # allocated; 0 where neither is known, and the size check stands alone

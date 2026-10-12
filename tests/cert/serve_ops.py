@@ -41,6 +41,9 @@ class Missing(StrEnum):
     ROUTE_STALE = "route-stale"
     NO_TEST = "no-test"
     TEST_MISSING = "test-missing"
+    FIELD_UNCOVERED = "field-uncovered"
+    FIELD_STALE = "field-stale"
+    FIELD_UNTESTED = "field-untested"
 
 
 # kind -> (what is missing about {s}, how to close it). {s} is the subject: a "METHOD /path" pair, or a route name.
@@ -61,6 +64,19 @@ MISSING: dict[Missing, tuple[str, str]] = {
     Missing.TEST_MISSING: (
         "route {s} names a test function that is not defined on disk",
         "create the named test (file::func), or correct the Route's `test` (renamed or removed)",
+    ),
+    Missing.FIELD_UNCOVERED: (
+        "the server writes the field {s} (a key of a payload FIELD_SOURCES names, in btb/serve.py) but no Field in "
+        "FIELDS claims it - a count a client reads back that nothing certifies",
+        "add the key to a Field (or a new Field) naming a test that asserts its value",
+    ),
+    Missing.FIELD_STALE: (
+        "FIELDS claims the field {s}, which btb/serve.py's payload no longer writes",
+        "drop the key from that Field (the field was renamed or removed)",
+    ),
+    Missing.FIELD_UNTESTED: (
+        "field {s} names no test, a test that is not defined on disk, or one whose body never reads its keys",
+        "add a test that requests the payload and asserts each of the Field's keys, and name it in the Field's `test`",
     ),
 }
 
@@ -118,6 +134,78 @@ OPS: tuple[Route, ...] = (
         "tests/unit/test_serve.py::test_server_routes_without_a_model",
     ),
 )
+
+
+@dataclass(frozen=True)
+class Field:
+    name: str  # the logical field group (a report row)
+    payload: str  # the btb/serve.py function whose dict literal writes these keys (one of FIELD_SOURCES)
+    keys: tuple[str, ...]  # the JSON keys this row claims, cross-checked against the payload's own
+    test: str | None  # a "tests/<file>.py::<func>" whose body reads every key and asserts its value
+
+
+# the payloads certified key by key: the counts a client reads back about a request (OpenAI's `usage`, the prompt
+# and how much of it the cache held among them). A key the payload writes that no Field claims is a gap
+FIELD_SOURCES: tuple[str, ...] = ("usage",)
+
+FIELDS: tuple[Field, ...] = (
+    Field(
+        "usage_prompt",
+        "usage",
+        ("prompt_tokens", "prompt_tokens_details", "cached_tokens"),
+        "tests/unit/test_serve_fields.py::test_usage_counts_the_prompt_tokens_the_cache_held",
+    ),
+    Field(
+        "usage_completion",
+        "usage",
+        ("completion_tokens",),
+        "tests/unit/test_serve_fields.py::test_logprobs_come_a_token_with_their_alternatives",
+    ),
+    Field(
+        "usage_total",
+        "usage",
+        ("total_tokens",),
+        "tests/unit/test_pi.py::test_openai_streams_usage_when_the_client_asks_for_it",
+    ),
+)
+
+_KEY_RE = re.compile(r'"(\w+)"\s*:')  # a dict literal's "key":
+
+
+def payload_keys(name: str, full: str | None = None) -> set[str]:
+    """the keys the payload function `name` (a `def name(` anywhere in btb/serve.py, or `full` a stand-in source,
+    nested or not) writes in its dict literals: its body, every line indented past its `def`"""
+    full = _serve_source() if full is None else full
+    m = re.search(rf"\n([ \t]*)def {re.escape(name)}\(", full)
+    if m is None:
+        return set()
+    indent = len(m.group(1))
+    body: list[str] = []
+    for line in full[m.end() :].splitlines()[1:]:
+        if line.strip() and len(line) - len(line.lstrip()) <= indent:
+            break
+        body.append(line)
+    return set(_KEY_RE.findall("\n".join(body)))
+
+
+def _test_body(ref: str | None) -> str | None:
+    """the source of the test function `ref` ("tests/<file>.py::<func>") names, None when it is not on disk"""
+    m = _TESTREF_RE.match(ref or "")
+    if m is None:
+        return None
+    path = os.path.join(ROOT, m.group(1))
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    d = re.search(rf"\ndef {re.escape(m.group(2))}\s*\(.*?(?=\n(?:def |class |@)|\Z)", src, re.S)
+    return d.group(0) if d else None
+
+
+def _field_tested(f: Field) -> bool:
+    """whether `f`'s test is on disk and its body reads every key the row claims"""
+    body = _test_body(f.test)
+    return body is not None and all(f'"{k}"' in body for k in f.keys)
 
 
 _CLASS_RE = re.compile(r"\nclass \w+\(BaseHTTPRequestHandler\):(.*?)(?=\nclass |\Z)", re.S)  # the request handler
@@ -202,6 +290,12 @@ def _findings() -> list[tuple[Missing, str]]:
             out.append((Missing.NO_TEST, op.name))
         elif not _test_exists(op.test):
             out.append((Missing.TEST_MISSING, f"{op.name} ({op.test})"))
+    for src in FIELD_SOURCES:
+        written = payload_keys(src)
+        fields = {k for f in FIELDS if f.payload == src for k in f.keys}
+        out += [(Missing.FIELD_UNCOVERED, f"{src}.{k}") for k in sorted(written - fields)]
+        out += [(Missing.FIELD_STALE, f"{src}.{k}") for k in sorted(fields - written)]
+    out += [(Missing.FIELD_UNTESTED, f.name) for f in FIELDS if not _field_tested(f)]
     return out
 
 
@@ -229,7 +323,8 @@ def gaps() -> list[tuple[str, str]]:
 def coverage() -> list[tuple[int, int, str]]:
     """(certified, total, what) for the comment's covered summary"""
     tested = sum(1 for op in OPS if op.test is not None and _test_exists(op.test))
-    return [(tested, len(OPS), "server routes with a test")]
+    fields = sum(1 for f in FIELDS if _field_tested(f))
+    return [(tested, len(OPS), "server routes with a test"), (fields, len(FIELDS), "server payload fields with a test")]
 
 
 def render_missing() -> list[str]:

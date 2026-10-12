@@ -46,6 +46,29 @@ def test_a_new_verb_is_parsed_from_the_handler() -> None:
     assert set(serve_ops.handler_methods(serve_ops._serve_source())) >= {"do_GET", "do_HEAD", "do_POST"}
 
 
+def test_the_payload_fields_are_parsed_from_the_function_writing_them() -> None:
+    """a payload's keys come from the function that writes them, nested in a handler or not, and stop where its
+    body does: the cached prompt count is among the usage's, and every one the payload writes is a Field's"""
+    keys = serve_ops.payload_keys("usage")
+    assert {"prompt_tokens", "prompt_tokens_details", "cached_tokens"} <= keys
+    assert keys == {k for f in serve_ops.FIELDS if f.payload == "usage" for k in f.keys}
+    src = (
+        "\nclass Handler:\n    def run(self) -> None:\n        def usage(r: int) -> dict:\n"
+        '            return {"a": r, "b": {"c": 2}}\n\n        later = {"z": 0}\n'
+    )
+    assert serve_ops.payload_keys("usage", src) == {"a", "b", "c"}
+    assert serve_ops.payload_keys("absent", src) == set()
+
+
+def test_a_field_whose_test_never_reads_it_is_untested() -> None:
+    """a Field is certified by a test that reads each of its keys: one naming a test that never mentions them, or
+    no test, is a gap like an untested route"""
+    real = serve_ops.FIELDS[0]
+    assert serve_ops._field_tested(real)
+    assert not serve_ops._field_tested(serve_ops.Field("x", "usage", ("never_read_anywhere",), real.test))
+    assert not serve_ops._field_tested(serve_ops.Field("x", "usage", real.keys, None))
+
+
 def test_a_handler_answering_through_another_dispatches_its_routes() -> None:
     """do_HEAD answering through `self.do_GET()` reaches every GET route, so each needs a HEAD row too"""
     src = _SYNTHETIC + "\n    def do_HEAD(self) -> None:\n        self.do_GET()\n"

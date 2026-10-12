@@ -76,6 +76,9 @@ class Qwen35Drafter(MTPDrafter):
         self.norm_h.weight.data = get("mtp.pre_fc_norm_hidden.weight").to(self.dev, dtype=self.cd)
         self.norm = Qwen3_5RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.norm.weight.data = get("mtp.norm.weight").to(self.dev, dtype=self.cd)
+        # the rope over the drafter's own positions, on its device: a drafter on the host (shed there, or the plan put
+        # none on the card) handed the card engine's rope its positions in RAM
+        self.rotary = sm.fam.rotary(config=cfg).to(self.dev)
         if weights is not None:
             sm.log(
                 f"[mtp] drafter weights <- {weights} ({sum(1 for k in src if k != '__meta__')} tensors"
@@ -357,7 +360,7 @@ class Qwen35Drafter(MTPDrafter):
         T = x.shape[1]
         pos = (torch.arange(T, device=self.dev) + pos0).view(1, 1, -1).expand(4, x.shape[0], -1)
         text_pos, rope_pos = pos[0], pos[1:]
-        pe = sm.rotary(x, rope_pos)
+        pe = self.rotary(x, rope_pos)
         mask = create_causal_mask(
             config=self.mcfg, inputs_embeds=x, attention_mask=None, past_key_values=self.cache, position_ids=text_pos
         )

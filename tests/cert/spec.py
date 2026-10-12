@@ -25,6 +25,7 @@ from btb.kinds import (
     Cap,
     FamilyKind,
     Json,
+    LayerKind,
     PassTag,
     Proposer,
     Quant,
@@ -232,6 +233,12 @@ def rope_dim(kind: FamilyKind) -> int | None:
     return hd if hd is None or not frac else int(hd * float(frac))
 
 
+def recurrent(kind: FamilyKind) -> bool:
+    """whether the fixture carries recurrent (linear-attention) layers, read from its config's `layer_types` in the
+    engine's own vocabulary: a prompt resumes on those only from a kept snapshot of their state, never a crop"""
+    return any(LayerKind.of(t) is LayerKind.LINEAR for t in fixture_config(kind).get("layer_types") or ())
+
+
 def has_mtp_head(kind: FamilyKind) -> bool:
     """whether the fixture carries an MTP drafter head, by the engine's own probe (scheduler.py:573): an
     `mtp.*` entry in the checkpoint's weight map. Read from the fixture, never from a stem list."""
@@ -372,6 +379,32 @@ def storage_tag(storage: Storage, hw: Hardware) -> PassTag | None:
     return PassTag.FP8_ASSTORED if hw is Hardware.CPU else PassTag.FP8_WIDENED
 
 
+# the head widths the card's paged attention kernels are built for (btb/engine/prefix.py CARD_HEAD_DIMS)
+CARD_HEAD_DIMS = (64, 128, 256)
+
+
+def paged(kind: FamilyKind, hw: Hardware, knobs: dict[str, object] | None = None) -> bool:
+    """whether the prefix cache serves the family on this hardware and with these load options - its attention
+    reading every one-sequence cache through the pages - by the engine's own rule (`PrefixCache.why_not`), in its
+    order: the host's tier and the card's, not MLX's yet (a hybrid's recurrent layers resumed from its snapshots on
+    both); not a family's own layer (Qwen4) or its own attention module (gpt-oss); on the card, heads its kernels take
+    and bf16 compute (`fp32` keeps the card's layers wider than its kernels read)"""
+    fl = core.flags(kind)
+    if hw is Hardware.CUDA:
+        hd = head_dim(kind)
+        tier = not (knobs or {}).get("fp32") and (hd is None or hd in CARD_HEAD_DIMS)
+    else:
+        tier = hw is Hardware.CPU
+    return tier and Cap.OWN not in fl and Cap.FAST in fl
+
+
+def kv_tag(kind: FamilyKind, hw: Hardware, knobs: dict[str, object] | None = None) -> PassTag:
+    """the reader a cell's attention must take its cache rows through: the engine's pool of pages where the prefix
+    cache serves the family there (`paged`), else each conversation's own contiguous buffers - the line that flips
+    per tier as each lands, so a receipt banked on the old reader stops proving the cell"""
+    return PassTag.KV_PAGED if paged(kind, hw, knobs) else PassTag.KV_CONTIGUOUS
+
+
 def expert_tag(kind: FamilyKind, storage: Storage) -> PassTag | None:
     """the stored form a MoE family's experts must be multiplied in where the storage decides it, or None: an FP8
     twin stores its fused expert tensors e4m3, multiplied as stored on every tier (MLX has no FP8 matvec, and a
@@ -406,13 +439,21 @@ class DeviceSubpath:
     # and a storage cell's short prompt, which one chunk takes, is the plain run of its hardware
     long_prompt: bool = False
 
+    def __post_init__(self) -> None:
+        # every cell pinned to the placement it loads at (`adapt` off): a cell certifies the path its placement
+        # takes, and another program on the card (a game, a second job) moved it mid-cell - every layer given up to
+        # the host, the card's path never run. How btb yields is test_never_oom's to hold, not a cell's
+        object.__setattr__(self, "knobs", {**self.knobs, "adapt": 0})
+
     def expects(self, kind: FamilyKind, storage: Storage) -> frozenset[PassTag]:
-        """every tag a run of this cell must carry: the sub-path's own, the residency policy this cell's own knobs
-        select where the family has an expert store - so the default's Bus Pass is asserted too - and the
-        storage's own read where it leaves one (`storage_tag`), and the form a MoE family's experts take there
-        (`expert_tag`)."""
+        """every tag a run of this cell must carry: the sub-path's own, the reader its attention takes the cache's
+        rows through (`kv_tag`), the residency policy this cell's own knobs select where the family has an expert
+        store - so the default's Bus Pass is asserted too - and the storage's own read where it leaves one
+        (`storage_tag`), and the form a MoE family's experts take there (`expert_tag`)."""
         extra = (residency_tag(kind, self.knobs), storage_tag(storage, self.hardware), expert_tag(kind, storage))
-        return frozenset({self.expect(kind, storage), *(t for t in extra if t is not None)})
+        return frozenset(
+            {self.expect(kind, storage), kv_tag(kind, self.hardware, self.knobs), *(t for t in extra if t is not None)}
+        )
 
 
 # device sub-paths, not devices: each a distinct set of branches
@@ -570,6 +611,8 @@ class Surface(StrEnum):
     FORK = "fork"
     MODEL = "model"
     SESSION = "session"
+    # conversations through one engine as a server sees them: one interleaved with others, prompts sharing a prefix
+    PREFIX = "prefix"
 
 
 # the surface a cell of each container records under; the shape surfaces have no container of their own.
@@ -591,10 +634,13 @@ SURFACE_SUBPATHS: dict[Surface, tuple[str, ...]] = {
     **{CONTAINER_SURFACE[c]: container_subpaths(c) for c in Container},
     Surface.BATCH: ("cpu", "mlx-step"),
     Surface.CONTEXT: ("cpu", "mlx-step", "cuda-prefill"),
-    Surface.HOOKED: ("cpu", "mlx-step", "cuda-torch"),
+    # a hooked pass on the card graph's kernels too: its prompt, steps and verify passes each row as the unhooked
+    Surface.HOOKED: ("cpu", "mlx-step", "cuda-graph", "cuda-torch"),
     Surface.FORK: ("cpu", "mlx-step", "cuda-graph", "cuda-torch"),
     Surface.MODEL: ("cpu", "mlx-step", "cuda-torch"),
     Surface.SESSION: ("cpu", "mlx-step", "cuda-torch"),
+    # every reader a conversation's cache rows are read and written through: each tier's own, converted in its phase
+    Surface.PREFIX: ("cpu", "mlx-mega", "mlx-step", "cuda-graph", "cuda-torch", "cuda-split", "cuda-kvhost"),
 }
 
 
@@ -627,6 +673,36 @@ def prefill_tags(kind: FamilyKind, dev: DeviceSubpath) -> frozenset[PassTag]:
     return frozenset(out)
 
 
+def prefix_tags(kind: FamilyKind, dev: DeviceSubpath) -> frozenset[PassTag]:
+    """what the prefix axis's conversations must show: a prompt whose rows the cache held (a conversation's next turn
+    with another request between) and one it did not, read through the pages and opened on rows the tree holds
+    (another conversation's, read in place), and on recurrent layers a resume from a kept snapshot"""
+    out = {PassTag.PREFIX_HIT, PassTag.PREFIX_MISS, PassTag.KV_PAGED, PassTag.PREFIX_SHARED}
+    if recurrent(kind):
+        out.add(PassTag.SNAPSHOT_RESUME)
+    if dev.hardware is Hardware.CUDA and not dev.knobs.get("kv_host"):
+        # the card runs layers whose rows it holds: the request between the turns parks the conversation's pages in
+        # RAM, and its next turn brings them back
+        out.add(PassTag.KV_PARK)
+    if dev.card_graph and card_rows(kind):
+        # every layer on the card graph's kernels: the prompts take them too, each row as its step makes it - the
+        # hit's rows and the cold decode's alike (`_forward_card_prefill`)
+        out.add(PassTag.CARD_PREFILL)
+    return frozenset(out)
+
+
+def forbidden_tags(kind: FamilyKind, dev: DeviceSubpath) -> frozenset[PassTag]:
+    """the forks a cell's own decode must NEVER show, beside the tags it must: on a sub-path that runs the card graph
+    for a family whose rows it makes (`card_rows`), every pass of a decode - its prompt, its steps, its verify passes,
+    hooked or not - takes the card's kernels, each row as its step makes it, so a layer run through torch's modules
+    (CUDA_TORCH_FALLBACK) is a path the cell certifies against: its rows would not be its steps', and a cache hit
+    would part from its prompt cold (a hooked verify pass once did, its steps on the card's kernels). A fork's or a
+    batch's rows (Surface.FORK) are not held to it: a forked cache's prompt is the torch layers' by design"""
+    if dev.card_graph and card_rows(kind):
+        return frozenset({PassTag.CUDA_TORCH_FALLBACK})
+    return frozenset()
+
+
 SURFACE_TAGS: dict[Surface, Callable[[FamilyKind, DeviceSubpath], frozenset[PassTag]]] = {
     Surface.CONTEXT: prefill_tags,
     Surface.HOOKED: lambda k, dev: frozenset({PassTag.PICK_HOOKED}),
@@ -635,6 +711,14 @@ SURFACE_TAGS: dict[Surface, Callable[[FamilyKind, DeviceSubpath], frozenset[Pass
     ),
     Surface.MODEL: lambda k, dev: api_tags("model") | api_tags("room"),
     Surface.SESSION: lambda k, dev: api_tags("session"),
+    Surface.PREFIX: prefix_tags,
+}
+
+# the tags a cell of an axis beside the cartesian must never show (`forbidden_tags`): the axes whose passes are a
+# decode's own - a hooked one, a conversation's - not a fork's or a batch's rows
+SURFACE_FORBIDS: dict[Surface, Callable[[FamilyKind, DeviceSubpath], frozenset[PassTag]]] = {
+    Surface.HOOKED: forbidden_tags,
+    Surface.PREFIX: forbidden_tags,
 }
 
 

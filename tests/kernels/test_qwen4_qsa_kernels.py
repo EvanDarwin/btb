@@ -8,12 +8,11 @@ order, not torch's mean's) and the picks' agreement reported - the scores' dot p
 where the host's run in cuBLAS's, so a near-tie at the budget's edge may go the other way. And EXACTLY against
 themselves: every node's picks, and its attention's bits, are those the one-token step computes over its path once
 committed (the prefix and its ancestors as real positions, the node the step's row) - the row invariance the
-speculative verify stands on. Under the budget the attention is btb_attn_split's, bit for bit. The lane16 gemv is
-the host's `Native.gemv`, bit for bit."""
+speculative verify stands on. Under the budget a node's list is its whole sequence in order. The lane16 gemv is the
+host's `Native.gemv`, bit for bit."""
 
 from __future__ import annotations
 
-import ctypes
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -343,38 +342,23 @@ def test_attention_over_the_picks(kern: Any, n0: int, r: int, k: int) -> None:
         assert torch.equal(one[0], out[t]), f"node {t} (depth {d}) parts from its committed path's one-token step"
 
 
-def _attn_split(kern: Any, q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, n0: int, par: list[int]) -> torch.Tensor:
-    n = int(q.shape[0])
-    cap = int(K.shape[1])
-    S = (cap + 1023) // 1024
-    out = torch.empty(n, HQ, D, dtype=bf, device=dev)
-    pm, pl = torch.zeros(S * n * HQ, device=dev), torch.zeros(S * n * HQ, device=dev)
-    pa = torch.zeros(S * n * HQ * D, device=dev)
-    cnt = torch.zeros(n * HQ, dtype=torch.int32, device=dev)
-    n0t, part = _i32([n0]), _i32(par)  # held past the launch: a freed temporary's block is the next one's
-    P, ci = kern.ptr, ctypes.c_int
-    kern.launch(
-        f"btb_attn_split_d{D}",
-        (HQ, n, S),
-        (256, 1, 1),
-        [
-            P(q), P(K), P(V), P(out), P(n0t), P(part), ci(n), ci(HQ), ci(HK), ci(K.stride(0)), ci(K.stride(1)),
-            ctypes.c_float(SCALE), P(pm), P(pl), P(pa), P(cnt), ci(S), ci(0),
-        ],
-    )  # fmt: skip
-    return out
-
-
 @pytest.mark.parametrize("n0,r,k", [(300, 4, 200), (3000, 4, 800), (2040, 8, 260)])
-def test_under_the_budget_it_is_btb_attn_split(kern: Any, n0: int, r: int, k: int) -> None:
-    """every node keeping its whole sequence: the list is the positions in order, walked as btb_attn_split walks
-    them - across splits too (3000 + the tree: three splits of 1024)"""
+def test_under_the_budget_a_node_attends_its_whole_sequence(kern: Any, n0: int, r: int, k: int) -> None:
+    """every node keeping its whole sequence: its picks are every complete block in order, so its list is the
+    positions in order, and its attention the softmax over all of them - across splits too (3000 + the tree: three
+    splits of 1024). Its bits are its committed path's one-token step's (`test_attention_over_the_picks`)"""
     x = _pass(kern, n0, r, k)
-    assert all(int(v) == (n0 + len(_anc(x.par, t))) // r for t, v in enumerate(x.nsel[:REAL].tolist()))
     q, K, V = _kv(x, n0 + 2)
     out = _attn(kern, x, q, K, V, n0, x.par, x.sel, x.nsel)
-    plain = _attn_split(kern, q, K, V, n0, x.par)
-    assert torch.equal(out[:REAL], plain[:REAL])
+    for t in range(REAL):
+        nb = (n0 + len(_anc(x.par, t))) // r
+        assert int(x.nsel[t]) == nb and x.sel[t, :nb].tolist() == list(range(nb)), f"node {t}: not every block"
+        anc = _anc(x.par, t)
+        seq = list(range(n0)) + [n0 + a for a in anc]
+        assert _keys_of(x, t, x.sel, x.nsel) == seq, f"node {t}: its list is not its sequence in order"
+        torch.testing.assert_close(
+            out[t].float(), _attn_ref(q[t], K, V, seq), rtol=8e-3, atol=2e-3, msg=f"node {t}: not its whole sequence"
+        )
 
 
 # -- the host's gemv on the card ------------------------------------------------------------------------------------

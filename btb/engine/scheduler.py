@@ -51,7 +51,12 @@ EPOCH = "epoch"  # the ledger's tag for an epoch's KV, reserved by `plan` and sp
 
 class MemoryGrantError(MemoryError):
     """A memory request the scheduler refused. Raised before the allocation, so the message names what asked
-    and for how much - torch's own OOM is raised from inside the allocator and names neither."""
+    and for how much - torch's own OOM is raised from inside the allocator and names neither. `device`: where the
+    room was short, where a caller making room gives something up (None where the refusal did not say)."""
+
+    def __init__(self, *args: object, device: Any = None) -> None:
+        super().__init__(*args)
+        self.device = device
 
 
 class PlanError(MemoryGrantError):
@@ -578,7 +583,8 @@ class BatchScheduler:
             # the refusal's words travel with it: whoever catches it says them (a trace here said them twice)
             raise MemoryGrantError(
                 f"[grant] REFUSED {who}: {kind} {_size(nbytes)} on {dev}, only {_size(free)} free"
-                f"{self._held_line(dev, tag)}{self._ledger_line()}"
+                f"{self._held_line(dev, tag)}{self._ledger_line()}",
+                device=dev,
             )
         seen = f"{kind}@{dev.type}"
         self.granted[seen] = self.granted.get(seen, 0) + nbytes

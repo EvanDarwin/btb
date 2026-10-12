@@ -81,6 +81,8 @@ def findings() -> set[str]:
             out.add(f"[manifest/{c.reason}] {cell}")
         elif c.verdict is manifest.Verdict.DNR and not c.reason.strip():
             out.add(f"[manifest/{_DNR_NO_REASON}] {cell}")  # "did not run" with no reason is a hidden gap
+    for surface, kind, key, why in manifest.shape_gaps():  # the axes beside the grid: a gap cell each, the same
+        out.add(f"[manifest/{why.value}] {surface}/{kind}/{key}")
     for name in manifest.fixture_gaps():
         out.add(f"[manifest/{_ORPHAN}] {_safe(name)}")
     return out
