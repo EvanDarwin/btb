@@ -2,20 +2,23 @@
 """The machine report (btb/machine.py, `btb bench` without a model) and the hardware readers under it
 (btb/sysinfo.py): the median's interval and the sampler's stopping rule, the SMBIOS memory devices (and udev's copy
 of them) and the channels their locators name, the CPU's cores, caches and features - Linux's sysfs and macOS's
-sysctl read from fakes on any OS, then this machine's own - the host and MLX sections at small sizes, a drive written
-and read through btb's reader, and the command's routing between the report and a model's bench. Model-free; the
-drive test writes a few MB into a temporary folder and leaves it empty."""
+sysctl read from fakes on any OS, then this machine's own - the host, card and MLX sections at small sizes, a drive
+written and read through btb's reader, and the command's routing between the report and a model's bench. Model-free;
+the drive test writes a few MB into a temporary folder and leaves it empty."""
 
 from __future__ import annotations
 
+import gc
 import json
 import math
 import os
 import random
 import struct
 from pathlib import Path
+from typing import Any
 
 import pytest
+import torch
 from pytest import CaptureFixture, MonkeyPatch
 
 from btb import machine, sysinfo
@@ -553,6 +556,57 @@ def test_the_host_sections_run_every_op(monkeypatch: MonkeyPatch) -> None:
     if Native.gemv is not None:
         assert {"gemv bf16 (native)", "gemv bf16 stream (native)"} <= timed, timed
         assert "host matmul" in rep.found, "\n".join(lines)
+
+
+def _card_kernels() -> Any:
+    from btb.engine.native import Native
+
+    k = Native.card_kernels() if torch.cuda.is_available() else None
+    if k is None:
+        pytest.skip("needs a CUDA card and btb's kernels")
+    return k
+
+
+def test_a_graph_body_holds_its_tensors() -> None:
+    """a graph body a card helper hands back keeps its tensors alive: a pointer is a bare address, and a body that kept
+    only addresses read freed memory once its helper returned (the prefill attention's did)"""
+    k = _card_kernels()
+    dev = torch.device("cuda", torch.cuda.current_device())
+    R, C = 256, 512
+
+    def bf(*s: int) -> torch.Tensor:
+        return torch.zeros(*s, dtype=torch.bfloat16, device=dev)
+
+    makers = {
+        "gemv": lambda: machine._gemv_body(k, [bf(R, C)], bf(1, C), bf(1, R), R, C, 1),
+        "mma": lambda: machine._mma_body(k, [bf(R, C)], bf(32, C), bf(32, R), R, C, 1),
+        "mma form": lambda: machine._mma_form_body(k, [bf(R, C)], bf(32, C), bf(32, R), R, C, True),
+        "prefill": lambda: machine._prefill_body(k, dev, 512),
+    }
+    for name, make in makers.items():
+        gc.collect()
+        before = torch.cuda.memory_allocated(dev)
+        body = make()
+        gc.collect()
+        assert torch.cuda.memory_allocated(dev) > before, f"{name}: its tensors went with the helper"
+        body()
+        torch.cuda.synchronize()
+        del body
+
+
+def test_the_card_section_runs_every_op(monkeypatch: MonkeyPatch) -> None:
+    """the card section at small sizes through btb's kernels: every op timed, or its row says the build lacks it;
+    none fails"""
+    _card_kernels()
+    rep, lines = _small(monkeypatch)
+    small = {"MLP": (512, 1024), "SHORT": (256, 512), "DELTA": (2, 4, 64, 64, 4), "CARD_SETS": (MB, 4 * MB)}
+    for name, v in small.items():
+        monkeypatch.setattr(machine, name, v)
+    card = {"name": "the card", "l2": 0, "peak_gb_s": None}
+    machine.card_ops(rep, {"cards": [card]}, torch.cuda.current_device())
+    assert not [r for r in rep.rows if r.note.startswith("failed")], "\n".join(lines)
+    timed = {r.op.split(",")[0] for r in rep.rows if r.t is not None}
+    assert {"attention prefill bf16", "residual add and rmsnorm", "q/k norm"} <= timed, timed
 
 
 def test_the_mlx_section_runs_every_op(monkeypatch: MonkeyPatch) -> None:

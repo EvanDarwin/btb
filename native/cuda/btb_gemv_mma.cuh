@@ -194,8 +194,8 @@ __device__ __forceinline__ void btb_gemv_mma_chain(const bf16* __restrict__ w, c
 }
 
 extern "C" __global__ void __launch_bounds__(32 * BTB_MMA_WARPS_MAX)
-    btb_gemv_mma_bf16(const bf16* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ y, int R,
-                      int C, int M) {
+    btb_gemv_mma_bf16(const Weight* __restrict__ w, const MatIn* __restrict__ x, MatOut* __restrict__ y, OutDim R,
+                      InDim C, Rows M) {
     btb_gemv_mma_chain<16, BTB_MMA_U, BTB_MMA_D>(w, x, y, R, C, M);
 }
 
@@ -208,8 +208,8 @@ extern "C" __global__ void __launch_bounds__(32 * BTB_MMA_WARPS_MAX)
 //   btb_gemv_mma8_bf16(w [R, C], x [32, C], y [32, R], R, C, M)  grid ceil(R / 8 W), block 32 W
 // ---------------------------------------------------------------------------------------------------------
 extern "C" __global__ void __launch_bounds__(32 * BTB_MMA_WARPS_MAX)
-    btb_gemv_mma8_bf16(const bf16* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ y, int R, int C,
-                       int M) {
+    btb_gemv_mma8_bf16(const Weight* __restrict__ w, const MatIn* __restrict__ x, MatOut* __restrict__ y, OutDim R,
+                       InDim C, Rows M) {
     btb_gemv_mma_chain<8, BTB_MMA8_U, BTB_MMA8_D>(w, x, y, R, C, M);
 }
 
@@ -304,13 +304,13 @@ __device__ __forceinline__ void btb_gemv_mma_glu(const bf16* __restrict__ w, con
 }
 
 extern "C" __global__ void __launch_bounds__(32 * BTB_MMA_WARPS_MAX)
-    btb_gemv_mma_glu_silu(const bf16* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ m, int I,
-                          int C, int M) {
+    btb_gemv_mma_glu_silu(const Weight* __restrict__ w, const MatIn* __restrict__ x, MlpAct* __restrict__ m,
+                          Intermediate I, InDim C, Rows M) {
     btb_gemv_mma_glu<0>(w, x, m, I, C, M);
 }
 extern "C" __global__ void __launch_bounds__(32 * BTB_MMA_WARPS_MAX)
-    btb_gemv_mma_glu_gelu(const bf16* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ m, int I,
-                          int C, int M) {
+    btb_gemv_mma_glu_gelu(const Weight* __restrict__ w, const MatIn* __restrict__ x, MlpAct* __restrict__ m,
+                          Intermediate I, InDim C, Rows M) {
     btb_gemv_mma_glu<1>(w, x, m, I, C, M);
 }
 
@@ -327,7 +327,8 @@ extern "C" __global__ void __launch_bounds__(32 * BTB_MMA_WARPS_MAX)
 //   btb_l2_warm(w [R, C] bf16, R, C, sharep, sink)  grid any x 1 x 1, block 256
 // ---------------------------------------------------------------------------------------------------------
 extern "C" __global__ void __launch_bounds__(256)
-    btb_l2_warm(const bf16* __restrict__ w, int R, int C, const int* __restrict__ sharep, int* __restrict__ sink) {
+    btb_l2_warm(const Weight* __restrict__ w, OutDim R, InDim C, const WarmShare* __restrict__ sharep,
+                WarmSink* __restrict__ sink) {
     const int share = *sharep;
     if (share <= 0) return;
     const int take = (int)(((long long)C * share) >> 8);  // the share of a row warmed, in elements

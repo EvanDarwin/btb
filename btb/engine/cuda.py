@@ -5,7 +5,6 @@ pass over the host-side attention cache."""
 from __future__ import annotations
 
 import contextlib
-import ctypes
 import functools
 import gc
 import itertools
@@ -21,7 +20,79 @@ import torch.nn.functional as F
 
 from .. import mlx as mlxdev
 from .. import trace
-from ..kinds import LayerKind, NodePath, Parents, PassTag, Tokens
+from ..kinds import (
+    Arrivals,
+    AttnOut,
+    AttnScale,
+    BlockOut,
+    CacheHeadStride,
+    CacheRowStride,
+    ChunkStart,
+    Depths,
+    GateUp,
+    Hidden,
+    HostClock,
+    HostLen,
+    HostToken,
+    InDim,
+    Intermediate,
+    KCache,
+    KNorm,
+    KvHeads,
+    LayerKind,
+    Logits,
+    MatIn,
+    MatOut,
+    MlpAct,
+    NodePath,
+    NoiseKeys,
+    NoisePos,
+    NoiseSalt,
+    NoiseSeed,
+    NormCentered,
+    Normed,
+    NormEps,
+    NormWeight,
+    OutDim,
+    Parents,
+    PartAcc,
+    PartMax,
+    PartSum,
+    PassTag,
+    PrefillRun,
+    PrefixLen,
+    QHeads,
+    Qkv,
+    QNorm,
+    Query,
+    RadixCarry,
+    RadixFloor,
+    RadixHist,
+    RadixLevel,
+    RadixPrefix,
+    Residual,
+    RopeCos,
+    RopeSin,
+    RowMap,
+    Rows,
+    RowsLayout,
+    SampleBest,
+    SampleMax,
+    SampleMode,
+    SampleParams,
+    StepToken,
+    Tokens,
+    TopK,
+    TopKFloor,
+    TopPFloor,
+    TreeParents,
+    VCache,
+    Vocab,
+    WarmShare,
+    WarmSink,
+    Weight,
+    Window,
+)
 from ..options import Device
 from ..sampling import GREEDY
 from . import device as device_mod
@@ -105,12 +176,12 @@ class _Warm:
 
     def __init__(
         self,
-        k: Any,
+        k: _Cuda,
         side: torch.cuda.Stream | None,
         sink: torch.Tensor | None,
         seq: list[tuple[torch.Tensor, int, int]],
         blocks: int,
-        share: ctypes.c_void_p | None = None,
+        share: WarmShare,
     ) -> None:
         self.k, self.side, self.sink, self.seq, self.blocks, self.share, self.i = k, side, sink, seq, blocks, share, 0
 
@@ -120,12 +191,14 @@ class _Warm:
         W, R, C = self.seq[self.i]
         self.i += 1
         self.side.wait_stream(torch.cuda.current_stream())
-        c = ctypes.c_int
-        self.k.launch(
-            "btb_l2_warm",
+        self.k.btb_l2_warm(
             (self.blocks, 1, 1),
             (256, 1, 1),
-            [self.k.ptr(W), c(R), c(C), self.share, self.k.ptr(self.sink)],
+            self.k.ptr(Weight, W),
+            OutDim(R),
+            InDim(C),
+            self.share,
+            self.k.ptr(WarmSink, self.sink),
             stream=self.side,
         )
 
@@ -472,9 +545,8 @@ class _CudaMixin(_State):
         if Hq % Hk or (T > 1 and Hq // Hk > k.flash_prefill_rows(D)):
             # a prompt's block of the prefill form holds a token's heads whole (`_card_family_ok` asks the same)
             return None
-        hs, rs = int(kb.stride(1)), int(kb.stride(2))
-        scale = float(scaling if scaling is not None else D**-0.5)
-        P, ci, cf = k.ptr, ctypes.c_int, ctypes.c_float
+        hs, rs = CacheHeadStride(int(kb.stride(1))), CacheRowStride(int(kb.stride(2)))
+        scale = AttnScale(float(scaling if scaling is not None else D**-0.5))
         q = query[0].transpose(0, 1).contiguous()  # [T, Hq, D]
         out = torch.empty(T, Hq, D, dtype=torch.bfloat16, device=query.device)
         if T > 1:
@@ -485,12 +557,24 @@ class _CudaMixin(_State):
             who = "the card's attention: a prompt chunk's row states"
             run = self.scratch.take("card attention rows", (T * Hq * D,), torch.float32, query.device, who)
             tpb = k.flash_prefill_rows(D) // (Hq // Hk)
-            k.launch(
-                k.flash_prefill_kernel(D),
+            k.flash_prefill(
+                D,
                 ((T + tpb - 1) // tpb, Hk, 1),
                 (128, 1, 1),
-                [P(q), P(kb), P(vb), P(out), ci(n0), ci(T), ci(Hq), ci(Hk), ci(hs), ci(rs), cf(scale), ci(win)]
-                + [P(tbl), P(run)],
+                k.ptr(Query, q),
+                k.ptr(KCache, kb),
+                k.ptr(VCache, vb),
+                k.ptr(AttnOut, out),
+                ChunkStart(n0),
+                Rows(T),
+                QHeads(Hq),
+                KvHeads(Hk),
+                hs,
+                rs,
+                scale,
+                Window(win),
+                k.ptr(RowMap, tbl),
+                k.ptr(PrefillRun, run),
                 shared=k.flash_prefill_smem(D),
             )
             return out[None]
@@ -515,34 +599,29 @@ class _CudaMixin(_State):
         part_acc = self.scratch.take("card attention acc", (S * Hq * D,), torch.float32, query.device, who)
         cnt = self.scratch.take("card attention cnt", (Hq,), torch.int32, query.device, who)
         cnt.zero_()  # the last group of each row folds and leaves its count at 0; a buffer made new holds anything
-        if rows is not None:
-            via = ctypes.c_void_p(int(rows.data_ptr()) - 4 * first)
-        else:
-            via = P(tbl)
-        k.launch(
-            f"btb_attn_flash_d{D}",
+        via = RowMap(int(rows.data_ptr()) - 4 * first) if rows is not None else k.ptr(RowMap, tbl)
+        k.btb_attn_flash(
+            D,
             ((Hq // Hk + 7) // 8, S, Hk),
             (self._attn_warps(D) * 32, 1, 1),
-            [
-                P(q),
-                P(kb),
-                P(vb),
-                P(out),
-                P(walk[0:1]),
-                P(walk[1:2]),
-                ci(1),
-                ci(Hq),
-                ci(Hk),
-                ci(hs),
-                ci(rs),
-                cf(scale),
-                P(part_m),
-                P(part_l),
-                P(part_acc),
-                P(cnt),
-                ci(win),
-                via,
-            ],
+            k.ptr(Query, q),
+            k.ptr(KCache, kb),
+            k.ptr(VCache, vb),
+            k.ptr(AttnOut, out),
+            k.ptr(PrefixLen, walk[0:1]),
+            k.ptr(TreeParents, walk[1:2]),
+            Rows(1),
+            QHeads(Hq),
+            KvHeads(Hk),
+            hs,
+            rs,
+            scale,
+            k.ptr(PartMax, part_m),
+            k.ptr(PartSum, part_l),
+            k.ptr(PartAcc, part_acc),
+            k.ptr(Arrivals, cnt),
+            Window(win),
+            via,
         )
         return out[None]
 
@@ -708,7 +787,7 @@ class _CudaMixin(_State):
 
     PROGRAM_SAMPLES = 5  # the timed replays of each width a card program's warm-up keeps the fastest of
 
-    def _card_kernels(self) -> Any:
+    def _card_kernels(self) -> _Cuda | None:
         """the card's kernels, else None once `_card_warning` has said why the card runs through torch alone"""
         k = Native.cuda
         if k is None:
@@ -1142,7 +1221,7 @@ class _CudaMixin(_State):
         self._card_prune_parts(st)
         # how much of the arena's front sits in persisting L2 is the scheduler's call (it holds the
         # hierarchy's sizes); the driver call is only the mechanism
-        k = st["k"]
+        k: _Cuda = st["k"]
         pinned = self.scheduler.pin_bytes(store.nbytes(store.cap)) if sched is not None else 0
         k.persist(store.front(), pinned, stream=st["stream"])
         k.persist(store.front(), pinned)
@@ -1361,13 +1440,9 @@ class _CudaMixin(_State):
         return (R + 15) // 16 < 2 * sms
 
     @classmethod
-    def _card_mma_kernel(cls, R: int, sms: int) -> str:
-        """the tensor-core matvec kernel for a [R, C] weight (`_card_mma_narrow`)"""
-        return "btb_gemv_mma8_bf16" if cls._card_mma_narrow(R, sms) else "btb_gemv_mma_bf16"
-
-    @classmethod
     def _card_mma_launch(cls, R: int, sms: int) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-        """`_card_mma_kernel`'s launch (grid, block): its row groups, a block's warps each its own"""
+        """the tensor-core matvec's launch (grid, block) for a [R, C] weight, btb_gemv_mma8_bf16's where
+        `_card_mma_narrow`, else btb_gemv_mma_bf16's: its row groups, a block's warps each its own"""
         rows, w = (8, cls.MMA8_WARPS) if cls._card_mma_narrow(R, sms) else (16, cls.MMA_WARPS)
         return ((R + rows * w - 1) // (rows * w), 1, 1), (32 * w, 1, 1)
 
@@ -1379,9 +1454,9 @@ class _CudaMixin(_State):
         return torch.tensor([round(256 * float(self.CARD_WARM))], dtype=torch.int32, device=self.dev)
 
     @staticmethod
-    def _card_switch_ptr(st: dict[str, Any], i: int) -> ctypes.c_void_p:
-        """a kernel's pointer to switch `i` of the card state"""
-        return ctypes.c_void_p(int(st["switch"].data_ptr()) + 4 * i)
+    def _card_switch_ptr(st: dict[str, Any], i: int) -> int:
+        """the card address of switch `i` of the card state"""
+        return int(st["switch"].data_ptr()) + 4 * i
 
     def _card_buffers(
         self,
@@ -1489,50 +1564,50 @@ class _CudaMixin(_State):
     def _card_body(self, st: dict[str, Any], g: dict[str, Any]) -> None:
         """the pass's kernels over `g`'s buffers, layers a..b-1 and the tail when the key carries it: run
         eagerly for the warm-up, then recorded by the capture"""
-        import ctypes
-
         a, b, T, tail = g["key"][:4]
-        k = st["k"]
+        k: _Cuda = st["k"]
         H, Hq, Hk, D, I = self._card_dims()
         M = 32 if g.get("mma") else self._card_m(T)
-        P, ci, cf = k.ptr, ctypes.c_int, ctypes.c_float
         # the rows' arenas: the prefix cache's card region, read and written through its row map (the map's pointer
         # the kernels' last argument), or the card graph's own arena at its front
         paged = bool(g.get("paged"))
         if paged:
             card = st["pg"]["card"]
             tables = self._card_tables(st, st["pg"]["cap"])
-            tbl = [P(card.tbl)]
+            row_map = k.ptr(RowMap, card.tbl)
             arenas = {i: (card.arenas[i][0, 0], card.arenas[i][0, 1]) for i in range(a, b)}
         else:
             ar = st["arena"]
             tables = self._card_tables(st, ar["cap"])
-            tbl = []
+            row_map = k.ptr(RowMap, None)
             arenas = {i: (ar["A"][ar["slot"][i], 0], ar["A"][ar["slot"][i], 1]) for i in range(a, b)}
         Ls = [self._card_weights(st, i) for i in range(a, b)]
         mma = bool(g.get("mma"))
         rows = g["key"][5:] == ("rows",)
         sandwich = self.fam.sandwich
-        cen = ci(1 if self.fam.norm_centered else 0)  # the norms scale by 1 + w
-        act = "gelu" if act_name(self.cfg) == "gelu_pytorch_tanh" else "silu"
-        gemv = f"btb_gemv_bf16_m{M}"
-        gemv_act = f"btb_gemv_{act}_bf16_m{M}"
-        via = "_tbl" if paged else ""
+        cen = NormCentered(1 if self.fam.norm_centered else 0)  # the norms scale by 1 + w
+        gelu = act_name(self.cfg) == "gelu_pytorch_tanh"
+        act = "gelu" if gelu else "silu"
         # the one attention every pass takes (btb_attn_flash.cuh): a row's bits its own, so a prompt's chunk makes the
         # rows these steps make. A block a row tile of 8 and a group of the keys, its warps the group's tiles
         attn = f"btb_attn_flash_rows_d{D}" if rows else f"btb_attn_flash_d{D}"
-        nrk = f"btb_norm_rope_kv_rows_d{D}" if rows else f"btb_norm_rope_kv{via}_d{D}"
+        nrk = f"btb_norm_rope_kv_rows_d{D}" if rows else f"btb_norm_rope_kv{'_tbl' if paged else ''}_d{D}"
         if attn not in k.fn or nrk not in k.fn:
             raise RuntimeError(f"[card] no kernel for head_dim {D}")
         G = Hq // Hk
         S = int(g["S"])
         attn_grid = (T * ((G + 7) // 8), S, Hk) if rows else ((T * G + 7) // 8, S, Hk)
         attn_block = (self._attn_warps(D) * 32, 1, 1)
-        attn_map = [] if rows else [tbl[0] if tbl else P(None)]  # the tree form's row map (null: none)
         # where each row's keys lie: the tree's (its prefix length, the rows' depths and parents), or the rows'
         # layout, one array for every rows graph
-        where = [P(st["rw"])] if rows else [P(g["n0"]), P(g["depth"])]
-        walk = [P(st["rw"])] if rows else [P(g["n0"]), P(g["par"])]
+        layout = k.ptr(RowsLayout, st["rw"] if rows else None)
+        n0p = k.ptr(PrefixLen, None if rows else g["n0"])
+        depth = k.ptr(Depths, None if rows else g["depth"])
+        par = k.ptr(TreeParents, None if rows else g["par"])
+        part_m, part_l = k.ptr(PartMax, g["part_m"]), k.ptr(PartSum, g["part_l"])
+        part_acc, cnt = k.ptr(PartAcc, g["part_acc"]), k.ptr(Arrivals, g["cnt"])
+        q, att = k.ptr(Query, g["q"]), k.ptr(AttnOut, g["att"])
+        t_rows, q_heads, kv_heads = Rows(T), QHeads(Hq), KvHeads(Hk)
         # every bf16 tensor the pass's kernels read, checked before the first launch
         reads = self._card_layer_reads(a, Ls, arenas, tables, nrk)
         reads += [("the layers' kernels", f"the pass's {n} buffer", g[n]) for n in ("h", "x", "y", "qkv", "q", "att")]
@@ -1556,137 +1631,122 @@ class _CudaMixin(_State):
         # one kernel fewer, so one edge fewer where another program on the card takes it and btb's L2 with it. The
         # same bits as the plain ones; which is faster is the tuner's to find
         fused = bool(g.get("fused")) and mma
-        glu = f"btb_gemv_mma_glu_{act}"
-        glu_on = fused and glu in k.fn
+        glu_on = fused and f"btb_gemv_mma_glu_{act}" in k.fn
+        glu = k.btb_gemv_mma_glu_gelu if gelu else k.btb_gemv_mma_glu_silu
+        act_mul = k.btb_gelu_mul if gelu else k.btb_silu_mul
+        gemv_act = k.btb_gemv_gelu_bf16 if gelu else k.btb_gemv_silu_bf16
+        h, x, hidden, row = k.ptr(Residual, g["h"]), k.ptr(Normed, g["x"]), Hidden(H), (T, 1, 1)
 
         def matvec(W: torch.Tensor, xin: torch.Tensor, yout: torch.Tensor, R: int, C: int) -> None:
+            w, mi, mo, r, c = k.ptr(Weight, W), k.ptr(MatIn, xin), k.ptr(MatOut, yout), OutDim(R), InDim(C)
             if mma:
                 grid, block = self._card_mma_launch(R, k.sms)
-                k.launch(self._card_mma_kernel(R, k.sms), grid, block, [P(W), P(xin), P(yout), ci(R), ci(C), ci(T)])
+                mv = k.btb_gemv_mma8_bf16 if self._card_mma_narrow(R, k.sms) else k.btb_gemv_mma_bf16
+                mv(grid, block, w, mi, mo, r, c, t_rows)
             else:
-                k.launch(gemv, ((R + 3) // 4, 1, 1), (128, 1, 1), [P(W), P(xin), P(yout), ci(R), ci(C)])
+                k.btb_gemv_bf16(M, ((R + 3) // 4, 1, 1), (128, 1, 1), w, mi, mo, r, c)
             warm()
 
         warm()
         y_prev = None
+        nrk_grid = (Hq + 2 * Hk, T, 1)
         for n, L in enumerate(Ls):
             kb, vb = arenas[a + n]
+            K, V = k.ptr(KCache, kb), k.ptr(VCache, vb)
             # where head g's row r lies (elements): g * hs + r * rs, read off the arena's [Hk, cap, D] view
-            kv_strides = (ci(int(kb.stride(0))), ci(int(kb.stride(1))))
+            hs, rs = CacheHeadStride(int(kb.stride(0))), CacheRowStride(int(kb.stride(1)))
             cos_t, sin_t = tables[self.layer_types[a + n]]
+            eps = NormEps(L["eps"])
             # the last layer's MLP output folded into this input norm's add (a sandwich layer added its own)
-            k.launch(
-                "btb_add_rmsnorm",
-                (T, 1, 1),
-                (256, 1, 1),
-                [P(g["h"]), P(y_prev), P(L["ln1"]), cf(L["eps"]), P(g["x"]), ci(H), cen],
+            k.btb_add_rmsnorm(
+                row, (256, 1, 1), h, k.ptr(BlockOut, y_prev), k.ptr(NormWeight, L["ln1"]), eps, x, hidden, cen
             )
             matvec(L["qkv"], g["x"], g["qkv"], (Hq + 2 * Hk) * D, H)
-            k.launch(
-                nrk,
-                (Hq + 2 * Hk, T, 1),
-                (32, 1, 1),
-                [
-                    P(g["qkv"]),
-                    P(L["wq"]),
-                    P(L["wk"]),
-                    cf(L["eps"]),
-                    P(cos_t),
-                    P(sin_t),
-                    *where,
-                    P(kb),
-                    P(vb),
-                    P(g["q"]),
-                    ci(T),
-                    ci(Hq),
-                    ci(Hk),
-                    *kv_strides,
-                    cen,
-                    *tbl,
-                ],
-            )
-            k.launch(
-                attn,
-                attn_grid,
-                attn_block,
-                [
-                    P(g["q"]),
-                    P(kb),
-                    P(vb),
-                    P(g["att"]),
-                    *walk,
-                    ci(T),
-                    ci(Hq),
-                    ci(Hk),
-                    *kv_strides,
-                    cf(L["scale"]),
-                    P(g["part_m"]),
-                    P(g["part_l"]),
-                    P(g["part_acc"]),
-                    P(g["cnt"]),
-                    ci(L["win"]),
-                    *attn_map,
-                ],
-            )
+            qkv, wq, wk = k.ptr(Qkv, g["qkv"]), k.ptr(QNorm, L["wq"]), k.ptr(KNorm, L["wk"])
+            cos, sin = k.ptr(RopeCos, cos_t), k.ptr(RopeSin, sin_t)
+            if rows:
+                k.btb_norm_rope_kv_rows(
+                    D, nrk_grid, (32, 1, 1), qkv, wq, wk, eps, cos, sin, layout, K, V, q, t_rows, q_heads, kv_heads,
+                    hs, rs, cen,
+                )  # fmt: skip
+            elif paged:
+                k.btb_norm_rope_kv_tbl(
+                    D, nrk_grid, (32, 1, 1), qkv, wq, wk, eps, cos, sin, n0p, depth, K, V, q, t_rows, q_heads,
+                    kv_heads, hs, rs, cen, row_map,
+                )  # fmt: skip
+            else:
+                k.btb_norm_rope_kv(
+                    D, nrk_grid, (32, 1, 1), qkv, wq, wk, eps, cos, sin, n0p, depth, K, V, q, t_rows, q_heads,
+                    kv_heads, hs, rs, cen,
+                )  # fmt: skip
+            scale, win = AttnScale(L["scale"]), Window(L["win"])
+            if rows:
+                k.btb_attn_flash_rows(
+                    D, attn_grid, attn_block, q, K, V, att, layout, t_rows, q_heads, kv_heads, hs, rs, scale,
+                    part_m, part_l, part_acc, cnt, win,
+                )  # fmt: skip
+            else:
+                k.btb_attn_flash(
+                    D, attn_grid, attn_block, q, K, V, att, n0p, par, t_rows, q_heads, kv_heads, hs, rs, scale,
+                    part_m, part_l, part_acc, cnt, win, row_map,
+                )  # fmt: skip
             matvec(L["o"], g["att"], g["y"], H, Hq * D)
             if sandwich:
                 # the attention output normed, then added; the MLP reads its own input norm of the sum
-                k.launch(
-                    "btb_sandwich_add",
-                    (T, 1, 1),
-                    (256, 1, 1),
-                    [P(g["h"]), P(g["y"]), P(L["ln2"]), cf(L["eps"]), ci(H), cen],
-                )
-                k.launch(
-                    "btb_add_rmsnorm",
-                    (T, 1, 1),
-                    (256, 1, 1),
-                    [P(g["h"]), P(None), P(L["pre_ff"]), cf(L["eps"]), P(g["x"]), ci(H), cen],
-                )
+                y = k.ptr(BlockOut, g["y"])
+                k.btb_sandwich_add(row, (256, 1, 1), h, y, k.ptr(NormWeight, L["ln2"]), eps, hidden, cen)
+                pre_ff = k.ptr(NormWeight, L["pre_ff"])
+                k.btb_add_rmsnorm(row, (256, 1, 1), h, k.ptr(BlockOut, None), pre_ff, eps, x, hidden, cen)
             else:
-                k.launch(
-                    "btb_add_rmsnorm",
-                    (T, 1, 1),
-                    (256, 1, 1),
-                    [P(g["h"]), P(g["y"]), P(L["ln2"]), cf(L["eps"]), P(g["x"]), ci(H), cen],
+                k.btb_add_rmsnorm(
+                    row, (256, 1, 1), h, k.ptr(BlockOut, g["y"]), k.ptr(NormWeight, L["ln2"]), eps, x, hidden, cen
                 )
             if glu_on:
                 # gate, up and the activation in one kernel, the activation in its epilogue - the plain matvec's
                 # and btb_{act}_mul's bits, each output one chain over all of k whatever the block (folded into the down
                 # projection's x load instead, each row group recomputed the whole row's act(gate) * up before
                 # its loads and stalled the stream: Qwen3-0.6B's down 21.6 us against 1.7 + its GEMV apart)
-                k.launch(
-                    glu,
+                glu(
                     ((I + 16 * self.MMA_WARPS - 1) // (16 * self.MMA_WARPS), 1, 1),
                     (32 * self.MMA_WARPS, 1, 1),
-                    [P(L["gu"]), P(g["x"]), P(g["m"]), ci(I), ci(H), ci(T)],
+                    k.ptr(Weight, L["gu"]),
+                    k.ptr(MatIn, g["x"]),
+                    k.ptr(MlpAct, g["m"]),
+                    Intermediate(I),
+                    InDim(H),
+                    Rows(T),
                 )
                 warm()
             else:
                 matvec(L["gu"], g["x"], g["gu"], 2 * I, H)
             if mma:
                 if not glu_on:
-                    k.launch(
-                        f"btb_{act}_mul",
+                    act_mul(
                         (min(4096, (M * I + 255) // 256), 1, 1),
                         (256, 1, 1),
-                        [P(g["gu"]), P(g["m"]), ci(M), ci(I)],
+                        k.ptr(GateUp, g["gu"]),
+                        k.ptr(MlpAct, g["m"]),
+                        Rows(M),
+                        Intermediate(I),
                     )
                 matvec(L["down"], g["m"], g["y"], H, I)
             else:
                 # act(gate) * up folded into the down projection's x load: the same bits as the two kernels
-                k.launch(
-                    gemv_act, ((H + 3) // 4, 1, 1), (128, 1, 1), [P(L["down"]), P(g["gu"]), P(g["y"]), ci(H), ci(I)]
+                gemv_act(
+                    M,
+                    ((H + 3) // 4, 1, 1),
+                    (128, 1, 1),
+                    k.ptr(Weight, L["down"]),
+                    k.ptr(GateUp, g["gu"]),
+                    k.ptr(MatOut, g["y"]),
+                    OutDim(H),
+                    InDim(I),
                 )
                 warm()
             if sandwich:
                 # the MLP output normed, then added: the residual is whole, nothing carries into the next norm
-                k.launch(
-                    "btb_sandwich_add",
-                    (T, 1, 1),
-                    (256, 1, 1),
-                    [P(g["h"]), P(g["y"]), P(L["post_ff"]), cf(L["eps"]), ci(H), cen],
-                )
+                y = k.ptr(BlockOut, g["y"])
+                k.btb_sandwich_add(row, (256, 1, 1), h, y, k.ptr(NormWeight, L["post_ff"]), eps, hidden, cen)
             else:
                 y_prev = g["y"]
         assert sandwich or y_prev is not None  # the segment holds at least one layer, so the loop set the residual
@@ -1695,14 +1755,11 @@ class _CudaMixin(_State):
             norm_w, head_w = self.norm.weight, self.head.weight
             if norm_w.device.type != "cuda" or head_w.device.type != "cuda" or head_w.dtype != torch.bfloat16:
                 raise RuntimeError("[card] the tail needs the final norm and the head on the card in bf16")
-            V = int(head_w.shape[0])
-            k.launch(
-                "btb_add_rmsnorm",
-                (T, 1, 1),
-                (256, 1, 1),
-                [P(g["h"]), P(y_prev), P(norm_w), cf(float(self.cfg.rms_norm_eps)), P(g["x"]), ci(H), cen],
-            )
-            matvec(head_w, g["x"], g["logits"], V, H)
+            vocab = int(head_w.shape[0])
+            final_eps = NormEps(float(self.cfg.rms_norm_eps))
+            final = k.ptr(NormWeight, norm_w)
+            k.btb_add_rmsnorm(row, (256, 1, 1), h, k.ptr(BlockOut, y_prev), final, final_eps, x, hidden, cen)
+            matvec(head_w, g["x"], g["logits"], vocab, H)
         elif y_prev is not None:
             g["h"][:T].add_(y_prev[:T])
         warm.join()
@@ -1718,7 +1775,7 @@ class _CudaMixin(_State):
     def _card_fuse_ok(self, st: dict[str, Any]) -> bool:
         """the step lanes in the fused kernels as well as the plain: where the tuner runs (`CARD_TUNE`), the build
         has them and the step takes the tensor-core matvec they are variants of"""
-        k = st["k"]
+        k: _Cuda = st["k"]
         return (
             self.CARD_FUSE
             and self.CARD_TUNE
@@ -1752,9 +1809,9 @@ class _CudaMixin(_State):
         Captured only where warming is on (`CARD_WARM`): at a share of 0 each warming
         kernel leaves at once, but a launch still costs its node. Nothing it does reaches a result: the bits are the
         chain's alone"""
-        k = st["k"]
+        k: _Cuda = st["k"]
         if self.CARD_WARM <= 0 or "btb_l2_warm" not in k.fn:
-            return _Warm(k, None, None, [], 0)
+            return _Warm(k, None, None, [], 0, WarmShare(0))
         w = st.get("warm")
         if w is None:
             dev = st["stream"].device
@@ -1762,7 +1819,8 @@ class _CudaMixin(_State):
                 "stream": torch.cuda.Stream(device=dev),
                 "sink": torch.zeros(1, dtype=torch.int32, device=dev),
             }
-        return _Warm(k, w["stream"], w["sink"], seq, self.WARM_BLOCKS, self._card_switch_ptr(st, self.SW_WARM))
+        share = WarmShare(self._card_switch_ptr(st, self.SW_WARM))
+        return _Warm(k, w["stream"], w["sink"], seq, self.WARM_BLOCKS, share)
 
     def _card_record(self, st: dict[str, Any], g: dict[str, Any], body: Any, what: str) -> None:
         """`body` once eagerly on the arena's stream (the warm-up), then captured there, so the captured
@@ -2022,10 +2080,7 @@ class _CudaMixin(_State):
         g["pin_ts"] = torch.zeros(self._card_depth() * U, dtype=torch.long, pin_memory=True)
         st["graphs"][key] = g
 
-        k = st["k"]
-        P = k.ptr
-
-        I = ctypes.c_int
+        k: _Cuda = st["k"]
 
         def pick_nodes() -> None:
             # the pipeline as graph nodes over the row's logits: derive the key, then max -> the top-k/top-p
@@ -2036,34 +2091,58 @@ class _CudaMixin(_State):
             lf.copy_(g["logits"][:1])  # the sampler kernels take float32; the head left bf16 (a captured cast)
             Vw = int(lf.shape[-1])
             nb = min(max(1, (Vw + 1023) // 1024), 4 * k.sms)
-            k.launch("btb_sample_keys", (1, 1, 1), (1, 1, 1), [P(g["seed"]), P(g["n0"]), I(0), P(g["keys"])])
+            logits, vocab, params = k.ptr(Logits, lf), Vocab(Vw), k.ptr(SampleParams, g["fp"])
+            keys, gM, ghist = k.ptr(NoiseKeys, g["keys"]), k.ptr(SampleMax, g["gM"]), k.ptr(RadixHist, g["ghist"])
+            k.btb_sample_keys(
+                (1, 1, 1), (1, 1, 1), k.ptr(NoiseSeed, g["seed"]), k.ptr(NoisePos, g["n0"]), NoiseSalt(0), keys
+            )
             g["gM"].zero_()
             g["gbest"].zero_()
             g["gpreK"].zero_()
             g["gpreP"].zero_()
-            k.launch("btb_sample_max", (nb, 1, 1), (1024, 1, 1), [P(lf), I(Vw), P(g["fp"]), P(g["gM"])])
+            k.btb_sample_max((nb, 1, 1), (1024, 1, 1), logits, vocab, params, gM)
             for mode, pre, flo, run in ((0, g["gpreK"], g["gpreP"], top_k > 0), (1, g["gpreP"], g["gpreK"], top_p_on)):
                 if not run:
                     continue
                 for lvl in (0, 1, 2):  # three radix levels: the exact 32-bit threshold
                     g["ghist"].zero_()
-                    k.launch(
-                        "btb_sample_hist",
+                    level, how = RadixLevel(lvl), SampleMode(mode)
+                    prefix = k.ptr(RadixPrefix, pre)
+                    k.btb_sample_hist(
                         (nb, 1, 1),
                         (1024, 1, 1),
-                        [P(lf), I(Vw), P(g["fp"]), I(lvl), I(mode), P(g["gM"]), P(pre), P(flo), P(g["ghist"])],
+                        logits,
+                        vocab,
+                        params,
+                        level,
+                        how,
+                        gM,
+                        prefix,
+                        k.ptr(RadixFloor, flo),
+                        ghist,
                     )
-                    k.launch(
-                        "btb_sample_bin",
+                    k.btb_sample_bin(
                         (1, 1, 1),
                         (1024, 1, 1),
-                        [I(lvl), I(mode), I(top_k), P(g["fp"]), P(g["ghist"]), P(pre), P(g["gcarry"])],
+                        level,
+                        how,
+                        TopK(top_k),
+                        params,
+                        ghist,
+                        prefix,
+                        k.ptr(RadixCarry, g["gcarry"]),
                     )
-            k.launch(
-                "btb_sample_draw",
+            k.btb_sample_draw(
                 (nb, 1, 1),
                 (1024, 1, 1),
-                [P(lf), P(g["keys"]), I(Vw), P(g["fp"]), P(g["gM"]), P(g["gpreK"]), P(g["gpreP"]), P(g["gbest"])],
+                logits,
+                keys,
+                vocab,
+                params,
+                gM,
+                k.ptr(TopKFloor, g["gpreK"]),
+                k.ptr(TopPFloor, g["gpreP"]),
+                k.ptr(SampleBest, g["gbest"]),
             )
             g["ids"].copy_((~g["gbest"]) & 0xFFFFFFFF)  # the packed winner's inverted low 32 bits = the token
 
@@ -2084,17 +2163,14 @@ class _CudaMixin(_State):
                 else:
                     g["ids"].copy_(torch.argmax(g["logits"][:1], dim=-1))
                 g["n0"].add_(1)
-                k.launch(
-                    "btb_publish",
+                k.btb_publish(
                     (1, 1, 1),
                     (32, 1, 1),
-                    [
-                        P(g["n0"]),
-                        P(g["ids"]),
-                        P(g["pin_tok"][slot : slot + 1]),
-                        P(g["pin_n0"]),
-                        P(g["pin_ts"][slot : slot + 1]),
-                    ],
+                    k.ptr(PrefixLen, g["n0"]),
+                    k.ptr(StepToken, g["ids"]),
+                    k.ptr(HostToken, g["pin_tok"][slot : slot + 1]),
+                    k.ptr(HostLen, g["pin_n0"]),
+                    k.ptr(HostClock, g["pin_ts"][slot : slot + 1]),
                 )
 
         # handed back beside the graph, never kept in it: the capture is its only caller, and a closure over `g`
@@ -2707,20 +2783,19 @@ class _CudaMixin(_State):
         self._tag(PassTag.CARD_PREFILL)
         cache, T, past = pas.cache, pas.T, pas.past
         st = self._card_state()
-        k = st["k"]
+        k: _Cuda = st["k"]
         paged = bool(getattr(cache, "paged", False))
         self._card_bind(cache, st, T if bind_rows is None else bind_rows)
         H, Hq, Hk, D, I = self._card_dims()
-        P, ci, cf = k.ptr, ctypes.c_int, ctypes.c_float
         if paged:
             card = st["pg"]["card"]
             cap = int(st["pg"]["cap"])
-            tbl = [P(card.tbl)]
+            row_map = k.ptr(RowMap, card.tbl)
             arenas = {i: (card.arenas[i][0, 0], card.arenas[i][0, 1]) for i in range(a, b)}
         else:
             ar = st["arena"]
             cap = int(ar["cap"])
-            tbl = []
+            row_map = k.ptr(RowMap, None)
             arenas = {i: (ar["A"][ar["slot"][i], 0], ar["A"][ar["slot"][i], 1]) for i in range(a, b)}
         if past + T > cap:
             # never past the rows the arena holds: the kernels write through no bound of their own
@@ -2729,8 +2804,8 @@ class _CudaMixin(_State):
         Ls = [self._card_weights(st, i) for i in range(a, b)]
         mma = self._card_mma_for(T)
         sandwich = self.fam.sandwich
-        cen = ci(1 if self.fam.norm_centered else 0)
-        act = "gelu" if act_name(self.cfg) == "gelu_pytorch_tanh" else "silu"
+        cen = NormCentered(1 if self.fam.norm_centered else 0)
+        act_mul = k.btb_gelu_mul if act_name(self.cfg) == "gelu_pytorch_tanh" else k.btb_silu_mul
         nrk = f"btb_norm_rope_kv{'_tbl' if paged else ''}_d{D}"
         parents = getattr(self, "ap", None) if T > 1 else None
         if parents is not None and T > self.CARD_T_MAX:
@@ -2796,81 +2871,81 @@ class _CudaMixin(_State):
         G = Hq // Hk
         tpb = k.flash_prefill_rows(D) // G
         smem = k.flash_prefill_smem(D)
+        h_rows, x_rows, hidden, row = k.ptr(Residual, hb), k.ptr(Normed, x), Hidden(H), (T, 1, 1)
+        q_all, att_out, t_rows, q_heads, kv_heads = (
+            k.ptr(Query, q),
+            k.ptr(AttnOut, att),
+            Rows(T),
+            QHeads(Hq),
+            KvHeads(Hk),
+        )
         y_prev: torch.Tensor | None = None
         hooked = False
         try:
             for n, L in enumerate(Ls):
                 kb, vb = arenas[a + n]
-                hs, rs = int(kb.stride(0)), int(kb.stride(1))
+                K, V = k.ptr(KCache, kb), k.ptr(VCache, vb)
+                hs, rs = CacheHeadStride(int(kb.stride(0))), CacheRowStride(int(kb.stride(1)))
                 cos_t, sin_t = tables[self.layer_types[a + n]]
-                k.launch(
-                    "btb_add_rmsnorm",
-                    (T, 1, 1),
-                    (256, 1, 1),
-                    [P(hb), P(y_prev), P(L["ln1"]), cf(L["eps"]), P(x), ci(H), cen],
-                )
+                eps = NormEps(L["eps"])
+                ln1 = k.ptr(NormWeight, L["ln1"])
+                k.btb_add_rmsnorm(row, (256, 1, 1), h_rows, k.ptr(BlockOut, y_prev), ln1, eps, x_rows, hidden, cen)
                 gemm(L["qkv"], x, qkv, (Hq + 2 * Hk) * D, H, T)
                 # q normed and rotated into its own buffer, k and v into the cache at positions past .. past + T - 1
+                wq, wk = k.ptr(QNorm, L["wq"]), k.ptr(KNorm, L["wk"])
+                cos, sin, depths = k.ptr(RopeCos, cos_t), k.ptr(RopeSin, sin_t), k.ptr(Depths, depth)
                 for s in range(nsl):
                     s0 = s * self.GRID_Y
                     rows = min(self.GRID_Y, T - s0)
-                    k.launch(
-                        nrk,
-                        (Hq + 2 * Hk, rows, 1),
-                        (32, 1, 1),
-                        [P(qkv[s0:]), P(L["wq"]), P(L["wk"]), cf(L["eps"]), P(cos_t), P(sin_t), P(where[s:])]
-                        + [P(depth), P(kb), P(vb), P(q[s0:]), ci(rows), ci(Hq), ci(Hk), ci(hs), ci(rs), cen, *tbl],
-                    )
+                    grid = (Hq + 2 * Hk, rows, 1)
+                    qkv_s, start, q_s = k.ptr(Qkv, qkv[s0:]), k.ptr(PrefixLen, where[s:]), k.ptr(Query, q[s0:])
+                    if paged:
+                        k.btb_norm_rope_kv_tbl(
+                            D, grid, (32, 1, 1), qkv_s, wq, wk, eps, cos, sin, start, depths, K, V, q_s, Rows(rows),
+                            q_heads, kv_heads, hs, rs, cen, row_map,
+                        )  # fmt: skip
+                    else:
+                        k.btb_norm_rope_kv(
+                            D, grid, (32, 1, 1), qkv_s, wq, wk, eps, cos, sin, start, depths, K, V, q_s, Rows(rows),
+                            q_heads, kv_heads, hs, rs, cen,
+                        )  # fmt: skip
+                scale, win = AttnScale(L["scale"]), Window(L["win"])
                 if parents is None:
-                    k.launch(
-                        k.flash_prefill_kernel(D),
-                        ((T + tpb - 1) // tpb, Hk, 1),
-                        (128, 1, 1),
-                        [P(q), P(kb), P(vb), P(att), ci(past), ci(T), ci(Hq), ci(Hk), ci(hs), ci(rs), cf(L["scale"])]
-                        + [ci(L["win"]), tbl[0] if tbl else P(None), P(run)],
-                        shared=smem,
-                    )
+                    k.flash_prefill(
+                        D, ((T + tpb - 1) // tpb, Hk, 1), (128, 1, 1), q_all, K, V, att_out, ChunkStart(past), t_rows,
+                        q_heads, kv_heads, hs, rs, scale, win, row_map, k.ptr(PrefillRun, run), shared=smem,
+                    )  # fmt: skip
                 else:
-                    k.launch(
-                        f"btb_attn_flash_d{D}",
-                        ((T * G + 7) // 8, S, Hk),
-                        (self._attn_warps(D) * 32, 1, 1),
-                        [P(q), P(kb), P(vb), P(att), P(n0p), P(run), ci(T), ci(Hq), ci(Hk), ci(hs), ci(rs)]
-                        + [cf(L["scale"]), P(part_m), P(part_l), P(part_acc), P(cnt), ci(L["win"])]
-                        + [tbl[0] if tbl else P(None)],
-                    )
+                    k.btb_attn_flash(
+                        D, ((T * G + 7) // 8, S, Hk), (self._attn_warps(D) * 32, 1, 1), q_all, K, V, att_out,
+                        k.ptr(PrefixLen, n0p), k.ptr(TreeParents, run), t_rows, q_heads, kv_heads, hs, rs, scale,
+                        k.ptr(PartMax, part_m), k.ptr(PartSum, part_l), k.ptr(PartAcc, part_acc),
+                        k.ptr(Arrivals, cnt), win, row_map,
+                    )  # fmt: skip
                 gemm(L["o"], att, y, H, Hq * D, T)
                 if sandwich:
-                    k.launch(
-                        "btb_sandwich_add", (T, 1, 1), (256, 1, 1), [P(hb), P(y), P(L["ln2"]), cf(L["eps"]), ci(H), cen]
-                    )
-                    k.launch(
-                        "btb_add_rmsnorm",
-                        (T, 1, 1),
-                        (256, 1, 1),
-                        [P(hb), P(None), P(L["pre_ff"]), cf(L["eps"]), P(x), ci(H), cen],
-                    )
+                    ln2 = k.ptr(NormWeight, L["ln2"])
+                    k.btb_sandwich_add(row, (256, 1, 1), h_rows, k.ptr(BlockOut, y), ln2, eps, hidden, cen)
+                    pre_ff = k.ptr(NormWeight, L["pre_ff"])
+                    k.btb_add_rmsnorm(row, (256, 1, 1), h_rows, k.ptr(BlockOut, None), pre_ff, eps, x_rows, hidden, cen)
                 else:
-                    k.launch(
-                        "btb_add_rmsnorm",
-                        (T, 1, 1),
-                        (256, 1, 1),
-                        [P(hb), P(y), P(L["ln2"]), cf(L["eps"]), P(x), ci(H), cen],
-                    )
+                    ln2 = k.ptr(NormWeight, L["ln2"])
+                    k.btb_add_rmsnorm(row, (256, 1, 1), h_rows, k.ptr(BlockOut, y), ln2, eps, x_rows, hidden, cen)
                 # gate and up, the activation times up, down: the plain kernels' bits, which the step's fused ones
                 # (the activation in the gate's epilogue, or folded into the down matvec's load) give as well
                 gemm(L["gu"], x, gu, 2 * I, H, T)
-                k.launch(
-                    f"btb_{act}_mul", (min(4096, (T * I + 255) // 256), 1, 1), (256, 1, 1), [P(gu), P(m), ci(T), ci(I)]
+                act_mul(
+                    (min(4096, (T * I + 255) // 256), 1, 1),
+                    (256, 1, 1),
+                    k.ptr(GateUp, gu),
+                    k.ptr(MlpAct, m),
+                    Rows(T),
+                    Intermediate(I),
                 )
                 gemm(L["down"], m, y, H, I, T)
                 if sandwich:
-                    k.launch(
-                        "btb_sandwich_add",
-                        (T, 1, 1),
-                        (256, 1, 1),
-                        [P(hb), P(y), P(L["post_ff"]), cf(L["eps"]), ci(H), cen],
-                    )
+                    post_ff = k.ptr(NormWeight, L["post_ff"])
+                    k.btb_sandwich_add(row, (256, 1, 1), h_rows, k.ptr(BlockOut, y), post_ff, eps, hidden, cen)
                 else:
                     y_prev = y
                 if pas.on_layer is not None:
@@ -2921,7 +2996,7 @@ class _CudaMixin(_State):
     @classmethod
     def _card_gemm(
         cls,
-        k: Any,
+        k: _Cuda,
         mma: bool,
         W: torch.Tensor,
         x: torch.Tensor,
@@ -2936,15 +3011,14 @@ class _CudaMixin(_State):
         `plan` (`_card_gemm_plan`'s answer) forced only by the tests"""
         kernel = "btb_gemm_mma_bf16" if mma else "btb_gemm_f32_bf16"
         cls._card_need_bf16([(kernel, "the weight", W), (kernel, "the input rows", x), (kernel, "the output rows", y)])
-        P, ci = k.ptr, ctypes.c_int
-        args = [P(W), P(x), P(y), ci(R), ci(C), ci(rows)]
+        args = (k.ptr(Weight, W), k.ptr(MatIn, x), k.ptr(MatOut, y), OutDim(R), InDim(C), Rows(rows))
         if not mma:
             grid = ((rows + 7) // 8 * ((R + 31) // 32), 1, 1)  # a block 8 x rows by 32 weight rows, in groups
-            k.launch("btb_gemm_f32_bf16", grid, (128, 1, 1), args)
+            k.btb_gemm_f32_bf16(grid, (128, 1, 1), *args)
         elif (plan or cls._card_gemm_plan(R, C, rows, k.sms)) == "small":
-            k.launch("btb_gemm_mma_small_bf16", ((rows + 63) // 64 * ((R + 63) // 64), 1, 1), (128, 1, 1), args)
+            k.btb_gemm_mma_small_bf16(((rows + 63) // 64 * ((R + 63) // 64), 1, 1), (128, 1, 1), *args)
         else:
-            k.launch("btb_gemm_mma_bf16", ((rows + 127) // 128 * ((R + 63) // 64), 1, 1), (128, 1, 1), args)
+            k.btb_gemm_mma_bf16(((rows + 127) // 128 * ((R + 63) // 64), 1, 1), (128, 1, 1), *args)
 
     def _card_tail_ok(self) -> bool:
         """the card graph's kernels run the tail: the card graph on, the final norm and the head on the card, bf16"""
@@ -2976,7 +3050,6 @@ class _CudaMixin(_State):
         assert k is not None and self.norm is not None and self.head is not None  # `_card_tail_ok`
         norm_w, head_w = self.norm.weight, self.head.weight
         self._card_need_bf16([("btb_add_rmsnorm", "the final norm", norm_w)])  # the head's GEMM checks its own
-        P, ci, cf = k.ptr, ctypes.c_int, ctypes.c_float
         R, H, V = int(h.shape[1]), int(h.shape[2]), int(head_w.shape[0])
         hb = h.reshape(R, H)
         if hb.dtype != torch.bfloat16 or hb.device != self.dev or not hb.is_contiguous():
@@ -2985,12 +3058,16 @@ class _CudaMixin(_State):
             )
             hb.copy_(h.reshape(R, H))
         x, logits = bufs if bufs is not None else self._card_tail_buffers(R, H)
-        k.launch(
-            "btb_add_rmsnorm",
+        k.btb_add_rmsnorm(
             (R, 1, 1),
             (256, 1, 1),
-            [P(hb), P(y), P(norm_w), cf(float(self.cfg.rms_norm_eps)), P(x), ci(H)]
-            + [ci(1 if self.fam.norm_centered else 0)],
+            k.ptr(Residual, hb),
+            k.ptr(BlockOut, y),
+            k.ptr(NormWeight, norm_w),
+            NormEps(float(self.cfg.rms_norm_eps)),
+            k.ptr(Normed, x),
+            Hidden(H),
+            NormCentered(1 if self.fam.norm_centered else 0),
         )
         self._card_gemm(k, self._card_mma_for(R), head_w, x, logits, V, H, R)
         return logits.view(1, R, V)

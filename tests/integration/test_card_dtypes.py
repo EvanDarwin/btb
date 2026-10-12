@@ -12,7 +12,7 @@ import torch
 from pytest import MonkeyPatch
 
 from btb.engine.cuda import _CudaMixin
-from btb.engine.native import NativeDtypeError
+from btb.engine.native import NativeDtypeError, _Cuda
 from tests.helpers import fixture, loaded_model, need_cuda
 
 IDS = [(7 * i + 3) % 200 + 2 for i in range(20)]  # inside every fixture's vocabulary
@@ -26,8 +26,9 @@ def test_a_wrong_dtype_names_its_kernel_and_tensor() -> None:
     assert (e.value.call, e.value.arg, e.value.got, e.value.want) == (
         "btb_add_rmsnorm", "layer 0's input norm", torch.float32, (torch.bfloat16,)
     )  # fmt: skip
+    unloaded = _Cuda.__new__(_Cuda)  # no module loaded: a launch through it would fail, the check comes first
     with pytest.raises(NativeDtypeError, match=r"btb_gemm_f32_bf16: the weight is torch\.float32"):
-        _CudaMixin._card_gemm(None, False, bf.float().view(2, 2), bf.view(2, 2), bf.view(2, 2), 2, 2, 2)
+        _CudaMixin._card_gemm(unloaded, False, bf.float().view(2, 2), bf.view(2, 2), bf.view(2, 2), 2, 2, 2)
 
 
 def _card_model() -> Any:

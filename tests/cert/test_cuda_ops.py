@@ -1,8 +1,8 @@
 """The CUDA card-kernel matrix as a suite gate. The card runs only where a GPU is present, so this is the
-structural half: the kernels the engine loads, the kernels native/cuda defines and the kernels btb launches must be
-the same set, and every launch must hand its kernel as many values as it declares parameters. A new card kernel that
-the engine does not load, a loaded name with no definition, a kernel nothing launches any more (a dead path), or a
-launch whose argument list is not its kernel's fails here."""
+structural half: the kernels' bindings are what native/cuda's signatures write (each parameter a role, no two of a
+kernel's alike), nothing in btb/ launches a kernel but through its typed launcher, and every launcher is reached from
+btb/. A signature edited without the bindings, a raw launch, or a kernel nothing launches any more fails here; mypy
+holds each launch to its kernel's parameters and their roles."""
 
 from __future__ import annotations
 
@@ -14,131 +14,71 @@ from . import cuda_ops
 
 
 @pytest.mark.cert_gap
-def test_loaded_and_defined_kernels_agree() -> None:
+def test_the_bindings_are_current_and_every_kernel_is_launched() -> None:
     assert cuda_ops.gaps() == [], cuda_ops.gaps()
 
 
 def test_matrix_is_not_empty() -> None:
     """a parse that silently found nothing would make the agreement test vacuous."""
-    assert cuda_ops.loaded_kernels(), "parsed no _Cuda.KERNELS from native.py"
     assert cuda_ops.defined_kernels(), "parsed no kernels from native/cuda"
-    assert cuda_ops.launched_kernels(), "parsed no launch site from btb/"
+    assert cuda_ops.reached_launchers(), "found no launcher reached from btb/"
 
 
-KERNELS = [
-    "btb_gemv_bf16_m16",
-    "btb_gemv_silu_bf16_m16",
-    "btb_gemv_sgate_bf16_m16",
-    "btb_sigmoid_mul",
-    "btb_silu_mul",
-    "btb_norm_rope_kv_d64",
-    "btb_norm_rope_kv_tbl_d128",
-    "btb_norm_rope_kv_rows_d64",
-    "btb_attn_flash_prefill_d64",
-    "btb_attn_flash_prefill_kq_d64",
-    "btb_gemm_f32_bf16",
-]
-
-
-def _launched(src: str) -> tuple[list[str], list[str]]:
-    """the kernels of KERNELS the module `src`'s launches can launch, and its launches the parse cannot name"""
-    sites = cuda_ops.launch_sites([("mod.py", ast.parse(src))])
-    pats = cuda_ops.launch_patterns(sites)
-    return [k for k in KERNELS if any(p.fullmatch(k) for p in pats)], cuda_ops.unresolved_launches(sites)
-
-
-def test_only_what_flows_into_a_launch_is_launched() -> None:
-    """a launch's kernel read through what names it - a constant, an f-string whose holes take the values the
-    function gives them, a conditional, a variable of the function or the one around it, a method's return - and
-    nothing else: a presence check, a requirement list, a message naming a kernel launches none of it"""
+def test_a_raw_launch_is_a_gap_and_a_launcher_reaches_its_kernels() -> None:
+    """a `.launch(...)` outside the launchers is a gap whatever it names; a launcher named as an attribute - called,
+    or picked and called later - reaches its kernels; a kernel named in a string (a presence check, a message) does
+    not"""
     src = """
-class K:
-    def flash_prefill_kernel(self, D, kq=None):
-        return f"btb_attn_flash_prefill_{'kq_' if kq else ''}d{D}"
-
-def body(k, paged, act_name, M, D):
-    via = "_tbl" if paged else ""
-    act = "gelu" if act_name == "gelu_pytorch_tanh" else "silu"
-    nrk = f"btb_norm_rope_kv{via}_d{D}"
-    gemv = f"btb_gemv_bf16_m{M}"
-    if "btb_gemm_f32_bf16" in k.fn and ("btb_sigmoid_mul",):
-        raise RuntimeError(f"no kernel btb_gemv_sgate_bf16_m{M}")
-
-    def matvec(W):
-        k.launch(gemv, (1, 1, 1), (1, 1, 1), [W])
-
-    k.launch(nrk, (1, 1, 1), (32, 1, 1), [])
-    k.launch(f"btb_{act}_mul", (1, 1, 1), (256, 1, 1), [])
-    k.launch(k.flash_prefill_kernel(D), (1, 1, 1), (128, 1, 1), [])
+def run(k, gelu, M):
+    k.launch("btb_silu_mul", (1, 1, 1), (256, 1, 1), [])
+    glu = k.btb_gemv_mma_glu_gelu if gelu else k.btb_gemv_mma_glu_silu
+    if "btb_publish" in k.fn:
+        k.btb_gemv_bf16(M, (1, 1, 1), (128, 1, 1))
+    btb_sample_out(k, (1, 1, 1), (256, 1, 1))
 """
-    launched, unresolved = _launched(src)
-    assert launched == [
-        "btb_gemv_bf16_m16",
-        "btb_silu_mul",
-        "btb_norm_rope_kv_d64",
-        "btb_norm_rope_kv_tbl_d128",
-        "btb_attn_flash_prefill_d64",
-        "btb_attn_flash_prefill_kq_d64",
-    ], launched
-    assert unresolved == []
-
-
-def test_a_launch_the_parse_cannot_name_is_a_gap() -> None:
-    """a launch whose kernel comes from a parameter or a loop names no kernel the cert can read: a gap of its own,
-    never a wildcard that would keep every kernel alive"""
-    src = """
-def run(k, name, names):
-    k.launch(name, (1, 1, 1), (1, 1, 1), [])
-    for n in names:
-        k.launch(n, (1, 1, 1), (1, 1, 1), [])
-"""
-    launched, unresolved = _launched(src)
-    assert launched == [] and unresolved == ["mod.py:3", "mod.py:5"], (launched, unresolved)
-
-
-def test_a_launch_handed_another_count_than_its_kernel_declares_is_a_gap() -> None:
-    """a launch's argument list counted as written - list literals, `*part`s of the lengths their assignments give,
-    sums and conditionals of those, by position or by keyword - against every kernel its name can be: one choosing a
-    row map's kernel and its extra value passes either way, a dropped value is caught - on one branch of a fixed
-    kernel's list as well, its other branch's count right - and a list the parse cannot count is a gap of its own"""
-    src = """
-def run(k, paged, D, xs, cond):
-    tbl = [P(t)] if paged else []
-    name = f"btb_x{'_tbl' if paged else ''}_d{D}"
-    k.launch(name, (1, 1, 1), (32, 1, 1), [a, b, c, *tbl])
-    k.launch("btb_x_d64", (1, 1, 1), (32, 1, 1), [a, b])
-    k.launch("btb_x_d64", (1, 1, 1), (32, 1, 1), args=[a] + [b, c])
-    k.launch("btb_x_d64", (1, 1, 1), (32, 1, 1), list(xs))
-    k.launch("btb_x_d64", (1, 1, 1), (32, 1, 1), [a, b, c] if cond else [a, b])
-    k.launch(f"btb_x_d{D}", (1, 1, 1), (32, 1, 1), [a, b, *tbl])
-"""
-    sites = cuda_ops.launch_sites([("mod.py", ast.parse(src))])
-    arity = {"btb_x_d64": 3, "btb_x_d128": 3, "btb_x_tbl_d64": 4}
-    assert cuda_ops.arity_mismatches(sites, arity) == [
-        "mod.py:6 btb_x_d64 (declares 3, handed 2)",
-        "mod.py:9 btb_x_d64 (declares 3, handed 2/3)",
-        # the head widths of one kernel declare one count: the branch without the row map hands it one short
-        "mod.py:10 btb_x_d128 (declares 3, handed 2/3)",
-        "mod.py:10 btb_x_d64 (declares 3, handed 2/3)",
-    ]
-    assert cuda_ops.uncounted_launches(sites) == ["mod.py:8"]
+    sources = [("mod.py", ast.parse(src))]
+    assert cuda_ops.raw_launches(sources) == ["mod.py:3"]
+    assert cuda_ops.reached_launchers(sources) == {
+        "btb_gemv_mma_glu_gelu", "btb_gemv_mma_glu_silu", "btb_gemv_bf16", "btb_sample_out"
+    }  # fmt: skip
 
 
 def test_kernels_parameters_are_read_off_their_definitions() -> None:
-    """the parameters each kernel declares: an entry point spelled out (its name on the line after its bounds), one a
-    macro makes for each head width, one whose list is an object-like macro"""
-    arity = cuda_ops.defined_arity()
-    assert set(arity) == cuda_ops.defined_kernels() and all(n > 0 for n in arity.values())
-    assert arity["btb_gemm_mma_bf16"] == arity["btb_gemm_mma_small_bf16"] == 6  # w, x, y, R, C, T
-    assert arity["btb_attn_flash_d64"] == arity["btb_attn_flash_d256"] == 18
-    assert arity["btb_attn_flash_prefill_d128"] == arity["btb_attn_flash_prefill_kq_d128"] == 14  # ATTN_FLASH_PF_ARGS
+    """each kernel's parameters and roles from its signature: an entry point spelled out (its name on the line after
+    its bounds), a macro's kernels at each instantiation (the variant the launcher's first argument), one whose list is
+    an object-like macro"""
+    kernels = {k.method: k for k in cuda_ops.bindings().card_kernels()}
+    gemm = kernels["btb_gemm_mma_bf16"]
+    assert [p.role for p in gemm.params] == ["Weight", "MatIn", "MatOut", "OutDim", "InDim", "Rows"]
+    assert [p.pointer for p in gemm.params] == [True, True, True, False, False, False]
+    attn = kernels["btb_attn_flash"]
+    assert attn.names() == ["btb_attn_flash_d64", "btb_attn_flash_d128", "btb_attn_flash_d256"]
+    assert attn.variant == "D" and len(attn.params) == 18
+    assert [p.role for p in attn.params[:6]] == ["Query", "KCache", "VCache", "AttnOut", "PrefixLen", "TreeParents"]
+    prefill, kq = kernels["btb_attn_flash_prefill"], kernels["btb_attn_flash_prefill_kq"]
+    assert prefill.params == kq.params and len(prefill.params) == 14  # ATTN_FLASH_PF_ARGS
+    assert kernels["btb_gemv_bf16"].names()[0] == "btb_gemv_bf16_m1"
 
 
-def test_every_launch_in_btb_is_read() -> None:
-    """btb's own launches all name their kernels and count their arguments as the parse reads them, launch only
-    loaded kernels, and hand each kernel its parameters"""
-    sites = cuda_ops.launch_sites()
-    assert cuda_ops.unresolved_launches(sites) == []
-    assert cuda_ops.uncounted_launches(sites) == []
-    assert cuda_ops.arity_mismatches(sites) == []
-    assert cuda_ops.launched_kernels() <= cuda_ops.loaded_kernels()
+def test_a_signature_the_types_could_not_hold_is_refused() -> None:
+    """the rules the launchers' types rest on: two parameters of a kernel sharing a role (a swap of them would type-
+    check), a role a pointer's in one kernel and a scalar's in another, a bf16 passed by value, a role no kernel takes"""
+    B = cuda_ops.bindings()
+    roles = {"Query": B.Role("Query", "bf16", "", ""), "Rows": B.Role("Rows", "int", "", "")}
+
+    def kernel(name: str, *params: tuple[str, str, bool]) -> object:
+        return B.Kernel(name, name, "", (), tuple(B.Param(n, r, p) for n, r, p in params))
+
+    B._hold([kernel("btb_x", ("q", "Query", True), ("T", "Rows", False))], roles)  # the rules kept
+    with pytest.raises(B.BindingError, match="q and k share the role Query"):
+        B._hold([kernel("btb_x", ("q", "Query", True), ("k", "Query", True), ("T", "Rows", False))], roles)
+    with pytest.raises(B.BindingError, match="Rows is a pointer's in one kernel and a scalar's in another"):
+        B._hold(
+            [kernel("btb_x", ("q", "Query", True), ("T", "Rows", False)), kernel("btb_y", ("t", "Rows", True))], roles
+        )
+    with pytest.raises(B.BindingError, match="passes a bf16 by value"):
+        B._hold([kernel("btb_x", ("q", "Query", False), ("T", "Rows", False))], roles)
+    with pytest.raises(B.BindingError, match="roles no kernel takes: Rows"):
+        B._hold([kernel("btb_x", ("q", "Query", True))], roles)
+    with pytest.raises(B.BindingError, match="two launchers would be named btb_x"):
+        B._hold([kernel("btb_x", ("q", "Query", True), ("T", "Rows", False)), kernel("btb_x")], roles)

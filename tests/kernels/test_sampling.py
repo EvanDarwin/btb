@@ -248,7 +248,7 @@ def test_the_cuda_pick_writes_its_own_rows_and_nothing_past_them() -> None:
     past R leave. Unguarded, a one-row pick's 255 spare threads wrote ~1 KB past `out` into whatever the allocator
     had put there - in the card graph tests a step graph's state, which then stalled. gbest and out are the fronts of
     sentinel-filled buffers here, so a stray write shows whatever the allocator's layout"""
-    import ctypes
+    from btb.kinds import Rows, SampleBest, SampledTokens
 
     cu = card_kernels()
     if cu is None:
@@ -259,9 +259,8 @@ def test_the_cuda_pick_writes_its_own_rows_and_nothing_past_them() -> None:
         gbest = torch.zeros(R + pad, dtype=torch.int64, device="cuda")  # past R: packs of token ~0, never sentinel
         gbest[:R] = torch.tensor([0xFFFFFFFF - t for t in toks], dtype=torch.int64)  # the packed low word is ~token
         out = torch.full((R + pad,), sentinel, dtype=torch.int32, device="cuda")
-        cu.launch(
-            "btb_sample_out", ((R + 255) // 256, 1, 1), (256, 1, 1), [cu.ptr(gbest), cu.ptr(out), ctypes.c_int(R)]
-        )
+        best, picked = cu.ptr(SampleBest, gbest), cu.ptr(SampledTokens, out)
+        cu.btb_sample_out(((R + 255) // 256, 1, 1), (256, 1, 1), best, picked, Rows(R))
         torch.cuda.synchronize()
         assert out[:R].tolist() == toks, R
         assert bool((out[R:] == sentinel).all()), f"R={R}: the finalize wrote past its rows"

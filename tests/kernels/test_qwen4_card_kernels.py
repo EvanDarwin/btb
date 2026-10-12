@@ -6,10 +6,9 @@ bit for bit, as the speculative verify needs. A malformed call is refused before
 
 from __future__ import annotations
 
-import ctypes
 import math
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
@@ -17,6 +16,10 @@ import torch.nn.functional as F
 
 from btb.engine.forward import path_of
 from btb.engine.native import Native
+from btb.kinds import InDim, MatIn, MatOut, OutDim, Weight
+
+if TYPE_CHECKING:
+    from btb.engine.native import _Cuda
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="the card's kernels")
 
@@ -72,12 +75,12 @@ def _rows_match(
             assert torch.equal(f[t : t + 1], o), f"row {t} of the {T}-row launch parts from its one-row launch"
 
 
-def _gemv(kern: Any, w: torch.Tensor, x: torch.Tensor, y: torch.Tensor) -> None:
+def _gemv(kern: _Cuda, w: torch.Tensor, x: torch.Tensor, y: torch.Tensor) -> None:
     """btb_gemv_bf16_m{M}: y [M, R] = x [M, C] w^T"""
     M, C = (int(s) for s in x.shape)
     Rw = int(w.shape[0])
-    P, ci = kern.ptr, ctypes.c_int
-    kern.launch(f"btb_gemv_bf16_m{M}", ((Rw + 3) // 4, 1, 1), (128, 1, 1), [P(w), P(x), P(y), ci(Rw), ci(C)])
+    wp, xp, yp = kern.ptr(Weight, w), kern.ptr(MatIn, x), kern.ptr(MatOut, y)
+    kern.btb_gemv_bf16(M, ((Rw + 3) // 4, 1, 1), (128, 1, 1), wp, xp, yp, OutDim(Rw), InDim(C))
 
 
 def _rmsnorm(dim: int, w: torch.Tensor, group: int | None = None) -> torch.nn.Module:

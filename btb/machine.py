@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import bisect
 import contextlib
-import ctypes
 import functools
 import gc
 import math
@@ -28,14 +27,62 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
 
 from . import sysinfo
 from .feedback import btb_version
-from .kinds import HostCache, Json
+from .kinds import (
+    Arrivals,
+    AttnOut,
+    AttnScale,
+    BlockOut,
+    CacheHeadStride,
+    CacheRowStride,
+    ChunkStart,
+    Depths,
+    GateUp,
+    Hidden,
+    HostCache,
+    InDim,
+    Intermediate,
+    Json,
+    KCache,
+    KNorm,
+    KvHeads,
+    MatIn,
+    MatOut,
+    MlpAct,
+    NormCentered,
+    Normed,
+    NormEps,
+    NormWeight,
+    OutDim,
+    PartAcc,
+    PartMax,
+    PartSum,
+    PrefillRun,
+    PrefixLen,
+    QHeads,
+    Qkv,
+    QNorm,
+    Query,
+    Residual,
+    RopeCos,
+    RopeSin,
+    RowMap,
+    Rows,
+    RowsLayout,
+    TreeParents,
+    VCache,
+    Weight,
+    Window,
+)
+
+if TYPE_CHECKING:
+    from .engine.native import _Cuda
 
 Z95 = 1.959964  # the normal quantile of a two-sided 95% interval
 KB, MB, GB = 1 << 10, 1 << 20, 1 << 30
@@ -1049,60 +1096,62 @@ def cpu_ops(rep: Report) -> None:
 # -- the card -------------------------------------------------------------------------------------------------------
 
 
-# Each launch below is written out in full, as in the engine: the CUDA cert (tests/cert/cuda_ops.py) reads every
-# `.launch(...)` in btb/ and checks its kernel name and argument count from the source.
+# Each launch below goes through its kernel's typed launcher (btb/engine/card_launch.py), as the engine's do. A
+# pointer is a bare address that keeps nothing alive, so a body handed back to its caller takes its pointers from
+# the tensors it holds when it runs.
 
 
 def _gemv_body(
-    k: Any, ws: list[torch.Tensor], x: torch.Tensor, y: torch.Tensor, R: int, C: int, M: int
+    k: _Cuda, ws: list[torch.Tensor], x: torch.Tensor, y: torch.Tensor, R: int, C: int, M: int
 ) -> Callable[[], None]:
     """A graph body: btb_gemv_bf16_m{M} over each [R, C] weight in `ws`."""
-    P, ci = k.ptr, ctypes.c_int
 
     def body() -> None:
+        xp, yp = k.ptr(MatIn, x), k.ptr(MatOut, y)
         for w in ws:
-            k.launch(f"btb_gemv_bf16_m{M}", ((R + 3) // 4, 1, 1), (128, 1, 1), [P(w), P(x), P(y), ci(R), ci(C)])
+            k.btb_gemv_bf16(M, ((R + 3) // 4, 1, 1), (128, 1, 1), k.ptr(Weight, w), xp, yp, OutDim(R), InDim(C))
 
     return body
 
 
 def _mma_body(
-    k: Any, ws: list[torch.Tensor], x: torch.Tensor, y: torch.Tensor, R: int, C: int, T: int
+    k: _Cuda, ws: list[torch.Tensor], x: torch.Tensor, y: torch.Tensor, R: int, C: int, T: int
 ) -> Callable[[], None]:
     """A graph body: the tensor-core matvec the engine picks for an [R, C] weight, over each weight in `ws`. `x` is
     padded to the 32 rows the kernel always reads; `T` are real."""
     from .engine.cuda import _CudaMixin as Card
 
-    P, ci = k.ptr, ctypes.c_int
     grid, block = Card._card_mma_launch(R, k.sms)
+    mv = k.btb_gemv_mma8_bf16 if Card._card_mma_narrow(R, k.sms) else k.btb_gemv_mma_bf16
 
     def body() -> None:
+        xp, yp = k.ptr(MatIn, x), k.ptr(MatOut, y)
         for w in ws:
-            k.launch(Card._card_mma_kernel(R, k.sms), grid, block, [P(w), P(x), P(y), ci(R), ci(C), ci(T)])
+            mv(grid, block, k.ptr(Weight, w), xp, yp, OutDim(R), InDim(C), Rows(T))
 
     return body
 
 
 def _mma_form_body(
-    k: Any, ws: list[torch.Tensor], x: torch.Tensor, y: torch.Tensor, R: int, C: int, narrow: bool
+    k: _Cuda, ws: list[torch.Tensor], x: torch.Tensor, y: torch.Tensor, R: int, C: int, narrow: bool
 ) -> Callable[[], None]:
     """A graph body: the tensor-core matvec at 16 rows a warp (btb_gemv_mma_bf16) or 8 (`narrow`,
     btb_gemv_mma8_bf16), whichever the engine would pick, over each weight in `ws`, one row."""
     from .engine.cuda import _CudaMixin as Card
 
-    P, ci = k.ptr, ctypes.c_int
     rows, warps = (8, Card.MMA8_WARPS) if narrow else (16, Card.MMA_WARPS)
     grid, block = ((R + rows * warps - 1) // (rows * warps), 1, 1), (32 * warps, 1, 1)
-    name = "btb_gemv_mma8_bf16" if narrow else "btb_gemv_mma_bf16"
+    mv = k.btb_gemv_mma8_bf16 if narrow else k.btb_gemv_mma_bf16
 
     def body() -> None:
+        xp, yp = k.ptr(MatIn, x), k.ptr(MatOut, y)
         for w in ws:
-            k.launch(name, grid, block, [P(w), P(x), P(y), ci(R), ci(C), ci(1)])
+            mv(grid, block, k.ptr(Weight, w), xp, yp, OutDim(R), InDim(C), Rows(1))
 
     return body
 
 
-def _card_memory(rep: Report, k: Any, dev: torch.device, past: int, peak: float, l2: int) -> None:
+def _card_memory(rep: Report, k: _Cuda | None, dev: torch.device, past: int, peak: float, l2: int) -> None:
     """torch's read on the card over each working set, re-read in place (a set the L2 holds is read from it), and
     its copy past the L2"""
     sets = [n for n in CARD_SETS if n <= max(16 * MB, card_free(dev) // 4)]
@@ -1122,7 +1171,7 @@ def _card_memory(rep: Report, k: Any, dev: torch.device, past: int, peak: float,
     rep.time("copy (torch)", shape, copy, clock=CardClock(), nbytes=2 * n, peak=peak, at={"bytes": n})
 
 
-def _card_gemv_rows(rep: Report, k: Any, dev: torch.device, past: int, peak: float, l2: int) -> None:
+def _card_gemv_rows(rep: Report, k: _Cuda, dev: torch.device, past: int, peak: float, l2: int) -> None:
     """btb's matvecs over a streamed projection by rows: the plain one at each width it is built for, the tensor-core
     one, and the host's bit-exact one"""
     R, C = LINEAR
@@ -1151,7 +1200,7 @@ def _card_gemv_rows(rep: Report, k: Any, dev: torch.device, past: int, peak: flo
 
 
 def _card_gemv_size(
-    rep: Report, k: Any, dev: torch.device, op: str, mma: bool, side: int, held: bool, past: int, peak: float
+    rep: Report, k: _Cuda, dev: torch.device, op: str, mma: bool, side: int, held: bool, past: int, peak: float
 ) -> None:
     """One point of `_card_gemv_sizes`: a one-row matvec (plain, or tensor cores with `mma`) over a [side, side]
     weight, the same one each launch (`held`) or a pool of them past the L2. Its weights go when it returns."""
@@ -1165,7 +1214,7 @@ def _card_gemv_size(
     rep.card(op, shape, body, len(ws), nbytes=each, peak=0.0 if held else peak, at={"bytes": each, "held": held})
 
 
-def _card_gemv_sizes(rep: Report, k: Any, dev: torch.device, past: int, peak: float, l2: int) -> None:
+def _card_gemv_sizes(rep: Report, k: _Cuda, dev: torch.device, past: int, peak: float, l2: int) -> None:
     """btb's one-row matvecs by weight size: the plain and the tensor-core one over weights streamed past the L2,
     and the tensor-core one over the same weight each launch (held in the L2 while it fits); then a short weight at
     16 and at 8 rows a warp, where the engine takes 8 once 16 would leave SMs idle (`_card_mma_narrow`)"""
@@ -1195,7 +1244,7 @@ def _card_gemv_sizes(rep: Report, k: Any, dev: torch.device, past: int, peak: fl
         rep.card(op, shape, body, len(ws), nbytes=R * C * 2, peak=peak, at=at)
 
 
-def _card_glu(rep: Report, k: Any, dev: torch.device, past: int, peak: float, l2: int) -> None:
+def _card_glu(rep: Report, k: _Cuda, dev: torch.device, past: int, peak: float, l2: int) -> None:
     from .engine.cuda import _CudaMixin as Card
 
     H, I = MLP
@@ -1204,19 +1253,20 @@ def _card_glu(rep: Report, k: Any, dev: torch.device, past: int, peak: float, l2
         return rep.skip(label, shape, "not in this build")
     gus = _pool(functools.partial(_bf16, 2 * I, H, device=dev), 2 * I * H * 2, past)
     x, m = _bf16(32, H, device=dev), torch.empty(32, I, dtype=torch.bfloat16, device=dev)
-    P, ci = k.ptr, ctypes.c_int
     w = Card.MMA_WARPS
     grid, block = ((I + 16 * w - 1) // (16 * w), 1, 1), (32 * w, 1, 1)
+    gps = [k.ptr(Weight, gu) for gu in gus]
+    xp, mp = k.ptr(MatIn, x), k.ptr(MlpAct, m)
 
     def glu() -> None:
-        for gu in gus:
-            k.launch("btb_gemv_mma_glu_silu", grid, block, [P(gu), P(x), P(m), ci(I), ci(H), ci(1)])
+        for gp in gps:
+            k.btb_gemv_mma_glu_silu(grid, block, gp, xp, mp, Intermediate(I), InDim(H), Rows(1))
 
     rep.card(label, shape, glu, len(gus), nbytes=2 * I * H * 2, peak=peak, at={"rows": 1})
     return None
 
 
-def _card_mx4(rep: Report, k: Any, dev: torch.device, past: int, peak: float, l2: int) -> None:
+def _card_mx4(rep: Report, k: _Cuda, dev: torch.device, past: int, peak: float, l2: int) -> None:
     """the host's MXFP4 gemv on the card, bit for bit, and the depot's widening of an expert to bf16"""
     R, C = MX4
     g = C // 32
@@ -1244,7 +1294,7 @@ def _card_mx4(rep: Report, k: Any, dev: torch.device, past: int, peak: float, l2
     rep.card("mxfp4 widened to bf16", f"an expert's {R}x{C}", widen, seats, nbytes=each + R * C * 2, peak=peak)
 
 
-def _card_attn_at(rep: Report, k: Any, dev: torch.device, past: int, peak: float, op: str, n: int, T: int) -> None:
+def _card_attn_at(rep: Report, k: _Cuda, dev: torch.device, past: int, peak: float, op: str, n: int, T: int) -> None:
     """`T` rows' decode attention over `n` cached keys (a step's one row, or a tree's verify), with the attention the
     engine runs (btb_attn_flash_d{D}), over caches streamed past the L2"""
     from .engine.cuda import _CudaMixin as Card
@@ -1261,24 +1311,25 @@ def _card_attn_at(rep: Report, k: Any, dev: torch.device, past: int, peak: float
     pa, cnt = torch.zeros(S * T * Hq * D, device=dev), torch.zeros(T * Hq, dtype=torch.int32, device=dev)
     n0 = torch.tensor([n], dtype=torch.int32, device=dev)
     par = torch.tensor([-1, 0, 1, 0, 3, 4, 2, 6][:T], dtype=torch.int32, device=dev)  # a tree's parents
-    P, ci, cf = k.ptr, ctypes.c_int, ctypes.c_float
     grid, block = ((T * (Hq // Hk) + 7) // 8, S, Hk), (32 * Card._attn_warps(D), 1, 1)
+    caches = [
+        (k.ptr(KCache, K), k.ptr(VCache, V), CacheHeadStride(K.stride(0)), CacheRowStride(K.stride(1))) for K, V in kvs
+    ]
+    qp, outp, n0p, parp = k.ptr(Query, q), k.ptr(AttnOut, out), k.ptr(PrefixLen, n0), k.ptr(TreeParents, par)
+    parts = (k.ptr(PartMax, pm), k.ptr(PartSum, pl), k.ptr(PartAcc, pa), k.ptr(Arrivals, cnt))
 
     def body() -> None:
-        for K, V in kvs:
-            k.launch(
-                f"btb_attn_flash_d{D}",
-                grid,
-                block,
-                [P(q), P(K), P(V), P(out), P(n0), P(par), ci(T), ci(Hq), ci(Hk), ci(K.stride(0)), ci(K.stride(1))]
-                + [cf(D**-0.5), P(pm), P(pl), P(pa), P(cnt), ci(0), P(None)],
-            )
+        for K, V, hs, rs in caches:
+            k.btb_attn_flash(
+                D, grid, block, qp, K, V, outp, n0p, parp, Rows(T), QHeads(Hq), KvHeads(Hk), hs, rs,
+                AttnScale(D**-0.5), *parts, Window(0), k.ptr(RowMap, None),
+            )  # fmt: skip
 
     rep.card(op, f"{_rows(T)} over {n}", body, len(kvs), nbytes=live, peak=peak, at={"context": n, "rows": T})
     return None
 
 
-def _card_attn(rep: Report, k: Any, dev: torch.device, past: int, peak: float, l2: int) -> None:
+def _card_attn(rep: Report, k: _Cuda, dev: torch.device, past: int, peak: float, l2: int) -> None:
     """decode attention by context, a step's one row; and a tree's five rows over long contexts"""
     Hq, Hk, D = HEADS
     if f"btb_attn_flash_d{D}" not in k.fn:
@@ -1294,7 +1345,7 @@ def _card_attn(rep: Report, k: Any, dev: torch.device, past: int, peak: float, l
     return None
 
 
-def _card_rows(rep: Report, k: Any, dev: torch.device, past: int, peak: float, l2: int) -> None:
+def _card_rows(rep: Report, k: _Cuda, dev: torch.device, past: int, peak: float, l2: int) -> None:
     """a fork's decode attention: every row over the shared prefix and its own steps, in one launch, by its rows"""
     from .engine.cuda import _CudaMixin as Card
 
@@ -1303,7 +1354,6 @@ def _card_rows(rep: Report, k: Any, dev: torch.device, past: int, peak: float, l
     op = f"attention, a fork's rows over a {n}-row prefix, {Hq}/{Hk} heads d{D}"
     if f"btb_attn_flash_rows_d{D}" not in k.fn:
         return rep.skip(op, "", "not in this build")
-    P, ci, cf = k.ptr, ctypes.c_int, ctypes.c_float
 
     def point(rows: int) -> None:
         cap = (n + (steps + 1) * rows + 1023) // 1024 * 1024
@@ -1317,16 +1367,19 @@ def _card_rows(rep: Report, k: Any, dev: torch.device, past: int, peak: float, l
         lay = [n, steps, rows, *[x for c in range(rows) for x in (c, 0, n)]]
         rw = torch.tensor(lay, dtype=torch.int32, device=dev)
         grid, block = (rows * ((Hq // Hk + 7) // 8), S, Hk), (32 * Card._attn_warps(D), 1, 1)
+        caches = [
+            (k.ptr(KCache, K), k.ptr(VCache, V), CacheHeadStride(K.stride(0)), CacheRowStride(K.stride(1)))
+            for K, V in kvs
+        ]
+        qp, outp, layout = k.ptr(Query, q), k.ptr(AttnOut, out), k.ptr(RowsLayout, rw)
+        parts = (k.ptr(PartMax, pm), k.ptr(PartSum, pl), k.ptr(PartAcc, pa), k.ptr(Arrivals, cnt))
 
         def body() -> None:
-            for K, V in kvs:
-                k.launch(
-                    f"btb_attn_flash_rows_d{D}",
-                    grid,
-                    block,
-                    [P(q), P(K), P(V), P(out), P(rw), ci(rows), ci(Hq), ci(Hk), ci(K.stride(0)), ci(K.stride(1))]
-                    + [cf(D**-0.5), P(pm), P(pl), P(pa), P(cnt), ci(0)],
-                )
+            for K, V, hs, rs in caches:
+                k.btb_attn_flash_rows(
+                    D, grid, block, qp, K, V, outp, layout, Rows(rows), QHeads(Hq), KvHeads(Hk), hs, rs,
+                    AttnScale(D**-0.5), *parts, Window(0),
+                )  # fmt: skip
 
         rep.card(op, _rows(rows), body, len(kvs), nbytes=live, peak=peak, at={"rows": rows, "context": n})
 
@@ -1337,29 +1390,28 @@ def _card_rows(rep: Report, k: Any, dev: torch.device, past: int, peak: float, l
     return None
 
 
-def _card_small(rep: Report, k: Any, dev: torch.device, past: int, peak: float, l2: int) -> None:
+def _card_small(rep: Report, k: _Cuda, dev: torch.device, past: int, peak: float, l2: int) -> None:
     """the kernels between the matmuls, a step's worth of each in a graph: a norm, an activation, the router, the
     DeltaNet step - and the pick, the token back on the host"""
     H, I = MLP
-    P, ci, cf = k.ptr, ctypes.c_int, ctypes.c_float
     reps = 64
     # the residual add's y zero: a graph replayed for seconds leaves the residual as it was
     h, x = _bf16(1, H, device=dev), torch.empty(1, H, dtype=torch.bfloat16, device=dev)
     y, w = torch.zeros(1, H, dtype=torch.bfloat16, device=dev), torch.ones(H, dtype=torch.bfloat16, device=dev)
-    norm = [P(h), P(y), P(w), cf(1e-6), P(x), ci(H), ci(0)]
+    hp, yp, wp, xp = k.ptr(Residual, h), k.ptr(BlockOut, y), k.ptr(NormWeight, w), k.ptr(Normed, x)
 
     def add_norm() -> None:
         for _ in range(reps):
-            k.launch("btb_add_rmsnorm", (1, 1, 1), (256, 1, 1), norm)
+            k.btb_add_rmsnorm((1, 1, 1), (256, 1, 1), hp, yp, wp, NormEps(1e-6), xp, Hidden(H), NormCentered(0))
 
     rep.card("residual add and rmsnorm", f"{H} wide, 1 row", add_norm, reps)
     gu, m = _bf16(1, 2 * I, device=dev), torch.empty(1, I, dtype=torch.bfloat16, device=dev)
-    act = [P(gu), P(m), ci(1), ci(I)]
+    gup, mp = k.ptr(GateUp, gu), k.ptr(MlpAct, m)
     act_grid = (min(4096, (I + 255) // 256), 1, 1)
 
     def silu() -> None:
         for _ in range(reps):
-            k.launch("btb_silu_mul", act_grid, (256, 1, 1), act)
+            k.btb_silu_mul(act_grid, (256, 1, 1), gup, mp, Rows(1), Intermediate(I))
 
     rep.card("silu(gate) x up", f"{I} wide, 1 row", silu, reps)
     E, top = 128, 8
@@ -1417,13 +1469,12 @@ def _card_small(rep: Report, k: Any, dev: torch.device, past: int, peak: float, 
         rep.time(op, f"{V} logits", pick(torch.randn(1, V, device=dev)), at={"vocab": V})
 
 
-def _card_layer(rep: Report, k: Any, dev: torch.device, past: int, peak: float, l2: int) -> None:
+def _card_layer(rep: Report, k: _Cuda, dev: torch.device, past: int, peak: float, l2: int) -> None:
     """the rest of a layer's kernels, a step's worth of each in a graph: the q/k norm, rope and cache write every
     attention layer runs; Gemma's GELU and sandwich norm; a mixture's shared-expert combine; Qwen4's attention
     output gate, alone and folded into o_proj; the down projection with the activation folded into its read"""
     H, I = MLP
     Hq, Hk, D = HEADS
-    P, ci, cf = k.ptr, ctypes.c_int, ctypes.c_float
     reps = 64
     cap = 4096
     qkv = _bf16(1, (Hq + 2 * Hk) * D, device=dev)
@@ -1432,31 +1483,33 @@ def _card_layer(rep: Report, k: Any, dev: torch.device, past: int, peak: float, 
     n0, depth = torch.tensor([cap // 2], dtype=torch.int32, device=dev), torch.zeros(1, dtype=torch.int32, device=dev)
     K, V = _bf16(Hk, cap, D, device=dev), _bf16(Hk, cap, D, device=dev)
     qo = torch.empty(1, Hq, D, dtype=torch.bfloat16, device=dev)
-    rope = [P(qkv), P(wq), P(wk), cf(1e-6), P(cos), P(sin), P(n0), P(depth), P(K), P(V), P(qo)] + [
-        ci(1), ci(Hq), ci(Hk), ci(cap * D), ci(D), ci(0)
-    ]  # fmt: skip
+    rope = (
+        k.ptr(Qkv, qkv), k.ptr(QNorm, wq), k.ptr(KNorm, wk), NormEps(1e-6), k.ptr(RopeCos, cos), k.ptr(RopeSin, sin),
+        k.ptr(PrefixLen, n0), k.ptr(Depths, depth), k.ptr(KCache, K), k.ptr(VCache, V), k.ptr(Query, qo), Rows(1),
+        QHeads(Hq), KvHeads(Hk), CacheHeadStride(cap * D), CacheRowStride(D), NormCentered(0),
+    )  # fmt: skip
 
     def norm_rope() -> None:
         for _ in range(reps):
-            k.launch(f"btb_norm_rope_kv_d{D}", (Hq + 2 * Hk, 1, 1), (32, 1, 1), rope)
+            k.btb_norm_rope_kv(D, (Hq + 2 * Hk, 1, 1), (32, 1, 1), *rope)
 
     rep.card("q/k norm, rope and the cache write", f"{Hq}/{Hk} heads d{D}, 1 row", norm_rope, reps)
     h, y = _bf16(1, H, device=dev), torch.zeros(1, H, dtype=torch.bfloat16, device=dev)
     w = torch.ones(H, dtype=torch.bfloat16, device=dev)
-    sandwich = [P(h), P(y), P(w), cf(1e-6), ci(H), ci(1)]
+    hp, yp, wp = k.ptr(Residual, h), k.ptr(BlockOut, y), k.ptr(NormWeight, w)
 
     def sandwich_add() -> None:
         for _ in range(reps):
-            k.launch("btb_sandwich_add", (1, 1, 1), (256, 1, 1), sandwich)
+            k.btb_sandwich_add((1, 1, 1), (256, 1, 1), hp, yp, wp, NormEps(1e-6), Hidden(H), NormCentered(1))
 
     rep.card("sandwich norm and add (Gemma)", f"{H} wide, 1 row", sandwich_add, reps)
     gu, m = _bf16(1, 2 * I, device=dev), torch.empty(1, I, dtype=torch.bfloat16, device=dev)
-    gelu = [P(gu), P(m), ci(1), ci(I)]
+    gup, mp = k.ptr(GateUp, gu), k.ptr(MlpAct, m)
     act_grid = (min(4096, (I + 255) // 256), 1, 1)
 
     def gelu_mul() -> None:
         for _ in range(reps):
-            k.launch("btb_gelu_mul", act_grid, (256, 1, 1), gelu)
+            k.btb_gelu_mul(act_grid, (256, 1, 1), gup, mp, Rows(1), Intermediate(I))
 
     rep.card("gelu(gate) x up (Gemma)", f"{I} wide, 1 row", gelu_mul, reps)
     yr, ys, out = _bf16(1, H, device=dev), _bf16(1, H, device=dev), torch.empty(1, H, dtype=torch.bfloat16, device=dev)
@@ -1485,11 +1538,12 @@ def _card_layer(rep: Report, k: Any, dev: torch.device, past: int, peak: float, 
     o_bytes = H * Hq * D * 2
     rep.card("o_proj with the gate folded (Qwen4)", f"{H}x{Hq * D}, 1 row", sgate, len(os_), nbytes=o_bytes, peak=peak)
     downs = _pool(functools.partial(_bf16, H, I, device=dev), H * I * 2, past)
-    gu1 = _bf16(1, 2 * I, device=dev)
+    dps = [k.ptr(Weight, dn) for dn in downs]
+    gu1, yop = k.ptr(GateUp, _bf16(1, 2 * I, device=dev)), k.ptr(MatOut, yo)
 
     def down() -> None:
-        for dn in downs:
-            k.launch("btb_gemv_silu_bf16_m1", ((H + 3) // 4, 1, 1), (128, 1, 1), [P(dn), P(gu1), P(yo), ci(H), ci(I)])
+        for dp in dps:
+            k.btb_gemv_silu_bf16(1, ((H + 3) // 4, 1, 1), (128, 1, 1), dp, gu1, yop, OutDim(H), InDim(I))
 
     rep.card("down with silu(gate) x up folded", f"{H}x{I}, 1 row", down, len(downs), nbytes=H * I * 2, peak=peak)
 
@@ -1505,7 +1559,7 @@ def _mm(x: torch.Tensor, weights: list[torch.Tensor]) -> Callable[[], None]:
 
 
 def _gemm_body(
-    k: Any, mma: bool, ws: list[torch.Tensor], x: torch.Tensor, y: torch.Tensor, R: int, C: int, rows: int
+    k: _Cuda, mma: bool, ws: list[torch.Tensor], x: torch.Tensor, y: torch.Tensor, R: int, C: int, rows: int
 ) -> Callable[[], None]:
     """A graph body: btb's prompt GEMM over each [R, C] weight in `ws`, the engine's own launch and plan."""
     from .engine.cuda import _CudaMixin as Card
@@ -1517,7 +1571,7 @@ def _gemm_body(
     return body
 
 
-def _card_matmul(rep: Report, k: Any, dev: torch.device, past: int, peak: float, l2: int) -> None:
+def _card_matmul(rep: Report, k: _Cuda | None, dev: torch.device, past: int, peak: float, l2: int) -> None:
     """A prompt's matmuls over a streamed projection by rows: btb's GEMM on the tensor cores and on the fp32 chain
     (each row the bits its step's matvec makes), and torch's cuBLAS from a step's one row to a prefill's thousands;
     then cuBLAS square by size, where it turns from the memory's rate to the tensor cores'."""
@@ -1545,30 +1599,27 @@ def _card_matmul(rep: Report, k: Any, dev: torch.device, past: int, peak: float,
         _let_go()
 
 
-def _prefill_body(k: Any, dev: torch.device, T: int) -> Callable[[], None]:
+def _prefill_body(k: _Cuda, dev: torch.device, T: int) -> Callable[[], None]:
     """A graph body: a T-row prompt chunk's causal attention with btb's prefill kernel, the orientation this card
-    takes (`flash_prefill_kernel`), no rows before it."""
+    takes (`flash_prefill`), no rows before it."""
     Hq, Hk, D = HEADS
     K, V = _bf16(Hk, T, D, device=dev), _bf16(Hk, T, D, device=dev)
     q, out = _bf16(T, Hq, D, device=dev), torch.empty(T, Hq, D, dtype=torch.bfloat16, device=dev)
     run = torch.empty(T * Hq * D, device=dev)  # the rows' float32 states
-    P, ci, cf = k.ptr, ctypes.c_int, ctypes.c_float
     tpb = k.flash_prefill_rows(D) // (Hq // Hk)  # a block's tokens, each with its G heads
 
     def body() -> None:
-        k.launch(
-            k.flash_prefill_kernel(D),
-            ((T + tpb - 1) // tpb, Hk, 1),
-            (128, 1, 1),
-            [P(q), P(K), P(V), P(out), ci(0), ci(T), ci(Hq), ci(Hk), ci(K.stride(0)), ci(K.stride(1))]
-            + [cf(D**-0.5), ci(0), P(None), P(run)],
+        k.flash_prefill(
+            D, ((T + tpb - 1) // tpb, Hk, 1), (128, 1, 1), k.ptr(Query, q), k.ptr(KCache, K), k.ptr(VCache, V),
+            k.ptr(AttnOut, out), ChunkStart(0), Rows(T), QHeads(Hq), KvHeads(Hk), CacheHeadStride(K.stride(0)),
+            CacheRowStride(K.stride(1)), AttnScale(D**-0.5), Window(0), k.ptr(RowMap, None), k.ptr(PrefillRun, run),
             shared=k.flash_prefill_smem(D),
-        )
+        )  # fmt: skip
 
     return body
 
 
-def _card_prefill(rep: Report, k: Any, dev: torch.device, past: int, peak: float, l2: int) -> None:
+def _card_prefill(rep: Report, k: _Cuda | None, dev: torch.device, past: int, peak: float, l2: int) -> None:
     """a prefill's attention by rows, btb's and torch's, and a mixture prefill's experts as one grouped matmul by the
     rows each expert takes"""
     Hq, Hk, D = HEADS

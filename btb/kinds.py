@@ -1,14 +1,15 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 """The engine's named vocabularies as StrEnums, each spelled once: a member equals its string (a config's
 `layer_types` entry, a report's field), hashes like it and JSON-encodes as it, so the enums drop in where the
-strings were and the names stop being scattered. Torch-free."""
+strings were and the names stop being scattered. The card kernels' parameter roles close the file, a NewType each.
+Torch-free."""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, NewType
 
 # token ids, the currency of the engine's inputs and outputs; TokenRows a batch of them (ragged prompts, a
 # tree's children per node)
@@ -462,3 +463,376 @@ class PassReport:
 
     def __contains__(self, tag: PassTag) -> bool:
         return tag in self.tags
+
+
+# --- card kernel roles: written by `python build.py bindings` from native/cuda/btb_roles.cuh ---
+# Each card kernel parameter's role as its own type (btb/engine/card_launch.py types the launchers with
+# them): a pointer role's value is a card address of its element, a scalar role's the value itself. So two
+# of a launch's arguments swapped, or a value of one role where another goes, fail the type check.
+
+# --- a pass's rows ---
+# int: T: the rows a launch carries (a pass's tokens, a matvec's M)
+Rows = NewType("Rows", int)
+# int*: [1]: the cache's rows before the pass, read on the card at each replay
+PrefixLen = NewType("PrefixLen", int)
+# int*: [T]: each row's depth in the pass's tree
+Depths = NewType("Depths", int)
+# int*: [T]: each row's parent in the pass's tree, -1 the prefix, -2 padding; null a chain
+TreeParents = NewType("TreeParents", int)
+# int*: [3 + 3 T]: the rows as T sequences a token each (base, step, W, then col, off, len)
+RowsLayout = NewType("RowsLayout", int)
+# int*: [cap]: the cache's row map, a logical row to its slot in its page; null none
+RowMap = NewType("RowMap", int)
+
+# --- matvecs and GEMMs ---
+# bf16*: [R, C] row-major: a matvec's or GEMM's weight
+Weight = NewType("Weight", int)
+# bf16*: [T, C]: the rows a matvec or GEMM reads
+MatIn = NewType("MatIn", int)
+# bf16*: [T, R]: the rows it writes
+MatOut = NewType("MatOut", int)
+# float*: [T, C] float32: the host gemv's rows, read by its card twin
+MatInF32 = NewType("MatInF32", int)
+# float*: [T, R] float32: the rows the host gemv's card twin writes
+MatOutF32 = NewType("MatOutF32", int)
+# int: R: the weight's rows, the output's width
+OutDim = NewType("OutDim", int)
+# int: C: the weight's columns, the input's width
+InDim = NewType("InDim", int)
+# bf16*: [T, 2 I]: the MLP's gate then up projection
+GateUp = NewType("GateUp", int)
+# bf16*: [T, I]: act(gate) * up, the down projection's input
+MlpAct = NewType("MlpAct", int)
+# int: I: the MLP's intermediate width
+Intermediate = NewType("Intermediate", int)
+# unsigned char*: [seats, groups, 16]: MXFP4 experts' 32-value blocks, two fp4 codes a byte
+Mx4Blocks = NewType("Mx4Blocks", int)
+# unsigned char*: [seats, groups]: each block's power-of-two scale, biased by 127
+Mx4Scales = NewType("Mx4Scales", int)
+# int*: [n]: the experts' seats in a depot's stacks
+Seats = NewType("Seats", int)
+# long long: the 32-value blocks of one expert
+Mx4Groups = NewType("Mx4Groups", int)
+# bf16*: [n, groups * 32]: the experts widened to bf16
+Widened = NewType("Widened", int)
+# int*: [1]: the share of each weight row warmed into L2, in 256ths, read on the card
+WarmShare = NewType("WarmShare", int)
+# int*: [1]: where the warm-up's loads land, so they are kept
+WarmSink = NewType("WarmSink", int)
+# int*: [1]: the tensor cores' self-check's mismatches, zeroed before it
+MmaMisses = NewType("MmaMisses", int)
+
+# --- norms, rope and the cache ---
+# bf16*: [T, H]: the residual stream, added to in place
+Residual = NewType("Residual", int)
+# bf16*: [T, H]: a block's output, added to the residual; null adds nothing
+BlockOut = NewType("BlockOut", int)
+# bf16*: [H]: an RMSNorm's weight
+NormWeight = NewType("NormWeight", int)
+# float: an RMSNorm's epsilon
+NormEps = NewType("NormEps", float)
+# int: 1: the norm's weight is zero-centred (times 1 + w); 0: times w
+NormCentered = NewType("NormCentered", int)
+# bf16*: [T, H]: an RMSNorm's output
+Normed = NewType("Normed", int)
+# int: H: the hidden width
+Hidden = NewType("Hidden", int)
+# bf16*: [T, (Hq + 2 Hk) D]: the merged q, k and v projection's rows
+Qkv = NewType("Qkv", int)
+# int: a Qkv row's width, in elements
+QkvWidth = NewType("QkvWidth", int)
+# int: the elements between two query heads of a Qkv row
+QHeadStride = NewType("QHeadStride", int)
+# int: where a Qkv row's keys start
+KColumn = NewType("KColumn", int)
+# int: where a Qkv row's values start
+VColumn = NewType("VColumn", int)
+# bf16*: [D]: the query heads' norm weight; null no norm
+QNorm = NewType("QNorm", int)
+# bf16*: [D]: the key heads' norm weight; null no norm
+KNorm = NewType("KNorm", int)
+# bf16*: [positions, ts]: the model's rotary cosines
+RopeCos = NewType("RopeCos", int)
+# bf16*: [positions, ts]: the model's rotary sines
+RopeSin = NewType("RopeSin", int)
+# int: ts: a rotary table's row width
+RopeStride = NewType("RopeStride", int)
+# int: the dims a head's rope turns; the rest pass through
+RopeDims = NewType("RopeDims", int)
+# int: 1: the keys go into the cache as projected (the indexer's raw keys)
+KeepRawKey = NewType("KeepRawKey", int)
+# bf16*: [T, Hq, D]: the query heads, normed and roped
+Query = NewType("Query", int)
+# bf16*: a layer's key rows: head g's row j at g * hs + j * rs
+KCache = NewType("KCache", int)
+# bf16*: a layer's value rows, laid out as its keys
+VCache = NewType("VCache", int)
+# int: Hq: the query heads
+QHeads = NewType("QHeads", int)
+# int: Hk: the key and value heads
+KvHeads = NewType("KvHeads", int)
+# int: hs: the elements between two heads of the cache
+CacheHeadStride = NewType("CacheHeadStride", int)
+# int: rs: the elements between two rows of the cache
+CacheRowStride = NewType("CacheRowStride", int)
+
+# --- attention ---
+# bf16*: [T, Hq, D]: the attention's output
+AttnOut = NewType("AttnOut", int)
+# float: the scores' scale, 1 / sqrt(D) unless the model says otherwise
+AttnScale = NewType("AttnScale", float)
+# int: a sliding layer's window, in keys; 0 the whole cache
+Window = NewType("Window", int)
+# float*: [S, T, Hq]: each split's running max, for the last block to fold
+PartMax = NewType("PartMax", int)
+# float*: [S, T, Hq]: each split's running sum of exponentials
+PartSum = NewType("PartSum", int)
+# float*: [S, T, Hq, D]: each split's running output
+PartAcc = NewType("PartAcc", int)
+# int*: [T, Hq]: the splits arrived so far, zero between launches
+Arrivals = NewType("Arrivals", int)
+# int: n0: a prompt chunk's first position
+ChunkStart = NewType("ChunkStart", int)
+# float*: [T, Hq, D]: each row's running output across its key groups
+PrefillRun = NewType("PrefillRun", int)
+# bf16*: the output gate's logits, at their own place in the query projection's rows
+OutGate = NewType("OutGate", int)
+# int: the elements between two rows of the gate
+GateRowStride = NewType("GateRowStride", int)
+# int: the elements between two heads of the gate
+GateHeadStride = NewType("GateHeadStride", int)
+# int: D: a head's width
+HeadDim = NewType("HeadDim", int)
+# bf16*: [T, Hq D]: the attention's output times sigmoid(gate)
+GatedAttn = NewType("GatedAttn", int)
+# int: Hq D: an attention output row's width
+AttnWidth = NewType("AttnWidth", int)
+
+# --- Qwen4's sparse attention's indexer ---
+# bf16*: [T, Hi, DI]: the indexer's query heads
+IdxQuery = NewType("IdxQuery", int)
+# bf16*: [cap, DI]: the indexer's raw keys, a row a position
+IdxRawKey = NewType("IdxRawKey", int)
+# bf16*: [NBcap, DI]: the committed complete blocks' pooled keys
+IdxPooled = NewType("IdxPooled", int)
+# int*: [2]: the pooled blocks, then the pool's arrival count
+IdxPooledLen = NewType("IdxPooledLen", int)
+# bf16*: [DI]: the indexer's key norm weight
+IdxKNorm = NewType("IdxKNorm", int)
+# int: Hi: the indexer's heads
+IdxHeads = NewType("IdxHeads", int)
+# int: r: the positions a block pools
+BlockRatio = NewType("BlockRatio", int)
+# int: the blocks a row keeps
+TopBlocks = NewType("TopBlocks", int)
+# int: NBcap: the pooled keys' rows
+PooledCap = NewType("PooledCap", int)
+# int: the most blocks a pool adds
+MaxNewBlocks = NewType("MaxNewBlocks", int)
+# float*: the indexer's block scores, its scratch
+IdxScores = NewType("IdxScores", int)
+# int*: [T, ktop]: each row's picked blocks
+PickedBlocks = NewType("PickedBlocks", int)
+# int*: [T]: each row's picked block count
+PickedCount = NewType("PickedCount", int)
+
+# --- the step's handoff to the host ---
+# long long*: [1]: the step's token, on the card
+StepToken = NewType("StepToken", int)
+# long long*: pinned host memory: the step's token
+HostToken = NewType("HostToken", int)
+# int*: pinned host memory: the cache's length after the step
+HostLen = NewType("HostLen", int)
+# long long*: pinned host memory: the card's clock at the step's end, ns
+HostClock = NewType("HostClock", int)
+
+# --- the gated DeltaNet ---
+# float*: [T, C]: the q | k | v projection before its conv
+DeltaMixed = NewType("DeltaMixed", int)
+# float*: [T, Hv dv]: the output gate's input
+DeltaZ = NewType("DeltaZ", int)
+# float*: [T, Hv]: the decay's input
+DeltaA = NewType("DeltaA", int)
+# float*: [T, Hv]: the write strength's input
+DeltaB = NewType("DeltaB", int)
+# bf16*: [T, ps]: the card program's merged projection, the nodes' inputs as its columns
+DeltaProj = NewType("DeltaProj", int)
+# int: ps: a DeltaProj row's width
+ProjStride = NewType("ProjStride", int)
+# int: where a DeltaProj row's q | k | v starts
+QkvColumn = NewType("QkvColumn", int)
+# int: where a DeltaProj row's z starts
+ZColumn = NewType("ZColumn", int)
+# int: where a DeltaProj row's b starts
+BColumn = NewType("BColumn", int)
+# int: where a DeltaProj row's a starts
+AColumn = NewType("AColumn", int)
+# int*: [T]: the DeltaProj row a node reads; null row j; negative ends the pass
+ProjRows = NewType("ProjRows", int)
+# float*: [C, K]: the conv's weight
+ConvWeight = NewType("ConvWeight", int)
+# float*: [C]: the conv's bias; null none
+ConvBias = NewType("ConvBias", int)
+# float*: [C, K]: the conv's window
+ConvState = NewType("ConvState", int)
+# float*: [Hv, dk, dv]: the recurrent state
+DeltaState = NewType("DeltaState", int)
+# float*: [slots, Hv, dk, dv]: the tree's node states; null steps the state in place
+DeltaScratch = NewType("DeltaScratch", int)
+# int*: [T]: the scratch slot a node's state goes to; null a slot a node
+ScratchSlots = NewType("ScratchSlots", int)
+# float*: [Hv]: the decay's log rate
+DeltaALog = NewType("DeltaALog", int)
+# float*: [Hv]: the decay's time-step bias
+DeltaDtBias = NewType("DeltaDtBias", int)
+# float*: [dv]: the output norm's weight
+DeltaNormWeight = NewType("DeltaNormWeight", int)
+# int: the output gate: 1 sigmoid, else silu
+DeltaGate = NewType("DeltaGate", int)
+# int: C: a conv's channels
+ConvChannels = NewType("ConvChannels", int)
+# int: K: a conv's taps
+ConvTaps = NewType("ConvTaps", int)
+# int: a conv's dilation
+ConvDilation = NewType("ConvDilation", int)
+# int: the DeltaNet's key heads
+DeltaKHeads = NewType("DeltaKHeads", int)
+# int: Hv: the DeltaNet's value heads
+DeltaVHeads = NewType("DeltaVHeads", int)
+# int: dk: a key head's width
+DeltaKDim = NewType("DeltaKDim", int)
+# int: dv: a value head's width
+DeltaVDim = NewType("DeltaVDim", int)
+# float*: [T, Hv dv] float32: the DeltaNet's output
+DeltaOutF32 = NewType("DeltaOutF32", int)
+# bf16*: [T, Hv dv]: the DeltaNet's output, rounded to bf16
+DeltaOut = NewType("DeltaOut", int)
+
+# --- Qwen4's hyper-connection streams ---
+# bf16*: [T, G, H]: the streams, added to in place
+Streams = NewType("Streams", int)
+# bf16*: [T, G]: the block's inject weights
+Inject = NewType("Inject", int)
+# int: G: the streams
+StreamCount = NewType("StreamCount", int)
+# bf16*: [T, ds]: the mixer's down projection rows (then the inject logits)
+MixDown = NewType("MixDown", int)
+# int: ds: a MixDown row's width
+MixDownStride = NewType("MixDownStride", int)
+# bf16*: [T, R]: silu(down / G), the mixer's low-rank activation
+MixAct = NewType("MixAct", int)
+# int: R: the mixer's rank
+MixRank = NewType("MixRank", int)
+# bf16*: [T, G, H]: the mixer's up projection's logits
+MixUp = NewType("MixUp", int)
+# bf16*: [T, H]: the streams mixed
+Mixed = NewType("Mixed", int)
+
+# --- Qwen4's MoE ---
+# bf16*: [T, ls]: the experts' logits, then the shared expert's gate logit
+RouterLogits = NewType("RouterLogits", int)
+# int: ls: a RouterLogits row's width
+RouterStride = NewType("RouterStride", int)
+# int: E: the routed experts
+Experts = NewType("Experts", int)
+# int: k: the experts a row takes
+TopExperts = NewType("TopExperts", int)
+# int*: [T, k]: each row's experts
+ExpertIds = NewType("ExpertIds", int)
+# bf16*: [T, k]: each row's expert weights
+ExpertWeights = NewType("ExpertWeights", int)
+# int*: pinned host memory: each row's experts; null none
+HostExpertIds = NewType("HostExpertIds", int)
+# bf16*: pinned host memory: each row's expert weights
+HostExpertWeights = NewType("HostExpertWeights", int)
+# unsigned*: [1]: the router's blocks arrived, zero between launches
+RouteCount = NewType("RouteCount", int)
+# int*: [1]: the routing's sequence number, on the card
+RouteSeq = NewType("RouteSeq", int)
+# int*: pinned host memory: the sequence number of the last rows out; null none
+HostRouteSeq = NewType("HostRouteSeq", int)
+# bf16*: [T, H]: the routed experts' sum
+Routed = NewType("Routed", int)
+# bf16*: [T, H]: the shared expert's output
+SharedOut = NewType("SharedOut", int)
+# bf16*: the shared expert's gate logit, row t at t * ls
+SharedGate = NewType("SharedGate", int)
+# bf16*: [T, H]: the MoE's output; may be Routed's buffer
+MoeOut = NewType("MoeOut", int)
+
+# --- Qwen4's per-layer n-gram embedding ---
+# bf16*: [T, ks]: the n-gram embeddings' key then value projection
+PleKv = NewType("PleKv", int)
+# int: ks: a PleKv row's width
+PleKvStride = NewType("PleKvStride", int)
+# bf16*: [T, G H]: the streams through the query norm
+PleQuery = NewType("PleQuery", int)
+# bf16*: [G H]: the key norm's weight
+PleKNorm = NewType("PleKNorm", int)
+# bf16*: [G H]: the conv norm's weight
+PleConvNorm = NewType("PleConvNorm", int)
+# float: 1 / sqrt(H)
+InvSqrtHidden = NewType("InvSqrtHidden", float)
+# bf16*: [T, G H]: sigmoid(gate) * value
+PleGated = NewType("PleGated", int)
+# bf16*: [T, G H]: the gated rows through the conv norm
+PleNormed = NewType("PleNormed", int)
+# bf16*: [C, K]: the dilated conv's weight
+PleConvWeight = NewType("PleConvWeight", int)
+# bf16*: [C, (K - 1) dil]: the conv's kept window, oldest first
+PleWindow = NewType("PleWindow", int)
+# int: 1: a one-row step shifts its row into the window
+PleUpdate = NewType("PleUpdate", int)
+
+# --- sampling ---
+# float*: [R, V] float32: the rows' logits
+Logits = NewType("Logits", int)
+# int: V: a Logits row's width
+Vocab = NewType("Vocab", int)
+# float*: [2]: 1 / temperature, top_p
+SampleParams = NewType("SampleParams", int)
+# unsigned*: [R]: each row's max scaled logit, as ordered bits
+SampleMax = NewType("SampleMax", int)
+# int: the radix level, 0 to 2
+RadixLevel = NewType("RadixLevel", int)
+# int: 0 counts (top-k), 1 masses (top-p)
+SampleMode = NewType("SampleMode", int)
+# unsigned*: [R]: the threshold resolved so far, as ordered bits
+RadixPrefix = NewType("RadixPrefix", int)
+# unsigned*: [R]: the floor a token must clear, as ordered bits
+RadixFloor = NewType("RadixFloor", int)
+# unsigned long long*: [R, 2048]: a level's histogram
+RadixHist = NewType("RadixHist", int)
+# unsigned long long*: [R]: the remainder a level carries to the next
+RadixCarry = NewType("RadixCarry", int)
+# int: the tokens top-k keeps; 0 all
+TopK = NewType("TopK", int)
+# unsigned*: [R]: the top-k threshold, as ordered bits
+TopKFloor = NewType("TopKFloor", int)
+# unsigned*: [R]: the top-p threshold, as ordered bits
+TopPFloor = NewType("TopPFloor", int)
+# unsigned long long*: [R]: each row's best draw, packed
+SampleBest = NewType("SampleBest", int)
+# unsigned*: [R]: each row's token
+SampledTokens = NewType("SampledTokens", int)
+# unsigned*: [2]: the seed, low word first
+NoiseSeed = NewType("NoiseSeed", int)
+# int*: [1]: the position the noise is keyed to
+NoisePos = NewType("NoisePos", int)
+# int: the key's salt; 0 none
+NoiseSalt = NewType("NoiseSalt", int)
+# unsigned*: [R, 2]: each row's noise key, low word first
+NoiseKeys = NewType("NoiseKeys", int)
+# float*: [T, Vd]: the drafter's distribution a node
+DraftProbs = NewType("DraftProbs", int)
+# int*: [T, C]: each node's drafted children in draw order, -1 padding
+DraftKids = NewType("DraftKids", int)
+# unsigned*: [T]: 0 where the drafts are point masses
+HasDraftProbs = NewType("HasDraftProbs", int)
+# int: Vd: a DraftProbs row's width
+DraftVocab = NewType("DraftVocab", int)
+# int: C: a node's drafted children
+DraftWidth = NewType("DraftWidth", int)
+# unsigned*: [T]: each node's pick, (slot + 1) << 24 | token
+VerifyPicks = NewType("VerifyPicks", int)
+# --- end of the card kernel roles ---

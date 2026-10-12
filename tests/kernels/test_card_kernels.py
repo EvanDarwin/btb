@@ -18,6 +18,51 @@ from pytest import CaptureFixture
 
 from btb.engine.cuda import _CudaMixin
 from btb.engine.native import NativeArgsError
+from btb.kinds import (
+    Arrivals,
+    AttnOut,
+    AttnScale,
+    BlockOut,
+    CacheHeadStride,
+    CacheRowStride,
+    ChunkStart,
+    Depths,
+    GateUp,
+    Hidden,
+    InDim,
+    Intermediate,
+    KCache,
+    KNorm,
+    KvHeads,
+    MatIn,
+    MatOut,
+    MlpAct,
+    NormCentered,
+    Normed,
+    NormEps,
+    NormWeight,
+    OutDim,
+    PartAcc,
+    PartMax,
+    PartSum,
+    PrefillRun,
+    PrefixLen,
+    QHeads,
+    Qkv,
+    QNorm,
+    Query,
+    Residual,
+    RopeCos,
+    RopeSin,
+    RowMap,
+    Rows,
+    RowsLayout,
+    TreeParents,
+    VCache,
+    Weight,
+    Window,
+)
+from tests.cert.cuda_ops import bindings
 from tests.helpers import need_card_kernels
 
 if TYPE_CHECKING:
@@ -31,9 +76,6 @@ def cu() -> _Cuda:
     return need_card_kernels()
 
 
-P = lambda t: ctypes.c_void_p(0 if t is None else t.data_ptr())
-I = ctypes.c_int
-Fl = ctypes.c_float
 dev = "cuda"
 bf = torch.bfloat16
 
@@ -44,8 +86,45 @@ def _gemv(cu: _Cuda, W: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     Mk = next(m for m in (1, 2, 4, 8, 16, 32) if M <= m)
     xp = x if M == Mk else torch.cat([x, torch.zeros(Mk - M, C, device=dev, dtype=x.dtype)])
     y = torch.empty(Mk, R, device=dev, dtype=bf)
-    cu.launch(f"btb_gemv_bf16_m{Mk}", ((R + 3) // 4, 1, 1), (128, 1, 1), [P(W), P(xp), P(y), I(R), I(C)])
+    w, xi, yo = cu.ptr(Weight, W), cu.ptr(MatIn, xp), cu.ptr(MatOut, y)
+    cu.btb_gemv_bf16(Mk, ((R + 3) // 4, 1, 1), (128, 1, 1), w, xi, yo, OutDim(R), InDim(C))
     return y[:M]
+
+
+def _norm_rope(
+    cu: _Cuda,
+    qkv: torch.Tensor,
+    wq: torch.Tensor,
+    wk: torch.Tensor,
+    cos_t: torch.Tensor,
+    sin_t: torch.Tensor,
+    n0: torch.Tensor,
+    depth: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    qo: torch.Tensor,
+    Hq: int,
+    tbl: torch.Tensor | None = None,
+    eps: float = 1e-6,
+) -> None:
+    """`btb_norm_rope_kv_d{D}` over qkv's T rows after *n0 at depth[t], or through the row map `tbl`
+    (`btb_norm_rope_kv_tbl_d{D}`): the q heads into `qo`, the k and v rows into `K`/`V` [Hk, cap, D] at their strides"""
+    T, Hk, D = int(qkv.shape[0]), int(K.shape[0]), int(K.shape[2])
+    grid = (Hq + 2 * Hk, T, 1)
+    rows = (cu.ptr(Qkv, qkv), cu.ptr(QNorm, wq), cu.ptr(KNorm, wk), NormEps(eps), cu.ptr(RopeCos, cos_t))
+    sin, n0p, dep = cu.ptr(RopeSin, sin_t), cu.ptr(PrefixLen, n0), cu.ptr(Depths, depth)
+    Kp, Vp, q = cu.ptr(KCache, K), cu.ptr(VCache, V), cu.ptr(Query, qo)
+    hs, rs = CacheHeadStride(K.stride(0)), CacheRowStride(K.stride(1))
+    if tbl is None:
+        cu.btb_norm_rope_kv(
+            D, grid, (32, 1, 1), *rows, sin, n0p, dep, Kp, Vp, q, Rows(T), QHeads(Hq), KvHeads(Hk), hs, rs,
+            NormCentered(0),
+        )  # fmt: skip
+    else:
+        cu.btb_norm_rope_kv_tbl(
+            D, grid, (32, 1, 1), *rows, sin, n0p, dep, Kp, Vp, q, Rows(T), QHeads(Hq), KvHeads(Hk), hs, rs,
+            NormCentered(0), cu.ptr(RowMap, tbl),
+        )  # fmt: skip
 
 
 @pytest.mark.parametrize("R,C", [(4096, 1024), (1024, 3072), (2560, 9728), (151936, 1024)])
@@ -110,14 +189,7 @@ def test_a_row_map_writes_each_row_into_its_page(cu: _Cuda, D: int) -> None:
     out: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     for K, V, mapped in ((zeros.clone(), zeros.clone(), None), (Kp, Vp, tbl)):
         qo = torch.empty(T, Hq, D, device=dev, dtype=bf)
-        cu.launch(
-            f"btb_norm_rope_kv{'_tbl' if mapped is not None else ''}_d{D}",
-            (Hq + 2 * Hk, T, 1),
-            (32, 1, 1),
-            [P(qkv), P(wq), P(wk), Fl(eps), P(cos_t), P(sin_t), P(n0t), P(depth), P(K), P(V), P(qo)]
-            + [I(T), I(Hq), I(Hk), I(K.stride(0)), I(K.stride(1)), I(0)]
-            + ([] if mapped is None else [P(mapped)]),
-        )
+        _norm_rope(cu, qkv, wq, wk, cos_t, sin_t, n0t, depth, K, V, qo, Hq, tbl=mapped, eps=eps)
         out.append((K, V, qo))
     (k0, v0, q0), (k1, v1, q1) = out
     assert torch.equal(q0, q1)
@@ -153,13 +225,7 @@ def test_position_major_rows_are_written_as_head_major_ones(cu: _Cuda, Hq: int, 
     for lay in (lambda t: t, _position_major):
         Kw, Vw = lay(torch.zeros(Hk, cap, D, device=dev, dtype=bf)), lay(torch.zeros(Hk, cap, D, device=dev, dtype=bf))
         qo = torch.empty(T, Hq, D, device=dev, dtype=bf)
-        cu.launch(
-            f"btb_norm_rope_kv_d{D}",
-            (Hq + 2 * Hk, T, 1),
-            (32, 1, 1),
-            [P(qkv), P(wq), P(wk), Fl(eps), P(cos_t), P(sin_t), P(n0t), P(depth), P(Kw), P(Vw), P(qo)]
-            + [I(T), I(Hq), I(Hk), I(Kw.stride(0)), I(Kw.stride(1)), I(0)],
-        )
+        _norm_rope(cu, qkv, wq, wk, cos_t, sin_t, n0t, depth, Kw, Vw, qo, Hq, eps=eps)
         written.append((Kw, Vw, qo))
     (k0, v0, q0), (k1, v1, q1) = written
     assert torch.equal(k0, k1) and torch.equal(v0, v1) and torch.equal(q0, q1)
@@ -211,13 +277,12 @@ def test_norm_rope_kv_rows_writes_each_row_as_its_own_step(
     V = torch.zeros_like(K)
     qo = torch.zeros(T, Hq, D, device=dev, dtype=bf)
     rw = _rows_layout(base, step, W, rows)
-    common = [I(T), I(Hq), I(Hk), I(K.stride(0)), I(K.stride(1)), I(0)]
-    cu.launch(
-        f"btb_norm_rope_kv_rows_d{D}",
-        (Hq + 2 * Hk, T, 1),
-        (32, 1, 1),
-        [P(qkv), P(wq), P(wk), Fl(eps), P(cos_t), P(sin_t), P(rw), P(K), P(V), P(qo), *common],
-    )
+    cu.btb_norm_rope_kv_rows(
+        D, (Hq + 2 * Hk, T, 1), (32, 1, 1), cu.ptr(Qkv, qkv), cu.ptr(QNorm, wq), cu.ptr(KNorm, wk), NormEps(eps),
+        cu.ptr(RopeCos, cos_t), cu.ptr(RopeSin, sin_t), cu.ptr(RowsLayout, rw), cu.ptr(KCache, K), cu.ptr(VCache, V),
+        cu.ptr(Query, qo), Rows(T), QHeads(Hq), KvHeads(Hk), CacheHeadStride(K.stride(0)), CacheRowStride(K.stride(1)),
+        NormCentered(0),
+    )  # fmt: skip
     written = torch.zeros(cap, dtype=torch.bool, device=dev)
     for t, r in enumerate(rows):
         if r is None:
@@ -232,30 +297,7 @@ def test_norm_rope_kv_rows_writes_each_row_as_its_own_step(
         x1 = qkv[t : t + 1].contiguous()
         n0t = torch.tensor([pos], dtype=torch.int32, device=dev)
         d0 = torch.zeros(1, dtype=torch.int32, device=dev)
-        cu.launch(
-            f"btb_norm_rope_kv_d{D}",
-            (Hq + 2 * Hk, 1, 1),
-            (32, 1, 1),
-            [
-                P(x1),
-                P(wq),
-                P(wk),
-                Fl(eps),
-                P(cos_t),
-                P(sin_t),
-                P(n0t),
-                P(d0),
-                P(K1),
-                P(V1),
-                P(q1),
-                I(1),
-                I(Hq),
-                I(Hk),
-                I(K1.stride(0)),
-                I(K1.stride(1)),
-                I(0),
-            ],
-        )
+        _norm_rope(cu, x1, wq, wk, cos_t, sin_t, n0t, d0, K1, V1, q1, Hq, eps=eps)
         assert torch.equal(qo[t], q1[0])
         assert torch.equal(K[:, slot], K1[:, pos]) and torch.equal(V[:, slot], V1[:, pos])
     assert bool((K[:, ~written] == 0).all()) and bool((V[:, ~written] == 0).all()), "no other slot is touched"
@@ -283,30 +325,7 @@ def test_norm_rope_kv_is_bit_exact_against_the_fused_ops(cu: _Cuda, D: int) -> N
     K = torch.zeros(Hk, cap, D, device=dev, dtype=bf)
     V = torch.zeros_like(K)
     qo = torch.empty(T, Hq, D, device=dev, dtype=bf)
-    cu.launch(
-        f"btb_norm_rope_kv_d{D}",
-        (Hq + 2 * Hk, T, 1),
-        (32, 1, 1),
-        [
-            P(qkv),
-            P(wq),
-            P(wk),
-            Fl(eps),
-            P(cos_t),
-            P(sin_t),
-            P(n0t),
-            P(depth),
-            P(K),
-            P(V),
-            P(qo),
-            I(T),
-            I(Hq),
-            I(Hk),
-            I(K.stride(0)),
-            I(K.stride(1)),
-            I(0),
-        ],
-    )
+    _norm_rope(cu, qkv, wq, wk, cos_t, sin_t, n0t, depth, K, V, qo, Hq, eps=eps)
     qs = qkv[:, : Hq * D].view(T, Hq, D)
     ks = qkv[:, Hq * D : (Hq + Hk) * D].view(T, Hk, D)
     vs = qkv[:, (Hq + Hk) * D :].view(T, Hk, D)
@@ -328,7 +347,11 @@ def test_add_rmsnorm_is_bit_exact(cu: _Cuda, H: int, centered: bool) -> None:
     y = torch.randn(T, H, device=dev, dtype=bf)
     w = (torch.rand(H, device=dev, dtype=bf) + 0.5) if not centered else (torch.rand(H, device=dev, dtype=bf) - 0.5)
     h2, x = h.clone(), torch.empty_like(h)
-    cu.launch("btb_add_rmsnorm", (T, 1, 1), (256, 1, 1), [P(h2), P(y), P(w), Fl(eps), P(x), I(H), I(centered)])
+    wp, cen = cu.ptr(NormWeight, w), NormCentered(int(centered))
+    cu.btb_add_rmsnorm(
+        (T, 1, 1), (256, 1, 1), cu.ptr(Residual, h2), cu.ptr(BlockOut, y), wp, NormEps(eps), cu.ptr(Normed, x),
+        Hidden(H), cen,
+    )  # fmt: skip
     hr = h + y
     if centered:
         xr = (F.rms_norm(hr.float(), (H,), None, eps) * (1.0 + w.float())).to(bf)
@@ -338,7 +361,10 @@ def test_add_rmsnorm_is_bit_exact(cu: _Cuda, H: int, centered: bool) -> None:
     assert torch.equal(x, xr)
     # without a residual: h untouched
     h3, x0 = h.clone(), torch.empty_like(h)
-    cu.launch("btb_add_rmsnorm", (T, 1, 1), (256, 1, 1), [P(h3), P(None), P(w), Fl(eps), P(x0), I(H), I(centered)])
+    cu.btb_add_rmsnorm(
+        (T, 1, 1), (256, 1, 1), cu.ptr(Residual, h3), cu.ptr(BlockOut, None), wp, NormEps(eps), cu.ptr(Normed, x0),
+        Hidden(H), cen,
+    )  # fmt: skip
     assert torch.equal(h3, h)
 
 
@@ -349,10 +375,14 @@ def test_gemv_with_silu_folded_in_matches_the_two_kernels(cu: _Cuda, M: int) -> 
     W = torch.randn(H, Ii, device=dev, dtype=bf)
     gu = torch.randn(M, 2 * Ii, device=dev, dtype=bf)
     m = torch.empty(M, Ii, device=dev, dtype=bf)
-    cu.launch("btb_silu_mul", (min(4096, (M * Ii + 255) // 256), 1, 1), (256, 1, 1), [P(gu), P(m), I(M), I(Ii)])
+    gup = cu.ptr(GateUp, gu)
+    cu.btb_silu_mul(
+        (min(4096, (M * Ii + 255) // 256), 1, 1), (256, 1, 1), gup, cu.ptr(MlpAct, m), Rows(M), Intermediate(Ii)
+    )
     two = _gemv(cu, W, m)
     one = torch.empty(M, H, device=dev, dtype=bf)
-    cu.launch(f"btb_gemv_silu_bf16_m{M}", ((H + 3) // 4, 1, 1), (128, 1, 1), [P(W), P(gu), P(one), I(H), I(Ii)])
+    w, yo = cu.ptr(Weight, W), cu.ptr(MatOut, one)
+    cu.btb_gemv_silu_bf16(M, ((H + 3) // 4, 1, 1), (128, 1, 1), w, gup, yo, OutDim(H), InDim(Ii))
     assert torch.equal(one, two)
 
 
@@ -363,10 +393,10 @@ def test_a_launch_is_held_to_the_kernels_parameters(cu: _Cuda) -> None:
     a count once held is not held again, a change of count always is"""
     if cu.param_sizes("btb_silu_mul") is None:
         pytest.skip("this driver cannot report a kernel's parameters (cuFuncGetParamInfo is CUDA 12.4's)")
-    for name in cu.KERNELS:
-        sizes = cu.param_sizes(name)
-        assert sizes and all(s in (4, 8) for s in sizes), (name, sizes)
     assert cu.param_sizes("btb_silu_mul") == (8, 8, 4, 4)
+    # `launch` itself, under the typed launchers: the raw arguments a stale caller would hand it
+    P = lambda t: ctypes.c_void_p(t.data_ptr())
+    I = ctypes.c_int
     T, Ii = 2, 512
     gu = torch.randn(T, 2 * Ii, device=dev, dtype=bf)
     m = torch.zeros(T, Ii, device=dev, dtype=bf)
@@ -384,12 +414,31 @@ def test_a_launch_is_held_to_the_kernels_parameters(cu: _Cuda) -> None:
         cu.launch("btb_silu_mul", grid, block, [P(gu), P(m), I(T), I(Ii), I(0)])
 
 
+def test_the_bindings_are_the_loaded_kernels(cu: _Cuda) -> None:
+    """every kernel the card loads takes the parameters its generated launcher packs (btb/engine/card_launch.py, from
+    native/cuda's signatures), width for width as the driver reports them: a fatbin built from other signatures than
+    the bindings were written from is caught here, before a launch of it"""
+    if cu.param_sizes("btb_silu_mul") is None:
+        pytest.skip("this driver cannot report a kernel's parameters (cuFuncGetParamInfo is CUDA 12.4's)")
+    sizes = {"int": 4, "unsigned": 4, "float": 4, "long long": 8, "unsigned long long": 8, "unsigned char": 1}
+    roles = {r.name: r.ctype for r in bindings().card_roles()}
+    kernels = bindings().card_kernels()
+    assert sorted(n for k in kernels for n in k.names()) == sorted(cu.KERNELS)
+    for k in kernels:
+        want = tuple(8 if p.pointer else sizes[roles[p.role]] for p in k.params)
+        for name in k.names():
+            assert cu.param_sizes(name) == want, name
+
+
 def test_silu_mul_is_bit_exact(cu: _Cuda) -> None:
     torch.manual_seed(5)
     T, Ii = 4, 3072
     gu = torch.randn(T, 2 * Ii, device=dev, dtype=bf)
     m = torch.empty(T, Ii, device=dev, dtype=bf)
-    cu.launch("btb_silu_mul", (min(4096, (T * Ii + 255) // 256), 1, 1), (256, 1, 1), [P(gu), P(m), I(T), I(Ii)])
+    cu.btb_silu_mul(
+        (min(4096, (T * Ii + 255) // 256), 1, 1), (256, 1, 1), cu.ptr(GateUp, gu), cu.ptr(MlpAct, m), Rows(T),
+        Intermediate(Ii),
+    )  # fmt: skip
     assert torch.equal(m, F.silu(gu[:, :Ii]).mul_(gu[:, Ii:]))
 
 
@@ -419,9 +468,10 @@ def _mma(cu: _Cuda, W: torch.Tensor, x: torch.Tensor, warps: int = 1, rows: int 
     R = W.shape[0]
     xp = x if M == 32 else torch.cat([x, torch.zeros(32 - M, C, device=dev, dtype=x.dtype)])
     y = torch.empty(32, R, device=dev, dtype=bf)
-    name = "btb_gemv_mma_bf16" if rows == 16 else "btb_gemv_mma8_bf16"
+    mv = cu.btb_gemv_mma_bf16 if rows == 16 else cu.btb_gemv_mma8_bf16
     grid = ((R + rows * warps - 1) // (rows * warps), 1, 1)
-    cu.launch(name, grid, (32 * warps, 1, 1), [P(W), P(xp), P(y), I(R), I(C), I(M)])
+    w, xi, yo = cu.ptr(Weight, W), cu.ptr(MatIn, xp), cu.ptr(MatOut, y)
+    mv(grid, (32 * warps, 1, 1), w, xi, yo, OutDim(R), InDim(C), Rows(M))
     return y[:M]
 
 
@@ -484,11 +534,15 @@ def test_the_glu_matvec_is_the_matvec_and_the_activation_bit_for_bit(
     x = torch.randn(M, C, device=dev, dtype=bf)
     gu = _mma(cu, W, x)
     want = torch.empty(M, Ii, device=dev, dtype=bf)
-    cu.launch(f"btb_{act}_mul", (min(4096, (M * Ii + 255) // 256), 1, 1), (256, 1, 1), [P(gu), P(want), I(M), I(Ii)])
+    act_mul = cu.btb_gelu_mul if act == "gelu" else cu.btb_silu_mul
+    glu = cu.btb_gemv_mma_glu_gelu if act == "gelu" else cu.btb_gemv_mma_glu_silu
+    act_grid = (min(4096, (M * Ii + 255) // 256), 1, 1)
+    act_mul(act_grid, (256, 1, 1), cu.ptr(GateUp, gu), cu.ptr(MlpAct, want), Rows(M), Intermediate(Ii))
     xp = x if M == 32 else torch.cat([x, torch.zeros(32 - M, C, device=dev, dtype=bf)])
     m = torch.empty(32, Ii, device=dev, dtype=bf)
     grid = ((Ii + 16 * warps - 1) // (16 * warps), 1, 1)
-    cu.launch(f"btb_gemv_mma_glu_{act}", grid, (32 * warps, 1, 1), [P(W), P(xp), P(m), I(Ii), I(C), I(M)])
+    w, xi, mo = cu.ptr(Weight, W), cu.ptr(MatIn, xp), cu.ptr(MlpAct, m)
+    glu(grid, (32 * warps, 1, 1), w, xi, mo, Intermediate(Ii), InDim(C), Rows(M))
     assert torch.equal(m[:M], want)
 
 
@@ -557,10 +611,10 @@ def test_gemv_mma_streams_the_weights_at_the_cards_ceiling(cu: _Cuda, capsys: Ca
             def body() -> None:
                 assert Ws is not None
                 grid, block = _CudaMixin._card_mma_launch(R, cu.sms)  # the engine's launch for the shape
+                mv = cu.btb_gemv_mma8_bf16 if _CudaMixin._card_mma_narrow(R, cu.sms) else cu.btb_gemv_mma_bf16
+                xi, yo = cu.ptr(MatIn, xs), cu.ptr(MatOut, y)
                 for W in Ws:
-                    cu.launch(
-                        _CudaMixin._card_mma_kernel(R, cu.sms), grid, block, [P(W), P(xs), P(y), I(R), I(C), I(m)]
-                    )
+                    mv(grid, block, cu.ptr(Weight, W), xi, yo, OutDim(R), InDim(C), Rows(m))
 
             for _ in range(3):
                 body()
@@ -614,7 +668,7 @@ def _flash(
     par: Sequence[int],
     scale: float,
     win: int = 0,
-    tbl: torch.Tensor | ctypes.c_void_p | None = None,
+    tbl: torch.Tensor | RowMap | None = None,
     cap: int | None = None,
 ) -> torch.Tensor:
     """the decode form `btb_attn_flash_d{D}`: T tokens after n0 rows, token t parented to par[t], every row's group
@@ -631,13 +685,16 @@ def _flash(
     pl = torch.zeros(S * T * Hq, device=dev)
     pa = torch.zeros(S * T * Hq * D, device=dev)
     cnt = torch.zeros(T * Hq, dtype=torch.int32, device=dev)
-    cu.launch(
-        f"btb_attn_flash_d{D}",
+    row_map = tbl if isinstance(tbl, int) else cu.ptr(RowMap, tbl)
+    cu.btb_attn_flash(
+        D,
         ((T * G + 7) // 8, S, Hk),  # a block 8 rows of a group, its warps its tiles (four at the widest head)
         (_fa_threads(D), 1, 1),
-        [P(q), P(K), P(V), P(out), P(n0t), P(pt), I(T), I(Hq), I(Hk), I(K.stride(0)), I(K.stride(1)), Fl(scale)]
-        + [P(pm), P(pl), P(pa), P(cnt), I(win), tbl if isinstance(tbl, ctypes.c_void_p) else P(tbl)],
-    )
+        cu.ptr(Query, q), cu.ptr(KCache, K), cu.ptr(VCache, V), cu.ptr(AttnOut, out), cu.ptr(PrefixLen, n0t),
+        cu.ptr(TreeParents, pt), Rows(T), QHeads(Hq), KvHeads(Hk), CacheHeadStride(K.stride(0)),
+        CacheRowStride(K.stride(1)), AttnScale(scale), cu.ptr(PartMax, pm), cu.ptr(PartSum, pl), cu.ptr(PartAcc, pa),
+        cu.ptr(Arrivals, cnt), Window(win), row_map,
+    )  # fmt: skip
     assert int(cnt.abs().sum()) == 0, "every row's count is reset by the block that folds it"
     return out
 
@@ -654,13 +711,12 @@ def _flash_rows(
     pl = torch.zeros(S * T * Hq, device=dev)
     pa = torch.zeros(S * T * Hq * D, device=dev)
     cnt = torch.zeros(T * Hq, dtype=torch.int32, device=dev)
-    cu.launch(
-        f"btb_attn_flash_rows_d{D}",
-        (T * ((Hq // Hk + 7) // 8), S, Hk),
-        (_fa_threads(D), 1, 1),
-        [P(q), P(K), P(V), P(out), P(rw), I(T), I(Hq), I(Hk), I(K.stride(0)), I(K.stride(1)), Fl(scale)]
-        + [P(pm), P(pl), P(pa), P(cnt), I(win)],
-    )
+    cu.btb_attn_flash_rows(
+        D, (T * ((Hq // Hk + 7) // 8), S, Hk), (_fa_threads(D), 1, 1), cu.ptr(Query, q), cu.ptr(KCache, K),
+        cu.ptr(VCache, V), cu.ptr(AttnOut, out), cu.ptr(RowsLayout, rw), Rows(T), QHeads(Hq), KvHeads(Hk),
+        CacheHeadStride(K.stride(0)), CacheRowStride(K.stride(1)), AttnScale(scale), cu.ptr(PartMax, pm),
+        cu.ptr(PartSum, pl), cu.ptr(PartAcc, pa), cu.ptr(Arrivals, cnt), Window(win),
+    )  # fmt: skip
     assert int(cnt.abs().sum()) == 0, "every row's count is reset by the block that folds it"
     return out
 
@@ -685,14 +741,13 @@ def _flash_prefill(
     tpb = cu.flash_prefill_rows(D) // (Hq // Hk)
     out = torch.full((T, Hq, D), float("nan"), device=dev, dtype=bf)
     run = torch.empty(T * Hq * D, device=dev)
-    cu.launch(
-        cu.flash_prefill_kernel(D, kq),
-        ((T + tpb - 1) // tpb, Hk, 1),
-        (128, 1, 1),
-        [P(q), P(K), P(V), P(out), I(n0), I(T), I(Hq), I(Hk), I(K.stride(0)), I(K.stride(1)), Fl(scale), I(win)]
-        + [P(tbl), P(run)],
+    prefill = cu.btb_attn_flash_prefill_kq if kq else cu.btb_attn_flash_prefill
+    prefill(
+        D, ((T + tpb - 1) // tpb, Hk, 1), (128, 1, 1), cu.ptr(Query, q), cu.ptr(KCache, K), cu.ptr(VCache, V),
+        cu.ptr(AttnOut, out), ChunkStart(n0), Rows(T), QHeads(Hq), KvHeads(Hk), CacheHeadStride(K.stride(0)),
+        CacheRowStride(K.stride(1)), AttnScale(scale), Window(win), cu.ptr(RowMap, tbl), cu.ptr(PrefillRun, run),
         shared=cu.flash_prefill_smem(D, kq),
-    )
+    )  # fmt: skip
     return out
 
 
@@ -709,6 +764,7 @@ def test_the_prefill_takes_the_form_its_card_passes(cu: _Cuda) -> None:
         want = "btb_attn_flash_prefill_kq_d" if not cu.mma_roles else "btb_attn_flash_prefill_d"
         assert cu.flash_prefill_kernel(D) == f"{want}{D}"
         assert cu.flash_prefill_smem(D) == cu.flash_prefill_smem(D, not cu.mma_roles)
+    assert cu.flash_prefill == (cu.btb_attn_flash_prefill if cu.mma_roles else cu.btb_attn_flash_prefill_kq)
     assert cu._mma_roles_hold() == cu.mma_roles
 
 
@@ -856,6 +912,6 @@ def test_one_attention_reads_rows_where_they_lie(cu: _Cuda, Hq: int, Hk: int, D:
     pos = n0 + 3
     first = max(0, pos + 1 - win) if win else 0
     rows = tbl[first : pos + 1].clone()
-    via = ctypes.c_void_p(int(rows.data_ptr()) - 4 * first)
+    via = RowMap(int(rows.data_ptr()) - 4 * first)
     node = _flash(cu, q[:1], Kp, Vp, pos, [-1], scale, win, tbl=via, cap=cap)
     assert torch.equal(node, _flash(cu, q[:1], K, V, pos, [-1], scale, win)), "a node through its named keys"
