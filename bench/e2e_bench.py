@@ -400,6 +400,12 @@ def _gbps(benchmark: Any, nbytes: float) -> None:
         benchmark.extra_info["gbps"] = round(nbytes / float(benchmark.stats.stats.mean) / 1e9, 1)
 
 
+def _tflops(benchmark: Any, flops: float) -> None:
+    """The bench's TFLOP/s over its mean round, as `tflops` in its record; none when nothing was timed."""
+    if benchmark.stats is not None:
+        benchmark.extra_info["tflops"] = round(flops / float(benchmark.stats.stats.mean) / 1e12, 1)
+
+
 def _attn_reference(q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, keys: list[list[int]]) -> torch.Tensor:
     """each row of `q` [T, Hq, D] over its own cache slots of `K`/`V` [Hk, cap, D], in float32 through torch's
     SDPA: what an attention kernel's `out` is held to before it is timed"""
@@ -453,8 +459,7 @@ def test_cuda_gemm(benchmark: object, shape: str, T: int, how: str) -> None:
 
     benchmark.group = f"cuda-gemm-{shape}-t{T}"  # type: ignore[attr-defined]
     benchmark(run)  # type: ignore[operator]
-    mean = float(benchmark.stats.stats.mean)  # type: ignore[attr-defined]
-    benchmark.extra_info["tflops"] = round(2 * T * R * C / mean / 1e12, 1)  # type: ignore[attr-defined]
+    _tflops(benchmark, 2 * T * R * C)
 
 
 @cuda_only
@@ -576,9 +581,8 @@ def test_cuda_attn_prefill(benchmark: object, T: int, n: int, how: str) -> None:
 
     benchmark.group = f"cuda-attn-prefill-t{T}-n{n}"  # type: ignore[attr-defined]
     benchmark(run)  # type: ignore[operator]
-    mean = float(benchmark.stats.stats.mean)  # type: ignore[attr-defined]
     macs = Hq * D * 2 * sum(n + t + 1 for t in range(T))  # q.k and p.v, the causal half
-    benchmark.extra_info["tflops"] = round(2 * macs / mean / 1e12, 1)  # type: ignore[attr-defined]
+    _tflops(benchmark, 2 * macs)
 
 
 @cuda_only
