@@ -251,6 +251,60 @@ MISSING: dict[Missing, tuple[str, str]] = {
     ),
 }
 
+# kind -> (the problem, the fix) in a few plain words: a row of the PR comment's table (tests/cert/comment.py)
+TITLE: dict[Missing, tuple[str, str]] = {
+    Missing.GGUF_LOAD: (
+        "Family can't load from GGUF",
+        "Map its architecture in hf.ARCH_MODEL_TYPES, add a GGUF fixture",
+    ),
+    Missing.GPTOSS_GGUF_TWIN: (
+        "No gpt-oss GGUF besides MXFP4",
+        "Add a bf16 or affine GGUF fixture, or mark it did-not-run",
+    ),
+    Missing.KIQUANT_FIXTURE: (
+        "No k-quant or i-quant fixture",
+        "Cache the real Qwen3-0.6B GGUFs, or generate these types",
+    ),
+    Missing.MEGAKERNEL: ("MLX megakernel not written for this family", "Write it, or mark it did-not-run"),
+    Missing.MEGA_STORAGE: ("MLX megakernel refuses this storage", "Teach it packed weights, or mark it did-not-run"),
+    Missing.MEGA_SHAPE: (
+        "Fixture's head width doesn't fit the megakernel",
+        "Widen the fixture's head to a multiple of 64",
+    ),
+    Missing.CARD_GRAPH_FAMILY: ("Card step graph not written for this family", "Write its card kernels"),
+    Missing.CARD_GRAPH_SHAPE: (
+        "Fixture's head width doesn't fit the card kernels",
+        "Widen the fixture's head to 64, 128 or 256",
+    ),
+    Missing.MLX_ATTN_FAMILY: (
+        "MLX attention kernels not on this family's path",
+        "Route its attention through _mlx_attend",
+    ),
+    Missing.MLX_ATTN_SHAPE: ("Fixture's head width doesn't fit MLX attention", "Widen the fixture's head"),
+    Missing.SPEC_MTP_HEAD: ("Fixture has no MTP head", "Add one in tests/make_fixtures.py"),
+    Missing.GGUF_MTP_HEAD: ("GGUF reader maps no MTP head", "Map the NextN layers to mtp.* in GGUFModel.weight_map"),
+    Missing.SPEC_OWN_LAYER: ("Qwen4 can't speculate on MLX", "Give its MLX layers node steps"),
+    Missing.FP16_FIXTURE: ("No fp16 fixture", "Run python tests/make_fixtures.py twins"),
+    Missing.FP32_FIXTURE: ("No fp32 fixture", "Run python tests/make_fixtures.py twins"),
+    Missing.FP8_FIXTURE: ("No FP8 fixture", "Run python tests/make_fixtures.py twins"),
+    Missing.ROCM_BACKEND: ("No AMD GPU backend", "Build the card kernels for HIP"),
+    Missing.QUANT_FIXTURE: (
+        "Some stored types have no GGUF fixture",
+        "Write the missing fixtures in tests/make_fixtures.py",
+    ),
+    Missing.NO_FIXTURE: ("No fixture for this storage", "Add the fixture to spec.FIXTURE_STEM and generate it"),
+    Missing.PREFIX_CACHE: ("No prefix cache on this tier yet", "Land the paged prefix cache here (plan P8)"),
+    Missing.PREFIX_WIDE: ("Prefix cache doesn't serve fp32 card layers", "Give the paged attention a float32 form"),
+    Missing.PREFIX_INVARIANCE: (
+        "Prompt rows differ from decode rows here",
+        "Run these layers on the card graph's kernels",
+    ),
+    Missing.PREFIX_FAMILY: (
+        "Prefix cache can't reach this family's attention",
+        "Give its attention the page table (P6, P7)",
+    ),
+}
+
 # each safetensors precision beside the BF16 fixture, to the gap kind a family with no twin of it reports. A
 # precision added to spec.Storage with no row here falls through to NO_FIXTURE; test_manifest holds it total.
 SAFE_PRECISION_GAP: dict[spec.Storage, Missing] = {

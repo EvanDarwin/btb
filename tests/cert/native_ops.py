@@ -87,6 +87,19 @@ MISSING: dict[Missing, tuple[str, str]] = {
     ),
 }
 
+# kind -> (the problem, the fix) in a few plain words: a row of the PR comment's table (tests/cert/comment.py)
+TITLE: dict[Missing, tuple[str, str]] = {
+    Missing.NO_PARITY: ("Op has no parity test", "Add one in native/tests against the scalar oracle"),
+    Missing.NO_GUARD: ("Op has no guard-page test", "Add a guard test in native/tests"),
+    Missing.EXPORT_UNCOVERED: ("Export missing from the native matrix", "Add it to an Op with parity, guard and bench"),
+    Missing.EXPORT_STALE: ("Matrix lists an export that's gone", "Drop it from the Op's exports"),
+    Missing.BENCH_UNCOVERED: ("Bench file times no matrix op", "Add an Op for it, or delete the bench"),
+    Missing.BENCH_MISSING: ("Bench file is missing", "Create it, or fix the Op's family"),
+    Missing.STORED_UNDECLARED: ("Storage name btb doesn't define", "Use its Quant name, or add it to NON_QUANT"),
+    Missing.STORED_UNUSED: ("Storage no op reads", "Drop it, or give its kernel an Op"),
+    Missing.TIER_UNIMPLEMENTED: ("Kernel family lacks this CPU tier", "Add the tier's variants in native/src"),
+}
+
 
 class Stored(StrEnum):
     """what a native kernel reads off the weight (or the file): a GGUF quant type spelled as its btb.kinds.Quant

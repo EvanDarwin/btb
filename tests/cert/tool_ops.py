@@ -74,6 +74,15 @@ MISSING: dict[Missing, tuple[str, str]] = {
     ),
 }
 
+# kind -> (the problem, the fix) in a few plain words: a row of the PR comment's table (tests/cert/comment.py)
+TITLE: dict[Missing, tuple[str, str]] = {
+    Missing.NO_TEST: ("Parser's test file never uses it", "Test it in that row's file"),
+    Missing.PARSER_UNCOVERED: ("Parser missing from the matrix", "Add a Parser row with a test"),
+    Missing.ROW_STALE: ("Matrix lists a parser that's gone", "Drop the row"),
+    Missing.FAMILY_UNMAPPED: ("Family has no tool-call parser", "Give it a parser, or add it to NO_TOOL_SUPPORT"),
+    Missing.PARSER_UNREACHED: ("Parser is never selected", "Register it in the dispatch set"),
+}
+
 
 @dataclass(frozen=True)
 class Parser:

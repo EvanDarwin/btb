@@ -85,6 +85,20 @@ MISSING: dict[Missing, tuple[str, str]] = {
     ),
 }
 
+# kind -> (the problem, the fix) in a few plain words: a row of the PR comment's table (tests/cert/comment.py)
+TITLE: dict[Missing, tuple[str, str]] = {
+    Missing.FUNC_UNCOVERED: ("Launcher missing from the MLX matrix", "Add it to an Op's funcs with a parity test"),
+    Missing.FUNC_STALE: ("Matrix lists a launcher that's gone", "Drop it from the Op's funcs"),
+    Missing.KERNEL_UNCOVERED: (
+        "Metal kernel missing from the MLX matrix",
+        "Add it to an Op's kernels with a parity test",
+    ),
+    Missing.KERNEL_STALE: ("Matrix lists a Metal kernel that's gone", "Drop it from the Op's kernels"),
+    Missing.KERNEL_WILDCARD: ("Matrix claims kernels with a wildcard", "List one entry per kind"),
+    Missing.NO_PARITY: ("Kernel family has no parity test", "Add one under tests/kernels"),
+    Missing.PARITY_MISSING: ("Parity test file is missing", "Create it, or fix the Op's parity"),
+}
+
 
 @dataclass(frozen=True)
 class Op:
