@@ -138,7 +138,7 @@ def _findings() -> list[tuple[Missing, str]]:
     B = bindings()
     try:
         names = launchers()
-        stale = B.stale_bindings()
+        stale = B.stale_bindings(BTB_SRC)  # the package under test: the wheel certify moves the checkout's aside
     except B.BindingError as e:
         return [(Missing.BINDING_RULE, str(e))]
     sources = _sources(BTB_SRC)

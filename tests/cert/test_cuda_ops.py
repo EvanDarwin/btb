@@ -7,8 +7,12 @@ holds each launch to its kernel's parameters and their roles."""
 from __future__ import annotations
 
 import ast
+import os
+import shutil
+from pathlib import Path
 
 import pytest
+from pytest import MonkeyPatch
 
 from . import cuda_ops
 
@@ -16,6 +20,30 @@ from . import cuda_ops
 @pytest.mark.cert_gap
 def test_the_bindings_are_current_and_every_kernel_is_launched() -> None:
     assert cuda_ops.gaps() == [], cuda_ops.gaps()
+
+
+def test_the_bindings_are_checked_in_the_package_under_test(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    """the cert holds the btb the suite imports to the bindings, wherever it is: the wheel certify moves the
+    checkout's btb/ aside and tests the installed wheel's. A copy of the generated files elsewhere is current, and is
+    stale once one is edited"""
+    B = cuda_ops.bindings()
+    seen: list[str] = []
+
+    def stale(package: str) -> list[str]:
+        seen.append(package)
+        return []
+
+    monkeypatch.setattr(B, "stale_bindings", stale)
+    cuda_ops.gaps()
+    assert seen == [cuda_ops.BTB_SRC]
+    monkeypatch.undo()
+    pkg = tmp_path / "site" / "btb"
+    (pkg / "engine").mkdir(parents=True)
+    for rel in ("kinds.py", os.path.join("engine", "card_launch.py")):
+        shutil.copy(os.path.join(cuda_ops.BTB_SRC, rel), pkg / rel)
+    assert B.stale_bindings(str(pkg)) == []
+    (pkg / "engine" / "card_launch.py").write_text("# edited\n", encoding="utf-8")
+    assert B.stale_bindings(str(pkg)) == ["btb/engine/card_launch.py"]
 
 
 def test_matrix_is_not_empty() -> None:

@@ -118,8 +118,7 @@ def macos_min(dylib: str) -> str:
 # kernel into btb/engine/card_launch.py. The cert (tests/cert/cuda_ops.py) holds the checked-in files to this output.
 CUDA_DIR = os.path.join(NATIVE, "cuda")
 ROLES_H = os.path.join(CUDA_DIR, "btb_roles.cuh")
-KINDS_PY = os.path.join(ROOT, "btb", "kinds.py")
-LAUNCH_PY = os.path.join(ROOT, "btb", "engine", "card_launch.py")
+PACKAGE = os.path.join(ROOT, "btb")  # the package `bindings` writes into
 ROLES_OPEN = "# --- card kernel roles: written by `python build.py bindings` from native/cuda/btb_roles.cuh ---"
 ROLES_CLOSE = "# --- end of the card kernel roles ---"
 LINE = 120  # pyproject's line length: the files are written as `ruff format` lays them out
@@ -474,11 +473,13 @@ def _isort_key(name: str) -> tuple[int, str, str]:
     return (0 if name.isupper() else 1 if name[:1].isupper() else 2, name.lower(), name)
 
 
-def card_bindings() -> dict[str, str]:
-    """the files `bindings` writes, path -> text: btb/kinds.py with its card roles block, and btb/engine/card_launch.py"""
+def card_bindings(package: str = PACKAGE) -> dict[str, str]:
+    """the files `bindings` writes into `package`, path -> text: kinds.py with its card roles block, and
+    engine/card_launch.py"""
     roles = card_roles()
     kernels = card_kernels(roles)
-    with open(KINDS_PY, encoding="utf-8") as f:
+    kinds_py = os.path.join(package, "kinds.py")
+    with open(kinds_py, encoding="utf-8") as f:
         kinds = f.read()
     a, b = kinds.find(ROLES_OPEN), kinds.find(ROLES_CLOSE)
     if a < 0 or b < a:
@@ -486,20 +487,21 @@ def card_bindings() -> dict[str, str]:
             f"btb/kinds.py has no card roles block: its first and last lines are\n{ROLES_OPEN}\n{ROLES_CLOSE}"
         )
     kinds = kinds[:a] + _kinds_block(roles, kernels) + kinds[b + len(ROLES_CLOSE) :]
-    return {KINDS_PY: kinds, LAUNCH_PY: _launch_py(roles, kernels)}
+    return {kinds_py: kinds, os.path.join(package, "engine", "card_launch.py"): _launch_py(roles, kernels)}
 
 
-def stale_bindings() -> list[str]:
-    """the files `bindings` would change, from the checkout's root"""
+def stale_bindings(package: str = PACKAGE) -> list[str]:
+    """the files `bindings` would change in `package` (the checkout's btb/, or an installed wheel's the cert tests),
+    by their path from its parent: btb/kinds.py"""
     out = []
-    for path, text in card_bindings().items():
+    for path, text in card_bindings(package).items():
         try:
             with open(path, encoding="utf-8") as f:
                 current = f.read()
         except FileNotFoundError:
             current = None
         if current != text:
-            out.append(os.path.relpath(path, ROOT).replace(os.sep, "/"))
+            out.append(os.path.relpath(path, os.path.dirname(package)).replace(os.sep, "/"))
     return out
 
 
