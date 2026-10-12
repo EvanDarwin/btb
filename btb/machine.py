@@ -19,6 +19,7 @@ import contextlib
 import functools
 import gc
 import math
+import mmap
 import os
 import platform
 import random
@@ -102,6 +103,7 @@ DELTA = (16, 32, 128, 128, 4)  # Qwen3.5's linear attention: key heads, value he
 HOST_SETS = (32 * KB, 256 * KB, 1 * MB, 4 * MB, 16 * MB, 64 * MB, 256 * MB, 1 * GB)
 CARD_SETS = (1 * MB, 4 * MB, 16 * MB, 64 * MB, 256 * MB, 1 * GB)
 SQUARES = (512, 1024, 2048, 4096, 8192)
+MLX_LARGER = (16384,)  # the squares Apple's GPU's gemv sweep goes on to past SQUARES
 CONTEXTS = (512, 2048, 8192, 32768, 131072)
 VOCABS = (32000, 151936, 262144)
 TRANSFERS = (4 * KB, 64 * KB, 1 * MB, 16 * MB, 256 * MB)
@@ -422,9 +424,30 @@ def _pool(make: Callable[[], Any], each: int, past: int, cap: int = 64, device: 
     return [make() for _ in range(n)]
 
 
+def _mapped(*shape: int, dtype: torch.dtype) -> torch.Tensor:
+    """an empty host operand in pages mapped for it alone, unmapped once it is let go. malloc can keep a freed block
+    in the process (macOS keeps each large size it has seen), and the report's peak would then be the sum of the
+    sizes it sweeps"""
+    n = math.prod(shape) * dtype.itemsize
+    return torch.frombuffer(mmap.mmap(-1, max(n, 1)), dtype=torch.uint8)[:n].view(dtype).view(shape)
+
+
+def _on_host(device: Any) -> bool:
+    return device is None or torch.device(device).type == "cpu"
+
+
 def _bf16(*shape: int, device: Any = None) -> torch.Tensor:
     """bf16 values of a weight's scale; never subnormal, which some CPUs take a slow path for"""
+    if _on_host(device):
+        return _mapped(*shape, dtype=torch.bfloat16).uniform_(-1, 1)
     return torch.empty(*shape, dtype=torch.bfloat16, device=device).uniform_(-1, 1)
+
+
+def _bytes(n: int, lo: int, hi: int, device: Any = None) -> torch.Tensor:
+    """`n` random bytes in [lo, hi)"""
+    if _on_host(device):
+        return _mapped(n, dtype=torch.uint8).random_(lo, hi)
+    return torch.randint(lo, hi, (n,), dtype=torch.uint8, device=device)
 
 
 def host_free() -> int:
@@ -740,7 +763,7 @@ def _host_sets(rep: Report, peak: float) -> None:
     l3 = max((g["size"] for g in groups if g["level"] == 3), default=0) or 32 * MB
     sizes = _host_set_sizes(groups)
     sets = [n for n in sizes if n <= room()]
-    x = torch.empty(sets[-1] // 4, dtype=torch.float32).uniform_()
+    x = _mapped(sets[-1] // 4, dtype=torch.float32).uniform_()
     threads = torch.get_num_threads()
     for k, label in ((threads, f"{threads} threads"), (1, "1 thread")):
         with _torch_threads(k):
@@ -913,8 +936,7 @@ def _mx4(device: Any = None) -> Any:
 
     R, C = MX4
     g = C // 32
-    blocks = torch.randint(0, 256, (R * g * 16,), dtype=torch.uint8, device=device)
-    return MxWeight(blocks, torch.randint(118, 124, (R * g,), dtype=torch.uint8, device=device), R, C)
+    return MxWeight(_bytes(R * g * 16, 0, 256, device), _bytes(R * g, 118, 124, device), R, C)
 
 
 def _mx4_ggml() -> Any:
@@ -922,7 +944,7 @@ def _mx4_ggml() -> Any:
     from .mxfp4 import MxWeight
 
     R, C = MX4
-    raw = torch.randint(0, 256, (R * C // 32, 17), dtype=torch.uint8)
+    raw = _mapped(R * C // 32, 17, dtype=torch.uint8).random_(0, 256)
     raw[:, 0] = 120
     return MxWeight.from_ggml(raw.view(-1), R, C)
 
@@ -986,7 +1008,7 @@ def _cpu_fp8(rep: Report, past: int) -> None:
     grid = (R // 128, C // 128)  # a 128x128 block's scale, as the FP8 checkpoints carry them
 
     def make() -> F8Weight:
-        return F8Weight(torch.randint(0, 0x7F, (R * C,), dtype=torch.uint8), torch.rand(*grid) + 0.5, R, C)
+        return F8Weight(_bytes(R * C, 0, 0x7F), torch.rand(*grid) + 0.5, R, C)
 
     each = R * C + grid[0] * grid[1] * 4
     _by_rows(rep, op, Native.gemv_fp8, Pool(make, each, past), R, C, (1, 4, 16), each)
@@ -1007,8 +1029,8 @@ def _cpu_p12(rep: Report, past: int) -> None:
     none_i, none_v = torch.empty(0, dtype=torch.int32), torch.empty(0, dtype=torch.uint8)
 
     def make() -> tuple[torch.Tensor, torch.Tensor]:
-        codes = torch.randint(0, 15, (2, n // 2), dtype=torch.uint8)
-        return torch.randint(0, 256, (n,), dtype=torch.uint8), codes[0] | (codes[1] << 4)
+        codes = _bytes(n // 2, 0, 15).bitwise_or_(_bytes(n // 2, 0, 15).bitwise_left_shift_(4))
+        return _bytes(n, 0, 256), codes
 
     def p12(packed: tuple[torch.Tensor, torch.Tensor], x: torch.Tensor, y: torch.Tensor) -> None:
         Native.gemv_p12(packed[0], packed[1], tbl, none_i, none_v, 0, R, C, x, y)
@@ -1113,7 +1135,7 @@ def _cpu_sdpa(rep: Report, past: int) -> None:
     Hq, Hk, D = HEADS
 
     def prefill(S: int) -> Callable[[], torch.Tensor]:
-        q, k, v = torch.randn(1, Hq, S, D), torch.randn(1, Hk, S, D), torch.randn(1, Hk, S, D)
+        q, k, v = (_mapped(1, h, S, D, dtype=torch.float32).normal_() for h in (Hq, Hk, Hk))
         return lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
 
     op = rep.sweep(f"attention prefill f32 (torch), {Hq}/{Hk} heads d{D}, causal", "rows")
@@ -1835,7 +1857,7 @@ def _mlx_gemv(rep: Report) -> None:
         rep.time(op, shape, lambda: m.eval(gemv(w, x)), nbytes=each, at={"bytes": each})
 
     op = rep.sweep("gemv bf16, 1 row", "weight size")
-    for side in (*SQUARES, 16384):
+    for side in (*SQUARES, *MLX_LARGER):
         shape = f"{side}x{side} ({_size(side * side * 2)})"
         _guarded(rep, op, shape, point, op, shape, side)
         m.clear_cache()
@@ -1874,10 +1896,8 @@ def mlx_ops(rep: Report) -> None:
 
 
 def _aligned(n: int) -> torch.Tensor:
-    """`n` bytes at a 4096-byte boundary: an unbuffered read's destination"""
-    raw = torch.empty(n + 4096, dtype=torch.uint8)
-    a = (-raw.data_ptr()) % 4096
-    return raw[a : a + n]
+    """`n` bytes at a page boundary (4096 bytes or more): an unbuffered read's destination"""
+    return _mapped(n, dtype=torch.uint8)
 
 
 def _write(rep: Report, fd: int, budget: int) -> None:
@@ -1975,7 +1995,7 @@ def _reads(rep: Report, path: str, handles: list[int], where: str) -> None:
     if 4096 not in alone or span not in kept:
         return
     big = kept[span]
-    other = torch.empty_like(big)
+    other = _aligned(big.numel())
     copy = rep.sampler.time(lambda: other.copy_(big)).median  # what a merged read's bounce copy costs
     profile = {"rates": rates, "reps": 3, "fixed_ms": alone[4096].median * 1e3, "single_ms": alone[span].median * 1e3}
     rule = BatchScheduler._disk_rule({**profile, "copy_ms": copy * 1e3})

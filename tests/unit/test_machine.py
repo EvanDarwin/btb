@@ -546,7 +546,7 @@ def test_a_drive_is_written_read_and_left_as_it_was(tmp_path: Path, monkeypatch:
 def _small(monkeypatch: MonkeyPatch) -> tuple[machine.Report, list[str]]:
     """the report's sweeps cut to sizes a unit test affords, and a report whose every point is a few samples"""
     small = {
-        "HOST_SETS": (32 * KB, MB, 4 * MB), "SQUARES": (512, 1024), "LINEAR": (256, 512),
+        "HOST_SETS": (32 * KB, MB, 4 * MB), "SQUARES": (512, 1024), "MLX_LARGER": (), "LINEAR": (256, 512),
         "EXPERT": (256, 512), "MX4": (256, 512), "HEADS": (4, 2, 128), "CONTEXTS": (512, 2048), "VOCABS": (32000,),
     }  # fmt: skip
     for name, v in small.items():
