@@ -1155,6 +1155,8 @@ def _win_topology() -> Json:
     """physical cores by efficiency class (GetLogicalProcessorInformationEx's RelationProcessorCore records) and
     the package's rated clock (CallNtPowerInformation's ProcessorInformation: the one figure for every core, a
     hybrid's efficiency cores included, so it is not given per class)"""
+    if sys.platform != "win32":
+        return {}
     raw = _win_records(0)  # RelationProcessorCore
     if raw is None:
         return {}
