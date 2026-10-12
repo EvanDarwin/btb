@@ -638,7 +638,7 @@ def test_the_mlx_section_runs_every_op(monkeypatch: MonkeyPatch) -> None:
     assert len({r.op for r in rep.rows}) == 2, "the gemv and the attention"
 
 
-def test_bench_is_the_machine_report_without_a_model(capsys: CaptureFixture[str]) -> None:
+def test_bench_is_the_machine_report_without_a_model(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
     """no model: the report, its JSON alone on stdout (every section skipped here, the facts still read); a model
     without --prompts is refused by its flag; an unknown section is refused"""
     from btb.cli import main
@@ -657,6 +657,17 @@ def test_bench_is_the_machine_report_without_a_model(capsys: CaptureFixture[str]
     assert "--prompts: times a model's prompt set" in capsys.readouterr().err
     assert main(["bench", "no/such-model", "--prompts", __file__, "--skip", "drive"]) == 2
     assert "--skip: is the machine report's" in capsys.readouterr().err
+    # a model's load options too, but the device the report times, which it reads
+    for flag in (["--cpu-layers", "2"], ["--temperature", "0.7"], ["--verbose"]):
+        assert main(["bench", *flag]) == 2
+        assert f"{flag[0]}: sets how a model loads" in capsys.readouterr().err
+    assert main(["bench", "--json", "--skip", skip, "-d", "cpu"]) == 0
+    capsys.readouterr()
+    # an empty prompt set is refused before the model loads
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("\n", encoding="utf-8")
+    assert main(["bench", "no/such-model", "--prompts", str(empty)]) == 2
+    assert "no prompts in it" in capsys.readouterr().err
     for bad in (["--ci", "0"], ["--ci", "1.5"], ["--max-seconds", "0"], ["--max-seconds", "-3"]):
         with pytest.raises(SystemExit):
             main(["bench", *bad])

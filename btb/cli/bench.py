@@ -17,9 +17,10 @@ from .console import say, say_err, title_name
 from .model import open_model
 
 NEW = (64, 256, 1024)  # default answer lengths for a model bench
-# flags (by dest) that belong to one mode only
+# flags (by dest) that belong to one mode only. A model's load options belong to the model bench too, but for SHARED.
 MODEL_FLAGS = ("prompts", "rows", "new", "label")
 MACHINE_FLAGS = ("ci", "max_seconds", "drive", "skip")
+SHARED = ("device", "native")  # load options the machine report reads too
 
 
 def sections(s: str) -> list[str]:
@@ -118,17 +119,27 @@ def add(sub: Any) -> None:
 
 def cmd_bench(a: argparse.Namespace) -> None:
     if a.path is None:
-        _refuse(a, MODEL_FLAGS, "times a model's prompt set: name the model (btb bench MODEL --prompts JSONL)")
+        name = "name the model (btb bench MODEL --prompts JSONL)"
+        _refuse(a, dict.fromkeys(MODEL_FLAGS), f"times a model's prompt set: {name}")
+        _refuse(a, _load_defaults(), f"sets how a model loads: {name}")
         _write(machine_report(a), a, append=False)
         return
-    _refuse(a, MACHINE_FLAGS, "is the machine report's: run `btb bench` without a model for it")
+    _refuse(a, dict.fromkeys(MACHINE_FLAGS), "is the machine report's: run `btb bench` without a model for it")
     record = model_bench(a)
     if record is not None:
         _write(record, a, append=True)
 
 
-def _refuse(a: argparse.Namespace, flags: tuple[str, ...], why: str) -> None:
-    stray = [d for d in flags if getattr(a, d) is not None]
+def _load_defaults() -> Json:
+    """The model load options' defaults by dest, those the machine report reads (`SHARED`) left out."""
+    p = argparse.ArgumentParser(add_help=False)
+    args.model_options(p, path_required=False)
+    return {d: v for d, v in vars(p.parse_args([])).items() if d not in ("path", *SHARED)}
+
+
+def _refuse(a: argparse.Namespace, flags: Json, why: str) -> None:
+    """Raise on the first of `flags` (dest to default) set to something other than its default."""
+    stray = [d for d, default in flags.items() if getattr(a, d) != default]
     if stray:
         raise BadValue(stray[0], why)
 
@@ -263,6 +274,8 @@ def model_bench(a: argparse.Namespace) -> Json | None:
         raise BadValue("prompts", 'a model\'s bench times a prompt set: a JSONL of {"prompt": ...} lines')
     with open(a.prompts, encoding="utf-8") as f:
         rows = [json.loads(line) for line in f if line.strip()]
+    if not rows:
+        raise BadValue("prompts", "no prompts in it", a.prompts)
     pick = list(a.rows) if a.rows else list(range(len(rows)))
     bad = [i for i in pick if i >= len(rows)]
     if bad:
