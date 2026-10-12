@@ -61,11 +61,25 @@ class NativeError(RuntimeError):
 class NativeDtypeError(TypeError):
     """A tensor handed to a native kernel is not the element type the kernel reads through its pointer: `call`
     the kernel, `arg` the argument, `got` its dtype and `want` what the kernel was built for. Raised before the
-    call by a binding loaded with `checked`, so a wrong tensor is refused rather than read as another type's."""
+    call - by a CPU binding loaded with `checked`, and by the card paths where their tensors enter
+    (`_CudaMixin._card_need_bf16`) - so a wrong tensor is refused rather than read as another type's."""
 
     def __init__(self, call: str, arg: str, got: torch.dtype, want: tuple[torch.dtype, ...]) -> None:
         self.call, self.arg, self.got, self.want = call, arg, got, want
         super().__init__(f"{call}: {arg} is {got}, the kernel reads {' or '.join(str(w) for w in want)}")
+
+
+class NativeArgsError(TypeError):
+    """A card kernel launch's arguments don't match the kernel's parameters as the driver reports them: their count
+    or byte widths. `call` the kernel, `want` its parameters' sizes, `got` the arguments' sizes. The driver reads as
+    many bytes as the kernel declares, so the launch would otherwise run on garbage."""
+
+    def __init__(self, call: str, want: tuple[int, ...], got: tuple[int, ...]) -> None:
+        self.call, self.want, self.got = call, want, got
+        super().__init__(
+            f"[cuda] {call} takes {len(want)} parameters of {list(want)} bytes; the launch passed "
+            f"{len(got)} of {list(got)}"
+        )
 
 
 _BF16, _F32, _U8, _I32 = torch.bfloat16, torch.float32, torch.uint8, torch.int32
@@ -1201,7 +1215,7 @@ class _Cuda:
         )
 
     def _hold(self, name: str, args: Sequence[Any]) -> None:
-        """`args` held to kernel `name`'s parameters (`param_sizes`), a ValueError naming a mismatch; their count is
+        """`args` held to kernel `name`'s parameters (`param_sizes`), a NativeArgsError naming a mismatch; their count is
         remembered once they pass, so a launch with that count is not held again - every change of count is (the
         drift a caller's stale list makes), a swap of one width for another at the same count only on the kernel's
         first launch. Where the driver cannot report parameters at all, nothing is held"""
@@ -1212,10 +1226,7 @@ class _Cuda:
             return
         got = tuple(ctypes.sizeof(a) for a in args)
         if got != sizes:
-            raise ValueError(
-                f"[cuda] {name} takes {len(sizes)} parameters of {list(sizes)} bytes; the launch passed "
-                f"{len(got)} of {list(got)}"
-            )
+            raise NativeArgsError(name, sizes, got)
         self._held[name] = len(args)
 
     # cuFuncGetParamInfo's answer past a kernel's last parameter

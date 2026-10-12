@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from pytest import CaptureFixture
 
 from btb.engine.cuda import _CudaMixin
+from btb.engine.native import NativeArgsError
 from tests.helpers import need_card_kernels
 
 if TYPE_CHECKING:
@@ -371,15 +372,15 @@ def test_a_launch_is_held_to_the_kernels_parameters(cu: _Cuda) -> None:
     m = torch.zeros(T, Ii, device=dev, dtype=bf)
     grid, block = ((T * Ii + 255) // 256, 1, 1), (256, 1, 1)
     cu._held.pop("btb_silu_mul", None)  # as the process's first launch of it: the module's earlier tests launched it
-    with pytest.raises(ValueError, match="btb_silu_mul takes 4 parameters"):
+    with pytest.raises(NativeArgsError, match="btb_silu_mul takes 4 parameters"):
         cu.launch("btb_silu_mul", grid, block, [P(gu), P(m), I(T)])
-    with pytest.raises(ValueError, match="btb_silu_mul takes 4 parameters"):
+    with pytest.raises(NativeArgsError, match="btb_silu_mul takes 4 parameters"):
         cu.launch("btb_silu_mul", grid, block, [P(gu), I(0), I(T), I(Ii)])
     torch.cuda.synchronize()
     assert not m.any(), "a refused launch never ran"
     cu.launch("btb_silu_mul", grid, block, [P(gu), P(m), I(T), I(Ii)])
     assert torch.equal(m, F.silu(gu[:, :Ii]).mul_(gu[:, Ii:]))
-    with pytest.raises(ValueError, match="btb_silu_mul takes 4 parameters"):
+    with pytest.raises(NativeArgsError, match="btb_silu_mul takes 4 parameters"):
         cu.launch("btb_silu_mul", grid, block, [P(gu), P(m), I(T), I(Ii), I(0)])
 
 

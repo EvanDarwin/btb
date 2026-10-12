@@ -31,7 +31,7 @@ from .families import act_name
 from .fixed_rows import KeyRows
 from .forward import chain_of, layer_window, node_mask, pe_for
 from .fused import _fused_rope
-from .native import Native, _Cuda, kernels_path
+from .native import Native, NativeDtypeError, _Cuda, kernels_path
 from .scheduler import MemoryGrantError, _size
 from .spec_cost import SpecCost
 from .state import _State
@@ -990,6 +990,35 @@ class _CudaMixin(_State):
         st["layers"][i] = L
         return L
 
+    @staticmethod
+    def _card_need_bf16(reads: Iterable[tuple[str, str, torch.Tensor | None]]) -> None:
+        """Raise NativeDtypeError unless every tensor in `reads` (kernel, what, tensor) is bf16. A kernel gets each
+        tensor as an 8-byte pointer, so the launch's width check can't see an fp32 tensor in a bf16 kernel. Called
+        where tensors enter - a graph build, a prompt chunk, a GEMM - never per decode step: replays don't run Python."""
+        for kernel, what, t in reads:
+            if t is not None and t.dtype != torch.bfloat16:
+                raise NativeDtypeError(kernel, what, t.dtype, (torch.bfloat16,))
+
+    def _card_layer_reads(
+        self, a: int, Ls: list[dict[str, Any]], arenas: dict[int, Any], tables: dict[str, Any], nrk: str
+    ) -> list[tuple[str, str, torch.Tensor | None]]:
+        """What layers a.. read besides their matmul weights (`_card_weights` checks those): the norms, the rope
+        tables and the cache, each with the kernel that reads it."""
+        reads: list[tuple[str, str, torch.Tensor | None]] = []
+        ln2_kernel = "btb_sandwich_add" if self.fam.sandwich else "btb_add_rmsnorm"
+        for i, L in enumerate(Ls, a):
+            kb, vb = arenas[i]
+            cos_t, sin_t = tables[self.layer_types[i]]
+            reads += [("btb_add_rmsnorm", f"layer {i}'s input norm", L["ln1"])]
+            reads += [(ln2_kernel, f"layer {i}'s post-attention norm", L["ln2"])]
+            reads += [(nrk, f"layer {i}'s q norm", L["wq"]), (nrk, f"layer {i}'s k norm", L["wk"])]
+            reads += [(nrk, "the rope cos table", cos_t), (nrk, "the rope sin table", sin_t)]
+            reads += [(nrk, f"layer {i}'s k cache", kb), (nrk, f"layer {i}'s v cache", vb)]
+            if self.fam.sandwich:
+                reads += [("btb_add_rmsnorm", f"layer {i}'s pre-MLP norm", L["pre_ff"])]
+                reads += [("btb_sandwich_add", f"layer {i}'s post-MLP norm", L["post_ff"])]
+        return reads
+
     def _card_merged(self, i: int, what: str, parts: list[tuple[Any, str]]) -> torch.Tensor:
         """layer i's weights `parts` (module, name) as one row block, the modules left viewing it: the block they view
         already where they lie whole in one storage, in order - merged before, the graphs that held it let go since
@@ -1504,6 +1533,16 @@ class _CudaMixin(_State):
         # layout, one array for every rows graph
         where = [P(st["rw"])] if rows else [P(g["n0"]), P(g["depth"])]
         walk = [P(st["rw"])] if rows else [P(g["n0"]), P(g["par"])]
+        # every bf16 tensor the pass's kernels read, checked before the first launch
+        reads = self._card_layer_reads(a, Ls, arenas, tables, nrk)
+        reads += [("the layers' kernels", f"the pass's {n} buffer", g[n]) for n in ("h", "x", "y", "qkv", "q", "att")]
+        reads += [("the layers' kernels", "the pass's gu buffer", g["gu"]), ("the MLP", "the pass's m buffer", g["m"])]
+        if tail and self.head is not None and self.norm is not None:
+            reads += [
+                ("btb_add_rmsnorm", "the final norm", self.norm.weight),
+                ("the head's matvec", "the head weight", self.head.weight),
+            ]
+        self._card_need_bf16(reads)
 
         # the pass's matvec weights in launch order, each warmed into L2 on the side stream once the one before it is
         # launched (`_card_warm`): through the kernels between them the chain leaves the DRAM idle
@@ -2733,6 +2772,10 @@ class _CudaMixin(_State):
                 part_l = buf("part l", (S * T * Hq,), torch.float32)
                 part_acc = buf("part acc", (S * T * Hq * D,), torch.float32)
                 cnt = buf("cnt", (T * Hq,), torch.int32)
+        # every bf16 tensor the chunk's kernels read, checked before the first launch; `h` is copied into `hb` as bf16
+        reads = self._card_layer_reads(a, Ls, arenas, tables, nrk)
+        bufs = {"h": hb, "x": x, "y": y, "qkv": qkv, "q": q, "att": att, "gu": gu, "m": m}
+        self._card_need_bf16(reads + [("the layers' kernels", f"the chunk's {n} buffer", t) for n, t in bufs.items()])
         r0 = 0 if all_rows else T - 1
         tail_bufs = self._card_tail_buffers(T - r0, H) if tail else None
         hb.copy_(h.reshape(T, H))
@@ -2891,6 +2934,8 @@ class _CudaMixin(_State):
         """y[:rows] = x[:rows] W^T [R, C] as the step's matvec sums each row (btb_gemm.cuh): the tensor cores' chain
         or the fp32 chain - the one the warm-up picked (`mma`). The engine's, the kernel tests' and the bench's launch;
         `plan` (`_card_gemm_plan`'s answer) forced only by the tests"""
+        kernel = "btb_gemm_mma_bf16" if mma else "btb_gemm_f32_bf16"
+        cls._card_need_bf16([(kernel, "the weight", W), (kernel, "the input rows", x), (kernel, "the output rows", y)])
         P, ci = k.ptr, ctypes.c_int
         args = [P(W), P(x), P(y), ci(R), ci(C), ci(rows)]
         if not mma:
@@ -2930,6 +2975,7 @@ class _CudaMixin(_State):
         k = self._card_kernels()
         assert k is not None and self.norm is not None and self.head is not None  # `_card_tail_ok`
         norm_w, head_w = self.norm.weight, self.head.weight
+        self._card_need_bf16([("btb_add_rmsnorm", "the final norm", norm_w)])  # the head's GEMM checks its own
         P, ci, cf = k.ptr, ctypes.c_int, ctypes.c_float
         R, H, V = int(h.shape[1]), int(h.shape[2]), int(head_w.shape[0])
         hb = h.reshape(R, H)
