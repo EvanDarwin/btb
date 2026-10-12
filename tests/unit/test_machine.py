@@ -739,6 +739,43 @@ def test_the_mlx_section_runs_every_op(monkeypatch: MonkeyPatch) -> None:
     assert len({r.op for r in rep.rows}) == 2, "the gemv and the attention"
 
 
+def test_the_mlx_section_skips_what_the_free_ram_cannot_hold(monkeypatch: MonkeyPatch) -> None:
+    """Apple's GPU section with 8 GB free (a 1 GB room), through a stand-in for MLX on any OS: the 16384-square
+    weight and the 128k-row caches (each 1.5 GB with the float32 values they are made from) are skipped before
+    anything is made, and every other point is timed"""
+    import importlib
+    import types
+
+    # the modules themselves: btb.mlx re-exports `gemv` the function under the module's name
+    core, gemv, attn = (importlib.import_module(f"btb.mlx.{n}") for n in ("core", "gemv", "attn"))
+    made: list[tuple[int, ...]] = []
+
+    class Array:
+        def astype(self, dtype: str) -> Array:
+            return self
+
+    def normal(shape: tuple[int, ...]) -> Array:
+        made.append(tuple(shape))
+        return Array()
+
+    m = types.SimpleNamespace(
+        bfloat16="bf16", float32="f32", random=types.SimpleNamespace(normal=normal),
+        ones=lambda shape, dtype=None: Array(), eval=lambda *a: None, clear_cache=lambda: None,
+    )  # fmt: skip
+    monkeypatch.setattr(core, "mx", lambda: m)
+    monkeypatch.setattr(gemv, "gemv", lambda w, x: None)
+    monkeypatch.setattr(attn, "attn_decode", lambda q, k, v, n, scale: None)
+    monkeypatch.setattr(machine, "host_free", lambda: 8 * 1024 * MB)
+    lines: list[str] = []
+    rep = machine.Report(machine.Sampler(ci=0.5, budget_s=0.01, min_n=3, sample_s=0.0001), lines.append)
+    machine.mlx_ops(rep)
+    skipped = {r.shape: r.note for r in rep.rows if r.t is None}
+    assert set(skipped) == {"16384x16384 (512 MB)", "131072 rows"}, "\n".join(lines)
+    assert all(n.startswith("skipped:") for n in skipped.values()), skipped
+    assert (16384, 16384) not in made and (1, 8, 131072, 128) not in made, "a skipped point made nothing"
+    assert sum(r.t is not None for r in rep.rows) == len(machine.SQUARES) + len(machine.CONTEXTS) - 1
+
+
 def test_bench_is_the_machine_report_without_a_model(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
     """no model: the report, its JSON alone on stdout (every section skipped here, the facts still read); a model
     without --prompts is refused by its flag; an unknown section is refused"""

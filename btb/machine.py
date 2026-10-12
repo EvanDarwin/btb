@@ -1826,16 +1826,18 @@ def _mlx_gemv(rep: Report) -> None:
 
     m = mx()
 
-    def point(op: str, side: int) -> None:
+    def point(op: str, shape: str, side: int) -> None:
+        each = side * side * 2
+        _room_for(3 * each)  # the bf16 weight, and the float32 values it is made from
         w = m.random.normal((side, side)).astype(m.bfloat16)
         x = m.ones((1, side), dtype=m.bfloat16)
         m.eval(w, x)
-        each = side * side * 2
-        rep.time(op, f"{side}x{side} ({_size(each)})", lambda: m.eval(gemv(w, x)), nbytes=each, at={"bytes": each})
+        rep.time(op, shape, lambda: m.eval(gemv(w, x)), nbytes=each, at={"bytes": each})
 
     op = rep.sweep("gemv bf16, 1 row", "weight size")
     for side in (*SQUARES, 16384):
-        point(op, side)
+        shape = f"{side}x{side} ({_size(side * side * 2)})"
+        _guarded(rep, op, shape, point, op, shape, side)
         m.clear_cache()
 
 
@@ -1847,16 +1849,18 @@ def _mlx_attn(rep: Report) -> None:
     Hq, Hk, D = HEADS
 
     def point(op: str, n: int) -> None:
+        cache = Hk * n * D * 2  # K or V, in bf16
+        _room_for(2 * 3 * cache)  # K and V, and the float32 values each is made from
         q = m.random.normal((Hq, D)).astype(m.float32)
         kb = m.random.normal((1, Hk, n, D)).astype(m.bfloat16)
         vb = m.random.normal((1, Hk, n, D)).astype(m.bfloat16)
         m.eval(q, kb, vb)
         call = lambda: m.eval(attn_decode(q, kb, vb, n, D**-0.5))
-        rep.time(op, f"{n} rows", call, nbytes=2 * Hk * n * D * 2, at={"context": n})
+        rep.time(op, f"{n} rows", call, nbytes=2 * cache, at={"context": n})
 
     op = rep.sweep(f"attention decode bf16, {Hq}/{Hk} heads d{D}, 1 row", "context")
     for n in CONTEXTS:
-        point(op, n)
+        _guarded(rep, op, f"{n} rows", point, op, n)
         m.clear_cache()
 
 
