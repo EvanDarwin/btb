@@ -1,9 +1,7 @@
-# The certification manifests as a committed check (enforcement lives here, not in gitignored local hooks).
-# Renders the cert state in prose (tests/cert/comment.py: closed vs the base branch, covered, the gaps) into the
-# job summary and, on a PR, a sticky comment; prints the matrices; then runs the torch-free gates as blocking
-# steps: a gap, a reasonless DNR, core family/quant drift, or a native-op gap fails the job. The engine-dependent
-# guards (the cert runner, the runtime drift guards) need torch, so they run against the wheel in wheels.yml.
-# Model-free, CPU-only, fast.
+# The certification report. Renders the cert state (tests/cert/comment.py: what the PR closed, coverage, gaps)
+# into the job summary and, on a PR, a sticky comment, prints the matrices, then runs the torch-free checks.
+# The checks report certification gaps and drift and publish the receipt; they never fail CI. The checks that
+# need torch run against the wheel in wheels.yml. Model-free, CPU-only, fast.
 #
 # The PR's code runs in the `cert` job, which holds a read-only token. Posting the comment needs
 # pull-requests: write, so it is a separate job that checks out nothing and runs no repo code.

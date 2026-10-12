@@ -5,6 +5,8 @@ open markup or mentions. Torch-free."""
 
 from __future__ import annotations
 
+from pytest import MonkeyPatch
+
 from . import comment, delta, manifest
 
 
@@ -48,8 +50,16 @@ def test_the_manifest_rows_are_what_its_gate_fails_on() -> None:
 def test_coverage_is_a_table_with_marks() -> None:
     body = comment.render()
     for done, total, what in comment.coverage_rows(comment.matrices()):
-        mark = "✅" if done == total else ("🟡" if done else "⬜")
+        mark = "✅" if total and done == total else ("🟡" if done else "⬜")  # nothing to count is not done
         assert f"| {mark} {comment._text(what[:1].upper() + what[1:])} | {done} / {total} |" in body, what
+
+
+def test_an_empty_coverage_row_is_not_marked_done(monkeypatch: MonkeyPatch) -> None:
+    """a coverage source with nothing to count (0 / 0) renders as ⬜: no entries proves nothing"""
+    assert comment._mark(0, 0) == "⬜" and comment._mark(3, 3) == "✅" and comment._mark(1, 3) == "🟡"
+    module = comment.matrices()[0].module
+    monkeypatch.setattr(module, "coverage", lambda: [(0, 0, "things to count")], raising=False)
+    assert "| ⬜ Things to count | 0 / 0 |" in comment.render()
 
 
 def test_the_body_stays_short() -> None:
