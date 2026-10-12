@@ -431,7 +431,8 @@ class BatchScheduler:
     def caches(self) -> dict[str, int]:
         """The memory hierarchy's sizes, read once and held here: the card's L2, the most of it the driver
         sets aside as persisting, the widest persisting window one stream may name, and the host's caches
-        (`host_cache_sizes`: one instance per level, plus the L2 and L3 totals). Bytes; 0 where a level does not
+        (`host_cache_sizes`: each level's smallest instance and its smallest per-thread share; never a total, which
+        assumes every instance is reachable). Bytes; 0 where a level does not
         exist or can't be read. The engine's placement and pinning decisions read these; nothing else queries the
         driver or the OS for them."""
         if self._caches is not None:

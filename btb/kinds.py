@@ -274,21 +274,27 @@ class LayerTier(StrEnum):
 
 
 class HostCache(StrEnum):
-    """The host CPU's cache figures in bytes (`sysinfo.host_cache_sizes`).
+    """The host CPU's cache figures in bytes (`sysinfo.host_cache_sizes`), two per level.
 
-    A bare level is its smallest single instance: what one thread running alone can count on, on any core.
-    `_PER_THREAD` is the smallest share a thread gets with every thread busy: an instance divided by the threads
-    sharing it, hyperthreads included. `_TOTAL` adds up every instance: what a working set must pass to miss every
-    cache. None of them assumes where the OS places a thread."""
+    `_INSTANCE` is the smallest single instance: what a thread running alone gets, on any core. `_SHARE` is the
+    smallest share a thread gets with every thread busy: an instance's size over the threads sharing it,
+    hyperthreads counted. A consumer picks by how many threads it runs. Neither assumes where a thread runs."""
 
-    L1D = "host_l1d"
-    L2 = "host_l2"
-    L3 = "host_l3"
-    L1D_PER_THREAD = "host_l1d_per_thread"
-    L2_PER_THREAD = "host_l2_per_thread"
-    L3_PER_THREAD = "host_l3_per_thread"
-    L2_TOTAL = "host_l2_total"
-    L3_TOTAL = "host_l3_total"
+    L1D_INSTANCE = "host_l1d_instance"
+    L1D_SHARE = "host_l1d_share"
+    L2_INSTANCE = "host_l2_instance"
+    L2_SHARE = "host_l2_share"
+    L3_INSTANCE = "host_l3_instance"
+    L3_SHARE = "host_l3_share"
+
+
+class HostCacheTotal(StrEnum):
+    """A cache level's every instance added up, in bytes (`sysinfo.host_cache_totals`): the size a working set must
+    pass to miss the level everywhere. Only the bench's past-the-cache pools use it."""
+
+    L1D = "host_l1d_total"
+    L2 = "host_l2_total"
+    L3 = "host_l3_total"
 
 
 class Proposer(StrEnum):

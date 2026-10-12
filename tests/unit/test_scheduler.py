@@ -34,7 +34,7 @@ from btb.engine.forward import _ForwardMixin
 from btb.engine.generate import _GenerateMixin
 from btb.engine.memory import RamPolicyState, VramPolicyState, _MemoryMixin
 from btb.engine.scheduler import MemoryGrantError
-from btb.kinds import FamilyKind, Json, LayerKind, Log, TokenRows, Tokens
+from btb.kinds import FamilyKind, HostCache, Json, LayerKind, Log, TokenRows, Tokens
 from tests.helpers import (
     ABSENT,
     GB,
@@ -3730,7 +3730,8 @@ def test_a_foreign_model_on_mlx_is_priced_against_the_ram_the_gpu_shares() -> No
 def test_a_foreign_model_on_the_host_is_priced_in_its_own_dtype_and_prices_no_card() -> None:
     """`for_model` over a torch module on the CPU: its compute dtype is its parameters', no card margin; asked for
     room on a card it has none to price, so the request is not refused; the memory hierarchy is the host's alone
-    (the card's levels 0) and read once, and nothing is pinned in a card's L2"""
+    (the card's levels 0) and read once - each cache level's instance and share, never a total - and nothing is
+    pinned in a card's L2"""
 
     class Tiny(torch.nn.Module):
         def __init__(self) -> None:
@@ -3745,6 +3746,7 @@ def test_a_foreign_model_on_the_host_is_priced_in_its_own_dtype_and_prices_no_ca
     assert sched.granted == {}, "a request nothing here can price is let through, not counted"
     cs = sched.caches()
     assert cs["gpu_l2"] == cs["gpu_l2_persist"] == cs["gpu_l2_window"] == 0 and sched.caches() is cs
+    assert set(cs) == {"gpu_l2", "gpu_l2_persist", "gpu_l2_window", *HostCache}, cs
     assert sched.pin_bytes(MB) == 0
 
 

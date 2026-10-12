@@ -46,6 +46,7 @@ from .kinds import (
     GateUp,
     Hidden,
     HostCache,
+    HostCacheTotal,
     InDim,
     Intermediate,
     Json,
@@ -397,8 +398,8 @@ def card_free(dev: torch.device) -> int:
 def host_past() -> int:
     """The bytes a host pool cycles through: 4x the total L3 (the total L2 where there's no L3), so it outgrows
     every cache. At least 64 MB, and at most 1/16 of the available RAM so the bench never presses on the machine."""
-    c = sysinfo.host_cache_sizes()
-    want = max(4 * (c[HostCache.L3_TOTAL] or c[HostCache.L2_TOTAL]), 64 * MB)
+    t = sysinfo.host_cache_totals()
+    want = max(4 * (t[HostCacheTotal.L3] or t[HostCacheTotal.L2]), 64 * MB)
     return int(max(16 * MB, min(want, host_free() // 16)))
 
 
@@ -569,10 +570,10 @@ def _cache_lines(groups: list[Json]) -> list[str]:
         return ["           caches   not readable here"]
     sizes = sysinfo.cache_sizes(groups)
     lines = []
-    for lvl, name, per_thread in (
-        (1, "L1d", HostCache.L1D_PER_THREAD),
-        (2, "L2", HostCache.L2_PER_THREAD),
-        (3, "L3", HostCache.L3_PER_THREAD),
+    for lvl, name, share in (
+        (1, "L1d", HostCache.L1D_SHARE),
+        (2, "L2", HostCache.L2_SHARE),
+        (3, "L3", HostCache.L3_SHARE),
     ):
         gs = [g for g in groups if g["level"] == lvl]
         if not gs:
@@ -586,7 +587,7 @@ def _cache_lines(groups: list[Json]) -> list[str]:
         ]
         total = sum(g["size"] * g["count"] for g in gs)
         tail = f" = {_exact(total)}" if lvl > 1 and sum(g["count"] for g in gs) > 1 else ""
-        busy = f"; {_exact(sizes[per_thread])} a thread with all busy"
+        busy = f"; {_exact(sizes[share])} a thread with all busy"
         lines.append(f"           {name:<4}{' + '.join(parts)}{tail}{busy}")
     return lines
 

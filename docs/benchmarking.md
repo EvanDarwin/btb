@@ -27,7 +27,8 @@ The report runs without a model, in two parts.
   an efficiency cluster's shared L2, each chiplet's L3), the level's total, and the smallest share a thread gets
   with every thread busy (a 13700K's L2: 1 MB a thread). Every OS is read to the same form, so a CPU reports the
   same on Windows, Linux and macOS. The totals count every instance, as `lscpu` and Task Manager do: a
-  two-chiplet Ryzen's L3 is 64 MB.
+  two-chiplet Ryzen's L3 is 64 MB. The engine plans with two figures a level, the smallest instance (a thread
+  alone) and the smallest share (every thread busy); the totals only size the bench's pools.
 - **Memory**: total and available. The modules the firmware lists (SMBIOS): their type, form, size, rated and
   running speed in MT/s, and maker and part. Where the board names the channels, the channel count and the peak
   rate they make. Linux's SMBIOS table is readable by root only; without root the modules come from the copy

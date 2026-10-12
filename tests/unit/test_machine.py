@@ -22,7 +22,7 @@ import torch
 from pytest import CaptureFixture, MonkeyPatch
 
 from btb import machine, sysinfo
-from btb.kinds import HostCache, Json
+from btb.kinds import HostCache, HostCacheTotal, Json
 from tests.helpers import KB, MB, fixture
 
 
@@ -214,14 +214,22 @@ def test_udev_memory_devices_read_as_modules(tmp_path: Path, monkeypatch: Monkey
     assert sysinfo._udev_modules() is None
 
 
-def _sizes(l1d: tuple[int, int], l2: tuple[int, int, int], l3: tuple[int, int, int] = (0, 0, 0)) -> dict[str, int]:
-    """`cache_sizes`' figures: (smallest instance, per-thread share with all busy) for L1d, and the total too for L2
-    and L3"""
-    return {
-        HostCache.L1D: l1d[0], HostCache.L1D_PER_THREAD: l1d[1],
-        HostCache.L2: l2[0], HostCache.L2_PER_THREAD: l2[1], HostCache.L2_TOTAL: l2[2],
-        HostCache.L3: l3[0], HostCache.L3_PER_THREAD: l3[1], HostCache.L3_TOTAL: l3[2],
+Level = tuple[int, int, int]  # a cache level's (instance, share, total)
+
+
+def _figures(groups: list[Json]) -> tuple[dict[str, int], dict[str, int]]:
+    """`cache_sizes` and `cache_totals` of `groups`"""
+    return sysinfo.cache_sizes(groups), sysinfo.cache_totals(groups)
+
+
+def _want(l1d: Level, l2: Level, l3: Level = (0, 0, 0)) -> tuple[dict[str, int], dict[str, int]]:
+    """`_figures` as each level's (smallest instance, smallest share with every thread busy, total)"""
+    sizes: dict[str, int] = {
+        HostCache.L1D_INSTANCE: l1d[0], HostCache.L1D_SHARE: l1d[1],
+        HostCache.L2_INSTANCE: l2[0], HostCache.L2_SHARE: l2[1],
+        HostCache.L3_INSTANCE: l3[0], HostCache.L3_SHARE: l3[1],
     }  # fmt: skip
+    return sizes, {HostCacheTotal.L1D: l1d[2], HostCacheTotal.L2: l2[2], HostCacheTotal.L3: l3[2]}
 
 
 def _sysfs(root: Path, files: dict[str, str]) -> str:
@@ -258,8 +266,8 @@ def test_linux_sysfs_reads_as_cores_and_caches(tmp_path: Path) -> None:
         {"level": 2, "size": 4 * MB, "threads": 2, "count": 1}, {"level": 2, "size": 2 * MB, "threads": 2, "count": 2},
         {"level": 3, "size": 30 * MB, "threads": 6, "count": 1},
     ]  # fmt: skip
-    assert sysinfo.cache_sizes(groups) == _sizes(
-        l1d=(32 * KB, 24 * KB), l2=(2 * MB, MB, 8 * MB), l3=(30 * MB, 5 * MB, 30 * MB)
+    assert _figures(groups) == _want(
+        l1d=(32 * KB, 24 * KB, 160 * KB), l2=(2 * MB, MB, 8 * MB), l3=(30 * MB, 5 * MB, 30 * MB)
     )
     assert sysinfo._linux_topology(root) == {
         "logical": 6, "physical": 4, "base_mhz": 3400, "max_mhz": 5400,
@@ -329,7 +337,7 @@ def test_macos_sysctl_reads_as_cores_and_caches(monkeypatch: MonkeyPatch) -> Non
         {"level": 1, "size": 128 * KB, "threads": 1, "count": 8}, {"level": 1, "size": 64 * KB, "threads": 1, "count": 4},
         {"level": 2, "size": 16 * MB, "threads": 4, "count": 2}, {"level": 2, "size": 4 * MB, "threads": 4, "count": 1},
     ]  # fmt: skip
-    assert sysinfo.cache_sizes(groups) == _sizes(l1d=(64 * KB, 64 * KB), l2=(4 * MB, MB, 36 * MB))
+    assert _figures(groups) == _want(l1d=(64 * KB, 64 * KB, 1280 * KB), l2=(4 * MB, MB, 36 * MB))
     # perflevels that give the L1d and L2 but no L3: the L3 still read, from hw.l3cachesize
     _sysctl(monkeypatch, {
         "hw.nperflevels": 1, "hw.logicalcpu": 4, "hw.l3cachesize": 8 * MB, "hw.cacheconfig": _cacheconfig(4, 1, 1, 4),
@@ -350,8 +358,8 @@ def test_macos_sysctl_reads_as_cores_and_caches(monkeypatch: MonkeyPatch) -> Non
         "classes": [{"name": "cores", "cores": 6, "threads": 12, "base_mhz": 0, "max_mhz": 2600}],
     }  # fmt: skip
     groups = sysinfo._cache_groups(sysinfo._darwin_caches())
-    assert sysinfo.cache_sizes(groups) == _sizes(
-        l1d=(32 * KB, 16 * KB), l2=(256 * KB, 128 * KB, 1536 * KB), l3=(12 * MB, MB, 12 * MB)
+    assert _figures(groups) == _want(
+        l1d=(32 * KB, 16 * KB, 192 * KB), l2=(256 * KB, 128 * KB, 1536 * KB), l3=(12 * MB, MB, 12 * MB)
     )
 
 
@@ -361,20 +369,29 @@ _I7_13700K = (
 )
 _R9_7950X = [(1, 32 * KB, 2)] * 16 + [(2, MB, 2)] * 16 + [(3, 32 * MB, 16)] * 2
 _R9_7950X3D = [(1, 32 * KB, 2)] * 16 + [(2, MB, 2)] * 16 + [(3, 96 * MB, 16), (3, 32 * MB, 16)]
+_M2 = [(1, 128 * KB, 1)] * 4 + [(1, 64 * KB, 1)] * 4 + [(2, 16 * MB, 4), (2, 4 * MB, 4)]
 
 
-def test_a_level_reports_its_smallest_instance_share_and_total(monkeypatch: MonkeyPatch) -> None:
+def test_each_level_reports_its_instance_share_and_total(monkeypatch: MonkeyPatch) -> None:
     """A thread can run on any core or chiplet, so each level reports its smallest instance (a thread alone) and its
-    smallest per-thread share (every thread busy: an instance over the threads sharing it, hyperthreads included).
-    The totals size the bench's pools, which must outgrow every cache."""
-    sizes = {name: sysinfo.cache_sizes(sysinfo._cache_groups(c)) for name, c in (
-        ("13700K", _I7_13700K), ("7950X", _R9_7950X), ("7950X3D", _R9_7950X3D))}  # fmt: skip
-    # 13700K: L2 per thread 1 MB either way (2 MB over a P-core's 2 hyperthreads, 4 MB over an E-cluster's 4 cores)
-    assert sizes["13700K"] == _sizes(l1d=(32 * KB, 24 * KB), l2=(2 * MB, MB, 24 * MB), l3=(30 * MB, 1280 * KB, 30 * MB))
-    assert sizes["7950X"] == _sizes(l1d=(32 * KB, 16 * KB), l2=(MB, 512 * KB, 16 * MB), l3=(32 * MB, 2 * MB, 64 * MB))
-    assert sizes["7950X3D"][HostCache.L3] == 32 * MB, "the smaller chiplet's L3, not the 96 MB V-cache"
-    assert (sizes["7950X3D"][HostCache.L3_PER_THREAD], sizes["7950X3D"][HostCache.L3_TOTAL]) == (2 * MB, 128 * MB)
-    assert sysinfo.cache_sizes([]) == dict.fromkeys(sizes["7950X"], 0)
+    smallest per-thread share (every thread busy: an instance over the threads sharing it, hyperthreads counted). The
+    totals size the bench's pools, which must outgrow every cache."""
+    got = {name: _figures(sysinfo._cache_groups(c)) for name, c in (
+        ("13700K", _I7_13700K), ("7950X", _R9_7950X), ("7950X3D", _R9_7950X3D), ("M2", _M2))}  # fmt: skip
+    # L2 1 MB a thread either way: 2 MB over a P-core's 2 hyperthreads, 4 MB over an E-cluster's 4 cores
+    assert got["13700K"] == _want(
+        l1d=(32 * KB, 24 * KB, 640 * KB), l2=(2 * MB, MB, 24 * MB), l3=(30 * MB, 1280 * KB, 30 * MB)
+    )
+    assert got["7950X"] == _want(
+        l1d=(32 * KB, 16 * KB, 512 * KB), l2=(MB, 512 * KB, 16 * MB), l3=(32 * MB, 2 * MB, 64 * MB)
+    )
+    # the smaller chiplet's L3, not the 96 MB V-cache
+    assert got["7950X3D"] == _want(
+        l1d=(32 * KB, 16 * KB, 512 * KB), l2=(MB, 512 * KB, 16 * MB), l3=(32 * MB, 2 * MB, 128 * MB)
+    )
+    # the efficiency cluster's L2, 4 MB over its 4 cores; no L3 listed
+    assert got["M2"] == _want(l1d=(64 * KB, 64 * KB, 768 * KB), l2=(4 * MB, MB, 20 * MB))
+    assert _figures([]) == _want(l1d=(0, 0, 0), l2=(0, 0, 0))
     # the pools: 4x the total L3, while the RAM allows
     monkeypatch.setattr(sysinfo, "host_cache_groups", lambda: sysinfo._cache_groups(_R9_7950X3D))
     monkeypatch.setattr(machine, "host_free", lambda: 64 * 1024 * MB)
@@ -439,8 +456,8 @@ def test_a_cpu_reads_the_same_on_every_os(tmp_path: Path, monkeypatch: MonkeyPat
     })  # fmt: skip
     new_mac = sysinfo._cache_groups(sysinfo._darwin_caches())
     assert linux == windows == windows32 == old_mac == new_mac == want, (linux, windows, windows32, old_mac, new_mac)
-    assert sysinfo.cache_sizes(want) == _sizes(
-        l1d=(32 * KB, 16 * KB), l2=(MB, 512 * KB, 4 * MB), l3=(32 * MB, 8 * MB, 64 * MB)
+    assert _figures(want) == _want(
+        l1d=(32 * KB, 16 * KB, 128 * KB), l2=(MB, 512 * KB, 4 * MB), l3=(32 * MB, 8 * MB, 64 * MB)
     )
     assert machine._cache_lines(want) == [
         "           L1d 4 x 32 KB (2 threads each); 16 KB a thread with all busy",
@@ -467,7 +484,7 @@ def test_the_cores_add_up() -> None:
         assert sum(g["threads"] * g["count"] for g in groups if g["level"] == lvl) <= topo["logical"], groups
     if groups:
         c = sysinfo.host_cache_sizes()
-        assert 0 < c[HostCache.L1D_PER_THREAD] <= c[HostCache.L1D], groups
+        assert 0 < c[HostCache.L1D_SHARE] <= c[HostCache.L1D_INSTANCE], groups
 
 
 def test_the_features_hold_the_tier_the_library_picked() -> None:
