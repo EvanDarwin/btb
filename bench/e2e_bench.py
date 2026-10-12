@@ -853,7 +853,7 @@ def _card(
     RAM each call (`cuda/ram`), a pool of pinned copies, each landing in one set of card buffers"""
     if lane == "cuda/vram":
         return ops.get(
-            "card", lambda: Pool(lambda: tuple(t.to(CUDA) for t in cpu.first), each, CARD_POOL, caps[0])
+            "card", lambda: Pool(lambda: tuple(t.to(CUDA) for t in cpu.first), each, CARD_POOL, caps[0], CUDA)
         ), on_card
     pin = ops.get("pin", lambda: Pool(lambda: tuple(t.pin_memory() for t in cpu.first), each, CARD_POOL, caps[1]))
     bufs = ops.get("buf", lambda: tuple(torch.empty_like(t, device=CUDA) for t in cpu.first))

@@ -322,7 +322,7 @@ class Report:
         try:
             t = (replace(self.sampler, **how) if how else self.sampler).time(call, clock).per(per)
         except Exception as e:
-            self.skip(op, shape, f"failed: {type(e).__name__}: {e}")
+            self.skip(op, shape, _why(e))
             return None
         self.add(Row(self.where, op, shape, t, nbytes, flops, peak, note, at or {}))
         return t
@@ -337,17 +337,56 @@ class Report:
             with torch.cuda.graph(g):
                 body()
         except Exception as e:
-            self.skip(op, shape, f"failed: {type(e).__name__}: {e}")
+            self.skip(op, shape, _why(e))
             return None
         return self.time(op, shape, g.replay, clock=CardClock(), per=per, **kw)
 
 
+class NoRoom(Exception):
+    """A point's operands would take more of the free memory than the bench allows itself (`room`)."""
+
+
+def room(device: Any = None) -> int:
+    """The most the bench's operands may take on `device`: 1/8 of the host's free RAM (shared with everything
+    else), 1/4 of a card's free memory."""
+    if device is not None and torch.device(device).type == "cuda":
+        return card_free(torch.device(device)) // 4
+    return host_free() // 8
+
+
+def _no_room(need: int) -> NoRoom:
+    return NoRoom(f"needs {_size(need)}, more than the bench takes of the free memory")
+
+
+def _room_for(need: int, device: Any = None) -> None:
+    """Raises NoRoom where `need` bytes are more than the `room` on `device` (the host when None)."""
+    if need > room(device):
+        raise _no_room(need)
+
+
+def _why(e: Exception) -> str:
+    """a skipped row's note for a setup that raised"""
+    return f"skipped: {e}" if isinstance(e, NoRoom) else f"failed: {type(e).__name__}: {e}"
+
+
+def _guarded(rep: Report, op: str, shape: str, fn: Callable[..., object], *args: Any) -> None:
+    """`fn(*args)`: a section's op, or one point of a sweep. A setup that fails (an operand's allocation) leaves a
+    row saying so, and the report goes on."""
+    try:
+        fn(*args)
+    except Exception as e:
+        rep.skip(op, shape, _why(e))
+    _let_go()
+
+
 class Pool:
     """copies of an operand, enough to pass `nbytes` (`_pool`), handed out in turn: a call reads its operand from
-    memory, never from a cache the last call filled. The one pool of the machine report and of bench/e2e_bench.py"""
+    memory, never from a cache an earlier call filled. The one pool of the machine report and of bench/e2e_bench.py"""
 
-    def __init__(self, make: Callable[[], Any], each: int, nbytes: int, cap: int = 64) -> None:
-        self.items, self.i = _pool(make, each, nbytes, cap), 0
+    def __init__(
+        self, make: Callable[[], Any], each: int, nbytes: int, cap: int = 64, device: Any = None, size: int = 0
+    ) -> None:
+        self.items, self.i = _pool(make, each, nbytes, cap, device, size), 0
 
     @classmethod
     def of(cls, items: list[Any]) -> Pool:
@@ -372,10 +411,15 @@ class Pool:
         return self.items[0]
 
 
-def _pool(make: Callable[[], Any], each: int, past: int, cap: int = 64) -> list[Any]:
-    """copies of an operand, enough to pass `past` bytes (two at least): a call takes the next, so it reads memory
-    rather than what the last call left in a cache"""
-    return [make() for _ in range(max(2, min(cap, -(-past // max(1, each)))))]
+def _pool(make: Callable[[], Any], each: int, past: int, cap: int = 64, device: Any = None, size: int = 0) -> list[Any]:
+    """copies of an operand, `each` the bytes a call reads of one, enough to pass `past` bytes: a call takes the next,
+    so between two reads of a byte the calls read `past` bytes at least (4x the L3). An LRU cache then holds none of
+    it, and one that resists a looping scan keeps at most a quarter. One copy as large as `past` is enough on its own. `size` is what one copy holds where that is more than a call reads (a cache longer
+    than its context). Raises NoRoom, before making any, where the copies would take more than the `room` on `device`
+    (the host when None)."""
+    n = max(1, min(cap, -(-past // max(1, each))))
+    _room_for(n * max(each, size), device)
+    return [make() for _ in range(n)]
 
 
 def _bf16(*shape: int, device: Any = None) -> torch.Tensor:
@@ -694,7 +738,8 @@ def _host_sets(rep: Report, peak: float) -> None:
     groups = sysinfo.host_cache_groups()
     # each thread reads a re-read set whole: it is past the caches once past one L3 (a chiplet's), not their sum
     l3 = max((g["size"] for g in groups if g["level"] == 3), default=0) or 32 * MB
-    sets = [n for n in _host_set_sizes(groups) if n <= max(64 * MB, host_free() // 8)]
+    sizes = _host_set_sizes(groups)
+    sets = [n for n in sizes if n <= room()]
     x = torch.empty(sets[-1] // 4, dtype=torch.float32).uniform_()
     threads = torch.get_num_threads()
     for k, label in ((threads, f"{threads} threads"), (1, "1 thread")):
@@ -704,8 +749,10 @@ def _host_sets(rep: Report, peak: float) -> None:
                 v = _reread(x, n, 64 * MB)
                 past = peak if n >= 4 * l3 else 0.0
                 rep.time(op, _exact(n), v.sum, nbytes=v.numel() * 4, peak=past, at={"bytes": n, "threads": k})
+            for n in sizes[len(sets) :]:
+                rep.skip(op, _exact(n), _why(_no_room(n)))
     n = sets[-1] // 2
-    src, dst = x[: n // 4], torch.empty(n // 4)
+    src, dst = x[: n // 4], x[n // 4 : n // 2]  # the largest set's two halves: the copy needs no memory of its own
 
     def copy() -> None:
         dst.copy_(src)
@@ -744,9 +791,8 @@ def memory(rep: Report, f: Json) -> None:
     past = host_past()
     peak = (f["memory"].get("peak_gb_s") or 0.0) * 1e9
     rep.section("memory", "the host's, from its caches to DRAM")
-    _host_sets(rep, peak)
-    _let_go()
-    _gemv_threads(rep, past, peak, f["cpu"])
+    _guarded(rep, "read", "", _host_sets, rep, peak)
+    _guarded(rep, "gemv bf16 stream", "", _gemv_threads, rep, past, peak, f["cpu"])
 
 
 # -- the host's ops -------------------------------------------------------------------------------------------------
@@ -762,7 +808,7 @@ def _cpu_gemv_size(rep: Report, op: str, side: int, held: bool, past: int) -> No
     """one point of `_cpu_gemv_sizes`, its weights let go when it returns"""
     each = side * side * 2
     make = functools.partial(_bf16, side, side)
-    ws = Pool.one(make()) if held else Pool(make, each, past, cap=4096)
+    ws = Pool(make, each, 0 if held else past, cap=1 if held else 4096)
     call = _native_gemv(ws, torch.randn(1, side), torch.empty(1, side))
     shape = f"{side}x{side} ({_size(each)})"
     rep.time(op, shape, call, nbytes=each, flops=2 * side * side, at={"bytes": each, "held": held})
@@ -779,8 +825,7 @@ def _cpu_gemv_sizes(rep: Report, past: int) -> None:
         how = "the same weight each call" if held else "weights streamed past the caches"
         op = rep.sweep(f"gemv bf16 (native), 1 row, {how}", "weight size")
         for side in SQUARES:
-            _cpu_gemv_size(rep, op, side, held, past)
-            _let_go()
+            _guarded(rep, op, f"{side}x{side}", _cpu_gemv_size, rep, op, side, held, past)
     return None
 
 
@@ -804,17 +849,19 @@ def _cpu_rows(rep: Report, past: int) -> None:
             if t is not None:
                 native[rows] = t
 
-    def widened(x: torch.Tensor) -> Callable[[], torch.Tensor]:
-        return lambda: F.linear(x, ws().float())
+    def widened(rows: int) -> None:
+        _room_for(4 * (R * C + rows * (C + R)))  # each call's float32 weight, and its rows in and out
+        x = torch.randn(rows, C)
+        t = rep.time(op, _rows(rows), lambda: F.linear(x, ws().float()), flops=2 * R * C * rows, at={"rows": rows})
+        if t is not None:
+            gemm[rows] = t
 
     def plain(x: torch.Tensor) -> Callable[[], torch.Tensor]:
         return lambda: F.linear(x, ws())
 
     op = rep.sweep(f"gemm f32 (torch, the bf16 weight widened), {R}x{C} streamed", "rows")
     for rows in (16, 32, 64, 128, 256, 512, 1024, 2048):
-        t = rep.time(op, _rows(rows), widened(torch.randn(rows, C)), flops=2 * R * C * rows, at={"rows": rows})
-        if t is not None:
-            gemm[rows] = t
+        _guarded(rep, op, _rows(rows), widened, rows)
     op = rep.sweep(f"matmul bf16 (torch), {R}x{C} streamed", "rows")
     for rows in (64, 512):
         rep.time(op, _rows(rows), plain(torch.randn(rows, C).bfloat16()), flops=2 * R * C * rows, at={"rows": rows})
@@ -857,8 +904,7 @@ def _cpu_group(rep: Report, past: int) -> None:
 
     rep.sweep(op, "experts in the call")
     for n in (4, 16, 64):
-        point(n)
-        _let_go()
+        _guarded(rep, op, f"{n} experts", point, n)
     return None
 
 
@@ -902,16 +948,19 @@ def _cpu_mx4(rep: Report, past: int) -> None:
     if Native.gemv_mx4 is None:
         rep.skip(op, "", "not in this library")
     else:
-        _by_rows(rep, op, Native.gemv_mx4, Pool(_mx4, each, past), R, C, (1, 4, 16), each)
-        _let_go()
+        rows = lambda: _by_rows(rep, op, Native.gemv_mx4, Pool(_mx4, each, past), R, C, (1, 4, 16), each)
+        _guarded(rep, op, "", rows)
     if Native.gemv_mx4_group is not None:
-        _cpu_mx4_group(rep, past, 8)
-        _let_go()
+        _guarded(rep, "gemv mxfp4 group (native)", f"8 experts of {R}x{C}, 1 row each", _cpu_mx4_group, rep, past, 8)
     if Native.gemv_mx4_ggml is not None:
-        ws = Pool(_mx4_ggml, each, past)
         x, y = torch.randn(1, C), torch.empty(1, R)
         op = "gemv mxfp4, a GGUF's blocks (native)"
-        rep.time(op, f"{R}x{C}, 1 row", lambda: Native.gemv_mx4_ggml(ws(), x, y), nbytes=each, at={"rows": 1})
+
+        def ggml() -> None:
+            ws = Pool(_mx4_ggml, each, past)
+            rep.time(op, f"{R}x{C}, 1 row", lambda: Native.gemv_mx4_ggml(ws(), x, y), nbytes=each, at={"rows": 1})
+
+        _guarded(rep, op, f"{R}x{C}, 1 row", ggml)
 
 
 def _cpu_mx4_group(rep: Report, past: int, n: int) -> None:
@@ -979,8 +1028,6 @@ def _cpu_attn(rep: Report, past: int) -> None:
 
     def point(n: int) -> None:
         each = 2 * Hk * n * D * 2
-        if 2 * each > host_free() // 8:
-            return rep.skip(op, f"{n} rows", f"needs {_size(2 * each)}, more than an eighth of the RAM available")
         kv = Pool(lambda: (_bf16(Hk, n, D), _bf16(Hk, n, D)), each, past, cap=16)
         q, out = torch.randn(Hq, D), torch.empty(Hq, D)
 
@@ -989,12 +1036,10 @@ def _cpu_attn(rep: Report, past: int) -> None:
             Native.attn_decode(q, k, v, D**-0.5, out)
 
         rep.time(op, f"{n} rows", call, nbytes=each, at={"context": n})
-        return None
 
     rep.sweep(op, "context")
     for n in CONTEXTS:
-        point(n)
-        _let_go()
+        _guarded(rep, op, f"{n} rows", point, n)
     if Native.attn_nodes is None:
         return None
     n = 4096
@@ -1087,11 +1132,7 @@ def cpu_ops(rep: Report) -> None:
         rep.section("cpu", "no native library: the host's matmuls run on torch")
     ops = (_cpu_gemv_sizes, _cpu_rows, _cpu_group, _cpu_mx4, _cpu_fp8, _cpu_p12, _cpu_attn, _cpu_delta, _cpu_pick)
     for op in (*ops, _cpu_sdpa):
-        try:
-            op(rep, past)
-        except Exception as e:  # an op's setup (its operands' allocation): its row says so, the report goes on
-            rep.skip(op.__name__.removeprefix("_cpu_"), "", f"failed: {type(e).__name__}: {e}")
-        _let_go()
+        _guarded(rep, op.__name__.removeprefix("_cpu_"), "", op, rep, past)
 
 
 # -- the card -------------------------------------------------------------------------------------------------------
@@ -1155,7 +1196,7 @@ def _mma_form_body(
 def _card_memory(rep: Report, k: _Cuda | None, dev: torch.device, past: int, peak: float, l2: int) -> None:
     """torch's read on the card over each working set, re-read in place (a set the L2 holds is read from it), and
     its copy past the L2"""
-    sets = [n for n in CARD_SETS if n <= max(16 * MB, card_free(dev) // 4)]
+    sets = [n for n in CARD_SETS if n <= max(16 * MB, room(dev))]
     x = torch.empty(sets[-1] // 4, dtype=torch.float32, device=dev).uniform_()
     op = rep.sweep("read (torch)", "working set")
     for n in sets:
@@ -1176,7 +1217,7 @@ def _card_gemv_rows(rep: Report, k: _Cuda, dev: torch.device, past: int, peak: f
     """btb's matvecs over a streamed projection by rows: the plain one at each width it is built for, the tensor-core
     one, and the host's bit-exact one"""
     R, C = LINEAR
-    ws = _pool(functools.partial(_bf16, R, C, device=dev), R * C * 2, past)
+    ws = _pool(functools.partial(_bf16, R, C, device=dev), R * C * 2, past, device=dev)
     op = rep.sweep(f"gemv bf16, {R}x{C} streamed", "rows")
     for M in (1, 2, 4, 8, 16, 32):
         x, y = _bf16(M, C, device=dev), torch.empty(M, R, dtype=torch.bfloat16, device=dev)
@@ -1207,7 +1248,7 @@ def _card_gemv_size(
     weight, the same one each launch (`held`) or a pool of them past the L2. Its weights go when it returns."""
     each = side * side * 2
     make = functools.partial(_bf16, side, side, device=dev)
-    ws = [make()] * 16 if held else _pool(make, each, past, cap=4096)
+    ws = [make()] * 16 if held else _pool(make, each, past, cap=4096, device=dev)
     rows = 32 if mma else 1  # the tensor-core kernel's x is padded to the 32 rows it always reads
     x, y = _bf16(rows, side, device=dev), torch.empty(rows, side, dtype=torch.bfloat16, device=dev)
     body = _mma_body(k, ws, x, y, side, side, 1) if mma else _gemv_body(k, ws, x, y, side, side, 1)
@@ -1228,12 +1269,11 @@ def _card_gemv_sizes(rep: Report, k: _Cuda, dev: torch.device, past: int, peak: 
             continue
         op = rep.sweep(kind, "weight size")
         for side in SQUARES:
-            _card_gemv_size(rep, k, dev, op, mma, side, held, past, peak)
-            _let_go()
+            _guarded(rep, op, f"{side}x{side}", _card_gemv_size, rep, k, dev, op, mma, side, held, past, peak)
     if "btb_gemv_mma_bf16" not in k.fn:
         return
     R, C = SHORT
-    ws = _pool(functools.partial(_bf16, R, C, device=dev), R * C * 2, past, cap=4096)
+    ws = _pool(functools.partial(_bf16, R, C, device=dev), R * C * 2, past, cap=4096, device=dev)
     x, y = _bf16(32, C, device=dev), torch.empty(32, R, dtype=torch.bfloat16, device=dev)
     op = rep.sweep(f"gemv bf16 tensor cores, a short {R}x{C}, 1 row", "rows a warp")
     for narrow, per_warp in ((False, 16), (True, 8)):
@@ -1252,7 +1292,7 @@ def _card_glu(rep: Report, k: _Cuda, dev: torch.device, past: int, peak: float, 
     label, shape = "gate and up with silu, tensor cores", f"{2 * I}x{H}, 1 row"
     if "btb_gemv_mma_glu_silu" not in k.fn:
         return rep.skip(label, shape, "not in this build")
-    gus = _pool(functools.partial(_bf16, 2 * I, H, device=dev), 2 * I * H * 2, past)
+    gus = _pool(functools.partial(_bf16, 2 * I, H, device=dev), 2 * I * H * 2, past, device=dev)
     x, m = _bf16(32, H, device=dev), torch.empty(32, I, dtype=torch.bfloat16, device=dev)
     w = Card.MMA_WARPS
     grid, block = ((I + 16 * w - 1) // (16 * w), 1, 1), (32 * w, 1, 1)
@@ -1272,7 +1312,7 @@ def _card_mx4(rep: Report, k: _Cuda, dev: torch.device, past: int, peak: float, 
     R, C = MX4
     g = C // 32
     each = R * g * 17
-    ws = _pool(lambda: _mx4(dev), each, past)
+    ws = _pool(lambda: _mx4(dev), each, past, device=dev)
     xf, yf = torch.randn(1, C, device=dev), torch.empty(1, R, device=dev)
 
     def lane16() -> None:
@@ -1304,9 +1344,8 @@ def _card_attn_at(rep: Report, k: _Cuda, dev: torch.device, past: int, peak: flo
     cap = (n + T + 1023) // 1024 * 1024
     S = cap // Card._attn_group(D)  # the key groups the launch covers
     live = 2 * Hk * (n + T) * D * 2
-    if 4 * Hk * cap * D * 2 > card_free(dev) // 4:
-        return rep.skip(op, f"{_rows(T)} over {n}", f"needs two caches of {_size(2 * Hk * cap * D * 2)}")
-    kvs = _pool(lambda: (_bf16(Hk, cap, D, device=dev), _bf16(Hk, cap, D, device=dev)), live, past, 28)
+    make = lambda: (_bf16(Hk, cap, D, device=dev), _bf16(Hk, cap, D, device=dev))
+    kvs = _pool(make, live, past, 28, dev, size=2 * Hk * cap * D * 2)
     q, out = _bf16(T, Hq, D, device=dev), torch.empty(T, Hq, D, dtype=torch.bfloat16, device=dev)
     pm, pl = torch.zeros(S * T * Hq, device=dev), torch.zeros(S * T * Hq, device=dev)
     pa, cnt = torch.zeros(S * T * Hq * D, device=dev), torch.zeros(T * Hq, dtype=torch.int32, device=dev)
@@ -1337,12 +1376,10 @@ def _card_attn(rep: Report, k: _Cuda, dev: torch.device, past: int, peak: float,
         return rep.skip("attention", "", "not in this build")
     op = rep.sweep(f"attention decode, {Hq}/{Hk} heads d{D}, 1 row", "context")
     for n in CONTEXTS:
-        _card_attn_at(rep, k, dev, past, peak, op, n, 1)
-        _let_go()
+        _guarded(rep, op, f"{_rows(1)} over {n}", _card_attn_at, rep, k, dev, past, peak, op, n, 1)
     op = rep.sweep(f"attention over a tree's 5 rows, {Hq}/{Hk} heads d{D}", "context")
     for n in (8192, 32768):
-        _card_attn_at(rep, k, dev, past, peak, op, n, 5)
-        _let_go()
+        _guarded(rep, op, f"{_rows(5)} over {n}", _card_attn_at, rep, k, dev, past, peak, op, n, 5)
     return None
 
 
@@ -1360,7 +1397,8 @@ def _card_rows(rep: Report, k: _Cuda, dev: torch.device, past: int, peak: float,
         cap = (n + (steps + 1) * rows + 1023) // 1024 * 1024
         S = cap // Card._attn_group(D)
         live = 2 * Hk * (n + steps * rows) * D * 2
-        kvs = _pool(lambda: (_bf16(Hk, cap, D, device=dev), _bf16(Hk, cap, D, device=dev)), live, past, 28)
+        make = lambda: (_bf16(Hk, cap, D, device=dev), _bf16(Hk, cap, D, device=dev))
+        kvs = _pool(make, live, past, 28, dev, size=2 * Hk * cap * D * 2)
         q, out = _bf16(rows, Hq, D, device=dev), torch.empty(rows, Hq, D, dtype=torch.bfloat16, device=dev)
         pm, pl = torch.zeros(S * rows * Hq, device=dev), torch.zeros(S * rows * Hq, device=dev)
         pa, cnt = torch.zeros(S * rows * Hq * D, device=dev), torch.zeros(rows * Hq, dtype=torch.int32, device=dev)
@@ -1386,8 +1424,7 @@ def _card_rows(rep: Report, k: _Cuda, dev: torch.device, past: int, peak: float,
 
     rep.sweep(op, "rows")
     for rows in (2, 8, 32):
-        point(rows)
-        _let_go()
+        _guarded(rep, op, _rows(rows), point, rows)
     return None
 
 
@@ -1529,7 +1566,7 @@ def _card_layer(rep: Report, k: _Cuda, dev: torch.device, past: int, peak: float
             k.sigmoid_mul(att, qg, gated, D, D, 2 * D)
 
     rep.card("attention output gate (Qwen4)", f"{Hq} heads d{D}, 1 row", gate, reps)
-    os_ = _pool(functools.partial(_bf16, H, Hq * D, device=dev), H * Hq * D * 2, past)
+    os_ = _pool(functools.partial(_bf16, H, Hq * D, device=dev), H * Hq * D * 2, past, device=dev)
     yo = torch.empty(1, H, dtype=torch.bfloat16, device=dev)
 
     def sgate() -> None:
@@ -1538,7 +1575,7 @@ def _card_layer(rep: Report, k: _Cuda, dev: torch.device, past: int, peak: float
 
     o_bytes = H * Hq * D * 2
     rep.card("o_proj with the gate folded (Qwen4)", f"{H}x{Hq * D}, 1 row", sgate, len(os_), nbytes=o_bytes, peak=peak)
-    downs = _pool(functools.partial(_bf16, H, I, device=dev), H * I * 2, past)
+    downs = _pool(functools.partial(_bf16, H, I, device=dev), H * I * 2, past, device=dev)
     dps = [k.ptr(Weight, dn) for dn in downs]
     gu1, yop = k.ptr(GateUp, _bf16(1, 2 * I, device=dev)), k.ptr(MatOut, yo)
 
@@ -1577,7 +1614,7 @@ def _card_matmul(rep: Report, k: _Cuda | None, dev: torch.device, past: int, pea
     (each row the bits its step's matvec makes), and torch's cuBLAS from a step's one row to a prefill's thousands;
     then cuBLAS square by size, where it turns from the memory's rate to the tensor cores'."""
     R, C = LINEAR
-    ws = _pool(functools.partial(_bf16, R, C, device=dev), R * C * 2, past)
+    ws = _pool(functools.partial(_bf16, R, C, device=dev), R * C * 2, past, device=dev)
     if k is not None and "btb_gemm_mma_bf16" in k.fn:
         for mma, how in ((True, "tensor cores"), (False, "fp32 chain")):
             op = rep.sweep(f"gemm bf16 ({how}), {R}x{C} streamed", "rows")
@@ -1691,11 +1728,7 @@ def card_ops(rep: Report, f: Json, index: int) -> None:
         ops += [_card_layer]
     ops += [_card_matmul, _card_prefill]
     for op in ops:
-        try:
-            op(rep, k, dev, past, peak, l2)
-        except Exception as e:  # an op's setup (its operands' allocation): its row says so, the report goes on
-            rep.skip(op.__name__.removeprefix("_card_"), "", f"failed: {type(e).__name__}: {e}")
-        _let_go()
+        _guarded(rep, op.__name__.removeprefix("_card_"), "", op, rep, k, dev, past, peak, l2)
 
 
 # -- the bus --------------------------------------------------------------------------------------------------------
@@ -1705,8 +1738,11 @@ def _bus_link(f: Json, index: int) -> tuple[Any, Any, float]:
     """the link's generation and width as it runs under a transfer (a card trains it down when idle), and its
     rate each direction"""
     dev = torch.device("cuda", index)
-    h = torch.empty(64 * MB, dtype=torch.uint8, pin_memory=True)
-    d = torch.empty(64 * MB, dtype=torch.uint8, device=dev)
+    n = min(64 * MB, room(), room(dev))
+    if n < MB:
+        raise NoRoom("a link read needs 1 MB on each side")
+    h = torch.empty(n, dtype=torch.uint8, pin_memory=True)
+    d = torch.empty(n, dtype=torch.uint8, device=dev)
     for _ in range(8):
         d.copy_(h, non_blocking=True)
     bus_id = f["cards"][index]["bus_id"]
@@ -1717,13 +1753,14 @@ def _bus_link(f: Json, index: int) -> tuple[Any, Any, float]:
 
 
 def _bus_copies(rep: Report, index: int, peak: float) -> None:
-    """copies each way by size, pinned and pageable, as the engine pays them: the copy and the wait for it"""
+    """copies each way by size, pinned and pageable, as the engine pays them: the copy and the wait for it. The
+    largest fits the room on both sides: a pinned and a pageable buffer on the host, one on the card."""
     dev = torch.device("cuda", index)
-    n = max(TRANSFERS)
-    room = host_free() // 8
-    if n > room:
-        n = max(t for t in TRANSFERS if t <= max(16 * MB, room))
-    sizes = [t for t in TRANSFERS if t <= n]
+    on_host, on_card = room(), room(dev)
+    sizes = [t for t in TRANSFERS if 2 * t <= on_host and t <= on_card]
+    if not sizes:
+        raise NoRoom(f"the smallest copy, {_size(min(TRANSFERS))}, has no room")
+    n = max(sizes)
     pinned = torch.empty(n, dtype=torch.uint8, pin_memory=True)
     pageable = torch.ones(n, dtype=torch.uint8)  # its pages touched
     d = torch.empty(n, dtype=torch.uint8, device=dev)
@@ -1762,16 +1799,21 @@ def _bus_trip(rep: Report, index: int) -> None:
 
 
 def bus(rep: Report, f: Json, index: int) -> None:
-    gen, width, peak = _bus_link(f, index)
+    gen, width, peak, why = None, None, 0.0, ""
+    try:
+        gen, width, peak = _bus_link(f, index)
+    except Exception as e:  # its buffers' allocation
+        why = _why(e)
     rep.found[f"cuda:{index} link"] = {"pcie_gen": gen, "pcie_width": width, "peak_gb_s": peak / 1e9}
     rep.section(
         f"bus to cuda:{index}",
         f"PCIe {gen}.0 x{width} under a transfer, {peak / 1e9:.1f} GB/s a direction" if peak else "the link unread",
     )
+    if why:
+        rep.skip("link", "", why)
     _let_go()
-    _bus_copies(rep, index, peak)
-    _let_go()
-    _bus_trip(rep, index)
+    _guarded(rep, "copies", "", _bus_copies, rep, index, peak)
+    _guarded(rep, "a row's round trip", "", _bus_trip, rep, index)
 
 
 # -- Apple's GPU ----------------------------------------------------------------------------------------------------
@@ -1820,10 +1862,7 @@ def _mlx_attn(rep: Report) -> None:
 def mlx_ops(rep: Report) -> None:
     rep.section("mlx", "Apple's GPU, through btb's Metal kernels")
     for op in (_mlx_gemv, _mlx_attn):
-        try:
-            op(rep)
-        except Exception as e:
-            rep.skip("mlx", "", f"failed: {type(e).__name__}: {e}")
+        _guarded(rep, op.__name__.removeprefix("_mlx_"), "", op, rep)
 
 
 # -- the drives -----------------------------------------------------------------------------------------------------
@@ -1888,47 +1927,49 @@ def _reads(rep: Report, path: str, handles: list[int], where: str) -> None:
     handles.append(h)
     span = int(min(6553600, size // 16) // 4096 * 4096)  # the drive probe's expert-sized read
     sizes = sorted({n for n in READS if n <= size // 2} | {span})
-    bufs = {n: _aligned(n) for n in sizes}
-
-    def one(nb: int) -> Callable[[], None]:
-        return lambda: Native.read_at(h, at(nb), nb, bufs[nb])
-
     alone: dict[int, Timing] = {}
+    kept: dict[int, torch.Tensor] = {}  # the span's buffer, for the bounce copy's cost
+
+    def one(op: str, label: str, nb: int) -> None:
+        _room_for(nb)
+        buf = _aligned(nb)
+        t = rep.time(op, label, lambda: Native.read_at(h, at(nb), nb, buf), nbytes=nb, at={"bytes": nb, "depth": 1})
+        if t is not None:
+            alone[nb] = t
+            if nb == span:
+                kept[nb] = buf
+
     op = rep.sweep("read, one in flight, at random offsets", "size")
     for nb in sizes:
         label = _size(nb) + (" (an expert's span)" if nb == span else "")
-        t = rep.time(op, label, one(nb), nbytes=nb, at={"bytes": nb, "depth": 1})
-        if t is not None:
-            alone[nb] = t
+        _guarded(rep, op, label, one, op, label, nb)
     rates: dict[int, tuple[float, float]] = {}
     if span in alone:
         rates[1] = _rate(alone[span], span)
+
+    def burst(op: str, nb: int, each: int, depth: int) -> None:
+        _room_for(depth * nb)
+        hs = [Native.open(path) for _ in range(depth)]
+        handles.extend(hs)
+        dst = [_aligned(nb) for _ in range(depth)]
+
+        def reader(i: int) -> None:
+            for _ in range(each):
+                Native.read_at(hs[i], at(nb), nb, dst[i])
+
+        with ThreadPoolExecutor(depth) as ex:
+            call = lambda: list(ex.map(reader, range(depth)))
+            t = rep.time(op, f"{depth} in flight", call, nbytes=each * depth * nb, at={"bytes": nb, "depth": depth})
+        if t is not None and nb == span:
+            rates[depth] = _rate(t, each * depth * span)
+
     for nb, each in ((span, 2), (4096, 32)):
         op = rep.sweep(f"read {_size(nb)}, at random offsets", "reads in flight")
         for depth in (4, 16):
-            hs = [Native.open(path) for _ in range(depth)]
-            handles += hs
-            dst = [_aligned(nb) for _ in range(depth)]
-
-            def reader(
-                i: int, nb: int = nb, each: int = each, hs: list[int] = hs, dst: list[torch.Tensor] = dst
-            ) -> None:
-                for _ in range(each):
-                    Native.read_at(hs[i], at(nb), nb, dst[i])
-
-            with ThreadPoolExecutor(depth) as ex:
-
-                def burst(ex: ThreadPoolExecutor = ex, depth: int = depth) -> None:
-                    list(ex.map(reader, range(depth)))
-
-                t = rep.time(
-                    op, f"{depth} in flight", burst, nbytes=each * depth * nb, at={"bytes": nb, "depth": depth}
-                )
-            if t is not None and nb == span:
-                rates[depth] = _rate(t, each * depth * span)
-    if 4096 not in alone or span not in alone:
+            _guarded(rep, op, f"{depth} in flight", burst, op, nb, each, depth)
+    if 4096 not in alone or span not in kept:
         return
-    big = bufs[span]
+    big = kept[span]
     other = torch.empty_like(big)
     copy = rep.sampler.time(lambda: other.copy_(big)).median  # what a merged read's bounce copy costs
     profile = {"rates": rates, "reps": 3, "fixed_ms": alone[4096].median * 1e3, "single_ms": alone[span].median * 1e3}

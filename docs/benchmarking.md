@@ -86,8 +86,11 @@ Every point is sampled until its median's 95% confidence interval is within `--c
 under a second. A point that is still wider when its time runs out is marked `~`, and its interval is shown as
 it stood. The interval is distribution-free (the order statistics around the median), so a noisy machine's
 stalls widen it instead of dragging the median. Streamed weights rotate through pools sized past the machine's
-own L3 and L2, so each call reads memory the way a decode step's layers do. Each row's JSON carries its place in
-its sweep (`at`: the bytes, rows, context, depth...) for plotting.
+own L3 and L2, so each call reads memory the way a decode step's layers do. A point whose operands would take more
+than 1/8 of the free RAM, or 1/4 of the card's free memory, is skipped and its row says so; an op whose setup fails
+leaves a row saying why, and the report goes on. So the report runs on a 4 GB machine without a card as well as on a
+64 GB one: there it skips the points that don't fit. Each row's JSON carries its place in its sweep (`at`: the bytes,
+rows, context, depth...) for plotting.
 
 - `--drive DIR`: time the drive under DIR instead of the Hugging Face cache (repeatable).
 - `--skip memory,cpu,card,bus,mlx,drive`: leave sections out.

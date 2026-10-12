@@ -3,8 +3,9 @@
 (btb/sysinfo.py): the median's interval and the sampler's stopping rule, the SMBIOS memory devices (and udev's copy
 of them) and the channels their locators name, the CPU's cores, caches and features - Linux's sysfs and macOS's
 sysctl read from fakes on any OS, then this machine's own - the host, card and MLX sections at small sizes, a drive
-written and read through btb's reader, and the command's routing between the report and a model's bench. Model-free;
-the drive test writes a few MB into a temporary folder and leaves it empty."""
+written and read through btb's reader, the report at full size on a small machine's free RAM, and the command's
+routing between the report and a model's bench. Model-free; the drive tests write a file into a temporary folder (a few
+MB, or 256 MB at full size) and remove it."""
 
 from __future__ import annotations
 
@@ -14,6 +15,8 @@ import math
 import os
 import random
 import struct
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -575,6 +578,82 @@ def test_the_host_sections_run_every_op(monkeypatch: MonkeyPatch) -> None:
         assert "host matmul" in rep.found, "\n".join(lines)
 
 
+def test_a_pool_past_the_room_is_refused_before_any_copy_is_made(monkeypatch: MonkeyPatch) -> None:
+    """a pool whose copies would take more than 1/8 of the free RAM raises NoRoom and makes nothing, counting what a
+    copy holds where that is more than a call reads"""
+    monkeypatch.setattr(machine, "host_free", lambda: 8 * MB)  # room: 1 MB
+    made: list[int] = []
+
+    def make() -> int:
+        made.append(1)
+        return len(made)
+
+    assert len(machine._pool(make, 256 * KB, 512 * KB)) == 2
+    assert len(machine._pool(make, 768 * KB, 512 * KB)) == 1, "one copy past `past` is enough on its own"
+    made.clear()
+    with pytest.raises(machine.NoRoom):
+        machine._pool(make, 1200 * KB, 0)
+    with pytest.raises(machine.NoRoom):
+        machine._pool(make, 4 * KB, 0, size=1200 * KB)  # a cache longer than the context it is read over
+    assert made == []
+
+
+def test_a_point_past_the_room_is_skipped_and_its_sweep_goes_on(monkeypatch: MonkeyPatch) -> None:
+    """the experts' group sweep with RAM for 4 and 16 experts' pools but not 64's: the two are timed and 64's row says
+    it was skipped, where its allocation once ran the machine into swap or ended the report"""
+    from btb.engine.native import Native
+
+    if Native.gemv_group is None:
+        pytest.skip("needs the native library's grouped gemv")
+    rep, lines = _small(monkeypatch)
+    monkeypatch.setattr(machine, "host_free", lambda: 96 * MB)  # room: 12 MB; 64 experts' one copy needs 16 MB
+    machine._cpu_group(rep, 8 * MB)
+    timed = [r.shape for r in rep.rows if r.t is not None]
+    skipped = {r.shape: r.note for r in rep.rows if r.t is None}
+    assert timed == ["4 experts", "16 experts"], "\n".join(lines)
+    assert list(skipped) == ["64 experts"] and skipped["64 experts"].startswith("skipped:"), "\n".join(lines)
+
+
+# the host sections and a drive at full size in a process of their own, its free RAM pinned (argv[1] bytes): each
+# row and how far the process's peak grew past where it stood with torch and the native library loaded
+SMALL_MACHINE = """
+import json, sys
+import torch
+from btb import machine, sysinfo
+from btb.engine.native import Native
+
+free = int(sys.argv[1])
+machine.host_free = lambda: free
+f = machine.facts([])
+_ = Native.gemv
+torch.randn(256, 256) @ torch.randn(256, 256)
+base = sysinfo.peak_rss_bytes()
+rep = machine.Report(machine.Sampler(ci=0.5, budget_s=0.05, min_n=3, sample_s=0.0005), lambda line: None)
+machine.memory(rep, f)
+machine.cpu_ops(rep)
+machine.drive(rep, sys.argv[2])
+rows = [{"op": r.op, "shape": r.shape, "timed": r.t is not None, "note": r.note} for r in rep.rows]
+print(json.dumps({"grown": sysinfo.peak_rss_bytes() - base, "rows": rows}))
+"""
+
+
+@pytest.mark.parametrize("free_mb", [1024, 512])
+def test_the_report_runs_on_a_4gb_machine_without_a_card(tmp_path: Path, free_mb: int) -> None:
+    """the host sections and the drive at full size with the RAM a 4 GB machine has free once its OS and torch are in
+    (1 GB, and 512 MB when it is busy): every row timed, or skipped for want of room; none fails, and the report's own
+    peak stays under half of what is free"""
+    free = free_mb * MB
+    root = Path(__file__).resolve().parents[2]  # `import btb`: the checkout's, or the installed wheel's beside it
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": "-1"}
+    cmd = [sys.executable, "-c", SMALL_MACHINE, str(free), str(tmp_path)]
+    out = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=root, timeout=900)
+    assert out.returncode == 0, out.stderr[-3000:]
+    got = json.loads(out.stdout.strip().splitlines()[-1])
+    assert not [r for r in got["rows"] if r["note"].startswith("failed")], got["rows"]
+    assert sum(r["timed"] for r in got["rows"]) > 50, got["rows"]
+    assert got["grown"] < free // 2, f"the report's peak grew {got['grown'] / MB:.0f} MB with {free_mb} MB free"
+
+
 def _card_kernels() -> Any:
     from btb.engine.native import Native
 
@@ -624,6 +703,28 @@ def test_the_card_section_runs_every_op(monkeypatch: MonkeyPatch) -> None:
     assert not [r for r in rep.rows if r.note.startswith("failed")], "\n".join(lines)
     timed = {r.op.split(",")[0] for r in rep.rows if r.t is not None}
     assert {"attention prefill bf16", "residual add and rmsnorm", "q/k norm"} <= timed, timed
+
+
+def test_the_bus_section_runs_every_op_and_a_card_without_room_skips_the_copies(monkeypatch: MonkeyPatch) -> None:
+    """the bus section at small sizes: every copy and the round trip timed. Then with the card's room too small for
+    any copy: the link read and the copies each leave a skipped row, and the round trip still runs"""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA card")
+    rep, lines = _small(monkeypatch)
+    monkeypatch.setattr(machine, "TRANSFERS", (4 * KB, MB))
+    i = torch.cuda.current_device()
+    f: Json = {"cards": [{"bus_id": None}] * (i + 1)}
+    machine.bus(rep, f, i)
+    assert all(r.t is not None for r in rep.rows), "\n".join(lines)
+    ops = {r.op for r in rep.rows}
+    assert {"to the card, pinned", "from the card, pageable", "a row's round trip"} <= ops, ops
+    rep, lines = _small(monkeypatch)
+    monkeypatch.setattr(machine, "card_free", lambda dev: 2 * KB)  # room: 512 bytes
+    machine.bus(rep, f, i)
+    skipped = {r.op: r.note for r in rep.rows if r.t is None}
+    assert list(skipped) == ["link", "copies"], "\n".join(lines)
+    assert all(n.startswith("skipped:") for n in skipped.values()), skipped
+    assert [r.op for r in rep.rows if r.t is not None] == ["a row's round trip"], "\n".join(lines)
 
 
 def test_the_mlx_section_runs_every_op(monkeypatch: MonkeyPatch) -> None:
