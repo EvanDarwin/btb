@@ -24,6 +24,7 @@ import os
 import sys
 from enum import StrEnum
 from types import ModuleType
+from typing import TypeGuard
 
 from .core import BTB_SRC
 
@@ -37,6 +38,7 @@ class Missing(StrEnum):
     BINDING_RULE = "binding-rule"
     BINDINGS_STALE = "bindings-stale"
     RAW_LAUNCH = "raw-launch"
+    TEMP_POINTER = "temp-pointer"
     UNLAUNCHED = "unlaunched"
 
 
@@ -55,6 +57,11 @@ MISSING: dict[Missing, tuple[str, str]] = {
     Missing.RAW_LAUNCH: (
         "the `.launch(...)` at {s} hands the driver an argument list no type checked",
         "launch the kernel through its method (`k.btb_<kernel>(grid, block, ...)`, btb/engine/card_launch.py)",
+    ),
+    Missing.TEMP_POINTER: (
+        "the pointer at {s} is taken from a tensor nothing holds: it is freed when the line ends, and the kernel reads "
+        "whatever memory comes to live there",
+        "make the tensor a named variable that lives as long as the launch (a graph body's own), then take its pointer",
     ),
     Missing.UNLAUNCHED: (
         "nothing in btb/ reaches {s}'s launcher - a dead kernel path, compiled and loaded for nothing",
@@ -118,6 +125,37 @@ def raw_launches(sources: list[tuple[str, ast.Module]] | None = None) -> list[st
     ]
 
 
+PASS_THROUGH = {"zip", "enumerate", "range", "reversed", "sorted", "list", "tuple"}  # hand on what they are given
+
+
+def _is_pointer(node: ast.AST) -> TypeGuard[ast.Call]:
+    """whether `node` takes a pointer: a call of `ptr` or `_at`"""
+    if not isinstance(node, ast.Call):
+        return False
+    f = node.func
+    return (f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else None) in ("ptr", "_at")
+
+
+def temp_pointers(sources: list[tuple[str, ast.Module]] | None = None) -> list[str]:
+    """every pointer in btb/ taken from tensors nothing holds, as `file:line`: one a call has just made
+    (`k.ptr(GateUp, _bf16(...))`), or each of a call's results in a comprehension (`[k.ptr(Weight, w) for w in
+    _pool(...)]`). A pointer is a bare address, so those tensors are freed once the line ends"""
+    sources = _sources(BTB_SRC) if sources is None else sources
+    out = []
+    for path, tree in sources:
+        for node in ast.walk(tree):
+            if _is_pointer(node) and len(node.args) >= 2 and isinstance(node.args[1], ast.Call):
+                out.append(_where(path, node.lineno))
+            elif isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)) and any(
+                isinstance(g.iter, ast.Call)
+                and not (isinstance(g.iter.func, ast.Name) and g.iter.func.id in PASS_THROUGH)
+                for g in node.generators
+            ):
+                if any(_is_pointer(n) for n in ast.walk(node.elt)):
+                    out.append(_where(path, node.lineno))
+    return out
+
+
 def reached_launchers(sources: list[tuple[str, ast.Module]] | None = None) -> set[str]:
     """the launchers btb/ reaches: each named as a function (`btb_silu_mul(k, ...)`) or as the card module's method
     (`k.btb_silu_mul(...)`), called there or picked and called later (`glu = k.btb_gemv_mma_glu_gelu if gelu else
@@ -145,6 +183,7 @@ def _findings() -> list[tuple[Missing, str]]:
     reached = reached_launchers(sources)
     out = [(Missing.BINDINGS_STALE, f) for f in stale]
     out += [(Missing.RAW_LAUNCH, s) for s in raw_launches(sources)]
+    out += [(Missing.TEMP_POINTER, s) for s in temp_pointers(sources)]
     out += [(Missing.UNLAUNCHED, m) for m in sorted(names) if m not in reached]
     return out
 

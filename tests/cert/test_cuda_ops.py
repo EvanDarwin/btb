@@ -1,8 +1,8 @@
 """The CUDA card-kernel matrix as a suite gate. The card runs only where a GPU is present, so this is the
 structural half: the kernels' bindings are what native/cuda's signatures write (each parameter a role, no two of a
 kernel's alike), nothing in btb/ launches a kernel but through its typed launcher, and every launcher is reached from
-btb/. A signature edited without the bindings, a raw launch, or a kernel nothing launches any more fails here; mypy
-holds each launch to its kernel's parameters and their roles."""
+btb/. A signature edited without the bindings, a raw launch, a pointer taken from a tensor nothing holds, or a kernel
+nothing launches any more fails here; mypy holds each launch to its kernel's parameters and their roles."""
 
 from __future__ import annotations
 
@@ -69,6 +69,25 @@ def run(k, gelu, M):
     assert cuda_ops.reached_launchers(sources) == {
         "btb_gemv_mma_glu_gelu", "btb_gemv_mma_glu_silu", "btb_gemv_bf16", "btb_sample_out"
     }  # fmt: skip
+
+
+def test_a_pointer_taken_from_a_tensor_nothing_holds_is_a_gap() -> None:
+    """a pointer is a bare address: one taken from a tensor a call has just made reads freed memory once the line ends
+    (the report's folded down projection did), and so does each one a comprehension takes over a call's results. One
+    taken from a named tensor, a subscript or None is not a gap, nor a comprehension over a named list or zip of them"""
+    src = """
+def run(k, dev, t, g, ws, xs):
+    a = k.ptr(GateUp, _bf16(1, 64, device=dev))
+    b = _at(MatIn, t.contiguous(), 0)
+    dps = [k.ptr(Weight, w) for w in _pool(make, 64, 128)]
+    kvs = [(k.ptr(KCache, K), k.ptr(VCache, V)) for K, V in fresh_caches()]
+    held = _bf16(1, 64, device=dev)
+    c, d, e = k.ptr(GateUp, held), k.ptr(Query, g["q"]), k.ptr(RowMap, None)
+    f = [k.ptr(Weight, w) for w in ws]
+    h = [(k.ptr(Weight, w), k.ptr(MatIn, x)) for w, x in zip(ws, xs)]
+"""
+    sources = [("mod.py", ast.parse(src))]
+    assert cuda_ops.temp_pointers(sources) == ["mod.py:3", "mod.py:4", "mod.py:5", "mod.py:6"]
 
 
 def test_kernels_parameters_are_read_off_their_definitions() -> None:

@@ -1577,11 +1577,12 @@ def _card_layer(rep: Report, k: _Cuda, dev: torch.device, past: int, peak: float
     rep.card("o_proj with the gate folded (Qwen4)", f"{H}x{Hq * D}, 1 row", sgate, len(os_), nbytes=o_bytes, peak=peak)
     downs = _pool(functools.partial(_bf16, H, I, device=dev), H * I * 2, past, device=dev)
     dps = [k.ptr(Weight, dn) for dn in downs]
-    gu1, yop = k.ptr(GateUp, _bf16(1, 2 * I, device=dev)), k.ptr(MatOut, yo)
+    gu1 = _bf16(1, 2 * I, device=dev)  # held by name: its pointer keeps nothing alive
+    gu1p, yop = k.ptr(GateUp, gu1), k.ptr(MatOut, yo)
 
     def down() -> None:
         for dp in dps:
-            k.btb_gemv_silu_bf16(1, ((H + 3) // 4, 1, 1), (128, 1, 1), dp, gu1, yop, OutDim(H), InDim(I))
+            k.btb_gemv_silu_bf16(1, ((H + 3) // 4, 1, 1), (128, 1, 1), dp, gu1p, yop, OutDim(H), InDim(I))
 
     rep.card("down with silu(gate) x up folded", f"{H}x{I}, 1 row", down, len(downs), nbytes=H * I * 2, peak=peak)
 
