@@ -12,7 +12,7 @@ import os
 import shutil
 from typing import TYPE_CHECKING
 
-from btb.kinds import QUANT_KIND, Cap, FamilyKind, PassTag, Proposer, Quant, QuantClass
+from btb.kinds import QUANT_KIND, STORED_CLASSES, Cap, FamilyKind, PassTag, Proposer, Quant, QuantClass, quant_tag
 
 from . import core, manifest, native_ops, spec
 
@@ -259,8 +259,27 @@ def test_every_subpath_declares_its_tag() -> None:
     for dev in spec.DEVICE_SUBPATHS:
         for kind in core.served_kinds():
             for storage in spec.Storage:
-                assert isinstance(dev.expect(kind, storage), PassTag), f"{dev.key} has no tag for {kind.value}"
-                assert dev.expect(kind, storage) in dev.expects(kind, storage)
+                for q in spec.STORAGE[storage].quants or (None,):
+                    tag = dev.expect(kind, storage, q)
+                    assert isinstance(tag, PassTag), f"{dev.key} has no tag for {kind.value}"
+                    assert tag in dev.expects(kind, storage, q)
+
+
+def test_a_packed_cell_shows_its_own_files_type_on_every_tier() -> None:
+    """every hardware's as-stored GGUF sub-path asks a file's cell for that type's own tag, never one tag for
+    every type: a Q4_K file's cell is satisfied by the Q4_K gemv alone, not by a Q6_K head beside dequantized
+    layers. The dequant twin of each asks for the bf16 slot."""
+    packed = [d for d in spec.DEVICE_SUBPATHS if d.only is spec.Container.GGUF and d.knobs.get("gguf_packed") == 1]
+    dequant = [d for d in spec.DEVICE_SUBPATHS if d.only is spec.Container.GGUF and d.knobs.get("gguf_packed") == 0]
+    assert {d.hardware for d in packed} == {d.hardware for d in dequant} == set(spec.Hardware) - spec.NO_BACKEND
+    for storage, info in spec.STORAGE.items():
+        if spec.quant_class(storage) not in STORED_CLASSES:
+            continue
+        for q in info.quants:
+            for dev in packed:
+                assert dev.expect(FamilyKind.QWEN3, storage, q) is quant_tag(q), (dev.key, q)
+            for dev in dequant:
+                assert dev.expect(FamilyKind.QWEN3, storage, q) is PassTag.QUANT_DEQUANT, (dev.key, q)
 
 
 def test_the_mlx_step_fork_is_tagged_per_family() -> None:
@@ -268,12 +287,12 @@ def test_the_mlx_step_fork_is_tagged_per_family() -> None:
     partial rotary and the MoE and hybrid families do not - and mlx-fp32 never does, its state is not bf16."""
     step, fp32 = spec.SUBPATH["mlx-step"], spec.SUBPATH["mlx-fp32"]
     bf16 = spec.Storage.SAFE_BF16
-    assert step.expect(FamilyKind.QWEN3, bf16) is PassTag.MLX_STEP_FUSED
-    assert step.expect(FamilyKind.GEMMA3, bf16) is PassTag.MLX_STEP_FUSED
-    assert step.expect(FamilyKind.PHI3, bf16) is PassTag.MLX_STEP_UNFUSED
-    assert step.expect(FamilyKind.QWEN3_5, bf16) is PassTag.MLX_HYBRID
-    assert step.expect(FamilyKind.GPT_OSS, bf16) is PassTag.MLX_PEROP
-    assert fp32.expect(FamilyKind.QWEN3, bf16) is PassTag.MLX_STEP_UNFUSED
+    assert step.expect(FamilyKind.QWEN3, bf16, None) is PassTag.MLX_STEP_FUSED
+    assert step.expect(FamilyKind.GEMMA3, bf16, None) is PassTag.MLX_STEP_FUSED
+    assert step.expect(FamilyKind.PHI3, bf16, None) is PassTag.MLX_STEP_UNFUSED
+    assert step.expect(FamilyKind.QWEN3_5, bf16, None) is PassTag.MLX_HYBRID
+    assert step.expect(FamilyKind.GPT_OSS, bf16, None) is PassTag.MLX_PEROP
+    assert fp32.expect(FamilyKind.QWEN3, bf16, None) is PassTag.MLX_STEP_UNFUSED
 
 
 def test_the_residency_fork_is_a_cell_per_hardware() -> None:
@@ -286,7 +305,7 @@ def test_the_residency_fork_is_a_cell_per_hardware() -> None:
         assert PassTag.EXPERT_BUS_PASS in spec.SUBPATH[default].expects(FamilyKind.GPT_OSS, bf16)
         assert PassTag.EXPERT_LINE in spec.SUBPATH[riders].expects(FamilyKind.GPT_OSS, bf16)
         assert spec.SUBPATH[default].expects(FamilyKind.QWEN3, bf16) == {
-            spec.SUBPATH[default].expect(FamilyKind.QWEN3, bf16),
+            spec.SUBPATH[default].expect(FamilyKind.QWEN3, bf16, None),
             spec.kv_tag(FamilyKind.QWEN3, spec.SUBPATH[default].hardware),
         }
     assert {d.hardware for d in spec.DEVICE_SUBPATHS if d.needs is Cap.MOE} == set(spec.Hardware) - spec.NO_BACKEND
@@ -323,8 +342,9 @@ def test_the_option_selected_forks_have_cells() -> None:
     for tag in (PassTag.HEAD_STREAMED, PassTag.EXPERT_MXFP4_ASSTORED, PassTag.EXPERT_BUS_PASS, PassTag.EXPERT_LINE):
         assert tag in asserted and tag not in manifest.FORK_NOTES, tag
     assert spec.SUBPATH["cpu-headstream"].knobs["resident_head"] == 0
-    packed = spec.SUBPATH["mlx-packed"].expect(FamilyKind.GPT_OSS, spec.Storage.GGUF_MXFP4)
-    assert packed is PassTag.EXPERT_MXFP4_ASSTORED
+    for key in ("cpu-packed", "mlx-packed", "cuda-packed"):
+        packed = spec.SUBPATH[key].expect(FamilyKind.GPT_OSS, spec.Storage.GGUF_MXFP4, Quant.MXFP4)
+        assert packed is PassTag.EXPERT_MXFP4_ASSTORED, key
 
 
 # --- the replicated engine predicates still match their source ----------------------------------------------
@@ -551,7 +571,9 @@ def test_a_cell_never_forbids_what_it_expects() -> None:
         for kind in core.served_kinds():
             bad = spec.forbidden_tags(kind, dev)
             for st in spec.Storage:
-                assert not bad & dev.expects(kind, st), (dev.key, kind, st)
+                # a storage of several stored types is asked for each file's own
+                for q in spec.STORAGE[st].quants or (None,):
+                    assert not bad & dev.expects(kind, st, q), (dev.key, kind, st, q)
             for surface, forbids in spec.SURFACE_FORBIDS.items():
                 if dev.key in spec.SURFACE_SUBPATHS[surface]:
                     assert not forbids(kind, dev) & spec.SURFACE_TAGS[surface](kind, dev), (surface, dev.key, kind)

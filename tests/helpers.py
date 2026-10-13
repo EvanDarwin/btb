@@ -26,7 +26,7 @@ import numpy as np
 import pytest
 import torch
 
-from btb.kinds import Json, Parents, TokenRows, Tokens
+from btb.kinds import Json, Parents, Quant, TokenRows, Tokens
 from btb.sampling import Sampling
 
 if TYPE_CHECKING:
@@ -317,6 +317,52 @@ def mxfp4_random(
 def mxfp4_slot(blocks: np.ndarray, scales: np.ndarray) -> np.ndarray:
     """one slot's bytes as the store holds them: the blocks, then the scales, flat"""
     return np.concatenate([blocks.reshape(-1), scales.reshape(-1)])
+
+
+# --- GGUF blocks of the stored types -------------------------------------------------------------------------
+
+# where each stored type keeps its f16 factors in a block (byte offsets): ggml's layouts, the kernels' knowledge
+# of the format. IQ1_M spreads its one half over the top nibbles of four scale words (bytes 49, 51, 53, 55).
+# Held to kinds.stored_quants() by test_gguf, so a new type fails until it has a row
+F16_AT: dict[Quant, tuple[int, ...]] = {
+    Quant.Q4_0: (0,), Quant.Q4_1: (0, 2), Quant.Q8_0: (0,), Quant.Q2_K: (80, 82), Quant.Q3_K: (108,),
+    Quant.Q4_K: (0, 2), Quant.Q5_K: (0, 2), Quant.Q6_K: (208,), Quant.IQ4_NL: (0,), Quant.IQ4_XS: (0,),
+    Quant.IQ3_XXS: (0,), Quant.IQ3_S: (0,), Quant.IQ2_XXS: (0,), Quant.IQ2_XS: (0,), Quant.IQ2_S: (0,),
+    Quant.IQ1_S: (0,), Quant.IQ1_M: (),
+}  # fmt: skip
+
+
+def _set_f16(raw: np.ndarray, q: Quant, d: np.ndarray) -> None:
+    """every block's f16 factors of `raw` ([blocks, bytes]) set to `d` (f16, one a block)"""
+    if q is Quant.IQ1_M:  # the four top nibbles of the scale words, low word first
+        bits = d.view(np.uint16)
+        for k, at in enumerate((49, 51, 53, 55)):
+            raw[:, at] = (raw[:, at] & 0x0F) | (((bits >> (4 * k)) & 0xF) << 4).astype(np.uint8)
+        return
+    for off in F16_AT[q]:
+        raw[:, off : off + 2] = d.view(np.uint8).reshape(-1, 2)
+
+
+def stored_blocks(q: Quant, rows: int, cols: int, rng: np.random.Generator | int, std: float = 0.0) -> np.ndarray:
+    """random bytes for a [rows, cols] matrix of type `q`, every f16 factor finite and one block in eight's
+    subnormal (a real quantizer writes those for a near-zero block, and a decode that gets their exponent wrong
+    passes every test that only draws normal halves). With `std`, the factors are scaled so the matrix's weights
+    spread as a tensor of that standard deviation does (each weight is linear in its block's factors)"""
+    from gguf import GGMLQuantizationType, dequantize
+
+    from btb.gguf import block_of
+
+    g = rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng)
+    weights, nbytes = block_of(q)
+    raw = g.integers(0, 256, size=(rows * cols // weights, nbytes), dtype=np.uint8)
+    d = g.uniform(0.001, 0.05, len(raw)).astype(np.float16)
+    d[g.random(len(raw)) < 0.125] = np.float16(3e-6)  # below f16's smallest normal, 6.1e-5
+    if std > 0:
+        _set_f16(raw, q, np.ones(len(raw), np.float16))
+        spread = float(np.std(dequantize(raw, GGMLQuantizationType[q.value])))
+        d = (d.astype(np.float64) / float(np.mean(d)) * std / max(spread, 1e-12)).astype(np.float16)
+    _set_f16(raw, q, d)
+    return raw.reshape(-1)
 
 
 # --- the scheduler's stub engines ----------------------------------------------------------------------------

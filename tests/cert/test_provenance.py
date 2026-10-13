@@ -12,18 +12,23 @@ import os
 import re
 
 import pytest
+import torch
 
 import btb
 from btb.engine.native import Native
-from btb.kinds import PassReport, PassTag
+from btb.kinds import PassReport, PassTag, Quant, quant_tag, stored_quants
 from tests.helpers import FIXTURES, loaded_model
 
 BTB = os.path.dirname(os.path.abspath(btb.__file__))  # the package under test: the checkout's, or the wheel's
 _ENGINE = os.path.join(BTB, "engine")
 QWEN3 = os.path.join(FIXTURES, "tiny_qwen3")
+# every tier this machine has
+DEVICES = ["cpu", *(["mlx"] if btb.mlx_available() else []), *(["cuda"] if torch.cuda.is_available() else [])]
 
 _DEF_RE = re.compile(r"^\s*(?:async\s+)?def\s+_forward", re.M)  # the count the AST walk must reproduce
 _TAG_RE = re.compile(r"\bPassTag\.([A-Z][A-Z_0-9]*)")  # a tag the engine records (its declaration names no prefix)
+# a stored type's own tag, recorded for whichever type the weight is (its definition aside)
+_QUANT_TAG_RE = re.compile(r"(?<!def )\bquant_tag\(")
 
 Forward = tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]  # (engine module, a _forward* entry point)
 
@@ -144,7 +149,10 @@ def test_every_pass_tag_is_emitted() -> None:
         for name in files:
             if name.endswith(".py"):
                 with open(os.path.join(root, name), encoding="utf-8") as f:
-                    used |= set(_TAG_RE.findall(f.read()))
+                    src = f.read()
+                used |= set(_TAG_RE.findall(src))
+                if _QUANT_TAG_RE.search(src):
+                    used |= {quant_tag(q).name for q in stored_quants()}
     orphans = sorted(t.name for t in PassTag if t.name not in used)
     assert not orphans, f"these PassTag members are never recorded in btb/ (wire the fork, or drop them): {orphans}"
 
@@ -242,23 +250,21 @@ def test_mlx_mxfp4_experts_are_as_stored() -> None:
     assert PassTag.EXPERT_MXFP4_ASSTORED in tags, sorted(t.value for t in tags)
 
 
-@pytest.mark.skipif(not btb.mlx_available(), reason="MLX is not available on this machine")
-def test_mlx_gguf_packed_vs_dequant_quant_tags() -> None:
-    """an affine-quantized GGUF on MLX: read as stored it records QUANT_ASSTORED (the matvec kernels bind the
-    packed bytes, mlx_state.affine), dequantized to bf16 it records QUANT_DEQUANT. A dense family (qwen3), so
-    the affine linears actually reach the fused path rather than the MoE per-op path."""
-    gdir = os.path.join(FIXTURES, "gguf")
-    files = sorted(os.listdir(gdir)) if os.path.isdir(gdir) else []
-    affine = [f for f in files if f.startswith("tiny_qwen3-") and (f.endswith("q4_0.gguf") or f.endswith("q8_0.gguf"))]
-    if not affine:
-        pytest.skip("no affine-quant dense GGUF fixture built")
-    path = os.path.join(gdir, affine[0])
-    with loaded_model(path, device="mlx", gguf_packed=1) as sm:
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("quant", [Quant.Q4_0, Quant.Q8_0])
+def test_gguf_packed_vs_dequant_quant_tags(device: str, quant: Quant) -> None:
+    """an affine-quantized GGUF on each tier: read as stored it records its type's own tag and no bf16 slot (each
+    linear's gemv binds the file's blocks), dequantized to bf16 it records QUANT_DEQUANT and no type's tag. A dense
+    family (qwen3), so the linears reach the fused paths rather than a MoE per-op path."""
+    path = os.path.join(FIXTURES, "gguf", f"tiny_qwen3-{quant.value.lower()}.gguf")
+    if not os.path.isfile(path):
+        pytest.skip(f"{os.path.basename(path)} not built")
+    with loaded_model(path, device=device, gguf_packed=1) as sm:
         sm.generate([1, 2, 3, 4], 6, speculate=False)
-        packed = sm.last_pass_report()
-    assert PassTag.QUANT_ASSTORED in packed, f"expected QUANT_ASSTORED, got {sorted(t.value for t in packed.tags)}"
+        packed = sm.last_pass_report().tags
+    assert quant_tag(quant) in packed and PassTag.QUANT_DEQUANT not in packed, sorted(t.value for t in packed)
 
-    with loaded_model(path, device="mlx", gguf_packed=0) as sm:
+    with loaded_model(path, device=device, gguf_packed=0) as sm:
         sm.generate([1, 2, 3, 4], 6, speculate=False)
-        dequant = sm.last_pass_report()
-    assert PassTag.QUANT_DEQUANT in dequant and PassTag.QUANT_ASSTORED not in dequant
+        dequant = sm.last_pass_report().tags
+    assert PassTag.QUANT_DEQUANT in dequant and quant_tag(quant) not in dequant, sorted(t.value for t in dequant)

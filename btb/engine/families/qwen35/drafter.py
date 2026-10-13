@@ -384,7 +384,7 @@ class Qwen35Drafter(MTPDrafter):
         else:
             head = self._torch_head()
             if head is None:
-                W = (sm.head.weight if sm.resident_head else sm._get(sm.head_key)).detach()
+                W = (sm.head.weight if sm.head is not None else sm._get(sm.head_key)).detach()
                 step = 32768
                 logits = torch.cat(
                     [hn.to(self.cd) @ W[c : c + step].to(self.dev, self.cd).T for c in range(0, W.shape[0], step)],

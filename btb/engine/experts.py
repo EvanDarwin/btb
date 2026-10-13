@@ -23,8 +23,9 @@ import torch
 from .. import mlx as mlxdev
 from .. import trace
 from ..fp8 import F8Weight
-from ..kinds import PassTag
-from ..mxfp4 import BLOCK, MxGateUp, MxWeight, stored_mxfp4
+from ..gguf import QuantWeight
+from ..kinds import QUANT_KIND, PassTag, Quant, QuantClass
+from ..mxfp4 import BLOCK, GateUp, MxWeight, stored_mxfp4
 from ..options import Device
 from .device import where
 from .host import bf16_in_place, stored_parts
@@ -906,11 +907,18 @@ class _ExpertStore:
         # an FP8 checkpoint's experts: each projection's e4m3 bytes and its scale grid, multiplied as stored
         self.f8 = bool(getattr(sm, "fp8_experts", False))
         self.f8_sdt = torch.float32  # the scale grids' stored dtype, from the first recipe
-        # a GGUF's experts: gate, up and down in ggml's block layout, multiplied as stored (btb/mxfp4.py)
-        self.ggml = self.mx and getattr(sm, "gguf", None) is not None
-        # a GGUF's other experts, which no kernel multiplies as stored: a read dequantizes the expert (its layout
+        # a GGUF's experts read as stored (`sm.stored_experts`): gate, up and down in the file's blocks, MXFP4
+        # (btb/mxfp4.py) or another stored type, each layer's three types in `types`
+        gg = getattr(sm, "gguf", None)
+        self.ggml = gg is not None and (self.mx or bool(getattr(sm, "stored_experts", False)))
+        self.types: dict[int, tuple[Quant, ...]] = {}
+        # a GGUF's other experts, which no kernel here multiplies as stored: a read dequantizes the expert (its layout
         # inverted, `GGUFModel.get`) into the slot as the bf16 a checkpoint's read would land there
-        self.dequant = not self.mx and getattr(sm, "gguf", None) is not None
+        self.dequant = gg is not None and not self.ggml
+        # those experts are a quantized type's, not a float file's: widened to bf16 on every read
+        self.widened = (
+            gg is not None and self.dequant and any(QUANT_KIND[q] is not QuantClass.FLOAT for q in gg.expert_quants())
+        )
         self.keys: dict[int, tuple[str, ...]] = {}  # the dequantized experts' tensor names by layer
         self.n_slots = 0
         self.budget = int(budget_bytes)
@@ -1358,6 +1366,8 @@ class _ExpertStore:
                     self.dt = self.sm.ST_DTYPES[info["dtype"]]
             if self.dequant:
                 self.keys[layer] = tuple(base + name for name in names)
+            if self.ggml and not self.mx:
+                self.types[layer] = tuple(Quant(self.sm.gguf.tensors[n].tensor_type.name) for n in names)
             r = self.recipes[layer] = parts
             sched = getattr(self.sm, "scheduler", None)
             if sched is not None and hasattr(sched, "disk"):
@@ -1366,14 +1376,16 @@ class _ExpertStore:
                     d = sched.disk(p[0])
                     if self.drive is None and d.get("measured"):
                         self.drive = d
-            per = sum(p[2] for p in parts)
+            # a stored type's slot parts take the widest layer's expert: a mix such as Q4_K_M widens some layers' down
+            widest = self._widest() if self.types else ()
+            per = sum(widest or (p[2] for p in parts))
             shapes = tuple(p[3] for p in parts)
             if self.shapes is None:
                 self.per = per
                 # bf16: (gate_up bytes, gate_up shape, down shape), what `_views` splits the slot on;
-                # MXFP4: the four tensors' per-expert shapes, and `sizes` their byte counts
-                self.shapes = shapes if self.mx or self.f8 else (parts[0][2], *shapes)
-                self.sizes = tuple(p[2] for p in parts)
+                # MXFP4 and the stored types: the tensors' per-expert shapes, and `sizes` their byte counts
+                self.shapes = shapes if self.mx or self.f8 or widest else (parts[0][2], *shapes)
+                self.sizes = widest or tuple(p[2] for p in parts)
                 # reads straight into the slot (padded regions) unless BTB_STORE_PADDED=0 asks for the bounce
                 self.padded = (
                     self.sm.mlx is None
@@ -1407,9 +1419,19 @@ class _ExpertStore:
                 )
                 if self.drive is not None:
                     self.sm.log(self.drive_report(self.drive, self.n_slots, total, per))
-            elif per != self.per or tuple(p[2] for p in parts) != self.sizes:
+            elif per != self.per or (shapes != self.shapes if widest else tuple(p[2] for p in parts) != self.sizes):
                 raise RuntimeError(f"[experts] layer {layer} expert shape differs from layer 0")
         return r
+
+    def _widest(self) -> tuple[int, ...]:
+        """each of (gate, up, down)'s most bytes an expert of any layer takes in the file"""
+        gg, out = self.sm.gguf, [0, 0, 0]
+        for i in range(int(self.sm.L)):
+            for j, k in enumerate(("gate", "up", "down")):
+                t = gg.tensors.get(f"blk.{i}.ffn_{k}_exps.weight")
+                if t is not None:
+                    out[j] = max(out[j], int(t.n_bytes) // int(t.shape[-1]))
+        return tuple(out)
 
     def _open_vram(self) -> None:
         """the card's seats for the bf16 experts, or the MXFP4 ones in the checkpoint's layout as stored, sized by
@@ -1622,13 +1644,26 @@ class _ExpertStore:
     def _views(self, slot: Any) -> Any:
         return self._views_in(self._region(slot), slot)
 
+    def _layer_of(self, slot: Any) -> int:
+        """the layer whose expert `slot` holds, the first recipe's for no slot (a layout read off no expert)"""
+        key = self.slots[slot].key if slot is not None else None
+        return key[0] if key is not None else next(iter(self.recipes))
+
     def _views_in(self, region: Any, slot: Any = None) -> Any:
         """an expert's views over `region`, its slot's bytes (`slot` for where a direct read left them)"""
+        if self.types:
+            # a stored type's (gate, up, down), each its layer's own type and bytes from its part's start
+            layer = self._layer_of(slot)
+            ws = [
+                QuantWeight.of(self._part(slot, region, p)[:n_e], q, *(int(s) for s in shape))
+                for p, ((_path, _off, n_e, shape), q) in enumerate(zip(self.recipes[layer], self.types[layer]))
+            ]
+            return GateUp(ws[0], ws[1]), ws[2]
         if self.ggml:
             (rows, k), _, (drows, dk) = self.shapes
             gate = MxWeight.from_ggml(self._part(slot, region, 0), int(rows), int(k))
             up = MxWeight.from_ggml(self._part(slot, region, 1), int(rows), int(k))
-            return MxGateUp(gate, up), MxWeight.from_ggml(self._part(slot, region, 2), int(drows), int(dk))
+            return GateUp(gate, up), MxWeight.from_ggml(self._part(slot, region, 2), int(drows), int(dk))
         if self.mx:
             out = []
             for i in (0, 2):
@@ -1680,6 +1715,17 @@ class _ExpertStore:
         sh = self.shared[sl.block]
         off = sl.row * int(self.stride or self.per)
         be = self.sm.mlx
+        if self.types:
+            # a stored type's (gate, up, down) read by the type's kernel straight from the shared block
+            layer, at = (
+                self._layer_of(slot),
+                [self.part_at[p] if self.part_at else sum(self.sizes[:p]) for p in range(3)],
+            )
+            ws = [
+                be.weight_stored_slot(sh, off + at[p], n_e, q, shape)
+                for p, ((_path, _off, n_e, shape), q) in enumerate(zip(self.recipes[layer], self.types[layer]))
+            ]
+            return (ws[0], ws[1]), ws[2]
         if self.mx:
             # the slot as the GPU's MXFP4 matvec reads it: gate_up's blocks then scales, then down's (a GGUF's:
             # gate, up, down in ggml's blocks), as uint8 views of the shared block (the store's readers write,

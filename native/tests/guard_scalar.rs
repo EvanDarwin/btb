@@ -45,6 +45,18 @@ fn fp8_rows_and_group() {
     fp8k::group_check("scalar", &[1, 0]);
 }
 
+/// Every GGUF quant matvec with no vector path selected.
+#[test]
+fn gemv_quant() {
+    pin();
+    quant::fenced_sweep(
+        "scalar quant",
+        &[(48, 1024), (17, 512), (1, 256)],
+        &[1, 9, 17],
+        &[1, 0],
+    );
+}
+
 /// The DeltaNet step and the state slab with no vector path selected.
 #[test]
 fn delta_step() {

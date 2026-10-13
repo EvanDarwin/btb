@@ -13,8 +13,9 @@ import torch
 from .. import fp8
 from .. import mlx as mlxdev
 from ..fp8 import F8Weight
-from ..kinds import PassTag
-from ..mxfp4 import BLOCK, MxGateUp, MxWeight
+from ..gguf import QuantWeight
+from ..kinds import PassTag, Quant, quant_tag
+from ..mxfp4 import BLOCK, GateUp, MxWeight
 from ..mxfp4_torch import dequant_blocks
 from ..options import Device
 from .native import Native
@@ -22,6 +23,7 @@ from .pack import unpack_bf16
 
 if TYPE_CHECKING:
     from .experts import StoreCall
+    from .scratch import Scratch
 
 
 def copy_bytes(dst: torch.Tensor, t: torch.Tensor) -> None:
@@ -47,6 +49,8 @@ class _HostLinear(torch.nn.Module):
     key: str | None
     mx: Any
     packed: tuple[Any, ...] | None
+    quant: QuantWeight | None
+    scratch: Scratch | None
     weight: torch.Tensor
 
     def __init__(self, weight: torch.Tensor, key: str | None = None, bias: torch.Tensor | None = None) -> None:
@@ -60,10 +64,22 @@ class _HostLinear(torch.nn.Module):
         self.mx = None
         # an FP8 checkpoint's matrix as stored (families/__init__.py binds it); `weight` is then its shape and no bytes
         self.f8 = None
+        # a GGUF matrix as stored for its type's native gemv (families/__init__.py, tiers.py bind it); `weight` is
+        # then its shape and no bytes
+        self.quant = None
+        self.scratch = None  # the engine's, where a stored matrix's prefill decodes its weights (`stored_matmul`)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self._matmul(x)
         return y if self.bias is None else y + self.bias.to(y.dtype)
+
+    def stored_tag(self) -> PassTag | None:
+        """the stored-weight path this linear's matmul takes: its GGUF type's own gemv, natively or on MLX, or a
+        bf16 slot; None for an FP8 matrix as stored, whose layer records FP8_ASSTORED"""
+        q = self.quant.q if self.quant is not None else getattr(self.mx, "q", None)
+        if q is not None:
+            return quant_tag(q)
+        return None if self.f8 is not None else PassTag.QUANT_DEQUANT
 
     def _matmul(self, x: torch.Tensor) -> torch.Tensor:
         if self.mx is not None:
@@ -71,6 +87,11 @@ class _HostLinear(torch.nn.Module):
                 return self._slot_gemv(x)
             return Native.mlx.linear(x, self.mx)
         rows, cols = self.weight.shape
+        if self.quant is not None:
+            # the type's gemv for a step's or a verify pass's rows; a prefill's take a GEMM, as a bf16 weight's do
+            shp = x.shape
+            x2 = x.reshape(-1, cols).float().contiguous()
+            return stored_matmul(self.quant, x2, self.scratch).view(*shp[:-1], rows).to(x.dtype)
         if self.f8 is not None:
             # the FP8 kernel widens a column tile once and reuses it over the batch tile, so it is the path at
             # every batch size, as the MXFP4 one is
@@ -118,6 +139,40 @@ class _HostLinear(torch.nn.Module):
 
 def _rows(x: torch.Tensor) -> int:
     return x.numel() // max(1, int(x.shape[-1]))
+
+
+def stored_matmul(w: QuantWeight, x2: torch.Tensor, scratch: Scratch | None) -> torch.Tensor:
+    """`x2` [b, cols] float32 times a stored matrix, [b, rows] float32: a step's or a verify pass's rows through
+    its type's gemv, one batch-invariant row each; a prefill's through its weights decoded once to float32
+    (`QuantGemv.dequant`) into the engine's `scratch` for torch's GEMM, from the row count a bf16 weight's take it
+    (4x the gemv at 512 rows)"""
+    gq = Native.gemv_quant
+    assert gq is not None  # bound only where the library carries the type's gemv
+    rows, cols = w.shape
+    if x2.shape[0] < Native.gemm_rows or w.q not in gq.dequants:
+        y = torch.empty(x2.shape[0], rows, dtype=torch.float32)
+        gq(w, x2, y)
+        return y
+    why = "a stored matrix decoded for a prefill's GEMM"
+    W = (
+        scratch.take("stored_gemm", (rows, cols), torch.float32, "cpu", why)
+        if scratch is not None
+        else torch.empty(rows, cols, dtype=torch.float32)
+    )
+    gq.dequant(w, W)
+    return torch.nn.functional.linear(x2, W)
+
+
+def stored_tags(module: torch.nn.Module) -> frozenset[PassTag]:
+    """the stored-weight tags `module`'s linears record when they run: each one's own `stored_tag` (a host linear,
+    a packed card linear), a torch Linear's bf16 slot"""
+    out: set[PassTag] = set()
+    for m in module.modules():
+        tag = getattr(m, "stored_tag", None)
+        t = tag() if callable(tag) else PassTag.QUANT_DEQUANT if isinstance(m, torch.nn.Linear) else None
+        if t is not None:
+            out.add(t)
+    return frozenset(out)
 
 
 class _Router(torch.nn.Module):
@@ -288,7 +343,8 @@ class _Experts(torch.nn.Module):
         # MXFP4 experts (gpt-oss's, or a GGUF's stored so) stay MXFP4 into the matvec; gpt-oss's two per-expert
         # biases ride with the layer and its gate is its own clamped GLU over interleaved halves
         self.mx = bool(mx)
-        self.ggml = self.mx and getattr(sm, "gguf", None) is not None  # a GGUF's experts, ggml's layout as stored
+        # a GGUF's experts as the file stores them (gate, up, down): MXFP4 in ggml's layout, or another stored type
+        self.ggml = getattr(sm, "gguf", None) is not None and (self.mx or bool(getattr(sm, "stored_experts", False)))
         self.f8 = bool(f8)  # an FP8 checkpoint's experts, e4m3 bytes and scale grids into the FP8 matvec
         self.gate = gate
         self.alpha = float(alpha)
@@ -301,16 +357,18 @@ class _Experts(torch.nn.Module):
     def _tables(self) -> Any:
         if self.gate_up is None:
             if self.ggml:
-                # the file's tensors as they are, one MxWeight per expert (the store does this from its slots)
+                # the file's tensors as they are, one weight per expert (the store does this from its slots)
                 gg, E, i = self.sm.gguf, self.num_experts, self.layer
 
-                def mats(k: str) -> list[MxWeight]:
+                def mats(k: str) -> list[MxWeight | QuantWeight]:
                     t = gg.tensors[f"blk.{i}.ffn_{k}_exps.weight"]
                     _e, rows, cols = (int(x) for x in reversed(list(t.shape)))
                     raw = gg.raw(t.name).reshape(E, -1)
-                    return [MxWeight.from_ggml(raw[e], rows, cols) for e in range(E)]
+                    if t.tensor_type.name == Quant.MXFP4:
+                        return [MxWeight.from_ggml(raw[e], rows, cols) for e in range(E)]
+                    return [QuantWeight.of(raw[e], Quant(t.tensor_type.name), rows, cols) for e in range(E)]
 
-                self.gate_up = [MxGateUp(g, u) for g, u in zip(mats("gate"), mats("up"), strict=True)]
+                self.gate_up = [GateUp(g, u) for g, u in zip(mats("gate"), mats("up"), strict=True)]
                 self.down = mats("down")
             elif self.mx:
                 parts = {}
@@ -340,7 +398,7 @@ class _Experts(torch.nn.Module):
     def _join(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
         """a GGUF's separate gate and up outputs in the checkpoint's [2I] order: gpt-oss's GLU interleaves its
         halves, the other families concatenate them"""
-        return MxGateUp.interleave(gate, up) if self.gate is not None else torch.cat([gate, up], dim=-1)
+        return GateUp.interleave(gate, up) if self.gate is not None else torch.cat([gate, up], dim=-1)
 
     def _down(self, y: torch.Tensor, e: int, dt: torch.dtype) -> torch.Tensor:
         """expert `e`'s down product `y` (float32, from the matvec) as the row's dtype, its bias added after the
@@ -370,6 +428,9 @@ class _Experts(torch.nn.Module):
 
     def _group(self) -> Any:
         """the grouped matvec for this layer's storage, None without the native library (`_linear` widens then)"""
+        if self.ggml and not self.mx:
+            gq = Native.gemv_quant
+            return gq.group if gq is not None else None
         if self.ggml:
             return Native.gemv_mx4_ggml_group
         if self.f8:
@@ -536,9 +597,7 @@ class _Experts(torch.nn.Module):
                     (
                         e,
                         *rows(e),
-                        store._views_mx(store.last_slots[e])
-                        if store is not None
-                        else (be.weight(tables[0][e]), be.weight(tables[1][e])),
+                        store._views_mx(store.last_slots[e]) if store is not None else self._mlx_table(be, tables, e),
                     )
                 )
         for batch in store.landed(pending) if pending else ():
@@ -547,6 +606,15 @@ class _Experts(torch.nn.Module):
         hits.sort(key=lambda t: t[0])
         out = be.experts(x, [(ti, w, pair) for _, ti, w, pair in hits], self.sm._mlx_act())
         final += out.to(final.dtype)
+
+    @staticmethod
+    def _mlx_table(be: Any, tables: Any, e: int) -> Any:
+        """expert `e` of the whole tables as the MLX step takes it: bf16 weights, or a GGUF's stored (gate, up), down"""
+        gu, dn = tables[0][e], tables[1][e]
+        if isinstance(dn, QuantWeight):
+            st = lambda w: be.weight_stored(w.q, w.raw.numpy(), w.shape)
+            return (st(gu.gate), st(gu.up)), st(dn)
+        return be.weight(gu), be.weight(dn)
 
     def _mx_biases(self) -> Any:
         """the two per-expert bias tables as float32 MLX arrays, made once per layer"""
@@ -561,7 +629,7 @@ class _Experts(torch.nn.Module):
         return b
 
     def _linear(self, x: torch.Tensor, w: Any) -> torch.Tensor:
-        if isinstance(w, MxGateUp):
+        if isinstance(w, GateUp):
             return self._join(self._linear(x, w.gate), self._linear(x, w.up))
         if isinstance(w, MxWeight):
             seat = on_card_device(w)
@@ -579,6 +647,10 @@ class _Experts(torch.nn.Module):
                 kernel(w, x.float().contiguous().cpu(), y)
                 return y.to(x.device).to(x.dtype)
             return torch.nn.functional.linear(x.float().cpu(), w.dequantize(torch.float32)).to(x.device).to(x.dtype)
+        if isinstance(w, QuantWeight):
+            # as a stored linear's (`_HostLinear`): the type's gemv, a prefill's rows the GEMM
+            scratch = getattr(self.sm, "scratch", None)
+            return stored_matmul(w, x.float().contiguous().cpu(), scratch).to(x.device).to(x.dtype)
         if isinstance(w, F8Weight):
             self.sm._tag(PassTag.EXPERT_FP8_ASSTORED if Native.gemv_fp8 is not None else PassTag.EXPERT_FP8_WIDENED)
             if Native.gemv_fp8 is not None:
@@ -946,6 +1018,11 @@ class _Experts(torch.nn.Module):
             seated = depot.seated(self.layer) & set(hit) if depot is not None else set()
             ask = [e for e in hit if e not in seated] if seated else hit
             call = store.call(self.layer, self.base, ask, keep=keep, rows=int(hidden_states.shape[0]))
+            if store.types:
+                # the slots' blocks into the layer's types' own kernels
+                self.sm._tag(PassTag.EXPERT_QUANT_ASSTORED, *(quant_tag(q) for q in store.types[self.layer]))
+            elif store.widened:
+                self.sm._tag(PassTag.EXPERT_QUANT_DEQUANT)
             # the MLX and one-row paths multiply the call's experts together: all of them seated at once, or the call
             # refused; the rest in the waves the store can seat
             views, pending = call.whole() if (use_mlx or grouped) else call.wave()
@@ -959,10 +1036,12 @@ class _Experts(torch.nn.Module):
         else:
             self.sm._tag(PassTag.EXPERT_TABLES)  # no store: the checkpoint's expert tables, held whole
             gu, dn = self._tables()
+            if self.ggml and not self.mx:
+                self.sm._tag(PassTag.EXPERT_QUANT_ASSTORED, *(quant_tag(w.q) for w in (gu[0].gate, gu[0].up, dn[0])))
             views = {e: (gu[e], dn[e]) for e in hit}
             call = None
             seated = set()
-            if self.mx or self.f8:
+            if self.mx or self.f8 or self.ggml:
                 per_expert = gu[0].nbytes + dn[0].nbytes
             else:
                 per_expert = (gu.shape[1] * gu.shape[2] + dn.shape[1] * dn.shape[2]) * gu.element_size()

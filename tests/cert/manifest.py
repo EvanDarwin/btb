@@ -69,8 +69,6 @@ class Missing(StrEnum):
     A new gap kind is one member here and one row in MISSING - the natural-language taxonomy lives in one place."""
 
     GGUF_LOAD = "gguf-load"
-    GPTOSS_GGUF_TWIN = "gptoss-gguf-twin"
-    KIQUANT_FIXTURE = "kiquant-fixture"
     MEGAKERNEL = "megakernel"
     MEGA_STORAGE = "mega-storage"
     MEGA_SHAPE = "mega-shape"
@@ -101,17 +99,6 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "hf.ARCH_MODEL_TYPES, so no GGUF path exists for it",
         "add the family's architecture to hf.ARCH_MODEL_TYPES with its GGUF tensor-name mapping, then commit a "
         "tiny GGUF fixture (tests/make_fixtures.py) so the storage cells can bind",
-    ),
-    Missing.GPTOSS_GGUF_TWIN: (
-        "gpt-oss ships only an mxfp4 GGUF; no GGUF twin of it in any other stored type is produced",
-        "produce a bf16/affine GGUF of gpt-oss and add the fixture, or record it as a DNR with the reason it "
-        "cannot exist",
-    ),
-    Missing.KIQUANT_FIXTURE: (
-        "no committed k-quant/i-quant tiny fixture exists (gguf-py cannot write these block types), so the "
-        "as-stored k/i-quant kernels are exercised by nothing in CI",
-        "cache the real Qwen3-0.6B GGUFs the manifest lists (--strict tracks them) so test_gguf runs the k/i-quant "
-        "kernels, or add a fixture-generation path that can emit these block types",
     ),
     Missing.MEGAKERNEL: (
         "the fused MLX megakernel is not written for this family: it takes the dense kernel layout alone "
@@ -206,8 +193,9 @@ MISSING: dict[Missing, tuple[str, str]] = {
     Missing.QUANT_FIXTURE: (
         "this storage stands for several stored types (one kernel each) and only some have a tiny GGUF twin, so "
         "certifying the cell off the ones that exist would claim kernels nothing reads",
-        "write the missing twins in tests/make_fixtures.py - the cell binds one file per kinds.Quant member of "
-        "its class, so the report names exactly which are absent",
+        "write the missing twins in tests/make_fixtures.py (`gguf_stored` writes every k-quant and i-quant one a "
+        "matrix of the family fits; where none does, widen the fixture to a multiple of 256) - the cell binds one "
+        "file per kinds.Quant member of its class, so the report names exactly which are absent",
     ),
     Missing.NO_FIXTURE: (
         "this family is served but has no tiny fixture for this storage at all",
@@ -256,14 +244,6 @@ TITLE: dict[Missing, tuple[str, str]] = {
     Missing.GGUF_LOAD: (
         "Family can't load from GGUF",
         "Map its architecture in hf.ARCH_MODEL_TYPES, add a GGUF fixture",
-    ),
-    Missing.GPTOSS_GGUF_TWIN: (
-        "No gpt-oss GGUF besides MXFP4",
-        "Add a bf16 or affine GGUF fixture, or mark it did-not-run",
-    ),
-    Missing.KIQUANT_FIXTURE: (
-        "No k-quant or i-quant fixture",
-        "Cache the real Qwen3-0.6B GGUFs, or generate these types",
     ),
     Missing.MEGAKERNEL: ("MLX megakernel not written for this family", "Write it, or mark it did-not-run"),
     Missing.MEGA_STORAGE: ("MLX megakernel refuses this storage", "Teach it packed weights, or mark it did-not-run"),
@@ -381,7 +361,8 @@ def expected_tags() -> frozenset[PassTag]:
     for dev in spec.DEVICE_SUBPATHS:
         for kind in core.served_kinds():
             for st in spec.Storage:
-                out |= dev.expects(kind, st)
+                for q in spec.STORAGE[st].quants or (None,):
+                    out |= dev.expects(kind, st, q)
     for surface, tags in spec.SURFACE_TAGS.items():
         for key in spec.SURFACE_SUBPATHS[surface]:
             for kind in core.served_kinds():
@@ -552,6 +533,11 @@ def dnr(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath, decode
             "not a distinct cell: llama.cpp's MXFP4_MOE stores only 3-D expert tensors as MXFP4 and every other "
             "as Q8_0 (src/llama-quant.cpp), so a dense family's MXFP4 file is its Q8_0 file (the gguf-affine run)"
         )
+    if storage is spec.Storage.GGUF_BF16 and Cap.MXFP4 in core.flags(kind):
+        return (
+            "not a distinct cell: gpt-oss ships its experts as MXFP4 alone, so every GGUF of it holds them so and its "
+            "BF16 file - the trunk as the checkpoint stores it - is its MXFP4 file (the gguf-mxfp4 run)"
+        )
     return None
 
 
@@ -648,7 +634,6 @@ def gap_reason(
     then a decode path nothing drives. The deepest true reason wins, so a cell that would still not run with every fixture in place says so."""
     fl = core.flags(kind)
     info = spec.STORAGE[storage]
-    qc = spec.quant_class(storage)
     # 0. hardware the engine has no backend for: nothing else about the cell matters
     if dev.hardware in spec.NO_BACKEND:
         return Missing.ROCM_BACKEND
@@ -656,8 +641,6 @@ def gap_reason(
     if info.container is spec.Container.GGUF:
         if kind not in core.gguf_kinds():
             return Missing.GGUF_LOAD
-        if Cap.MXFP4 in fl and qc is not QuantClass.MXFP4:
-            return Missing.GPTOSS_GGUF_TWIN
     if SAFE_PRECISION_GAP.get(storage) in UNIMPLEMENTED:
         return SAFE_PRECISION_GAP[storage]
     # 2. the device sub-path the engine does not engage for this family or this fixture
@@ -668,8 +651,6 @@ def gap_reason(
     paths = spec.fixture_paths(kind, storage)
     if info.container is spec.Container.SAFETENSORS and storage in SAFE_PRECISION_GAP and not paths:
         return SAFE_PRECISION_GAP[storage]
-    if qc in (QuantClass.KQUANT, QuantClass.IQ4, QuantClass.LATTICE):
-        return Missing.KIQUANT_FIXTURE
     absent = [p for p in paths if not os.path.exists(p)]
     if not paths or len(absent) == len(paths):
         return Missing.NO_FIXTURE
@@ -784,8 +765,15 @@ def _grid(cells: list[Cell], col_of: Callable[[Cell], str], cols: list[str], tit
 # by name) - never a hand list. A type exercised by no fixture or cached model is an uncovered quant; a new
 # kernel is a new Quant member, and it appears here on its own.
 SUPPORTED_QUANTS: frozenset[GQ] = frozenset(GQ[q.name] for q in Quant)
-# what the committed tiny GGUF fixtures already exercise (make_fixtures writes only these); always credited
-TINY_FIXTURE_QUANTS: frozenset[GQ] = frozenset({GQ.BF16, GQ.F16, GQ.Q4_0, GQ.Q8_0, GQ.MXFP4})
+
+
+def tiny_fixture_quants() -> frozenset[GQ]:
+    """what the committed tiny GGUF fixtures exercise, read off the twins on disk by the type each one's name
+    declares; always credited"""
+    names = sorted(os.listdir(GGUF_DIR)) if os.path.isdir(GGUF_DIR) else []
+    return frozenset(GQ[q.name] for n in names if n.endswith(".gguf") and (q := spec.quant_of_gguf(n)) is not None)
+
+
 # the Unsloth Qwen3-0.6B GGUF file names -> the GGML type each exercises (the mixes to their dominant block type)
 QWEN3_06B_GGUF: dict[str, GQ] = {
     "BF16": GQ.BF16, "Q8_0": GQ.Q8_0, "Q6_K": GQ.Q6_K, "Q5_K_M": GQ.Q5_K, "Q5_K_S": GQ.Q5_K,
@@ -854,7 +842,7 @@ def target_status() -> list[tuple[Target, bool]]:
 
 def covered_quants() -> set[GQ]:
     """GGML quants exercised here: the committed tiny fixtures (always) plus what cached real targets add."""
-    return set(TINY_FIXTURE_QUANTS) | {t.quant for t, ok in target_status() if ok and t.quant is not None}
+    return set(tiny_fixture_quants()) | {t.quant for t, ok in target_status() if ok and t.quant is not None}
 
 
 # --- the support table: the grid rolled up for users ---------------------------------------------------------

@@ -254,7 +254,9 @@ def _assert_path_engaged(
         assert (PassTag.SAMPLE_STOCHASTIC if sampled else PassTag.SAMPLE_GREEDY) in report, (
             f"{subject} on {dev.key}/{decode.value}: sampler tag missing (got {sorted(report.tags)})"
         )
-    for want in sorted(dev.expects(kind, storage)):
+    # a GGUF cell's subject is its file, whose name carries the stored type the cell must show it multiplied
+    gguf = spec.STORAGE[storage].container is spec.Container.GGUF
+    for want in sorted(dev.expects(kind, storage, spec.quant_of_gguf(subject) if gguf else None)):
         assert want in report, (
             f"{subject} on {dev.key} ({storage.value}): {want} never engaged (got {sorted(report.tags)}); "
             f"a fallback ran"

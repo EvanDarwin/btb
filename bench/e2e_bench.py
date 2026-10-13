@@ -60,7 +60,6 @@ from btb.kinds import (
     PrefixLen,
     QHeads,
     Quant,
-    QuantClass,
     Query,
     RowMap,
     Rows,
@@ -69,13 +68,14 @@ from btb.kinds import (
     VCache,
     Weight,
     Window,
-    latt_backend_key,
-    quants_of,
+    quant_key,
+    stored_quants,
 )
 from btb.machine import Pool  # the one pool the machine report and these benches share
 from btb.mxfp4 import MxWeight
 from btb.mxfp4_torch import dequant_blocks
 from tests.cert.spec import FIXTURE_STEM, Hardware
+from tests.helpers import stored_blocks
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -280,47 +280,22 @@ def test_lend(benchmark: object, device: str, knobs: dict[str, str]) -> None:
         benchmark(once)  # type: ignore[operator]
 
 
-# the one piece of hand data: bytes per 256-weight superblock, as the GGUF layout stores it. IQ4_NL has no entry
-# because it is not a superblock type - 32-weight blocks with the scales in a separate array, so its launcher
-# takes (d, q, x, ...) rather than one as-stored buffer and does not fit this bench's call shape.
-SUPERBLOCK: dict[Quant, int] = {
-    Quant.Q2_K: 84, Quant.Q3_K: 110, Quant.Q4_K: 144, Quant.Q5_K: 176, Quant.Q6_K: 210, Quant.IQ4_XS: 136,
-}  # fmt: skip
-# every as-stored quant kernel btb binds, keyed by the backend key its launcher is named after - a new k-quant
-# is benched once it has a superblock size above, with no list to update here
-QUANTS: dict[str, int] = {
-    latt_backend_key(q): SUPERBLOCK[q]
-    for q in quants_of(QuantClass.KQUANT) + quants_of(QuantClass.IQ4)
-    if q in SUPERBLOCK
-}
-
-
-def _matvec(kind: str) -> Matvec:
-    """the `matvec_<kind>` launcher, from whichever kernel module defines it."""
-    from btb.mlx import iquant, kquant, q6k
-
-    for mod in (kquant, q6k, iquant):
-        fn = getattr(mod, "matvec_" + kind, None)
-        if fn is not None:
-            return cast("Matvec", fn)
-    raise AttributeError(f"no matvec_{kind}() in btb.mlx.{{kquant,q6k,iquant}}")
-
-
 @mlx_only
 @pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
-@pytest.mark.parametrize("kind", list(QUANTS))
+@pytest.mark.parametrize("q", stored_quants(), ids=quant_key)
 @pytest.mark.parametrize("t", [1, 16])  # decode (1 row) and a verify pass (16 rows)
-def test_mlx_quant_matvec(benchmark: object, kind: str, t: int) -> None:
+def test_mlx_quant_matvec(benchmark: object, q: Quant, t: int) -> None:
+    """every type a linear multiplies as stored, on its own Metal kernel over its blocks"""
+    from btb.mlx.backend import stored_matvec, stored_streams
+
     m = mlxdev.mx()
-    nbytes = (OP_WIDTH * OP_WIDTH // 256) * QUANTS[kind]
-    w = m.array(np.random.randint(0, 256, nbytes, dtype=np.uint8))
+    s = stored_streams(q, stored_blocks(q, OP_WIDTH, OP_WIDTH, 0))
     x = m.random.normal((t, OP_WIDTH)).astype(m.bfloat16)
-    m.eval(w, x)
-    fn = _matvec(kind)
+    m.eval(*s, x)
     benchmark.group = "mlx-quant"  # type: ignore[attr-defined]
 
     def run() -> object:
-        return m.eval(fn(w, x, OP_WIDTH, OP_WIDTH))  # eval forces the lazy kernel to actually run
+        return m.eval(stored_matvec(q, s, x, OP_WIDTH, OP_WIDTH))  # eval forces the lazy kernel to actually run
 
     run()  # warm
     benchmark(run)  # type: ignore[operator]
@@ -373,6 +348,28 @@ def test_cuda_gemv_bf16(benchmark: object, m: int) -> None:
         torch.cuda.synchronize()
 
     benchmark.group = "cuda-gemv"  # type: ignore[attr-defined]
+    benchmark(run)  # type: ignore[operator]
+
+
+@cuda_only
+@pytest.mark.benchmark(min_rounds=25, warmup=True, disable_gc=True)
+@pytest.mark.parametrize("q", stored_quants(), ids=quant_key)
+@pytest.mark.parametrize("m", [1, 16, 32])
+def test_cuda_gemv_stored(benchmark: object, q: Quant, m: int) -> None:
+    """every type a linear multiplies as stored, on the card's gemv over its blocks (`btb_gemv_<key>_bf16_m{m}`)"""
+    from btb.gguf import QuantWeight
+
+    k = _cuda_kernels()
+    raw = torch.from_numpy(stored_blocks(q, OP_WIDTH, OP_WIDTH, 0))
+    w = QuantWeight.of(raw, q, OP_WIDTH, OP_WIDTH).to("cuda")
+    x = torch.randn(m, OP_WIDTH, dtype=torch.bfloat16, device="cuda")
+    y = torch.empty(m, OP_WIDTH, dtype=torch.bfloat16, device="cuda")
+
+    def run() -> None:
+        k.gemv_stored(w, x, y)
+        torch.cuda.synchronize()
+
+    benchmark.group = "cuda-quant"  # type: ignore[attr-defined]
     benchmark(run)  # type: ignore[operator]
 
 

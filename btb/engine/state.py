@@ -34,6 +34,8 @@ _TIER_TAG: dict[LayerTier, PassTag] = {
     LayerTier.COLD: PassTag.TIER_COLD,
     LayerTier.STREAMED: PassTag.TIER_STREAMED,
 }
+# the stored-weight tags of a layer no binder recorded: a streamed template's bf16 slots
+_BF16_SLOT = frozenset({PassTag.QUANT_DEQUANT})
 
 
 @dataclass
@@ -75,6 +77,7 @@ if TYPE_CHECKING:
     from .scheduler import BatchScheduler, Plan
     from .scratch import Scratch
     from .spec_cost import SpecCost
+    from .stored import CardStored
     from .tiers import ColdRing
 
 
@@ -100,6 +103,7 @@ class _State:
     fam: Family
     gguf: GGUFModel | None
     gguf_packed: bool  # a GGUF's quantized tensors on the packed kernels as stored (else dequantized to bf16)
+    stored_experts: bool  # a GGUF's experts read into the store as the file's blocks, multiplied as stored
     _gguf_names: dict[str, str]
     _gguf_hdr: dict[str, Any]
     head_key: str
@@ -107,6 +111,8 @@ class _State:
     fp8_experts: bool  # the checkpoint's fused experts are FP8 (btb/fp8.py), multiplied as stored
     fp8_layers: set[int]  # the host layers whose FP8 linears are multiplied as stored (`_HostLinear.f8`)
     fp8_widened: bool  # some FP8 tensor was widened to bf16 for a path that reads it so (MLX slots, a card, cold)
+    # each bound layer's stored-weight tags (`host.stored_tags`), set as it is bound; a layer absent reads as bf16
+    weight_tags: dict[int, frozenset[PassTag]]
     kv_bits: int | None
     kv_block: int
     kv_host: bool
@@ -123,7 +129,7 @@ class _State:
     drafter_dev: torch.device | None
     embed_table: torch.Tensor | None
     embed_scale: float | None
-    head: torch.nn.Linear | None
+    head: torch.nn.Linear | CardStored | None  # on the card as a GGUF type's blocks, it has no bf16 weight
     head_host: _HostLinear | None
     host: dict[int, Any]
     mixer: torch.nn.Module | None
@@ -288,6 +294,15 @@ class _State:
     def _bind_host_packed_layer(self, layer: Any) -> Any:
         raise NotImplementedError
 
+    def _host_stored_keys(self, i: int, linears: Iterable[str]) -> dict[str, str]:
+        raise NotImplementedError
+
+    def _bind_host_stored(self, i: int, layer: Any) -> None:
+        raise NotImplementedError
+
+    def _head_stored(self) -> str | None:
+        raise NotImplementedError
+
     @staticmethod
     def _cache_to(cache: Any, i: int, dev: str | torch.device) -> None:
         raise NotImplementedError
@@ -344,6 +359,12 @@ class _State:
         raise NotImplementedError
 
     def _head_host(self) -> Any:
+        raise NotImplementedError
+
+    def _make_head(self) -> torch.nn.Linear | CardStored:
+        raise NotImplementedError
+
+    def _card_stores(self) -> bool:
         raise NotImplementedError
 
     def _layer_items(self, lins: Sequence[Any]) -> tuple[list[tuple[Any, str | None, int, int, int]], int]:
@@ -853,10 +874,17 @@ class _State:
         if cache is not None:
             self._tag(PassTag.KV_PAGED if getattr(cache, "paged", False) else PassTag.KV_CONTIGUOUS)
 
-    def _tag_quant(self) -> None:
-        """record the stored-weight path on MLX: as-stored quant bytes (`mlx_state.affine`) vs a bf16 slot"""
-        if self.mlx is not None:
-            self._tag(PassTag.QUANT_ASSTORED if self.mlx_state.affine else PassTag.QUANT_DEQUANT)
+    def _tag_quant(self, n_layers: int) -> None:
+        """record the stored-weight paths the pass's layers take, each linear's own as its layer was bound: a GGUF
+        type's gemv over its blocks, or a bf16 slot"""
+        wt = self.weight_tags
+        self._tag(*{t for i in range(n_layers) for t in wt.get(i, _BF16_SLOT)})
+
+    def _bind_tags(self, i: int, layer: torch.nn.Module) -> None:
+        """layer `i`'s stored-weight tags, read off its linears as they are bound now"""
+        from .host import stored_tags
+
+        self.weight_tags[i] = stored_tags(layer)
 
     def _tag_spec(self, proposed: int, accepted: int) -> None:
         """record one speculative pass's outcome: the accept/reject tags and the running counts"""

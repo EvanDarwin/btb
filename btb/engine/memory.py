@@ -40,10 +40,10 @@ from ..sysinfo import (
 from . import device as device_mod
 from .cache import GrantedIndexedLayer, GrowLayer
 from .device import DeviceSpec, Where, torch_device, where
-from .fixed_rows import RowLinear
 from .host import _HostLinear
 from .scheduler import EPOCH, MemoryGrantError, _size
 from .state import _State
+from .stored import held_bytes
 from .tiers import ColdRing
 
 if TYPE_CHECKING:
@@ -217,9 +217,7 @@ class _MemoryMixin(_State):
         if self.resident_head and self.head is not None and self.dev.type == Device.CUDA:
             self.head = None
             torch.cuda.empty_cache()
-            with self._meta:
-                self.head = RowLinear(self.cfg.hidden_size, self.cfg.vocab_size, bias=False)
-            self._adopt(self.head, "weight", self._get(self.head_key))
+            self.head = self._make_head()
             done.append("head")
         aj = getattr(self, "aj", None)
         if aj is not None and aj.dev.type == Device.CUDA:
@@ -280,9 +278,7 @@ class _MemoryMixin(_State):
             return None
         what = self._shed.pop()
         if what == "head":
-            with self._meta:
-                self.head = RowLinear(self.cfg.hidden_size, self.cfg.vocab_size, bias=False)
-            self._adopt(self.head, "weight", self._get(self.head_key))
+            self.head = self._make_head()
             self.resident_head = True
         elif what == "drafter":
             self.drafter_dev = None
@@ -1287,7 +1283,7 @@ class _MemoryMixin(_State):
             n = sum(self._layer_bytes(i) for i in resident) * (2 if (fp32 and self.resident_fp32) else 1)
             head = self.head
             if self.resident_head and head is not None:
-                n += head.weight.numel() * head.weight.element_size()
+                n += held_bytes(head)
             aj = getattr(self, "aj", None)
             if aj is not None and aj.dev.type == Device.CUDA:
                 n += self._drafter_bytes()

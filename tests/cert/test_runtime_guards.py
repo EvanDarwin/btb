@@ -9,8 +9,7 @@ import types
 
 import pytest
 
-from btb.hf import AFFINE_TYPES
-from btb.kinds import CAPS, KIND_OF, Cap, QuantClass, latt_backend_key, quants_of
+from btb.kinds import CAPS, KIND_OF, Cap, QuantClass, quant_key, quants_of
 
 
 def test_every_served_type_builds() -> None:
@@ -52,21 +51,23 @@ def test_backend_lattice_registry_matches_enum() -> None:
     """kills the two-list mirror: btb/mlx/iquant._LATT (the per-kind byte layouts) carries exactly the backend
     keys the LATTICE members of kinds.Quant derive. A lattice quant added to one list and not the other fails."""
     iquant = pytest.importorskip("btb.mlx.iquant")
-    derived = {latt_backend_key(q) for q in quants_of(QuantClass.LATTICE)}
+    derived = {quant_key(q) for q in quants_of(QuantClass.LATTICE)}
     assert set(iquant._LATT) == derived, set(iquant._LATT) ^ derived
 
 
-def test_engine_lattice_map_matches_enum() -> None:
-    """the engine's GGUF-name -> backend-key map is exactly the LATTICE members (it is derived, so this pins
-    that the derivation and the backend agree on the same kinds)."""
-    mf = pytest.importorskip("btb.engine.mlx_forward")
-    assert mf._MlxMixin._LATT_KINDS == {q.value: latt_backend_key(q) for q in quants_of(QuantClass.LATTICE)}
+def test_every_stored_type_has_its_kernel_on_every_host_backend() -> None:
+    """each type kinds.stored_quants() names reaches its own kernel: the MLX backend's per-type table holds the
+    k-quant and IQ4 types, the affine and lattice families their own tables, and the native library binds a gemv
+    for every type. A type added to the declaration with a kernel missing on a backend fails here."""
+    from btb.engine.native import Native
+    from btb.kinds import stored_quants
 
-
-def test_affine_types_are_enum_members() -> None:
-    """AFFINE_TYPES (name -> bits) is keyed by Quant members - the affine decoder's set cannot name a type the
-    enum does not know, and every AFFINE-class quant has a bits entry."""
-    from btb.kinds import Quant
-
-    assert all(k in set(Quant) for k in AFFINE_TYPES), [k for k in AFFINE_TYPES if k not in set(Quant)]
-    assert set(quants_of(QuantClass.AFFINE)) <= set(AFFINE_TYPES), "an AFFINE quant with no bits entry"
+    backend = pytest.importorskip("btb.mlx.backend")
+    iquant = pytest.importorskip("btb.mlx.iquant")
+    legacyq = pytest.importorskip("btb.mlx.legacyq")
+    own = {quant_key(q) for q in quants_of(QuantClass.KQUANT) + quants_of(QuantClass.IQ4)}
+    assert set(backend._MATVEC) == set(backend._DEQUANT) == own, set(backend._MATVEC) ^ own
+    assert {q.value.lower() for q in quants_of(QuantClass.AFFINE)} == set(legacyq.KINDS)
+    assert {quant_key(q) for q in quants_of(QuantClass.LATTICE)} == set(iquant._LATT)
+    gq = Native.gemv_quant
+    assert gq is not None and all(q in gq for q in stored_quants()), [q for q in stored_quants() if gq and q not in gq]

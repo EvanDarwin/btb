@@ -29,6 +29,12 @@ typedef int InDim;             // C: the weight's columns, the input's width
 typedef bf16 GateUp;           // [T, 2 I]: the MLP's gate then up projection
 typedef bf16 MlpAct;           // [T, I]: act(gate) * up, the down projection's input
 typedef int Intermediate;      // I: the MLP's intermediate width
+typedef unsigned char QuantBlocks;  // [R, C / block * bytes]: a GGUF type's blocks as the file holds them
+typedef signed char QuantGrid;      // a lattice type's int8 codebook; null for the rest
+typedef unsigned char QuantSigns;   // the lattice types' 128-entry sign table; null for the rest
+typedef int OutStride;         // the elements between two rows of a matvec's output (a merged projection's piece)
+typedef bf16 Dequant;          // [R, C]: a GGUF type's weight as bf16
+typedef long long QuantValues; // R * C: the values a dequant writes
 typedef unsigned char Mx4Blocks;  // [seats, groups, 16]: MXFP4 experts' 32-value blocks, two fp4 codes a byte
 typedef unsigned char Mx4Scales;  // [seats, groups]: each block's power-of-two scale, biased by 127
 typedef int Seats;             // [n]: the experts' seats in a depot's stacks

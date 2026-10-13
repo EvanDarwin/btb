@@ -13,6 +13,7 @@ from typing import Any
 import torch
 
 from .. import mlx as mlxdev
+from ..gguf import QuantWeight
 from ..kinds import Tokens
 from .cache import GrowLayer, indexer_keys, set_rows
 from .fixed_rows import RowLinear
@@ -153,7 +154,7 @@ class MTPDrafter:
         head = getattr(self, "_head_t", None)
         if head is None:
             sm = self.sm
-            W = (sm.head.weight if sm.resident_head else sm._get(sm.head_key)).detach()
+            W = (sm.head.weight if sm.head is not None else sm._get(sm.head_key)).detach()
             n = int(getattr(sm, "draft_vocab", 0) or 0)
             whole = not (0 < n < int(W.shape[0]))
             if whole and W.device.type != self.dev.type:
@@ -183,8 +184,16 @@ class MTPDrafter:
             n = int(getattr(sm, "draft_vocab", 0) or 0)
             head = False
             if sm.mlx is None and Native.gemv is not None and n > 0:
-                W = sm._get(sm.head_key)
-                if n < int(W.shape[0]):
+                w = sm._head_host().quant if sm._head_stored() is not None else None
+                rows = int(sm._shape(sm.head_key)[0])
+                if n < rows and w is not None:
+                    # the first n rows of a head stored as a GGUF type: its first n rows of blocks, no copy
+                    head = _HostLinear(torch.zeros((), dtype=torch.bfloat16).expand(n, w.shape[1]), key=sm.head_key)
+                    head.quant = QuantWeight.of(w.raw[: w.raw.numel() // rows * n], w.q, n, w.shape[1])
+                    head.scratch = sm.scratch
+                    sm.log(f"[draft] the drafter's head on the host: the first {n} ids ({w.q.value}, as stored)")
+                elif n < rows:
+                    W = sm._get(sm.head_key)
                     head = _HostLinear(W[:n], key=sm.head_key)
                     sm.log(
                         f"[draft] the drafter's head on the host: the first {n} ids "
@@ -203,7 +212,7 @@ class MTPDrafter:
             return (sm._head_host() if head is None else head)(hn.float()).float()
         head = self._torch_head()
         if head is None:
-            W = (sm.head.weight if sm.resident_head else sm._get(sm.head_key)).detach()
+            W = (sm.head.weight if sm.head is not None else sm._get(sm.head_key)).detach()
             step = 32768
             return torch.cat(
                 [hn.to(self.cd) @ W[c : c + step].to(self.dev, self.cd).T for c in range(0, W.shape[0], step)], dim=-1

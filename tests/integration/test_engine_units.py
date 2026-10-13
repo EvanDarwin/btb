@@ -23,7 +23,8 @@ from btb.engine import StreamedTextModel
 from btb.engine.cache import GrowLayer
 from btb.engine.device import where
 from btb.engine.generate import _chains_tree
-from btb.kinds import Json, LayerKind, TokenRows
+from btb.engine.host import _HostLinear
+from btb.kinds import Json, LayerKind, Quant, SlotKind, TokenRows, quant_tag
 from tests.cert import spec
 from tests.helpers import (
     NO_LOG,
@@ -1385,23 +1386,27 @@ def test_every_native_kernel_refuses_a_dtype_it_was_not_built_for(monkeypatch: p
 @pytest.mark.parametrize("name", ["tiny_qwen3-f16", "tiny_qwen3-f32", "gguf/tiny_qwen3-q8_0.gguf"])
 def test_a_layer_shed_to_the_drive_off_a_weight_not_stored_as_bf16_answers_as_from_ram(name: str, device: str) -> None:
     """the cold ring over weights it cannot read off the drive as bf16: a cast twin's floats are read as stored
-    and rewritten as bf16 where they land ("cast"), a GGUF's Q8_0 blocks are taken from `_get` each pass
-    ("mem"). `_bind_cold` read such a tensor's key as a 12-bit record and raised when a busy machine shed a
-    layer mid-decode; shed under the decode's inference mode, the layer now answers as it did from RAM, and
-    regrown it still does"""
+    and rewritten as bf16 where they land (CAST); a GGUF's Q8_0 blocks are read off the drive as stored (QUANT),
+    the native kernels' and the Metal kernel's to read in the slot. `_bind_cold` read such a tensor's key as a
+    12-bit record and raised when a busy machine shed a layer mid-decode; shed under the decode's inference mode,
+    the layer now answers as it did from RAM, and regrown it still does - its blocks bound as stored again"""
     path = fixture(name)
     if device == "mlx":
         need_mlx()
+    gguf = name.startswith("gguf/")
     with loaded_model(path, device=device, v_max=0) as sm:
         before = sm.generate(REPEATING, 12, speculate=False).tokens
         with torch.inference_mode():
             i = sm.ram_shed("the test")
         assert i is not None and sm.cold == {i}
-        kind = "mem" if name.startswith("gguf/") else "cast"
-        assert {it[5] for it in sm.cold_ring.recipe[i]} == {kind}, "every linear of the shed layer is read cast"
+        kind = SlotKind.QUANT if gguf else SlotKind.CAST
+        assert {it.kind for it in sm.cold_ring.recipe[i]} == {kind}, f"every linear of the shed layer is read {kind}"
         during = sm.generate(REPEATING, 12, speculate=False).tokens
         assert during == before, "a layer read through the ring each pass answers as it did from RAM"
         assert sm.ram_regrow() == i and not sm.cold
+        if gguf:
+            lins = [m for m in sm.host[i].modules() if isinstance(m, _HostLinear)]
+            assert lins and all(m.stored_tag() is quant_tag(Quant.Q8_0) for m in lins), "not bound as stored again"
         after = sm.generate(REPEATING, 12, speculate=False).tokens
         assert after == before
 

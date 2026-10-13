@@ -12,6 +12,7 @@ native gemv kernel is loaded first so the receipts match the tolerance the suite
     python tests/make_fixtures.py qwen3 q4   # a subset
     python tests/make_fixtures.py twins      # only the precision twins of every cert fixture
     python tests/make_fixtures.py q4_mtp     # tiny_q4's drafting head added to the built fixture and its twins
+    python tests/make_fixtures.py gguf_stored  # each GGUF family's k-quant and i-quant twins (`stored_twin`)
     python -m tests.make_fixtures seed phi3  # a family's first draw the oracle's margin floor accepts (its *_SEED)
 
 Families: qwen3, q35, phi3, q4, gpt_oss. `build_q4_card` draws a Qwen4 at the card kernels' shapes, which
@@ -28,7 +29,7 @@ import sys
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Protocol
 
-from btb.kinds import FamilyKind, Json, LayerKind, QuantClass, TokenRows, quants_of
+from btb.kinds import FamilyKind, Json, LayerKind, Quant, QuantClass, TokenRows, quants_of, stored_quants
 from tests.helpers import (
     CHUNK,
     FIXTURES,
@@ -42,6 +43,7 @@ from tests.helpers import (
     native_library,
     safetensors_state,
     speculation,
+    stored_blocks,
     tree_next,
     tree_pass,
 )
@@ -130,6 +132,7 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
         "phi3": MODEL_ARCH.PHI3,
         "gpt_oss": MODEL_ARCH.GPT_OSS,
         "qwen3_5_text": MODEL_ARCH.QWEN35,
+        "gemma3_text": MODEL_ARCH.GEMMA3,
     }[cfg["model_type"]]
     L = int(cfg["num_hidden_layers"])
     heads = int(cfg["num_attention_heads"])
@@ -143,6 +146,7 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
     w.add_head_count(heads)
     w.add_head_count_kv(int(cfg.get("num_key_value_heads") or heads))
     rope = cfg.get("rope_parameters") or {}
+    rope = rope.get("full_attention", rope)  # a rope a layer type (Gemma 3's): the file's base is the global layers'
     w.add_rope_freq_base(float(rope.get("rope_theta") or cfg.get("rope_theta") or 10000.0))
     w.add_layer_norm_rms_eps(float(cfg.get("rms_norm_eps", 1e-6)))
     w.add_key_length(head_dim)
@@ -202,6 +206,8 @@ def write_gguf(model_dir: str, out: str, outtype: str) -> None:
             w.add_tensor(gname, state[name].float().numpy())
             continue
         arr = state[name].float().numpy()
+        if arch is MODEL_ARCH.GEMMA3 and name.endswith("norm.weight"):
+            arr = arr + 1  # Gemma3Model.modify_tensors: llama.cpp's RMSNorm scales by the weight, Gemma's by 1 + it
         if gname in conv:
             w.add_tensor(f"{gname}.{suffix}", arr.astype(np.float32))
         elif arr.ndim == 2 and qtype is not None and arr.shape[-1] % 32 == 0:
@@ -287,20 +293,22 @@ def _qwen35_converted(cfg: Json, state: dict[str, torch.Tensor]) -> dict[str, to
 
 
 def make_gguf() -> None:
-    """the GGUF fixtures: tiny_qwen3 in every storage type the reader is tested on, tiny_phi3 as f16 (its fused
-    projections exercise the table's other layout), tiny_q35 in the float and affine types (make_gguf_q35), tiny_q4
-    as llama.cpp's converter writes it (make_q4_gguf)"""
+    """the GGUF fixtures: tiny_qwen3, tiny_phi3 and tiny_gemma3 in every storage type gguf-py writes, tiny_q35 in
+    the float and affine types (make_gguf_q35), tiny_q4 as llama.cpp's converter writes it (make_q4_gguf), and each
+    family's k-quant and i-quant twins (make_gguf_stored)"""
     out = os.path.join(FIXTURES, "gguf")
     os.makedirs(out, exist_ok=True)
     for t in GGUF_TYPES:
         write_gguf(os.path.join(FIXTURES, "tiny_qwen3"), os.path.join(out, f"tiny_qwen3-{t}.gguf"), t)
-    # phi3 in bf16 (its fused projections exercise the table's other layout) and the affine quants, so the
-    # affine-as-stored kernels have a phi3 tiny fixture too, not only qwen3
-    for t in ("bf16", "q4_0", "q8_0"):
-        write_gguf(os.path.join(FIXTURES, "tiny_phi3"), os.path.join(out, f"tiny_phi3-{t}.gguf"), t)
+    # phi3 in every type too (its fused projections exercise the table's other layout), and gemma3 (its norms through
+    # the converter's +1)
+    for stem in ("tiny_phi3", "tiny_gemma3"):
+        for t in GGUF_TYPES:
+            write_gguf(os.path.join(FIXTURES, stem), os.path.join(out, f"{stem}-{t}.gguf"), t)
     write_gguf(os.path.join(FIXTURES, "tiny_gpt_oss"), os.path.join(out, "tiny_gpt_oss-mxfp4.gguf"), "bf16")
     make_gguf_q35()
     make_q4_gguf()
+    make_gguf_stored()
     print("[fixture] gguf twins regenerated")
 
 
@@ -379,6 +387,69 @@ def requantize_gguf(src: str, like: str, out: str, outtype: str) -> None:
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
     w.close()
+
+
+def stored_twin(src: str, like: str, out: str, q: Quant) -> bool:
+    """`like` (a family's q8_0 twin) rewritten with type `q`: each matrix it stores as Q8_0 whose rows are whole
+    blocks of `q` becomes valid random blocks of `q` at the spread of `src`'s (a float twin's) numbers for it, the
+    rest kept Q8_0 as llama.cpp keeps a matrix a type does not fit; every metadata key copied. gguf-py writes no
+    k-quant or i-quant block, so these weights are not `src`'s: test_gguf certifies the kernels' numbers against
+    gguf's dequantization, the twin the engine's paths. False, and nothing written, where no matrix fits."""
+    import numpy as np
+    from gguf import GGMLQuantizationType, GGUFReader, GGUFValueType, GGUFWriter, Keys, dequantize
+
+    from btb.gguf import block_of
+
+    weights, nbytes = block_of(q)
+    r, floats = GGUFReader(like), {t.name: t for t in GGUFReader(src).tensors}
+    fits = [t for t in r.tensors if t.tensor_type is GGMLQuantizationType.Q8_0 and int(t.shape[0]) % weights == 0]
+    if not fits:
+        return False
+    rng = np.random.default_rng(stored_quants().index(q))
+    w = GGUFWriter(out, str(r.fields[Keys.General.ARCHITECTURE].contents()))
+    for f in r.fields.values():
+        if f.name.startswith("GGUF.") or f.name in (Keys.General.ARCHITECTURE, Keys.General.FILE_TYPE):
+            continue
+        sub = f.types[-1] if f.types[0] is GGUFValueType.ARRAY else None
+        w.add_key_value(f.name, f.contents(), f.types[0], sub_type=sub)
+    qtype = GGMLQuantizationType[q.value]
+    for t in r.tensors:
+        if not any(t is u for u in fits):
+            w.add_tensor(t.name, np.array(t.data), raw_dtype=t.tensor_type)
+            continue
+        s = floats[t.name]
+        std = float(np.std(dequantize(np.asarray(s.data), s.tensor_type)))
+        shape = [int(x) for x in reversed(list(t.shape))]
+        lead, cols = int(np.prod(shape[:-1])), shape[-1]
+        raw = stored_blocks(q, lead, cols, rng, std=std)
+        w.add_tensor(t.name, raw.reshape(*shape[:-1], cols // weights * nbytes), raw_dtype=qtype)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    return True
+
+
+def make_gguf_stored() -> None:
+    """each GGUF family's twins in every type a linear multiplies as stored that gguf-py cannot write (the k-quants
+    and i-quants, `stored_twin`), from its q8_0 twin's layout and a float twin's spreads; a type no matrix of the
+    family fits has no twin"""
+    from tests.cert import spec
+
+    out = os.path.join(FIXTURES, "gguf")
+    written = set(GGUF_TYPES)
+    for stem in spec.FIXTURE_STEM.values():
+        like = os.path.join(out, spec.gguf_name(stem, Quant.Q8_0))
+        floats = (os.path.join(out, spec.gguf_name(stem, f)) for f in quants_of(QuantClass.FLOAT))
+        src = next((p for p in floats if os.path.isfile(p)), None)
+        if src is None or not os.path.isfile(like):
+            continue
+        for q in stored_quants():
+            if q.value.lower() in written:
+                continue
+            dest = os.path.join(out, spec.gguf_name(stem, q))
+            if not stored_twin(src, like, dest, q):
+                print(f"[fixture] {stem}: no matrix's rows are whole {q.value} blocks, no twin")
 
 
 def _drop_mtp(model_dir: str) -> None:
@@ -1198,6 +1269,9 @@ def make(name: str) -> None:
         return
     if name == "gguf_q35":
         make_gguf_q35()
+        return
+    if name == "gguf_stored":
+        make_gguf_stored()
         return
     if name == "q4_mtp":
         add_q4_mtp()

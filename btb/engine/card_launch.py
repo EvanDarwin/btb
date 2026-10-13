@@ -51,6 +51,7 @@ from btb.kinds import (
     DeltaVHeads,
     DeltaZ,
     Depths,
+    Dequant,
     DraftKids,
     DraftProbs,
     DraftVocab,
@@ -115,6 +116,7 @@ from btb.kinds import (
     NormWeight,
     OutDim,
     OutGate,
+    OutStride,
     PartAcc,
     PartMax,
     PartSum,
@@ -141,6 +143,10 @@ from btb.kinds import (
     QkvColumn,
     QkvWidth,
     QNorm,
+    QuantBlocks,
+    QuantGrid,
+    QuantSigns,
+    QuantValues,
     Query,
     RadixCarry,
     RadixFloor,
@@ -215,6 +221,23 @@ KERNELS: tuple[str, ...] = (
     "btb_conv_window",
     "btb_delta_nodes",
     "btb_delta_nodes_bf16",
+    "btb_dequant_iq1m_bf16",
+    "btb_dequant_iq1s_bf16",
+    "btb_dequant_iq2s_bf16",
+    "btb_dequant_iq2xs_bf16",
+    "btb_dequant_iq2xxs_bf16",
+    "btb_dequant_iq3s_bf16",
+    "btb_dequant_iq3xxs_bf16",
+    "btb_dequant_iq4nl_bf16",
+    "btb_dequant_iq4xs_bf16",
+    "btb_dequant_q2k_bf16",
+    "btb_dequant_q3k_bf16",
+    "btb_dequant_q40_bf16",
+    "btb_dequant_q41_bf16",
+    "btb_dequant_q4k_bf16",
+    "btb_dequant_q5k_bf16",
+    "btb_dequant_q6k_bf16",
+    "btb_dequant_q80_bf16",
     "btb_gelu_mul",
     "btb_gemm_f32_bf16",
     "btb_gemm_mma_bf16",
@@ -231,6 +254,60 @@ KERNELS: tuple[str, ...] = (
     "btb_gemv_gelu_bf16_m8",
     "btb_gemv_gelu_bf16_m16",
     "btb_gemv_gelu_bf16_m32",
+    "btb_gemv_iq1m_bf16_m1",
+    "btb_gemv_iq1m_bf16_m2",
+    "btb_gemv_iq1m_bf16_m4",
+    "btb_gemv_iq1m_bf16_m8",
+    "btb_gemv_iq1m_bf16_m16",
+    "btb_gemv_iq1m_bf16_m32",
+    "btb_gemv_iq1s_bf16_m1",
+    "btb_gemv_iq1s_bf16_m2",
+    "btb_gemv_iq1s_bf16_m4",
+    "btb_gemv_iq1s_bf16_m8",
+    "btb_gemv_iq1s_bf16_m16",
+    "btb_gemv_iq1s_bf16_m32",
+    "btb_gemv_iq2s_bf16_m1",
+    "btb_gemv_iq2s_bf16_m2",
+    "btb_gemv_iq2s_bf16_m4",
+    "btb_gemv_iq2s_bf16_m8",
+    "btb_gemv_iq2s_bf16_m16",
+    "btb_gemv_iq2s_bf16_m32",
+    "btb_gemv_iq2xs_bf16_m1",
+    "btb_gemv_iq2xs_bf16_m2",
+    "btb_gemv_iq2xs_bf16_m4",
+    "btb_gemv_iq2xs_bf16_m8",
+    "btb_gemv_iq2xs_bf16_m16",
+    "btb_gemv_iq2xs_bf16_m32",
+    "btb_gemv_iq2xxs_bf16_m1",
+    "btb_gemv_iq2xxs_bf16_m2",
+    "btb_gemv_iq2xxs_bf16_m4",
+    "btb_gemv_iq2xxs_bf16_m8",
+    "btb_gemv_iq2xxs_bf16_m16",
+    "btb_gemv_iq2xxs_bf16_m32",
+    "btb_gemv_iq3s_bf16_m1",
+    "btb_gemv_iq3s_bf16_m2",
+    "btb_gemv_iq3s_bf16_m4",
+    "btb_gemv_iq3s_bf16_m8",
+    "btb_gemv_iq3s_bf16_m16",
+    "btb_gemv_iq3s_bf16_m32",
+    "btb_gemv_iq3xxs_bf16_m1",
+    "btb_gemv_iq3xxs_bf16_m2",
+    "btb_gemv_iq3xxs_bf16_m4",
+    "btb_gemv_iq3xxs_bf16_m8",
+    "btb_gemv_iq3xxs_bf16_m16",
+    "btb_gemv_iq3xxs_bf16_m32",
+    "btb_gemv_iq4nl_bf16_m1",
+    "btb_gemv_iq4nl_bf16_m2",
+    "btb_gemv_iq4nl_bf16_m4",
+    "btb_gemv_iq4nl_bf16_m8",
+    "btb_gemv_iq4nl_bf16_m16",
+    "btb_gemv_iq4nl_bf16_m32",
+    "btb_gemv_iq4xs_bf16_m1",
+    "btb_gemv_iq4xs_bf16_m2",
+    "btb_gemv_iq4xs_bf16_m4",
+    "btb_gemv_iq4xs_bf16_m8",
+    "btb_gemv_iq4xs_bf16_m16",
+    "btb_gemv_iq4xs_bf16_m32",
     "btb_gemv_lane16_f32_m1",
     "btb_gemv_lane16_f32_m2",
     "btb_gemv_lane16_f32_m4",
@@ -247,6 +324,54 @@ KERNELS: tuple[str, ...] = (
     "btb_gemv_mma_bf16",
     "btb_gemv_mma_glu_gelu",
     "btb_gemv_mma_glu_silu",
+    "btb_gemv_q2k_bf16_m1",
+    "btb_gemv_q2k_bf16_m2",
+    "btb_gemv_q2k_bf16_m4",
+    "btb_gemv_q2k_bf16_m8",
+    "btb_gemv_q2k_bf16_m16",
+    "btb_gemv_q2k_bf16_m32",
+    "btb_gemv_q3k_bf16_m1",
+    "btb_gemv_q3k_bf16_m2",
+    "btb_gemv_q3k_bf16_m4",
+    "btb_gemv_q3k_bf16_m8",
+    "btb_gemv_q3k_bf16_m16",
+    "btb_gemv_q3k_bf16_m32",
+    "btb_gemv_q40_bf16_m1",
+    "btb_gemv_q40_bf16_m2",
+    "btb_gemv_q40_bf16_m4",
+    "btb_gemv_q40_bf16_m8",
+    "btb_gemv_q40_bf16_m16",
+    "btb_gemv_q40_bf16_m32",
+    "btb_gemv_q41_bf16_m1",
+    "btb_gemv_q41_bf16_m2",
+    "btb_gemv_q41_bf16_m4",
+    "btb_gemv_q41_bf16_m8",
+    "btb_gemv_q41_bf16_m16",
+    "btb_gemv_q41_bf16_m32",
+    "btb_gemv_q4k_bf16_m1",
+    "btb_gemv_q4k_bf16_m2",
+    "btb_gemv_q4k_bf16_m4",
+    "btb_gemv_q4k_bf16_m8",
+    "btb_gemv_q4k_bf16_m16",
+    "btb_gemv_q4k_bf16_m32",
+    "btb_gemv_q5k_bf16_m1",
+    "btb_gemv_q5k_bf16_m2",
+    "btb_gemv_q5k_bf16_m4",
+    "btb_gemv_q5k_bf16_m8",
+    "btb_gemv_q5k_bf16_m16",
+    "btb_gemv_q5k_bf16_m32",
+    "btb_gemv_q6k_bf16_m1",
+    "btb_gemv_q6k_bf16_m2",
+    "btb_gemv_q6k_bf16_m4",
+    "btb_gemv_q6k_bf16_m8",
+    "btb_gemv_q6k_bf16_m16",
+    "btb_gemv_q6k_bf16_m32",
+    "btb_gemv_q80_bf16_m1",
+    "btb_gemv_q80_bf16_m2",
+    "btb_gemv_q80_bf16_m4",
+    "btb_gemv_q80_bf16_m8",
+    "btb_gemv_q80_bf16_m16",
+    "btb_gemv_q80_bf16_m32",
     "btb_gemv_sgate_bf16_m1",
     "btb_gemv_sgate_bf16_m2",
     "btb_gemv_sgate_bf16_m4",
@@ -711,6 +836,312 @@ def btb_delta_nodes_bf16(
     )
 
 
+def btb_dequant_iq1m_bf16(
+    launcher: Launcher,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    out: Dequant,
+    n: QuantValues,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    launcher.launch(
+        "btb_dequant_iq1m_bf16", grid, block, [_P(w), _P(lattice), _P(signs), _P(out), _LL(n)], stream, shared
+    )
+
+
+def btb_dequant_iq1s_bf16(
+    launcher: Launcher,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    out: Dequant,
+    n: QuantValues,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    launcher.launch(
+        "btb_dequant_iq1s_bf16", grid, block, [_P(w), _P(lattice), _P(signs), _P(out), _LL(n)], stream, shared
+    )
+
+
+def btb_dequant_iq2s_bf16(
+    launcher: Launcher,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    out: Dequant,
+    n: QuantValues,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    launcher.launch(
+        "btb_dequant_iq2s_bf16", grid, block, [_P(w), _P(lattice), _P(signs), _P(out), _LL(n)], stream, shared
+    )
+
+
+def btb_dequant_iq2xs_bf16(
+    launcher: Launcher,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    out: Dequant,
+    n: QuantValues,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    launcher.launch(
+        "btb_dequant_iq2xs_bf16", grid, block, [_P(w), _P(lattice), _P(signs), _P(out), _LL(n)], stream, shared
+    )
+
+
+def btb_dequant_iq2xxs_bf16(
+    launcher: Launcher,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    out: Dequant,
+    n: QuantValues,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    launcher.launch(
+        "btb_dequant_iq2xxs_bf16", grid, block, [_P(w), _P(lattice), _P(signs), _P(out), _LL(n)], stream, shared
+    )
+
+
+def btb_dequant_iq3s_bf16(
+    launcher: Launcher,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    out: Dequant,
+    n: QuantValues,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    launcher.launch(
+        "btb_dequant_iq3s_bf16", grid, block, [_P(w), _P(lattice), _P(signs), _P(out), _LL(n)], stream, shared
+    )
+
+
+def btb_dequant_iq3xxs_bf16(
+    launcher: Launcher,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    out: Dequant,
+    n: QuantValues,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    launcher.launch(
+        "btb_dequant_iq3xxs_bf16", grid, block, [_P(w), _P(lattice), _P(signs), _P(out), _LL(n)], stream, shared
+    )
+
+
+def btb_dequant_iq4nl_bf16(
+    launcher: Launcher,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    out: Dequant,
+    n: QuantValues,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    launcher.launch(
+        "btb_dequant_iq4nl_bf16", grid, block, [_P(w), _P(lattice), _P(signs), _P(out), _LL(n)], stream, shared
+    )
+
+
+def btb_dequant_iq4xs_bf16(
+    launcher: Launcher,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    out: Dequant,
+    n: QuantValues,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    launcher.launch(
+        "btb_dequant_iq4xs_bf16", grid, block, [_P(w), _P(lattice), _P(signs), _P(out), _LL(n)], stream, shared
+    )
+
+
+def btb_dequant_q2k_bf16(
+    launcher: Launcher,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    out: Dequant,
+    n: QuantValues,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    launcher.launch(
+        "btb_dequant_q2k_bf16", grid, block, [_P(w), _P(lattice), _P(signs), _P(out), _LL(n)], stream, shared
+    )
+
+
+def btb_dequant_q3k_bf16(
+    launcher: Launcher,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    out: Dequant,
+    n: QuantValues,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    launcher.launch(
+        "btb_dequant_q3k_bf16", grid, block, [_P(w), _P(lattice), _P(signs), _P(out), _LL(n)], stream, shared
+    )
+
+
+def btb_dequant_q40_bf16(
+    launcher: Launcher,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    out: Dequant,
+    n: QuantValues,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    launcher.launch(
+        "btb_dequant_q40_bf16", grid, block, [_P(w), _P(lattice), _P(signs), _P(out), _LL(n)], stream, shared
+    )
+
+
+def btb_dequant_q41_bf16(
+    launcher: Launcher,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    out: Dequant,
+    n: QuantValues,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    launcher.launch(
+        "btb_dequant_q41_bf16", grid, block, [_P(w), _P(lattice), _P(signs), _P(out), _LL(n)], stream, shared
+    )
+
+
+def btb_dequant_q4k_bf16(
+    launcher: Launcher,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    out: Dequant,
+    n: QuantValues,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    launcher.launch(
+        "btb_dequant_q4k_bf16", grid, block, [_P(w), _P(lattice), _P(signs), _P(out), _LL(n)], stream, shared
+    )
+
+
+def btb_dequant_q5k_bf16(
+    launcher: Launcher,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    out: Dequant,
+    n: QuantValues,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    launcher.launch(
+        "btb_dequant_q5k_bf16", grid, block, [_P(w), _P(lattice), _P(signs), _P(out), _LL(n)], stream, shared
+    )
+
+
+def btb_dequant_q6k_bf16(
+    launcher: Launcher,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    out: Dequant,
+    n: QuantValues,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    launcher.launch(
+        "btb_dequant_q6k_bf16", grid, block, [_P(w), _P(lattice), _P(signs), _P(out), _LL(n)], stream, shared
+    )
+
+
+def btb_dequant_q80_bf16(
+    launcher: Launcher,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    out: Dequant,
+    n: QuantValues,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    launcher.launch(
+        "btb_dequant_q80_bf16", grid, block, [_P(w), _P(lattice), _P(signs), _P(out), _LL(n)], stream, shared
+    )
+
+
 def btb_gelu_mul(
     launcher: Launcher,
     grid: Dim3,
@@ -811,6 +1242,258 @@ def btb_gemv_gelu_bf16(
 ) -> None:
     """btb_gemv_gelu_bf16_m{M}, M one of 1, 2, 4, 8, 16, 32"""
     launcher.launch(f"btb_gemv_gelu_bf16_m{M}", grid, block, [_P(w), _P(gu), _P(y), _I(R), _I(C)], stream, shared)
+
+
+def btb_gemv_iq1m_bf16(
+    launcher: Launcher,
+    M: int,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    x: MatIn,
+    y: MatOut,
+    R: OutDim,
+    C: InDim,
+    ldy: OutStride,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    """btb_gemv_iq1m_bf16_m{M}, M one of 1, 2, 4, 8, 16, 32"""
+    launcher.launch(
+        f"btb_gemv_iq1m_bf16_m{M}",
+        grid,
+        block,
+        [_P(w), _P(lattice), _P(signs), _P(x), _P(y), _I(R), _I(C), _I(ldy)],
+        stream,
+        shared,
+    )
+
+
+def btb_gemv_iq1s_bf16(
+    launcher: Launcher,
+    M: int,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    x: MatIn,
+    y: MatOut,
+    R: OutDim,
+    C: InDim,
+    ldy: OutStride,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    """btb_gemv_iq1s_bf16_m{M}, M one of 1, 2, 4, 8, 16, 32"""
+    launcher.launch(
+        f"btb_gemv_iq1s_bf16_m{M}",
+        grid,
+        block,
+        [_P(w), _P(lattice), _P(signs), _P(x), _P(y), _I(R), _I(C), _I(ldy)],
+        stream,
+        shared,
+    )
+
+
+def btb_gemv_iq2s_bf16(
+    launcher: Launcher,
+    M: int,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    x: MatIn,
+    y: MatOut,
+    R: OutDim,
+    C: InDim,
+    ldy: OutStride,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    """btb_gemv_iq2s_bf16_m{M}, M one of 1, 2, 4, 8, 16, 32"""
+    launcher.launch(
+        f"btb_gemv_iq2s_bf16_m{M}",
+        grid,
+        block,
+        [_P(w), _P(lattice), _P(signs), _P(x), _P(y), _I(R), _I(C), _I(ldy)],
+        stream,
+        shared,
+    )
+
+
+def btb_gemv_iq2xs_bf16(
+    launcher: Launcher,
+    M: int,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    x: MatIn,
+    y: MatOut,
+    R: OutDim,
+    C: InDim,
+    ldy: OutStride,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    """btb_gemv_iq2xs_bf16_m{M}, M one of 1, 2, 4, 8, 16, 32"""
+    launcher.launch(
+        f"btb_gemv_iq2xs_bf16_m{M}",
+        grid,
+        block,
+        [_P(w), _P(lattice), _P(signs), _P(x), _P(y), _I(R), _I(C), _I(ldy)],
+        stream,
+        shared,
+    )
+
+
+def btb_gemv_iq2xxs_bf16(
+    launcher: Launcher,
+    M: int,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    x: MatIn,
+    y: MatOut,
+    R: OutDim,
+    C: InDim,
+    ldy: OutStride,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    """btb_gemv_iq2xxs_bf16_m{M}, M one of 1, 2, 4, 8, 16, 32"""
+    launcher.launch(
+        f"btb_gemv_iq2xxs_bf16_m{M}",
+        grid,
+        block,
+        [_P(w), _P(lattice), _P(signs), _P(x), _P(y), _I(R), _I(C), _I(ldy)],
+        stream,
+        shared,
+    )
+
+
+def btb_gemv_iq3s_bf16(
+    launcher: Launcher,
+    M: int,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    x: MatIn,
+    y: MatOut,
+    R: OutDim,
+    C: InDim,
+    ldy: OutStride,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    """btb_gemv_iq3s_bf16_m{M}, M one of 1, 2, 4, 8, 16, 32"""
+    launcher.launch(
+        f"btb_gemv_iq3s_bf16_m{M}",
+        grid,
+        block,
+        [_P(w), _P(lattice), _P(signs), _P(x), _P(y), _I(R), _I(C), _I(ldy)],
+        stream,
+        shared,
+    )
+
+
+def btb_gemv_iq3xxs_bf16(
+    launcher: Launcher,
+    M: int,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    x: MatIn,
+    y: MatOut,
+    R: OutDim,
+    C: InDim,
+    ldy: OutStride,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    """btb_gemv_iq3xxs_bf16_m{M}, M one of 1, 2, 4, 8, 16, 32"""
+    launcher.launch(
+        f"btb_gemv_iq3xxs_bf16_m{M}",
+        grid,
+        block,
+        [_P(w), _P(lattice), _P(signs), _P(x), _P(y), _I(R), _I(C), _I(ldy)],
+        stream,
+        shared,
+    )
+
+
+def btb_gemv_iq4nl_bf16(
+    launcher: Launcher,
+    M: int,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    x: MatIn,
+    y: MatOut,
+    R: OutDim,
+    C: InDim,
+    ldy: OutStride,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    """btb_gemv_iq4nl_bf16_m{M}, M one of 1, 2, 4, 8, 16, 32"""
+    launcher.launch(
+        f"btb_gemv_iq4nl_bf16_m{M}",
+        grid,
+        block,
+        [_P(w), _P(lattice), _P(signs), _P(x), _P(y), _I(R), _I(C), _I(ldy)],
+        stream,
+        shared,
+    )
+
+
+def btb_gemv_iq4xs_bf16(
+    launcher: Launcher,
+    M: int,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    x: MatIn,
+    y: MatOut,
+    R: OutDim,
+    C: InDim,
+    ldy: OutStride,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    """btb_gemv_iq4xs_bf16_m{M}, M one of 1, 2, 4, 8, 16, 32"""
+    launcher.launch(
+        f"btb_gemv_iq4xs_bf16_m{M}",
+        grid,
+        block,
+        [_P(w), _P(lattice), _P(signs), _P(x), _P(y), _I(R), _I(C), _I(ldy)],
+        stream,
+        shared,
+    )
 
 
 def btb_gemv_lane16_f32(
@@ -923,6 +1606,230 @@ def btb_gemv_mma_glu_silu(
     shared: int = 0,
 ) -> None:
     launcher.launch("btb_gemv_mma_glu_silu", grid, block, [_P(w), _P(x), _P(m), _I(I), _I(C), _I(M)], stream, shared)
+
+
+def btb_gemv_q2k_bf16(
+    launcher: Launcher,
+    M: int,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    x: MatIn,
+    y: MatOut,
+    R: OutDim,
+    C: InDim,
+    ldy: OutStride,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    """btb_gemv_q2k_bf16_m{M}, M one of 1, 2, 4, 8, 16, 32"""
+    launcher.launch(
+        f"btb_gemv_q2k_bf16_m{M}",
+        grid,
+        block,
+        [_P(w), _P(lattice), _P(signs), _P(x), _P(y), _I(R), _I(C), _I(ldy)],
+        stream,
+        shared,
+    )
+
+
+def btb_gemv_q3k_bf16(
+    launcher: Launcher,
+    M: int,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    x: MatIn,
+    y: MatOut,
+    R: OutDim,
+    C: InDim,
+    ldy: OutStride,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    """btb_gemv_q3k_bf16_m{M}, M one of 1, 2, 4, 8, 16, 32"""
+    launcher.launch(
+        f"btb_gemv_q3k_bf16_m{M}",
+        grid,
+        block,
+        [_P(w), _P(lattice), _P(signs), _P(x), _P(y), _I(R), _I(C), _I(ldy)],
+        stream,
+        shared,
+    )
+
+
+def btb_gemv_q40_bf16(
+    launcher: Launcher,
+    M: int,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    x: MatIn,
+    y: MatOut,
+    R: OutDim,
+    C: InDim,
+    ldy: OutStride,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    """btb_gemv_q40_bf16_m{M}, M one of 1, 2, 4, 8, 16, 32"""
+    launcher.launch(
+        f"btb_gemv_q40_bf16_m{M}",
+        grid,
+        block,
+        [_P(w), _P(lattice), _P(signs), _P(x), _P(y), _I(R), _I(C), _I(ldy)],
+        stream,
+        shared,
+    )
+
+
+def btb_gemv_q41_bf16(
+    launcher: Launcher,
+    M: int,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    x: MatIn,
+    y: MatOut,
+    R: OutDim,
+    C: InDim,
+    ldy: OutStride,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    """btb_gemv_q41_bf16_m{M}, M one of 1, 2, 4, 8, 16, 32"""
+    launcher.launch(
+        f"btb_gemv_q41_bf16_m{M}",
+        grid,
+        block,
+        [_P(w), _P(lattice), _P(signs), _P(x), _P(y), _I(R), _I(C), _I(ldy)],
+        stream,
+        shared,
+    )
+
+
+def btb_gemv_q4k_bf16(
+    launcher: Launcher,
+    M: int,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    x: MatIn,
+    y: MatOut,
+    R: OutDim,
+    C: InDim,
+    ldy: OutStride,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    """btb_gemv_q4k_bf16_m{M}, M one of 1, 2, 4, 8, 16, 32"""
+    launcher.launch(
+        f"btb_gemv_q4k_bf16_m{M}",
+        grid,
+        block,
+        [_P(w), _P(lattice), _P(signs), _P(x), _P(y), _I(R), _I(C), _I(ldy)],
+        stream,
+        shared,
+    )
+
+
+def btb_gemv_q5k_bf16(
+    launcher: Launcher,
+    M: int,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    x: MatIn,
+    y: MatOut,
+    R: OutDim,
+    C: InDim,
+    ldy: OutStride,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    """btb_gemv_q5k_bf16_m{M}, M one of 1, 2, 4, 8, 16, 32"""
+    launcher.launch(
+        f"btb_gemv_q5k_bf16_m{M}",
+        grid,
+        block,
+        [_P(w), _P(lattice), _P(signs), _P(x), _P(y), _I(R), _I(C), _I(ldy)],
+        stream,
+        shared,
+    )
+
+
+def btb_gemv_q6k_bf16(
+    launcher: Launcher,
+    M: int,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    x: MatIn,
+    y: MatOut,
+    R: OutDim,
+    C: InDim,
+    ldy: OutStride,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    """btb_gemv_q6k_bf16_m{M}, M one of 1, 2, 4, 8, 16, 32"""
+    launcher.launch(
+        f"btb_gemv_q6k_bf16_m{M}",
+        grid,
+        block,
+        [_P(w), _P(lattice), _P(signs), _P(x), _P(y), _I(R), _I(C), _I(ldy)],
+        stream,
+        shared,
+    )
+
+
+def btb_gemv_q80_bf16(
+    launcher: Launcher,
+    M: int,
+    grid: Dim3,
+    block: Dim3,
+    w: QuantBlocks,
+    lattice: QuantGrid,
+    signs: QuantSigns,
+    x: MatIn,
+    y: MatOut,
+    R: OutDim,
+    C: InDim,
+    ldy: OutStride,
+    *,
+    stream: torch.cuda.Stream | None = None,
+    shared: int = 0,
+) -> None:
+    """btb_gemv_q80_bf16_m{M}, M one of 1, 2, 4, 8, 16, 32"""
+    launcher.launch(
+        f"btb_gemv_q80_bf16_m{M}",
+        grid,
+        block,
+        [_P(w), _P(lattice), _P(signs), _P(x), _P(y), _I(R), _I(C), _I(ldy)],
+        stream,
+        shared,
+    )
 
 
 def btb_gemv_sgate_bf16(
@@ -1834,18 +2741,52 @@ class CardLaunch:
     btb_conv_window = btb_conv_window
     btb_delta_nodes = btb_delta_nodes
     btb_delta_nodes_bf16 = btb_delta_nodes_bf16
+    btb_dequant_iq1m_bf16 = btb_dequant_iq1m_bf16
+    btb_dequant_iq1s_bf16 = btb_dequant_iq1s_bf16
+    btb_dequant_iq2s_bf16 = btb_dequant_iq2s_bf16
+    btb_dequant_iq2xs_bf16 = btb_dequant_iq2xs_bf16
+    btb_dequant_iq2xxs_bf16 = btb_dequant_iq2xxs_bf16
+    btb_dequant_iq3s_bf16 = btb_dequant_iq3s_bf16
+    btb_dequant_iq3xxs_bf16 = btb_dequant_iq3xxs_bf16
+    btb_dequant_iq4nl_bf16 = btb_dequant_iq4nl_bf16
+    btb_dequant_iq4xs_bf16 = btb_dequant_iq4xs_bf16
+    btb_dequant_q2k_bf16 = btb_dequant_q2k_bf16
+    btb_dequant_q3k_bf16 = btb_dequant_q3k_bf16
+    btb_dequant_q40_bf16 = btb_dequant_q40_bf16
+    btb_dequant_q41_bf16 = btb_dequant_q41_bf16
+    btb_dequant_q4k_bf16 = btb_dequant_q4k_bf16
+    btb_dequant_q5k_bf16 = btb_dequant_q5k_bf16
+    btb_dequant_q6k_bf16 = btb_dequant_q6k_bf16
+    btb_dequant_q80_bf16 = btb_dequant_q80_bf16
     btb_gelu_mul = btb_gelu_mul
     btb_gemm_f32_bf16 = btb_gemm_f32_bf16
     btb_gemm_mma_bf16 = btb_gemm_mma_bf16
     btb_gemm_mma_small_bf16 = btb_gemm_mma_small_bf16
     btb_gemv_bf16 = btb_gemv_bf16
     btb_gemv_gelu_bf16 = btb_gemv_gelu_bf16
+    btb_gemv_iq1m_bf16 = btb_gemv_iq1m_bf16
+    btb_gemv_iq1s_bf16 = btb_gemv_iq1s_bf16
+    btb_gemv_iq2s_bf16 = btb_gemv_iq2s_bf16
+    btb_gemv_iq2xs_bf16 = btb_gemv_iq2xs_bf16
+    btb_gemv_iq2xxs_bf16 = btb_gemv_iq2xxs_bf16
+    btb_gemv_iq3s_bf16 = btb_gemv_iq3s_bf16
+    btb_gemv_iq3xxs_bf16 = btb_gemv_iq3xxs_bf16
+    btb_gemv_iq4nl_bf16 = btb_gemv_iq4nl_bf16
+    btb_gemv_iq4xs_bf16 = btb_gemv_iq4xs_bf16
     btb_gemv_lane16_f32 = btb_gemv_lane16_f32
     btb_gemv_lane16_mx4_f32 = btb_gemv_lane16_mx4_f32
     btb_gemv_mma8_bf16 = btb_gemv_mma8_bf16
     btb_gemv_mma_bf16 = btb_gemv_mma_bf16
     btb_gemv_mma_glu_gelu = btb_gemv_mma_glu_gelu
     btb_gemv_mma_glu_silu = btb_gemv_mma_glu_silu
+    btb_gemv_q2k_bf16 = btb_gemv_q2k_bf16
+    btb_gemv_q3k_bf16 = btb_gemv_q3k_bf16
+    btb_gemv_q40_bf16 = btb_gemv_q40_bf16
+    btb_gemv_q41_bf16 = btb_gemv_q41_bf16
+    btb_gemv_q4k_bf16 = btb_gemv_q4k_bf16
+    btb_gemv_q5k_bf16 = btb_gemv_q5k_bf16
+    btb_gemv_q6k_bf16 = btb_gemv_q6k_bf16
+    btb_gemv_q80_bf16 = btb_gemv_q80_bf16
     btb_gemv_sgate_bf16 = btb_gemv_sgate_bf16
     btb_gemv_silu_bf16 = btb_gemv_silu_bf16
     btb_hc_act = btb_hc_act

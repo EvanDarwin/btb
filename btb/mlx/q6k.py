@@ -1,9 +1,9 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 """Q6_K on Metal: llama.cpp's Q6_K superblocks read as stored and dequantized in registers (free under the
 memory-bound read, by the roofline), so the 6-bit weights never expand to bf16 in memory. `matvec_q6k` is the
-linear (one simdgroup a row, the 32 lanes cooperating on a superblock for coalesced reads, up to 16 rows an
-invocation reusing the one weight read); `gather_q6k` reads only an embedding's own rows; `dequant_q6k` the
-whole matrix, for the rare path that wants a bf16 copy."""
+linear (`matvec.launch`, the 32 lanes of a simdgroup cooperating on a superblock for coalesced reads, up to 16
+rows an invocation reusing the one weight read); `gather_q6k` reads only an embedding's own rows; `dequant_q6k`
+the whole matrix, for the rare path that wants a bf16 copy."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import threading
 from typing import TYPE_CHECKING, Any
 
 from .core import mx
+from .matvec import blocks, launch
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -38,49 +39,64 @@ inline void q6k_decode_block(const device uchar* blk, device U* o) {
 }
 """
 
-# the linear: one simdgroup a row, lane = inner index l so all 32 lanes cooperate on a superblock (coalesced
-# ql/qh/x), each lane its four weights, then simd_sum. Cooperative, so it does not share q6k_decode_block.
-_MATVEC = r"""
-    uint gid = thread_position_in_grid.x;
-    uint row = gid / 32, lane = gid % 32;
-    if (row >= ROWS) return;
-    const device uchar* base = W + (size_t)row * NSB * 210;
-    float acc[TR];
-    #pragma unroll
-    for (int u = 0; u < TR; u++) acc[u] = 0.0f;
-    for (uint c = 0; c < NSB; c++) {
-        const device uchar* blk = base + (size_t)c * 210;
-        const device uchar* ql = blk;
-        const device uchar* qh = blk + 128;
-        const device char* sc = (const device char*)(blk + 192);
-        float df = (float)(*(const device half*)(blk + 208));
-        for (int h = 0; h < 2; h++) {
-            uint o = h * 128, qlo = h * 64, qho = h * 32, sco = h * 8;
-            int isc = sco + lane / 16;
-            uchar l0 = ql[qlo + lane], l1 = ql[qlo + lane + 32], hb = qh[qho + lane];
-            float w1 = df * sc[isc + 0] * (((l0 & 0xF) | (((hb >> 0) & 3) << 4)) - 32);
-            float w2 = df * sc[isc + 2] * (((l1 & 0xF) | (((hb >> 2) & 3) << 4)) - 32);
-            float w3 = df * sc[isc + 4] * (((l0 >> 4)  | (((hb >> 4) & 3) << 4)) - 32);
-            float w4 = df * sc[isc + 6] * (((l1 >> 4)  | (((hb >> 6) & 3) << 4)) - 32);
-            for (int tr = 0; tr < TR; tr++) {
-                const device T* xb = x + (size_t)tr * (NSB * 256) + (size_t)c * 256;
-                acc[tr] += w1 * (float)xb[o + lane] + w2 * (float)xb[o + lane + 32]
-                         + w3 * (float)xb[o + lane + 64] + w4 * (float)xb[o + lane + 96];
+# the linear (`matvec.blocks`): lane = inner index l so all 32 lanes cooperate on a superblock (coalesced ql/qh/x),
+# each lane its eight weights (four a half, at col h*128 + i*32 + lane), then simd_sum. Cooperative, so it does
+# not share q6k_decode_block.
+_MATVEC = blocks(
+    "",
+    "        float w[RP][8];\n",
+    r"""
+            const device uchar* blk = W + ((size_t)row * NSB + c) * 210;
+            const device uchar* ql = blk;
+            const device uchar* qh = blk + 128;
+            const device char* sc = (const device char*)(blk + 192);
+            float df = (float)(*(const device half*)(blk + 208));
+            #pragma unroll
+            for (int h = 0; h < 2; h++) {
+                uint qlo = h * 64, qho = h * 32, sco = h * 8;
+                int isc = sco + lane / 16;
+                uchar l0 = ql[qlo + lane], l1 = ql[qlo + lane + 32], hb = qh[qho + lane];
+                w[r][4 * h + 0] = df * sc[isc + 0] * (((l0 & 0xF) | (((hb >> 0) & 3) << 4)) - 32);
+                w[r][4 * h + 1] = df * sc[isc + 2] * (((l1 & 0xF) | (((hb >> 2) & 3) << 4)) - 32);
+                w[r][4 * h + 2] = df * sc[isc + 4] * (((l0 >> 4)  | (((hb >> 4) & 3) << 4)) - 32);
+                w[r][4 * h + 3] = df * sc[isc + 6] * (((l1 >> 4)  | (((hb >> 6) & 3) << 4)) - 32);
             }
-        }
-    }
-    #pragma unroll
-    for (int tr = 0; tr < TR; tr++) {
-        float a = simd_sum(acc[tr]);
-        if (lane == 0) out[(size_t)tr * ROWS + row] = (T)a;
-    }
-"""
+""",
+    r"""
+            float xv[8];
+            #pragma unroll
+            for (int k = 0; k < 8; k++) xv[k] = (float)xc[(k >> 2) * 128 + (k & 3) * 32 + lane];
+            #pragma unroll
+            for (int r = 0; r < RP; r++)
+                #pragma unroll
+                for (int h = 0; h < 2; h++)
+                    acc[r][tr] += w[r][4 * h] * xv[4 * h] + w[r][4 * h + 1] * xv[4 * h + 1]
+                                + w[r][4 * h + 2] * xv[4 * h + 2] + w[r][4 * h + 3] * xv[4 * h + 3];
+""",
+)
 
-# one thread a superblock; `dequant` walks the matrix, `gather` an embedding's own rows by the ids in `tok`.
+# `dequant` walks the matrix a simdgroup a superblock, lane = inner index l as in the matvec, so each store is 32
+# consecutive weights (a thread a superblock measured 12x slower); `gather` an embedding's own rows by `tok`, a
+# thread a superblock. Both are `q6k_decode_block`'s numbers.
 _DEQUANT = r"""
-    uint t = thread_position_in_grid.x;
+    uint gid = thread_position_in_grid.x;
+    uint t = gid / 32, l = gid % 32;
     if (t >= NBLK) return;
-    q6k_decode_block<T>(W + (size_t)t * 210, out + (size_t)t * 256);
+    const device uchar* blk = W + (size_t)t * 210;
+    const device uchar* ql = blk;
+    const device uchar* qh = blk + 128;
+    const device char* sc = (const device char*)(blk + 192);
+    float df = (float)(*(const device half*)(blk + 208));
+    device T* o = out + (size_t)t * 256;
+    for (int h = 0; h < 2; h++) {
+        uint base = h * 128, qlo = h * 64, qho = h * 32, sco = h * 8;
+        int isc = sco + l / 16;
+        uchar l0 = ql[qlo + l], l1 = ql[qlo + l + 32], hb = qh[qho + l];
+        o[base + l]      = (T)(df * sc[isc + 0] * (((l0 & 0xF) | (((hb >> 0) & 3) << 4)) - 32));
+        o[base + l + 32] = (T)(df * sc[isc + 2] * (((l1 & 0xF) | (((hb >> 2) & 3) << 4)) - 32));
+        o[base + l + 64] = (T)(df * sc[isc + 4] * (((l0 >> 4)  | (((hb >> 4) & 3) << 4)) - 32));
+        o[base + l + 96] = (T)(df * sc[isc + 6] * (((l1 >> 4)  | (((hb >> 6) & 3) << 4)) - 32));
+    }
 """
 _GATHER = r"""
     uint i = thread_position_in_grid.x;
@@ -91,50 +107,16 @@ _GATHER = r"""
     q6k_decode_block<T>(W + ((size_t)row * NSB + (size_t)c) * 210, out + ((size_t)t * NSB + (size_t)c) * 256);
 """
 
-_matvec_kernels: dict[Any, Any] = {}
 _deq_kernel = None
 _gather_kernels: dict[int, Any] = {}
 _lock = threading.Lock()
-ROWS_MAX = 16  # a call takes up to 16 rows (acc[TR] in registers); a wider pass is chunked
-
-
-def _matvec_kernel(rows: int, nsb: int, tr: int) -> Any:
-    m = mx()
-    key = (rows, nsb, tr)
-    with _lock:
-        k = _matvec_kernels.get(key)
-        if k is None:
-            k = _matvec_kernels[key] = m.fast.metal_kernel(
-                name=f"btb_q6k_mv_{rows}_{nsb}_{tr}",
-                input_names=["W", "x"],
-                output_names=["out"],
-                header=f"#define ROWS {rows}\n#define NSB {nsb}\n#define TR {tr}\n",
-                source=_MATVEC,
-            )
-    return k
 
 
 def matvec_q6k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:
     """y[T, rows] = x[T, cols] . W[rows, cols]^T, W the raw Q6_K bytes (rows * cols / 256 row-major superblocks).
     float32 accumulation over the blocks as stored, y in x's dtype; 1..16 rows a launch, a wider pass chunked."""
-    m = mx()
     nsb = cols // 256
-    grid = ((rows * 32 + 255) // 256) * 256
-    outs = []
-    for s in range(0, int(x.shape[0]), ROWS_MAX):
-        xr = x[s : s + ROWS_MAX]
-        tr = int(xr.shape[0])
-        outs.append(
-            _matvec_kernel(rows, nsb, tr)(
-                inputs=[w_bytes, xr],
-                grid=(grid, 1, 1),
-                threadgroup=(256, 1, 1),
-                output_shapes=[(tr, rows)],
-                output_dtypes=[x.dtype],
-                template=[("T", x.dtype)],
-            )[0]
-        )
-    return outs[0] if len(outs) == 1 else m.concatenate(outs, axis=0)
+    return launch(f"btb_q6k_mv_{rows}_{nsb}", _MATVEC, "", [("W", w_bytes)], x, rows, cols, 256)
 
 
 def gather_q6k(w_bytes: mx_.array, tok: mx_.array, cols: int) -> mx_.array:
@@ -172,9 +154,9 @@ def dequant_q6k(w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
     with _lock:
         if _deq_kernel is None:
             _deq_kernel = m.fast.metal_kernel(
-                name="btb_q6k_dequant", input_names=["W"], output_names=["out"], header=_DECODE, source=_DEQUANT
+                name="btb_q6k_dequant", input_names=["W"], output_names=["out"], header="", source=_DEQUANT
             )
-    grid = ((nblk + 255) // 256) * 256
+    grid = ((nblk * 32 + 255) // 256) * 256
     return _deq_kernel(
         inputs=[w_bytes],
         grid=(grid, 1, 1),

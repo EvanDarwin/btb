@@ -10,11 +10,13 @@ import math
 import os
 import sys
 from collections.abc import Callable, Sequence
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import torch
 
 from ..kinds import (
+    CARD_ROWS,
+    QUANT_KIND,
     AColumn,
     Arrivals,
     AttnOut,
@@ -49,6 +51,7 @@ from ..kinds import (
     DeltaVHeads,
     DeltaZ,
     Depths,
+    Dequant,
     DraftKids,
     DraftProbs,
     DraftVocab,
@@ -81,6 +84,7 @@ from ..kinds import (
     KNorm,
     KvHeads,
     Logits,
+    MatIn,
     MatInF32,
     MatOut,
     MatOutF32,
@@ -103,6 +107,7 @@ from ..kinds import (
     NormWeight,
     OutDim,
     OutGate,
+    OutStride,
     PartAcc,
     PartMax,
     PartSum,
@@ -128,6 +133,12 @@ from ..kinds import (
     QkvColumn,
     QkvWidth,
     QNorm,
+    Quant,
+    QuantBlocks,
+    QuantClass,
+    QuantGrid,
+    QuantSigns,
+    QuantValues,
     Query,
     RadixCarry,
     RadixFloor,
@@ -168,12 +179,39 @@ from ..kinds import (
     Weight,
     Widened,
     ZColumn,
+    quant_key,
+    stored_quants,
 )
 from ..native_files import kernels_path, native_path
 from ..sysinfo import raise_file_limit
 from . import card_launch
 
 _R = TypeVar("_R")
+
+if TYPE_CHECKING:
+    from ..gguf import QuantWeight
+
+# a GGUF type's launchers as the card module carries them, picked by the type's key (`btb_gemv_<key>_bf16`, its rows
+# M first, and `btb_dequant_<key>_bf16`): the generated launchers' signatures, which every stored type's share
+GemvStored = Callable[
+    [
+        int,
+        card_launch.Dim3,
+        card_launch.Dim3,
+        QuantBlocks,
+        QuantGrid,
+        QuantSigns,
+        MatIn,
+        MatOut,
+        OutDim,
+        InDim,
+        OutStride,
+    ],
+    None,
+]
+DequantStored = Callable[
+    [card_launch.Dim3, card_launch.Dim3, QuantBlocks, QuantGrid, QuantSigns, Dequant, QuantValues], None
+]
 
 
 def _library(lib: Any) -> Any:
@@ -381,6 +419,129 @@ def quiet_omp() -> None:
             ctypes.CDLL(p).kmp_set_blocktime(0)
 
 
+class QuantGemv:
+    """The GGUF types' as-stored gemvs a library carries, one `btb_gemv_<key>_rows` and `_group` a type of
+    `kinds.stored_quants()` (`kinds.quant_key`): `q in` asks for a type, a call runs one over a `QuantWeight`,
+    y[b, rows] = x[b, cols] . W^T in f32. Each is bit-identical for every thread count and batch width. `dequant`
+    (`btb_dequant_<key>_rows`) decodes a whole matrix as the gemv widens it, for a prefill's GEMM."""
+
+    def __init__(
+        self,
+        fns: dict[Quant, Callable[[QuantWeight, torch.Tensor, torch.Tensor], None]],
+        groups: dict[Quant, Callable[[Sequence[QuantWeight], Sequence[torch.Tensor], Sequence[torch.Tensor]], None]],
+        dequants: dict[Quant, Callable[[QuantWeight, torch.Tensor, int | None], None]],
+    ) -> None:
+        self.fns = fns
+        self.groups = groups
+        self.dequants = dequants
+
+    def dequant(self, w: QuantWeight, out: torch.Tensor, threads: int | None = None) -> None:
+        """`out` ([rows, cols] float32, or bfloat16 rounded as torch casts) = `w` decoded as its gemv widens it, on
+        `threads` of the pool where given"""
+        self.dequants[w.q](w, out, threads)
+
+    def __contains__(self, q: object) -> bool:
+        return q in self.fns
+
+    def __call__(self, w: QuantWeight, x: torch.Tensor, y: torch.Tensor) -> None:
+        self.fns[w.q](w, x, y)
+
+    def group(self, ws: Sequence[QuantWeight], xs: Sequence[torch.Tensor], ys: Sequence[torch.Tensor]) -> None:
+        """`ys[i] = xs[i] . ws[i]^T` for every i, one dispatch a type among `ws`: each task's bits its own call's"""
+        for q in dict.fromkeys(w.q for w in ws):
+            at = [i for i, w in enumerate(ws) if w.q is q]
+            self.groups[q]([ws[i] for i in at], [xs[i] for i in at], [ys[i] for i in at])
+
+    @classmethod
+    def bind(cls, lib: Any, threads: int) -> QuantGemv | None:
+        """the types `lib` exports a gemv for, None for a library with none; a lattice type's also takes its
+        codebook and sign table, which every task of a group shares"""
+        P, S = ctypes.c_void_p, ctypes.c_size_t
+        PP, PS = ctypes.POINTER(P), ctypes.POINTER(S)
+        fns: dict[Quant, Callable[[QuantWeight, torch.Tensor, torch.Tensor], None]] = {}
+        groups: dict[Quant, Callable[[Sequence[QuantWeight], Sequence[torch.Tensor], Sequence[torch.Tensor]], None]]
+        groups = {}
+        dequants: dict[Quant, Callable[[QuantWeight, torch.Tensor, int | None], None]] = {}
+        for q in stored_quants():
+            sym, gsym = f"btb_gemv_{quant_key(q)}_rows", f"btb_gemv_{quant_key(q)}_group"
+            if not hasattr(lib, sym):
+                continue
+            latt = QUANT_KIND[q] is QuantClass.LATTICE
+            dsym = f"btb_dequant_{quant_key(q)}_rows"
+            if hasattr(lib, dsym):
+                d = getattr(lib, dsym)
+                d.restype = ctypes.c_int32
+                B = ctypes.c_bool
+                d.argtypes = [P, P, P, S, S, P, B, S] if latt else [P, S, S, P, B, S]
+
+                def run_dequant(
+                    w: QuantWeight, out: torch.Tensor, nt: int | None, d: Any = d, dsym: str = dsym
+                ) -> None:
+                    if out.shape != w.shape or out.dtype not in (torch.float32, torch.bfloat16):
+                        raise ValueError(f"[native] {dsym}: out {tuple(out.shape)} {out.dtype} for {w.shape}")
+                    (rows, cols), raw, o, bf = w.shape, w.raw.data_ptr(), out.data_ptr(), out.dtype == torch.bfloat16
+                    nt = threads if nt is None else nt
+                    if w.grid is not None:
+                        ks = 0 if w.ksigns is None else w.ksigns.data_ptr()
+                        rc = d(raw, w.grid.data_ptr(), ks, rows, cols, o, bf, nt)
+                    else:
+                        rc = d(raw, rows, cols, o, bf, nt)
+                    if rc != 0:
+                        raise NativeError(dsym, rc)
+
+                dequants[q] = run_dequant
+            f = getattr(lib, sym)
+            f.restype = ctypes.c_int32
+            f.argtypes = [P, P, P, S, S, P, S, P, S] if latt else [P, S, S, P, S, P, S]
+
+            def run(w: QuantWeight, x: torch.Tensor, y: torch.Tensor, f: Any = f, sym: str = sym) -> None:
+                (rows, cols), raw = w.shape, w.raw.data_ptr()
+                xs, b, ys = x.data_ptr(), x.shape[0], y.data_ptr()
+                if w.grid is not None:
+                    ks = 0 if w.ksigns is None else w.ksigns.data_ptr()
+                    rc = f(raw, w.grid.data_ptr(), ks, rows, cols, xs, b, ys, threads)
+                else:
+                    rc = f(raw, rows, cols, xs, b, ys, threads)
+                if rc != 0:
+                    raise NativeError(sym, rc)
+
+            fns[q] = run
+            if not hasattr(lib, gsym):
+                continue
+            g = getattr(lib, gsym)
+            g.restype = ctypes.c_int32
+            g.argtypes = [S, PP, P, P, PS, PS, PP, PS, PP, S] if latt else [S, PP, PS, PS, PP, PS, PP, S]
+
+            def run_group(
+                ws: Sequence[QuantWeight],
+                xs: Sequence[torch.Tensor],
+                ys: Sequence[torch.Tensor],
+                g: Any = g,
+                gsym: str = gsym,
+            ) -> None:
+                n = len(ws)
+                arrays = (
+                    (P * n)(*[w.raw.data_ptr() for w in ws]),
+                    (S * n)(*[w.shape[0] for w in ws]),
+                    (S * n)(*[w.shape[1] for w in ws]),
+                    (P * n)(*[x.data_ptr() for x in xs]),
+                    (S * n)(*[x.shape[0] for x in xs]),
+                    (P * n)(*[y.data_ptr() for y in ys]),
+                )
+                w0 = ws[0]
+                if w0.grid is not None:
+                    ks = 0 if w0.ksigns is None else w0.ksigns.data_ptr()
+                    raws, *rest = arrays
+                    rc = g(n, raws, w0.grid.data_ptr(), ks, *rest, threads)
+                else:
+                    rc = g(n, *arrays, threads)
+                if rc != 0:
+                    raise NativeError(gsym, rc)
+
+            groups[q] = run_group
+        return cls(fns, groups, dequants) if fns else None
+
+
 class _Binding(type):
     """A kernel handle read before any load binds the install's library first (`Native.bind_install`), as
     `btb.load` binds it: a handle is never None only because no model has loaded yet in this process - None means
@@ -410,6 +571,7 @@ class Native(metaclass=_Binding):
         "gemv_mx4_ggml_group",
         "gemv_fp8",
         "gemv_fp8_group",
+        "gemv_quant",
         "attn_decode",
         "attn_nodes",
         "attn_spans",
@@ -432,6 +594,7 @@ class Native(metaclass=_Binding):
     gemv_mx4_ggml_group: Any
     gemv_fp8: Any
     gemv_fp8_group: Any
+    gemv_quant: QuantGemv | None
     attn_decode: Any
     attn_nodes: Any
     attn_spans: Any
@@ -723,6 +886,7 @@ class Native(metaclass=_Binding):
                     raise NativeError("btb_gemv_fp8_group", rc)
 
             cls.gemv_fp8, cls.gemv_fp8_group = gemv_fp8, gemv_fp8_group
+        cls.gemv_quant = QuantGemv.bind(lib, threads)
         cls.read_direct = None
         if hasattr(lib, "btb_read_direct"):
             rd = lib.btb_read_direct
@@ -1750,7 +1914,46 @@ class _Cuda(card_launch.CardLaunch):
                 AttnWidth(C),
             )
 
-    GEMV_ROWS = (1, 2, 4, 8, 16, 32)  # the M of btb_gemv_*_bf16_m{M}
+    GEMV_ROWS = CARD_ROWS  # the M of btb_gemv_*_bf16_m{M}
+
+    def gemv_stored(self, w: QuantWeight, x: torch.Tensor, y: torch.Tensor, ldy: int | None = None) -> None:
+        """`y` [M, R] = `x` [M, C] times a GGUF type's blocks `w` on the card (`btb_gemv_<key>_bf16_m{M}`), x and y
+        bf16, M one of GEMV_ROWS - the pass's rows padded to it; `y`'s rows `ldy` apart (R by default), so a merged
+        projection's pieces write one buffer"""
+        (R, C), M = w.shape, int(x.shape[0])
+        if M not in self.GEMV_ROWS or int(x.shape[1]) != C or x.dtype != torch.bfloat16 or y.dtype != torch.bfloat16:
+            raise ValueError(f"[cuda] gemv_stored: {w.q.value} [{R}, {C}] against x {tuple(x.shape)} {x.dtype}")
+        gemv: GemvStored = getattr(self, f"btb_gemv_{quant_key(w.q)}_bf16")
+        gemv(
+            M,
+            ((R + 3) // 4, 1, 1),
+            (128, 1, 1),
+            self.ptr(QuantBlocks, w.raw),
+            self.ptr(QuantGrid, w.grid),
+            self.ptr(QuantSigns, w.ksigns),
+            self.ptr(MatIn, x),
+            self.ptr(MatOut, y),
+            OutDim(R),
+            InDim(C),
+            OutStride(R if ldy is None else ldy),
+        )
+
+    def dequant_stored(self, w: QuantWeight, out: torch.Tensor) -> None:
+        """the whole of `w` (a GGUF type's blocks on the card) into `out` [R, C] bf16, gguf's numbers
+        (`btb_dequant_<key>_bf16`, a 256-thread block a 256-weight unit)"""
+        n = w.shape[0] * w.shape[1]
+        if out.numel() != n or out.dtype != torch.bfloat16 or not out.is_contiguous():
+            raise ValueError(f"[cuda] dequant_stored: {w.q.value} {w.shape} into {tuple(out.shape)} {out.dtype}")
+        dequant: DequantStored = getattr(self, f"btb_dequant_{quant_key(w.q)}_bf16")
+        dequant(
+            ((n + 255) // 256, 1, 1),
+            (256, 1, 1),
+            self.ptr(QuantBlocks, w.raw),
+            self.ptr(QuantGrid, w.grid),
+            self.ptr(QuantSigns, w.ksigns),
+            self.ptr(Dequant, out),
+            QuantValues(n),
+        )
 
     def gemv_sgate(
         self,

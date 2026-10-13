@@ -196,7 +196,7 @@ def test_the_experts_linear_widens_what_no_kernel_multiplies(monkeypatch: Monkey
     from btb.engine.native import Native
     from btb.fp8 import F8Weight, quantize
     from btb.kinds import PassTag
-    from btb.mxfp4 import MxGateUp, MxWeight, hf_to_ggml
+    from btb.mxfp4 import GateUp, MxWeight, hf_to_ggml
     from tests.helpers import mxfp4_random
 
     native_library()
@@ -209,7 +209,7 @@ def test_the_experts_linear_widens_what_no_kernel_multiplies(monkeypatch: Monkey
     gg = MxWeight.from_ggml(torch.from_numpy(hf_to_ggml(b, s)).reshape(-1), 32, 64)
     q, sc = quantize(torch.randn(32, 64, generator=g), (16, 16))
     f8 = F8Weight(q, sc, 32, 64)
-    forms: dict[str, Any] = {"mxfp4": mx, "ggml": gg, "fp8": f8, "gate_up": MxGateUp(gg, gg)}
+    forms: dict[str, Any] = {"mxfp4": mx, "ggml": gg, "fp8": f8, "gate_up": GateUp(gg, gg)}
     kernel = {name: ex._linear(x, w) for name, w in forms.items()}
     assert tags == {PassTag.EXPERT_MXFP4_ASSTORED, PassTag.EXPERT_FP8_ASSTORED}
     for name in ("gemv_mx4", "gemv_mx4_ggml", "gemv_fp8"):
@@ -217,7 +217,7 @@ def test_the_experts_linear_widens_what_no_kernel_multiplies(monkeypatch: Monkey
     tags.clear()
     for name, w in forms.items():
         got = ex._linear(x, w)
-        if isinstance(w, MxGateUp):
+        if isinstance(w, GateUp):
             # the gate and the up are each their own widened product, joined: one product of the two stacked is
             # not the same bits on every host's BLAS (arm64's sums a row of a taller matrix otherwise)
             half = F.linear(x, mx.dequantize(torch.float32))

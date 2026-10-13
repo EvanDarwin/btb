@@ -24,6 +24,7 @@ from .fused import DELTA_BLOCK
 from .native import Native
 from .scheduler import EPOCH, MemoryGrantError
 from .state import _State
+from .stored import CardStored
 
 # the ledger's tag for a layer-by-layer prefill's own working set, for the sweep: on the card, and on the host where
 # its host chunks run and its rows wait between layers
@@ -275,7 +276,7 @@ class _ForwardMixin(_State):
         self._tag_tiers(n_layers)
         self._tag_kv(cache)
         self._bind_kv(cache, T)
-        self._tag_quant()
+        self._tag_quant(n_layers)
         if (
             attention_mask is None
             and not own
@@ -828,7 +829,8 @@ class _ForwardMixin(_State):
         if self.head is None and self.head_host is not None:
             return self.head_host(hf.float().cpu()).float()
         assert self.head is not None  # no head_host means the head is resident
-        if self.head.weight.dtype != cd:
+        # a head of a GGUF type's blocks on the card takes bf16 rows, the compute's (`_card_stores`)
+        if not isinstance(self.head, CardStored) and self.head.weight.dtype != cd:
             # the resident head is bf16, the compute float32: the native gemv reads the head once and widens on the
             # fly (no float32 copy of a ~1 Gelem head per token) for the few rows a decode or verify pass carries. Its
             # accumulation order moves the logits ~20 ulp from the widen's; the tokens are identical. BTB_HEAD_GEMV=0
@@ -1293,7 +1295,7 @@ class _ForwardMixin(_State):
         # a paged cache's prompt rows reserved in the card's region before the sweep cuts its working set: grown
         # mid-sweep, the region's arenas would sit inside it
         self._bind_kv(cache, T)
-        self._tag_quant()
+        self._tag_quant(self.L)
         self._attn_ctx = cache
         cd = self.compute_dtype
         spans = [(a, min(T, a + C)) for a in range(0, T, C)]

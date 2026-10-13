@@ -242,6 +242,258 @@ pub unsafe extern "C" fn btb_gemv_mxfp4_ggml_group(
     })
 }
 
+/// A GGUF quant matvec over the file's own bytes, [`btb_gemv_bf16_rows`]'s contract with `raw` in
+/// the weight's place: `rows * cols / block` blocks row-major, `cols` a multiple of the type's block.
+/// Bit-identical for every `threads` and every `b`, and row `r` is the same at any `b`.
+macro_rules! quant_rows {
+    ($(#[$doc:meta])* $name:ident, $core:ident) => {
+        $(#[$doc])*
+        ///
+        /// # Safety
+        /// `raw` readable for the type's `rows * cols / block * block_bytes`, `x` for `b * cols` f32, `y`
+        /// writable for `b * rows` f32; `y` must not overlap an input.
+        #[no_mangle]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe extern "C" fn $name(
+            raw: *const u8,
+            rows: usize,
+            cols: usize,
+            x: *const f32,
+            b: usize,
+            y: *mut f32,
+            threads: usize,
+        ) -> i32 {
+            guard(|| unsafe { gemv::$core(raw, rows, cols, x, b, y, threads) })
+        }
+    };
+}
+quant_rows!(
+    /// Q2_K: 84-byte superblocks of 256 - 16 scale/min bytes, 64 bytes of 2-bit weights, the f16 delta and min.
+    btb_gemv_q2k_rows,
+    gemv_q2k_core
+);
+quant_rows!(
+    /// Q3_K: 110-byte superblocks of 256 - a 32-byte high-bit mask, 64 low-2-bit bytes, 12 packed 6-bit scale
+    /// bytes, the f16 delta.
+    btb_gemv_q3k_rows,
+    gemv_q3k_core
+);
+quant_rows!(
+    /// Q4_K: 144-byte superblocks of 256 - the f16 delta and min, 12 packed 6-bit scale/min bytes, 128 nibble
+    /// bytes.
+    btb_gemv_q4k_rows,
+    gemv_q4k_core
+);
+quant_rows!(
+    /// Q5_K: 176-byte superblocks of 256 - Q4_K's header, a 32-byte fifth-bit plane, 128 nibble bytes.
+    btb_gemv_q5k_rows,
+    gemv_q5k_core
+);
+quant_rows!(
+    /// Q6_K: 210-byte superblocks of 256 - 128 low-nibble bytes, 64 high-2-bit bytes, 16 int8 scales, the
+    /// f16 delta.
+    btb_gemv_q6k_rows,
+    gemv_q6k_core
+);
+quant_rows!(
+    /// Q4_0: 18-byte blocks of 32 - the f16 delta, 16 nibble bytes; a weight `d * (code - 8)`.
+    btb_gemv_q40_rows,
+    gemv_q40_core
+);
+quant_rows!(
+    /// Q4_1: 20-byte blocks of 32 - the f16 delta and min, 16 nibble bytes; a weight `d * code + m`.
+    btb_gemv_q41_rows,
+    gemv_q41_core
+);
+quant_rows!(
+    /// Q8_0: 34-byte blocks of 32 - the f16 delta, 32 int8 weights; a weight `d * code`.
+    btb_gemv_q80_rows,
+    gemv_q80_core
+);
+quant_rows!(
+    /// IQ4_NL: 18-byte blocks of 32 - the f16 delta, 16 nibble bytes; a weight `d * KV[code]` through the
+    /// fixed non-linear codebook.
+    btb_gemv_iq4nl_rows,
+    gemv_iq4nl_core
+);
+quant_rows!(
+    /// IQ4_XS: 136-byte superblocks of 256 - the f16 delta, a high-scale word, four low-scale bytes, 128
+    /// nibble bytes; a weight `d * (scale - 32) * KV[code]`.
+    btb_gemv_iq4xs_rows,
+    gemv_iq4xs_core
+);
+
+/// `quant_rows!` over a GGUF i-quant lattice (256-weight superblocks): `grid` the type's int8 codebook
+/// flattened (entries x values), `ksigns` the shared 128-entry sign table, read by IQ3_XXS, IQ2_XXS and
+/// IQ2_XS (`ERR_NULL` there without it) and null for the types that carry explicit signs or none.
+macro_rules! latt_rows {
+    ($name:ident, $core:ident) => {
+        /// A GGUF i-quant lattice matvec: see `latt_rows!` for the tables.
+        ///
+        /// # Safety
+        /// `raw`, `grid` and (where read) `ksigns` valid for the type; `x` readable for `b * cols` f32, `y`
+        /// writable for `b * rows` f32; `y` must not overlap an input.
+        #[no_mangle]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe extern "C" fn $name(
+            raw: *const u8,
+            grid: *const i8,
+            ksigns: *const u8,
+            rows: usize,
+            cols: usize,
+            x: *const f32,
+            b: usize,
+            y: *mut f32,
+            threads: usize,
+        ) -> i32 {
+            guard(|| unsafe { gemv::$core(raw, grid, ksigns, rows, cols, x, b, y, threads) })
+        }
+    };
+}
+latt_rows!(btb_gemv_iq3xxs_rows, gemv_iq3xxs_core);
+latt_rows!(btb_gemv_iq3s_rows, gemv_iq3s_core);
+latt_rows!(btb_gemv_iq2xxs_rows, gemv_iq2xxs_core);
+latt_rows!(btb_gemv_iq2xs_rows, gemv_iq2xs_core);
+latt_rows!(btb_gemv_iq2s_rows, gemv_iq2s_core);
+latt_rows!(btb_gemv_iq1s_rows, gemv_iq1s_core);
+latt_rows!(btb_gemv_iq1m_rows, gemv_iq1m_core);
+
+/// A type's `_rows` matvec for `n` independent tasks under one thread-pool dispatch, as
+/// [`btb_gemv_bf16_group`] is for the bf16 one (a layer's active experts are one call): task `t` reads
+/// `raw[t]` (`[rows[t], cols[t]]` in the type's blocks) and `x[t]` (`[b[t], cols[t]]` f32) and writes
+/// `y[t]` (`[b[t], rows[t]]` f32), bit-identical to its own `_rows` call for every `threads` and `n`.
+macro_rules! quant_group {
+    ($name:ident, $core:ident) => {
+        /// A GGUF stored type's grouped matvec: see `quant_group!`.
+        ///
+        /// # Safety
+        /// `raw`, `rows`, `cols`, `x`, `b` and `y` readable for `n` elements, each task's arrays valid for the
+        /// lengths its `_rows` call states; the `n` outputs must not overlap each other or an input.
+        #[no_mangle]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe extern "C" fn $name(
+            n: usize,
+            raw: *const *const u8,
+            rows: *const usize,
+            cols: *const usize,
+            x: *const *const f32,
+            b: *const usize,
+            y: *mut *mut f32,
+            threads: usize,
+        ) -> i32 {
+            guard(|| unsafe { gemv::$core(n, raw, rows, cols, x, b, y, threads) })
+        }
+    };
+}
+quant_group!(btb_gemv_q2k_group, gemv_q2k_group_core);
+quant_group!(btb_gemv_q3k_group, gemv_q3k_group_core);
+quant_group!(btb_gemv_q4k_group, gemv_q4k_group_core);
+quant_group!(btb_gemv_q5k_group, gemv_q5k_group_core);
+quant_group!(btb_gemv_q6k_group, gemv_q6k_group_core);
+quant_group!(btb_gemv_q40_group, gemv_q40_group_core);
+quant_group!(btb_gemv_q41_group, gemv_q41_group_core);
+quant_group!(btb_gemv_q80_group, gemv_q80_group_core);
+quant_group!(btb_gemv_iq4nl_group, gemv_iq4nl_group_core);
+quant_group!(btb_gemv_iq4xs_group, gemv_iq4xs_group_core);
+
+/// `quant_group!` over a lattice type: every task shares the type's `grid` and `ksigns` (`latt_rows!`).
+macro_rules! latt_group {
+    ($name:ident, $core:ident) => {
+        /// A GGUF i-quant lattice's grouped matvec: see `latt_group!`.
+        ///
+        /// # Safety
+        /// As `quant_group!`, with `grid` and (where read) `ksigns` valid for the type.
+        #[no_mangle]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe extern "C" fn $name(
+            n: usize,
+            raw: *const *const u8,
+            grid: *const i8,
+            ksigns: *const u8,
+            rows: *const usize,
+            cols: *const usize,
+            x: *const *const f32,
+            b: *const usize,
+            y: *mut *mut f32,
+            threads: usize,
+        ) -> i32 {
+            guard(|| unsafe { gemv::$core(n, raw, grid, ksigns, rows, cols, x, b, y, threads) })
+        }
+    };
+}
+latt_group!(btb_gemv_iq3xxs_group, gemv_iq3xxs_group_core);
+latt_group!(btb_gemv_iq3s_group, gemv_iq3s_group_core);
+latt_group!(btb_gemv_iq2xxs_group, gemv_iq2xxs_group_core);
+latt_group!(btb_gemv_iq2xs_group, gemv_iq2xs_group_core);
+latt_group!(btb_gemv_iq2s_group, gemv_iq2s_group_core);
+latt_group!(btb_gemv_iq1s_group, gemv_iq1s_group_core);
+latt_group!(btb_gemv_iq1m_group, gemv_iq1m_group_core);
+
+/// A type's whole `[rows, cols]` matrix decoded as its `_rows` matvec widens it, into `out`: f32, or with
+/// `bf16` each value rounded to the nearest bf16 (ties to even, as torch casts) and written as its bit pattern.
+/// A prefill's GEMM takes these weights in place of the type's matvec. Bit-identical for every `threads`.
+macro_rules! quant_dequant {
+    ($name:ident, $core:ident) => {
+        /// A GGUF stored type's dequantization: see `quant_dequant!`.
+        ///
+        /// # Safety
+        /// `raw` readable for the type's `rows * cols / block * block_bytes`, `out` writable for `rows * cols`
+        /// f32 (or u16 with `bf16`) and not overlapping `raw`.
+        #[no_mangle]
+        pub unsafe extern "C" fn $name(
+            raw: *const u8,
+            rows: usize,
+            cols: usize,
+            out: *mut u8,
+            bf16: bool,
+            threads: usize,
+        ) -> i32 {
+            guard(|| unsafe { gemv::$core(raw, rows, cols, out, bf16, threads) })
+        }
+    };
+}
+quant_dequant!(btb_dequant_q2k_rows, dequant_q2k_core);
+quant_dequant!(btb_dequant_q3k_rows, dequant_q3k_core);
+quant_dequant!(btb_dequant_q4k_rows, dequant_q4k_core);
+quant_dequant!(btb_dequant_q5k_rows, dequant_q5k_core);
+quant_dequant!(btb_dequant_q6k_rows, dequant_q6k_core);
+quant_dequant!(btb_dequant_q40_rows, dequant_q40_core);
+quant_dequant!(btb_dequant_q41_rows, dequant_q41_core);
+quant_dequant!(btb_dequant_q80_rows, dequant_q80_core);
+quant_dequant!(btb_dequant_iq4nl_rows, dequant_iq4nl_core);
+quant_dequant!(btb_dequant_iq4xs_rows, dequant_iq4xs_core);
+
+/// `quant_dequant!` over a lattice type, with its `grid` and `ksigns` (`latt_rows!`).
+macro_rules! latt_dequant {
+    ($name:ident, $core:ident) => {
+        /// A GGUF i-quant lattice's dequantization: see `latt_dequant!`.
+        ///
+        /// # Safety
+        /// As `quant_dequant!`, with `grid` and (where read) `ksigns` valid for the type.
+        #[no_mangle]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe extern "C" fn $name(
+            raw: *const u8,
+            grid: *const i8,
+            ksigns: *const u8,
+            rows: usize,
+            cols: usize,
+            out: *mut u8,
+            bf16: bool,
+            threads: usize,
+        ) -> i32 {
+            guard(|| unsafe { gemv::$core(raw, grid, ksigns, rows, cols, out, bf16, threads) })
+        }
+    };
+}
+latt_dequant!(btb_dequant_iq3xxs_rows, dequant_iq3xxs_core);
+latt_dequant!(btb_dequant_iq3s_rows, dequant_iq3s_core);
+latt_dequant!(btb_dequant_iq2xxs_rows, dequant_iq2xxs_core);
+latt_dequant!(btb_dequant_iq2xs_rows, dequant_iq2xs_core);
+latt_dequant!(btb_dequant_iq2s_rows, dequant_iq2s_core);
+latt_dequant!(btb_dequant_iq1s_rows, dequant_iq1s_core);
+latt_dequant!(btb_dequant_iq1m_rows, dequant_iq1m_core);
+
 /// `y[i][r] = sum_c e4m3(w[r][c]) * scale(r, c) * x[i][c]` in f32 over an FP8 matrix as fine-grained FP8
 /// checkpoints store it: `w` its `rows * cols` e4m3fn bytes row-major, `scales` an `[sr, sc]` f32 grid
 /// row-major whose block is `rows / sr` rows by `cols / sc` columns (`[1, 1]` for one per-tensor scale;

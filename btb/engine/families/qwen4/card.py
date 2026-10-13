@@ -48,13 +48,14 @@ from typing import Any
 
 import torch
 
-from ....kinds import GateUp, InDim, LayerKind, MatIn, MatOut, OutDim, Weight
+from ....kinds import GateUp, InDim, Intermediate, LayerKind, MatIn, MatOut, MlpAct, OutDim, Rows, Weight
 from ...arena import KvPair, RowArena, Run
 from ...cache import ArenaIndexedLayer, indexer_keys
 from ...forward import path_of
 from ...host import _Experts
 from ...native import Native, _Cuda
 from ...scheduler import MemoryGrantError
+from ...stored import CardMat, CardStored
 from .verify import _slots
 
 STEP, TREE = "step", "tree"
@@ -293,7 +294,7 @@ class Qwen4Card:
         if self.others:
             return "a layer type the program has no body for"
         head = sm.head
-        if head is None or head.weight.device.type != "cuda" or head.weight.dtype != torch.bfloat16:
+        if head is None or not sm._card_on(head):
             return "the head not on the card in bf16"
         mixer = sm.mixer
         if mixer is None or any(p.device.type != "cuda" or p.dtype != torch.bfloat16 for p in mixer.parameters()):
@@ -461,11 +462,18 @@ class Qwen4Card:
             del self.held[what]
         self._drop_graphs()
 
-    def _merge(self, what: str, parts: list[tuple[Any, str]]) -> torch.Tensor:
+    def _mat(self, mod: Any, what: str) -> CardMat:
+        """a linear's weight as the program's gemv takes it: bf16 on the card, or its GGUF blocks there"""
+        return (mod.stored,) if isinstance(mod, CardStored) else self._bf(mod.weight, what)
+
+    def _merge(self, what: str, parts: list[tuple[Any, str]]) -> CardMat:
         """the modules' matrices `parts` [(module, name)] as one row block on the card, the modules keeping views of
-        it (a block merged before - a placement's second reading - is taken as it lies)"""
+        it (a block merged before - a placement's second reading - is taken as it lies); where any is a GGUF type's
+        blocks on the card, each module's own weight in row order, each written into its rows of the output"""
         sm = self._sm()
         assert sm is not None
+        if any(isinstance(m, CardStored) for m, _ in parts):
+            return tuple(m.stored if isinstance(m, CardStored) else self._bf(getattr(m, n), what) for m, n in parts)
         ts = [getattr(m, n) for m, n in parts]
         for t in ts:
             if t.dtype != torch.bfloat16 or t.device.type != "cuda" or t.dim() != 2:
@@ -500,17 +508,17 @@ class Qwen4Card:
             raise RuntimeError(f"[card] {what}: the program takes a contiguous bf16 tensor on the card")
         return t
 
-    def _hc(self, mod: Any, what: str) -> dict[str, torch.Tensor]:
+    def _hc(self, mod: Any, what: str) -> dict[str, CardMat]:
         """a hyper-connection's weights: its norm, the [down | inject] block the gemv reads in one, and up"""
         inject = getattr(mod, "block_inject_weight", None)
         if inject is not None:
             dn = self._merge(what, [(mod.input_mix_weight_down, "weight"), (inject, "weight")])
         else:
-            dn = self._bf(mod.input_mix_weight_down.weight, what)
+            dn = self._mat(mod.input_mix_weight_down, what)
         return {
             "norm": self._bf(mod.hc_norm.weight, what),
             "dn": dn,
-            "up": self._bf(mod.input_mix_weight_up.weight, what),
+            "up": self._mat(mod.input_mix_weight_up, what),
         }
 
     def weights(self, i: int) -> dict[str, Any]:
@@ -523,7 +531,7 @@ class Qwen4Card:
         assert sm is not None
         if i == self.L:
             assert sm.head is not None and sm.mixer is not None
-            W = {"hc": self._hc(sm.mixer, "the final mixer"), "head": self._bf(sm.head.weight, "the head")}
+            W = {"hc": self._hc(sm.mixer, "the final mixer"), "head": self._mat(sm.head, "the head")}
             self.W[i] = W
             return W
         layer = sm.resident[i]
@@ -534,7 +542,7 @@ class Qwen4Card:
             "hcM": self._hc(layer.mlp_hyper_connection, f"layer {i}'s MLP hyper-connection"),
             "router": self._merge(f"layer {i}'s router", [(mlp.gate, "weight"), (mlp.shared_expert_gate, "weight")]),
             "sgu": self._merge(f"layer {i}'s shared expert", [(se.gate_proj, "weight"), (se.up_proj, "weight")]),
-            "sdn": self._bf(se.down_proj.weight, f"layer {i}'s shared expert"),
+            "sdn": self._mat(se.down_proj, f"layer {i}'s shared expert"),
         }
         # the store's lookahead reads each layer's router off its module: its cached weight is the one merged away
         store = sm.expert_store
@@ -547,7 +555,7 @@ class Qwen4Card:
                 f"layer {i}'s attention",
                 [(at.q_proj, "weight"), (at.k_proj, "weight"), (at.v_proj, "weight"), (ix.index_qk_proj, "weight")],
             )
-            W["o"] = self._bf(at.o_proj.weight, f"layer {i}'s o_proj")
+            W["o"] = self._mat(at.o_proj, f"layer {i}'s o_proj")
             W["wq"], W["wk"] = self._bf(at.q_norm.weight, "q_norm"), self._bf(at.k_norm.weight, "k_norm")
             W["iq"] = self._bf(ix.q_layernorm.weight, "the indexer's q norm")
             W["ik"] = self._bf(ix.k_layernorm.weight, "the indexer's k norm")
@@ -563,7 +571,7 @@ class Qwen4Card:
                     (la.in_proj_a, "weight"),
                 ],
             )
-            W["out"] = self._bf(la.out_proj.weight, f"layer {i}'s out_proj")
+            W["out"] = self._mat(la.out_proj, f"layer {i}'s out_proj")
             f32 = lambda t: None if t is None else t.detach().to(sm.dev, torch.float32).contiguous()
             parts = [la.conv1d.weight.squeeze(1), la.conv1d.bias, la.A_log, la.dt_bias, la.norm.weight]
             self._grant(
@@ -606,7 +614,8 @@ class Qwen4Card:
         H, G, R, M = self.H, self.G, self.R, ROWS
         bf, f32, i32 = torch.bfloat16, torch.float32, torch.int32
         S = _Cuda.qsa_splits(self.r, self.ktop) if self.sparse else 1
-        V = int(sm.head.weight.shape[0])
+        assert sm.head is not None  # the program runs only with the head on the card (`ok`)
+        V = sm.head.shape[0] if isinstance(sm.head, CardStored) else int(sm.head.weight.shape[0])
         spec: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
             "h": ((M, G * H), bf),
             "xn": ((M, G * H), bf),
@@ -624,6 +633,7 @@ class Qwen4Card:
             "idx": ((M, self.topk), i32),
             "wts": ((M, self.topk), bf),
             "gu_s": ((M, 2 * self.Is), bf),
+            "m_s": ((M, self.Is), bf),  # silu(gate) * up, where a stored down projection reads it apart
             "logits": ((M, V), bf),
             "meta": ((1 + 4 * M,), i32),
             "crow": ((M,), i32),
@@ -1108,9 +1118,28 @@ class Qwen4Card:
             B["emb_h"][p][:T].copy_(rows)
         self.staged = True
 
-    def _gemv(self, W: torch.Tensor, x: torch.Tensor, y: torch.Tensor, act: bool = False) -> None:
+    def _gemv(self, W: CardMat, x: torch.Tensor, y: torch.Tensor, act: bool = False) -> None:
         k = self.kern
         M = int(x.shape[0])
+        if not isinstance(W, torch.Tensor):
+            # GGUF blocks: no kernel of theirs folds silu(gate) * up into its x load, so it is its own kernel first
+            # (the same bits); then each piece into its rows of y
+            if act:
+                assert self.B is not None
+                I = int(x.shape[1]) // 2
+                m = self.B["m_s"][:M]
+                grid_m = (min(4096, (M * I + 255) // 256), 1, 1)
+                k.btb_silu_mul(grid_m, (256, 1, 1), k.ptr(GateUp, x), k.ptr(MlpAct, m), Rows(M), Intermediate(I))
+                x = m
+            off = 0
+            for p in W:
+                if isinstance(p, torch.Tensor):
+                    raise RuntimeError(
+                        "[card] a bf16 matrix among a projection's GGUF blocks: the program takes one form"
+                    )
+                k.gemv_stored(p, x, y[:, off:], ldy=int(y.shape[1]))
+                off += p.shape[0]
+            return
         R, C = (int(s) for s in W.shape)
         grid, w, r, c = ((R + 3) // 4, 1, 1), k.ptr(Weight, W), OutDim(R), InDim(C)
         if act:
@@ -1272,7 +1301,12 @@ class Qwen4Card:
             B["q"][:M], K, V, B["att"][:M], n0, par, B["sel"][:M], B["nsel"][:M], r, self.ktop, W["scale"],
             B["part_m"], B["part_l"], B["part_acc"], B["acnt"],
         )  # fmt: skip
-        k.gemv_sgate(W["o"], B["att"][:M].view(M, Hq * D), qkv, B["y"][:M], D, D, 2 * D)
+        att = B["att"][:M].view(M, Hq * D)
+        if isinstance(W["o"], torch.Tensor):
+            k.gemv_sgate(W["o"], att, qkv, B["y"][:M], D, D, 2 * D)
+        else:  # GGUF blocks: the gate its own kernel over the rows in place, then the projection
+            k.sigmoid_mul(att, qkv, att, D, D, 2 * D)
+            self._gemv(W["o"], att, B["y"][:M])
 
     def attend_rows(
         self, attn: Any, hs: torch.Tensor, pe: tuple[torch.Tensor, torch.Tensor], cache: Any, parents: list[int]

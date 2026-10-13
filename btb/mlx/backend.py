@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from ..kinds import Log
+from ..kinds import QUANT_KIND, Log, Quant, QuantClass, quant_key
 from .core import bf16_weight, from_mx, info, mx, to_mx
 from .gemv import GEMV_ROWS, gemv, matmul_mxfp4, matmul_mxfp4_pair, unpack_bf16
 from .iquant import (
@@ -26,7 +26,7 @@ from .iquant import (
 )
 from .kquant import dequant_q2k, dequant_q3k, dequant_q4k, dequant_q5k, matvec_q2k, matvec_q3k, matvec_q4k, matvec_q5k
 from .legacyq import dequant_legacy, matvec_legacy
-from .q6k import dequant_q6k, matvec_q6k
+from .q6k import dequant_q6k, gather_q6k, matvec_q6k
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -35,9 +35,93 @@ if TYPE_CHECKING:
     from .core import Shared
 
 
+# the k-quant and IQ4 types' own matvec and dequant, by `kinds.quant_key`; the affine and lattice classes each
+# share one family keyed by the type (`stored_matvec`). Held to `kinds.stored_quants()` by test_runtime_guards
+_MATVEC: dict[str, Callable[..., Any]] = {
+    "q2k": matvec_q2k,
+    "q3k": matvec_q3k,
+    "q4k": matvec_q4k,
+    "q5k": matvec_q5k,
+    "q6k": matvec_q6k,
+    "iq4nl": matvec_iq4nl,
+    "iq4xs": matvec_iq4xs,
+}
+_DEQUANT: dict[str, Callable[..., Any]] = {
+    "q2k": dequant_q2k,
+    "q3k": dequant_q3k,
+    "q4k": dequant_q4k,
+    "q5k": dequant_q5k,
+    "q6k": dequant_q6k,
+    "iq4nl": dequant_iq4nl,
+    "iq4xs": dequant_iq4xs,
+}
+
+
+def stored_streams(q: Quant, raw: Any) -> tuple[Any, ...]:
+    """the arrays type `q`'s kernels read for the file's bytes `raw`: the bytes, IQ4_NL's split streams, a lattice
+    type's bytes and side streams. Host bytes are copied in and repacked once, here; a slot's MLX view is read in
+    place, its repack in the graph of each pass that reads it"""
+    m = mx()
+    a = raw if isinstance(raw, m.array) else m.array(np.asarray(raw, dtype=np.uint8).reshape(-1))
+    out = (
+        repack_iq4nl(a)
+        if q is Quant.IQ4_NL
+        else (a, *repack_lattice(quant_key(q), a))
+        if QUANT_KIND[q] is QuantClass.LATTICE
+        else (a,)
+    )
+    if a is not raw:
+        m.eval(*out)
+    return out
+
+
+def stored_matvec(q: Quant, streams: tuple[Any, ...], x: mx_.array, rows: int, cols: int) -> mx_.array:
+    """y[T, rows] = x[T, cols] . W^T on type `q`'s own kernel over its `stored_streams`: f32 accumulation, y in x's
+    dtype, batch-invariant (16 rows a launch)"""
+    c, key = QUANT_KIND[q], quant_key(q)
+    if c is QuantClass.AFFINE:
+        return matvec_legacy(q.value.lower(), streams[0], x, rows, cols)
+    if c is QuantClass.LATTICE:
+        return matvec_lattice(key, streams[0], x, rows, cols, streams[1:])
+    return _MATVEC[key](*streams, x, rows, cols)
+
+
+def stored_dequant(q: Quant, streams: tuple[Any, ...], rows: int, cols: int) -> mx_.array:
+    """the whole [rows, cols] weight of type `q` in bf16 from its `stored_streams`, gguf's numbers"""
+    c, key = QUANT_KIND[q], quant_key(q)
+    if c is QuantClass.AFFINE:
+        return dequant_legacy(q.value.lower(), streams[0], rows, cols)
+    if c is QuantClass.LATTICE:
+        return dequant_lattice(key, streams[0], rows, cols)
+    return _DEQUANT[key](*streams, rows, cols)
+
+
+def _join_stored(ws: Sequence[Weight]) -> Weight | None:
+    """resident stored weights of one type and width as one launch's: their streams joined (a stored matrix is its
+    rows' blocks in order, so the join is a matrix whose rows run their own chains), each member then a view of its
+    rows of the join, the bytes held once. None for mixed types, or a slot's (rewritten in place: a join goes stale)"""
+    w0 = ws[0]
+    if any(w.slot or w.q is not w0.q or w.shape[1] != w0.shape[1] or len(w.streams) != len(w0.streams) for w in ws):
+        return None
+    m = mx()
+    parts = [[s.reshape(-1) for s in w.streams] for w in ws]
+    joined = tuple(m.concatenate([p[i] for p in parts]) for i in range(len(w0.streams)))
+    m.eval(*joined)
+    at = [0] * len(joined)
+    for w, p in zip(ws, parts, strict=True):
+        views = []
+        for i, s in enumerate(p):
+            views.append(joined[i][at[i] : at[i] + int(s.size)])
+            at[i] += int(s.size)
+        w.streams = tuple(views)
+        m.eval(*w.streams)
+    return Weight(q=w0.q, streams=joined, shape=(sum(int(w.shape[0]) for w in ws), int(w0.shape[1])))
+
+
 class Weight:
-    """A linear's weight for the GPU: `get()` is the bf16 [rows, cols] array. Three kinds: a resident copy, a
-    view of a shared byte slot, or a packed record over a slot that unpacks on the GPU once per pass."""
+    """A linear's weight for the GPU: `get()` is the bf16 [rows, cols] array. Four kinds: a resident copy, a
+    view of a shared byte slot, a packed record over a slot that unpacks on the GPU once per pass, or a GGUF
+    type's blocks (`q`, `streams`) multiplied by the type's own kernel."""
 
     packed: Any
     shape: Any
@@ -49,30 +133,18 @@ class Weight:
     a: Any
     host: Any  # a slot weight's bytes as a bf16 torch view, for the host's gemv over a few rows (`_HostLinear`)
 
-    legacy: tuple[str, Any, int, int] | None  # (kind, raw bytes, rows, cols): a GGUF Q4_0/Q4_1/Q8_0 weight, as stored
-    q6k: tuple[Any, int, int] | None  # (raw bytes, rows, cols): a GGUF Q6_K weight, multiplied by its own kernel
-    q4k: tuple[Any, int, int] | None  # (raw bytes, rows, cols): a GGUF Q4_K weight, multiplied by its own kernel
-    q5k: tuple[Any, int, int] | None  # (raw bytes, rows, cols): a GGUF Q5_K weight, multiplied by its own kernel
-    q2k: tuple[Any, int, int] | None  # (raw bytes, rows, cols): a GGUF Q2_K weight, multiplied by its own kernel
-    q3k: tuple[Any, int, int] | None  # (raw bytes, rows, cols): a GGUF Q3_K weight, multiplied by its own kernel
-    iq4nl: tuple[Any, Any, int, int] | None  # (d f16, nibble bytes, rows, cols): IQ4_NL repacked struct-of-arrays
-    iq4xs: tuple[Any, int, int] | None  # (raw bytes, rows, cols): a GGUF IQ4_XS weight, multiplied by its own kernel
-    latt: tuple[str, Any, int, int, tuple[Any, ...]] | None  # (kind, raw bytes, rows, cols, side streams): IQ lattice
+    q: Quant | None  # a GGUF type multiplied as stored, its kernels' arrays in `streams` (`stored_streams`)
+    streams: tuple[Any, ...]
+    slot: bool  # `streams` read a slot rewritten in place (`weight_stored_slot`), never copied out of it
 
     def __init__(
         self,
         a: Any = None,
         packed: tuple[Any, ...] | None = None,
         shape: Sequence[int] | None = None,
-        legacy: tuple[str, Any, int, int] | None = None,
-        q6k: tuple[Any, int, int] | None = None,
-        q4k: tuple[Any, int, int] | None = None,
-        q5k: tuple[Any, int, int] | None = None,
-        q2k: tuple[Any, int, int] | None = None,
-        q3k: tuple[Any, int, int] | None = None,
-        iq4nl: tuple[Any, Any, int, int] | None = None,
-        iq4xs: tuple[Any, int, int] | None = None,
-        latt: tuple[str, Any, int, int, tuple[Any, ...]] | None = None,
+        q: Quant | None = None,
+        streams: tuple[Any, ...] = (),
+        slot: bool = False,
     ) -> None:
         # every array made here is evaluated at once: a lazy node made on one thread cannot be evaluated by
         # another (MLX's default stream is per thread), and the server runs each request on its own thread
@@ -81,82 +153,20 @@ class Weight:
             m.eval(a)
         if packed is not None:
             m.eval(*[x for x in packed[:5] if x is not None])
-        if legacy is not None:
-            m.eval(legacy[1])
-        if q6k is not None:
-            m.eval(q6k[0])
-        if q4k is not None:
-            m.eval(q4k[0])
-        if q5k is not None:
-            m.eval(q5k[0])
-        if q2k is not None:
-            m.eval(q2k[0])
-        if q3k is not None:
-            m.eval(q3k[0])
-        if iq4nl is not None:
-            m.eval(iq4nl[0], iq4nl[1])
-        if iq4xs is not None:
-            m.eval(iq4xs[0])
-        if latt is not None:
-            m.eval(latt[1], *latt[4])
+        if streams:
+            m.eval(*streams)
         self.a = a
         self.packed = packed
-        self.legacy = legacy
-        self.q6k = q6k
-        self.q4k = q4k
-        self.q5k = q5k
-        self.q2k = q2k
-        self.q3k = q3k
-        self.iq4nl = iq4nl
-        self.iq4xs = iq4xs
-        self.latt = latt
+        self.q = q
+        self.streams = streams
+        self.slot = slot
         self.shape = tuple(shape) if shape is not None else tuple(int(s) for s in a.shape)
 
     def get(self) -> mx_.array:
         if self.a is None:
-            if self.q6k is not None:
-                raw, rows, cols = self.q6k
-                self.a = dequant_q6k(raw, rows, cols)
-                mx().eval(self.a)
-                return self.a
-            if self.q4k is not None:
-                raw, rows, cols = self.q4k
-                self.a = dequant_q4k(raw, rows, cols)
-                mx().eval(self.a)
-                return self.a
-            if self.q5k is not None:
-                raw, rows, cols = self.q5k
-                self.a = dequant_q5k(raw, rows, cols)
-                mx().eval(self.a)
-                return self.a
-            if self.q2k is not None:
-                raw, rows, cols = self.q2k
-                self.a = dequant_q2k(raw, rows, cols)
-                mx().eval(self.a)
-                return self.a
-            if self.q3k is not None:
-                raw, rows, cols = self.q3k
-                self.a = dequant_q3k(raw, rows, cols)
-                mx().eval(self.a)
-                return self.a
-            if self.iq4nl is not None:
-                d, q, rows, cols = self.iq4nl
-                self.a = dequant_iq4nl(d, q, rows, cols)
-                mx().eval(self.a)
-                return self.a
-            if self.iq4xs is not None:
-                raw, rows, cols = self.iq4xs
-                self.a = dequant_iq4xs(raw, rows, cols)
-                mx().eval(self.a)
-                return self.a
-            if self.latt is not None:
-                kind, raw, rows, cols, _side = self.latt
-                self.a = dequant_lattice(kind, raw, rows, cols)
-                mx().eval(self.a)
-                return self.a
-            if self.legacy is not None:
-                kind, raw, rows, cols = self.legacy
-                self.a = dequant_legacy(kind, raw, rows, cols)
+            if self.q is not None:
+                rows, cols = (int(s) for s in self.shape)
+                self.a = stored_dequant(self.q, self.streams, rows, cols)
             else:
                 lo, hi4, tbl, esc_idx, esc_val, n = self.packed
                 self.a = unpack_bf16(lo, hi4, tbl, n, self.shape, esc_idx, esc_val)
@@ -165,7 +175,7 @@ class Weight:
 
     def invalidate(self) -> None:
         """The slot under a streamed weight was rewritten: drop the unpacked copy of a packed one."""
-        if self.packed is not None or self.legacy is not None:
+        if self.packed is not None or self.q is not None:
             self.a = None
 
     def drop(self) -> None:
@@ -237,8 +247,10 @@ class Backend:
         return w
 
     def weight_fused(self, ws: Sequence[Any]) -> Weight | None:
-        """One weight over adjacent slot weights with the same columns (one matmul instead of several), None when they
-        are not adjacent. A view, no copy."""
+        """One weight over several with the same columns (one matmul instead of several), None where they cannot be
+        one: adjacent slot weights as a view, no copy; resident stored weights of one type joined (`_join_stored`)."""
+        if ws and all(getattr(w, "q", None) is not None for w in ws):
+            return _join_stored(ws)
         if not ws or any(getattr(w, "sh", None) is None for w in ws):
             return None
         sh = ws[0].sh
@@ -266,88 +278,43 @@ class Backend:
         return Weight(packed=(lo, hi4, table, esc_idx, esc_val, int(e["n"])), shape=shape)
 
     # -- the linear --
-    def weight_legacy(self, kind: str, raw: Any, shape: Sequence[int]) -> Weight:
-        """a GGUF Q4_0/Q4_1/Q8_0 weight (`kind` a legacyq.KINDS key) kept as its own bytes (`matvec_legacy` reads
-        the blocks as stored, batch-invariant), never a bf16 copy. `raw` the file's uint8 bytes for `shape`."""
-        rows, cols = int(shape[0]), int(shape[1])
-        return Weight(legacy=(kind, mx().array(raw), rows, cols), shape=shape)
+    def weight_stored(self, q: Quant, raw: Any, shape: Sequence[int]) -> Weight:
+        """a GGUF weight of a stored type `q` kept as its own blocks (`stored_streams`), never a bf16 copy: its
+        type's kernel reads them as stored, batch-invariant. `raw` the file's uint8 bytes for `shape`."""
+        return Weight(q=q, streams=stored_streams(q, raw), shape=shape)
 
-    def weight_q6k(self, raw: Any, shape: Sequence[int]) -> Weight:
-        """a GGUF Q6_K weight kept as its own bytes (`matvec_q6k` reads the superblocks as stored), never a bf16
-        copy. `raw` the file's uint8 bytes for `shape` [rows, cols]."""
-        rows, cols = int(shape[0]), int(shape[1])
-        return Weight(q6k=(mx().array(raw), rows, cols), shape=shape)
+    def weight_stored_slot(self, shared: Shared, off: int, nb: int, q: Quant, shape: Sequence[int]) -> Weight:
+        """a stored type's blocks as the `nb` bytes of a shared slot at `off` (a cold layer's or an expert's,
+        rewritten as the slot is): read in place, a type that repacks them repacking in each pass's graph"""
+        return Weight(
+            q=q, streams=stored_streams(q, shared.view_mx(off, nb, mx().uint8, (nb,))), shape=shape, slot=True
+        )
 
-    def weight_q5k(self, raw: Any, shape: Sequence[int]) -> Weight:
-        """a GGUF Q5_K weight kept as its own bytes (`matvec_q5k` reads the superblocks as stored)."""
-        rows, cols = int(shape[0]), int(shape[1])
-        return Weight(q5k=(mx().array(raw), rows, cols), shape=shape)
-
-    def weight_q2k(self, raw: Any, shape: Sequence[int]) -> Weight:
-        """a GGUF Q2_K weight kept as its own bytes (`matvec_q2k` reads the superblocks as stored)."""
-        rows, cols = int(shape[0]), int(shape[1])
-        return Weight(q2k=(mx().array(raw), rows, cols), shape=shape)
-
-    def weight_q3k(self, raw: Any, shape: Sequence[int]) -> Weight:
-        """a GGUF Q3_K weight kept as its own bytes (`matvec_q3k` reads the superblocks as stored)."""
-        rows, cols = int(shape[0]), int(shape[1])
-        return Weight(q3k=(mx().array(raw), rows, cols), shape=shape)
-
-    def weight_iq4nl(self, raw: Any, shape: Sequence[int]) -> Weight:
-        """a GGUF IQ4_NL weight repacked once into struct-of-arrays (the f16 scales and the nibble bytes as two
-        contiguous streams): ggml's 18-byte blocks straddle cache lines, the split streams read at DRAM speed."""
-        rows, cols = int(shape[0]), int(shape[1])
-        d, q = repack_iq4nl(raw)
-        return Weight(iq4nl=(d, q, rows, cols), shape=shape)
-
-    def weight_iq4xs(self, raw: Any, shape: Sequence[int]) -> Weight:
-        """a GGUF IQ4_XS weight kept as its own bytes (`matvec_iq4xs` reads the superblocks as stored)."""
-        rows, cols = int(shape[0]), int(shape[1])
-        return Weight(iq4xs=(mx().array(raw), rows, cols), shape=shape)
-
-    def weight_lattice(self, kind: str, raw: Any, shape: Sequence[int]) -> Weight:
-        """a GGUF IQ lattice weight (IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M) kept as its own bytes, multiplied by
-        `matvec_lattice` reading the grid-codebook superblocks as stored."""
-        rows, cols = int(shape[0]), int(shape[1])
-        side = repack_lattice(kind, raw)
-        return Weight(latt=(kind, mx().array(raw), rows, cols, side), shape=shape)
-
-    def weight_q4k(self, raw: Any, shape: Sequence[int]) -> Weight:
-        """a GGUF Q4_K weight kept as its own bytes (`matvec_q4k` reads the superblocks as stored), never a bf16
-        or affine-repacked copy. `raw` the file's uint8 bytes for `shape` [rows, cols]."""
-        rows, cols = int(shape[0]), int(shape[1])
-        return Weight(q4k=(mx().array(raw), rows, cols), shape=shape)
+    @staticmethod
+    def gather_rows(w: Weight, tok: mx_.array) -> mx_.array:
+        """rows `tok` (int32 [T]) of a stored weight as bf16 [T, cols], decoded from their own blocks - a tied
+        head's table read without a bf16 copy of the vocabulary: Q6_K's gather kernel, else each row's blocks taken
+        and dequantized"""
+        assert w.q is not None  # the gather reads a stored weight's blocks
+        m, (rows, cols) = mx(), (int(s) for s in w.shape)
+        if w.q is Quant.Q6_K:
+            return gather_q6k(w.streams[0], tok, cols)
+        # the dequant reads the bytes alone, but IQ4_NL's split scale and nibble streams; a row's are contiguous
+        streams = w.streams if w.q is Quant.IQ4_NL else w.streams[:1]
+        picked = tuple(m.take(s.reshape(rows, -1), tok, axis=0).reshape(-1) for s in streams)
+        return stored_dequant(w.q, picked, int(tok.shape[0]), cols)
 
     def matmul(self, x: mx_.array, w: Weight) -> mx_.array:
         """x [b, cols] MLX (bf16 or float32), w a `Weight`: y [b, rows] in x's dtype, lazily."""
         m = mx()
-        if w.q6k is not None:
-            raw, rows, cols = w.q6k
-            return matvec_q6k(raw, x, rows, cols)
-        if w.q4k is not None:
-            raw, rows, cols = w.q4k
-            return matvec_q4k(raw, x, rows, cols)
-        if w.q5k is not None:
-            raw, rows, cols = w.q5k
-            return matvec_q5k(raw, x, rows, cols)
-        if w.q2k is not None:
-            raw, rows, cols = w.q2k
-            return matvec_q2k(raw, x, rows, cols)
-        if w.q3k is not None:
-            raw, rows, cols = w.q3k
-            return matvec_q3k(raw, x, rows, cols)
-        if w.iq4nl is not None:
-            d, q, rows, cols = w.iq4nl
-            return matvec_iq4nl(d, q, x, rows, cols)
-        if w.iq4xs is not None:
-            raw, rows, cols = w.iq4xs
-            return matvec_iq4xs(raw, x, rows, cols)
-        if w.latt is not None:
-            kind, raw, rows, cols, side = w.latt
-            return matvec_lattice(kind, raw, x, rows, cols, side)
-        if w.legacy is not None:
-            kind, raw, rows, cols = w.legacy
-            return matvec_legacy(kind, raw, x, rows, cols)
+        if w.q is not None:
+            rows, cols = (int(s) for s in w.shape)
+            # the type's kernel reads the weight once a 16 rows, so a prefill of `gemm_rows` rows or more widens it
+            # once to bf16 for MLX's gemm (4x faster at 512 rows), as a bf16 weight takes the gemm past 16
+            if int(x.shape[0]) < self.gemm_rows:
+                return stored_matvec(w.q, w.streams, x, rows, cols)
+            W = stored_dequant(w.q, w.streams, rows, cols)
+            return m.matmul(x, (W.astype(m.float32) if x.dtype == m.float32 else W).T)
         W = w.get()
         # up to 16 rows: the engine's kernel, one weight read for the tile and batch-invariant rows (a verify
         # pass computes each row as the one-row step does); past that (prefill) MLX's gemm
@@ -387,7 +354,8 @@ class Backend:
 
     def experts(self, x: torch.Tensor, hits: Any, act: Any) -> Any:
         """The mixture-of-experts step for one call: `hits` a list of (token_idx, top_k_weights, (gu, dn)) per active
-        expert in expert order; returns the summed [T, H] as a torch tensor. One graph, one eval."""
+        expert in expert order, `gu` one weight or a GGUF's (gate, up) pair; returns the summed [T, H] as a torch
+        tensor. One graph, one eval."""
         m = mx()
         t0 = time.perf_counter()
         xm = to_mx(x)
@@ -398,7 +366,10 @@ class Backend:
             whole = T == 1 and len(token_idx) == 1
             idx = None if whole else m.array(np.asarray(token_idx, dtype=np.int32))
             cur = xm if whole else m.take(xm, idx, axis=0)
-            gate, up = m.split(self.matmul(cur, gu), 2, axis=-1)
+            if isinstance(gu, tuple):
+                gate, up = self.matmul(cur, gu[0]), self.matmul(cur, gu[1])
+            else:
+                gate, up = m.split(self.matmul(cur, gu), 2, axis=-1)
             h = act(gate) * up
             y = self.matmul(h, dn) * m.array(np.asarray(wts, dtype=np.float32)).astype(xm.dtype)[:, None]
             final = final + y if whole else final.at[idx].add(y)
