@@ -624,3 +624,14 @@ def test_the_gate_stays_red_while_gaps_are_open() -> None:
     (It writes its FAIL lines to stderr, which pytest captures.)"""
     if manifest.missing_items():
         assert manifest.check() == 1
+
+
+def test_only_the_converted_gguf_twins_are_committed() -> None:
+    """.gitignore keeps every derived GGUF twin out of the tree (spec.derived_gguf) and tiny_q4's converter twins in
+    it (spec.CONVERTED_QUANTS): its negations name the latter, so the two lists cannot drift apart"""
+    import subprocess
+
+    derived = [os.path.join(spec.GGUF_DIR, spec.gguf_name(*t)) for t in spec.derived_gguf()]
+    converted = [os.path.join(spec.GGUF_DIR, spec.gguf_name(spec.CONVERTED_STEM, q)) for q in spec.CONVERTED_QUANTS]
+    run = subprocess.run(["git", "check-ignore", "--no-index", *derived, *converted], capture_output=True, text=True)
+    assert set(run.stdout.split()) == set(derived), run.stderr

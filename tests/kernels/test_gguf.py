@@ -483,7 +483,7 @@ MOE_KEYS = ("num_experts", "num_experts_per_tok", "moe_intermediate_size", "shar
 
 def _need_q35(stem: str = "tiny_q35") -> None:
     if not os.path.isfile(os.path.join(GGUF, f"{stem}-bf16.gguf")):
-        pytest.skip(f"the {stem} GGUF fixtures are not here (tests/make_fixtures.py gguf_{stem.removeprefix('tiny_')})")
+        pytest.skip(f"the {stem} GGUF fixtures are not here (tests/make_fixtures.py gguf_twins)")
 
 
 def _q35_trunk(stem: str = "tiny_q35") -> dict[str, torch.Tensor]:

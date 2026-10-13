@@ -67,6 +67,14 @@ jobs:
       - name: Build the native library
         run: python build.py build --no-cuda --no-wheel
 
+      # the GGUF twins the cells bind are derived from the committed fixtures and never committed (tests/cert/spec.py
+      # derived_gguf); their writer is the one step here that needs torch, the CPU wheel
+      - name: Write the derived GGUF twins
+        run: |
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --quiet safetensors
+          python -m tests.make_fixtures gguf_twins
+
       # Coverage is the UNION of receipts (tests/cert/receipt.py) and receipts are deliberately not committed, so
       # the run has to collect them: each one a contributor pastes into the PR description as a ```json btb-receipt
       # block (their GPU box, their Mac). They land in one dir and BTB_CERT_RECEIPTS points the later steps at it.
@@ -131,6 +139,8 @@ jobs:
         if: github.event_name == 'pull_request'
         working-directory: base
         run: |
+          # a base that derives its GGUF twins writes them first, so its findings bind them as this branch's do
+          if grep -q '"gguf_twins"' tests/make_fixtures.py; then python -m tests.make_fixtures gguf_twins; fi
           if [ -f tests/cert/delta.py ]; then python -m tests.cert.delta bank --out ../base-findings.json
           else echo "the base predates tests/cert/delta.py; nothing to compare"; fi
 

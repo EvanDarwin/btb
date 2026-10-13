@@ -192,9 +192,9 @@ MISSING: dict[Missing, tuple[str, str]] = {
     Missing.QUANT_FIXTURE: (
         "this storage stands for several stored types (one kernel each) and only some have a tiny GGUF twin, so "
         "certifying the cell off the ones that exist would claim kernels nothing reads",
-        "write the missing twins in tests/make_fixtures.py (`gguf_stored` writes every k-quant and i-quant one a "
-        "matrix of the family fits; where none does, widen the fixture to a multiple of 256) - the cell binds one "
-        "file per kinds.Quant member of its class, so the report names exactly which are absent",
+        "write the derived twins (`python tests/make_fixtures.py gguf_twins`, which a test run does itself); a type "
+        "no matrix of the family fits stops that writer, and the fixture is widened to a multiple of 256 - the cell "
+        "binds one file per kinds.Quant member of its class, so the report names exactly which are absent",
     ),
     Missing.NO_FIXTURE: (
         "this family is served but has no tiny fixture for this storage at all",

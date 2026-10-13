@@ -13,8 +13,9 @@ the tolerance the suite uses.
     python tests/make_fixtures.py qwen3 q4   # a subset
     python tests/make_fixtures.py twins      # only the precision twins of every cert fixture
     python tests/make_fixtures.py q4_mtp     # tiny_q4's drafting head added to the built fixture and its twins
-    python tests/make_fixtures.py gguf_stored  # each GGUF family's k-quant and i-quant twins (`stored_twin`)
-    python tests/make_fixtures.py gguf_q35moe  # tiny_q35moe's GGUF twins, every type
+    python tests/make_fixtures.py gguf       # every GGUF twin: tiny_q4's through llama.cpp ($LLAMA_CPP), then the rest
+    python tests/make_fixtures.py gguf_twins # the GGUF twins derived from the committed fixtures (a test run writes
+                                             # the missing ones itself; spec.derived_gguf)
     python -m tests.make_fixtures seed phi3  # a family's first draw the oracle's margin floor accepts (its *_SEED)
 
 Families: qwen3, q35, q35moe, phi3, q4, gpt_oss. `build_q4_card` draws a Qwen4 at the card kernels' shapes, which
@@ -104,9 +105,6 @@ def write_tokenizer(model_dir: str) -> None:
 
 
 # --- GGUF twins: a fixture written in llama.cpp's format through the gguf package's writer ------------------
-
-# the storage types the reader is tested on: every float and affine type (the ones gguf-py writes)
-GGUF_TYPES = tuple(q.value.lower() for c in (QuantClass.FLOAT, QuantClass.AFFINE) for q in quants_of(c))
 
 
 def write_gguf(model_dir: str, out: str, outtype: str) -> None:
@@ -358,39 +356,46 @@ def _qwen35_converted(cfg: Json, state: dict[str, torch.Tensor]) -> dict[str, to
 
 
 def make_gguf() -> None:
-    """the GGUF fixtures: tiny_qwen3, tiny_phi3 and tiny_gemma3 in every storage type gguf-py writes, tiny_q35 and
-    tiny_q35moe in the float and affine types and the mixture in MXFP4_MOE (make_gguf_q35), tiny_q4 as llama.cpp's
-    converter writes it (make_q4_gguf), and each family's k-quant and i-quant twins (make_gguf_stored)"""
-    out = os.path.join(FIXTURES, "gguf")
-    os.makedirs(out, exist_ok=True)
-    for t in GGUF_TYPES:
-        write_gguf(os.path.join(FIXTURES, "tiny_qwen3"), os.path.join(out, f"tiny_qwen3-{t}.gguf"), t)
-    # phi3 in every type too (its fused projections exercise the table's other layout), and gemma3 (its norms through
-    # the converter's +1)
-    for stem in ("tiny_phi3", "tiny_gemma3"):
-        for t in GGUF_TYPES:
-            write_gguf(os.path.join(FIXTURES, stem), os.path.join(out, f"{stem}-{t}.gguf"), t)
-    write_gguf(os.path.join(FIXTURES, "tiny_gpt_oss"), os.path.join(out, "tiny_gpt_oss-mxfp4.gguf"), "bf16")
-    make_gguf_q35()
-    make_gguf_q35("tiny_q35moe")
+    """every GGUF twin: tiny_q4's as llama.cpp's converter writes them (make_q4_gguf), then all the others, derived
+    from the committed fixtures (ensure_gguf)"""
     make_q4_gguf()
-    make_gguf_stored()
+    ensure_gguf(force=True)
     print("[fixture] gguf twins regenerated")
 
 
-def make_gguf_q35(stem: str = "tiny_q35") -> None:
-    """a Qwen3.5 fixture (tiny_q35, or tiny_q35moe and its experts) in every float and affine type (the storage
-    cells gguf-py can write a twin for), and a mixture's MXFP4_MOE too, its linear attention through the
-    converter's rewrites the reader must invert"""
-    from btb.kinds import QuantClass, quants_of
+def _write_twin(stem: str, q: Quant, out: str) -> bool:
+    """`stem`'s GGUF twin of type `q` at `out`: a float, affine or MXFP4 type from its checkpoint (write_gguf; a
+    checkpoint with MXFP4 experts writes its MXFP4 twin as its bf16 run), any other from its q8_0 and a float twin
+    (stored_twin). False where no matrix of the family fits `q`"""
+    from tests.cert import spec
 
-    out = os.path.join(FIXTURES, "gguf")
-    os.makedirs(out, exist_ok=True)
-    cfg = json.load(open(os.path.join(FIXTURES, stem, "config.json"), encoding="utf-8"))
-    moe = quants_of(QuantClass.MXFP4) if cfg.get("num_experts") else ()
-    for q in (*quants_of(QuantClass.FLOAT), *quants_of(QuantClass.AFFINE), *moe):
-        t = q.value.lower()
-        write_gguf(os.path.join(FIXTURES, stem), os.path.join(out, f"{stem}-{t}.gguf"), t)
+    if q in spec.CONVERTED_QUANTS:
+        native = q is Quant.MXFP4 and Quant.BF16 not in spec.gguf_quants(stem)
+        write_gguf(os.path.join(FIXTURES, stem), out, "bf16" if native else q.value.lower())
+        return True
+    like = os.path.join(spec.GGUF_DIR, spec.gguf_name(stem, Quant.Q8_0))
+    floats = (os.path.join(spec.GGUF_DIR, spec.gguf_name(stem, f)) for f in quants_of(QuantClass.FLOAT))
+    return stored_twin(next(p for p in floats if os.path.isfile(p)), like, out, q)
+
+
+def ensure_gguf(twins: Sequence[tuple[str, Quant]] | None = None, force: bool = False) -> int:
+    """the derived GGUF twins (`spec.derived_gguf`, or `twins` of them) written where they are not on disk (every one
+    under `force`), each through a temporary file so no reader sees half of one; returns how many were written. One
+    the generator cannot write raises: its family's matrices no longer fit its type"""
+    from tests.cert import spec
+
+    os.makedirs(spec.GGUF_DIR, exist_ok=True)
+    n = 0
+    for stem, q in spec.derived_gguf() if twins is None else twins:
+        path = os.path.join(spec.GGUF_DIR, spec.gguf_name(stem, q))
+        if os.path.isfile(path) and not force:
+            continue
+        tmp = f"{path}.{os.getpid()}.tmp"
+        if not _write_twin(stem, q, tmp):
+            raise SystemExit(f"[fixture] {stem}: no matrix's rows are whole {q.value} blocks, no {q.value} twin")
+        os.replace(tmp, path)
+        n += 1
+    return n
 
 
 # --- the qwen4exp twins, written by llama.cpp's own converter (a checkout named by $LLAMA_CPP) --------------
@@ -519,28 +524,6 @@ def stored_twin(src: str, like: str, out: str, q: Quant) -> bool:
     return True
 
 
-def make_gguf_stored(stems: Sequence[str] | None = None) -> None:
-    """each GGUF family's twins (`stems`, every fixture's by default) in every type a linear multiplies as stored that
-    gguf-py cannot write (the k-quants and i-quants, `stored_twin`), from its q8_0 twin's layout and a float twin's
-    spreads; a type no matrix of the family fits has no twin"""
-    from tests.cert import spec
-
-    out = os.path.join(FIXTURES, "gguf")
-    written = set(GGUF_TYPES)
-    for stem in spec.FIXTURE_STEM.values() if stems is None else stems:
-        like = os.path.join(out, spec.gguf_name(stem, Quant.Q8_0))
-        floats = (os.path.join(out, spec.gguf_name(stem, f)) for f in quants_of(QuantClass.FLOAT))
-        src = next((p for p in floats if os.path.isfile(p)), None)
-        if src is None or not os.path.isfile(like):
-            continue
-        for q in stored_quants():
-            if q.value.lower() in written:
-                continue
-            dest = os.path.join(out, spec.gguf_name(stem, q))
-            if not stored_twin(src, like, dest, q):
-                print(f"[fixture] {stem}: no matrix's rows are whole {q.value} blocks, no twin")
-
-
 def _drop_mtp(model_dir: str) -> None:
     """a copy of a checkpoint without the drafting head `write_mtp` added: its shard and its index entries gone"""
     path = os.path.join(model_dir, MTP_SHARD)
@@ -562,8 +545,10 @@ def make_q4_gguf() -> None:
     import shutil
     import tempfile
 
-    types = [q.value.lower() for c in (QuantClass.FLOAT, QuantClass.AFFINE, QuantClass.MXFP4) for q in quants_of(c)]
-    src = os.path.join(FIXTURES, "tiny_q4")
+    from tests.cert import spec
+
+    types = [q.value.lower() for q in spec.CONVERTED_QUANTS]
+    src = os.path.join(FIXTURES, spec.CONVERTED_STEM)
     out = os.path.join(FIXTURES, "gguf")
     with tempfile.TemporaryDirectory() as tmp:
         stage = os.path.join(tmp, "tiny_q4")
@@ -1433,15 +1418,8 @@ def make(name: str) -> None:
         for stem in spec.FIXTURE_STEM.values():
             write_twins(os.path.join(FIXTURES, stem))
         return
-    if name == "gguf_q35":
-        make_gguf_q35()
-        return
-    if name == "gguf_q35moe":
-        make_gguf_q35("tiny_q35moe")
-        make_gguf_stored(("tiny_q35moe",))
-        return
-    if name == "gguf_stored":
-        make_gguf_stored()
+    if name == "gguf_twins":
+        print(f"[fixture] {ensure_gguf(force=True)} derived gguf twins written")
         return
     if name == "q4_mtp":
         add_q4_mtp()
@@ -1490,10 +1468,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{name.upper()}_SEED = {find_seed(name)}")
         return 0
     names = argv or list(FAMILIES)
-    native_library()  # the receipts are banked by the native gemv kernel, so the suite's 1e-6 tolerance holds
+    # the receipts and the bank are the native gemv kernel's, so the suite's 1e-6 tolerance holds; the GGUF twins
+    # are written by gguf-py alone, and the bank reads the checkpoints and their fp8 twins, no GGUF one
+    banks = any(n not in ("gguf", "gguf_twins") for n in names)
+    if banks:
+        native_library()
     for name in names:
         make(name)
-    _rebank_oracle()
+    if banks:
+        _rebank_oracle()
     return 0
 
 

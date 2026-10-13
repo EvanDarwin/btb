@@ -277,6 +277,40 @@ def gguf_name(stem: str, q: Quant) -> str:
     return f"{stem}-{q.value.lower()}.gguf"
 
 
+# tiny_q4's twins in these types are llama.cpp's own converter's (tests/make_fixtures.py make_q4_gguf) and committed:
+# a run has no llama.cpp checkout. Every other twin is derived from the committed fixtures where a run needs it
+# (make_fixtures.ensure_gguf) and never committed
+CONVERTED_STEM = "tiny_q4"
+CONVERTED_QUANTS: tuple[Quant, ...] = tuple(
+    q for c in (QuantClass.FLOAT, QuantClass.AFFINE, QuantClass.MXFP4) for q in quants_of(c)
+)
+
+
+def gguf_quants(stem: str) -> tuple[Quant, ...]:
+    """the types `stem` has a GGUF twin in: the float and affine ones, MXFP4 where its config has experts, and every
+    other stored type. A checkpoint whose experts are MXFP4 already (gpt-oss's U8 blocks) has no bf16 twin: its bf16
+    run is the MXFP4 one"""
+    with open(os.path.join(FIXTURES, stem, "config.json"), encoding="utf-8") as f:
+        cfg: Json = json.load(f)
+    native = "U8" in header_dtypes(os.path.join(FIXTURES, stem))
+    out = [q for c in (QuantClass.FLOAT, QuantClass.AFFINE) for q in quants_of(c) if not (native and q is Quant.BF16)]
+    if cfg.get("num_experts") or cfg.get("num_local_experts"):
+        out += quants_of(QuantClass.MXFP4)
+    return (*out, *(q for q in stored_quants() if q not in out))
+
+
+def derived_gguf() -> list[tuple[str, Quant]]:
+    """every (stem, type) GGUF twin derived from the committed fixtures, the float, affine and MXFP4 ones (written
+    from a checkpoint) before the types written from them"""
+    twins = [
+        (stem, q)
+        for stem in FIXTURE_STEM.values()
+        for q in gguf_quants(stem)
+        if not (stem == CONVERTED_STEM and q in CONVERTED_QUANTS)
+    ]
+    return sorted(twins, key=lambda t: t[1] not in CONVERTED_QUANTS)
+
+
 def quant_of_gguf(fname: str) -> Quant | None:
     """the stored type a tiny GGUF fixture's name declares, or None when its suffix is no supported Quant."""
     stem = fname[:-5] if fname.endswith(".gguf") else fname
