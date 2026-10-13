@@ -963,6 +963,7 @@ class _MlxMixin(_State):
                 prepared=prepared,
                 odt=qh.dtype,
                 pbases=cl._offs if cl._flat else None,
+                rmap=cl._rmap,
                 **kq,
             )
             return a.reshape(B, Hq * hd)

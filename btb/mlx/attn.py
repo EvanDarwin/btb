@@ -658,13 +658,30 @@ def attn_rows(
     prepared: tuple[mx_.array, mx_.array, int] | None = None,
     odt: Any = None,
     pbases: Sequence[int] | None = None,
+    rmap: mx_.array | None = None,
 ) -> mx_.array:
     """A batched decode step: `q[b]` ([B, Hq, D] float32) over cache slice b of ns[b] live rows, each row as the
     one-row step at its length computes it. `segs`: rows past segs[b] come from `k2`/`v2`; `pbases`: the prefill
-    rows in one flat buffer; `prepared` = `rows_meta(...)` shared across layers. Returns [B, Hq, D], lazily."""
+    rows in one flat buffer; `rmap`: a fork's rows over a paged session, the prefill rows (every row's the same)
+    through its row map; `prepared` = `rows_meta(...)` shared across layers. Returns [B, Hq, D], lazily."""
     meta, path, splits = prepared if prepared is not None else rows_meta(ns, window, segs, pbases)
     return attn_nodes(
-        q, k, v, meta, path, scale, splits, sinks=sinks, ks=ks, vs=vs, k2=k2, v2=v2, ks2=ks2, vs2=vs2, odt=odt
+        q,
+        k,
+        v,
+        meta,
+        path,
+        scale,
+        splits,
+        sinks=sinks,
+        ks=ks,
+        vs=vs,
+        k2=k2,
+        v2=v2,
+        ks2=ks2,
+        vs2=vs2,
+        odt=odt,
+        rmap=rmap,
     )
 
 
