@@ -420,16 +420,16 @@ class MegaRefusal(StrEnum):
     SHAPE = "shape"
 
 
-def mega_refusal(kind: FamilyKind, storage: Storage) -> MegaRefusal | None:
+def mega_refusal(kind: FamilyKind, storage: Storage, packed: bool = True) -> MegaRefusal | None:
     """why the megakernel cannot take this family's fixture in this storage, by the engine's own gates, in their
     order: the family's block (`Family.mega`: the kernel layout, not the sandwich's), the weights it reads out of slot
-    buffers (as-stored quant blocks, `mlx_state.affine`, and the 12-bit store's packed weights fall to the step), then
-    the head width"""
+    buffers (a GGUF's quant blocks bound as stored under `packed`, `mlx_state.affine`, and the 12-bit store's packed
+    weights fall to the step; blocks dequantized on load are bf16 slots it reads), then the head width"""
     fl = core.flags(kind)
     if Cap.KERNEL_LAYOUT not in fl or Cap.SANDWICH in fl:
         return MegaRefusal.LAYOUT
     qc = quant_class(storage)
-    if STORAGE[storage].container is Container.PACK12 or qc not in (None, QuantClass.FLOAT):
+    if STORAGE[storage].container is Container.PACK12 or (packed and qc not in (None, QuantClass.FLOAT)):
         return MegaRefusal.STORAGE
     hd = head_dim(kind)
     if hd is None or hd % MEGA_HEAD_MULTIPLE:
@@ -439,9 +439,10 @@ def mega_refusal(kind: FamilyKind, storage: Storage) -> MegaRefusal | None:
 
 def mega_serves(kind: FamilyKind, storage: Storage, knobs: dict[str, object] | None = None) -> bool:
     """whether MLX's megakernel takes a load's passes (`_mega_serves`): its knob on (`mlx_mega`, on by default), a
-    bf16 state, and a family, storage and fixture it takes"""
+    bf16 state, and a family, storage and fixture it takes (`gguf_packed`, on by default, keeping a GGUF's blocks)"""
     k = knobs or {}
-    return bool(int(str(k.get("mlx_mega", 1)))) and not k.get("fp32") and mega_refusal(kind, storage) is None
+    packed = bool(int(str(k.get("gguf_packed", 1))))
+    return bool(int(str(k.get("mlx_mega", 1)))) and not k.get("fp32") and mega_refusal(kind, storage, packed) is None
 
 
 def paged(

@@ -441,7 +441,11 @@ def test_every_cell_asserts_the_reader_its_cache_rows_take() -> None:
     # MLX's per-token graph reads the pages; its megakernel, where it serves, the conversation's own arena
     assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.MLX, spec.SUBPATH["mlx-step"].knobs) is PassTag.KV_PAGED
     assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.MLX) is PassTag.KV_CONTIGUOUS
-    assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.MLX, {}, spec.Storage.GGUF_KQUANT) is PassTag.KV_PAGED
+    # a GGUF's blocks as stored keep the megakernel off; dequantized on load they are bf16 slots it reads
+    kq = spec.Storage.GGUF_KQUANT
+    assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.MLX, spec.SUBPATH["mlx-packed"].knobs, kq) is PassTag.KV_PAGED
+    dequant = spec.SUBPATH["mlx-dequant"].knobs
+    assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.MLX, dequant, kq) is PassTag.KV_CONTIGUOUS
     assert PassTag.KV_CONTIGUOUS in spec.SUBPATH["mlx-kvbits"].expects(FamilyKind.QWEN3, bf16)
     # a hybrid on the pages too, its states resumed from its snapshots
     assert spec.kv_tag(FamilyKind.QWEN3_5, spec.Hardware.CPU) is PassTag.KV_PAGED
