@@ -177,7 +177,7 @@ addopts = "-q"
 timeout = 1800
 markers = [
     "timing: asserts on wall-clock rates or a process-wide limit; not run on shared CI runners",
-    "cert_gap: fails while a certification gap is open (cert.yml gates on it); not a code failure, so a wheel build does not stop on it",
+    "cert_gap: fails while a certification gap is open",
 ]
 
 [tool.pylint.messages_control]

@@ -207,16 +207,29 @@ jobs:
             export SETUPTOOLS_SCM_PRETEND_VERSION="${GITHUB_REF_NAME#v}"
           fi
           ${{ matrix.build }}
-      - name: Certify (install the wheel, run the CPU suite)
+      - name: Certify (install the wheel, run the suite; MLX on the Mac)
         shell: bash
         run: |
           # the pinned, hashed lock brings torch (CPU build via the index baked into the file), the runtime
-          # deps and pytest; the wheel then installs --no-deps, so its dependencies are the locked ones
+          # deps, pytest, and MLX on Apple silicon; the wheel then installs --no-deps, so its dependencies are
+          # the locked ones
           python -m pip install --require-hashes -r .github/requirements-test.txt
           python -m pip install --no-deps ./dist/*.whl
           mv btb btb.src   # so `import btb` resolves to the installed wheel, not the source tree
-          # an open certification gap is cert.yml's to report; the wheel stops only on a failing test
-          python -m pytest tests -q -m "not timing and not cert_gap"
+          if [[ "${{ matrix.id }}" == "macos" ]]; then
+            # the MLX tests skip where MLX is not usable: here that is a failure, not a skip
+            python -c "import btb.mlx as m; assert m.available(), 'MLX is installed but has no Metal device here'"
+          fi
+          # an open certification gap is cert.yml's to report; the wheel stops only on a failing test. Each result
+          # lands in pytest-report.jsonl as it is reported, so a run that aborts keeps its failures, and the last line
+          # is the setup of a test that died in its body; --capture=sys leaves a native abort's message in this log
+          python -m pytest tests -q -m "not timing and not cert_gap" --capture=sys --report-log=pytest-report.jsonl
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: pytest-report-${{ matrix.id }}
+          path: pytest-report.jsonl
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-${{ matrix.id }}

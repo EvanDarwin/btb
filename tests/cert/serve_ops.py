@@ -80,6 +80,17 @@ MISSING: dict[Missing, tuple[str, str]] = {
     ),
 }
 
+# kind -> (the problem, the fix) in a few plain words: a row of the PR comment's table (tests/cert/comment.py)
+TITLE: dict[Missing, tuple[str, str]] = {
+    Missing.ROUTE_UNCOVERED: ("Route missing from the server matrix", "Add a Route with a test"),
+    Missing.ROUTE_STALE: ("Matrix lists a route that's gone", "Drop it from the Route"),
+    Missing.NO_TEST: ("Route has no test", "Add a test that requests it"),
+    Missing.TEST_MISSING: ("Route's test is missing", "Create it, or fix the Route's test"),
+    Missing.FIELD_UNCOVERED: ("Payload field missing from the matrix", "Add it to a Field with a test"),
+    Missing.FIELD_STALE: ("Matrix lists a field the server no longer writes", "Drop it from the Field"),
+    Missing.FIELD_UNTESTED: ("Field has no working test", "Add a test that asserts its keys"),
+}
+
 
 @dataclass(frozen=True)
 class Route:

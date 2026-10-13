@@ -70,6 +70,30 @@ MISSING: dict[Missing, tuple[str, str]] = {
     ),
 }
 
+# kind -> (the problem, the fix) in a few plain words: a row of the PR comment's table (tests/cert/comment.py)
+TITLE: dict[Missing, tuple[str, str]] = {
+    Missing.BINDING_RULE: (
+        "Kernel breaks a rule the bindings rest on",
+        "Give its parameters roles, then run python build.py bindings",
+    ),
+    Missing.BINDINGS_STALE: (
+        "Bindings don't match native/cuda's signatures",
+        "Run python build.py bindings, then fix the launches mypy names",
+    ),
+    Missing.RAW_LAUNCH: (
+        "Kernel launched without its typed launcher",
+        "Launch it through its method, k.btb_<kernel>(...)",
+    ),
+    Missing.TEMP_POINTER: (
+        "Pointer taken from a tensor nothing holds",
+        "Name the tensor so it lives as long as the launch",
+    ),
+    Missing.UNLAUNCHED: (
+        "Kernel defined but never launched",
+        "Launch it, or delete it and run python build.py bindings",
+    ),
+}
+
 
 @functools.cache
 def bindings() -> ModuleType:
