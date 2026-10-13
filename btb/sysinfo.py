@@ -7,16 +7,20 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import glob
 import os
+import re
+import struct
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
 from . import pool
-from .kinds import Json
+from .kinds import HostCache, HostCacheTotal, Json
 
 # macOS: sysctlbyname through libc, bound once - a read is microseconds, where spawning `sysctl` from a process
 # with the model mapped was milliseconds a call inside the decode loop's once-a-second policy check
@@ -912,11 +916,8 @@ def _nvml() -> Any:
     return _NVML["lib"]
 
 
-def nvml_free_bytes(bus_id: str) -> int | None:
-    """The card's free memory across every process as NVML counts it - the reading `nvidia-smi` prints, without
-    starting it (a process a read, 36 ms each on this machine) - for the card at PCI `bus_id` ("00000000:01:00.0"):
-    NVML numbers the cards in its own order, which CUDA's (and CUDA_VISIBLE_DEVICES) does not follow. None where NVML
-    is absent (no NVIDIA driver) or the card cannot be read. Microseconds a read."""
+def _nvml_handle(bus_id: str) -> Any:
+    """NVML's handle on the card at PCI `bus_id`, looked up once; None without NVML or where it names no card"""
     lib = _nvml()
     find = getattr(lib, "nvmlDeviceGetHandleByPciBusId_v2", None) if lib is not None else None
     if find is None:
@@ -927,6 +928,18 @@ def nvml_free_bytes(bus_id: str) -> int | None:
         if find(bus_id.encode(), ctypes.byref(h)) != 0:
             return None
         _NVML["handles"][bus_id] = h
+    return h
+
+
+def nvml_free_bytes(bus_id: str) -> int | None:
+    """The card's free memory across every process as NVML counts it - the reading `nvidia-smi` prints, without
+    starting it (a process a read, 36 ms each on this machine) - for the card at PCI `bus_id` ("00000000:01:00.0"):
+    NVML numbers the cards in its own order, which CUDA's (and CUDA_VISIBLE_DEVICES) does not follow. None where NVML
+    is absent (no NVIDIA driver) or the card cannot be read. Microseconds a read."""
+    h = _nvml_handle(bus_id)
+    if h is None:
+        return None
+    lib = _NVML["lib"]
     m = _NvmlMemory()
     if lib.nvmlDeviceGetMemoryInfo(h, ctypes.byref(m)) != 0:
         _NVML["handles"].pop(bus_id, None)  # a stale handle (a driver reset): looked up afresh next read
@@ -934,67 +947,541 @@ def nvml_free_bytes(bus_id: str) -> int | None:
     return int(m.free)
 
 
-def host_cache_sizes() -> dict[str, int]:
-    """The host CPU's L2 (all cores' together) and L3 in bytes, read from the OS: Windows through the
-    processor-information table, Linux from sysfs, macOS from sysctl. Zeros where a level cannot be read."""
-    out = {"host_l2": 0, "host_l3": 0}
+def host_cache_groups() -> list[Json]:
+    """The host CPU's data and unified caches, L1 to L3, as the OS lists them: each kind of instance once with its
+    `level`, `size` in bytes, the `threads` (logical processors) sharing one, and the `count` of them - a P-core's
+    own L2 shared by its two hyperthreads, an efficiency cluster's by four cores, a chiplet's L3 by its cores.
+    Windows through GetLogicalProcessorInformationEx, Linux from sysfs, macOS from sysctl; every OS read to this
+    one form, so a CPU reads the same on each. Level by level, the largest first; [] where none can be read. Read
+    once; each call a fresh list."""
+    return _cache_groups(list(_host_caches()))
+
+
+@lru_cache(maxsize=1)
+def _host_caches() -> tuple[tuple[int, int, int], ...]:
+    """the OS's caches as (level, size, threads) instances, read once: they cannot change while btb runs"""
     try:
         if sys.platform == "win32":
-
-            class _Cache(ctypes.Structure):
-                _fields_ = [
-                    ("Level", ctypes.c_ubyte),
-                    ("Associativity", ctypes.c_ubyte),
-                    ("LineSize", ctypes.c_ushort),
-                    ("Size", ctypes.c_uint32),
-                    ("Type", ctypes.c_int),
-                ]
-
-            class _Union(ctypes.Union):
-                _fields_ = [("Cache", _Cache), ("Reserved", ctypes.c_ulonglong * 2)]
-
-            class _Info(ctypes.Structure):
-                _fields_ = [("ProcessorMask", ctypes.c_size_t), ("Relationship", ctypes.c_int), ("u", _Union)]
-
-            k32 = ctypes.windll.kernel32
-            n = ctypes.c_uint32(0)
-            k32.GetLogicalProcessorInformation(None, ctypes.byref(n))
-            cnt = n.value // ctypes.sizeof(_Info)
-            buf = (_Info * cnt)()
-            if k32.GetLogicalProcessorInformation(buf, ctypes.byref(n)):
-                for e in buf:
-                    if e.Relationship == 2:  # RelationCache
-                        c = e.u.Cache
-                        if c.Level == 2:
-                            out["host_l2"] += int(c.Size)
-                        elif c.Level == 3:
-                            # one entry per sharing group: the same L3 appears under each mask it serves
-                            out["host_l3"] = max(out["host_l3"], int(c.Size))
-        elif sys.platform == "linux":
-            import glob
-
-            for lvl in (2, 3):
-                seen: set[str] = set()
-                tot = 0
-                for p in glob.glob("/sys/devices/system/cpu/cpu*/cache/index*/level"):
-                    d = p[: -len("level")]
-                    with open(p) as fh:
-                        if fh.read().strip() != str(lvl):
-                            continue
-                    with open(d + "shared_cpu_list") as fh:
-                        key = fh.read().strip()
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    with open(d + "size") as fh:
-                        s = fh.read().strip()
-                    tot += int(s[:-1]) * (1024 if s.endswith("K") else 2**20 if s.endswith("M") else 1)
-                out[f"host_l{lvl}"] = tot
-        elif sys.platform == "darwin":
-            for lvl in (2, 3):
-                v = _sysctl_int(f"hw.l{lvl}cachesize")
-                if v:
-                    out[f"host_l{lvl}"] = v
+            raw = _win_records(2)  # RelationCache
+            return tuple(_win_caches(raw) if raw else [])
+        if sys.platform == "linux":
+            return tuple(_linux_caches())
+        if sys.platform == "darwin":
+            return tuple(_darwin_caches())
     except Exception:
         pass
+    return ()
+
+
+def host_cache_sizes() -> dict[str, int]:
+    """The host CPU's cache figures in bytes, keyed by `HostCache`: each level's smallest instance (a thread alone,
+    on any core: a 7950X3D's L3 is 32 MB, not 96) and its smallest per-thread share with every thread busy (a 13700K's
+    L2 is 1 MB a thread). 0 where a level is missing or can't be read."""
+    return cache_sizes(host_cache_groups())
+
+
+def host_cache_totals() -> dict[str, int]:
+    """Each cache level's instances added up, keyed by `HostCacheTotal`; 0 where a level is missing"""
+    return cache_totals(host_cache_groups())
+
+
+# each level's number and its figures' keys
+_LEVELS = (
+    (1, HostCache.L1D_INSTANCE, HostCache.L1D_SHARE, HostCacheTotal.L1D),
+    (2, HostCache.L2_INSTANCE, HostCache.L2_SHARE, HostCacheTotal.L2),
+    (3, HostCache.L3_INSTANCE, HostCache.L3_SHARE, HostCacheTotal.L3),
+)
+
+
+def cache_sizes(groups: list[Json]) -> dict[str, int]:
+    """`host_cache_sizes` from `host_cache_groups`' form: per level, min(size) and min(size / threads)"""
+    out: dict[str, int] = dict.fromkeys(HostCache, 0)
+    for level, instance, share, _ in _LEVELS:
+        gs = [g for g in groups if g["level"] == level]
+        if gs:
+            out[instance] = min(g["size"] for g in gs)
+            out[share] = min(g["size"] // g["threads"] for g in gs)
+    return out
+
+
+def cache_totals(groups: list[Json]) -> dict[str, int]:
+    """`host_cache_totals` from `host_cache_groups`' form: per level, sum(size * count)"""
+    out: dict[str, int] = dict.fromkeys(HostCacheTotal, 0)
+    for level, _, _, total in _LEVELS:
+        out[total] = sum(g["size"] * g["count"] for g in groups if g["level"] == level)
+    return out
+
+
+def _cache_groups(caches: list[tuple[int, int, int]]) -> list[Json]:
+    """each (level, size, threads) instance counted into `host_cache_groups`' form"""
+    n: dict[tuple[int, int, int], int] = {}
+    for c in caches:
+        n[c] = n.get(c, 0) + 1
+    return [
+        {"level": lvl, "size": size, "threads": threads, "count": k}
+        for (lvl, size, threads), k in sorted(n.items(), key=lambda e: (e[0][0], -e[0][1], -e[0][2]))
+    ]
+
+
+def _win_records(rel: int) -> bytes | None:
+    """GetLogicalProcessorInformationEx's records of relationship `rel` (0 the cores, 2 the caches), every
+    processor group's; None where it gives none (or this is not Windows)"""
+    if sys.platform != "win32":
+        return None
+    k32 = ctypes.windll.kernel32
+    n = ctypes.c_uint32(0)
+    k32.GetLogicalProcessorInformationEx(rel, None, ctypes.byref(n))  # the size it needs
+    buf = ctypes.create_string_buffer(max(1, n.value))
+    if not n.value or not k32.GetLogicalProcessorInformationEx(rel, buf, ctypes.byref(n)):
+        return None
+    return buf.raw[: n.value]
+
+
+def _win_each(raw: bytes, at: int, wide: bool | None = None) -> Iterator[tuple[int, int, set[int]]]:
+    """each record of `_win_records` as (its relationship, its offset, the logical processors it names): a record
+    is Relationship and Size, then the relationship's fields; GroupCount (0 before Windows 11: one group) sits
+    just before the GROUP_AFFINITYs, `at` bytes in - each a mask the pointer's width (`wide`: 64-bit, this
+    process's by default), the group and reserved bytes. A record cut short ends the walk."""
+    wide = ctypes.sizeof(ctypes.c_void_p) == 8 if wide is None else wide
+    bits, fmt, stride = (64, "<QH", 16) if wide else (32, "<IH", 12)
+    off = 0
+    while off + 8 <= len(raw):
+        rel, size = struct.unpack_from("<II", raw, off)
+        if size < at + stride or off + size > len(raw):
+            break
+        (groups,) = struct.unpack_from("<H", raw, off + at - 2)
+        lps: set[int] = set()
+        for g in range(min(max(1, groups), (size - at) // stride)):
+            mask, grp = struct.unpack_from(fmt, raw, off + at + stride * g)
+            lps.update(grp * bits + b for b in range(bits) if mask >> b & 1)
+        yield rel, off, lps
+        off += size
+
+
+def _win_caches(raw: bytes, wide: bool | None = None) -> list[tuple[int, int, int]]:
+    """each data or unified cache in RelationCache records, once by the processors sharing it: after Relationship
+    and Size, CACHE_RELATIONSHIP - Level, Associativity, LineSize, CacheSize, Type (0 unified, 1 instruction,
+    2 data, 3 trace), 18 reserved bytes, GroupCount - and its GROUP_AFFINITYs from offset 40"""
+    out = []
+    seen: set[tuple[int, int, frozenset[int]]] = set()
+    for rel, off, lps in _win_each(raw, 40, wide):
+        level = raw[off + 8]
+        nbytes, kind = struct.unpack_from("<Ii", raw, off + 12)
+        key = (level, kind, frozenset(lps))
+        if rel == 2 and kind in (0, 2) and 1 <= level <= 3 and lps and key not in seen:
+            seen.add(key)
+            out.append((level, int(nbytes), len(lps)))
+    return out
+
+
+def _linux_caches(root: str = "/sys") -> list[tuple[int, int, int]]:
+    """each data or unified cache in sysfs under `root` once, by the CPUs sharing it (shared_cpu_list); an entry
+    whose files cannot be read is passed over"""
+    out = []
+    seen: set[tuple[str, str]] = set()
+    for p in sorted(glob.glob(f"{glob.escape(root)}/devices/system/cpu/cpu*/cache/index*/level")):
+        d = p[: -len("level")]
+        lvl, shared, s = _read(p), _read(d + "shared_cpu_list"), _read(d + "size")
+        if lvl not in ("1", "2", "3") or _read(d + "type") == "Instruction" or not shared or not s:
+            continue
+        if (lvl, shared) in seen:
+            continue
+        seen.add((lvl, shared))
+        unit = {"K": 1024, "M": 2**20}.get(s[-1], 1)
+        out.append((int(lvl), int(s[:-1] if unit > 1 else s) * unit, len(_cpulist(shared))))
+    return out
+
+
+def _darwin_caches() -> list[tuple[int, int, int]]:
+    """sysctl's caches: each perflevel's (macOS 12 on) - its cores' own L1d, an L2 per `cpusperl2` of its CPUs, an
+    L3 per `cpusperl3` - where its cores run a thread each (Apple silicon: CPUs are cores, whichever `cpusperl`
+    counts); else, and for a level the perflevels leave out, hw.l1d/l2/l3cachesize, each shared by the logical
+    CPUs hw.cacheconfig gives for its level (Intel Macs, hyperthreaded; Apple silicon publishes no L3)"""
+    out: list[tuple[int, int, int]] = []
+    levels = int(_sysctl_int("hw.nperflevels") or 0)
+    for i in range(levels):
+        p = f"hw.perflevel{i}."
+        cores = int(_sysctl_int(p + "physicalcpu") or 0)
+        if not cores or int(_sysctl_int(p + "logicalcpu") or cores) != cores:
+            # hyperthreaded: whether `cpusperl` counts its cores or its threads is not said; hw.cacheconfig's are threads
+            out = []
+            break
+        l1 = _sysctl_int(p + "l1dcachesize")
+        if l1:
+            out += [(1, l1, 1)] * cores
+        for lvl in (2, 3):
+            size, per = _sysctl_int(f"{p}l{lvl}cachesize"), _sysctl_int(f"{p}cpusperl{lvl}")
+            if size and per:
+                out += [(lvl, size, per)] * max(1, cores // per)
+    have = {c[0] for c in out}
+    raw = _sysctl_raw("hw.cacheconfig")  # uint64s: the logical CPUs sharing memory, then each level's cache
+    share = struct.unpack_from(f"<{len(raw) // 8}Q", raw) if raw else ()
+    logical = int(_sysctl_int("hw.logicalcpu") or 0)
+    for lvl, name in ((1, "hw.l1dcachesize"), (2, "hw.l2cachesize"), (3, "hw.l3cachesize")):
+        size = _sysctl_int(name)
+        per = int(share[lvl]) if len(share) > lvl and share[lvl] else 1
+        if size and logical and lvl not in have:
+            out += [(lvl, size, per)] * max(1, logical // per)
+    return out
+
+
+# -- the hardware as the OS and the drivers describe it: what the machine report (`btb bench`) lists -------------
+
+
+def _read(path: str) -> str | None:
+    """a small sysfs file's text, stripped; None where it cannot be read"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    except (OSError, ValueError):
+        return None
+
+
+def _cpulist(s: str | None) -> set[int]:
+    """the CPUs a Linux cpulist names ("0-7,16")"""
+    out: set[int] = set()
+    for part in (s or "").split(","):
+        lo, _, hi = part.strip().partition("-")
+        if lo.isdigit():
+            out.update(range(int(lo), int(hi if hi.isdigit() else lo) + 1))
+    return out
+
+
+def _class_names(n: int) -> list[str]:
+    return ["cores"] if n == 1 else ["performance", "efficiency"] if n == 2 else [f"class {i}" for i in range(n)]
+
+
+def _win_topology() -> Json:
+    """physical cores by efficiency class (GetLogicalProcessorInformationEx's RelationProcessorCore records) and
+    the package's rated clock (CallNtPowerInformation's ProcessorInformation: the one figure for every core, a
+    hybrid's efficiency cores included, so it is not given per class)"""
+    if sys.platform != "win32":
+        return {}
+    raw = _win_records(0)  # RelationProcessorCore
+    if raw is None:
+        return {}
+    # after Relationship and Size, PROCESSOR_RELATIONSHIP - Flags, EfficiencyClass, 20 reserved bytes, GroupCount -
+    # and its GROUP_AFFINITYs from offset 32
+    cores = [(raw[off + 9], lps) for rel, off, lps in _win_each(raw, 32) if rel == 0]
+    logical = sum(len(lps) for _, lps in cores)
+    rated = 0
+    try:
+        # PROCESSOR_POWER_INFORMATION: Number, MaxMhz, CurrentMhz, MhzLimit, MaxIdleState, CurrentIdleState
+        out = ctypes.create_string_buffer(24 * logical)
+        if ctypes.windll.powrprof.CallNtPowerInformation(11, None, 0, out, 24 * logical) == 0:
+            rated = max(struct.unpack_from("<I", out.raw, 24 * i + 4)[0] for i in range(logical))
+    except (OSError, AttributeError, ValueError):
+        pass
+    by: dict[int, Json] = {}
+    for eff, lps in cores:
+        c = by.setdefault(eff, {"cores": 0, "threads": 0, "base_mhz": 0, "max_mhz": 0})
+        c["cores"] += 1
+        c["threads"] += len(lps)
+    order = sorted(by, reverse=True)  # the higher the class, the faster the core
+    names = _class_names(len(order))
+    return {
+        "logical": logical,
+        "physical": len(cores),
+        "base_mhz": int(rated),
+        "max_mhz": 0,
+        "classes": [{"name": names[i], **by[e]} for i, e in enumerate(order)],
+    }
+
+
+def _linux_topology(root: str = "/sys") -> Json:
+    """sysfs under `root`: physical cores from each CPU's thread siblings (its package and core id where the kernel
+    lists none: Arm's core ids restart in each cluster), classes from cpu_capacity (Arm) or the hybrid PMUs' cpu
+    lists (Intel's cpu_core), clocks from cpufreq (kHz)"""
+    online = _cpulist(_read(f"{root}/devices/system/cpu/online"))
+    if not online:
+        online = {int(p.rsplit("cpu", 1)[1]) for p in glob.glob(f"{glob.escape(root)}/devices/system/cpu/cpu[0-9]*")}
+    big = _cpulist(_read(f"{root}/devices/cpu_core/cpus"))
+    by: dict[int, Json] = {}
+    for c in sorted(online):
+        d = f"{root}/devices/system/cpu/cpu{c}/"
+        cap = _read(d + "cpu_capacity")
+        key = int(cap) if cap and cap.isdigit() else (1 if c in big else 0)
+        k = by.setdefault(key, {"core_ids": set(), "threads": 0, "base_mhz": 0, "max_mhz": 0})
+        sib = _read(d + "topology/core_cpus_list") or _read(d + "topology/thread_siblings_list")
+        k["core_ids"].add(sib or f"{_read(d + 'topology/physical_package_id')}/{_read(d + 'topology/core_id') or c}")
+        k["threads"] += 1
+        for field, name in (("base_mhz", "base_frequency"), ("max_mhz", "cpuinfo_max_freq")):
+            v = _read(d + "cpufreq/" + name)
+            if v and v.isdigit():
+                k[field] = max(k[field], int(v) // 1000)
+    order = sorted(by, reverse=True)
+    names = _class_names(len(order))
+    classes = [
+        {"name": names[i], "cores": len(by[e]["core_ids"]), "threads": by[e]["threads"],
+         "base_mhz": by[e]["base_mhz"], "max_mhz": by[e]["max_mhz"]}
+        for i, e in enumerate(order)
+    ]  # fmt: skip
+    return {
+        "logical": len(online),
+        "physical": sum(c["cores"] for c in classes),
+        "base_mhz": max((c["base_mhz"] for c in classes), default=0),
+        "max_mhz": max((c["max_mhz"] for c in classes), default=0),
+        "classes": classes,
+    }
+
+
+def _darwin_topology() -> Json:
+    """sysctl's perflevels (Apple silicon's performance and efficiency cores; one level on an Intel Mac)"""
+    levels = int(_sysctl_int("hw.nperflevels") or 0)
+    top = int(_sysctl_int("hw.cpufrequency_max") or 0) // 1_000_000  # Intel Macs; Apple silicon publishes none
+    classes = []
+    for i in range(levels):
+        raw = _sysctl_raw(f"hw.perflevel{i}.name")
+        name = raw.split(b"\0", 1)[0].decode(errors="replace").lower() if raw else _class_names(levels)[i]
+        classes.append(
+            {
+                "name": name,
+                "cores": int(_sysctl_int(f"hw.perflevel{i}.physicalcpu") or 0),
+                "threads": int(_sysctl_int(f"hw.perflevel{i}.logicalcpu") or 0),
+                "base_mhz": 0,
+                "max_mhz": top,
+            }
+        )
+    physical, logical = int(_sysctl_int("hw.physicalcpu") or 0), int(_sysctl_int("hw.logicalcpu") or 0)
+    if not classes:
+        classes = [{"name": "cores", "cores": physical, "threads": logical, "base_mhz": 0, "max_mhz": top}]
+    return {"logical": logical, "physical": physical, "base_mhz": 0, "max_mhz": top, "classes": classes}
+
+
+@lru_cache(maxsize=1)
+def host_cpu_topology() -> Json:
+    """The CPU's cores as the OS groups them: `logical` processors, `physical` cores, the clocks the OS reports in
+    MHz - `base_mhz` the rated clock (Windows, Linux's intel_pstate), `max_mhz` the highest a core may boost to
+    (Linux, Intel Macs), 0 where it gives none - and `classes`: each kind of core, the fastest first (a hybrid's
+    performance and efficiency cores, a single class elsewhere) with its `cores`, `threads` and clocks where the OS
+    gives them per core (Linux; 0 elsewhere). Windows through GetLogicalProcessorInformationEx and
+    CallNtPowerInformation, Linux from sysfs, macOS from sysctl. Read once; {} where nothing could be read."""
+    try:
+        if sys.platform == "win32":
+            return _win_topology()
+        if sys.platform == "linux":
+            return _linux_topology()
+        if sys.platform == "darwin":
+            return _darwin_topology()
+    except Exception:
+        pass
+    return {}
+
+
+# SMBIOS type 17's memory type and form factor bytes (the DMTF's SMBIOS reference, 7.18.1-2), the ones a machine
+# btb runs on carries
+_SMBIOS_KIND = {
+    0x12: "DDR", 0x13: "DDR2", 0x18: "DDR3", 0x1A: "DDR4", 0x1B: "LPDDR", 0x1C: "LPDDR2", 0x1D: "LPDDR3",
+    0x1E: "LPDDR4", 0x20: "HBM", 0x21: "HBM2", 0x22: "DDR5", 0x23: "LPDDR5", 0x24: "HBM3",
+}  # fmt: skip
+_SMBIOS_FORM = {0x09: "DIMM", 0x0B: "row of chips", 0x0D: "SODIMM", 0x0F: "FB-DIMM", 0x10: "die", 0x11: "CAMM"}
+
+
+def _smbios_table() -> bytes | None:
+    """the firmware's SMBIOS structure table: Windows through GetSystemFirmwareTable('RSMB') (its 8-byte header
+    dropped), Linux from /sys/firmware/dmi/tables/DMI (readable by root alone on most distributions); None elsewhere
+    or where it cannot be read"""
+    if sys.platform == "win32":
+        fn = ctypes.windll.kernel32.GetSystemFirmwareTable
+        fn.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32]
+        fn.restype = ctypes.c_uint32
+        sig = int.from_bytes(b"RSMB", "big")
+        size = int(fn(sig, 0, None, 0))
+        if size <= 8:
+            return None
+        buf = ctypes.create_string_buffer(size)
+        if int(fn(sig, 0, buf, size)) != size:
+            return None
+        (n,) = struct.unpack_from("<I", buf.raw, 4)
+        return buf.raw[8 : 8 + n]
+    if sys.platform == "linux":
+        try:
+            with open("/sys/firmware/dmi/tables/DMI", "rb") as f:
+                return f.read()
+        except OSError:
+            return None
+    return None
+
+
+def _smbios_structs(t: bytes, kind: int) -> list[tuple[bytes, list[str]]]:
+    """every structure of `kind` in the table: its formatted area and its strings (string n is [n - 1])"""
+    out = []
+    off = 0
+    while off + 4 <= len(t):
+        typ, ln = t[off], t[off + 1]
+        if ln < 4:
+            break
+        end = t.find(b"\0\0", off + ln)
+        if end < 0:
+            break
+        if typ == kind:
+            strings = [s.decode("ascii", errors="replace").strip() for s in t[off + ln : end].split(b"\0")]
+            out.append((t[off : off + ln], strings))
+        if typ == 127:  # the end of the table
+            break
+        off = end + 2
+    return out
+
+
+def _module(s: bytes, strings: list[str]) -> Json | None:
+    """one SMBIOS memory device (type 17) as `memory_modules` lists it, None for an empty slot"""
+
+    def u16(o: int) -> int:
+        return int.from_bytes(s[o : o + 2], "little") if len(s) >= o + 2 else 0
+
+    def u32(o: int) -> int:
+        return int.from_bytes(s[o : o + 4], "little") if len(s) >= o + 4 else 0
+
+    def text(o: int) -> str:
+        i = s[o] if len(s) > o else 0
+        return strings[i - 1] if 0 < i <= len(strings) else ""
+
+    size = u16(0x0C)
+    if size in (0, 0xFFFF):
+        return None
+    mb = (u32(0x1C) & 0x7FFFFFFF) if size == 0x7FFF else (size & 0x7FFF) / 1024 if size & 0x8000 else size
+    rated = u32(0x54) if u16(0x15) == 0xFFFF else u16(0x15)
+    runs = u32(0x58) if u16(0x20) == 0xFFFF else u16(0x20)
+    width = u16(0x0A)
+    return {
+        "size_gb": round(mb / 1024, 2),
+        "kind": _SMBIOS_KIND.get(s[0x12] if len(s) > 0x12 else 0, "unknown"),
+        "form": _SMBIOS_FORM.get(s[0x0E] if len(s) > 0x0E else 0, "other"),
+        "rated_mts": int(rated),
+        "mts": int(runs),
+        "width": 0 if width == 0xFFFF else int(width),
+        "rank": (s[0x1B] & 0x0F) if len(s) > 0x1B else 0,
+        "slot": text(0x10),
+        "bank": text(0x11),
+        "maker": text(0x17),
+        "part": text(0x1A),
+    }
+
+
+_UDEV_DMI = "/run/udev/data/+dmi:id"
+
+
+def _udev_modules() -> list[Json] | None:
+    """the SMBIOS memory devices as systemd's udev keeps them: its dmi_memory_id helper (systemd 248 on) reads the
+    table as root at boot, and udev's database holds what it found for the dmi device, readable by every user, as
+    `E:MEMORY_DEVICE_<n>_<FIELD>=<value>` lines. The populated slots as `memory_modules` lists them; None where
+    the database holds none (no systemd, an older one, a container)"""
+    try:
+        with open(_UDEV_DMI, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None
+    slots: dict[int, dict[str, str]] = {}
+    for line in text.splitlines():
+        m = re.fullmatch(r"E:MEMORY_DEVICE_(\d+)_([A-Z_]+)=(.*)", line.strip())
+        if m:
+            slots.setdefault(int(m[1]), {})[m[2]] = m[3].strip()
+    if not slots:
+        return None
+
+    def num(d: dict[str, str], k: str) -> int:
+        v = d.get(k, "")
+        return int(v) if v.isdigit() else 0
+
+    def text_of(d: dict[str, str], k: str) -> str:
+        v = d.get(k, "")
+        return "" if v == "Not Specified" else v  # the helper's word for a string the table leaves empty
+
+    # the helper's names for the type and form codes ("Row Of Chips", "Unknown", "<OUT OF SPEC>") mapped to the
+    # names `_module` gives the same codes: a module reads the same from udev as from the table
+    kinds = {v.lower(): v for v in _SMBIOS_KIND.values()}
+    forms = {v.lower(): v for v in _SMBIOS_FORM.values()}
+
+    out = []
+    for _, d in sorted(slots.items()):
+        size = num(d, "SIZE")  # bytes; an empty slot carries PRESENT=0 and no size
+        if d.get("PRESENT") == "0" or not size:
+            continue
+        out.append(
+            {
+                "size_gb": round(size / 2**30, 2),
+                "kind": kinds.get(d.get("TYPE", "").lower(), "unknown"),
+                "form": forms.get(d.get("FORM_FACTOR", "").lower(), "other"),
+                "rated_mts": num(d, "SPEED_MTS"),
+                "mts": num(d, "CONFIGURED_SPEED_MTS"),
+                "width": num(d, "DATA_WIDTH"),
+                "rank": num(d, "RANK"),
+                "slot": text_of(d, "LOCATOR"),
+                "bank": text_of(d, "BANK_LOCATOR"),
+                "maker": text_of(d, "MANUFACTURER"),
+                "part": text_of(d, "PART_NUMBER"),
+            }
+        )
+    return out
+
+
+def memory_modules() -> list[Json] | None:
+    """The memory modules the firmware lists (SMBIOS type 17), the populated slots: each one's `size_gb`, `kind`
+    (DDR4, DDR5, LPDDR5...), `form` (DIMM, SODIMM...), `rated_mts` (its rated transfer rate, MT/s) and `mts` (the
+    rate the firmware runs it at; 0 where it does not say), `width` (data bits), `rank`, `slot` and `bank` (the
+    board's locators), `maker` and `part`. Serial numbers and asset tags are left out. Linux reads the table where
+    it may (root) and udev's copy of it otherwise. None where neither can be read (macOS; Linux without systemd's
+    copy)."""
+    try:
+        t = _smbios_table()
+        if t is not None:
+            return [m for s, strings in _smbios_structs(t, 17) if (m := _module(s, strings)) is not None]
+        return _udev_modules() if sys.platform == "linux" else None
+    except Exception:
+        return None
+
+
+def memory_channels(mods: list[Json]) -> int | None:
+    """The channels the modules sit on, read off the locators where the board names them: `ChannelA`,
+    `P0 CHANNEL B` and `Controller1-ChannelA-DIMM0` (a channel and its controller), `Controller0-DIMM1` (a controller
+    of one channel: Intel's desktop DDR5), or `DIMM_A2` (channel A's second slot). None where any module's locators
+    name none of these: a peak rate is not guessed from a module count, as two modules on one channel share its
+    rate."""
+    keys: set[tuple[str, str]] = set()
+    for m in mods:
+        text = f"{m.get('bank', '')} {m.get('slot', '')}".lower()
+        ch = re.search(r"channel\s*[-_]?\s*([a-z0-9]+)", text) or re.search(r"\bdimm[\s_-]?([a-h])\d", text)
+        ctl = re.search(r"(?:controller|socket|node|cpu|\bp)\s*[-_]?\s*(\d+)", text)
+        if ch is None and ctl is None:
+            return None
+        keys.add((ctl.group(1) if ctl else "", ch.group(1) if ch else ""))
+    return len(keys) or None
+
+
+def _nvml_uint(fn: str, h: Any, *args: int) -> int | None:
+    """an NVML query that writes one unsigned int, None where the driver lacks it or refuses it"""
+    f = getattr(_NVML["lib"], fn, None)
+    if f is None:
+        return None
+    v = ctypes.c_uint(0)
+    return int(v.value) if f(h, *[ctypes.c_int(a) for a in args], ctypes.byref(v)) == 0 else None
+
+
+def nvml_card(bus_id: str) -> Json | None:
+    """The card at PCI `bus_id` as NVML describes it: its PCIe link now (`pcie_gen`, `pcie_width`) and at most
+    (`pcie_max_gen`, `pcie_max_width`: the slot's and the card's lesser), the peak clocks in MHz (`sm_mhz`,
+    `mem_mhz`), the memory bus in bits (`bus_bits`), the power limit in watts (`power_w`) and the `driver`'s
+    version. A field NVML cannot give is left out; None without NVML. The link trains down when the card idles:
+    read under a transfer, it is the speed the bus runs at."""
+    h = _nvml_handle(bus_id)
+    if h is None:
+        return None
+    out: Json = {}
+    for key, fn, args in (
+        ("pcie_gen", "nvmlDeviceGetCurrPcieLinkGeneration", ()),
+        ("pcie_width", "nvmlDeviceGetCurrPcieLinkWidth", ()),
+        ("pcie_max_gen", "nvmlDeviceGetMaxPcieLinkGeneration", ()),
+        ("pcie_max_width", "nvmlDeviceGetMaxPcieLinkWidth", ()),
+        ("sm_mhz", "nvmlDeviceGetMaxClockInfo", (1,)),  # NVML_CLOCK_SM
+        ("mem_mhz", "nvmlDeviceGetMaxClockInfo", (2,)),  # NVML_CLOCK_MEM
+        ("bus_bits", "nvmlDeviceGetMemoryBusWidth", ()),
+        ("power_w", "nvmlDeviceGetPowerManagementLimit", ()),
+    ):
+        v = _nvml_uint(fn, h, *args)
+        if v is not None:
+            out[key] = v // 1000 if key == "power_w" else v  # the limit is in milliwatts
+    ver = ctypes.create_string_buffer(96)
+    f = getattr(_NVML["lib"], "nvmlSystemGetDriverVersion", None)
+    if f is not None and f(ver, ctypes.c_uint(96)) == 0:
+        out["driver"] = ver.value.decode(errors="replace")
     return out

@@ -45,6 +45,9 @@
 
 typedef __nv_bfloat16 bf16;
 
+// each kernel parameter's role (btb_roles.cuh): the extern "C" signatures below are written in them
+#include "btb_roles.cuh"
+
 #define NEG_INF (__int_as_float(0xff800000))
 
 __device__ __forceinline__ float bf2f(bf16 v) { return __bfloat162float(v); }
@@ -139,7 +142,8 @@ __device__ __forceinline__ void gemv_rows(const bf16* __restrict__ w, const bf16
 
 #define GEMV(M)                                                                                              \
     extern "C" __global__ void __launch_bounds__(128) btb_gemv_bf16_m##M(                                    \
-        const bf16* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ y, int R, int C) {         \
+        const Weight* __restrict__ w, const MatIn* __restrict__ x, MatOut* __restrict__ y, OutDim R,         \
+        InDim C) {                                                                                           \
         gemv_rows<M>(w, x, y, R, C);                                                                         \
     }
 GEMV(1)
@@ -205,11 +209,13 @@ __device__ __forceinline__ void gemv_act_rows(const bf16* __restrict__ w, const 
 
 #define GEMV_ACT(M)                                                                                          \
     extern "C" __global__ void __launch_bounds__(128) btb_gemv_silu_bf16_m##M(                               \
-        const bf16* __restrict__ w, const bf16* __restrict__ gu, bf16* __restrict__ y, int R, int C) {        \
+        const Weight* __restrict__ w, const GateUp* __restrict__ gu, MatOut* __restrict__ y, OutDim R,       \
+        InDim C) {                                                                                           \
         gemv_act_rows<M, 0>(w, gu, y, R, C);                                                                 \
     }                                                                                                        \
     extern "C" __global__ void __launch_bounds__(128) btb_gemv_gelu_bf16_m##M(                               \
-        const bf16* __restrict__ w, const bf16* __restrict__ gu, bf16* __restrict__ y, int R, int C) {        \
+        const Weight* __restrict__ w, const GateUp* __restrict__ gu, MatOut* __restrict__ y, OutDim R,       \
+        InDim C) {                                                                                           \
         gemv_act_rows<M, 1>(w, gu, y, R, C);                                                                 \
     }
 GEMV_ACT(1)
@@ -223,16 +229,16 @@ GEMV_ACT(32)
 // the rows layout: a pass's T rows as T sequences a token each - a fork's rows, or a batch's - each at its own
 // position. Row t's keys are its prefix, len rows from slot off (a fork's rows share one prefix, a batch's lie end to
 // end), then its own steps, step i at slot base + i * W + col: every row's step i in one stretch of W slots. One int32
-// array on the card, [base, steps, W, then per row (col, off, len)]; a row with len < 0 is padding (the pass is
-// launched for a width its graph was captured at) and computes nothing. The norm/rope write lands each row's step at
-// its slot (btb_norm_rope_kv_rows below); the one attention's rows form walks each row's keys in logical order, the
-// sequence a one-row step of that sequence alone walks (btb_attn_flash.cuh), so a row's bits are its own decode's
-// whatever rows step beside it.
+// array on the card (a RowsLayout), [base, steps, W, then per row (col, off, len)]; a row with len < 0 is padding (the
+// pass is launched for a width its graph was captured at) and computes nothing. RowPlace is row t's place in it. The
+// norm/rope write lands each row's step at its slot (btb_norm_rope_kv_rows below); the one attention's rows form walks
+// each row's keys in logical order, the sequence a one-row step of that sequence alone walks (btb_attn_flash.cuh), so a
+// row's bits are its own decode's whatever rows step beside it.
 // ---------------------------------------------------------------------------------------------------------
-struct RowsLayout {
+struct RowPlace {
     int base = 0, step = 0, W = 0, col = 0, off = 0, len = 0;
-    RowsLayout() = default;
-    __device__ __forceinline__ RowsLayout(const int* __restrict__ rw, int t)
+    RowPlace() = default;
+    __device__ __forceinline__ RowPlace(const int* __restrict__ rw, int t)
         : base(rw[0]), step(rw[1]), W(rw[2]), col(rw[3 + 3 * t]), off(rw[4 + 3 * t]), len(rw[5 + 3 * t]) {}
     // the cache slot of the row's logical key j
     __device__ __forceinline__ int slot(int j) const { return j < len ? off + j : base + (j - len) * W + col; }
@@ -246,7 +252,7 @@ struct RowsLayout {
 // the head's dims and 16-31 the second, so rotate_half is a shuffle with lane ^ 16. The norm is the fused
 // F.rms_norm (fp32 throughout, one rounding), the rope the engine's fused form: q*cos rounded to bf16, then
 // one fused multiply-add with the rotated half and sin, rounded once. Warps past Hq + Hk copy the v rows.
-// ROWS: row t is a sequence of its own (RowsLayout above), at position len + steps, its row written to its step's
+// ROWS: row t is a sequence of its own (RowPlace above), at position len + steps, its row written to its step's
 // slot.
 // ---------------------------------------------------------------------------------------------------------
 template <int D, bool ROWS>
@@ -262,7 +268,7 @@ __device__ __forceinline__ void norm_rope_kv(const bf16* __restrict__ qkv, const
     const int lane = threadIdx.x & 31;
     int slot, pos;
     if constexpr (ROWS) {
-        const RowsLayout r(rw, t);
+        const RowPlace r(rw, t);
         if (r.len < 0) return;
         pos = r.len + r.step;
         slot = r.slot(pos);
@@ -319,26 +325,28 @@ __device__ __forceinline__ void norm_rope_kv(const bf16* __restrict__ qkv, const
 
 #define NORMROPE(D)                                                                                          \
     extern "C" __global__ void __launch_bounds__(32) btb_norm_rope_kv_d##D(                                  \
-        const bf16* __restrict__ qkv, const bf16* __restrict__ wq, const bf16* __restrict__ wk, float eps,   \
-        const bf16* __restrict__ cos_t, const bf16* __restrict__ sin_t, const int* __restrict__ n0p,         \
-        const int* __restrict__ depth, bf16* __restrict__ K, bf16* __restrict__ V, bf16* __restrict__ qo,    \
-        int T, int Hq, int Hk, int hs, int rs, int centered) {                                               \
+        const Qkv* __restrict__ qkv, const QNorm* __restrict__ wq, const KNorm* __restrict__ wk, NormEps eps, \
+        const RopeCos* __restrict__ cos_t, const RopeSin* __restrict__ sin_t, const PrefixLen* __restrict__ n0p, \
+        const Depths* __restrict__ depth, KCache* __restrict__ K, VCache* __restrict__ V,                    \
+        Query* __restrict__ qo, Rows T, QHeads Hq, KvHeads Hk, CacheHeadStride hs, CacheRowStride rs,        \
+        NormCentered centered) {                                                                             \
         norm_rope_kv<D, false>(qkv, wq, wk, eps, cos_t, sin_t, n0p, depth, nullptr, K, V, qo, T, Hq, Hk, hs, \
                                rs, centered);                                                                \
     }                                                                                                        \
     extern "C" __global__ void __launch_bounds__(32) btb_norm_rope_kv_rows_d##D(                             \
-        const bf16* __restrict__ qkv, const bf16* __restrict__ wq, const bf16* __restrict__ wk, float eps,   \
-        const bf16* __restrict__ cos_t, const bf16* __restrict__ sin_t, const int* __restrict__ rw,          \
-        bf16* __restrict__ K, bf16* __restrict__ V, bf16* __restrict__ qo, int T, int Hq, int Hk, int hs,    \
-        int rs, int centered) {                                                                              \
+        const Qkv* __restrict__ qkv, const QNorm* __restrict__ wq, const KNorm* __restrict__ wk, NormEps eps, \
+        const RopeCos* __restrict__ cos_t, const RopeSin* __restrict__ sin_t, const RowsLayout* __restrict__ rw, \
+        KCache* __restrict__ K, VCache* __restrict__ V, Query* __restrict__ qo, Rows T, QHeads Hq,           \
+        KvHeads Hk, CacheHeadStride hs, CacheRowStride rs, NormCentered centered) {                          \
         norm_rope_kv<D, true>(qkv, wq, wk, eps, cos_t, sin_t, nullptr, nullptr, rw, K, V, qo, T, Hq, Hk, hs, \
                               rs, centered);                                                                 \
     }                                                                                                        \
     extern "C" __global__ void __launch_bounds__(32) btb_norm_rope_kv_tbl_d##D(                              \
-        const bf16* __restrict__ qkv, const bf16* __restrict__ wq, const bf16* __restrict__ wk, float eps,   \
-        const bf16* __restrict__ cos_t, const bf16* __restrict__ sin_t, const int* __restrict__ n0p,         \
-        const int* __restrict__ depth, bf16* __restrict__ K, bf16* __restrict__ V, bf16* __restrict__ qo,    \
-        int T, int Hq, int Hk, int hs, int rs, int centered, const int* __restrict__ tbl) {                  \
+        const Qkv* __restrict__ qkv, const QNorm* __restrict__ wq, const KNorm* __restrict__ wk, NormEps eps, \
+        const RopeCos* __restrict__ cos_t, const RopeSin* __restrict__ sin_t, const PrefixLen* __restrict__ n0p, \
+        const Depths* __restrict__ depth, KCache* __restrict__ K, VCache* __restrict__ V,                    \
+        Query* __restrict__ qo, Rows T, QHeads Hq, KvHeads Hk, CacheHeadStride hs, CacheRowStride rs,        \
+        NormCentered centered, const RowMap* __restrict__ tbl) {                                             \
         norm_rope_kv<D, false>(qkv, wq, wk, eps, cos_t, sin_t, n0p, depth, nullptr, K, V, qo, T, Hq, Hk, hs, \
                                rs, centered, tbl);                                                           \
     }
@@ -351,9 +359,9 @@ NORMROPE(256)
 // x = bf16(h * rstd * w) (or * (1 + w)). One block of 256 threads per row; thread i sums the squares of
 // elements i, i + 256, ... in order, then a fixed tree over the block.
 // ---------------------------------------------------------------------------------------------------------
-extern "C" __global__ void __launch_bounds__(256) btb_add_rmsnorm(bf16* __restrict__ h, const bf16* __restrict__ y,
-                                                                  const bf16* __restrict__ w, float eps,
-                                                                  bf16* __restrict__ x, int H, int centered) {
+extern "C" __global__ void __launch_bounds__(256)
+    btb_add_rmsnorm(Residual* __restrict__ h, const BlockOut* __restrict__ y, const NormWeight* __restrict__ w,
+                    NormEps eps, Normed* __restrict__ x, Hidden H, NormCentered centered) {
     const int t = blockIdx.x, tid = threadIdx.x;
     bf16* hr = h + (size_t)t * H;
     const bf16* yr = y == nullptr ? nullptr : y + (size_t)t * H;
@@ -385,9 +393,9 @@ extern "C" __global__ void __launch_bounds__(256) btb_add_rmsnorm(bf16* __restri
 // the sandwich block's residual (Gemma): h [T, H] bf16 += bf16(y * rstd * w) (or * (1 + w)), the delta normed
 // before it is added rather than after; the add rounded as torch's bf16 add. The row's reduction as above.
 // ---------------------------------------------------------------------------------------------------------
-extern "C" __global__ void __launch_bounds__(256) btb_sandwich_add(bf16* __restrict__ h, const bf16* __restrict__ y,
-                                                                   const bf16* __restrict__ w, float eps, int H,
-                                                                   int centered) {
+extern "C" __global__ void __launch_bounds__(256)
+    btb_sandwich_add(Residual* __restrict__ h, const BlockOut* __restrict__ y, const NormWeight* __restrict__ w,
+                     NormEps eps, Hidden H, NormCentered centered) {
     const int t = blockIdx.x, tid = threadIdx.x;
     bf16* hr = h + (size_t)t * H;
     const bf16* yr = y + (size_t)t * H;
@@ -441,8 +449,8 @@ __device__ __forceinline__ void cp_waitn() {
 // (ns, `out_ts`: when the steps ran, whatever the host was doing when it looked), and a system fence orders them
 // before the length, so a host that has seen the length also sees the token and the time.
 // ---------------------------------------------------------------------------------------------------------
-extern "C" __global__ void btb_publish(const int* __restrict__ n0, const long long* __restrict__ ids,
-                                       long long* out_tok, int* out_n0, long long* out_ts) {
+extern "C" __global__ void btb_publish(const PrefixLen* __restrict__ n0, const StepToken* __restrict__ ids,
+                                       HostToken* out_tok, HostLen* out_n0, HostClock* out_ts) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         *out_tok = *ids;
         unsigned long long t;
@@ -467,12 +475,12 @@ __device__ __forceinline__ void act_mul(const bf16* __restrict__ gu, bf16* __res
         m[k] = f2bf(s * u);
     }
 }
-extern "C" __global__ void __launch_bounds__(256) btb_silu_mul(const bf16* __restrict__ gu, bf16* __restrict__ m,
-                                                               int T, int I) {
+extern "C" __global__ void __launch_bounds__(256) btb_silu_mul(const GateUp* __restrict__ gu,
+                                                               MlpAct* __restrict__ m, Rows T, Intermediate I) {
     act_mul<0>(gu, m, T, I);
 }
-extern "C" __global__ void __launch_bounds__(256) btb_gelu_mul(const bf16* __restrict__ gu, bf16* __restrict__ m,
-                                                               int T, int I) {
+extern "C" __global__ void __launch_bounds__(256) btb_gelu_mul(const GateUp* __restrict__ gu,
+                                                               MlpAct* __restrict__ m, Rows T, Intermediate I) {
     act_mul<1>(gu, m, T, I);
 }
 
@@ -638,22 +646,26 @@ __device__ __forceinline__ void delta_nodes_run(const DeltaIn<In> in, const int*
 }
 
 extern "C" __global__ void __launch_bounds__(DELTA_THREADS) btb_delta_nodes(
-    const float* __restrict__ mixed, const float* __restrict__ z, const float* __restrict__ a,
-    const float* __restrict__ b, const float* __restrict__ conv_w, const float* __restrict__ conv_b,
-    const float* __restrict__ conv0, float* state, float* scratch, const int* __restrict__ parents,
-    const float* __restrict__ a_log, const float* __restrict__ dt_bias, const float* __restrict__ norm_w, float eps,
-    int gate, int T, int C, int K, int Hk, int Hv, int dk, int dv, float* __restrict__ out) {
+    const DeltaMixed* __restrict__ mixed, const DeltaZ* __restrict__ z, const DeltaA* __restrict__ a,
+    const DeltaB* __restrict__ b, const ConvWeight* __restrict__ conv_w, const ConvBias* __restrict__ conv_b,
+    const ConvState* __restrict__ conv0, DeltaState* state, DeltaScratch* scratch,
+    const TreeParents* __restrict__ parents, const DeltaALog* __restrict__ a_log,
+    const DeltaDtBias* __restrict__ dt_bias, const DeltaNormWeight* __restrict__ norm_w, NormEps eps, DeltaGate gate,
+    Rows T, ConvChannels C, ConvTaps K, DeltaKHeads Hk, DeltaVHeads Hv, DeltaKDim dk, DeltaVDim dv,
+    DeltaOutF32* __restrict__ out) {
     const DeltaIn<float> in{mixed, z, a, b, (size_t)C, (size_t)Hv * dv, (size_t)Hv, (size_t)Hv};
     delta_nodes_run<float, float>(in, nullptr, conv_w, conv_b, conv0, state, scratch, nullptr, parents, a_log,
                                   dt_bias, norm_w, eps, gate, T, K, Hk, Hv, dk, dv, out, (size_t)Hv * dv);
 }
 
 extern "C" __global__ void __launch_bounds__(DELTA_THREADS) btb_delta_nodes_bf16(
-    const bf16* __restrict__ proj, int ps, int oq, int oz, int ob, int oa, const int* __restrict__ rows,
-    const float* __restrict__ conv_w, const float* __restrict__ conv_b, const float* __restrict__ conv0, float* state,
-    float* scratch, const int* __restrict__ slots, const int* __restrict__ parents, const float* __restrict__ a_log,
-    const float* __restrict__ dt_bias, const float* __restrict__ norm_w, float eps, int gate, int T, int K, int Hk,
-    int Hv, int dk, int dv, bf16* __restrict__ out) {
+    const DeltaProj* __restrict__ proj, ProjStride ps, QkvColumn oq, ZColumn oz, BColumn ob, AColumn oa,
+    const ProjRows* __restrict__ rows, const ConvWeight* __restrict__ conv_w, const ConvBias* __restrict__ conv_b,
+    const ConvState* __restrict__ conv0, DeltaState* state, DeltaScratch* scratch,
+    const ScratchSlots* __restrict__ slots, const TreeParents* __restrict__ parents,
+    const DeltaALog* __restrict__ a_log, const DeltaDtBias* __restrict__ dt_bias,
+    const DeltaNormWeight* __restrict__ norm_w, NormEps eps, DeltaGate gate, Rows T, ConvTaps K, DeltaKHeads Hk,
+    DeltaVHeads Hv, DeltaKDim dk, DeltaVDim dv, DeltaOut* __restrict__ out) {
     const size_t s = (size_t)ps;
     const DeltaIn<bf16> in{proj + oq, proj + oz, proj + oa, proj + ob, s, s, s, s};
     delta_nodes_run<bf16, bf16>(in, rows, conv_w, conv_b, conv0, state, scratch, slots, parents, a_log, dt_bias,
@@ -667,9 +679,9 @@ extern "C" __global__ void __launch_bounds__(DELTA_THREADS) btb_delta_nodes_bf16
 // A negative row is padding and ends the rows, as there. A thread a channel, its old window held in registers:
 // in place, and nothing summed, so a row count changes nothing but which columns come from where.
 // ---------------------------------------------------------------------------------------------------------
-extern "C" __global__ void __launch_bounds__(256) btb_conv_window(float* __restrict__ conv,
-                                                                  const bf16* __restrict__ proj, int ps, int oq,
-                                                                  const int* __restrict__ rows, int n, int C, int K) {
+extern "C" __global__ void __launch_bounds__(256)
+    btb_conv_window(ConvState* __restrict__ conv, const DeltaProj* __restrict__ proj, ProjStride ps, QkvColumn oq,
+                    const ProjRows* __restrict__ rows, Rows n, ConvChannels C, ConvTaps K) {
     const int c = blockIdx.x * 256 + threadIdx.x;
     if (c >= C) return;
     int cnt = n;
@@ -700,10 +712,10 @@ extern "C" __global__ void __launch_bounds__(256) btb_conv_window(float* __restr
 __constant__ float BTB_FP4[16] = {0.f,  .5f,  1.f,  1.5f,  2.f,  3.f,  4.f,  6.f,
                                   -0.f, -.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
 
-extern "C" __global__ void __launch_bounds__(256) btb_mx4_widen(const unsigned char* __restrict__ blocks,
-                                                                const unsigned char* __restrict__ scales,
-                                                                const int* __restrict__ seats, long long groups,
-                                                                bf16* __restrict__ out) {
+extern "C" __global__ void __launch_bounds__(256) btb_mx4_widen(const Mx4Blocks* __restrict__ blocks,
+                                                                const Mx4Scales* __restrict__ scales,
+                                                                const Seats* __restrict__ seats, Mx4Groups groups,
+                                                                Widened* __restrict__ out) {
     const long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (g >= groups) return;
     const long long at = (long long)seats[blockIdx.y] * groups + g;
@@ -755,10 +767,10 @@ __device__ __forceinline__ float block_sum256(float v, float* red) {
 // alone (the norm's group_size H) and w [G H] its zero-centred weight (or * w, `centered` 0). Block (t, g), 256
 // threads: btb_add_rmsnorm's fixed-order sum within the one stream of the one row, so T enters nowhere.
 // ---------------------------------------------------------------------------------------------------------
-extern "C" __global__ void __launch_bounds__(256) btb_hc_rmsnorm(bf16* __restrict__ h, const bf16* __restrict__ y,
-                                                                 const bf16* __restrict__ inj,
-                                                                 const bf16* __restrict__ w, float eps,
-                                                                 bf16* __restrict__ x, int H, int G, int centered) {
+extern "C" __global__ void __launch_bounds__(256)
+    btb_hc_rmsnorm(Streams* __restrict__ h, const BlockOut* __restrict__ y, const Inject* __restrict__ inj,
+                   const NormWeight* __restrict__ w, NormEps eps, Normed* __restrict__ x, Hidden H, StreamCount G,
+                   NormCentered centered) {
     const int t = blockIdx.x, g = blockIdx.y, tid = threadIdx.x;
     const size_t base = ((size_t)t * G + g) * H;
     bf16* hr = h + base;
@@ -789,8 +801,8 @@ extern "C" __global__ void __launch_bounds__(256) btb_hc_rmsnorm(bf16* __restric
 // bf16 div by a Python scalar computes it - a multiply by the fp32 reciprocal - then silu in fp32 as btb_silu_mul.
 // Elementwise: nothing depends on another row.
 // ---------------------------------------------------------------------------------------------------------
-extern "C" __global__ void __launch_bounds__(256) btb_hc_act(const bf16* __restrict__ dn, int ds,
-                                                             bf16* __restrict__ act, int R, int G) {
+extern "C" __global__ void __launch_bounds__(256) btb_hc_act(const MixDown* __restrict__ dn, MixDownStride ds,
+                                                             MixAct* __restrict__ act, MixRank R, StreamCount G) {
     const int t = blockIdx.y, i = blockIdx.x * 256 + threadIdx.x;
     if (i >= R) return;
     const float v = bfround(bf2f(dn[(size_t)t * ds + i]) * (1.f / (float)G));
@@ -805,10 +817,10 @@ extern "C" __global__ void __launch_bounds__(256) btb_hc_act(const bf16* __restr
 // columns of the merged [down | block_inject] gemv's row (dn [T, ds]). Null inj: the model's final mixer, which
 // has no inject. Elementwise over (t, i), the G-term sum inside the one thread.
 // ---------------------------------------------------------------------------------------------------------
-extern "C" __global__ void __launch_bounds__(256) btb_hc_mix(const bf16* __restrict__ xn, const bf16* __restrict__ up,
-                                                             const bf16* __restrict__ dn, int ds,
-                                                             bf16* __restrict__ mixed, bf16* __restrict__ inj, int H,
-                                                             int G, int R) {
+extern "C" __global__ void __launch_bounds__(256)
+    btb_hc_mix(const Normed* __restrict__ xn, const MixUp* __restrict__ up, const MixDown* __restrict__ dn,
+               MixDownStride ds, Mixed* __restrict__ mixed, Inject* __restrict__ inj, Hidden H, StreamCount G,
+               MixRank R) {
     const int t = blockIdx.y, i = blockIdx.x * 256 + threadIdx.x;
     const float rg = 1.f / (float)G;
     if (i < H) {
@@ -844,8 +856,9 @@ extern "C" __global__ void __launch_bounds__(256) btb_hc_mix(const bf16* __restr
 #define ROUTE_MAX_K 32
 
 extern "C" __global__ void __launch_bounds__(ROUTE_THREADS) btb_moe_route(
-    const bf16* __restrict__ logits, int ls, int E, int k, int* __restrict__ idx, bf16* __restrict__ w, int* hidx,
-    bf16* hw, unsigned* cnt, const int* __restrict__ seq, int* hseq) {
+    const RouterLogits* __restrict__ logits, RouterStride ls, Experts E, TopExperts k, ExpertIds* __restrict__ idx,
+    ExpertWeights* __restrict__ w, HostExpertIds* hidx, HostExpertWeights* hw, RouteCount* cnt,
+    const RouteSeq* __restrict__ seq, HostRouteSeq* hseq) {
     extern __shared__ float pr[];  // [E] the row's probabilities; a picked one set below every live one
     __shared__ float red[ROUTE_THREADS];
     __shared__ int redi[ROUTE_THREADS];
@@ -937,9 +950,9 @@ extern "C" __global__ void __launch_bounds__(ROUTE_THREADS) btb_moe_route(
 // router's merged logits row, column E). torch's three bf16 ops. y may be yr (in place): a thread reads its
 // element before it writes it. Elementwise.
 // ---------------------------------------------------------------------------------------------------------
-extern "C" __global__ void __launch_bounds__(256) btb_moe_combine(const bf16* yr, const bf16* __restrict__ ys,
-                                                                  const bf16* __restrict__ sg, int sgs, bf16* y,
-                                                                  int H) {
+extern "C" __global__ void __launch_bounds__(256) btb_moe_combine(const Routed* yr, const SharedOut* __restrict__ ys,
+                                                                  const SharedGate* __restrict__ sg, RouterStride sgs,
+                                                                  MoeOut* y, Hidden H) {
     const int t = blockIdx.y, i = blockIdx.x * 256 + threadIdx.x;
     if (i >= H) return;
     const float gate = bfround(act_sigmoid(bf2f(sg[(size_t)t * sgs])));
@@ -957,9 +970,9 @@ extern "C" __global__ void __launch_bounds__(256) btb_moe_combine(const bf16* yr
 // btb_gemv_bf16_m{M} (chunks c, c + 32, .. of a lane, a chunk's 8 in index order, then the butterfly), so it is
 // btb_gemv_bf16 over btb_sigmoid_mul's x bit for bit, and row m's sequence does not depend on M.
 // ---------------------------------------------------------------------------------------------------------
-extern "C" __global__ void __launch_bounds__(256) btb_sigmoid_mul(const bf16* __restrict__ att,
-                                                                  const bf16* __restrict__ gate, int gs, int D, int hs,
-                                                                  bf16* __restrict__ out, int C) {
+extern "C" __global__ void __launch_bounds__(256)
+    btb_sigmoid_mul(const AttnOut* __restrict__ att, const OutGate* __restrict__ gate, GateRowStride gs, HeadDim D,
+                    GateHeadStride hs, GatedAttn* __restrict__ out, AttnWidth C) {
     const int t = blockIdx.y, i = blockIdx.x * 256 + threadIdx.x;
     if (i >= C) return;
     const float g = bf2f(gate[(size_t)t * gs + (size_t)(i / D) * hs + i % D]);
@@ -1010,8 +1023,8 @@ __device__ __forceinline__ void gemv_sgate_rows(const bf16* __restrict__ w, cons
 
 #define GEMV_SGATE(M)                                                                                        \
     extern "C" __global__ void __launch_bounds__(128) btb_gemv_sgate_bf16_m##M(                              \
-        const bf16* __restrict__ w, const bf16* __restrict__ att, const bf16* __restrict__ gate, int gs, int D, \
-        int hs, bf16* __restrict__ y, int R, int C) {                                                        \
+        const Weight* __restrict__ w, const AttnOut* __restrict__ att, const OutGate* __restrict__ gate,     \
+        GateRowStride gs, HeadDim D, GateHeadStride hs, MatOut* __restrict__ y, OutDim R, InDim C) {         \
         gemv_sgate_rows<M>(w, att, gate, gs, D, hs, y, R, C);                                                \
     }
 GEMV_SGATE(1)
@@ -1127,11 +1140,12 @@ __device__ __forceinline__ void norm_rope_part(const bf16* __restrict__ qkv, int
 
 #define NORMROPE_PART(D)                                                                                     \
     extern "C" __global__ void __launch_bounds__(32) btb_norm_rope_part_d##D(                                \
-        const bf16* __restrict__ qkv, int width, int qhs, int koff, int voff, const bf16* __restrict__ wq,   \
-        const bf16* __restrict__ wk, float eps, const bf16* __restrict__ cos_t, const bf16* __restrict__ sin_t, \
-        int ts, int rot, const int* __restrict__ n0p, const int* __restrict__ depth, bf16* __restrict__ K,  \
-        bf16* __restrict__ V, bf16* __restrict__ qo, int Hq, int Hk, int hs, int rs, int centered,          \
-        int rawk) {                                                                                          \
+        const Qkv* __restrict__ qkv, QkvWidth width, QHeadStride qhs, KColumn koff, VColumn voff,             \
+        const QNorm* __restrict__ wq, const KNorm* __restrict__ wk, NormEps eps,                             \
+        const RopeCos* __restrict__ cos_t, const RopeSin* __restrict__ sin_t, RopeStride ts, RopeDims rot,   \
+        const PrefixLen* __restrict__ n0p, const Depths* __restrict__ depth, KCache* __restrict__ K,         \
+        VCache* __restrict__ V, Query* __restrict__ qo, QHeads Hq, KvHeads Hk, CacheHeadStride hs,           \
+        CacheRowStride rs, NormCentered centered, KeepRawKey rawk) {                                         \
         norm_rope_part<D>(qkv, width, qhs, koff, voff, wq, wk, eps, cos_t, sin_t, ts, rot, n0p, depth, K, V, qo, \
                           Hq, Hk, hs, rs, centered, rawk);                                                   \
     }
@@ -1587,25 +1601,28 @@ __device__ __forceinline__ void qsa_attn(const bf16* __restrict__ q, const bf16*
 
 #define QSA_K(D)                                                                                             \
     extern "C" __global__ void __launch_bounds__(256) btb_qsa_pool_d##D(                                     \
-        const bf16* __restrict__ raw, bf16* __restrict__ pk, int* pk_len, const int* __restrict__ n0p,       \
-        const bf16* __restrict__ cos_t, const bf16* __restrict__ sin_t, int ts, int rot,                     \
-        const bf16* __restrict__ kw, float eps, int r, int max_new) {                                        \
+        const IdxRawKey* __restrict__ raw, IdxPooled* __restrict__ pk, IdxPooledLen* pk_len,                 \
+        const PrefixLen* __restrict__ n0p, const RopeCos* __restrict__ cos_t,                                \
+        const RopeSin* __restrict__ sin_t, RopeStride ts, RopeDims rot, const IdxKNorm* __restrict__ kw,     \
+        NormEps eps, BlockRatio r, MaxNewBlocks max_new) {                                                   \
         qsa_pool<D>(raw, pk, pk_len, n0p, cos_t, sin_t, ts, rot, kw, eps, r, max_new);                       \
     }                                                                                                        \
     extern "C" __global__ void __launch_bounds__(QSA_THREADS) btb_qsa_select_d##D(                           \
-        const bf16* __restrict__ qi, const bf16* __restrict__ pk, const bf16* __restrict__ raw,              \
-        const int* __restrict__ n0p, const int* __restrict__ par, const bf16* __restrict__ cos_t,            \
-        const bf16* __restrict__ sin_t, int ts, int rot, const bf16* __restrict__ kw, float eps, int T,      \
-        int Hi, int r, int ktop, int NBcap, float* scores, int* __restrict__ sel, int* __restrict__ nsel) {  \
+        const IdxQuery* __restrict__ qi, const IdxPooled* __restrict__ pk, const IdxRawKey* __restrict__ raw, \
+        const PrefixLen* __restrict__ n0p, const TreeParents* __restrict__ par,                              \
+        const RopeCos* __restrict__ cos_t, const RopeSin* __restrict__ sin_t, RopeStride ts, RopeDims rot,   \
+        const IdxKNorm* __restrict__ kw, NormEps eps, Rows T, IdxHeads Hi, BlockRatio r, TopBlocks ktop,     \
+        PooledCap NBcap, IdxScores* scores, PickedBlocks* __restrict__ sel, PickedCount* __restrict__ nsel) { \
         qsa_select<D>(qi, pk, raw, n0p, par, cos_t, sin_t, ts, rot, kw, eps, T, Hi, r, ktop, NBcap, scores,  \
                       sel, nsel);                                                                            \
     }                                                                                                        \
     extern "C" __global__ void __launch_bounds__(256) btb_qsa_attn_split_d##D(                               \
-        const bf16* __restrict__ q, const bf16* __restrict__ K, const bf16* __restrict__ V,                  \
-        bf16* __restrict__ out, const int* __restrict__ n0p, const int* __restrict__ par,                    \
-        const int* __restrict__ sel, const int* __restrict__ nsel, int r, int ktop, int T, int Hq, int Hk,   \
-        int hs, int rs, float scale, float* __restrict__ part_m, float* __restrict__ part_l,                 \
-        float* __restrict__ part_acc, int* __restrict__ cnt) {                                               \
+        const Query* __restrict__ q, const KCache* __restrict__ K, const VCache* __restrict__ V,             \
+        AttnOut* __restrict__ out, const PrefixLen* __restrict__ n0p, const TreeParents* __restrict__ par,   \
+        const PickedBlocks* __restrict__ sel, const PickedCount* __restrict__ nsel, BlockRatio r,            \
+        TopBlocks ktop, Rows T, QHeads Hq, KvHeads Hk, CacheHeadStride hs, CacheRowStride rs, AttnScale scale, \
+        PartMax* __restrict__ part_m, PartSum* __restrict__ part_l, PartAcc* __restrict__ part_acc,          \
+        Arrivals* __restrict__ cnt) {                                                                        \
         qsa_attn<D>(q, K, V, out, n0p, par, sel, nsel, r, ktop, T, Hq, Hk, hs, rs, scale, part_m, part_l,    \
                     part_acc, cnt);                                                                          \
     }
@@ -1667,7 +1684,8 @@ __device__ __forceinline__ void gemv_lane16_rows(const bf16* __restrict__ w, con
 
 #define GEMV_LANE16(M)                                                                                       \
     extern "C" __global__ void __launch_bounds__(128) btb_gemv_lane16_f32_m##M(                              \
-        const bf16* __restrict__ w, const float* __restrict__ x, float* __restrict__ y, int R, int C) {      \
+        const Weight* __restrict__ w, const MatInF32* __restrict__ x, MatOutF32* __restrict__ y, OutDim R,   \
+        InDim C) {                                                                                           \
         gemv_lane16_rows<M>(w, x, y, R, C);                                                                  \
     }
 GEMV_LANE16(1)
@@ -1733,8 +1751,8 @@ __device__ __forceinline__ void gemv_lane16_mx4_rows(const unsigned char* __rest
 
 #define GEMV_LANE16_MX4(M)                                                                                   \
     extern "C" __global__ void __launch_bounds__(128) btb_gemv_lane16_mx4_f32_m##M(                          \
-        const unsigned char* __restrict__ blocks, const unsigned char* __restrict__ scales,                  \
-        const float* __restrict__ x, float* __restrict__ y, int R, int C) {                                  \
+        const Mx4Blocks* __restrict__ blocks, const Mx4Scales* __restrict__ scales,                          \
+        const MatInF32* __restrict__ x, MatOutF32* __restrict__ y, OutDim R, InDim C) {                      \
         gemv_lane16_mx4_rows<M>(blocks, scales, x, y, R, C);                                                 \
     }
 GEMV_LANE16_MX4(1)
@@ -1765,12 +1783,11 @@ GEMV_LANE16_MX4(32)
 // is skipped by both. Nothing crosses nodes but the ancestors' normed rows, which are the rows their own steps make:
 // a node computes bit for bit as the one-token step of its path.
 // ---------------------------------------------------------------------------------------------------------
-extern "C" __global__ void __launch_bounds__(256) btb_ple_gate(const bf16* __restrict__ kv, int ks,
-                                                               const bf16* __restrict__ xq,
-                                                               const bf16* __restrict__ wk,
-                                                               const bf16* __restrict__ wc, float eps, float inv_h,
-                                                               const int* __restrict__ par, bf16* __restrict__ gated,
-                                                               bf16* __restrict__ normed, int H, int G) {
+extern "C" __global__ void __launch_bounds__(256)
+    btb_ple_gate(const PleKv* __restrict__ kv, PleKvStride ks, const PleQuery* __restrict__ xq,
+                 const PleKNorm* __restrict__ wk, const PleConvNorm* __restrict__ wc, NormEps eps, InvSqrtHidden inv_h,
+                 const TreeParents* __restrict__ par, PleGated* __restrict__ gated, PleNormed* __restrict__ normed,
+                 Hidden H, StreamCount G) {
     const int t = blockIdx.x, g = blockIdx.y, tid = threadIdx.x;
     if (par != nullptr && par[t] < -1) return;
     __shared__ float red[256];
@@ -1809,11 +1826,10 @@ extern "C" __global__ void __launch_bounds__(256) btb_ple_gate(const bf16* __res
     }
 }
 
-extern "C" __global__ void __launch_bounds__(256) btb_ple_conv(const bf16* __restrict__ gated,
-                                                               const bf16* __restrict__ normed,
-                                                               const bf16* __restrict__ w, bf16* pre,
-                                                               const int* __restrict__ par, bf16* __restrict__ h, int C,
-                                                               int K, int dil, int update) {
+extern "C" __global__ void __launch_bounds__(256)
+    btb_ple_conv(const PleGated* __restrict__ gated, const PleNormed* __restrict__ normed,
+                 const PleConvWeight* __restrict__ w, PleWindow* pre, const TreeParents* __restrict__ par,
+                 Streams* __restrict__ h, ConvChannels C, ConvTaps K, ConvDilation dil, PleUpdate update) {
     const int t = blockIdx.y, c = blockIdx.x * 256 + threadIdx.x;
     if (par != nullptr && par[t] < -1) return;
     __shared__ int path[32];
@@ -1949,9 +1965,9 @@ __device__ __forceinline__ void smp_block_argmax(float best, unsigned bi, unsign
 
 // M = max(x / T): grid over the row, atomicMax(ordered) into gM[r] (pre-zeroed). T from fp[0] on the device, so
 // the captured step graph reads a temperature filled before the replay rather than one baked at capture.
-extern "C" __global__ void __launch_bounds__(SMP_THREADS) btb_sample_max(const float* __restrict__ x, int V,
-                                                                         const float* __restrict__ fp,
-                                                                         unsigned* gM) {
+extern "C" __global__ void __launch_bounds__(SMP_THREADS) btb_sample_max(const Logits* __restrict__ x, Vocab V,
+                                                                         const SampleParams* __restrict__ fp,
+                                                                         SampleMax* gM) {
     const float invT = fp[0];
     const unsigned r = blockIdx.y;
     const float* row = x + (size_t)r * (unsigned)V;
@@ -1972,11 +1988,10 @@ extern "C" __global__ void __launch_bounds__(SMP_THREADS) btb_sample_max(const f
 
 // one radix level's histogram: mode 0 counts (top-k), 1 masses (top-p). `gpre[r]` the prefix resolved so far,
 // `gfloor[r]` the ordered floor a token must clear (0 for top-k; the top-k threshold for top-p). ghist pre-zeroed
-extern "C" __global__ void __launch_bounds__(SMP_THREADS) btb_sample_hist(const float* __restrict__ x, int V,
-                                                                          const float* __restrict__ fp, int level,
-                                                                          int mode, const unsigned* gM,
-                                                                          const unsigned* gpre, const unsigned* gfloor,
-                                                                          unsigned long long* ghist) {
+extern "C" __global__ void __launch_bounds__(SMP_THREADS)
+    btb_sample_hist(const Logits* __restrict__ x, Vocab V, const SampleParams* __restrict__ fp, RadixLevel level,
+                    SampleMode mode, const SampleMax* gM, const RadixPrefix* gpre, const RadixFloor* gfloor,
+                    RadixHist* ghist) {
     const float invT = fp[0];
     __shared__ unsigned long long sh[SMP_BINS];  // this block's private histogram: shared atomics, then one flush
     const unsigned r = blockIdx.y;
@@ -2010,10 +2025,9 @@ extern "C" __global__ void __launch_bounds__(SMP_THREADS) btb_sample_hist(const 
 // one radix level's pick: one block a row scans the histogram from the top, extends `gpre[r]` by the bin the
 // count/mass first reaches the target, carries the remainder in `gcarry[r]`. top-k's target is `top_k` at level
 // 0 then the carry; top-p's is `top_p` of the level-0 total then the carry.
-extern "C" __global__ void __launch_bounds__(SMP_THREADS) btb_sample_bin(int level, int mode, int top_k,
-                                                                         const float* __restrict__ fp,
-                                                                         const unsigned long long* ghist,
-                                                                         unsigned* gpre, unsigned long long* gcarry) {
+extern "C" __global__ void __launch_bounds__(SMP_THREADS)
+    btb_sample_bin(RadixLevel level, SampleMode mode, TopK top_k, const SampleParams* __restrict__ fp,
+                   const RadixHist* ghist, RadixPrefix* gpre, RadixCarry* gcarry) {
     // the whole block loads the row's histogram into shared (latency hidden across threads), then the scan runs
     // off shared - a serial scan of global memory here was 2048 dependent ~600-cycle loads on one thread, the
     // pipeline's whole cost. The level-0 mass total is a block reduction over the same shared copy.
@@ -2066,8 +2080,8 @@ extern "C" __global__ void __launch_bounds__(SMP_THREADS) btb_sample_bin(int lev
 // the top-k and top-p thresholds), the lowest index among equals; atomicMax-packed into gbest[r] (pre-zeroed).
 // `keys` [R, 2] uint32 (lo, hi). out[r] the picked token (uint32).
 extern "C" __global__ void __launch_bounds__(SMP_THREADS) btb_sample_draw(
-    const float* __restrict__ x, const unsigned* __restrict__ keys, int V, const float* __restrict__ fp,
-    const unsigned* gM, const unsigned* gpreK, const unsigned* gpreP, unsigned long long* gbest) {
+    const Logits* __restrict__ x, const NoiseKeys* __restrict__ keys, Vocab V, const SampleParams* __restrict__ fp,
+    const SampleMax* gM, const TopKFloor* gpreK, const TopPFloor* gpreP, SampleBest* gbest) {
     const float invT = fp[0];
     const unsigned r = blockIdx.y;
     const float* row = x + (size_t)r * (unsigned)V;
@@ -2089,7 +2103,7 @@ extern "C" __global__ void __launch_bounds__(SMP_THREADS) btb_sample_draw(
 // write out[r] = the picked token from the packed gbest (a tiny finalize after the draw's grid has settled). The
 // launch rounds R up to whole blocks, so the threads past R leave: unguarded, a one-row pick's 255 spare threads
 // wrote ~1 KB past `out` into whatever the allocator had placed after it
-extern "C" __global__ void btb_sample_out(const unsigned long long* gbest, unsigned* out, int R) {
+extern "C" __global__ void btb_sample_out(const SampleBest* gbest, SampledTokens* out, Rows R) {
     const unsigned r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= (unsigned)R) return;
     out[r] = ~(unsigned)(gbest[r] & 0xFFFFFFFFull);
@@ -2097,7 +2111,8 @@ extern "C" __global__ void btb_sample_out(const unsigned long long* gbest, unsig
 
 // derive a row's key from (seed, position) on the card, into keys[0..1] - the step graph's draw reads it, so a
 // replay draws the token the sequential loop's key_for(pos) keys
-extern "C" __global__ void btb_sample_keys(const unsigned* seed, const int* pos, int salt, unsigned* keys) {
+extern "C" __global__ void btb_sample_keys(const NoiseSeed* seed, const NoisePos* pos, NoiseSalt salt,
+                                           NoiseKeys* keys) {
     if (blockIdx.x || threadIdx.x) return;
     const unsigned long long sd = ((unsigned long long)seed[1] << 32) | (unsigned long long)seed[0];
     const unsigned long long k = smp_key(sd, (unsigned long long)(unsigned)pos[0], (unsigned)salt);
@@ -2201,9 +2216,9 @@ __device__ float smp_residual(const float* row, const float* qrow, const int* ki
 // x [T, V] node logits, q [T, Vd] the drafter's distribution a node, kids [T, C] int32 (draw order, -1 pad),
 // hasq [T] (0: point-mass drafts), keys [T, 2], fp [1/T, top_p]; out[r] packed (slot + 1) << 24 | token
 extern "C" __global__ void __launch_bounds__(SMP_THREADS) btb_sample_verify(
-    const float* __restrict__ x, const float* __restrict__ q, const int* __restrict__ kids,
-    const unsigned* __restrict__ hasq, const unsigned* __restrict__ keys, int V, int Vd, int C, int top_k,
-    const float* __restrict__ fp, unsigned* __restrict__ out) {
+    const Logits* __restrict__ x, const DraftProbs* __restrict__ q, const DraftKids* __restrict__ kids,
+    const HasDraftProbs* __restrict__ hasq, const NoiseKeys* __restrict__ keys, Vocab V, DraftVocab Vd,
+    DraftWidth C, TopK top_k, const SampleParams* __restrict__ fp, VerifyPicks* __restrict__ out) {
     const float invT = fp[0], top_p = fp[1];
     const unsigned r = blockIdx.x, tid = threadIdx.x, lane = tid & 31u, wid = tid >> 5;
     const float* row = x + (size_t)r * (unsigned)V;

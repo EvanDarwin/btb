@@ -81,6 +81,20 @@ def not_found_report(e: BaseException, model: Any = None) -> str:
     return f"{path!r}: no such file or directory"
 
 
+DISTRIBUTION = "beyondthebox"  # what pyproject names the package on PyPI; the import and the command stay `btb`
+
+
+def btb_version() -> str:
+    """btb's installed version, read from its distribution's metadata; "source checkout" where it is not installed or
+    its metadata cannot be read - a crash report built from this never fails on it"""
+    from importlib.metadata import version
+
+    try:
+        return version(DISTRIBUTION)
+    except Exception:
+        return "source checkout"
+
+
 def _environment(argv: Sequence[str] | None = None) -> Json:
     """The machine, the versions and the command line, for a bug report - shared by the out-of-memory notice
     and the diagnostics bundle so both read the box the same way. `argv` is the invocation to record; None reads
@@ -93,13 +107,7 @@ def _environment(argv: Sequence[str] | None = None) -> Json:
         for a in (list(argv) if argv is not None else sys.argv[1:])
     ]
 
-    versions: dict[str, str] = {}
-    try:
-        from importlib.metadata import version
-
-        versions["btb"] = version("btb")
-    except Exception:
-        versions["btb"] = "source checkout"
+    versions: dict[str, str] = {"btb": btb_version()}
     for name, attr in (("torch", "torch"), ("transformers", "transformers"), ("mlx", "mlx.core")):
         mod = sys.modules.get(attr)  # mlx keeps its version on mlx.core
         if mod is not None:

@@ -10,23 +10,200 @@ import math
 import os
 import sys
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, TypeVar
 
 import torch
 
+from ..kinds import (
+    AColumn,
+    Arrivals,
+    AttnOut,
+    AttnScale,
+    AttnWidth,
+    BColumn,
+    BlockOut,
+    BlockRatio,
+    CacheHeadStride,
+    CacheRowStride,
+    ConvBias,
+    ConvChannels,
+    ConvDilation,
+    ConvState,
+    ConvTaps,
+    ConvWeight,
+    DeltaA,
+    DeltaALog,
+    DeltaB,
+    DeltaDtBias,
+    DeltaGate,
+    DeltaKDim,
+    DeltaKHeads,
+    DeltaMixed,
+    DeltaNormWeight,
+    DeltaOut,
+    DeltaOutF32,
+    DeltaProj,
+    DeltaScratch,
+    DeltaState,
+    DeltaVDim,
+    DeltaVHeads,
+    DeltaZ,
+    Depths,
+    DraftKids,
+    DraftProbs,
+    DraftVocab,
+    DraftWidth,
+    ExpertIds,
+    Experts,
+    ExpertWeights,
+    GatedAttn,
+    GateHeadStride,
+    GateRowStride,
+    HasDraftProbs,
+    HeadDim,
+    Hidden,
+    HostExpertIds,
+    HostExpertWeights,
+    HostRouteSeq,
+    IdxHeads,
+    IdxKNorm,
+    IdxPooled,
+    IdxPooledLen,
+    IdxQuery,
+    IdxRawKey,
+    IdxScores,
+    InDim,
+    Inject,
+    InvSqrtHidden,
+    KCache,
+    KColumn,
+    KeepRawKey,
+    KNorm,
+    KvHeads,
+    Logits,
+    MatInF32,
+    MatOut,
+    MatOutF32,
+    MaxNewBlocks,
+    MixAct,
+    MixDown,
+    MixDownStride,
+    Mixed,
+    MixRank,
+    MixUp,
+    MmaMisses,
+    MoeOut,
+    Mx4Blocks,
+    Mx4Groups,
+    Mx4Scales,
+    NoiseKeys,
+    NormCentered,
+    Normed,
+    NormEps,
+    NormWeight,
+    OutDim,
+    OutGate,
+    PartAcc,
+    PartMax,
+    PartSum,
+    PickedBlocks,
+    PickedCount,
+    PleConvNorm,
+    PleConvWeight,
+    PleGated,
+    PleKNorm,
+    PleKv,
+    PleKvStride,
+    PleNormed,
+    PleQuery,
+    PleUpdate,
+    PleWindow,
+    PooledCap,
+    PrefixLen,
+    ProjRows,
+    ProjStride,
+    QHeads,
+    QHeadStride,
+    Qkv,
+    QkvColumn,
+    QkvWidth,
+    QNorm,
+    Query,
+    RadixCarry,
+    RadixFloor,
+    RadixHist,
+    RadixLevel,
+    RadixPrefix,
+    RopeCos,
+    RopeDims,
+    RopeSin,
+    RopeStride,
+    RouteCount,
+    Routed,
+    RouterLogits,
+    RouterStride,
+    RouteSeq,
+    Rows,
+    SampleBest,
+    SampledTokens,
+    SampleMax,
+    SampleMode,
+    SampleParams,
+    ScratchSlots,
+    Seats,
+    SharedGate,
+    SharedOut,
+    StreamCount,
+    Streams,
+    TopBlocks,
+    TopExperts,
+    TopK,
+    TopKFloor,
+    TopPFloor,
+    TreeParents,
+    VCache,
+    VColumn,
+    VerifyPicks,
+    Vocab,
+    Weight,
+    Widened,
+    ZColumn,
+)
 from ..native_files import kernels_path, native_path
 from ..sysinfo import raise_file_limit
+from . import card_launch
+
+_R = TypeVar("_R")
 
 
-def isa() -> str:
-    """the kernel tier the native library selected for this process (avx512/avx2/neon/scalar; `BTB_NATIVE_ISA`
-    honored) - what a benchmark's numbers belong to"""
+def _library(lib: Any) -> Any:
+    """`lib`, a loaded native library (the one `Native` bound, say), or the install's where it is None"""
+    if lib is not None:
+        return lib
     p = native_path()
-    if p is None:
+    return ctypes.CDLL(p) if p is not None else None
+
+
+def isa(lib: Any = None) -> str:
+    """the kernel tier the native library `lib` (the install's by default) selected for this process
+    (avx512/avx2/neon/scalar; `BTB_NATIVE_ISA` honored) - what a benchmark's numbers belong to"""
+    loaded = _library(lib)
+    if loaded is None:
         raise NativeError("btb_isa", -1, ": no native library in this install")
-    f = ctypes.CDLL(p).btb_isa
+    f = loaded.btb_isa
     f.restype = ctypes.c_char_p
     return f().decode()
+
+
+def cpu_features(lib: Any = None) -> list[str] | None:
+    """the CPU features the native library `lib` (the install's by default) detects on this machine
+    (`btb_cpu_features`: avx2, fma, avxvnni, avx512bf16, amx-tile, neon, i8mm, ...); None where there is no library
+    or it predates the probe"""
+    f = getattr(_library(lib), "btb_cpu_features", None)
+    if f is None:
+        return None
+    f.restype = ctypes.c_char_p
+    return f().decode().split()
 
 
 class NativeError(RuntimeError):
@@ -42,11 +219,25 @@ class NativeError(RuntimeError):
 class NativeDtypeError(TypeError):
     """A tensor handed to a native kernel is not the element type the kernel reads through its pointer: `call`
     the kernel, `arg` the argument, `got` its dtype and `want` what the kernel was built for. Raised before the
-    call by a binding loaded with `checked`, so a wrong tensor is refused rather than read as another type's."""
+    call - by a CPU binding loaded with `checked`, and by the card paths where their tensors enter
+    (`_CudaMixin._card_need_bf16`) - so a wrong tensor is refused rather than read as another type's."""
 
     def __init__(self, call: str, arg: str, got: torch.dtype, want: tuple[torch.dtype, ...]) -> None:
         self.call, self.arg, self.got, self.want = call, arg, got, want
         super().__init__(f"{call}: {arg} is {got}, the kernel reads {' or '.join(str(w) for w in want)}")
+
+
+class NativeArgsError(TypeError):
+    """A card kernel launch's arguments don't match the kernel's parameters as the driver reports them: their count
+    or byte widths. `call` the kernel, `want` its parameters' sizes, `got` the arguments' sizes. The driver reads as
+    many bytes as the kernel declares, so the launch would otherwise run on garbage."""
+
+    def __init__(self, call: str, want: tuple[int, ...], got: tuple[int, ...]) -> None:
+        self.call, self.want, self.got = call, want, got
+        super().__init__(
+            f"[cuda] {call} takes {len(want)} parameters of {list(want)} bytes; the launch passed "
+            f"{len(got)} of {list(got)}"
+        )
 
 
 _BF16, _F32, _U8, _I32 = torch.bfloat16, torch.float32, torch.uint8, torch.int32
@@ -884,116 +1075,17 @@ class _StreamAttrValue(ctypes.Union):
     _fields_ = [("accessPolicyWindow", _AccessPolicyWindow), ("pad", ctypes.c_ubyte * 64)]
 
 
-class _Cuda:
+class _Cuda(card_launch.CardLaunch):
     """The card's kernels through the driver API: the fatbin loaded into torch's context, one function
     handle per kernel, and `launch` on a torch stream - inside a graph capture too, where the launches are
-    recorded like any other node. `persist(base, nbytes)` sets the stream's persisting-L2 window (the part
-    of the cache the weights' streaming loads never evict) and `persist_limit()` the card's ceiling for it."""
+    recorded like any other node. A kernel is launched through its typed launcher (btb/engine/card_launch.py), a
+    function this module carries as a method (`k.btb_add_rmsnorm(grid, block, ...)`), which hands `launch` its
+    arguments. `persist(base, nbytes)` sets the stream's
+    persisting-L2 window (the part of the cache the weights' streaming loads never evict) and `persist_limit()` the
+    card's ceiling for it."""
 
     _NAMES = {"windows": "nvcuda.dll", "linux": "libcuda.so.1"}
-    KERNELS = (
-        "btb_gemv_bf16_m1",
-        "btb_gemv_bf16_m2",
-        "btb_gemv_bf16_m4",
-        "btb_gemv_bf16_m8",
-        "btb_gemv_bf16_m16",
-        "btb_gemv_bf16_m32",
-        "btb_gemv_silu_bf16_m1",
-        "btb_gemv_silu_bf16_m2",
-        "btb_gemv_silu_bf16_m4",
-        "btb_gemv_silu_bf16_m8",
-        "btb_gemv_silu_bf16_m16",
-        "btb_gemv_silu_bf16_m32",
-        "btb_gemv_gelu_bf16_m1",
-        "btb_gemv_gelu_bf16_m2",
-        "btb_gemv_gelu_bf16_m4",
-        "btb_gemv_gelu_bf16_m8",
-        "btb_gemv_gelu_bf16_m16",
-        "btb_gemv_gelu_bf16_m32",
-        "btb_gemv_mma_bf16",
-        "btb_gemv_mma8_bf16",
-        "btb_gemv_mma_glu_silu",
-        "btb_gemv_mma_glu_gelu",
-        # a prompt's matmuls in the step's bits (btb_gemm.cuh): one for each matvec the warm-up may pick
-        "btb_gemm_mma_bf16",
-        "btb_gemm_mma_small_bf16",
-        "btb_gemm_f32_bf16",
-        "btb_l2_warm",
-        "btb_norm_rope_kv_d64",
-        "btb_norm_rope_kv_d128",
-        "btb_norm_rope_kv_d256",
-        "btb_norm_rope_kv_rows_d64",
-        "btb_norm_rope_kv_rows_d128",
-        "btb_norm_rope_kv_rows_d256",
-        # the write through a cache's row map: a paged cache's rows wherever their pages lie
-        "btb_norm_rope_kv_tbl_d64",
-        "btb_norm_rope_kv_tbl_d128",
-        "btb_norm_rope_kv_tbl_d256",
-        # the one attention of every pass (btb_attn_flash.cuh): a row's bits its own, a prompt's rows its steps'
-        "btb_attn_flash_d64",
-        "btb_attn_flash_d128",
-        "btb_attn_flash_d256",
-        "btb_attn_flash_rows_d64",
-        "btb_attn_flash_rows_d128",
-        "btb_attn_flash_rows_d256",
-        "btb_attn_flash_prefill_d64",
-        "btb_attn_flash_prefill_d128",
-        "btb_attn_flash_prefill_d256",
-        "btb_attn_flash_prefill_kq_d64",
-        "btb_attn_flash_prefill_kq_d128",
-        "btb_attn_flash_prefill_kq_d256",
-        "btb_mma_roles",
-        "btb_add_rmsnorm",
-        "btb_sandwich_add",
-        "btb_silu_mul",
-        "btb_gelu_mul",
-        "btb_mx4_widen",
-        "btb_delta_nodes",
-        "btb_delta_nodes_bf16",
-        "btb_conv_window",
-        "btb_hc_rmsnorm",
-        "btb_hc_act",
-        "btb_hc_mix",
-        "btb_moe_route",
-        "btb_moe_combine",
-        "btb_sigmoid_mul",
-        "btb_gemv_sgate_bf16_m1",
-        "btb_gemv_sgate_bf16_m2",
-        "btb_gemv_sgate_bf16_m4",
-        "btb_gemv_sgate_bf16_m8",
-        "btb_gemv_sgate_bf16_m16",
-        "btb_gemv_sgate_bf16_m32",
-        "btb_norm_rope_part_d128",
-        "btb_norm_rope_part_d256",
-        "btb_qsa_pool_d128",
-        "btb_qsa_pool_d256",
-        "btb_qsa_select_d128",
-        "btb_qsa_select_d256",
-        "btb_qsa_attn_split_d128",
-        "btb_qsa_attn_split_d256",
-        "btb_gemv_lane16_f32_m1",
-        "btb_gemv_lane16_f32_m2",
-        "btb_gemv_lane16_f32_m4",
-        "btb_gemv_lane16_f32_m8",
-        "btb_gemv_lane16_f32_m16",
-        "btb_gemv_lane16_f32_m32",
-        "btb_gemv_lane16_mx4_f32_m1",
-        "btb_gemv_lane16_mx4_f32_m2",
-        "btb_gemv_lane16_mx4_f32_m4",
-        "btb_gemv_lane16_mx4_f32_m8",
-        "btb_gemv_lane16_mx4_f32_m16",
-        "btb_gemv_lane16_mx4_f32_m32",
-        "btb_ple_gate",
-        "btb_ple_conv",
-        "btb_publish",
-        "btb_sample_max",
-        "btb_sample_hist",
-        "btb_sample_bin",
-        "btb_sample_draw",
-        "btb_sample_out",
-        "btb_sample_keys",
-        "btb_sample_verify",
-    )
+    KERNELS = card_launch.KERNELS  # every kernel native/cuda defines (`python build.py bindings` lists them)
     # cuda.h
     _LIMIT_PERSISTING_L2 = 0x06
     _ATTR_L2_SIZE = 38
@@ -1039,6 +1131,13 @@ class _Cuda:
         self._call("cuCtxGetDevice", ctypes.byref(dev))
         self.device = int(dev.value)
         self.sms = self.attr(16)  # CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT
+        # each kernel's parameters as the driver reports them, read on its first launch (`param_sizes`), and the
+        # argument count a launch of it has already been held to them with (`_hold`); set before the first launch
+        self._param_info = getattr(self.lib, "cuFuncGetParamInfo", None)
+        if self._param_info is not None:
+            self._param_info.restype = ctypes.c_int
+        self._params: dict[str, tuple[int, ...] | None] = {}
+        self._held: dict[str, int] = {}
         # the one attention's prefill form takes its block's shared memory dynamically, past the 48 KB a launch may
         # take without the kernel's ceiling raised to it
         for d in (64, 128, 256):
@@ -1048,6 +1147,8 @@ class _Cuda:
         # whatever operand holds which factor and wherever in the tile it sits: checked on this card, once
         # (`btb_mma_roles`); where it fails, the decode form's own orientation serves the prefill
         self.mma_roles = self._mma_roles_hold()
+        # the prefill form's launcher in the orientation this card takes (`flash_prefill_kernel`)
+        self.flash_prefill = self.btb_attn_flash_prefill if self.mma_roles else self.btb_attn_flash_prefill_kq
 
     def _mma_roles_hold(self) -> bool:
         """whether this card's mma passes `btb_mma_roles` (2048 trials, each D = A B + C against its transpose with
@@ -1056,7 +1157,7 @@ class _Cuda:
         self._call("cuMemAlloc_v2", ctypes.byref(bad), ctypes.c_size_t(4))
         try:
             self._call("cuMemsetD32_v2", bad, ctypes.c_uint(0), ctypes.c_size_t(1))
-            self.launch("btb_mma_roles", (256, 1, 1), (256, 1, 1), [ctypes.c_void_p(bad.value)])
+            self.btb_mma_roles((256, 1, 1), (256, 1, 1), MmaMisses(bad.value))
             torch.cuda.synchronize()
             n = ctypes.c_int()
             self._call("cuMemcpyDtoH_v2", ctypes.byref(n), bad, ctypes.c_size_t(4))
@@ -1146,13 +1247,18 @@ class _Cuda:
         shared: int = 0,
     ) -> None:
         """Launch kernel `name` with `args` - each a ctypes value (c_void_p for a pointer, c_int, c_float) - on
-        `stream` (the current torch stream by default)."""
+        `stream` (the current torch stream by default); the typed launchers (btb/engine/card_launch.py) are its
+        callers. The arguments are held to the kernel's parameters as the driver reports them (`_hold`) before anything
+        reaches the card: the driver reads as many as the kernel declares from the array it is handed, so one too few
+        or one of the wrong width would launch on garbage."""
         if self.module is None:
             raise RuntimeError(
                 f"[cuda] {name}: the card's kernels were let go with the last engine on the card "
                 "(`Native.unload_cuda`); `Native.card_kernels()` loads them again"
             )
         n = len(args)
+        if self._held.get(name) != n:
+            self._hold(name, args)
         params = (ctypes.c_void_p * n)(*[ctypes.addressof(a) for a in args])
         st = (stream or torch.cuda.current_stream()).cuda_stream
         self._call(
@@ -1170,6 +1276,46 @@ class _Cuda:
             None,
         )
 
+    def _hold(self, name: str, args: Sequence[Any]) -> None:
+        """`args` held to kernel `name`'s parameters (`param_sizes`), a NativeArgsError naming a mismatch; their count is
+        remembered once they pass, so a launch with that count is not held again - every change of count is (the
+        drift a caller's stale list makes), a swap of one width for another at the same count only on the kernel's
+        first launch. Where the driver cannot report parameters at all, nothing is held"""
+        sizes = self.param_sizes(name)
+        if sizes is None:
+            if self._param_info is None:
+                self._held[name] = len(args)
+            return
+        got = tuple(ctypes.sizeof(a) for a in args)
+        if got != sizes:
+            raise NativeArgsError(name, sizes, got)
+        self._held[name] = len(args)
+
+    # cuFuncGetParamInfo's answer past a kernel's last parameter
+    _ERROR_INVALID_VALUE = 1
+
+    def param_sizes(self, name: str) -> tuple[int, ...] | None:
+        """kernel `name`'s parameters, each one's size in bytes in order, as the driver reports them
+        (cuFuncGetParamInfo, CUDA 12.4's drivers on); None where the driver cannot say. A whole answer is kept for the
+        process; a failed one (the driver unable to answer on this thread now) is not, and is asked again next time"""
+        if name in self._params:
+            return self._params[name]
+        f = self._param_info
+        if f is None:
+            self._params[name] = None
+            return None
+        out: list[int] = []
+        off, size = ctypes.c_size_t(), ctypes.c_size_t()
+        while len(out) < 256:
+            rc = f(self.fn[name], ctypes.c_size_t(len(out)), ctypes.byref(off), ctypes.byref(size))
+            if rc == self._ERROR_INVALID_VALUE:  # past the last parameter: the list is whole
+                sizes = self._params[name] = tuple(out)
+                return sizes
+            if rc != 0:
+                return None
+            out.append(int(size.value))
+        return None
+
     def close(self) -> None:
         """The module unloaded - its code and the driver's copy of the image - and the primary context's retain
         given back; the function handles go with it. Safe to call twice"""
@@ -1179,10 +1325,6 @@ class _Cuda:
         self.fn = {}
         self._call("cuModuleUnload", module)
         self._call("cuDevicePrimaryCtxRelease", self._retained)
-
-    @staticmethod
-    def ptr(t: torch.Tensor | None) -> ctypes.c_void_p:
-        return ctypes.c_void_p(0 if t is None else t.data_ptr())
 
     def mx4_widen(
         self, blocks: torch.Tensor, scales: torch.Tensor, seats: torch.Tensor, out: torch.Tensor | None = None
@@ -1210,12 +1352,14 @@ class _Cuda:
         elif out.dtype != torch.bfloat16 or not out.is_contiguous() or out.numel() != n * groups * 32:
             raise ValueError(f"[cuda] mx4_widen: out must be {n * groups * 32} contiguous bf16")
         if n:
-            P = self.ptr
-            self.launch(
-                "btb_mx4_widen",
+            self.btb_mx4_widen(
                 ((groups + 255) // 256, n, 1),
                 (256, 1, 1),
-                [P(blocks), P(scales), P(seats), ctypes.c_longlong(groups), P(out)],
+                self.ptr(Mx4Blocks, blocks),
+                self.ptr(Mx4Scales, scales),
+                self.ptr(Seats, seats),
+                Mx4Groups(groups),
+                self.ptr(Widened, out),
             )
         return out
 
@@ -1282,37 +1426,33 @@ class _Cuda:
             )
         if parents is not None and (parents.dtype != torch.int32 or parents.numel() != T or not parents.is_cuda):
             raise ValueError(f"[cuda] delta_nodes: parents must be {T} int32 on the card")
-        P = self.ptr
         shared = (2 * dk + 2 * dv + self.DELTA_THREADS) * 4
-        self.launch(
-            "btb_delta_nodes",
+        self.btb_delta_nodes(
             (hv, 1, 1),
             (self.DELTA_THREADS, 1, 1),
-            [
-                P(mixed),
-                P(z),
-                P(a),
-                P(b),
-                P(conv_w),
-                P(conv_b),
-                P(conv0),
-                P(state),
-                P(scratch),
-                P(parents),
-                P(a_log),
-                P(dt_bias),
-                P(norm_w),
-                ctypes.c_float(float(eps)),
-                ctypes.c_int(int(gate)),
-                ctypes.c_int(T),
-                ctypes.c_int(C),
-                ctypes.c_int(K),
-                ctypes.c_int(int(hk)),
-                ctypes.c_int(int(hv)),
-                ctypes.c_int(int(dk)),
-                ctypes.c_int(int(dv)),
-                P(out),
-            ],
+            self.ptr(DeltaMixed, mixed),
+            self.ptr(DeltaZ, z),
+            self.ptr(DeltaA, a),
+            self.ptr(DeltaB, b),
+            self.ptr(ConvWeight, conv_w),
+            self.ptr(ConvBias, conv_b),
+            self.ptr(ConvState, conv0),
+            self.ptr(DeltaState, state),
+            self.ptr(DeltaScratch, scratch),
+            self.ptr(TreeParents, parents),
+            self.ptr(DeltaALog, a_log),
+            self.ptr(DeltaDtBias, dt_bias),
+            self.ptr(DeltaNormWeight, norm_w),
+            NormEps(float(eps)),
+            DeltaGate(int(gate)),
+            Rows(T),
+            ConvChannels(C),
+            ConvTaps(K),
+            DeltaKHeads(int(hk)),
+            DeltaVHeads(int(hv)),
+            DeltaKDim(int(dk)),
+            DeltaVDim(int(dv)),
+            self.ptr(DeltaOutF32, out),
             shared=shared,
         )
 
@@ -1373,9 +1513,9 @@ class _Cuda:
             )
 
     @staticmethod
-    def _at(t: torch.Tensor, off: int) -> ctypes.c_void_p:
-        """the address of element `off` of contiguous `t`"""
-        return ctypes.c_void_p(t.data_ptr() + int(off) * t.element_size())
+    def _at(role: Callable[[int], _R], t: torch.Tensor, off: int) -> _R:
+        """element `off` of contiguous `t` as an argument of `role` (`ptr`'s, past the start)"""
+        return role(t.data_ptr() + int(off) * t.element_size())
 
     def hc_rmsnorm(
         self,
@@ -1405,12 +1545,18 @@ class _Cuda:
         ):
             raise ValueError(f"[cuda] hc_rmsnorm: shapes do not agree (T {T}, {G} streams of {H})")
         if T:
-            P, ci = self.ptr, ctypes.c_int
-            self.launch(
-                "btb_hc_rmsnorm",
+            self.btb_hc_rmsnorm(
                 (T, G, 1),
                 (256, 1, 1),
-                [P(h), P(y), P(inj), P(w), ctypes.c_float(float(eps)), P(x), ci(H), ci(G), ci(int(bool(centered)))],
+                self.ptr(Streams, h),
+                self.ptr(BlockOut, y),
+                self.ptr(Inject, inj),
+                self.ptr(NormWeight, w),
+                NormEps(float(eps)),
+                self.ptr(Normed, x),
+                Hidden(H),
+                StreamCount(G),
+                NormCentered(int(bool(centered))),
             )
 
     def hc_act(self, dn: torch.Tensor, act: torch.Tensor, streams: int) -> None:
@@ -1422,12 +1568,14 @@ class _Cuda:
             raise ValueError(f"[cuda] hc_act: shapes do not agree (dn {tuple(dn.shape)}, act {tuple(act.shape)})")
         T, R = (int(s) for s in act.shape)
         if T and R:
-            ci = ctypes.c_int
-            self.launch(
-                "btb_hc_act",
+            self.btb_hc_act(
                 ((R + 255) // 256, T, 1),
                 (256, 1, 1),
-                [self.ptr(dn), ci(int(dn.shape[1])), self.ptr(act), ci(R), ci(G)],
+                self.ptr(MixDown, dn),
+                MixDownStride(int(dn.shape[1])),
+                self.ptr(MixAct, act),
+                MixRank(R),
+                StreamCount(G),
             )
 
     def hc_mix(
@@ -1456,13 +1604,19 @@ class _Cuda:
         ):
             raise ValueError(f"[cuda] hc_mix: shapes do not agree (T {T}, {G} streams of {H}, lowrank {R})")
         if T:
-            P, ci = self.ptr, ctypes.c_int
             ds = int(dn.shape[1]) if dn is not None else 0
-            self.launch(
-                "btb_hc_mix",
+            self.btb_hc_mix(
                 ((H + 255) // 256, T, 1),
                 (256, 1, 1),
-                [P(xn), P(up), P(dn), ci(ds), P(mixed), P(inj), ci(H), ci(G), ci(R)],
+                self.ptr(Normed, xn),
+                self.ptr(MixUp, up),
+                self.ptr(MixDown, dn),
+                MixDownStride(ds),
+                self.ptr(Mixed, mixed),
+                self.ptr(Inject, inj),
+                Hidden(H),
+                StreamCount(G),
+                MixRank(R),
             )
 
     ROUTE_MAX_K = 32  # ROUTE_MAX_K in btb_kernels.cu
@@ -1520,24 +1674,20 @@ class _Cuda:
                     f"[cuda] moe_route: {', '.join(bad) or 'cnt, seq'} must be pinned host rows of the pass"
                 )
         if T:
-            P, ci = self.ptr, ctypes.c_int
-            self.launch(
-                "btb_moe_route",
+            self.btb_moe_route(
                 (T, 1, 1),
                 (256, 1, 1),
-                [
-                    P(logits),
-                    ci(int(logits.shape[1])),
-                    ci(E),
-                    ci(k),
-                    P(idx),
-                    P(w),
-                    P(hidx),
-                    P(hw),
-                    P(cnt),
-                    P(seq),
-                    P(hseq),
-                ],
+                self.ptr(RouterLogits, logits),
+                RouterStride(int(logits.shape[1])),
+                Experts(E),
+                TopExperts(k),
+                self.ptr(ExpertIds, idx),
+                self.ptr(ExpertWeights, w),
+                self.ptr(HostExpertIds, hidx),
+                self.ptr(HostExpertWeights, hw),
+                self.ptr(RouteCount, cnt),
+                self.ptr(RouteSeq, seq),
+                self.ptr(HostRouteSeq, hseq),
                 shared=E * 4,
             )
 
@@ -1553,12 +1703,15 @@ class _Cuda:
         if logits.shape[0] != T or not 0 <= int(gate_col) < int(logits.shape[1]):
             raise ValueError(f"[cuda] moe_combine: shapes do not agree (logits {tuple(logits.shape)}, col {gate_col})")
         if T and H:
-            P, ci = self.ptr, ctypes.c_int
-            self.launch(
-                "btb_moe_combine",
+            self.btb_moe_combine(
                 ((H + 255) // 256, T, 1),
                 (256, 1, 1),
-                [P(yr), P(ys), self._at(logits, int(gate_col)), ci(int(logits.shape[1])), P(y), ci(H)],
+                self.ptr(Routed, yr),
+                self.ptr(SharedOut, ys),
+                self._at(SharedGate, logits, int(gate_col)),
+                RouterStride(int(logits.shape[1])),
+                self.ptr(MoeOut, y),
+                Hidden(H),
             )
 
     def _gate_args(
@@ -1585,20 +1738,16 @@ class _Cuda:
             raise ValueError(f"[cuda] sigmoid_mul: shapes do not agree (out {tuple(out.shape)})")
         T, C = (int(s) for s in att.shape)
         if T:
-            ci = ctypes.c_int
-            self.launch(
-                "btb_sigmoid_mul",
+            self.btb_sigmoid_mul(
                 ((C + 255) // 256, T, 1),
                 (256, 1, 1),
-                [
-                    self.ptr(att),
-                    self._at(qkv, gate_off),
-                    ci(int(qkv.shape[1])),
-                    ci(int(head_dim)),
-                    ci(int(gate_stride)),
-                    self.ptr(out),
-                    ci(C),
-                ],
+                self.ptr(AttnOut, att),
+                self._at(OutGate, qkv, gate_off),
+                GateRowStride(int(qkv.shape[1])),
+                HeadDim(int(head_dim)),
+                GateHeadStride(int(gate_stride)),
+                self.ptr(GatedAttn, out),
+                AttnWidth(C),
             )
 
     GEMV_ROWS = (1, 2, 4, 8, 16, 32)  # the M of btb_gemv_*_bf16_m{M}
@@ -1630,22 +1779,19 @@ class _Cuda:
                 f"[cuda] gemv_sgate: shapes do not agree (w {tuple(w.shape)}, att {tuple(att.shape)}, M {M})"
             )
         R = int(w.shape[0])
-        ci = ctypes.c_int
-        self.launch(
-            f"btb_gemv_sgate_bf16_m{M}",
+        self.btb_gemv_sgate_bf16(
+            M,
             ((R + 3) // 4, 1, 1),
             (128, 1, 1),
-            [
-                self.ptr(w),
-                self.ptr(att),
-                self._at(qkv, gate_off),
-                ci(int(qkv.shape[1])),
-                ci(int(head_dim)),
-                ci(int(gate_stride)),
-                self.ptr(y),
-                ci(R),
-                ci(C),
-            ],
+            self.ptr(Weight, w),
+            self.ptr(AttnOut, att),
+            self._at(OutGate, qkv, gate_off),
+            GateRowStride(int(qkv.shape[1])),
+            HeadDim(int(head_dim)),
+            GateHeadStride(int(gate_stride)),
+            self.ptr(MatOut, y),
+            OutDim(R),
+            InDim(C),
         )
 
     def norm_rope_part(
@@ -1716,36 +1862,33 @@ class _Cuda:
                 f"rot {rot})"
             )
         if T:
-            P, ci = self.ptr, ctypes.c_int
-            self.launch(
-                f"btb_norm_rope_part_d{D}",
+            self.btb_norm_rope_part(
+                D,
                 (Hq + Hk + (Hk if V is not None else 0), T, 1),
                 (32, 1, 1),
-                [
-                    self._at(qkv, q0),
-                    ci(width),
-                    ci(qs),
-                    ci(ko - q0),
-                    ci(max(0, vo - q0)),
-                    P(wq),
-                    P(wk),
-                    ctypes.c_float(float(eps)),
-                    P(cos),
-                    P(sin),
-                    ci(rot),
-                    ci(rot),
-                    P(n0),
-                    P(depth),
-                    P(K),
-                    P(V),
-                    P(qo),
-                    ci(Hq),
-                    ci(Hk),
-                    ci(int(K.stride(0))),  # head g's slot j at g * hs + j * rs: either layout of [Hk, cap, D]
-                    ci(int(K.stride(1))),
-                    ci(int(bool(centered))),
-                    ci(int(bool(raw_key))),
-                ],
+                self._at(Qkv, qkv, q0),
+                QkvWidth(width),
+                QHeadStride(qs),
+                KColumn(ko - q0),
+                VColumn(max(0, vo - q0)),
+                self.ptr(QNorm, wq),
+                self.ptr(KNorm, wk),
+                NormEps(float(eps)),
+                self.ptr(RopeCos, cos),
+                self.ptr(RopeSin, sin),
+                RopeStride(rot),
+                RopeDims(rot),
+                self.ptr(PrefixLen, n0),
+                self.ptr(Depths, depth),
+                self.ptr(KCache, K),
+                self.ptr(VCache, V),
+                self.ptr(Query, qo),
+                QHeads(Hq),
+                KvHeads(Hk),
+                CacheHeadStride(int(K.stride(0))),  # head g's slot j at g * hs + j * rs: either layout of [Hk, cap, D]
+                CacheRowStride(int(K.stride(1))),
+                NormCentered(int(bool(centered))),
+                KeepRawKey(int(bool(raw_key))),
             )
 
     # -- Qwen4's sparse attention (QSA): the indexer's picks and the attention over them
@@ -1819,25 +1962,22 @@ class _Cuda:
         di, _cap, rot = self._qsa_keys("qsa_pool", raw, pk, cos, sin, kw, ratio)
         if pk_len.numel() != 2 or n0.numel() != 1 or int(max_new) < 1:
             raise ValueError(f"[cuda] qsa_pool: shapes do not agree (pk_len {pk_len.numel()}, max_new {max_new})")
-        P, ci = self.ptr, ctypes.c_int
-        self.launch(
-            f"btb_qsa_pool_d{di}",
+        self.btb_qsa_pool(
+            di,
             ((int(max_new) + 7) // 8, 1, 1),
             (256, 1, 1),
-            [
-                P(raw),
-                P(pk),
-                P(pk_len),
-                P(n0),
-                P(cos),
-                P(sin),
-                ci(rot),
-                ci(rot),
-                P(kw),
-                ctypes.c_float(float(eps)),
-                ci(int(ratio)),
-                ci(int(max_new)),
-            ],
+            self.ptr(IdxRawKey, raw),
+            self.ptr(IdxPooled, pk),
+            self.ptr(IdxPooledLen, pk_len),
+            self.ptr(PrefixLen, n0),
+            self.ptr(RopeCos, cos),
+            self.ptr(RopeSin, sin),
+            RopeStride(rot),
+            RopeDims(rot),
+            self.ptr(IdxKNorm, kw),
+            NormEps(float(eps)),
+            BlockRatio(int(ratio)),
+            MaxNewBlocks(int(max_new)),
         )
 
     def qsa_select(
@@ -1886,32 +2026,29 @@ class _Cuda:
             raise ValueError(
                 f"[cuda] qsa_select: shapes do not agree (T {T}, {Hi} index heads of {di}, k_top {k}, NBcap {NB})"
             )
-        P, ci = self.ptr, ctypes.c_int
-        self.launch(
-            f"btb_qsa_select_d{di}",
+        self.btb_qsa_select(
+            di,
             (T, 1, 1),
             (self.QSA_THREADS, 1, 1),
-            [
-                P(qi),
-                P(pk),
-                P(raw),
-                P(n0),
-                P(par),
-                P(cos),
-                P(sin),
-                ci(rot),
-                ci(rot),
-                P(kw),
-                ctypes.c_float(float(eps)),
-                ci(T),
-                ci(Hi),
-                ci(int(ratio)),
-                ci(k),
-                ci(NB),
-                P(scores),
-                P(sel),
-                P(nsel),
-            ],
+            self.ptr(IdxQuery, qi),
+            self.ptr(IdxPooled, pk),
+            self.ptr(IdxRawKey, raw),
+            self.ptr(PrefixLen, n0),
+            self.ptr(TreeParents, par),
+            self.ptr(RopeCos, cos),
+            self.ptr(RopeSin, sin),
+            RopeStride(rot),
+            RopeDims(rot),
+            self.ptr(IdxKNorm, kw),
+            NormEps(float(eps)),
+            Rows(T),
+            IdxHeads(Hi),
+            BlockRatio(int(ratio)),
+            TopBlocks(k),
+            PooledCap(NB),
+            self.ptr(IdxScores, scores),
+            self.ptr(PickedBlocks, sel),
+            self.ptr(PickedCount, nsel),
             shared=Hi * di * 2,
         )
 
@@ -1972,33 +2109,30 @@ class _Cuda:
                 f"[cuda] qsa_attn_split: shapes do not agree (T {T}, heads {Hq}/{Hk}, head_dim {D}, k_top {k}, "
                 f"ratio {ratio}, {S} splits)"
             )
-        P, ci = self.ptr, ctypes.c_int
-        self.launch(
-            f"btb_qsa_attn_split_d{D}",
+        self.btb_qsa_attn_split(
+            D,
             (Hq, T, S),
             (256, 1, 1),
-            [
-                P(q),
-                P(K),
-                P(V),
-                P(out),
-                P(n0),
-                P(par),
-                P(sel),
-                P(nsel),
-                ci(int(ratio)),
-                ci(k),
-                ci(T),
-                ci(Hq),
-                ci(Hk),
-                ci(int(K.stride(0))),  # head g's row j at g * hs + j * rs: either layout of [Hk, cap, D]
-                ci(int(K.stride(1))),
-                ctypes.c_float(float(scale)),
-                P(part_m),
-                P(part_l),
-                P(part_acc),
-                P(cnt),
-            ],
+            self.ptr(Query, q),
+            self.ptr(KCache, K),
+            self.ptr(VCache, V),
+            self.ptr(AttnOut, out),
+            self.ptr(PrefixLen, n0),
+            self.ptr(TreeParents, par),
+            self.ptr(PickedBlocks, sel),
+            self.ptr(PickedCount, nsel),
+            BlockRatio(int(ratio)),
+            TopBlocks(k),
+            Rows(T),
+            QHeads(Hq),
+            KvHeads(Hk),
+            CacheHeadStride(int(K.stride(0))),  # head g's row j at g * hs + j * rs: either layout of [Hk, cap, D]
+            CacheRowStride(int(K.stride(1))),
+            AttnScale(float(scale)),
+            self.ptr(PartMax, part_m),
+            self.ptr(PartSum, part_l),
+            self.ptr(PartAcc, part_acc),
+            self.ptr(Arrivals, cnt),
         )
 
     def gemv_lane16(self, w: torch.Tensor, x: torch.Tensor, y: torch.Tensor) -> None:
@@ -2015,12 +2149,15 @@ class _Cuda:
                 f"[cuda] gemv_lane16: shapes do not agree (w {tuple(w.shape)}, x {tuple(x.shape)}, y {tuple(y.shape)})"
             )
         if R:
-            ci = ctypes.c_int
-            self.launch(
-                f"btb_gemv_lane16_f32_m{M}",
+            self.btb_gemv_lane16_f32(
+                M,
                 ((R + 7) // 8, 1, 1),
                 (128, 1, 1),
-                [self.ptr(w), self.ptr(x), self.ptr(y), ci(R), ci(C)],
+                self.ptr(Weight, w),
+                self.ptr(MatInF32, x),
+                self.ptr(MatOutF32, y),
+                OutDim(R),
+                InDim(C),
             )
 
     def gemv_lane16_mx4(self, w: Any, x: torch.Tensor, y: torch.Tensor) -> None:
@@ -2040,12 +2177,16 @@ class _Cuda:
         if w.blocks.numel() != R * C // 2 or w.scales.numel() != R * C // 32:
             raise ValueError(f"[cuda] gemv_lane16_mx4: w {w.shape} needs {R * C // 2} + {R * C // 32} bytes")
         if R:
-            ci = ctypes.c_int
-            self.launch(
-                f"btb_gemv_lane16_mx4_f32_m{M}",
+            self.btb_gemv_lane16_mx4_f32(
+                M,
                 ((R + 7) // 8, 1, 1),
                 (128, 1, 1),
-                [self.ptr(w.blocks), self.ptr(w.scales), self.ptr(x), self.ptr(y), ci(R), ci(C)],
+                self.ptr(Mx4Blocks, w.blocks),
+                self.ptr(Mx4Scales, w.scales),
+                self.ptr(MatInF32, x),
+                self.ptr(MatOutF32, y),
+                OutDim(R),
+                InDim(C),
             )
 
     PLE_WALK = 32  # the ancestors btb_ple_conv's walk follows (its path[32])
@@ -2105,31 +2246,35 @@ class _Cuda:
                 f"kv {tuple(kv.shape)}, pre {tuple(pre.shape)}{', update over several rows' if update and T != 1 else ''})"
             )
         inv_h = float(torch.tensor(1.0, dtype=torch.float32) / torch.tensor(math.sqrt(H), dtype=torch.float32))
-        P, ci, cf = self.ptr, ctypes.c_int, ctypes.c_float
-        self.launch(
-            "btb_ple_gate",
+        self.btb_ple_gate(
             (T, G, 1),
             (256, 1, 1),
-            [
-                P(kv),
-                ci(C + H),
-                P(xq),
-                P(wk),
-                P(wc),
-                cf(float(eps)),
-                cf(inv_h),
-                P(par),
-                P(gated),
-                P(normed),
-                ci(H),
-                ci(G),
-            ],
+            self.ptr(PleKv, kv),
+            PleKvStride(C + H),
+            self.ptr(PleQuery, xq),
+            self.ptr(PleKNorm, wk),
+            self.ptr(PleConvNorm, wc),
+            NormEps(float(eps)),
+            InvSqrtHidden(inv_h),
+            self.ptr(TreeParents, par),
+            self.ptr(PleGated, gated),
+            self.ptr(PleNormed, normed),
+            Hidden(H),
+            StreamCount(G),
         )
-        self.launch(
-            "btb_ple_conv",
+        self.btb_ple_conv(
             ((C + 255) // 256, T, 1),
             (256, 1, 1),
-            [P(gated), P(normed), P(conv_w), P(pre), P(par), P(h), ci(C), ci(K), ci(dil), ci(int(bool(update)))],
+            self.ptr(PleGated, gated),
+            self.ptr(PleNormed, normed),
+            self.ptr(PleConvWeight, conv_w),
+            self.ptr(PleWindow, pre),
+            self.ptr(TreeParents, par),
+            self.ptr(Streams, h),
+            ConvChannels(C),
+            ConvTaps(K),
+            ConvDilation(dil),
+            PleUpdate(int(bool(update))),
         )
 
     def delta_nodes_bf16(
@@ -2209,39 +2354,35 @@ class _Cuda:
             if t is not None and (scratch is None or t.numel() != T):
                 raise ValueError(f"[cuda] delta_nodes_bf16: {n} must be {T} int32 on the card, with a scratch")
         if T:
-            P, ci = self.ptr, ctypes.c_int
-            self.launch(
-                "btb_delta_nodes_bf16",
+            self.btb_delta_nodes_bf16(
                 (hv, 1, 1),
                 (self.DELTA_THREADS, 1, 1),
-                [
-                    P(proj),
-                    ci(ps),
-                    ci(oq),
-                    ci(oz),
-                    ci(ob),
-                    ci(oa),
-                    P(rows),
-                    P(conv_w),
-                    P(conv_b),
-                    P(conv0),
-                    P(state),
-                    P(scratch),
-                    P(slots),
-                    P(parents),
-                    P(a_log),
-                    P(dt_bias),
-                    P(norm_w),
-                    ctypes.c_float(float(eps)),
-                    ci(int(gate)),
-                    ci(T),
-                    ci(K),
-                    ci(int(hk)),
-                    ci(int(hv)),
-                    ci(int(dk)),
-                    ci(int(dv)),
-                    P(out),
-                ],
+                self.ptr(DeltaProj, proj),
+                ProjStride(ps),
+                QkvColumn(oq),
+                ZColumn(oz),
+                BColumn(ob),
+                AColumn(oa),
+                self.ptr(ProjRows, rows),
+                self.ptr(ConvWeight, conv_w),
+                self.ptr(ConvBias, conv_b),
+                self.ptr(ConvState, conv0),
+                self.ptr(DeltaState, state),
+                self.ptr(DeltaScratch, scratch),
+                self.ptr(ScratchSlots, slots),
+                self.ptr(TreeParents, parents),
+                self.ptr(DeltaALog, a_log),
+                self.ptr(DeltaDtBias, dt_bias),
+                self.ptr(DeltaNormWeight, norm_w),
+                NormEps(float(eps)),
+                DeltaGate(int(gate)),
+                Rows(T),
+                ConvTaps(K),
+                DeltaKHeads(int(hk)),
+                DeltaVHeads(int(hv)),
+                DeltaKDim(int(dk)),
+                DeltaVDim(int(dv)),
+                self.ptr(DeltaOut, out),
                 shared=(2 * dk + 2 * dv + self.DELTA_THREADS) * 4,
             )
 
@@ -2268,21 +2409,17 @@ class _Cuda:
         ):
             raise ValueError(f"[cuda] conv_window: shapes do not agree (C {C}, K {K}, n {n}, proj {tuple(proj.shape)})")
         if C:
-            ci = ctypes.c_int
-            self.launch(
-                "btb_conv_window",
+            self.btb_conv_window(
                 ((C + 255) // 256, 1, 1),
                 (256, 1, 1),
-                [
-                    self.ptr(conv),
-                    self.ptr(proj),
-                    ci(int(proj.shape[1])),
-                    ci(int(q_off)),
-                    self.ptr(rows),
-                    ci(n),
-                    ci(C),
-                    ci(K),
-                ],
+                self.ptr(ConvState, conv),
+                self.ptr(DeltaProj, proj),
+                ProjStride(int(proj.shape[1])),
+                QkvColumn(int(q_off)),
+                self.ptr(ProjRows, rows),
+                Rows(n),
+                ConvChannels(C),
+                ConvTaps(K),
             )
 
     def pick(self, x: torch.Tensor, keys: Sequence[int], temperature: float, top_k: int, top_p: float) -> torch.Tensor:
@@ -2310,37 +2447,57 @@ class _Cuda:
         gcarry = torch.empty(R, dtype=torch.int64, device=x.device)
         gbest = torch.zeros(R, dtype=torch.int64, device=x.device)
         out = torch.empty(R, dtype=torch.int32, device=x.device)
-        P, I = self.ptr, ctypes.c_int
         nb = min(max(1, (V + 1023) // 1024), 4 * self.sms)  # blocks a row (grid-stride); an ordinary launch
-        self.launch("btb_sample_max", (nb, R, 1), (1024, 1, 1), [P(x), I(V), P(fp), P(gM)])
+        logits, vocab, params = self.ptr(Logits, x), Vocab(V), self.ptr(SampleParams, fp)
+        self.btb_sample_max((nb, R, 1), (1024, 1, 1), logits, vocab, params, self.ptr(SampleMax, gM))
 
         def levels(mode: int, prefix: torch.Tensor, floor: torch.Tensor) -> None:
             for lvl in (0, 1, 2):  # three radix levels = the exact 32-bit threshold, bit-for-bit with the CPU kernel
                 ghist.zero_()
-                self.launch(
-                    "btb_sample_hist",
+                self.btb_sample_hist(
                     (nb, R, 1),
                     (1024, 1, 1),
-                    [P(x), I(V), P(fp), I(lvl), I(mode), P(gM), P(prefix), P(floor), P(ghist)],
+                    logits,
+                    vocab,
+                    params,
+                    RadixLevel(lvl),
+                    SampleMode(mode),
+                    self.ptr(SampleMax, gM),
+                    self.ptr(RadixPrefix, prefix),
+                    self.ptr(RadixFloor, floor),
+                    self.ptr(RadixHist, ghist),
                 )
-                self.launch(
-                    "btb_sample_bin",
+                self.btb_sample_bin(
                     (R, 1, 1),
                     (1024, 1, 1),
-                    [I(lvl), I(mode), I(int(top_k)), P(fp), P(ghist), P(prefix), P(gcarry)],
+                    RadixLevel(lvl),
+                    SampleMode(mode),
+                    TopK(int(top_k)),
+                    params,
+                    self.ptr(RadixHist, ghist),
+                    self.ptr(RadixPrefix, prefix),
+                    self.ptr(RadixCarry, gcarry),
                 )
 
         if 0 < top_k < V:
             levels(0, gpreK, gpreP)  # gpreP is 0 here, so the top-k floor is 0
         if top_p < 1.0:
             levels(1, gpreP, gpreK)  # the top-p mass over the tokens the top-k kept
-        self.launch(
-            "btb_sample_draw",
+        self.btb_sample_draw(
             (nb, R, 1),
             (1024, 1, 1),
-            [P(x), P(kk), I(V), P(fp), P(gM), P(gpreK), P(gpreP), P(gbest)],
+            logits,
+            self.ptr(NoiseKeys, kk),
+            vocab,
+            params,
+            self.ptr(SampleMax, gM),
+            self.ptr(TopKFloor, gpreK),
+            self.ptr(TopPFloor, gpreP),
+            self.ptr(SampleBest, gbest),
         )
-        self.launch("btb_sample_out", ((R + 255) // 256, 1, 1), (256, 1, 1), [P(gbest), P(out), I(R)])
+        self.btb_sample_out(
+            ((R + 255) // 256, 1, 1), (256, 1, 1), self.ptr(SampleBest, gbest), self.ptr(SampledTokens, out), Rows(R)
+        )
         return out.to(torch.int64)
 
     def verify(
@@ -2374,11 +2531,19 @@ class _Cuda:
         hasq = hasq.contiguous().to(torch.int32)
         fp = torch.tensor([1.0 / temperature, float(top_p)], dtype=torch.float32, device=x.device)
         out = torch.empty(T, dtype=torch.int32, device=x.device)
-        P, I = self.ptr, ctypes.c_int
-        self.launch(
-            "btb_sample_verify",
+        self.btb_sample_verify(
             (T, 1, 1),
             (1024, 1, 1),
-            [P(x), P(q), P(kids), P(hasq), P(kk), I(V), I(Vd), I(C), I(int(top_k)), P(fp), P(out)],
+            self.ptr(Logits, x),
+            self.ptr(DraftProbs, q),
+            self.ptr(DraftKids, kids),
+            self.ptr(HasDraftProbs, hasq),
+            self.ptr(NoiseKeys, kk),
+            Vocab(V),
+            DraftVocab(Vd),
+            DraftWidth(C),
+            TopK(int(top_k)),
+            self.ptr(SampleParams, fp),
+            self.ptr(VerifyPicks, out),
         )
         return out.to(torch.int64) & 0xFFFFFFFF  # the packing is unsigned: a slot past 126 sets the sign bit

@@ -1,13 +1,101 @@
 # Benchmarking
 
-Three tools, all on one question set (`bench/questions.jsonl`) at greedy decoding (temperature 0) so the numbers
-are reproducible and comparable across machines and engines:
+- `btb bench`: the machine. What the hardware is, and how fast each op btb runs goes on it.
+- `btb bench MODEL --prompts ...`: one model, btb only.
+- `bench/matrix.py`: btb across every device configuration and model on the machine, and the rival engines.
+- `bench/compare.py`: one rival engine, run from `.venv-compare`.
 
-- `btb bench` — one model, btb only.
-- `bench/matrix.py` — btb across every device configuration and model on the machine, and the rival engines.
-- `bench/compare.py` — one rival engine, run from `.venv-compare`.
+The model benches all use one question set (`bench/questions.jsonl`) at greedy decoding (temperature 0), so the
+numbers are reproducible and comparable across machines and engines. `tok/s` is the decode rate after the first
+token, averaged over the prompts.
 
-`tok/s` is the decode rate after the first token, averaged over the prompts.
+## The machine
+
+```sh
+btb bench
+```
+
+The report runs without a model, in two parts.
+
+**What the machine is**, as the OS and the drivers report it:
+
+- **CPU**: the model, its cores (a hybrid's performance and efficiency cores apart) and threads, and the rated
+  and boost clocks the OS gives.
+- **CPU features**: what the native library detects (AVX2, FMA, AVX-VNNI, AVX-512 and its BF16/VNNI parts, AMX,
+  NEON, dotprod, i8mm, SVE), the kernel tier it picked, and torch's own tier.
+- **Caches**: each level's instances: how many, their size, and how many threads share one (a P-core's own L2,
+  an efficiency cluster's shared L2, each chiplet's L3), the level's total, and the smallest share a thread gets
+  with every thread busy (a 13700K's L2: 1 MB a thread). Every OS is read to the same form, so a CPU reports the
+  same on Windows, Linux and macOS. The totals count every instance, as `lscpu` and Task Manager do: a
+  two-chiplet Ryzen's L3 is 64 MB. The engine plans with two figures a level, the smallest instance (a thread
+  alone) and the smallest share (every thread busy); the totals only size the bench's pools.
+- **Memory**: total and available. The modules the firmware lists (SMBIOS): their type, form, size, rated and
+  running speed in MT/s, and maker and part. Where the board names the channels, the channel count and the peak
+  rate they make. Linux's SMBIOS table is readable by root only; without root the modules come from the copy
+  systemd's udev keeps (systemd 248 and later). macOS lists no modules.
+- **Each card**: memory, compute capability, SMs and clock, L2. The memory bus and clock with the peak rate they
+  make. The PCIe link now and at most, the driver, and the power limit.
+- **The drives**: each folder's free space.
+
+**What it does**: each op timed where it runs, and swept across the sizes it runs at. A sweep shows where a
+cache ends, where a call's fixed cost stops mattering, and where an op turns from the memory's rate to the
+compute's.
+
+- **memory**: the host's read rate by working set (32 KB to 1 GB, plus half and twice each cache size the OS
+  lists, so every cache's edge falls between two points), on every thread and on one, and its copy.
+  A set is re-read in place, so one that fits a cache is read from it and the rate steps down at each cache's
+  edge. Then the native gemv's stream by thread count, where the memory saturates. Rates past the L3 are shown
+  as a share of the modules' peak.
+- **cpu**: the native kernels.
+  - The bf16 gemv by weight size (512² to 8192²), held in a cache and streamed.
+  - The gemv by rows (1 to 256) against torch's float32 GEMM by rows (16 to 2048), and the row count from which
+    the GEMM is faster on this machine, beside the 64 the engine switches at.
+  - Torch's bf16 matmul.
+  - A mixture's grouped experts by count, MXFP4 by rows (as stored, grouped, and as a GGUF stores it), FP8 and
+    pack-12 by rows.
+  - Decode attention by context (512 to 128k rows) and over a tree's nodes by count.
+  - The DeltaNet step, the sampler by vocabulary, and torch's prefill attention by rows.
+- **cuda:N**: the card's own kernels and torch's.
+  - The card's read by working set (1 MB to 1 GB, its L2 against its DRAM) and copy.
+  - btb's gemv by rows (1 to 32), plain and on the tensor cores.
+  - The one-row gemv by weight size, streamed and held in the L2, and the tensor-core gemv at 16 and 8 rows a
+    warp on a short weight.
+  - The fused gate and up, the down projection with the activation folded in, the host's bit-exact gemvs, and
+    the MXFP4 widening.
+  - Decode attention by context, a tree's verify over long contexts, and a fork's rows by count.
+  - The q/k norm with rope and cache write, the norms, the activations, the router and the shared-expert
+    combine, Qwen4's output gate (alone and folded into o_proj), the DeltaNet step, and the sampler by
+    vocabulary.
+  - btb's prompt GEMM by rows (64 to 4096), on the tensor cores and on the fp32 chain, beside cuBLAS by rows
+    (1 to 4096) and square by size.
+  - btb's prefill attention by rows beside torch's, and grouped experts by the rows each takes.
+- **bus**: copies each way by size (4 KB to 256 MB), pinned and pageable, as the engine pays them (the copy and
+  the wait). They are held to the PCIe link, read while a copy is in flight because a card trains its link down
+  when idle. Then a hidden row's round trip.
+- **mlx** (Apple silicon): the Metal gemv by weight size and decode attention by context.
+- **drive**: a file written in the folder, each write flushed, 32 MB and 1 MB at a time. Then btb's own
+  unbuffered reader on it:
+  - reads one at a time by size (4 KB to 128 MB, an expert's span among them);
+  - an expert's span and a 4 KB read with 4 and 16 in flight;
+  - the reading rule btb's Route would draw from those reads.
+
+  The file is removed afterwards.
+
+Every point is sampled until its median's 95% confidence interval is within `--ci` of the median (default
+±2%), or for `--max-seconds` (default 15), whichever comes first. A quiet machine settles most points in well
+under a second. A point that is still wider when its time runs out is marked `~`, and its interval is shown as
+it stood. The interval is distribution-free (the order statistics around the median), so a noisy machine's
+stalls widen it instead of dragging the median. Streamed weights rotate through pools sized past the machine's
+own L3 and L2, so each call reads memory the way a decode step's layers do. A point whose operands would take more
+than 1/8 of the free RAM, or 1/4 of the card's free memory, is skipped and its row says so; an op whose setup fails
+leaves a row saying why, and the report goes on. So the report runs on a 4 GB machine without a card as well as on a
+64 GB one: there it skips the points that don't fit. Each row's JSON carries its place in its sweep (`at`: the bytes,
+rows, context, depth...) for plotting.
+
+- `--drive DIR`: time the drive under DIR instead of the Hugging Face cache (repeatable).
+- `--skip memory,cpu,card,bus,mlx,drive`: leave sections out.
+- `-d cuda:N`: the card to time (default: the first). `-d cpu` times no card.
+- `--json`: the whole report as one JSON object on stdout. `--out FILE` writes the same JSON to a file.
 
 ## One model
 
@@ -18,7 +106,9 @@ btb bench Qwen/Qwen3-4B --prompts bench/questions.jsonl
 Times each prompt at 64 / 256 / 1024 new tokens (`--new`). When the model speculates it times both the
 one-token-at-a-time baseline and the speculative run, reporting both rates, first-token latency, tokens per pass,
 peak RAM/VRAM, and how many prompts the two decoded identically (`identical N/M`; speculation is exact, so a
-healthy run is `N/N` and anything less is a bug). Other flags: `--rows I,J`, `--label`, `--out JSONL`.
+healthy run is `N/N` and anything less is a bug). Other flags: `--rows I,J`, `--label`, `--out JSONL`, and
+`--json`, which prints the record `--out` appends (the cells and the engine's report) as one JSON object on stdout,
+with the per-row lines on stderr.
 
 The placement and speed knobs that move these numbers are in [Tuning btb](./tuning.md).
 

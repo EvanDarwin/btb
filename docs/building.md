@@ -62,6 +62,18 @@ them for Linux and Windows only.
 - `--no-cuda` — skip them.
 - `--cuda-only` — build the fatbin and stop.
 
+Every kernel parameter has a role, a typedef in `native/cuda/btb_roles.cuh` (`const Query* __restrict__ q`,
+`QHeads Hq`), and no two parameters of one kernel share one. `python build.py bindings` reads the roles and the
+`extern "C"` signatures and writes the Python side: each role a `NewType` in a marked block of `btb/kinds.py`, and a
+typed launcher function per kernel in `btb/engine/card_launch.py`. A launcher takes anything with a `launch` method
+(the `Launcher` protocol) - btb's card module, or your own with its own module and streams - then the kernel's
+arguments: `btb_attn_flash(k, D, grid, block, ptr(Query, q), ...)`. btb's card module carries each one as a method,
+so `k.btb_attn_flash(D, grid, block, ...)` is the same call. mypy then holds every launch to its kernel's
+parameters, their count, their order and their roles. Run it after
+changing a signature or a role; the CUDA cert (`python -m tests.cert.cuda_ops --check`) fails while the checked-in
+bindings differ from what the sources write, while anything in `btb/` calls `launch` directly, and while a kernel's
+launcher is reached from nowhere.
+
 ## Other build flags
 
 - `--target <triple>` — cross-build for another platform (e.g. `aarch64-unknown-linux-gnu`); the wheel and

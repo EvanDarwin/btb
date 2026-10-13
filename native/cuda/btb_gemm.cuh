@@ -151,15 +151,15 @@ __device__ __forceinline__ void gm_mma(const bf16* __restrict__ w, const bf16* _
 }
 
 extern "C" __global__ void __launch_bounds__(128, GM_BIG_BLOCKS)
-    btb_gemm_mma_bf16(const bf16* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ y, int R, int C,
-                      int T) {
+    btb_gemm_mma_bf16(const Weight* __restrict__ w, const MatIn* __restrict__ x, MatOut* __restrict__ y, OutDim R,
+                      InDim C, Rows T) {
     __shared__ __align__(16) bf16 sm[GM_BIG_STAGES * (128 + 64) * 32];
     gm_mma<2, 2, 4, 4, GM_BIG_STAGES>(w, x, y, R, C, T, sm);
 }
 
 extern "C" __global__ void __launch_bounds__(128, GM_SMALL_BLOCKS)
-    btb_gemm_mma_small_bf16(const bf16* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ y, int R,
-                            int C, int T) {
+    btb_gemm_mma_small_bf16(const Weight* __restrict__ w, const MatIn* __restrict__ x, MatOut* __restrict__ y,
+                            OutDim R, InDim C, Rows T) {
     __shared__ __align__(16) bf16 sm[GM_SMALL_STAGES * (64 + 64) * 32];
     gm_mma<2, 2, 2, 4, GM_SMALL_STAGES>(w, x, y, R, C, T, sm);
 }
@@ -188,8 +188,8 @@ __device__ __forceinline__ void gm_fold(float* a, int lane) {
 }
 
 extern "C" __global__ void __launch_bounds__(128)
-    btb_gemm_f32_bf16(const bf16* __restrict__ w, const bf16* __restrict__ x, bf16* __restrict__ y, int R, int C,
-                      int T) {
+    btb_gemm_f32_bf16(const Weight* __restrict__ w, const MatIn* __restrict__ x, MatOut* __restrict__ y, OutDim R,
+                      InDim C, Rows T) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int xt, wt;
     gm_tile((T + 7) / 8, (R + 31) / 32, GM_GROUP_F32, xt, wt);

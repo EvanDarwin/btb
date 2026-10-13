@@ -578,3 +578,23 @@ fn packed_rejects_bad_pointers_shapes_and_escape_lists() {
     }
     assert_eq!(y, [0.0f32; 8], "a refused call must not write output");
 }
+
+/// The features `btb_cpu_features` lists hold what the tier this process runs needs (a pinned narrower tier
+/// still needs its own), and the C string is the list joined by spaces.
+#[test]
+fn cpu_features_hold_the_tier() {
+    use btb_native::gemv::{cpu_features, isa, Isa};
+    let f = cpu_features();
+    let need: &[&str] = match isa() {
+        Isa::Avx512 => &["avx2", "fma", "avx512f", "avx512bw"],
+        Isa::Avx2 => &["avx2", "fma"],
+        Isa::Neon => &["neon"],
+        Isa::Scalar => &[],
+    };
+    for n in need {
+        assert!(f.contains(n), "{n} missing from {f:?}");
+    }
+    // SAFETY: btb_cpu_features returns a static NUL-terminated string
+    let s = unsafe { std::ffi::CStr::from_ptr(btb_native::btb_cpu_features()) };
+    assert_eq!(s.to_str().expect("ascii"), f.join(" "));
+}

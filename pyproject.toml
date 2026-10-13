@@ -50,6 +50,7 @@ btb = "btb.cli:main"
 [tool.setuptools]
 packages = [
   "btb",
+  "btb.cli",
   "btb.engine",
   "btb.engine.families",
   "btb.engine.families.gemma3",
@@ -101,7 +102,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"btb/cli.py" = ["T20"]
+"btb/cli/console.py" = ["T20"]  # the command line's two streams and its banner
 "btb/serve.py" = ["T20"]        # the server's console lines are its output, not stray debugging
 "bench/*" = ["T20", "SIM105"]   # a try/except/pass around a cleanup remove() reads fine in the bench harness
 "tests/*" = ["T20", "E402", "RUF059"]  # sys.path before btb; an unused shape unpack in a test is not a defect

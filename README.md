@@ -128,6 +128,14 @@ btb chat Qwen/Qwen3-4B
 
 The model path is a local directory or a Hugging Face repo id. A repo not already in the cache is downloaded, and btb asks first, naming the size where the Hub reports it; pass `--confirm` (or set `BTB_CONFIRM=1`) to answer yes ahead of time, which a non-interactive run needs to fetch anything.
 
+### What your machine does
+
+```sh
+btb bench
+```
+
+`btb bench` reports the machine without loading a model. It lists the CPU and the features its kernels use, the memory modules and their speed, each card with its memory and PCIe link, and the drives. Then it times every op btb runs, swept across the sizes it runs at: memory from the caches to DRAM, matmuls by weight size and rows, attention by context, the bus by transfer size, and the drive by read size and depth, read through btb's own reader. Each point is sampled until its 95% confidence interval is within ±2%, or for 15 s, whichever comes first. Attach the output (or `--out report.json`) to an issue about speed. See [Benchmarking](docs/benchmarking.md#the-machine).
+
 ### From code
 
 ```python
@@ -186,7 +194,7 @@ Each command's own arguments (`btb <command> --help` lists them):
 
 - `run PATH`: `-p, --prompt` (else stdin, else a sample prompt), `--file JSONL` (one `{"prompt": ...}` per line, a fresh context each), `--new N`, `--raw` (keep special tokens), `-q, --quiet`, `--json` (one record per prompt), `--out PATH`.
 - `chat PATH`: `--file JSONL` (scripted turns, one `{"user": ...}` per line), `--new N`; `/reset` clears, `/quit` exits.
-- `bench PATH --prompts JSONL`: `--rows I,J,...` (default all), `--new N,N,...` (default `64,256,1024`), `--label LABEL`, `--out JSONL`; always greedy.
+- `bench PATH --prompts JSONL`: `--rows I,J,...` (default all), `--new N,N,...` (default `64,256,1024`), `--label LABEL`, `--out JSONL`, `--json` (the record on stdout); always greedy.
 - `serve [PATH]`: `--host` (default `127.0.0.1`), `--port` (default `8000`), `--new N` (a ceiling per request), `--api-key KEY` (required on every request as `Authorization: Bearer KEY`; default `BTB_API_KEY` from the environment, else none), `--models-dir DIR` (repeatable), `--models-filter REGEX`; no path starts empty.
 - `ollama [PATH]`: `serve`'s arguments, `--port` default `11435`, `--gui` (the desktop app instead of the terminal chat); anything unrecognized goes to `ollama run`.
 - `pi [PATH]`: `serve`'s arguments (`--api-key` included, written into the provider entry), `--no-configure` (print the provider entry instead of writing `~/.pi/agent/models.json`), `--config PATH` (write it elsewhere).

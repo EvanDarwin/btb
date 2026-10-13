@@ -24,6 +24,9 @@ Before changing anything, look at what btb already chose.
   DIR/events.npz` replays those calls split between the CPU and the card).
 - `btb bench PATH --prompts prompts.jsonl` times a prompt set at several answer lengths and reports tok/s and
   tokens per pass per length. Use it to compare two configurations instead of eyeballing a single run.
+- `btb bench` with no model reports the machine: the memory's and the bus's measured rates, each op on the CPU
+  and the card, and the drive read the way btb reads it. These are the rates the placement trades between
+  ([Benchmarking](./benchmarking.md#the-machine)).
 
 ## Memory: moving weights and cache around
 

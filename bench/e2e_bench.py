@@ -24,7 +24,6 @@ Not part of `pytest tests` (bench/ is outside testpaths); the bench workflow run
 
 from __future__ import annotations
 
-import ctypes
 import gc
 import os
 import threading
@@ -41,7 +40,39 @@ import btb
 from btb import mlx as mlxdev
 from btb.engine.cuda import _CudaMixin
 from btb.engine.native import Native
-from btb.kinds import Quant, QuantClass, latt_backend_key, quants_of
+from btb.kinds import (
+    Arrivals,
+    AttnOut,
+    AttnScale,
+    CacheHeadStride,
+    CacheRowStride,
+    ChunkStart,
+    InDim,
+    KCache,
+    KvHeads,
+    MatIn,
+    MatOut,
+    OutDim,
+    PartAcc,
+    PartMax,
+    PartSum,
+    PrefillRun,
+    PrefixLen,
+    QHeads,
+    Quant,
+    QuantClass,
+    Query,
+    RowMap,
+    Rows,
+    RowsLayout,
+    TreeParents,
+    VCache,
+    Weight,
+    Window,
+    latt_backend_key,
+    quants_of,
+)
+from btb.machine import Pool  # the one pool the machine report and these benches share
 from btb.mxfp4 import MxWeight
 from btb.mxfp4_torch import dequant_blocks
 from tests.cert.spec import FIXTURE_STEM, Hardware
@@ -335,10 +366,10 @@ def test_cuda_gemv_bf16(benchmark: object, m: int) -> None:
     w = torch.randn(OP_WIDTH, OP_WIDTH, dtype=torch.bfloat16, device="cuda")
     x = torch.randn(m, OP_WIDTH, dtype=torch.bfloat16, device="cuda")
     y = torch.empty(m, OP_WIDTH, dtype=torch.bfloat16, device="cuda")
-    args = [k.ptr(w), k.ptr(x), k.ptr(y), ctypes.c_int(OP_WIDTH), ctypes.c_int(OP_WIDTH)]
+    wp, xp, yp = k.ptr(Weight, w), k.ptr(MatIn, x), k.ptr(MatOut, y)
 
     def run() -> None:
-        k.launch(f"btb_gemv_bf16_m{m}", ((OP_WIDTH + 3) // 4, 1, 1), (128, 1, 1), args)
+        k.btb_gemv_bf16(m, ((OP_WIDTH + 3) // 4, 1, 1), (128, 1, 1), wp, xp, yp, OutDim(OP_WIDTH), InDim(OP_WIDTH))
         torch.cuda.synchronize()
 
     benchmark.group = "cuda-gemv"  # type: ignore[attr-defined]
@@ -370,11 +401,12 @@ def test_cuda_gemv_mma(benchmark: object, shape: str, warps: int, rows: int) -> 
     x = torch.randn(32, C, dtype=torch.bfloat16, device="cuda")
     y = torch.empty(32, R, dtype=torch.bfloat16, device="cuda")
     grid, block = ((R + rows * warps - 1) // (rows * warps), 1, 1), (32 * warps, 1, 1)
-    args = [[k.ptr(w), k.ptr(x), k.ptr(y), ctypes.c_int(R), ctypes.c_int(C), ctypes.c_int(1)] for w in ws]
+    mv = k.btb_gemv_mma_bf16 if rows == 16 else k.btb_gemv_mma8_bf16
+    wps, xp, yp = [k.ptr(Weight, w) for w in ws], k.ptr(MatIn, x), k.ptr(MatOut, y)
 
     def body() -> None:
-        for a in args:
-            k.launch(name, grid, block, a)
+        for wp in wps:
+            mv(grid, block, wp, xp, yp, OutDim(R), InDim(C), Rows(1))
 
     # the round as one captured graph, as a step replays its layers: the host's launches out of the time
     body()
@@ -389,8 +421,46 @@ def test_cuda_gemv_mma(benchmark: object, shape: str, warps: int, rows: int) -> 
 
     benchmark.group = f"cuda-gemv-mma-{shape}"  # type: ignore[attr-defined]
     benchmark(run)  # type: ignore[operator]
-    mean = float(benchmark.stats.stats.mean)  # type: ignore[attr-defined]
-    benchmark.extra_info["gbps"] = round(n * R * C * 2 / mean / 1e9, 1)  # type: ignore[attr-defined]
+    _gbps(benchmark, n * R * C * 2)
+
+
+def _gbps(benchmark: Any, nbytes: float) -> None:
+    """the bench's rate over its mean round, `nbytes` a round, as `gbps` in its record; none where nothing was timed
+    (a run under --benchmark-disable checks each answer and times none)"""
+    if benchmark.stats is not None:
+        benchmark.extra_info["gbps"] = round(nbytes / float(benchmark.stats.stats.mean) / 1e9, 1)
+
+
+def _tflops(benchmark: Any, flops: float) -> None:
+    """The bench's TFLOP/s over its mean round, as `tflops` in its record; none when nothing was timed."""
+    if benchmark.stats is not None:
+        benchmark.extra_info["tflops"] = round(flops / float(benchmark.stats.stats.mean) / 1e12, 1)
+
+
+def _attn_reference(q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, keys: list[list[int]]) -> torch.Tensor:
+    """each row of `q` [T, Hq, D] over its own cache slots of `K`/`V` [Hk, cap, D], in float32 through torch's
+    SDPA: what an attention kernel's `out` is held to before it is timed"""
+    Hq, D = q.shape[1:]
+    rows = []
+    for t, slots in enumerate(keys):
+        idx = torch.tensor(slots, device=K.device)
+        k, v = K.index_select(1, idx).float().unsqueeze(0), V.index_select(1, idx).float().unsqueeze(0)
+        y = F.scaled_dot_product_attention(q[t].float().view(1, Hq, 1, D), k, v, scale=D**-0.5, enable_gqa=True)
+        rows.append(y.view(Hq, D))
+    return torch.stack(rows)
+
+
+def _tree_keys(n: int, par: list[int]) -> list[list[int]]:
+    """the slots each row of a tree reads: the prefix's `n`, then its ancestors' from the root to itself at n + row"""
+    out = []
+    for t in range(len(par)):
+        chain = []
+        p = t
+        while p >= 0:
+            chain.append(n + p)
+            p = par[p]
+        out.append([*range(n), *reversed(chain)])
+    return out
 
 
 @cuda_only
@@ -420,8 +490,7 @@ def test_cuda_gemm(benchmark: object, shape: str, T: int, how: str) -> None:
 
     benchmark.group = f"cuda-gemm-{shape}-t{T}"  # type: ignore[attr-defined]
     benchmark(run)  # type: ignore[operator]
-    mean = float(benchmark.stats.stats.mean)  # type: ignore[attr-defined]
-    benchmark.extra_info["tflops"] = round(2 * T * R * C / mean / 1e12, 1)  # type: ignore[attr-defined]
+    _tflops(benchmark, 2 * T * R * C)
 
 
 @cuda_only
@@ -453,12 +522,19 @@ def test_cuda_attn_decode(benchmark: object, n: int, T: int, how: str) -> None:
     tree = [-1, 0, 1, 0, 3][:T]
     n0 = torch.tensor([n], dtype=torch.int32, device="cuda")
     par = torch.tensor(tree, dtype=torch.int32, device="cuda")
-    P, I, Fl = k.ptr, ctypes.c_int, ctypes.c_float
     # head g's row r at g * hs + r * rs: the caches here head-major [Hk, cap, D]; a block 8 rows of a group, a warp a
     # tile
     grid, block = ((T * (Hq // Hk) + 7) // 8, S, Hk), (32 * _CudaMixin._attn_warps(D), 1, 1)
-    tail = [I(T), I(Hq), I(Hk), I(cap * D), I(D), Fl(D**-0.5), P(pm), P(pl), P(pa), P(cnt), I(0), P(None)]
-    args = [[P(q), P(kv[0]), P(kv[1]), P(out), P(n0), P(par), *tail] for kv in KV]
+    qp, outp, n0p, parp = k.ptr(Query, q), k.ptr(AttnOut, out), k.ptr(PrefixLen, n0), k.ptr(TreeParents, par)
+    pmp, plp, pap, cntp = k.ptr(PartMax, pm), k.ptr(PartSum, pl), k.ptr(PartAcc, pa), k.ptr(Arrivals, cnt)
+    caches = [(k.ptr(KCache, kv[0]), k.ptr(VCache, kv[1])) for kv in KV]
+
+    def flash(K: KCache, V: VCache) -> None:
+        k.btb_attn_flash(
+            D, grid, block, qp, K, V, outp, n0p, parp, Rows(T), QHeads(Hq), KvHeads(Hk), CacheHeadStride(cap * D),
+            CacheRowStride(D), AttnScale(D**-0.5), pmp, plp, pap, cntp, Window(0), k.ptr(RowMap, None),
+        )  # fmt: skip
+
     # sdpa's rows: each over the prefix, its ancestors and itself
     seen = torch.zeros(T, n + T, dtype=torch.bool, device="cuda")
     seen[:, :n] = True
@@ -471,14 +547,19 @@ def test_cuda_attn_decode(benchmark: object, n: int, T: int, how: str) -> None:
 
     def body() -> None:
         if how == "flash":
-            for a in args:
-                k.launch("btb_attn_flash_d128", grid, block, a)
+            for K, V in caches:
+                flash(K, V)
         else:
             for kv in KV:
                 F.scaled_dot_product_attention(
                     qs, kv[0, None, :, : n + T], kv[1, None, :, : n + T], attn_mask=seen, enable_gqa=True, scale=D**-0.5
                 )
 
+    # check the kernel against torch before timing it; the float32 reference past 40960 keys needs gigabytes
+    if how == "flash" and n <= 40960:
+        flash(*caches[0])
+        keys = _tree_keys(n, tree)
+        _check(f"btb_attn_flash_d128 at {n} keys, {T} rows", out, _attn_reference(q, KV[0][0], KV[0][1], keys))
     body()
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
@@ -491,8 +572,7 @@ def test_cuda_attn_decode(benchmark: object, n: int, T: int, how: str) -> None:
 
     benchmark.group = f"cuda-attn-decode-n{n}-t{T}"  # type: ignore[attr-defined]
     benchmark(run)  # type: ignore[operator]
-    mean = float(benchmark.stats.stats.mean)  # type: ignore[attr-defined]
-    benchmark.extra_info["gbps"] = round(layers * live / mean / 1e9, 1)  # type: ignore[attr-defined]
+    _gbps(benchmark, layers * live)
 
 
 @cuda_only
@@ -515,10 +595,12 @@ def test_cuda_attn_prefill(benchmark: object, T: int, n: int, how: str) -> None:
     V = torch.randn(Hk, n + T, D, dtype=torch.bfloat16, device="cuda")
     q = torch.randn(T, Hq, D, dtype=torch.bfloat16, device="cuda")
     out = torch.empty(T, Hq, D, dtype=torch.bfloat16, device="cuda")
-    P, I, Fl = k.ptr, ctypes.c_int, ctypes.c_float
     states = torch.empty(T * Hq * D, device="cuda")  # the row states (its `run`)
-    args = [P(q), P(K), P(V), P(out), I(n), I(T), I(Hq), I(Hk), I(K.stride(0)), I(K.stride(1)), Fl(D**-0.5)]
-    args += [I(0), P(None), P(states)]
+    args = (
+        k.ptr(Query, q), k.ptr(KCache, K), k.ptr(VCache, V), k.ptr(AttnOut, out), ChunkStart(n), Rows(T), QHeads(Hq),
+        KvHeads(Hk), CacheHeadStride(K.stride(0)), CacheRowStride(K.stride(1)), AttnScale(D**-0.5), Window(0),
+        k.ptr(RowMap, None), k.ptr(PrefillRun, states),
+    )  # fmt: skip
     qs = q.transpose(0, 1)[None]  # [1, Hq, T, D], the module's layout
     # sdpa's alone: the flash kernel reads no mask, and at a million keys this one is 4 GB (twice that while it is made)
     mask = torch.ones(T, n + T, dtype=torch.bool, device="cuda").tril(diagonal=n) if how == "sdpa" else None
@@ -526,22 +608,16 @@ def test_cuda_attn_prefill(benchmark: object, T: int, n: int, how: str) -> None:
 
     def run() -> None:
         if how == "flash":
-            k.launch(
-                k.flash_prefill_kernel(D),  # the orientation this card takes (`btb_mma_roles`)
-                ((T + tpb - 1) // tpb, Hk, 1),
-                (128, 1, 1),
-                args,
-                shared=k.flash_prefill_smem(D),
-            )
+            # the orientation this card takes (`btb_mma_roles`)
+            k.flash_prefill(D, ((T + tpb - 1) // tpb, Hk, 1), (128, 1, 1), *args, shared=k.flash_prefill_smem(D))
         else:
             F.scaled_dot_product_attention(qs, K[None], V[None], attn_mask=mask, enable_gqa=True, scale=D**-0.5)
         torch.cuda.synchronize()
 
     benchmark.group = f"cuda-attn-prefill-t{T}-n{n}"  # type: ignore[attr-defined]
     benchmark(run)  # type: ignore[operator]
-    mean = float(benchmark.stats.stats.mean)  # type: ignore[attr-defined]
     macs = Hq * D * 2 * sum(n + t + 1 for t in range(T))  # q.k and p.v, the causal half
-    benchmark.extra_info["tflops"] = round(2 * macs / mean / 1e12, 1)  # type: ignore[attr-defined]
+    _tflops(benchmark, 2 * macs)
 
 
 @cuda_only
@@ -553,7 +629,7 @@ def test_cuda_attn_rows(benchmark: object, rows: int, n: int, how: str) -> None:
     """a fork's decode attention at Qwen3-0.6B's heads (16 q, 8 kv, d 128), each row 16 steps past a shared prefix:
     the one attention's rows form (`btb_attn_flash_rows_d128`) over all rows in one launch, against its decode form
     (`btb_attn_flash_d128`) a launch a row over the same keys (the one-row steps the rows would take one session at a
-    time)."""
+    time). The output is checked against torch's attention before it is timed."""
     k = _cuda_kernels()
     if "btb_attn_flash_rows_d128" not in k.fn:
         pytest.skip("the one attention is not in this build")
@@ -573,32 +649,41 @@ def test_cuda_attn_rows(benchmark: object, rows: int, n: int, how: str) -> None:
     rw = torch.tensor([n, steps, rows, *[x for c in range(rows) for x in (c, 0, n)]], dtype=torch.int32, device="cuda")
     n0 = torch.tensor([n + steps], dtype=torch.int32, device="cuda")
     root = torch.tensor([-1], dtype=torch.int32, device="cuda")
-    P, I, Fl = k.ptr, ctypes.c_int, ctypes.c_float
     # head g's row r at g * hs + r * rs: the cache head-major [Hk, cap, D]
-    dims = [I(Hq), I(Hk), I(cap * D), I(D), Fl(D**-0.5)]
-    states = [P(pm), P(pl), P(pa), P(cnt), I(0)]
+    Kp, Vp, hs, rs = k.ptr(KCache, K), k.ptr(VCache, V), CacheHeadStride(cap * D), CacheRowStride(D)
+    q_heads, kv_heads, scale, win = QHeads(Hq), KvHeads(Hk), AttnScale(D**-0.5), Window(0)
+    pmp, plp, pap, cntp = k.ptr(PartMax, pm), k.ptr(PartSum, pl), k.ptr(PartAcc, pa), k.ptr(Arrivals, cnt)
+    block = (32 * _CudaMixin._attn_warps(D), 1, 1)
     if how == "rows":
-        launches = [
-            (
-                "btb_attn_flash_rows_d128",
-                (rows * ((G + 7) // 8), S, Hk),
-                [P(q), P(K), P(V), P(out), P(rw), I(rows), *dims, *states],
-            )
-        ]
+        qp, outp, layout = k.ptr(Query, q), k.ptr(AttnOut, out), k.ptr(RowsLayout, rw)
+
+        def launch() -> None:
+            k.btb_attn_flash_rows(
+                D, (rows * ((G + 7) // 8), S, Hk), block, qp, Kp, Vp, outp, layout, Rows(rows), q_heads, kv_heads,
+                hs, rs, scale, pmp, plp, pap, cntp, win,
+            )  # fmt: skip
+
+        # row c: the shared prefix, then its own steps + 1 keys, interleaved `rows` wide from slot n
+        keys = [[*range(n), *(n + j * rows + c for j in range(steps + 1))] for c in range(rows)]
     else:
-        launches = [
-            (
-                "btb_attn_flash_d128",
-                ((G + 7) // 8, S, Hk),
-                [P(q[r]), P(K), P(V), P(out[r]), P(n0), P(root), I(1), *dims, *states, P(None)],
-            )
-            for r in range(rows)
-        ]
+        qs = [(k.ptr(Query, q[r]), k.ptr(AttnOut, out[r])) for r in range(rows)]
+        n0p, rootp = k.ptr(PrefixLen, n0), k.ptr(TreeParents, root)
+
+        def launch() -> None:
+            for qp, outp in qs:
+                k.btb_attn_flash(
+                    D, ((G + 7) // 8, S, Hk), block, qp, Kp, Vp, outp, n0p, rootp, Rows(1), q_heads, kv_heads, hs,
+                    rs, scale, pmp, plp, pap, cntp, win, k.ptr(RowMap, None),
+                )  # fmt: skip
+
+        keys = [list(range(n + steps + 1))] * rows
 
     def run() -> None:
-        for name, grid, args in launches:
-            k.launch(name, grid, (32 * _CudaMixin._attn_warps(D), 1, 1), args)
+        launch()
         torch.cuda.synchronize()
+
+    run()
+    _check(f"btb_attn ({how}) at {n} rows, {rows} rows", out, _attn_reference(q, K, V, keys))
 
     benchmark.group = f"cuda-attn-rows/n{n}/rows{rows}"  # type: ignore[attr-defined]
     benchmark(run)  # type: ignore[operator]
@@ -705,29 +790,6 @@ POINTS: dict[tuple[str, str], Point] = {
 }
 
 
-class Pool:
-    """copies of one operand, enough to pass `nbytes`, handed out in turn: a call reads its weights from memory,
-    never from a cache the last call filled"""
-
-    def __init__(self, make: Callable[[], Any], each: int, nbytes: int, cap: int = 64) -> None:
-        n = max(2, min(cap, -(-nbytes // max(1, each))))
-        self.items = [make() for _ in range(n)]
-        self.i = 0
-
-    @classmethod
-    def one(cls, item: Any) -> Pool:
-        """one operand handed out every call: the glue's small weights, which a cache holds whatever the bench does"""
-        return cls(lambda: item, 0, 0, cap=1)
-
-    def next(self) -> Any:
-        self.i = (self.i + 1) % len(self.items)
-        return self.items[self.i]
-
-    @property
-    def first(self) -> Any:
-        return self.items[0]
-
-
 class _Operands:
     """A point's operands in each tier, built on first use and shared by its row counts and lanes; one point's at a
     time - the last point's are let go (and the allocators' cached blocks given back) before the next one's."""
@@ -791,7 +853,7 @@ def _card(
     RAM each call (`cuda/ram`), a pool of pinned copies, each landing in one set of card buffers"""
     if lane == "cuda/vram":
         return ops.get(
-            "card", lambda: Pool(lambda: tuple(t.to(CUDA) for t in cpu.first), each, CARD_POOL, caps[0])
+            "card", lambda: Pool(lambda: tuple(t.to(CUDA) for t in cpu.first), each, CARD_POOL, caps[0], CUDA)
         ), on_card
     pin = ops.get("pin", lambda: Pool(lambda: tuple(t.pin_memory() for t in cpu.first), each, CARD_POOL, caps[1]))
     bufs = ops.get("buf", lambda: tuple(torch.empty_like(t, device=CUDA) for t in cpu.first))

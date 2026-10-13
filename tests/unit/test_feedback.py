@@ -13,6 +13,38 @@ from btb.kinds import Json
 from tests.helpers import fixture
 
 
+def test_the_version_is_read_by_the_distributions_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """btb's version is read from the distribution pyproject names - `btb` is the import, not the package on PyPI,
+    so asking for it read every installed wheel as a source checkout - and a checkout not installed says so"""
+    import importlib.metadata
+    import tomllib
+
+    from btb.feedback import DISTRIBUTION, _environment, btb_version
+    from tests.helpers import checkout
+
+    with open(checkout("pyproject.toml"), "rb") as f:
+        assert tomllib.load(f)["project"]["name"] == DISTRIBUTION
+    asked: list[str] = []
+
+    def version(name: str) -> str:
+        asked.append(name)
+        if name != DISTRIBUTION:
+            raise importlib.metadata.PackageNotFoundError(name)
+        return "1.2.3"
+
+    monkeypatch.setattr(importlib.metadata, "version", version)
+    assert btb_version() == "1.2.3" and _environment([])["versions"]["btb"] == "1.2.3"
+    assert set(asked) == {DISTRIBUTION}
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: version("not-" + name))
+    assert btb_version() == "source checkout"
+
+    def broken(name: str) -> str:
+        raise ValueError(f"{name}: a dist-info half written")
+
+    monkeypatch.setattr(importlib.metadata, "version", broken)
+    assert btb_version() == "source checkout" and _environment([])["versions"]["btb"] == "source checkout"
+
+
 def test_oom_is_recognized_and_reported() -> None:
     """the last resort: an out-of-memory failure of any flavour is named and turned into a paste-ready report"""
     from btb.feedback import ISSUES, crash_notice, is_oom, issue_report

@@ -2,18 +2,23 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 """The build and the checks, one script for every platform: `python build.py` builds the native library and the
 wheel for this machine (or `--target <triple>` for another), with the card's kernels when nvcc or a built fatbin
-is here and without them otherwise; `check` is what a change must pass before it lands (ruff, mypy, cargo fmt and
-clippy); `test` runs the suites. Standard library only, so it runs before anything is installed."""
+is here and without them otherwise; `bindings` writes the card kernels' typed Python launchers from their CUDA
+signatures; `check` is what a change must pass before it lands (ruff, mypy, cargo fmt and clippy); `test` runs the
+suites. Standard library only, so it runs before anything is installed."""
 
 from __future__ import annotations
 
 import argparse
 import glob
+import keyword
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 NATIVE = os.path.join(ROOT, "native")
@@ -105,6 +110,419 @@ def macos_min(dylib: str) -> str:
         elif seen and "minos" in line:
             return line.split()[1]
     return "11.0"
+
+
+# --- the card kernels' bindings -----------------------------------------------------------------------------------
+# native/cuda/btb_roles.cuh names each kernel parameter's role, a typedef; `bindings` reads it and every extern "C"
+# kernel's signature and writes the roles as NewTypes into a marked block of btb/kinds.py and a typed launcher a
+# kernel into btb/engine/card_launch.py. The cert (tests/cert/cuda_ops.py) holds the checked-in files to this output.
+CUDA_DIR = os.path.join(NATIVE, "cuda")
+ROLES_H = os.path.join(CUDA_DIR, "btb_roles.cuh")
+PACKAGE = os.path.join(ROOT, "btb")  # the package `bindings` writes into
+ROLES_OPEN = "# --- card kernel roles: written by `python build.py bindings` from native/cuda/btb_roles.cuh ---"
+ROLES_CLOSE = "# --- end of the card kernel roles ---"
+LINE = 120  # pyproject's line length: the files are written as `ruff format` lays them out
+# a role's C type -> (the ctypes type a scalar of it is passed as, its alias in card_launch.py, its Python type); a
+# bf16 is a pointer's element only
+C_TYPES: dict[str, tuple[str, str, str]] = {
+    "int": ("c_int", "_I", "int"),
+    "unsigned": ("c_uint", "_U", "int"),
+    "long long": ("c_longlong", "_LL", "int"),
+    "unsigned long long": ("c_ulonglong", "_ULL", "int"),
+    "unsigned char": ("c_ubyte", "_UB", "int"),
+    "float": ("c_float", "_F", "float"),
+    "bf16": ("", "", ""),
+}
+
+
+class BindingError(ValueError):
+    """native/cuda breaks a rule the card kernels' bindings rest on; the message names where and which"""
+
+
+@dataclass(frozen=True)
+class Role:
+    """a role of btb_roles.cuh: its name, the C type it names, its comment, and its section's title"""
+
+    name: str
+    ctype: str
+    note: str
+    section: str
+
+
+@dataclass(frozen=True)
+class Param:
+    """a kernel parameter: its name, its role, and whether it points to the role's element"""
+
+    name: str
+    role: str
+    pointer: bool
+
+
+@dataclass(frozen=True)
+class Kernel:
+    """an extern "C" kernel, or a macro's kernels as one: the launcher's name (the kernel's; a macro's without its
+    variant), the kernel's name with the variant as a format field (`btb_attn_flash_d{D}`), the variant's parameter and
+    its instantiated values (none for a lone kernel), and the parameters"""
+
+    method: str
+    pattern: str
+    variant: str
+    values: tuple[str, ...]
+    params: tuple[Param, ...]
+
+    def names(self) -> list[str]:
+        """the kernels' names, a macro's at each of its instantiations"""
+        if not self.variant:
+            return [self.pattern]
+        return [self.pattern.replace("{" + self.variant + "}", v) for v in self.values]
+
+
+_TYPEDEF = re.compile(r"typedef\s+([a-z][a-z0-9 ]*?)\s+(\w+);\s*//\s*(.+)")
+_SECTION = re.compile(r"//\s*---\s*(.+?)\s*---")
+# a kernel entry point: `extern "C" __global__ void [__launch_bounds__(...)] btb_<name>(`, the name possibly on the
+# next line; never a macro's templated name, which `##` breaks before its `(`
+_EXTERN = re.compile(r'extern\s+"C"\s+__global__\s+void\s+(?:__launch_bounds__\([^)]*\)\s*)?(btb_\w+)\s*\(')
+_TEMPLATE = re.compile(r"(btb_\w+)##(\w+)\s*\(")  # a macro's kernel name, its variant last: btb_gemv_bf16_m##M(
+_DEFINE = re.compile(r"#define\s+(\w+)\(([^)]*)\)")  # a function-like macro's head and parameters
+_OBJECT = re.compile(r"#define\s+(\w+)\s+(.*)")  # an object-like macro and its text
+_INST = re.compile(r"^(\w+)\(([^()]*)\)\s*$", re.M)  # a macro's instantiation on a line of its own: GEMV(16)
+_PARAM = re.compile(r"(?:const )?(\w+) ?(\*?) ?(?:__restrict__ )?(\w+)")  # `[const] Role[*] [__restrict__] name`
+
+
+def card_roles() -> list[Role]:
+    """btb_roles.cuh's roles in its order: each `typedef <C type> Name;  // what it is`, under the last
+    `// --- section ---` line"""
+    out: list[Role] = []
+    section = ""
+    with open(ROLES_H, encoding="utf-8") as f:
+        for n, raw in enumerate(f, 1):
+            line = raw.strip()
+            s = _SECTION.fullmatch(line)
+            if s:
+                section = s.group(1)
+                continue
+            if not line.startswith("typedef"):
+                continue
+            m = _TYPEDEF.fullmatch(line)
+            ctype = " ".join(m.group(1).split()) if m else ""
+            if m is None or ctype not in C_TYPES:
+                raise BindingError(
+                    f"btb_roles.cuh:{n}: a role is `typedef <{' | '.join(C_TYPES)}> Name;  // what it is`: {line}"
+                )
+            if any(r.name == m.group(2) for r in out):
+                raise BindingError(f"btb_roles.cuh:{n}: {m.group(2)} is named twice")
+            out.append(Role(m.group(2), ctype, m.group(3).strip(), section))
+    return out
+
+
+def _cuda_source() -> str:
+    """every native/cuda/*.cu|*.cuh joined, a macro's continued lines folded into one"""
+    parts = []
+    for fn in sorted(os.listdir(CUDA_DIR)):
+        if fn.endswith((".cu", ".cuh")):
+            with open(os.path.join(CUDA_DIR, fn), encoding="utf-8") as f:
+                parts.append(f.read())
+    return "\n".join(parts).replace("\\\n", " ")
+
+
+def _inside(text: str, i: int) -> str:
+    """the text between the bracket at text[i] and the one that closes it"""
+    depth = 0
+    for j in range(i, len(text)):
+        depth += text[j] in "([{"
+        depth -= text[j] in ")]}"
+        if depth == 0:
+            return text[i + 1 : j]
+    raise BindingError(f"no bracket closes {text[i : i + 60]!r}")
+
+
+def _params(kernel: str, text: str, objects: dict[str, str], roles: dict[str, Role]) -> tuple[Param, ...]:
+    """a kernel's parameter list as Params, a list that is one object-like macro (ATTN_FLASH_PF_ARGS) read as its
+    text; a parameter whose type is not a role is a BindingError"""
+    text = " ".join(text.split())
+    text = objects.get(text, text)
+    out = []
+    for part in text.split(","):  # a role is one name, so no parameter's type holds a comma
+        p = " ".join(part.split())
+        m = _PARAM.fullmatch(p)
+        if m is None or m.group(1) not in roles:
+            raise BindingError(
+                f"{kernel}: parameter `{p}` is not `[const] Role[*] [__restrict__] name` with a role of btb_roles.cuh"
+            )
+        out.append(Param(m.group(3), m.group(1), m.group(2) == "*"))
+    return tuple(out)
+
+
+def card_kernels(roles: list[Role] | None = None) -> list[Kernel]:
+    """every extern "C" kernel of native/cuda, a macro's kernels as one, held to the rules (`_hold`)"""
+    by_name = {r.name: r for r in (card_roles() if roles is None else roles)}
+    src = _cuda_source()
+    lines = [line.strip() for line in src.splitlines()]
+    objects = {}
+    for line in lines:
+        o = _OBJECT.fullmatch(line)
+        if o and not _DEFINE.match(line):
+            objects[o.group(1)] = " ".join(o.group(2).split())
+    out = [
+        Kernel(m.group(1), m.group(1), "", (), _params(m.group(1), _inside(src, m.end() - 1), objects, by_name))
+        for m in _EXTERN.finditer(src)
+    ]
+    values: dict[str, list[str]] = {}
+    for macro, args in _INST.findall(src):
+        values.setdefault(macro, []).append(args.strip())
+    for line in lines:
+        d = _DEFINE.match(line)
+        if d is None or "btb_" not in line:
+            continue
+        macro = d.group(1)
+        found = list(_TEMPLATE.finditer(line))
+        if len(found) != len(re.findall(r"btb_\w*##", line)):
+            raise BindingError(f"{macro}: a kernel's name in a macro is `btb_<name>##<variant>(`, the variant last")
+        for t in found:
+            head, var = t.group(1), t.group(2)
+            if [p.strip() for p in d.group(2).split(",")] != [var]:
+                raise BindingError(
+                    f"{macro}: a kernel macro takes one parameter, the variant its kernels' names end in"
+                )
+            if not values.get(macro):
+                raise BindingError(f"{macro} defines kernels but is never instantiated")
+            # the launcher drops the variant and its tag: btb_attn_flash_d##D -> btb_attn_flash
+            out.append(
+                Kernel(
+                    re.sub(r"_[a-z]+$", "", head),
+                    head + "{" + var + "}",
+                    var,
+                    tuple(values[macro]),
+                    _params(head + "##" + var, _inside(line, t.end() - 1), objects, by_name),
+                )
+            )
+    _hold(out, by_name)
+    return sorted(out, key=lambda k: k.method)
+
+
+def _hold(kernels: list[Kernel], roles: dict[str, Role]) -> None:
+    """the rules the launchers' types rest on, a BindingError naming the first broken: two parameters of a kernel
+    never share a role (a swap of them would type-check); a role is a pointer's everywhere or a scalar's everywhere (its
+    Python type is one or the other), and a bf16 one a pointer's; every role is some kernel's; no two launchers share a
+    name; a parameter's name is one its launcher can take"""
+    pointer: dict[str, bool] = {}
+    methods: set[str] = set()
+    for k in kernels:
+        if k.method in methods:
+            raise BindingError(f"two launchers would be named {k.method}: rename a kernel")
+        methods.add(k.method)
+        seen: dict[str, str] = {}
+        for p in k.params:
+            if p.role in seen:
+                raise BindingError(
+                    f"{k.pattern}: {seen[p.role]} and {p.name} share the role {p.role}: "
+                    "give one its own (btb_roles.cuh)"
+                )
+            seen[p.role] = p.name
+            if pointer.setdefault(p.role, p.pointer) != p.pointer:
+                raise BindingError(
+                    f"{p.role} is a pointer's in one kernel and a scalar's in another ({k.pattern}'s {p.name})"
+                )
+            if not p.pointer and roles[p.role].ctype == "bf16":
+                raise BindingError(f"{k.pattern}: {p.name} passes a bf16 by value; a bf16 role is a pointer's")
+            if keyword.iskeyword(p.name) or p.name in ("launcher", "grid", "block", "stream", "shared", k.variant):
+                raise BindingError(f"{k.pattern}: a launcher cannot take a parameter named {p.name}")
+    unused = [r for r in roles if r not in pointer]
+    if unused:
+        raise BindingError(f"roles no kernel takes: {', '.join(unused)} (btb_roles.cuh)")
+
+
+# a bracketed list's item: text, or a bracketed list of text (opening, items, closing)
+_Item = str | tuple[str, list[str], str]
+
+
+def _flat(item: _Item) -> str:
+    return item if isinstance(item, str) else item[0] + ", ".join(item[1]) + item[2]
+
+
+def _lay(head: str, items: Sequence[_Item], tail: str, indent: str, after: str = "") -> list[str]:
+    """`head`, the items, `tail` laid out as `ruff format` lays a bracketed list: on one line where it fits; else the
+    items on one line of their own between the brackets; else an item a line, each with a trailing comma, a bracketed
+    item laid out the same way in turn. `after` follows the closing bracket (an enclosing list's comma)"""
+    flat = ", ".join(_flat(i) for i in items)
+    if len(indent + head + flat + tail + after) <= LINE:
+        return [indent + head + flat + tail + after]
+    inner = indent + "    "
+    if len(inner + flat) <= LINE:
+        return [indent + head, inner + flat, indent + tail + after]
+    out = [indent + head]
+    for i in items:
+        if isinstance(i, str) or len(inner + _flat(i) + ",") <= LINE:
+            out.append(inner + _flat(i) + ",")
+        else:
+            out += _lay(i[0], i[1], i[2], inner, ",")
+    return [*out, indent + tail + after]
+
+
+def _pointers(kernels: list[Kernel]) -> dict[str, bool]:
+    return {p.role: p.pointer for k in kernels for p in k.params}
+
+
+def _kinds_block(roles: list[Role], kernels: list[Kernel]) -> str:
+    """btb/kinds.py's card roles, a NewType each: a pointer role over int (a card address), a scalar over its value"""
+    pointer = _pointers(kernels)
+    lines = [
+        ROLES_OPEN,
+        "# Each card kernel parameter's role as its own type (btb/engine/card_launch.py types the launchers with",
+        "# them): a pointer role's value is a card address of its element, a scalar role's the value itself. So two",
+        "# of a launch's arguments swapped, or a value of one role where another goes, fail the type check.",
+    ]
+    section = None
+    for r in roles:
+        if r.section != section:
+            section = r.section
+            lines += ["", f"# --- {section} ---"]
+        lines.append(f"# {r.ctype}{'*' if pointer[r.name] else ''}: {r.note}")
+        lines.append(f'{r.name} = NewType("{r.name}", {"int" if pointer[r.name] else C_TYPES[r.ctype][2]})')
+    lines.append(ROLES_CLOSE)
+    return "\n".join(lines)
+
+
+def _launch_py(roles: list[Role], kernels: list[Kernel]) -> str:
+    """btb/engine/card_launch.py: the kernels' names, `Launcher`, `ptr`, a launcher function a kernel, and the card
+    module's methods that alias them"""
+    by_name = {r.name: r for r in roles}
+    pointer = _pointers(kernels)
+    scalars = sorted({C_TYPES[by_name[r].ctype] for r, ptr in pointer.items() if not ptr}, key=lambda c: c[1])
+    imported: list[str] = sorted(pointer, key=_isort_key)
+    launch_params = [
+        "self",
+        "name: str",
+        "grid: Dim3",
+        "block: Dim3",
+        "args: Sequence[Any]",
+        "stream: torch.cuda.Stream | None = None",
+        "shared: int = 0",
+    ]
+    out = [
+        "# Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2",
+        "# Written by `python build.py bindings` from native/cuda: edit a kernel or btb_roles.cuh there, then run it.",
+        '"""The card kernels\' launchers: a function a kernel, taking a launcher and then the kernel\'s parameters in',
+        "order, each typed by its role (btb/kinds.py, from native/cuda/btb_roles.cuh): a pointer role a card address",
+        "(`ptr(Role, tensor)`), a scalar role its value. A macro's kernels share a function, the variant (the head width",
+        "D, the rows M) first. A function packs its arguments as the kernel declares them and hands them to the launcher",
+        "(`Launcher`): btb's card module (`_Cuda` in btb/engine/native.py), or one's own with its own streams. The card",
+        'module carries each function as a method: `k.btb_attn_flash(D, ...)` is `btb_attn_flash(k, D, ...)`."""',
+        "",
+        "from __future__ import annotations",
+        "",
+        "import ctypes",
+        "from collections.abc import Callable, Sequence",
+        "from typing import Any, Protocol, TypeVar",
+        "",
+        "import torch",
+        "",
+        *_lay("from btb.kinds import (", imported, ")", ""),
+        "",
+        "Dim3 = tuple[int, int, int]",
+        "_P = ctypes.c_void_p",
+        *(f"{alias} = ctypes.{ctype}" for ctype, alias, _ in scalars),
+        '_R = TypeVar("_R")',
+        "",
+        "# every kernel the card program loads, a macro's at each of its instantiations",
+        *_lay("KERNELS: tuple[str, ...] = (", [f'"{n}"' for k in kernels for n in k.names()], ")", ""),
+        "",
+        "",
+        "class Launcher(Protocol):",
+        '    """what launches a kernel: its name in the launcher\'s module, the grid and block, and one ctypes value a',
+        '    parameter (c_void_p a pointer, c_int, c_float, ..), on `stream` with `shared` bytes of dynamic shared memory"""',
+        "",
+        *_lay("def launch(", launch_params, ") -> None: ...", "    "),
+        "",
+        "",
+        "def ptr(role: Callable[[int], _R], t: torch.Tensor | None) -> _R:",
+        '    """tensor `t`\'s card address as an argument of `role` (`ptr(Query, q)`); None the null pointer. The address',
+        '    keeps nothing alive: hold `t` while a launch or a captured graph can read it"""',
+        "    return role(0 if t is None else t.data_ptr())",
+    ]
+    for k in kernels:
+        sig: list[_Item] = ["launcher: Launcher", *([f"{k.variant}: int"] if k.variant else [])]
+        sig += ["grid: Dim3", "block: Dim3"]
+        sig += [f"{p.name}: {p.role}" for p in k.params]
+        sig += ["*", "stream: torch.cuda.Stream | None = None", "shared: int = 0"]
+        out += ["", "", *_lay(f"def {k.method}(", sig, ") -> None:", "")]
+        if k.variant:
+            out.append(f'    """{k.pattern}, {k.variant} one of {", ".join(k.values)}"""')
+        args = [f"{'_P' if p.pointer else C_TYPES[by_name[p.role].ctype][1]}({p.name})" for p in k.params]
+        name = f'f"{k.pattern}"' if k.variant else f'"{k.pattern}"'
+        out += _lay("launcher.launch(", [name, "grid", "block", ("[", args, "]"), "stream", "shared"], ")", "    ")
+    out += [
+        "",
+        "",
+        "class CardLaunch:",
+        '    """the launchers as methods of the card\'s kernel module (`_Cuda`), each the function of its name with the',
+        '    module as its launcher"""',
+        "",
+        *_lay("def launch(", launch_params, ") -> None:", "    "),
+        "        raise NotImplementedError",
+        "",
+        "    ptr = staticmethod(ptr)",
+        *(f"    {k.method} = {k.method}" for k in kernels),
+    ]
+    return "\n".join(out) + "\n"
+
+
+def _isort_key(name: str) -> tuple[int, str, str]:
+    """ruff's isort order of imported names: constants, then classes (a role's CamelCase), then the rest, each kind
+    ignoring case"""
+    return (0 if name.isupper() else 1 if name[:1].isupper() else 2, name.lower(), name)
+
+
+def card_bindings(package: str = PACKAGE) -> dict[str, str]:
+    """the files `bindings` writes into `package`, path -> text: kinds.py with its card roles block, and
+    engine/card_launch.py"""
+    roles = card_roles()
+    kernels = card_kernels(roles)
+    kinds_py = os.path.join(package, "kinds.py")
+    with open(kinds_py, encoding="utf-8") as f:
+        kinds = f.read()
+    a, b = kinds.find(ROLES_OPEN), kinds.find(ROLES_CLOSE)
+    if a < 0 or b < a:
+        raise BindingError(
+            f"btb/kinds.py has no card roles block: its first and last lines are\n{ROLES_OPEN}\n{ROLES_CLOSE}"
+        )
+    kinds = kinds[:a] + _kinds_block(roles, kernels) + kinds[b + len(ROLES_CLOSE) :]
+    return {kinds_py: kinds, os.path.join(package, "engine", "card_launch.py"): _launch_py(roles, kernels)}
+
+
+def stale_bindings(package: str = PACKAGE) -> list[str]:
+    """the files `bindings` would change in `package` (the checkout's btb/, or an installed wheel's the cert tests),
+    by their path from its parent: btb/kinds.py"""
+    out = []
+    for path, text in card_bindings(package).items():
+        try:
+            with open(path, encoding="utf-8") as f:
+                current = f.read()
+        except FileNotFoundError:
+            current = None
+        if current != text:
+            out.append(os.path.relpath(path, os.path.dirname(package)).replace(os.sep, "/"))
+    return out
+
+
+def cmd_bindings(a: argparse.Namespace) -> None:
+    try:
+        files = card_bindings()
+    except BindingError as e:
+        raise SystemExit(f"bindings: {e}") from None
+    for path, text in files.items():
+        rel = os.path.relpath(path, ROOT).replace(os.sep, "/")
+        try:
+            with open(path, encoding="utf-8") as f:
+                same = f.read() == text
+        except FileNotFoundError:
+            same = False
+        if same:
+            say(f"bindings: {rel} is current")
+            continue
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        say(f"bindings: wrote {rel}")
 
 
 def cmd_build(a: argparse.Namespace) -> None:
@@ -224,6 +642,7 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--python", default="", help="the interpreter that builds the wheel (default: this one)")
     b.set_defaults(fn=cmd_build)
     for name, fn, text in (
+        ("bindings", cmd_bindings, "the card kernels' typed launchers and roles, from native/cuda's signatures"),
         ("check", cmd_check, "lint, format check, types, clippy: what a change must pass"),
         ("lint", cmd_lint, "ruff check"),
         ("fix", cmd_fix, "ruff check --fix"),

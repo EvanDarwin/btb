@@ -35,11 +35,12 @@ class _Stdin:
 def test_run_reads_the_prompt_from_a_pipe_explicit_or_a_sample(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
     """`btb run` takes its one prompt from -p when given, else from a pipe on stdin, else a sample; a JSONL
     --file overrides all. Platform-independent: stdin is faked, never shell-piped."""
-    from btb.cli import DEFAULT_PROMPT, _run_prompts
+    from btb.cli import run
+    from btb.cli.run import DEFAULT_PROMPT
 
     def prompts(prompt: str | None = None, file: str | None = None, data: str = "", tty: bool = True) -> list[str]:
         monkeypatch.setattr(sys, "stdin", _Stdin(data, tty))
-        return _run_prompts(argparse.Namespace(prompt=prompt, file=file))
+        return run.prompts(argparse.Namespace(prompt=prompt, file=file))
 
     assert prompts(data="What is 2+2?\n", tty=False) == ["What is 2+2?"], "a piped prompt is taken and trimmed"
     assert prompts(prompt="explicit", data="piped", tty=False) == ["explicit"], "-p wins over a pipe"

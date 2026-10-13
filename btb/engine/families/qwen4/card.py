@@ -39,7 +39,6 @@ Where the program cannot run a model or a pass (`why_not`), the engine takes its
 
 from __future__ import annotations
 
-import ctypes
 import math
 import sys
 import time
@@ -49,7 +48,7 @@ from typing import Any
 
 import torch
 
-from ....kinds import LayerKind
+from ....kinds import GateUp, InDim, LayerKind, MatIn, MatOut, OutDim, Weight
 from ...arena import KvPair, RowArena, Run
 from ...cache import ArenaIndexedLayer, indexer_keys
 from ...forward import path_of
@@ -149,7 +148,7 @@ class Qwen4Card:
         self.ik0 = self.iq0 + self.Hi * self.di
         self.width = self.ik0 + self.di
         self.pool_new = ROWS // max(1, self.r) + 2  # the blocks a pass's graph pools: one pass's committed growth
-        self.k: Any = None
+        self.k: _Cuda | None = None
         self.version: Any = None
         self._why: str | None = "not checked"
         self._why_rows: str | None = "not checked"  # what keeps `attend_rows` off (`why_not_rows`)
@@ -589,6 +588,13 @@ class Qwen4Card:
         return W
 
     # -- the buffers ------------------------------------------------------------------------------------------
+
+    @property
+    def kern(self) -> _Cuda:
+        """the card's kernels, loaded with the pass buffers (`buffers`)"""
+        if self.k is None:
+            raise RuntimeError("[qwen4 card] the kernels load with the pass buffers (`buffers`), not made yet")
+        return self.k
 
     def buffers(self) -> dict[str, Any]:
         """the pass buffers, sized for 32 rows and shared by every graph (a graph of fewer rows reads their
@@ -1047,7 +1053,7 @@ class Qwen4Card:
     def _catch_up(self, n0: int) -> None:
         """each sparse layer's pooled keys brought to where the graph's own pool (a pass's growth at most) reaches:
         rows a torch path rewrote (a crop, a prefill) pooled again, a long stretch pooled here at once"""
-        A, B, k = self.A, self.B, self.k
+        A, B, k = self.A, self.B, self.kern
         assert A is not None and B is not None
         r = max(1, self.r)
         for j in range(len(self.sparse)):
@@ -1103,17 +1109,19 @@ class Qwen4Card:
         self.staged = True
 
     def _gemv(self, W: torch.Tensor, x: torch.Tensor, y: torch.Tensor, act: bool = False) -> None:
-        k = self.k
+        k = self.kern
         M = int(x.shape[0])
         R, C = (int(s) for s in W.shape)
-        P, ci = k.ptr, ctypes.c_int
-        name = f"btb_gemv_silu_bf16_m{M}" if act else f"btb_gemv_bf16_m{M}"
-        k.launch(name, ((R + 3) // 4, 1, 1), (128, 1, 1), [P(W), P(x), P(y), ci(R), ci(C)])
+        grid, w, r, c = ((R + 3) // 4, 1, 1), k.ptr(Weight, W), OutDim(R), InDim(C)
+        if act:
+            k.btb_gemv_silu_bf16(M, grid, (128, 1, 1), w, k.ptr(GateUp, x), k.ptr(MatOut, y), r, c)
+        else:
+            k.btb_gemv_bf16(M, grid, (128, 1, 1), w, k.ptr(MatIn, x), k.ptr(MatOut, y), r, c)
 
     def _hc_read(self, Wh: dict[str, torch.Tensor], M: int, inj: torch.Tensor | None) -> None:
         """a hyper-connection's read of the normed streams `xn`: the mixed row into `mixed`, the inject weights
         into `inj` (None: the final mixer)"""
-        B, k, G, R = self.B, self.k, self.G, self.R
+        B, k, G, R = self.B, self.kern, self.G, self.R
         assert B is not None
         dn = B["dn"][:M] if inj is not None else B["dn_mix"][:M]
         self._gemv(Wh["dn"], B["xn"][:M], dn)
@@ -1124,7 +1132,7 @@ class Qwen4Card:
     def _moe_close(self, M: int) -> None:
         """the previous layer's mixture closed: the routed experts' rows the host wrote, plus the shared expert's
         gated output, into `y`"""
-        B, k = self.B, self.k
+        B, k = self.B, self.kern
         assert B is not None
         B["yr"][:M].copy_(B["yh"][:M], non_blocking=True)
         k.moe_combine(B["yr"][:M], B["ys"][:M], B["logits_r"][:M], self.E, B["y"][:M])
@@ -1133,7 +1141,7 @@ class Qwen4Card:
         """graph i: the previous layer's mixture closed into the streams, layer i through its router's publish and
         its shared expert (a segment's first layer takes the streams as they came in: the layer before it is the
         host's, or there is none)"""
-        B, k, W = self.B, self.k, self.weights(i)
+        B, k, W = self.B, self.kern, self.weights(i)
         assert B is not None
         first = (i - 1) not in self.at
         if not first:
@@ -1172,7 +1180,7 @@ class Qwen4Card:
     def close_body(self, i: int, M: int, mode: str, tap: bool) -> None:
         """a segment's close: its last layer `i`'s mixture into the streams, which leave for the host layer after
         it (the stream write is the read's kernel, its normed rows unread)"""
-        B, k, W = self.B, self.k, self.weights(i)
+        B, k, W = self.B, self.kern, self.weights(i)
         assert B is not None
         self._moe_close(M)
         h = B["h"][:M]
@@ -1183,7 +1191,7 @@ class Qwen4Card:
     def tail_body(self, M: int, mode: str, tap: bool) -> None:
         """the tail: the last layer's mixture closed into the streams (a last layer on the host hands them in
         whole), the final mixer, the head"""
-        B, k, W = self.B, self.k, self.weights(self.L)
+        B, k, W = self.B, self.kern, self.weights(self.L)
         assert B is not None
         h = B["h"][:M]
         if (self.L - 1) in self.at:
@@ -1238,7 +1246,7 @@ class Qwen4Card:
     def _attention(self, i: int, M: int) -> None:
         """the sparse attention: the pooled keys caught up, q | k | v | the indexer's q and key in one gemv, the
         rows normed and roped into the arena, each node's picks, the attention over them, o_proj through the gate"""
-        A, B, k, W = self.A, self.B, self.k, self.weights(i)
+        A, B, k, W = self.A, self.B, self.kern, self.weights(i)
         assert A is not None and B is not None
         j = self.sj[i]
         r = max(1, self.r)
@@ -1310,7 +1318,7 @@ class Qwen4Card:
         # the rows into the arena (a growth there reallocates it: read after), then every slice over them
         cl.update(k, v)
         cl.update_indexer(raw.reshape(B, T, -1, d).squeeze(2))
-        A, Bf, kern, W = self.A, self.buffers(), self.k, self.weights(i)
+        A, Bf, kern, W = self.A, self.buffers(), self.kern, self.weights(i)
         assert A is not None
         P = self._tree_rows()
         qs = q[0].transpose(0, 1)
@@ -1365,7 +1373,7 @@ class Qwen4Card:
     def _delta(self, i: int, M: int, mode: str) -> None:
         """the gated DeltaNet: q|k|v|z|b|a in one gemv into the layer's own rows (the commit steps them again),
         the nodes stepped - a step's in place, a verify pass's in scratch from the cache's state - out_proj"""
-        B, S, k, W = self.B, self.S, self.k, self.weights(i)
+        B, S, k, W = self.B, self.S, self.kern, self.weights(i)
         assert B is not None and S is not None
         j = self.lj[i]
         proj = B["proj"][j][:M]
@@ -1385,7 +1393,7 @@ class Qwen4Card:
     def _ple(self, i: int, M: int, mode: str) -> None:
         """the per-layer n-gram embedding: the staged rows in, [key | value] in one gemv, the nodes' gate, gated
         rows and conv into the streams (a step's kept window shifted in place)"""
-        B, S, k, W = self.B, self.S, self.k, self.weights(i)
+        B, S, k, W = self.B, self.S, self.kern, self.weights(i)
         assert B is not None and S is not None
         p = self.pj[i]
         B["emb"][:M].copy_(B["emb_h"][p][:M], non_blocking=True)
@@ -1480,7 +1488,7 @@ class Qwen4Card:
 
     def _commit_body(self) -> None:
         """each DeltaNet layer's state and conv window stepped along the accepted rows (`crow`, -1 past them)"""
-        B, S, k = self.B, self.S, self.k
+        B, S, k = self.B, self.S, self.kern
         assert B is not None and S is not None
         for j, i in enumerate(self.linear):
             W = self.weights(i)

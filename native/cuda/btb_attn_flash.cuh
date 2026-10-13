@@ -283,7 +283,7 @@ __device__ __forceinline__ void fa_ld_run(unsigned (&w)[RUN / 2], const bf16* __
 // last of its groups' blocks to arrive folds them in group order (`cnt`, reset by it), the block's threads a run of
 // four dims each. TREE: *n0p rows stand before the pass; token t's key at logical position n0 + d is its ancestor at
 // depth d (par[], -1 at the root), so a verify pass's node walks its committed step's keys. ROWS: token t is a
-// sequence of its own (`RowsLayout`). `part_*` hold S x T x Hq states, S the groups the graph's capacity reaches.
+// sequence of its own (`RowPlace`). `part_*` hold S x T x Hq states, S the groups the graph's capacity reaches.
 //
 // A lane's tile: the cache rows of keys j0 + lane (+ 32) looked up once and passed round by shuffles; K of keys
 // mt * 16 + gid (+ 8), their super-tiles' dims 8 tig .. a load each; V of keys kk * 16 + 2 tig (+ 1, + 8, + 9), two
@@ -393,12 +393,12 @@ __device__ __forceinline__ void attn_flash(const bf16* __restrict__ q, const bf1
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
     const int lo = grp * F::GK, hi = lo + F::GK - 1;
     int n0 = 0, rbase, tok_b = 0;
-    [[maybe_unused]] RowsLayout rl;
+    [[maybe_unused]] RowPlace rl;
     if constexpr (MODE == FA_ROWS) {
         const int ZR = (G + 7) / 8;
         tok_b = blockIdx.x / ZR;
         rbase = (blockIdx.x % ZR) * 8;
-        rl = RowsLayout(rw, tok_b);
+        rl = RowPlace(rw, tok_b);
         if (rl.len < 0 || lo > rl.len + rl.step) return;  // a padding row, or a group past the row's keys
     } else {
         n0 = *n0p;
@@ -651,19 +651,21 @@ __device__ __forceinline__ void attn_flash(const bf16* __restrict__ q, const bf1
 // each a sequence of its own (`rw` their layout)
 #define ATTN_FLASH_K(D)                                                                                      \
     extern "C" __global__ void __launch_bounds__(FaPick<D>::WPB * 32) btb_attn_flash_d##D(                   \
-        const bf16* __restrict__ q, const bf16* __restrict__ K, const bf16* __restrict__ V,                  \
-        bf16* __restrict__ out, const int* __restrict__ n0p, const int* __restrict__ par, int T, int Hq,     \
-        int Hk, int hs, int rs, float scale, float* __restrict__ part_m, float* __restrict__ part_l,         \
-        float* __restrict__ part_acc, int* __restrict__ cnt, int win, const int* __restrict__ tbl) {         \
+        const Query* __restrict__ q, const KCache* __restrict__ K, const VCache* __restrict__ V,             \
+        AttnOut* __restrict__ out, const PrefixLen* __restrict__ n0p, const TreeParents* __restrict__ par,   \
+        Rows T, QHeads Hq, KvHeads Hk, CacheHeadStride hs, CacheRowStride rs, AttnScale scale,               \
+        PartMax* __restrict__ part_m, PartSum* __restrict__ part_l, PartAcc* __restrict__ part_acc,          \
+        Arrivals* __restrict__ cnt, Window win, const RowMap* __restrict__ tbl) {                            \
         attn_flash<FaTile<D, FaPick<D>::BN, FaPick<D>::GT>, D, FA_TREE, FaPick<D>::WPB>(                     \
             q, K, V, out, n0p, par, nullptr, T, Hq, Hk, hs, rs, scale, win, part_m, part_l, part_acc, cnt,   \
             tbl);                                                                                            \
     }                                                                                                        \
     extern "C" __global__ void __launch_bounds__(FaPick<D>::WPB * 32) btb_attn_flash_rows_d##D(              \
-        const bf16* __restrict__ q, const bf16* __restrict__ K, const bf16* __restrict__ V,                  \
-        bf16* __restrict__ out, const int* __restrict__ rw, int T, int Hq, int Hk, int hs, int rs,           \
-        float scale, float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,   \
-        int* __restrict__ cnt, int win) {                                                                    \
+        const Query* __restrict__ q, const KCache* __restrict__ K, const VCache* __restrict__ V,             \
+        AttnOut* __restrict__ out, const RowsLayout* __restrict__ rw, Rows T, QHeads Hq, KvHeads Hk,         \
+        CacheHeadStride hs, CacheRowStride rs, AttnScale scale, PartMax* __restrict__ part_m,                \
+        PartSum* __restrict__ part_l, PartAcc* __restrict__ part_acc, Arrivals* __restrict__ cnt,            \
+        Window win) {                                                                                        \
         attn_flash<FaTile<D, FaPick<D>::BN, FaPick<D>::GT>, D, FA_ROWS, FaPick<D>::WPB>(                     \
             q, K, V, out, nullptr, nullptr, rw, T, Hq, Hk, hs, rs, scale, win, part_m, part_l, part_acc,     \
             cnt, nullptr);                                                                                   \
@@ -1382,7 +1384,7 @@ __device__ __forceinline__ unsigned short fa_roles_bf(unsigned trial, unsigned w
     return (unsigned short)(((h & 1u) << 15) | (e << 7) | ((h >> 1) & 0x7fu));
 }
 
-extern "C" __global__ void __launch_bounds__(256) btb_mma_roles(int* __restrict__ bad) {
+extern "C" __global__ void __launch_bounds__(256) btb_mma_roles(MmaMisses* __restrict__ bad) {
     __shared__ float d1s[8][16][8];
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
     const unsigned trial = blockIdx.x * 8 + w, mode = trial & 3;
@@ -1455,9 +1457,10 @@ extern "C" __global__ void __launch_bounds__(256) btb_mma_roles(int* __restrict_
 // ceiling itself (q re-read each tile, the compiler's prefetch of it, the group state and the scores): some bytes
 // spilled on Ada and Blackwell - the price of the fallback's orientation
 #define ATTN_FLASH_PF_ARGS                                                                                   \
-    const bf16* __restrict__ q, const bf16* __restrict__ K, const bf16* __restrict__ V,                      \
-        bf16* __restrict__ out, int n0, int T, int Hq, int Hk, int hs, int rs, float scale, int win,         \
-        const int* __restrict__ tbl, float* __restrict__ run
+    const Query* __restrict__ q, const KCache* __restrict__ K, const VCache* __restrict__ V,                 \
+        AttnOut* __restrict__ out, ChunkStart n0, Rows T, QHeads Hq, KvHeads Hk, CacheHeadStride hs,         \
+        CacheRowStride rs, AttnScale scale, Window win, const RowMap* __restrict__ tbl,                      \
+        PrefillRun* __restrict__ run
 #define ATTN_FLASH_PREFILL_K(D)                                                                              \
     extern "C" __global__ void __launch_bounds__(FaPick<D>::PFW * 32, FaPick<D>::PFB)                        \
         btb_attn_flash_prefill_d##D(ATTN_FLASH_PF_ARGS) {                                                    \
