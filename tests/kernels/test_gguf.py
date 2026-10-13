@@ -576,6 +576,31 @@ def test_a_qwen35_bf16_gguf_decodes_as_its_safetensors_twin_on_mlx(stem: str) ->
     assert _tokens(os.path.join(GGUF, f"{stem}-bf16.gguf"), "mlx") == _tokens(twin, "mlx")
 
 
+def test_a_squeezed_qwen35moe_gguf_reads_and_decodes_as_the_converters(tmp_path: Path) -> None:
+    """Qwen3.5-MoE as an older converter wrote it, each size-1 axis squeezed (the shared-expert gate a vector):
+    every tensor reads back as the unsqueezed file's at its checkpoint shape, and the file decodes as its
+    safetensors twin on the CPU and on MLX"""
+    stem = "tiny_q35moe"
+    _need_q35(stem)
+    from btb.gguf import GGUFModel
+    from tests.make_fixtures import squeezed_gguf
+
+    src, out = os.path.join(GGUF, f"{stem}-bf16.gguf"), str(tmp_path / f"{stem}-squeezed.gguf")
+    squeezed_gguf(src, out)
+    a, b = GGUFModel(src), GGUFModel(out)
+    assert any(len(b._shape(n)) < len(a._shape(n)) for n in a.tensors)
+    state, layers = _q35_named(stem), a.config().num_hidden_layers
+    (na, ha), (nb, hb) = a.weight_map(list(state), layers), b.weight_map(list(state), layers)
+    assert set(na) == set(nb) == set(state)
+    for hf in na:
+        assert hb[hf]["shape"] == ha[hf]["shape"], hf
+        assert torch.equal(b.get(nb[hf]), a.get(na[hf])), hf
+    twin = os.path.join(FIXTURES, stem)
+    assert _tokens(out) == _tokens(twin)
+    need_mlx()
+    assert _tokens(out, "mlx") == _tokens(twin, "mlx")
+
+
 @pytest.mark.parametrize("stem", Q35_STEMS)
 def test_a_quantized_qwen35_gguf_decodes_as_its_dequantized_weights(tmp_path: Path, stem: str) -> None:
     """each affine type: the file read as bf16 slots (`gguf_packed=0`, a mixture's experts too) decodes exactly as a

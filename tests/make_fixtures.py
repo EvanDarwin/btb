@@ -53,7 +53,7 @@ from tests.helpers import (
 
 if TYPE_CHECKING:
     import torch
-    from gguf import GGUFWriter
+    from gguf import GGUFReader, GGUFWriter
     from transformers import PretrainedConfig
     from transformers._typing import GenerativePreTrainedModel
 
@@ -428,23 +428,47 @@ def llama_convert(model_dir: str, out: str, outtype: str) -> None:
     subprocess.run([sys.executable, "-c", _CONVERT, llama, model_dir, outtype, out], env=env, check=True)
 
 
+def _copy_keys(r: GGUFReader, w: GGUFWriter) -> None:
+    """`r`'s metadata onto `w`, but the keys a writer sets itself (the format's, the architecture, the file type)"""
+    from gguf import GGUFValueType, Keys
+
+    for f in r.fields.values():
+        if f.name.startswith("GGUF.") or f.name in (Keys.General.ARCHITECTURE, Keys.General.FILE_TYPE):
+            continue
+        sub = f.types[-1] if f.types[0] is GGUFValueType.ARRAY else None
+        w.add_key_value(f.name, f.contents(), f.types[0], sub_type=sub)
+
+
+def squeezed_gguf(src: str, out: str) -> None:
+    """`src` with every tensor's size-1 axes dropped, as older llama.cpp converters wrote a checkpoint (a
+    `squeeze()` on each tensor: Qwen3.5-MoE's shared-expert gate a vector); llama.cpp reads either"""
+    import numpy as np
+    from gguf import GGUFReader, GGUFWriter, Keys
+
+    r = GGUFReader(src)
+    w = GGUFWriter(out, str(r.fields[Keys.General.ARCHITECTURE].contents()))
+    _copy_keys(r, w)
+    for t in r.tensors:
+        w.add_tensor(t.name, np.array(t.data).squeeze(), raw_dtype=t.tensor_type)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
 def requantize_gguf(src: str, like: str, out: str, outtype: str) -> None:
     """`like` (a converter q8_0 output) rewritten as `outtype`: every tensor it stores as Q8_0 quantized to
     `outtype` from `src`'s (the f32 output's) numbers, every other tensor and every metadata key copied as is.
     MXFP4 is llama.cpp's MXFP4_MOE (src/llama-quant.cpp): only the 3-D expert tensors, the rest kept Q8_0."""
     import numpy as np
-    from gguf import GGMLQuantizationType, GGUFReader, GGUFValueType, GGUFWriter, Keys, LlamaFileType
+    from gguf import GGMLQuantizationType, GGUFReader, GGUFWriter, Keys, LlamaFileType
     from gguf.quants import quantize
 
     qtype = GGMLQuantizationType[outtype.upper()]
     moe = qtype is GGMLQuantizationType.MXFP4
     r, f32 = GGUFReader(like), {t.name: t for t in GGUFReader(src).tensors}
     w = GGUFWriter(out, str(r.fields[Keys.General.ARCHITECTURE].contents()))
-    for f in r.fields.values():
-        if f.name.startswith("GGUF.") or f.name in (Keys.General.ARCHITECTURE, Keys.General.FILE_TYPE):
-            continue
-        sub = f.types[-1] if f.types[0] is GGUFValueType.ARRAY else None
-        w.add_key_value(f.name, f.contents(), f.types[0], sub_type=sub)
+    _copy_keys(r, w)
     w.add_file_type(LlamaFileType[f"MOSTLY_{outtype.upper()}{'_MOE' if moe else ''}"])
     for t in r.tensors:
         if t.tensor_type is GGMLQuantizationType.Q8_0 and (not moe or len(t.shape) == 3):
@@ -465,7 +489,7 @@ def stored_twin(src: str, like: str, out: str, q: Quant) -> bool:
     k-quant or i-quant block, so these weights are not `src`'s: test_gguf certifies the kernels' numbers against
     gguf's dequantization, the twin the engine's paths. False, and nothing written, where no matrix fits."""
     import numpy as np
-    from gguf import GGMLQuantizationType, GGUFReader, GGUFValueType, GGUFWriter, Keys, dequantize
+    from gguf import GGMLQuantizationType, GGUFReader, GGUFWriter, Keys, dequantize
 
     from btb.gguf import block_of
 
@@ -476,11 +500,7 @@ def stored_twin(src: str, like: str, out: str, q: Quant) -> bool:
         return False
     rng = np.random.default_rng(stored_quants().index(q))
     w = GGUFWriter(out, str(r.fields[Keys.General.ARCHITECTURE].contents()))
-    for f in r.fields.values():
-        if f.name.startswith("GGUF.") or f.name in (Keys.General.ARCHITECTURE, Keys.General.FILE_TYPE):
-            continue
-        sub = f.types[-1] if f.types[0] is GGUFValueType.ARRAY else None
-        w.add_key_value(f.name, f.contents(), f.types[0], sub_type=sub)
+    _copy_keys(r, w)
     qtype = GGMLQuantizationType[q.value]
     for t in r.tensors:
         if not any(t is u for u in fits):

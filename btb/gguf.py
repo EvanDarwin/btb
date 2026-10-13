@@ -737,8 +737,9 @@ class GGUFModel:
     def _undo(self, hf: str, shape: list[int]) -> Undo | None:
         """the inverse of llama.cpp's Qwen3.5 converter (`Qwen3_5TextModel.modify_tensors`, which qwen4exp's runs
         too) on the tensor HF calls `hf`, whose file shape is `shape`: its value heads back from the tiled order
-        to grouped by key head, A_log from -exp(A_log), the +1 gammas, the squeezed convolutions. Gemma 3's
-        converter rewrites its gammas alone, the same +1 (a file with no linear attention has no heads to move)"""
+        to grouped by key head, A_log from -exp(A_log), the +1 gammas, the squeezed convolutions and shared-expert
+        gate. Gemma 3's converter rewrites its gammas alone, the same +1 (a file with no linear attention has no
+        heads to move)"""
         ssm = gguf_lib().Keys.SSM
         nk = (self._ints(ssm.GROUP_COUNT) or [1])[0]
         nv = (self._ints(ssm.TIME_STEP_RANK) or [nk])[0]
@@ -761,6 +762,8 @@ class GGUFModel:
             undo = Undo(rows=qkv, shape=(shape[0], 1, shape[-1]))
         elif hf.endswith(".ple.conv1d.weight"):
             undo = Undo(shape=(shape[0], 1, shape[-1]))
+        elif hf.endswith(".mlp.shared_expert_gate.weight") and len(shape) == 1:
+            undo = Undo(shape=(1, shape[0]))  # an older converter's squeeze(); llama.cpp reads either
         elif hf.endswith(lin + "out_proj.weight"):
             undo = Undo(cols=heads)
         elif _plus_one(hf):
