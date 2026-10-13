@@ -209,17 +209,11 @@ def _dequant(kind: str, w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
 _iq4nl_deq = None
 
 
-def _bytes(raw: Any) -> mx_.array:
-    """the file's bytes as an MLX uint8 array: a slot's view as it is, host bytes copied in"""
-    m = mx()
-    return raw if isinstance(raw, m.array) else m.array(np.asarray(raw, dtype=np.uint8).reshape(-1))
-
-
-def repack_iq4nl(raw: Any) -> tuple[mx_.array, mx_.array]:
+def repack_iq4nl(raw: mx_.array) -> tuple[mx_.array, mx_.array]:
     """ggml's interleaved 18-byte IQ4_NL blocks split into the two streams the kernels read: the f16 scales (one a
     block) and the nibble bytes (16 a block, so each block is one aligned uint4). In the graph: once at bind, or
     each pass over a slot's view"""
-    b = _bytes(raw).reshape(-1, 18)
+    b = raw.reshape(-1, 18)
     return b[:, 0:2].reshape(-1).view(mx().float16), b[:, 2:18].reshape(-1)
 
 
@@ -586,12 +580,12 @@ _DEQUANT_IQ1M = r"""
 """
 
 
-def _side_iq1m(raw: Any) -> tuple[Any, Any]:
+def _side_iq1m(raw: mx_.array) -> tuple[mx_.array, mx_.array]:
     """IQ1_M's matvec side stream from the raw 56-byte superblocks, in the graph (once at bind, or each pass over a
     slot's view): the block f16 d reassembled here rather than in the kernel, and the sixteen 3-bit sub-scales
     packed as nibble pairs (8 B)."""
     m = mx()
-    scb = _bytes(raw).reshape(-1, 56)[:, 48:56].reshape(-1).view(m.uint16).reshape(-1, 4).astype(m.uint32)
+    scb = raw.reshape(-1, 56)[:, 48:56].reshape(-1).view(m.uint16).reshape(-1, 4).astype(m.uint32)
     dbits = (scb[:, 0] >> 12) | ((scb[:, 1] >> 12) << 4) | ((scb[:, 2] >> 12) << 8) | ((scb[:, 3] >> 12) << 12)
     sub = (scb.reshape(-1, 4, 1) >> m.array([0, 3, 6, 9], dtype=m.uint32).reshape(1, 1, 4)) & 7
     sub = sub.reshape(-1, 16)
@@ -623,7 +617,7 @@ _LATT: dict[str, dict[str, Any]] = {
 }
 
 
-def repack_lattice(kind: str, raw: Any) -> tuple[Any, ...]:
+def repack_lattice(kind: str, raw: mx_.array) -> tuple[mx_.array, ...]:
     """the side streams `matvec_lattice` wants beside the raw bytes for this kind (empty for most), built once."""
     side = _LATT[kind].get("side")
     return tuple(side(raw)) if side is not None else ()

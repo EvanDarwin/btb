@@ -18,7 +18,8 @@ contiguous cache they always had, never a copied prefix.
 from __future__ import annotations
 
 import weakref
-from collections.abc import Callable, Hashable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -31,6 +32,8 @@ from .radix import Match, RadixTree
 from .scheduler import MemoryGrantError
 
 if TYPE_CHECKING:
+    import mlx.core as mx_
+
     from .state import _State
 
 # the head widths the card's one attention is built for (btb_attn_flash.cuh: its prefill and decode forms)
@@ -45,6 +48,16 @@ def card_runs(sm: Any, i: int) -> bool:
         and i in sm.resident
         and not getattr(sm, "kv_host", False)
     )
+
+
+@dataclass
+class PassLists:
+    """what a pass reads a table's rows by, keyed by the pass's base and rows: the host's spans (rows, starts, ends)
+    and node lists (offs, idx) by its window too, the node lists by its parents; MLX's row maps (before, own)"""
+
+    spans: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = field(default_factory=dict)
+    nodes: dict[tuple[int, int, tuple[int, ...], int], tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
+    mlx: dict[tuple[int, int], tuple[mx_.array, mx_.array]] = field(default_factory=dict)
 
 
 class PrefixCache:
@@ -92,7 +105,7 @@ class PrefixCache:
         self.tree.before = self.flush
         # what a pass reads its rows by (`lists`): the last conversation's alone - its table, the map's version they
         # were made for, the lists
-        self._lists: tuple[weakref.ref[Table], int, dict[Hashable, object]] | None = None
+        self._lists: tuple[weakref.ref[Table], int, PassLists] | None = None
 
     @staticmethod
     def why_not(sm: Any) -> str | None:
@@ -204,16 +217,15 @@ class PrefixCache:
                 if not self.tree.drop_snaps(lambda dropped: dropped >= 1):
                     return False
 
-    def lists(self, table: Table) -> dict[Hashable, object]:
+    def lists(self, table: Table) -> PassLists:
         """what a pass reads `table`'s rows by (the host's row lists, MLX's row maps), made once for every layer: those
         of its map's present version alone, which every change to the map moves. One set, the last conversation's:
         kept on each conversation, an idle one held its last pass's. Let go as another conversation's pass begins
         (`reading`)"""
-        ref, ver, memo = self._lists or (None, None, {})
-        if ref is None or ref() is not table or ver != table.version:
-            memo = {}
-            self._lists = (weakref.ref(table), table.version, memo)
-        return memo
+        held = self._lists
+        if held is None or held[0]() is not table or held[1] != table.version:
+            held = self._lists = (weakref.ref(table), table.version, PassLists())
+        return held[2]
 
     def reading(self, table: Table) -> None:
         """a pass over `table` begins: the row lists another conversation's pass left (`_lists`) let go. Made only by

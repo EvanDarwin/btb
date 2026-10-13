@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from .core import mx
 
 if TYPE_CHECKING:
     import mlx.core as mx_
+
+    from .core import MetalKernel
 
 ROWS_MAX = 16  # pass rows a launch; a wider pass is chunked
 
@@ -109,7 +111,7 @@ def shape(shapes: Shapes, tr: int) -> tuple[int, int, int]:
     return rp, trs, tr if tr % trs == 0 else trs
 
 
-_kernels: dict[tuple[Any, ...], Any] = {}
+_kernels: dict[tuple[str, int, int, int], MetalKernel] = {}
 _lock = threading.Lock()
 
 
@@ -163,7 +165,7 @@ def _compile(
     bw: int,
     cols: int,
     trl: int,
-) -> Any:
+) -> MetalKernel:
     name, tr, rp, trs = key
     shaped = f"{name}_{tr}_{rp}_{trs}"  # the caller's name (the kernel the matrix runs), its launch shape appended
     with _lock:

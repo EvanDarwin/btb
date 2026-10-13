@@ -15,6 +15,8 @@ from .core import mx
 if TYPE_CHECKING:
     import mlx.core as mx_
 
+    from .core import MetalKernel
+
 _STORE_SRC = """
     // rows [Hk, T, D] (16-bit) written into buf [1, Hk, cap, D] from row n0[0], in place
     uint i = thread_position_in_grid.x;
@@ -42,8 +44,8 @@ _SCATTER_SRC = """
 """
 
 _lock = threading.Lock()
-_store_kernel = None
-_scatter_kernel = None
+_store_kernel: MetalKernel | None = None
+_scatter_kernel: MetalKernel | None = None
 
 
 def kv_store(buf: mx_.array, rows: mx_.array, n0: int) -> mx_.array:

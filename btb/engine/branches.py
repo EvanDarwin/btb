@@ -10,7 +10,7 @@ import time
 from abc import abstractmethod
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Self, cast
+from typing import TYPE_CHECKING, Self
 
 import torch
 from transformers.cache_utils import DynamicCache
@@ -35,6 +35,7 @@ from .cache import (
 )
 from .generate import lin_layer
 from .hooks import Hooks, LogitsProcessor, OnPass, OnRowToken, Taps
+from .paged import PagedCache, PagedLayer
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -44,7 +45,6 @@ if TYPE_CHECKING:
     from .cache import CacheLayer, KvCache
     from .generate import LinLayer, LinSnap
     from .model import StreamedTextModel
-    from .paged import PagedCache, PagedLayer
     from .text import BatchGeneration
 
     # a row's own attention rows taken out of the batch: a fork's torch (k, v[, indexer keys]), or the MLX step
@@ -133,8 +133,8 @@ class _Rows:
         """the rows' own cache, its layers the parent's until the fork's replace them. A paged session's is a plain
         one: copied, it kept the session's table and read as paged - priced as the table's growth, bound to the table
         every step (parking another conversation's pages for it), its own rows never counted"""
-        if getattr(parent, "paged", False):
-            cache = DynamicCache(config=cast("PagedCache", parent).prefix.cfg)
+        if isinstance(parent, PagedCache):
+            cache = DynamicCache(config=parent.prefix.cfg)
         else:
             cache = copy.copy(parent)
         cache.layers = list(parent.layers)
@@ -532,16 +532,15 @@ class _Rows:
         off = self._off_route
 
         def write(cache: KvCache) -> None:
-            if off and getattr(cache, "paged", False):
+            if off and isinstance(cache, PagedCache):
                 # the row's own rows made through the torch pass, other bits than a step's: the session reads them,
                 # the tree is never given them - a prompt opening on them decoded otherwise than the same prompt cold
-                pc = cast("PagedCache", cache)
-                pc.off_route(len(pc.table))
+                cache.off_route(len(cache.table))
             for i, kv in row.kv.items():
                 pl = cache.layers[i]
-                if isinstance(kv, list) and getattr(pl, "paged", False):
+                if isinstance(kv, list) and isinstance(pl, PagedLayer):
                     # the MLX step buffer's slices onto a paged session's table, in pages of its own
-                    cast("PagedLayer", pl).append(mlxdev.from_mx(kv[0]), mlxdev.from_mx(kv[1]))
+                    pl.append(mlxdev.from_mx(kv[0]), mlxdev.from_mx(kv[1]))
                 elif isinstance(kv, list):
                     # the MLX step buffer's slices, into the session's MLX buffer
                     assert isinstance(pl, GrowLayer)
@@ -552,9 +551,9 @@ class _Rows:
                         k, v = kv[0], kv[1]
                     pl.mx_update(k, v)
                     mlxdev.mx().eval(*[x for x in pl._mx if x is not None])
-                elif getattr(pl, "paged", False):
+                elif isinstance(pl, PagedLayer):
                     # the row's own rows onto the session's table, in pages of its own
-                    cast("PagedLayer", pl).append(kv[0], kv[1])
+                    pl.append(kv[0], kv[1])
                 else:
                     assert isinstance(pl, CacheLayerMixin)
                     pl.update(kv[0], kv[1])
@@ -962,10 +961,9 @@ def _cache_of(s: Session) -> KvCache:
 
 def _mlx_paged(cl: object) -> PagedLayer | None:
     """`cl` where it is a paged layer whose rows lie in the pool's MLX regions (an MLX engine's), else None"""
-    if not getattr(cl, "paged", False):
+    if not isinstance(cl, PagedLayer):
         return None
-    pl = cast("PagedLayer", cl)
-    return pl if pl.pool.host.shared and pl.i in pl.pool.host.mk else None
+    return cl if cl.pool.host.shared and cl.i in cl.pool.host.mk else None
 
 
 def _page_rows(pl: PagedLayer) -> tuple[mx_.array, mx_.array, mx_.array]:

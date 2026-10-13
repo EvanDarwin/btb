@@ -5,7 +5,7 @@ of rows, a forest of prompts; bit-exact to the one-row step), rope for rows at t
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -15,6 +15,11 @@ from .gemv import _gemv_lock
 
 if TYPE_CHECKING:
     import mlx.core as mx_
+
+    from .core import MetalKernel
+
+    # what `rows_meta` and `tree_meta` make once for a pass's layers: (meta, path, splits)
+    NodeMeta = tuple[mx_.array, mx_.array, int]
 ATTN_MAXG = 8
 
 
@@ -430,13 +435,13 @@ _ATTN_FOLD_SRC = """
 """
 
 
-_attn_kernels: dict[Any, Any] = {}
+_attn_kernels: dict[tuple[int, int, bool, bool, int, bool], MetalKernel] = {}
 
 
-_attn_fold = None
+_attn_fold: MetalKernel | None = None
 
 
-_NO_SINKS = None
+_NO_SINKS: mx_.array | None = None
 
 
 def attn_splits(n: int, start: int = 0) -> int:
@@ -503,7 +508,7 @@ _ROPE_ROWS_SRC = """
 """
 
 
-_rope_rows_kernel = None
+_rope_rows_kernel: MetalKernel | None = None
 
 
 def rope_rows(x: mx_.array, rd: int, freqs: mx_.array, scaling: float, pos: Sequence[int] | mx_.array) -> mx_.array:
@@ -534,7 +539,7 @@ def rope_rows(x: mx_.array, rd: int, freqs: mx_.array, scaling: float, pos: Sequ
 
 def rows_meta(
     ns: Sequence[int], window: int | None = None, segs: Sequence[int] | None = None, pbases: Sequence[int] | None = None
-) -> tuple[mx_.array, mx_.array, int]:
+) -> NodeMeta:
     """A batched decode step's node metadata (meta [B, 8], path [B, 1], splits): row b has ns[b] live rows, its
     rows past segs[b] in the step buffer, its prefill in slice b or at pbases[b] of one flat buffer."""
     m = mx()
@@ -550,9 +555,7 @@ def rows_meta(
     return m.array(meta), m.array(path), int(meta[:, 1].max())
 
 
-def forest_meta(
-    lens: Sequence[int], pbases: Sequence[int], window: int | None = None
-) -> tuple[mx_.array, mx_.array, int]:
+def forest_meta(lens: Sequence[int], pbases: Sequence[int], window: int | None = None) -> NodeMeta:
     """A batched prefill's node metadata: token p of a row is a node of p + 1 rows, all in place, row b's from
     pbases[b] of one flat buffer - causal attention as T decode-shaped nodes in one launch."""
     m = mx()
@@ -605,7 +608,7 @@ _ROPE_ROWS2_SRC = """
 """
 
 
-_rope_rows2_kernel = None
+_rope_rows2_kernel: MetalKernel | None = None
 
 
 def rope_rows2(
@@ -655,8 +658,8 @@ def attn_rows(
     v2: mx_.array | None = None,
     ks2: mx_.array | None = None,
     vs2: mx_.array | None = None,
-    prepared: tuple[mx_.array, mx_.array, int] | None = None,
-    odt: Any = None,
+    prepared: NodeMeta | None = None,
+    odt: mx_.Dtype | None = None,
     pbases: Sequence[int] | None = None,
     rmap: mx_.array | None = None,
 ) -> mx_.array:
@@ -687,7 +690,7 @@ def attn_rows(
 
 def _attn_kernel(
     D: int, g: int, kq: bool = False, seg: bool = False, nt: int = 1, mapped: bool = False
-) -> tuple[Any, Any]:
+) -> tuple[MetalKernel, MetalKernel]:
     """the node kernel for head_dim D and g query heads per kv head over groups of `nt` nodes, compiled once per
     shape; `kq` reads an int8 cache with a scale per row, `seg` a two-segment cache (rows past `seg` from k2/v2),
     `mapped` a paged one (each row through the conversation's row map)"""
@@ -725,7 +728,7 @@ def _attn_kernel(
     return k, _attn_fold
 
 
-_SCALES: dict[Any, Any] = {}
+_SCALES: dict[float, mx_.array] = {}
 
 
 def attn_nodes(
@@ -743,7 +746,7 @@ def attn_nodes(
     v2: mx_.array | None = None,
     ks2: mx_.array | None = None,
     vs2: mx_.array | None = None,
-    odt: Any = None,
+    odt: mx_.Dtype | None = None,
     rmap: mx_.array | None = None,
 ) -> mx_.array:
     """Attention for T query nodes over a cache: `q` [T, Hq, D] float32, `k`/`v` the cache buffers [1, Hk, cap, D]
@@ -804,7 +807,7 @@ def attn_nodes(
     )[0]
 
 
-_NO_PATH = None
+_NO_PATH: mx_.array | None = None
 
 
 # the prefill kernel's tiling: keys a block, simdgroups a threadgroup (four pairs)
@@ -977,10 +980,10 @@ _ATTN_PREFILL_SRC = """
 """
 
 
-_prefill_kernels: dict[tuple[int, bool], Any] = {}
+_prefill_kernels: dict[tuple[int, bool], MetalKernel] = {}
 
 
-def _attn_prefill_kernel(g: int, mapped: bool = False) -> Any:
+def _attn_prefill_kernel(g: int, mapped: bool = False) -> MetalKernel:
     """the prefill kernel for g query heads per kv head at head_dim 256, compiled once per g; `mapped` a paged
     cache's (its older rows through the conversation's row map, the chunk's own in k2/v2)"""
     m = mx()
@@ -1005,7 +1008,7 @@ def attn_prefill(
     v: mx_.array,
     past: int,
     scale: float,
-    odt: Any = None,
+    odt: mx_.Dtype | None = None,
     rmap: mx_.array | None = None,
     k2: mx_.array | None = None,
     v2: mx_.array | None = None,
@@ -1021,9 +1024,10 @@ def attn_prefill(
     Hk, cap = int(k.shape[1]), int(k.shape[2])
     g = Hq // Hk
     past = int(past)
-    mapped = rmap is not None
+    paged: list[mx_.array] = []
     if rmap is not None:
         assert k2 is not None and v2 is not None
+        paged = [k2, v2, rmap]
         fits = int(rmap.shape[0]) >= max(past, 1) and int(k2.shape[2]) >= T and k2.dtype == m.bfloat16
     else:
         fits = cap >= ATTN_PF_BLOCK and past + T <= cap
@@ -1037,8 +1041,8 @@ def attn_prefill(
         m.eval(sc)
     odt = odt if odt is not None else q.dtype
     rows = ATTN_PF_SIMD // 2 * (8 // g)
-    return _attn_prefill_kernel(g, mapped)(
-        inputs=[q, k, v, m.array([past, T], dtype=m.uint32), sc, *([k2, v2, rmap] if mapped else [])],
+    return _attn_prefill_kernel(g, bool(paged))(
+        inputs=[q, k, v, m.array([past, T], dtype=m.uint32), sc, *paged],
         template=[("QT", q.dtype), ("OT", odt)],
         grid=(Hk * ATTN_PF_SIMD * 32, (T + rows - 1) // rows, 1),
         threadgroup=(ATTN_PF_SIMD * 32, 1, 1),
@@ -1094,7 +1098,7 @@ def attn_tree(
     batch: int = 0,
     pbase: int = 0,
     kbatch: int | None = None,
-    prepared: tuple[mx_.array, mx_.array, int] | None = None,
+    prepared: NodeMeta | None = None,
     rmap: mx_.array | None = None,
     k2: mx_.array | None = None,
     v2: mx_.array | None = None,
@@ -1119,7 +1123,7 @@ def tree_meta(
     pbase: int = 0,
     kbatch: int | None = None,
     seg: int | None = None,
-) -> tuple[mx_.array, mx_.array, int]:
+) -> NodeMeta:
     """`attn_tree`'s (meta [T, 8], path [T, D], splits), which depend on the tree and the cache's geometry, not on
     the layer: built once per pass. `seg` the rows before the pass's own (a paged cache's prefix, `past`)."""
     m = mx()
@@ -1161,7 +1165,7 @@ def kv_quantize(x: mx_.array) -> tuple[mx_.array, mx_.array]:
     return q, s
 
 
-def kv_dequantize(q: mx_.array, s: mx_.array, dtype: Any = None) -> mx_.array:
+def kv_dequantize(q: mx_.array, s: mx_.array, dtype: mx_.Dtype | None = None) -> mx_.array:
     """the int8 rows back to `dtype` (bf16 by default): q * s, one scale per row"""
     m = mx()
     return (q.astype(m.float32) * s[..., None]).astype(dtype or m.bfloat16)

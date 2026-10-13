@@ -181,21 +181,22 @@ class HostRegion:
         if self.shared:
             mlxdev.mx().synchronize()
 
-    def _new(self, i: int, which: int, rows: int) -> torch.Tensor:
-        """a fresh K (`which` 0) or V region of layer i, `rows` rows: MLX's buffer under `shared`, its view kept"""
+    def _new(self, i: int, views: dict[int, mx_.array], rows: int) -> torch.Tensor:
+        """a fresh K or V region of layer i, `rows` rows: MLX's buffer under `shared`, its view kept in `views`
+        (`mk` or `mv`)"""
         assert self.dtype is not None
         if not self.shared:
             return torch.empty(self.hk, rows, self.d, dtype=self.dtype)
         sh = mlxdev.Shared(self.hk * rows * self.d * self._el())
         a = sh.mx.view(mlxdev._dtypes()[self.dtype]).reshape(1, self.hk, rows, self.d)
         mlxdev.mx().eval(a)
-        (self.mk, self.mv)[which][i] = a
+        views[i] = a
         return sh.torch.view(self.dtype).view(self.hk, rows, self.d)
 
     @_kept
     def _regrow(self, i: int, new: int) -> None:
         rows, el = new * PAGE, self._el()
-        for which, store in enumerate((self.k, self.v)):
+        for store, views in ((self.k, self.mk), (self.v, self.mv)):
             old = store.get(i)
             if old is not None and old.shape[1] >= rows:
                 continue  # grown by an attempt the ledger refused part way
@@ -209,7 +210,7 @@ class HostRegion:
                     device="cpu",
                     held=old.numel() * el if old is not None else 0,
                 )
-            buf = self._new(i, which, rows)
+            buf = self._new(i, views, rows)
             if old is not None:
                 self._settle()
                 buf[:, : old.shape[1]] = old
@@ -246,7 +247,7 @@ class HostRegion:
         rows, el = pages * PAGE, self._el()
         self._settle()
         try:
-            for which, store in enumerate((self.k, self.v)):
+            for store, views in ((self.k, self.mk), (self.v, self.mv)):
                 for i in list(store):
                     old = store[i]
                     if old.shape[1] <= rows:
@@ -261,12 +262,12 @@ class HostRegion:
                                 device="cpu",
                                 draws="",
                             )
-                        buf = self._new(i, which, rows)
+                        buf = self._new(i, views, rows)
                         buf.copy_(old[:, :rows])
                         store[i] = buf
                     else:
                         del store[i]
-                        (self.mk, self.mv)[which].pop(i, None)
+                        views.pop(i, None)
                     del old
         except MemoryGrantError:
             pass

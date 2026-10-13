@@ -121,7 +121,7 @@ class GrowLayer(_DynamicLayer):
     _flat: bool
     _flat_len: int
     _rows_total: int
-    _rmap: Any
+    _rmap: mx_.array | None
 
     def __init__(
         self,

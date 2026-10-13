@@ -441,8 +441,8 @@ def mega_serves(kind: FamilyKind, storage: Storage, knobs: dict[str, object] | N
     """whether MLX's megakernel takes a load's passes (`_mega_serves`): its knob on (`mlx_mega`, on by default), a
     bf16 state, and a family, storage and fixture it takes (`gguf_packed`, on by default, keeping a GGUF's blocks)"""
     k = knobs or {}
-    packed = bool(int(str(k.get("gguf_packed", 1))))
-    return bool(int(str(k.get("mlx_mega", 1)))) and not k.get("fp32") and mega_refusal(kind, storage, packed) is None
+    packed = bool(k.get("gguf_packed", 1))
+    return bool(k.get("mlx_mega", 1)) and not k.get("fp32") and mega_refusal(kind, storage, packed) is None
 
 
 def paged(

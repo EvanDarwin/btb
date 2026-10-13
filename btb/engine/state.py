@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     from .memory import RamPolicyState, Room, VramPolicyState
     from .mlx_forward import MlxState
     from .model import StreamedTextModel
+    from .paged import PagedCache
     from .scheduler import BatchScheduler, Plan
     from .scratch import Scratch
     from .spec_cost import SpecCost
@@ -578,11 +579,15 @@ class _State:
         raise NotImplementedError
 
     @staticmethod
-    def _span_lists(paged: Any, base: int, T: int, win: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _span_lists(
+        paged: PagedCache | None, base: int, T: int, win: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
     @staticmethod
-    def _node_lists(paged: Any, base: int, T: int, parents: Parents, win: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _node_lists(
+        paged: PagedCache | None, base: int, T: int, parents: Parents, win: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
     # -- mlx_forward.py --

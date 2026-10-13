@@ -213,6 +213,12 @@ DequantStored = Callable[
     [card_launch.Dim3, card_launch.Dim3, QuantBlocks, QuantGrid, QuantSigns, Dequant, QuantValues], None
 ]
 
+if TYPE_CHECKING:
+
+    def _stored_launchers(k: card_launch.CardLaunch) -> tuple[GemvStored, DequantStored]:
+        """holds the aliases to the generated launchers: q4k's, one macro stamping every stored type's"""
+        return k.btb_gemv_q4k_bf16, k.btb_dequant_q4k_bf16
+
 
 def _library(lib: Any) -> Any:
     """`lib`, a loaded native library (the one `Native` bound, say), or the install's where it is None"""

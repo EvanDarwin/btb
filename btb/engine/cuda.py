@@ -111,6 +111,8 @@ from .stored import CardMat, CardStored, card_loose, mat_rows
 
 if TYPE_CHECKING:
     from .forward import PassRope, Rope
+    from .paged import PagedCache
+    from .prefix import PassLists
 
 _KERNELS_WARNED = False
 # a layer's projections in `_card_weights`
@@ -4038,21 +4040,23 @@ class _CudaMixin(_State):
         return self._ai_mlp(layer, residual + mix)
 
     @staticmethod
-    def _pass_lists(paged: Any) -> dict[Any, Any]:
+    def _pass_lists(paged: PagedCache) -> PassLists:
         """a paged cache's lists for the pass (`_span_lists`, `_node_lists`), its prefix cache's for its table
         (`PrefixCache.lists`): a window's and the whole prefix's (Gemma 3's layers alternate) side by side"""
-        return cast("dict[Any, Any]", paged.prefix.lists(paged.table))
+        return paged.prefix.lists(paged.table)
 
     @staticmethod
-    def _span_lists(paged: Any, base: int, T: int, win: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _span_lists(
+        paged: PagedCache | None, base: int, T: int, win: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """a chain's T rows after `base` as `attn_spans` takes them: (rows, starts, ends) int32, row p over the rows
         before it and itself - the last `win` of them under a window - each a span of one map: the cache's rows in
         order, a paged cache's (`paged`) through its table"""
-        memo = _CudaMixin._pass_lists(paged) if paged is not None else None
-        key = ("spans", base, T, win)
+        memo = _CudaMixin._pass_lists(paged).spans if paged is not None else None
+        key = (base, T, win)
         got = memo.get(key) if memo is not None else None
         if got is not None:
-            return cast("tuple[torch.Tensor, torch.Tensor, torch.Tensor]", got)
+            return got
         ends = torch.arange(base + 1, base + T + 1, dtype=torch.int32)
         starts = (ends - win).clamp_(min=0) if win else torch.zeros(T, dtype=torch.int32)
         if paged is None:
@@ -4063,15 +4067,17 @@ class _CudaMixin(_State):
         return rows, starts, ends
 
     @staticmethod
-    def _node_lists(paged: Any, base: int, T: int, parents: Parents, win: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _node_lists(
+        paged: PagedCache | None, base: int, T: int, parents: Parents, win: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """each of a pass's T rows' cache rows, in the order its committed step reads them, as `attn_nodes` takes
         them: (offs [T + 1], idx) int32. `paged` (a paged cache): the rows are its pool's, through its row map, made
         once a pass (`_pass_lists`)"""
-        memo = _CudaMixin._pass_lists(paged) if paged is not None else None
+        memo = _CudaMixin._pass_lists(paged).nodes if paged is not None else None
         key = (base, T, tuple(parents), win)
         got = memo.get(key) if memo is not None else None
         if got is not None:
-            return cast("tuple[torch.Tensor, torch.Tensor]", got)
+            return got
         lists = []
         for p in range(T):
             rows = node_mask(base, p, parents, win)

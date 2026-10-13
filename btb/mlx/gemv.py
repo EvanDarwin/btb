@@ -7,7 +7,7 @@ from __future__ import annotations
 import functools
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -16,6 +16,8 @@ from .core import mx
 
 if TYPE_CHECKING:
     import mlx.core as mx_
+
+    from .core import MetalKernel
 _UNPACK_SRC = """
     // one thread per pair of weights (one byte of codes): out[2i] and out[2i + 1]
     uint i = thread_position_in_grid.x;
@@ -198,7 +200,7 @@ _GEMM_SRC = """
 """
 
 
-_gemm_kernels: dict[tuple[int, int], Any] = {}
+_gemm_kernels: dict[tuple[int, int], MetalKernel] = {}
 _gemv_lock = threading.Lock()
 
 
@@ -209,7 +211,7 @@ def _sgn(nb: int, xb: bool) -> int:
     return max(1, min(8 if xb else 4, 32768 // tile))
 
 
-def _gemm_kernel(xb: int, sgn: int) -> Any:
+def _gemm_kernel(xb: int, sgn: int) -> MetalKernel:
     m = mx()
     with _gemv_lock:
         k = _gemm_kernels.get((xb, sgn))
@@ -609,7 +611,7 @@ def gemv_mxfp4_pair(
     return _mxfp4_call([(gate.reshape(-1), up.reshape(-1))], 2 * int(inter), k, x[None], tm, True, True)[0]
 
 
-def _tiles(f: Any, x: mx_.array) -> mx_.array:
+def _tiles(f: Callable[[mx_.array], mx_.array], x: mx_.array) -> mx_.array:
     """`f` (a batch-invariant matvec of up to 16 rows) over x's rows 16 at a time"""
     n = int(x.shape[0])
     if n <= GEMV_ROWS:
