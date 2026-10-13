@@ -262,7 +262,10 @@ TITLE: dict[Missing, tuple[str, str]] = {
     ),
     Missing.MLX_ATTN_SHAPE: ("Fixture's head width doesn't fit MLX attention", "Widen the fixture's head"),
     Missing.SPEC_MTP_HEAD: ("Fixture has no MTP head", "Add one in tests/make_fixtures.py"),
-    Missing.GGUF_MTP_HEAD: ("GGUF reader maps no MTP head", "Map the NextN layers to mtp.* in GGUFModel.weight_map"),
+    Missing.GGUF_MTP_HEAD: (
+        "GGUF twins keep no MTP head: the converter exports none",
+        "Convert the twins with the head once llama.cpp exports it",
+    ),
     Missing.SPEC_OWN_LAYER: ("Qwen4 can't speculate on MLX", "Give its MLX layers node steps"),
     Missing.FP16_FIXTURE: ("No fp16 fixture", "Run python tests/make_fixtures.py twins"),
     Missing.FP32_FIXTURE: ("No fp32 fixture", "Run python tests/make_fixtures.py twins"),
@@ -273,7 +276,10 @@ TITLE: dict[Missing, tuple[str, str]] = {
         "Write the missing fixtures in tests/make_fixtures.py",
     ),
     Missing.NO_FIXTURE: ("No fixture for this storage", "Add the fixture to spec.FIXTURE_STEM and generate it"),
-    Missing.PREFIX_CACHE: ("No prefix cache on this tier yet", "Land the paged prefix cache here (plan P8)"),
+    Missing.PREFIX_CACHE: (
+        "MLX megakernel reads its own arena, not the pages",
+        "Have the megakernel read the pages through the row map",
+    ),
     Missing.PREFIX_WIDE: ("Prefix cache doesn't serve fp32 card layers", "Give the paged attention a float32 form"),
     Missing.PREFIX_INVARIANCE: (
         "Prompt rows differ from decode rows here",

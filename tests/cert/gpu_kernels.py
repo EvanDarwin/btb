@@ -13,7 +13,7 @@ import importlib.util
 import os
 import re
 
-from btb.kinds import Json
+from btb.kinds import Json, quant_key, stored_quants
 
 from . import spec
 
@@ -41,7 +41,8 @@ CATEGORIES: tuple[tuple[str, str], ...] = (
     ("Matrix-vector: MXFP4", r"mxfp4|mx4_widen|lane16_mx4"),
     ("Matrix-vector: bf16", r"gemv_(bf16|silu|gelu|mma|sgate|lane16)|gemm_rows"),
     ("Matrix-vector: 12-bit", r"p12"),
-    ("Matrix-vector: GGUF quants", r"<kind>|q\dk|iq4nl"),
+    # a templated type (`<kind>`), or a stored type's own kernels by its key (`btb_gemv_q4k_bf16`)
+    ("Matrix-vector: GGUF quants", "|".join(["<kind>", *(f"_{quant_key(q)}_" for q in stored_quants())])),
     ("Matrix-matrix: bf16", r"gemm_(mma|f32)"),
     ("Attention", r"attn"),
     ("Tensor-core self-check", r"mma_roles"),
@@ -53,7 +54,7 @@ CATEGORIES: tuple[tuple[str, str], ...] = (
     ("Activation", r"silu_mul|gelu_mul|sigmoid_mul"),
     ("DeltaNet", r"delta|conv_window"),
     ("Sampling", r"sample"),
-    ("KV cache", r"kv_store"),
+    ("KV cache", r"kv_store|kv_scatter"),
     ("Whole-pass kernels", r"mega|publish"),
     ("Cache warming", r"l2_warm"),
 )
