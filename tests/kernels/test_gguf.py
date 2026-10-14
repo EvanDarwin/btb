@@ -30,6 +30,10 @@ from tests.helpers import (
     NO_LOG,
     assert_close,
     cached,
+    fixture,
+    forward_logits,
+    host_model,
+    layer_count,
     loaded_model,
     max_abs,
     mxfp4_random,
@@ -241,6 +245,31 @@ def test_each_stored_types_dequant_feeds_the_prefills_gemm(q: Quant) -> None:
     y = stored_matmul(w, torch.from_numpy(x), None).numpy()
     want, mag = x.astype(np.float64) @ ref.T, np.abs(x.astype(np.float64)) @ np.abs(ref.T)
     assert float(np.max(np.abs(y - want) / np.maximum(mag, 1e-30))) < 1e-2, q.value
+
+
+@pytest.mark.parametrize("q", [Quant.IQ4_NL, Quant.IQ1_M], ids=lambda q: q.value)
+def test_a_cold_layer_repacks_its_types_streams_from_each_fill_on_mlx(q: Quant) -> None:
+    """IQ4_NL's split streams and IQ1_M's side stream are repacked from a cold layer's slot each time the ring
+    refills it (`Weight.invalidate`), so two cold layers taking turns in one slot give the logits they give resident
+    (the tiny model's greedy tokens can hide a layer read from the other's weights)"""
+    need_mlx()
+    path = os.path.join(GGUF, f"tiny_qwen3-{q.value.lower()}.gguf")
+    L = layer_count(fixture("tiny_qwen3"))
+    logits = []
+    for cold in ((), range(1, L - 1)):
+        sm = host_model(path, device="mlx", dtype=torch.bfloat16, cpu_layers=range(L), cold_layers=cold, cold_slots=1)
+        try:
+            assert sorted(sm.cold) == list(cold), sm.cold
+            assert not cold or len(sm.cold_ring.shared or ()) == 1, "the cold layers do not share one MLX slot"
+            cache = sm.new_cache()
+            lg = [forward_logits(sm, PROMPT, cache)[0, -1]]
+            for _ in range(4):
+                lg.append(forward_logits(sm, [[int(lg[-1].argmax())]], cache)[0, -1])
+            logits.append(torch.stack(lg).float())
+        finally:
+            sm.close()
+    # the two paths' bf16 rounding is ~0.3% of the largest logit; a layer read from the other's weights ~70%
+    assert_close(logits[1], logits[0], atol_frac=0.02, msg=q.value)
 
 
 @pytest.mark.parametrize("device", ["cpu", "mlx"])

@@ -135,6 +135,7 @@ class Weight:
     q: Quant | None  # a GGUF type multiplied as stored, its kernels' arrays in `streams` (`stored_streams`)
     streams: tuple[Any, ...]
     slot: bool  # `streams` read a slot rewritten in place (`weight_stored_slot`), never copied out of it
+    raw: mx_.array | None  # a slot weight's bytes as the slot holds them, which `invalidate` repacks
 
     def __init__(
         self,
@@ -159,6 +160,7 @@ class Weight:
         self.q = q
         self.streams = streams
         self.slot = slot
+        self.raw = None
         self.shape = tuple(shape) if shape is not None else tuple(int(s) for s in a.shape)
 
     def get(self) -> mx_.array:
@@ -173,12 +175,18 @@ class Weight:
         return self.a
 
     def invalidate(self) -> None:
-        """The slot under a streamed weight was rewritten: drop the unpacked copy of a packed one."""
+        """The slot under a streamed weight was rewritten: drop the unpacked copy of a packed one, and repack a stored
+        type's streams from the slot's new bytes (IQ4_NL's split, a lattice type's side streams are copies)."""
         if self.packed is not None or self.q is not None:
             self.a = None
+        if self.slot and self.q is not None:
+            self.streams = stored_streams(self.q, self.raw)
+            mx().eval(*self.streams)
 
     def drop(self) -> None:
-        self.invalidate()
+        """The slot goes back to be refilled: drop the unpacked copy (the streams repack once the fill lands)."""
+        if self.packed is not None or self.q is not None:
+            self.a = None
 
 
 class Backend:
@@ -284,10 +292,11 @@ class Backend:
 
     def weight_stored_slot(self, shared: Shared, off: int, nb: int, q: Quant, shape: Sequence[int]) -> Weight:
         """a stored type's blocks as the `nb` bytes of a shared slot at `off` (a cold layer's or an expert's,
-        rewritten as the slot is): read in place, a type that repacks them repacking in each pass's graph"""
-        return Weight(
-            q=q, streams=stored_streams(q, shared.view_mx(off, nb, mx().uint8, (nb,))), shape=shape, slot=True
-        )
+        rewritten as the slot is): read in place, a type that repacks them repacking after each fill (`invalidate`)"""
+        raw = shared.view_mx(off, nb, mx().uint8, (nb,))
+        w = Weight(q=q, streams=stored_streams(q, raw), shape=shape, slot=True)
+        w.raw = raw
+        return w
 
     @staticmethod
     def gather_rows(w: Weight, tok: mx_.array) -> mx_.array:
