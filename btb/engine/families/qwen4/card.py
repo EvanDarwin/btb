@@ -44,6 +44,7 @@ import sys
 import time
 import types
 import weakref
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 import torch
@@ -73,6 +74,16 @@ _KERNELS = (
     "btb_ple_gate",
     "btb_ple_conv",
 )
+
+
+def pieced(W: Mapping[str, Any]) -> Iterator[CardMat]:
+    """every matrix of a layer's weights (`Qwen4Card.weights`) the gemv reads as pieces, a hyper-connection's
+    nested ones among them"""
+    for v in W.values():
+        if isinstance(v, Mapping):
+            yield from pieced(v)
+        elif isinstance(v, tuple):
+            yield v
 
 
 class _NGram:
@@ -523,9 +534,9 @@ class Qwen4Card:
 
     def _read_weights(self) -> None:
         """every layer's weights (`weights`), and the rows a bf16 piece among a projection's GGUF blocks runs into
-        (`piece`: a tensor the file kept so, Qwen4's indexer derived from two of its own) sized for the widest"""
-        mats = [W for i in (*(self.res or ()), self.L) for W in self.weights(i).values() if isinstance(W, tuple)]
-        loose, B = card_loose(mats), self.B
+        (`piece`: a tensor the file kept so, Qwen4's indexer derived from two of its own, a hyper-connection's inject
+        beside a stored down) sized for the widest"""
+        loose, B = card_loose([W for i in (*(self.res or ()), self.L) for W in pieced(self.weights(i))]), self.B
         assert B is not None  # the pass buffers come first (`buffers`)
         if loose and ("piece" not in B or int(B["piece"].shape[1]) < loose):
             B |= self._alloc("a bf16 piece's rows", {"piece": ((ROWS, loose), torch.bfloat16)}, "scratch")

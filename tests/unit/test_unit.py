@@ -185,6 +185,29 @@ def test_stored_parts_are_the_bytes_the_card_takes_of_each_form() -> None:
     assert stored_parts(meta, dn) is None, "an expert off the host is the card's already"
 
 
+def test_a_qwen4_cards_piece_rows_reach_its_hyper_connections() -> None:
+    """the card program's `piece` rows are sized from every mixed projection of a layer's weights
+    (families/qwen4/card.py `pieced`), a hyper-connection's down and inject in its own dict among them: a GGUF
+    keeping `hc_attn_down` stored and `hc_attn_inject` bf16 found no buffer, or one too narrow, from the top level"""
+    from btb.engine.families.qwen4.card import pieced
+    from btb.engine.stored import card_loose
+    from btb.gguf import QuantWeight
+    from btb.kinds import Quant
+    from tests.helpers import stored_blocks
+
+    stored = QuantWeight.of(torch.from_numpy(stored_blocks(Quant.Q8_0, 16, 256, 0)), Quant.Q8_0, 16, 256)
+    bf = lambda rows: torch.zeros(rows, 256, dtype=torch.bfloat16)
+    W = {
+        "hcA": {"norm": torch.ones(256, dtype=torch.bfloat16), "dn": (stored, bf(40)), "up": (stored,)},
+        "qkv": (stored, bf(24)),
+        "o": bf(256),
+        "_own": [torch.zeros(4)],
+        "scale": 0.5,
+    }
+    assert card_loose(list(pieced(W))) == 40
+    assert card_loose([v for v in W.values() if isinstance(v, tuple)]) == 24, "the top level alone: too narrow"
+
+
 def test_the_experts_linear_widens_what_no_kernel_multiplies(monkeypatch: MonkeyPatch) -> None:
     """`_Experts._linear` without the kernel for a form (a native library built without it): MXFP4 in either layout,
     a GGUF's gate and up apart, and FP8 are widened and multiplied in float32 - the dequantized matrix's product,
