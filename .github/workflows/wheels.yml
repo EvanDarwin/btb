@@ -96,7 +96,7 @@ jobs:
           sub-packages: '["nvcc", "cudart"]'
       - name: Build the fatbin from source
         run: python build.py build --cuda-only
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fatbin
           path: native/cuda/btb_kernels.fatbin
@@ -224,13 +224,13 @@ jobs:
           # lands in pytest-report.jsonl as it is reported, so a run that aborts keeps its failures, and the last line
           # is the setup of a test that died in its body; --capture=sys leaves a native abort's message in this log
           python -m pytest tests -q -m "not timing and not cert_gap" --capture=sys --report-log=pytest-report.jsonl
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: pytest-report-${{ matrix.id }}
           path: pytest-report.jsonl
           if-no-files-found: ignore
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-${{ matrix.id }}
           path: dist/*.whl
@@ -257,7 +257,7 @@ jobs:
           python -m pip install --require-hashes -r .github/requirements-build.txt -r .github/requirements-sdist.txt
           python -P -m build --sdist   # -P: build.py in the checkout would shadow the build package
           twine check dist/*
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-sdist
           path: dist/*.tar.gz
