@@ -9,7 +9,7 @@ import ctypes
 import itertools
 import math
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import pytest
@@ -71,6 +71,7 @@ from tests.helpers import need_card_kernels, rel_err, stored_blocks
 
 if TYPE_CHECKING:
     from btb.engine.native import _Cuda
+    from btb.engine.scratch import Scratch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA card")
 
@@ -959,6 +960,22 @@ def test_a_stored_types_kernels_are_ggufs_numbers_and_each_row_its_steps(cu: _Cu
         cu.gemv_stored(w, x[:M].contiguous(), y)
         assert rel_err(y.float(), x[:M].float() @ ref.T) < 1e-2, (q.value, M)
         assert torch.equal(y, steps[:M]), (q.value, M)
+
+
+def test_a_refused_card_prefill_decode_takes_the_types_gemv(cu: _Cuda) -> None:
+    """a prefill through a stored linear whose bf16 weight the scheduler has no room for: the rows through the
+    type's gemv 32 at a time, each the bits its step gives, instead of the refusal escaping"""
+    from btb.engine.scheduler import MemoryGrantError
+    from btb.engine.stored import CardStored
+
+    class Refusing:
+        def take(self, *_a: object) -> torch.Tensor:
+            raise MemoryGrantError("no room for the decoded weight")
+
+    w, _ = _stored(Quant.Q4_K, 72, 512, 3)
+    m = CardStored(w, "w", scratch=cast("Scratch", Refusing()))
+    x = torch.randn(1, 70, 512, device=dev, dtype=bf)
+    assert torch.equal(m(x)[0], _steps(cu, w, x[0]))
 
 
 def test_a_merged_projection_writes_a_bf16_piece_beside_its_blocks(cu: _Cuda) -> None:

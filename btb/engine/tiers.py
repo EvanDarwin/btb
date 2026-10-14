@@ -1440,7 +1440,7 @@ class _TiersMixin(_State):
         gg = self.gguf
         name = self._gguf_names.get(self.head_key) if gg is not None else None
         if gg is not None and name is not None and self._card_stores() and gg.storable(name):
-            return CardStored(gg.stored(name).to(self.dev), self.head_key)
+            return CardStored(gg.stored(name).to(self.dev), self.head_key, scratch=self.scratch)
         with self._meta:
             head = RowLinear(self.cfg.hidden_size, self.cfg.vocab_size, bias=False)
         self._adopt(head, "weight", self._get(self.head_key))
@@ -1457,7 +1457,7 @@ class _TiersMixin(_State):
                 parent = getattr(parent, p)
             bias = getattr(getattr(parent, leaf), "bias", None)
             w = self.gguf.stored(name).to(self.dev)
-            setattr(parent, leaf, CardStored(w, key, None if bias is None else bias.data))
+            setattr(parent, leaf, CardStored(w, key, scratch=self.scratch, bias=None if bias is None else bias.data))
 
     def _load_layer(self, i: int, tmpl: Any, first: bool = False) -> None:
         t0 = time.time()
