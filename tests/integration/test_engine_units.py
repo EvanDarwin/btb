@@ -1023,9 +1023,10 @@ def test_the_host_layers_take_a_bf16_activation_through_their_widened_modules(na
 
 
 def test_spec_budget_without_a_cost_curve_is_the_wider_of_the_tree_and_the_chain() -> None:
-    """The speculative loop caps a pass's rows at the budget; without the card's cost curve (the CPU and MLX
-    tiers) the budget must be the configured width, the chain's included: a tree budget of 0 with v_max 4 once
-    returned 1 and switched speculation off on every model without a drafting head."""
+    """The speculative loop caps a pass's rows at the budget; without a cost curve the budget must be the
+    configured width, the chain's included: a tree budget of 0 with v_max 4 once returned 1 and switched
+    speculation off on every model without a drafting head. With one, the drafts swim at the whole width before
+    what they return sizes the passes."""
     from btb.engine.cuda import _CudaMixin
     from btb.engine.families.base import Family
     from btb.kinds import FamilyKind
@@ -1035,13 +1036,19 @@ def test_spec_budget_without_a_cost_curve_is_the_wider_of_the_tree_and_the_chain
             self.tree_budget = tree_budget
             self.fam = Family(kind=FamilyKind.QWEN3)  # the plain block's: no bound on a pass's rows
 
-    assert _Engine(0)._spec_budget(1.0, 0, v_max=4) == 5, "a chain of four drafts and the root"
-    assert _Engine(16)._spec_budget(1.0, 0, v_max=4) == 17, "the tree's rows when wider"
-    assert _Engine(0)._spec_budget(1.0, 0) == 1, "nothing configured: one row"
+    assert _Engine(0)._spec_budget(v_max=4) == 5, "a chain of four drafts and the root"
+    assert _Engine(16)._spec_budget(v_max=4) == 17, "the tree's rows when wider"
+    assert _Engine(0)._spec_budget() == 1, "nothing configured: one row"
     e = _Engine(15)
     e._card_cost = {1: 1.0, 2: 1.1, 4: 1.2, 8: 1.6, 16: 2.0}
-    assert e._spec_budget(1.0, 1, v_max=4) == 4, "with a curve: the widest pass within a quarter over a step"
-    assert e._spec_budget(2.0, 1, v_max=4) == 16, "and wider while the passes yield the tokens to pay for it"
+    pc = e._spec_pricer(4)
+    for _ in range(pc.SWIM):
+        assert e._spec_budget(v_max=4) == 16, "with a curve, before the drafts have returned anything: the whole width"
+        pc.record_pass(16, 2.0, 0.0, 0.01)  # no draft accepted: one token
+    assert e._spec_budget(v_max=4) == 4, "then the widest pass within a quarter over a step"
+    for _ in range(3):
+        pc.record_pass(4, 1.2, 0.0, 0.01, accepted=("mtp",) * 3)  # every draft accepted: four tokens
+    assert e._spec_budget(v_max=4) == 16, "and wider while the passes yield the tokens to pay for it"
 
 
 def test_int8_linear_packs_in_memory_and_multiplies() -> None:

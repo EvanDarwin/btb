@@ -561,9 +561,6 @@ class _GenerateMixin(_State):
             return committed, census
         cur = first
         phase = {"propose": 0.0, "forward": 0.0, "commit": 0.0}
-        # tokens a pass has been yielding (the root and its accepted drafts), against which the card weighs
-        # the width of the next pass
-        ema_tokens = 1.0
         # the drafter's steps and time of this call's passes (its prefill excluded)
         dr_steps0 = int(getattr(getattr(self, "aj", None), "steps", 0) or 0)
         dr_step_s0 = float(getattr(getattr(self, "aj", None), "step_s", 0.0) or 0.0)
@@ -580,7 +577,7 @@ class _GenerateMixin(_State):
         while len(committed) < max_new and not self._stop_asked():
             tp = time.perf_counter()
             v = min(v_max, max_new - len(committed) - 1)
-            budget = self._spec_budget(ema_tokens, census["forwards"], v_max, cache.get_seq_length())
+            budget = self._spec_budget(v_max, cache.get_seq_length())
             rows, probe = pricer.plan(budget, census["forwards"])
             if trace.ON:  # every pass: nothing built for the trace when it is off
                 trace.changed(
@@ -832,7 +829,6 @@ class _GenerateMixin(_State):
                 [str(tags_all[path[d]]) for d in range(1, len(path))],
                 (store_waited() - wait0) if store_waited is not None else 0.0,
             )
-            ema_tokens = 0.85 * ema_tokens + 0.15 * (1 + a)
             if guesses:
                 by_src["drafted"][src] = by_src["drafted"].get(src, 0) + len(guesses)
                 by_src["accepted"][src] = by_src["accepted"].get(src, 0) + a

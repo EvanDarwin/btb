@@ -551,7 +551,7 @@ class _State:
     def _forward_fast(self, h: torch.Tensor, pe: Any, cache: Any, last_only: bool, head: bool) -> torch.Tensor:
         raise NotImplementedError
 
-    def _spec_budget(self, ema_tokens: float, passes: int, v_max: int | None = None, past: int = 0) -> int:
+    def _spec_budget(self, v_max: int | None = None, past: int = 0) -> int:
         raise NotImplementedError
 
     def _spec_full(self, v_max: int | None = None) -> int:

@@ -96,6 +96,20 @@ def test_the_mixture_drafter_on_mlx() -> None:
         _speculates_as_plain(sm)
 
 
+def test_the_mixture_drafter_drafts_through_a_load() -> None:
+    """through btb.load on the CPU, whose warm-up prices the mixture's 2-row pass at about twice a step (each row
+    reads its own experts), a load's first passes still draft at the whole width, so what the drafter returns sizes
+    the passes; each proposer from a fresh pricing, and the decode the plain one"""
+    with loaded_model(fixture("tiny_q35moe"), device="cpu") as sm:
+        plain = sm.generate_greedy(PROMPT, 16)
+        for proposer in PROPOSERS:
+            speculation(sm, tree_budget=8, tree_min_prob=0.0, ngram_p=0.0, v_max=4, price=False)
+            sm._spec_cost = None  # nothing drafted on this load yet
+            toks, census = sm.generate_speculative(PROMPT, 16, proposer=proposer, v_max=4)
+            assert toks == plain, f"{proposer}: {toks} != {plain}"
+            assert census["proposed"] > 0 and census["mtp_steps"] > 0, f"{proposer}: the drafter never drafted"
+
+
 def test_the_mixture_drafter_reads_experts_wider_than_the_trunks(tmp_path: Path) -> None:
     """a GGUF whose drafting block keeps its experts Q8_0 beside the trunk's Q4_0: the store's slot parts are sized
     for the widest expert of any block, the NextN one's included, so the drafter reads its experts whole and the

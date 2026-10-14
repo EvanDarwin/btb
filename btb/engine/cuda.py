@@ -2701,18 +2701,16 @@ class _CudaMixin(_State):
         bound = self.fam.verify_rows(self)
         return full if bound is None else max(1, min(full, int(bound)))
 
-    def _spec_budget(self, ema_tokens: float, passes: int, v_max: int | None = None, past: int = 0) -> int:
-        """Rows a speculative pass may carry, the root included, from the cost curve of the card graph's passes -
-        the warm-up's, as the passes measure it now (`_spec_curve`) - and the running acceptance: the widest pass
-        costing at most a quarter more than the
-        one-row step, and only while the tokens a pass yields pay for its width - otherwise one-row passes,
-        with a wide probe every sixteenth pass so a stretch of accepted drafts can reopen the tree. Without a
-        cost curve (the MLX and host paths) the configured budget stands: the tree's rows, or a chain's
-        `v_max` drafts and the root, whichever is wider."""
+    def _spec_budget(self, v_max: int | None = None, past: int = 0) -> int:
+        """Rows a speculative pass may carry, the root included, from the cost curve of the engine's passes (the
+        card's, MLX's or the host's warm-up, as the passes measure it now: `_spec_curve`) and the tokens its drafted
+        passes return (`SpecCost.budget`). Without a curve the configured budget stands: the tree's rows, or a
+        chain's `v_max` drafts and the root, whichever is wider."""
         full = self._spec_full(v_max)
         cost = self._spec_curve()
         if not cost or 1 not in cost or len(cost) <= 1 or full <= 1:
             return full
+        pc: SpecCost | None = getattr(self, "_spec_cost", None)
         slope = getattr(self, "_mlx_attn_slope", None)
         if slope and getattr(self, "_card_cost", None) is None and past > 0:
             # a pass over `past` rows: every node past the first reads the prefix again, at the warm-up's cost
@@ -2720,20 +2718,9 @@ class _CudaMixin(_State):
             # widths the warm-up's short context prices, not to those the passes measured here, whose seconds hold it
             b = next((s for r, s in slope if past <= r), slope[-1][1])
             n_attn = sum(1 for lt in self.layer_types if lt in (LayerKind.FULL, LayerKind.SLIDING))
-            pc: SpecCost | None = getattr(self, "_spec_cost", None)
             measured = pc.measured() if pc is not None else set()
             cost = {T: c + (0 if T in measured else n_attn * (T - 1) * past * b) for T, c in cost.items()}
-        c1 = cost[1]
-        # a pass may cost what it yields: the widest pass whose cost, in one-row steps, is within the tokens
-        # a pass has been returning (a quarter over a step is always allowed, so a tree can start)
-        allow = max(1.25, float(ema_tokens)) * c1
-        wide = [T for T, c in cost.items() if T <= full and c <= allow]
-        cap = max(wide) if wide else 1
-        if passes % 16 == 0:
-            # the periodic probe: the widest pass within a quarter over a step, whatever the yield has been
-            probe = [T for T, c in cost.items() if T <= full and c <= 1.25 * c1]
-            cap = max(cap, max(probe) if probe else 1)
-        return max(1, cap)
+        return (pc if pc is not None else self._spec_pricer(v_max)).budget(cost, full)
 
     def _spec_pricer(self, v_max: int | None = None) -> SpecCost:
         """The engine's pricing of its speculative passes (`SpecCost`): made on first use and kept across calls,

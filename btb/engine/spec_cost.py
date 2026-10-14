@@ -39,6 +39,13 @@ pass only where the rows' reads matter - the widest pass's modelled reads a twen
 over the engine's full width, the base curve's budget set aside (its curve priced the reads into the rows); a model
 whose experts sit in VRAM or RAM, and a dense model, keep the width the base curve gives them.
 
+Yield. The base curve gives a pass the widest width whose cost in one-row steps is within the tokens a drafted pass
+has been returning, decayed and kept across calls (`budget`). Only a pass that drafts measures them, and a curve that
+prices a 2-row pass over a quarter above a step (tiny_q35moe on the host: 2.2 steps) sized every pass one row wide
+before any had, for good. So the drafter swims first: the first SWIM passes that draft take the whole width, then one
+every PROBE passes, the gap doubling to SWIM_FAR with each that does not pay for its rows. Where no width's rows could
+return a quarter more than they cost, nothing is tried.
+
 Every figure is a Python float updated by a few operations a pass: nothing synchronizes, and the same history gives
 the same widths.
 """
@@ -78,6 +85,11 @@ class SpecCost:
     # drafter's measured again (Qwen3.8-flash-next on the host: a 2-row pass 2.2 steps and the drafter 0.58 s, its
     # probes a sixth of the call)
     PROBE_FAR = 64
+    # the unpriced budget (`budget`): the passes that draft at the whole width before what they return sizes the
+    # passes, and the widest gap its later probes stretch to, doubling from PROBE with each that did not pay
+    SWIM = 4
+    SWIM_FAR = 256
+    YIELD_DECAY = 0.85  # in the tokens a drafted pass returns
     # passes past a width's last measure before the curve takes the warm-up's figure for it again (`curve_now`)
     LIVE_STALE = 256
     LIVE_N = 8  # a width's recent passes the curve takes the fastest of
@@ -115,6 +127,11 @@ class SpecCost:
         # the first pass priced once a step is measured probes: the tree drafted whole, one draft verified at least
         self.probe_next = True
         self.plain_run = 0  # the plain steps since a pass last verified a draft
+        self.tokens: float | None = None  # the tokens a drafted pass returned, its root's included, decayed
+        self.drafted = 0  # the passes that drafted
+        self.swim_gap = self.PROBE  # the passes between the unpriced budget's probes
+        self.swim_at = 0  # `passes_seen` at its last
+        self.swim_probe = False  # the budget gave the next pass to draft the whole width
         self.begin()
 
     @staticmethod
@@ -266,6 +283,28 @@ class SpecCost:
 
     # -- the pass ----------------------------------------------------------------------------------------------
 
+    def swims(self, cost: Mapping[int, float], full: int) -> bool:
+        """whether the unpriced budget gives the next pass the whole `full` width: the first SWIM passes that draft,
+        then one every `swim_gap` passes - a pass the tokens size one row wide never drafts, so never learns what a
+        draft returns. Only where some width's rows could return a quarter more than the base curve `cost` says they
+        cost ({rows: seconds}): where none could, no yield pays and nothing is tried"""
+        c1 = cost.get(1, 0.0)
+        if c1 <= 0 or not any(t >= 1.25 * c / c1 for t, c in cost.items() if 1 < t <= full):
+            return False
+        if self.drafted < self.SWIM or self.passes_seen - self.swim_at >= self.swim_gap:
+            self.swim_probe = True
+        return self.swim_probe
+
+    def budget(self, cost: Mapping[int, float], full: int) -> int:
+        """the rows an unpriced pass may carry, root included, from the base curve `cost` ({rows: seconds}): the
+        widest whose cost in one-row steps is within the tokens a drafted pass has been returning (a quarter over a
+        step always, so a tree can start), or the whole `full` while the drafter swims (`swims`)"""
+        if self.swims(cost, full):
+            return full
+        allow = max(1.25, self.tokens or 1.0) * cost[1]
+        wide = [t for t, c in cost.items() if t <= full and c <= allow]
+        return max(wide) if wide else 1
+
     def plan(self, cap: int, passes: int) -> tuple[int, bool]:
         """(the rows to draft for, root included; whether this pass probes). Unpriced, the base curve's `cap`.
         Priced, the engine's full width bounds it - `cap` set aside, its curve having priced the store's reads into
@@ -330,7 +369,7 @@ class SpecCost:
         """a pass of `k` rows done in `seconds` (the verify, the drafter's `draft_s` apart, None when it did not
         draft), putting `reads` expert reads to the drive and waiting `wait` of its seconds on the store's reads;
         `nodes` its drafts' (source, depth, path probability), `accepted` the sources of its accepted drafts by
-        depth"""
+        depth, one each"""
         k = max(1, int(k))
         if self.ready():
             self.pred_s += self.cost(k)
@@ -394,6 +433,17 @@ class SpecCost:
         win.append(compute)
         self.live[w] = min(win)
         self.live_at[w] = self.passes_seen
+        if k > 1:
+            a = len(accepted)
+            self.tokens = _mix(self.tokens, 1.0 + a, self.YIELD_DECAY)
+            self.drafted += 1
+            if self.swim_probe:
+                if self.drafted > self.SWIM:
+                    # a probe past the trial that did not pay for its rows waits twice as long for the next
+                    paid = 1.0 + a >= self.ratio(k)
+                    self.swim_gap = self.PROBE if paid else min(self.SWIM_FAR, 2 * self.swim_gap)
+                self.swim_probe = False
+                self.swim_at = self.passes_seen
 
     def calibration(self, tag: str) -> list[float]:
         """`tag`'s calibration by depth, 1 .. DEPTHS"""
