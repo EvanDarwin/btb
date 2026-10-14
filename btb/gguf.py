@@ -10,6 +10,7 @@ the memmapped file by the `gguf` package, which also dequantizes it, and a tenso
 from __future__ import annotations
 
 import functools
+import math
 import os
 import warnings
 from collections import Counter
@@ -914,15 +915,38 @@ class GGUFModel:
         return self.path, int(t.data_offset), int(t.n_bytes)
 
     def _float32(self, name: str, expert: int | None) -> np.ndarray:
-        """the file's tensor `name` (its `expert`-th slice where given) dequantized to float32 by the gguf package"""
+        """the file's tensor `name` (its `expert`-th slice where given) in float32: a type btb's library decodes by
+        that decode, the gguf package's numbers to the bit but a zero's sign (its fused multiply-add rounds an exact
+        zero to +0 where the package's product keeps -0); a float type widened; any other by the gguf package"""
+        from .engine.native import Native
+
         t = self.tensors[name]
         data = np.asarray(t.data)
-        return np.asarray(gguf_lib().dequantize(data if expert is None else data[expert], t.tensor_type))
+        data = data if expert is None else data[expert]
+        kind = t.tensor_type.name
+        if kind == "F32":
+            return data.view(np.float32)
+        if kind == "F16":
+            return data.view(np.float16).astype(np.float32)
+        if kind == "BF16":
+            return (data.view(np.int16).astype(np.int32) << 16).view(np.float32)
+        gq = Native.gemv_quant
+        q = next((q for q in gq.dequants if q.value == kind), None) if gq is not None else None
+        if gq is None or q is None:
+            return np.asarray(gguf_lib().dequantize(data, t.tensor_type))
+        weights, nbytes = block_of(q)
+        rows, cols = math.prod(data.shape[:-1]), data.shape[-1] // nbytes * weights
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # the memmap is read-only, and the decode only reads it
+            raw = torch.from_numpy(np.ascontiguousarray(data).view(np.uint8).reshape(-1))
+        out = torch.empty(rows, cols, dtype=torch.float32)
+        gq.dequant(QuantWeight.of(raw, q, rows, cols), out)
+        return out.numpy().reshape(*data.shape[:-1], cols)
 
     def get(self, name: str, expert: int | None = None) -> torch.Tensor:
         """the file's tensor `name` as bf16 (the `expert`-th of a stacked expert tensor where given): read off the
-        memmap and, for a quantized type, dequantized by the gguf package to the numbers llama.cpp itself would
-        compute; a `fused` name is its two biases interleaved, an `undo` one the converter's rewrite inverted and
+        memmap and, for a quantized type, decoded to the numbers llama.cpp itself would compute (`_float32`); a
+        `fused` name is its two biases interleaved, an `undo` one the converter's rewrite inverted and
         a `derived` one rebuilt from the file's, both in float32 (int64 for a hash constant)"""
         if name in self.fused:
             gate, up = (self.get(n) for n in self.fused[name])

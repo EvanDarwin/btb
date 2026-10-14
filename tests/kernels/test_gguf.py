@@ -248,6 +248,31 @@ def test_each_stored_types_dequant_feeds_the_prefills_gemm(q: Quant) -> None:
     assert float(np.max(np.abs(y - want) / np.maximum(mag, 1e-30))) < 1e-2, q.value
 
 
+@pytest.mark.parametrize("q", [Quant.BF16, Quant.F16, *stored_quants()], ids=lambda q: q.value)
+def test_the_reader_decodes_each_type_to_the_packages_numbers(q: Quant) -> None:
+    """every tensor of a type's twin, and each expert of a mixture's, decoded by btb (`GGUFModel._float32`): the
+    gguf package's numbers to the bit but a zero's sign"""
+    from gguf import dequantize
+
+    from btb.gguf import GGUFModel
+
+    native_library()
+    for stem in ("tiny_qwen3", "tiny_q35moe"):
+        g = GGUFModel(os.path.join(GGUF, f"{stem}-{q.value.lower()}.gguf"))
+        n = 0
+        for name, t in g.tensors.items():
+            if t.tensor_type.name != q.value:
+                continue
+            data = np.asarray(t.data)
+            for e in range(data.shape[0]) if name.endswith("_exps.weight") else (None,):
+                got = g._float32(name, e)
+                want = np.asarray(dequantize(data if e is None else data[e], t.tensor_type))
+                assert got.shape == want.shape and np.array_equal(got, want), (stem, name, e)
+                assert not np.any((got.view(np.uint32) != want.view(np.uint32)) & (want != 0)), (stem, name, e)
+                n += 1
+        assert n, f"{stem}: no {q.value} tensor"
+
+
 def test_a_refused_prefill_decode_takes_the_types_gemv() -> None:
     """a prefill whose decoded weight the scheduler has no room for: `stored_matmul`'s rows through the type's gemv,
     each row the bits its step gives, instead of the refusal escaping"""
@@ -326,8 +351,8 @@ def test_a_long_gguf_prefill_takes_the_gemm_as_a_bf16_one_does(device: str, monk
     monkeypatch.setattr(backend, "stored_dequant", mlx_dequant)
     logits = {}
     for packed in (1, 0):
-        decoded.clear()
         with loaded_model(path, device=device, gguf_packed=packed) as sm:
+            decoded.clear()  # the pass's decodes: the load decodes the file's other tensors through `dequant` too
             lg = sm.forward(prompt, cache=sm.new_cache())
             assert lg is not None
             logits[packed] = lg.float()[0, -1]
