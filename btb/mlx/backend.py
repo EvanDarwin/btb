@@ -60,7 +60,7 @@ _DEQUANT: dict[str, Callable[..., Any]] = {
 def stored_streams(q: Quant, raw: Any) -> tuple[Any, ...]:
     """the arrays type `q`'s kernels read for the file's bytes `raw`: the bytes, IQ4_NL's split streams, a lattice
     type's bytes and side streams. Host bytes are copied in and repacked once, here; a slot's MLX view is read in
-    place, its repack in the graph of each pass that reads it"""
+    place, repacked after each fill (`Weight.invalidate`)"""
     m = mx()
     a = raw if isinstance(raw, m.array) else m.array(np.asarray(raw, dtype=np.uint8).reshape(-1))
     out = (
@@ -79,6 +79,8 @@ def stored_matvec(q: Quant, streams: tuple[Any, ...], x: mx_.array, rows: int, c
     """y[T, rows] = x[T, cols] . W^T on type `q`'s own kernel over its `stored_streams`: f32 accumulation, y in x's
     dtype, batch-invariant (16 rows a launch)"""
     c, key = QUANT_KIND[q], quant_key(q)
+    if c is QuantClass.FLOAT:
+        return gemv(_floats(q, streams[0], rows, cols), x)
     if c is QuantClass.AFFINE:
         return matvec_legacy(q.value.lower(), streams[0], x, rows, cols)
     if c is QuantClass.LATTICE:
@@ -86,9 +88,17 @@ def stored_matvec(q: Quant, streams: tuple[Any, ...], x: mx_.array, rows: int, c
     return _MATVEC[key](*streams, x, rows, cols)
 
 
+def _floats(q: Quant, raw: mx_.array, rows: int, cols: int) -> mx_.array:
+    """a float type's bytes (`EXPERT_FLOATS`: a GGUF's expert held as the file's) as its [rows, cols] matrix"""
+    m = mx()
+    return raw.view(m.float16 if q is Quant.F16 else m.bfloat16).reshape(rows, cols)
+
+
 def stored_dequant(q: Quant, streams: tuple[Any, ...], rows: int, cols: int) -> mx_.array:
     """the whole [rows, cols] weight of type `q` in bf16 from its `stored_streams`, gguf's numbers"""
     c, key = QUANT_KIND[q], quant_key(q)
+    if c is QuantClass.FLOAT:
+        return _floats(q, streams[0], rows, cols).astype(mx().bfloat16)
     if c is QuantClass.AFFINE:
         return dequant_legacy(q.value.lower(), streams[0], rows, cols)
     if c is QuantClass.LATTICE:

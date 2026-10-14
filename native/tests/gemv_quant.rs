@@ -140,11 +140,14 @@ fn malformed_calls_return_their_codes() {
                 );
             }
         }
-        assert_eq!(
-            code(rp, gp, kp, rows, f.block + 1, xp, 1, yp),
-            ERR_DOMAIN,
-            "{n}: a partial block"
-        );
+        if f.block > 1 {
+            // a block of one weight (F16) has no partial block
+            assert_eq!(
+                code(rp, gp, kp, rows, f.block + 1, xp, 1, yp),
+                ERR_DOMAIN,
+                "{n}: a partial block"
+            );
+        }
         assert_eq!(
             code(rp, gp, kp, 0, cols, xp, 1, yp),
             ERR_DOMAIN,
@@ -247,11 +250,13 @@ fn malformed_groups_return_their_codes() {
             ERR_NULL,
             "{n}: a null task"
         );
-        assert_eq!(
-            code(rp, gp, kp, 1, f.block + 1),
-            ERR_DOMAIN,
-            "{n}: a partial block"
-        );
+        if f.block > 1 {
+            assert_eq!(
+                code(rp, gp, kp, 1, f.block + 1),
+                ERR_DOMAIN,
+                "{n}: a partial block"
+            );
+        }
         if let Call::Latt(..) = f.call {
             assert_eq!(
                 code(rp, std::ptr::null(), kp, 1, cols),
@@ -323,11 +328,13 @@ fn malformed_dequants_return_their_codes() {
             ERR_NULL,
             "{n}: null out"
         );
-        assert_eq!(
-            code(rp, gp, kp, f.block + 1, op),
-            ERR_DOMAIN,
-            "{n}: a partial block"
-        );
+        if f.block > 1 {
+            assert_eq!(
+                code(rp, gp, kp, f.block + 1, op),
+                ERR_DOMAIN,
+                "{n}: a partial block"
+            );
+        }
         assert_eq!(code(rp, gp, kp, 0, op), ERR_DOMAIN, "{n}: no columns");
         let off = unsafe { (op as *mut u8).add(1) as *mut f32 };
         assert_eq!(

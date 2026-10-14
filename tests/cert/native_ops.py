@@ -193,6 +193,16 @@ OPS: tuple[Op, ...] = (
         )
         for c in sorted(STORED_CLASSES)
     ),
+    # a GGUF expert's f16 tensor multiplied as stored (`kinds.EXPERT_FLOATS`; a bf16 one is `gemv_bf16`'s): its rows,
+    # group and dequantization, a format of one weight a block in the stored types' tests and bench
+    Op(
+        "gemv_f16",
+        (Stored.F16,),
+        tuple(e.format(quant_key(Quant.F16)) for e in QUANT_EXPORTS),
+        "gemv_quant.rs",
+        "guard_gemv_quant.rs",
+        "gemv.rs",
+    ),
     Op(
         "gemv_group",
         (Stored.BF16, Stored.MXFP4, Stored.FP8),

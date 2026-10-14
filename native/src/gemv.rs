@@ -545,6 +545,159 @@ def_task_bf16!(
     "avx512f,avx512bw"
 );
 
+/// The f16 rows of a task (a GGUF's float tensor, multiplied as stored), `Send + Sync` for the row partition.
+#[derive(Clone, Copy)]
+struct F16(*const u16);
+
+// SAFETY: a task reads its rows and writes its own rows of `y`; the caller's buffers do not overlap
+unsafe impl Send for F16 {}
+unsafe impl Sync for F16 {}
+
+#[inline]
+unsafe fn widen_f16_scalar<const R: usize>(
+    dst: *mut f32,
+    w: *const u16,
+    row_stride: usize,
+    dst_stride: usize,
+    n: usize,
+) {
+    for r in 0..R {
+        let src = w.add(r * row_stride);
+        let out = dst.add(r * dst_stride);
+        for j in 0..n {
+            *out.add(j) = f16_to_f32(*src.add(j));
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn widen_f16_neon<const R: usize>(
+    dst: *mut f32,
+    w: *const u16,
+    row_stride: usize,
+    dst_stride: usize,
+    n: usize,
+) {
+    use std::arch::aarch64::*;
+    let nb = n / 8;
+    for r in 0..R {
+        let src = w.add(r * row_stride);
+        let out = dst.add(r * dst_stride);
+        for k in 0..nb {
+            let c = k * 8;
+            let h = vreinterpretq_f16_u16(vld1q_u16(src.add(c)));
+            vst1q_f32(out.add(c), vcvt_f32_f16(vget_low_f16(h)));
+            vst1q_f32(out.add(c + 4), vcvt_high_f32_f16(h));
+        }
+        for j in (nb * 8)..n {
+            *out.add(j) = f16_to_f32(*src.add(j));
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c")]
+unsafe fn widen_f16_avx2<const R: usize>(
+    dst: *mut f32,
+    w: *const u16,
+    row_stride: usize,
+    dst_stride: usize,
+    n: usize,
+) {
+    use std::arch::x86_64::*;
+    let nb = n / 8;
+    for r in 0..R {
+        let src = w.add(r * row_stride);
+        let out = dst.add(r * dst_stride);
+        for k in 0..nb {
+            let c = k * 8;
+            _mm256_storeu_ps(
+                out.add(c),
+                _mm256_cvtph_ps(_mm_loadu_si128(src.add(c) as *const __m128i)),
+            );
+        }
+        for j in (nb * 8)..n {
+            *out.add(j) = f16_to_f32(*src.add(j));
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn widen_f16_avx512<const R: usize>(
+    dst: *mut f32,
+    w: *const u16,
+    row_stride: usize,
+    dst_stride: usize,
+    n: usize,
+) {
+    use std::arch::x86_64::*;
+    let nb = n / LANES;
+    for r in 0..R {
+        let src = w.add(r * row_stride);
+        let out = dst.add(r * dst_stride);
+        for k in 0..nb {
+            let c = k * LANES;
+            _mm512_storeu_ps(
+                out.add(c),
+                _mm512_cvtph_ps(_mm256_loadu_si256(src.add(c) as *const __m256i)),
+            );
+        }
+        for j in (nb * LANES)..n {
+            *out.add(j) = f16_to_f32(*src.add(j));
+        }
+    }
+}
+
+// every vector count widens the tile and accumulates it as the bf16 path's wider passes do: one path, so the bits
+// never depend on `b`, and the widening is exact
+macro_rules! def_task_f16 {
+    ($group:ident, $task:ident, $accum:ident, $widen:ident $(, $feat:literal)?) => {
+        def_task!($group, $task, F16, $accum $(, $feat)?,
+            prep |p, r, cols, cur| {},
+            tile |scratch, wide, x, i0, bt, p, r, c0, cols, n, cur| {
+                $widen::<R>(wide, p.0.add(r * cols + c0), cols, COL_TILE, n);
+                false
+            });
+    };
+}
+
+def_task_f16!(
+    group_f16_scalar,
+    task_f16_scalar,
+    accum_scalar,
+    widen_f16_scalar
+);
+#[cfg(target_arch = "x86_64")]
+def_task_f16!(
+    group_f16_avx2,
+    task_f16_avx2,
+    accum_avx2,
+    widen_f16_avx2,
+    "avx2,fma,f16c"
+);
+#[cfg(target_arch = "aarch64")]
+def_task_f16!(group_f16_neon, task_f16_neon, accum_neon, widen_f16_neon);
+#[cfg(target_arch = "x86_64")]
+def_task_f16!(
+    group_f16_avx512,
+    task_f16_avx512,
+    accum_avx512,
+    widen_f16_avx512,
+    "avx512f,avx512bw,f16c"
+);
+
+/// `isa` where its f16 widen can run: an x86 core without F16C (none with AVX2 ships so) takes the scalar one
+#[inline]
+fn f16_isa(isa: Isa) -> Isa {
+    #[cfg(target_arch = "x86_64")]
+    if matches!(isa, Isa::Avx2 | Isa::Avx512) && !std::arch::is_x86_feature_detected!("f16c") {
+        return Isa::Scalar;
+    }
+    isa
+}
+
 #[derive(Clone, Copy)]
 struct P12 {
     lo: *const u8,
@@ -3437,6 +3590,30 @@ impl Weights for Bf16 {
     }
 }
 
+impl Weights for F16 {
+    #[inline]
+    unsafe fn rows(
+        self,
+        isa: Isa,
+        cols: usize,
+        x: *const f32,
+        b: usize,
+        y: *mut f32,
+        rows_total: usize,
+        r0: usize,
+        r1: usize,
+    ) {
+        by_isa!(
+            f16_isa(isa),
+            task_f16_scalar,
+            task_f16_avx2,
+            task_f16_avx512,
+            task_f16_neon,
+            (self, cols, x, b, y, rows_total, r0, r1)
+        )
+    }
+}
+
 impl Weights for P12 {
     #[inline]
     unsafe fn rows(
@@ -3799,6 +3976,34 @@ pub(crate) unsafe fn gemv_core(
     y: *mut f32,
     threads: usize,
 ) -> i32 {
+    gemv_u16(Bf16, w, rows, cols, x, b, y, threads)
+}
+
+/// [`gemv_core`] over an f16 matrix (`raw`, `[rows, cols]` IEEE halves): a GGUF's float tensor as stored.
+pub(crate) unsafe fn gemv_f16_core(
+    raw: *const u8,
+    rows: usize,
+    cols: usize,
+    x: *const f32,
+    b: usize,
+    y: *mut f32,
+    threads: usize,
+) -> i32 {
+    gemv_u16(F16, raw as *const u16, rows, cols, x, b, y, threads)
+}
+
+/// One matrix of 16-bit weights checked and run, `wrap` naming their form.
+#[allow(clippy::too_many_arguments)]
+unsafe fn gemv_u16<W: Weights>(
+    wrap: fn(*const u16) -> W,
+    w: *const u16,
+    rows: usize,
+    cols: usize,
+    x: *const f32,
+    b: usize,
+    y: *mut f32,
+    threads: usize,
+) -> i32 {
     if w.is_null() || x.is_null() || y.is_null() {
         return ERR_NULL;
     }
@@ -3811,7 +4016,7 @@ pub(crate) unsafe fn gemv_core(
     }
     run_one(
         Task {
-            w: Bf16(w),
+            w: wrap(w),
             x,
             y,
             rows,
@@ -3858,6 +4063,47 @@ pub(crate) unsafe fn gemv_group_core(
     y: *mut *mut f32,
     threads: usize,
 ) -> i32 {
+    group_u16(Bf16, n, w, rows, cols, x, b, y, threads)
+}
+
+/// [`gemv_group_core`] over f16 matrices (each `raw[t]` `[rows[t], cols[t]]` IEEE halves).
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn gemv_f16_group_core(
+    n: usize,
+    raw: *const *const u8,
+    rows: *const usize,
+    cols: *const usize,
+    x: *const *const f32,
+    b: *const usize,
+    y: *mut *mut f32,
+    threads: usize,
+) -> i32 {
+    group_u16(
+        F16,
+        n,
+        raw as *const *const u16,
+        rows,
+        cols,
+        x,
+        b,
+        y,
+        threads,
+    )
+}
+
+/// `n` matrices of 16-bit weights checked and run under one dispatch, `wrap` naming their form.
+#[allow(clippy::too_many_arguments)]
+unsafe fn group_u16<W: Weights>(
+    wrap: fn(*const u16) -> W,
+    n: usize,
+    w: *const *const u16,
+    rows: *const usize,
+    cols: *const usize,
+    x: *const *const f32,
+    b: *const usize,
+    y: *mut *mut f32,
+    threads: usize,
+) -> i32 {
     if w.is_null() || rows.is_null() || cols.is_null() || x.is_null() || b.is_null() || y.is_null()
     {
         return ERR_NULL;
@@ -3866,25 +4112,26 @@ pub(crate) unsafe fn gemv_group_core(
         return ERR_DOMAIN;
     }
 
-    let mut tasks: Vec<Task<Bf16>> = Vec::with_capacity(n);
+    let mut tasks: Vec<Task<W>> = Vec::with_capacity(n);
     let mut total = 0usize;
     for t in 0..n {
+        let wt = *w.add(t);
         let job = Task {
-            w: Bf16(*w.add(t)),
+            w: wrap(wt),
             x: *x.add(t),
             y: *y.add(t),
             rows: *rows.add(t),
             cols: *cols.add(t),
             b: *b.add(t),
         };
-        if job.w.0.is_null() || job.x.is_null() || job.y.is_null() {
+        if wt.is_null() || job.x.is_null() || job.y.is_null() {
             return ERR_NULL;
         }
         if job.rows == 0 || job.cols == 0 || job.b == 0 {
             return ERR_DOMAIN;
         }
         if !shape_ok(job.rows, job.cols, job.b)
-            || !aligned(job.w.0)
+            || !aligned(wt)
             || !aligned(job.x)
             || !aligned(job.y)
         {
@@ -4405,6 +4652,20 @@ impl_widen!(Iq1s, widen_iq1s, widen_iq1s_neon);
 impl_widen!(Iq3s, widen_iq3s, widen_iq3s_neon);
 impl_widen!(Iq1m, widen_iq1m, widen_iq1m_neon);
 
+impl Widen for F16 {
+    #[inline]
+    unsafe fn widen_row(self, isa: Isa, dst: *mut f32, r: usize, cols: usize) {
+        let src = self.0.add(r * cols);
+        match f16_isa(isa) {
+            #[cfg(target_arch = "aarch64")]
+            Isa::Neon => widen_f16_neon::<1>(dst, src, cols, cols, cols),
+            #[cfg(target_arch = "x86_64")]
+            Isa::Avx2 | Isa::Avx512 => widen_f16_avx2::<1>(dst, src, cols, cols, cols),
+            _ => widen_f16_scalar::<1>(dst, src, cols, cols, cols),
+        }
+    }
+}
+
 /// One dequantization: the weights and where the rows go.
 #[derive(Clone, Copy)]
 struct Dequant<W> {
@@ -4487,6 +4748,24 @@ quant_dequant_core!(dequant_iq4nl_core, Iq4nl, IQ4NL_BLK);
 quant_dequant_core!(dequant_q40_core, Q40, AFFINE_BLK);
 quant_dequant_core!(dequant_q41_core, Q41, AFFINE_BLK);
 quant_dequant_core!(dequant_q80_core, Q80, AFFINE_BLK);
+
+/// [`dequant`] for an f16 matrix (`raw`, `[rows, cols]` IEEE halves): its numbers exactly, in f32.
+pub(crate) unsafe fn dequant_f16_core(
+    raw: *const u8,
+    rows: usize,
+    cols: usize,
+    out: *mut f32,
+    threads: usize,
+) -> i32 {
+    let w = raw as *const u16;
+    if w.is_null() {
+        return ERR_NULL;
+    }
+    if !aligned(w) {
+        return ERR_DOMAIN;
+    }
+    dequant(F16(w), rows, cols, 1, out, threads)
+}
 
 /// [`dequant`] for a lattice type, with its grid and (`$ks`) sign table.
 macro_rules! latt_dequant_core {
@@ -5551,6 +5830,205 @@ mod tests {
             }
         }
         raw
+    }
+
+    /// finite halves, a few subnormals among them: the exponent field drawn over 0..=30
+    fn f16_random(n: usize, seed: u64) -> Vec<u16> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let h = (s >> 32) as u16;
+                (h & 0x83FF) | ((((h >> 10) & 0x1F) % 31) << 10)
+            })
+            .collect()
+    }
+
+    fn f16_call(
+        w: &[u16],
+        rows: usize,
+        cols: usize,
+        x: &[f32],
+        b: usize,
+        threads: usize,
+    ) -> Vec<f32> {
+        let mut y = vec![f32::NAN; b * rows];
+        let code = unsafe {
+            gemv_f16_core(
+                w.as_ptr() as *const u8,
+                rows,
+                cols,
+                x.as_ptr(),
+                b,
+                y.as_mut_ptr(),
+                threads,
+            )
+        };
+        assert_eq!(code, OK);
+        y
+    }
+
+    #[test]
+    fn f16_matches_the_f64_reference() {
+        for (i, (rows, cols)) in [
+            (1usize, 1usize),
+            (3, 17),
+            (7, 400),
+            (16, 16),
+            (17, 1025),
+            (33, 512),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let w = f16_random(rows * cols, 0x5151_a0a0_1234_0000 ^ i as u64);
+            let x = f8_x(cols, 0x0f0f_1616_2525_3434 ^ i as u64);
+            let y = f16_call(&w, rows, cols, &x, 1, 1);
+            for r in 0..rows {
+                let row = &w[r * cols..(r + 1) * cols];
+                let terms = row
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(a, b)| f16_to_f32(*a) as f64 * *b as f64);
+                let want: f64 = terms.clone().sum();
+                let scale = terms.map(f64::abs).sum::<f64>().max(1e-30);
+                assert!(
+                    ((y[r] as f64 - want).abs() / scale) < 1e-6,
+                    "{rows}x{cols} row {r}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn f16_tiling_threads_and_batching_do_not_move_a_single_bit() {
+        let (rows, cols) = (67usize, 1040usize);
+        let w = f16_random(rows * cols, 0xf16f_16f1_6f16_f16f);
+        let x = f8_x(3 * cols, 0x0bad_f16f_ee00_0dd1);
+        let base = f16_call(&w, rows, cols, &x, 3, 1);
+        for t in [2usize, 3, 5, 8, 0] {
+            let got = f16_call(&w, rows, cols, &x, 3, t);
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                base.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "threads = {t}"
+            );
+        }
+        for i in 0..3 {
+            let solo = f16_call(&w, rows, cols, &x[i * cols..(i + 1) * cols], 1, 0);
+            for r in 0..rows {
+                assert_eq!(
+                    solo[r].to_bits(),
+                    base[i * rows + r].to_bits(),
+                    "vector {i} row {r}"
+                );
+            }
+        }
+    }
+
+    /// Every half through each widening this machine runs against the scalar one, over a run that cuts the SIMD
+    /// width, to the bit (a NaN to a NaN).
+    #[test]
+    fn f16_widenings_agree_across_isas() {
+        let n = 65536 + 7;
+        let w: Vec<u16> = (0..n).map(|i| (i % 65536) as u16).collect();
+        let mut want = vec![0.0f32; n];
+        unsafe { widen_f16_scalar::<1>(want.as_mut_ptr(), w.as_ptr(), n, n, n) };
+        let same = |got: &[f32], isa: &str| {
+            for (j, (g, e)) in got.iter().zip(want.iter()).enumerate() {
+                assert!(
+                    g.to_bits() == e.to_bits() || (g.is_nan() && e.is_nan()),
+                    "{isa} half {:#06x}",
+                    w[j]
+                );
+            }
+        };
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mut got = vec![0.0f32; n];
+            unsafe { widen_f16_neon::<1>(got.as_mut_ptr(), w.as_ptr(), n, n, n) };
+            same(&got, "neon");
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("f16c")
+            {
+                let mut got = vec![0.0f32; n];
+                unsafe { widen_f16_avx2::<1>(got.as_mut_ptr(), w.as_ptr(), n, n, n) };
+                same(&got, "avx2");
+            }
+            if std::arch::is_x86_feature_detected!("avx512f") {
+                let mut got = vec![0.0f32; n];
+                unsafe { widen_f16_avx512::<1>(got.as_mut_ptr(), w.as_ptr(), n, n, n) };
+                same(&got, "avx512");
+            }
+        }
+        let _ = same;
+    }
+
+    #[test]
+    fn f16_group_and_dequant_match_the_single_calls() {
+        let shapes = [(12usize, 64usize), (7, 400), (20, 96)];
+        let mats: Vec<Vec<u16>> = shapes
+            .iter()
+            .enumerate()
+            .map(|(i, (r, c))| f16_random(r * c, 0x16_0000 ^ i as u64))
+            .collect();
+        let xs: Vec<Vec<f32>> = shapes
+            .iter()
+            .enumerate()
+            .map(|(i, (_, c))| f8_x(2 * c, 0x16_1111 ^ (i as u64) << 8))
+            .collect();
+        let want: Vec<Vec<f32>> = shapes
+            .iter()
+            .enumerate()
+            .map(|(i, (r, c))| f16_call(&mats[i], *r, *c, &xs[i], 2, 0))
+            .collect();
+        let mut got: Vec<Vec<f32>> = shapes.iter().map(|s| vec![0.0f32; 2 * s.0]).collect();
+        let wp: Vec<*const u8> = mats.iter().map(|m| m.as_ptr() as *const u8).collect();
+        let rp: Vec<usize> = shapes.iter().map(|s| s.0).collect();
+        let cp: Vec<usize> = shapes.iter().map(|s| s.1).collect();
+        let xp: Vec<*const f32> = xs.iter().map(|v| v.as_ptr()).collect();
+        let bs: Vec<usize> = shapes.iter().map(|_| 2usize).collect();
+        let mut yp: Vec<*mut f32> = got.iter_mut().map(|v| v.as_mut_ptr()).collect();
+        let code = unsafe {
+            gemv_f16_group_core(
+                shapes.len(),
+                wp.as_ptr(),
+                rp.as_ptr(),
+                cp.as_ptr(),
+                xp.as_ptr(),
+                bs.as_ptr(),
+                yp.as_mut_ptr(),
+                0,
+            )
+        };
+        assert_eq!(code, OK);
+        for (i, (w, g)) in want.iter().zip(got.iter()).enumerate() {
+            assert_eq!(
+                w.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                g.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "task {i}"
+            );
+        }
+        let (rows, cols) = shapes[1];
+        let mut out = vec![f32::NAN; rows * cols];
+        let code = unsafe {
+            dequant_f16_core(
+                mats[1].as_ptr() as *const u8,
+                rows,
+                cols,
+                out.as_mut_ptr(),
+                0,
+            )
+        };
+        assert_eq!(code, OK);
+        for (o, h) in out.iter().zip(mats[1].iter()) {
+            assert_eq!(o.to_bits(), f16_to_f32(*h).to_bits());
+        }
     }
 
     #[test]

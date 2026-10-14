@@ -213,7 +213,7 @@ class Quant(StrEnum):
 class QuantClass(StrEnum):
     """the bind path that reads a Quant - the engine's dispatch group and the cert's storage bucket"""
 
-    FLOAT = "float"  # BF16 / F16: dequantized, no as-stored kernel
+    FLOAT = "float"  # BF16 / F16: a linear read as bf16; an expert multiplied as stored (`EXPERT_FLOATS`)
     AFFINE = "affine"  # Q4_0 / Q4_1 / Q8_0: one scale (and Q4_1's min) a 32-weight block
     KQUANT = "kquant"  # Q2_K..Q6_K: the k-quant as-stored kernels
     IQ4 = "iq4"  # IQ4_NL / IQ4_XS: the non-linear 4-bit codebook
@@ -263,6 +263,16 @@ STORED_CLASSES: frozenset[QuantClass] = frozenset(
 def stored_quants() -> list[Quant]:
     """the types a linear multiplies as stored, in declaration order"""
     return [q for q in Quant if QUANT_KIND[q] in STORED_CLASSES]
+
+
+# the float types a GGUF's expert store also holds as the file's and multiplies with its own kernel, so a quantizer's
+# float fallback beside a stored type keeps the experts stored (a Q2_K file's down at 400 columns, no whole block)
+EXPERT_FLOATS: tuple[Quant, ...] = (Quant.BF16, Quant.F16)
+
+
+def expert_quants() -> list[Quant]:
+    """the types an expert store multiplies as stored: the stored types and `EXPERT_FLOATS`"""
+    return [*stored_quants(), *EXPERT_FLOATS]
 
 
 def quant_key(q: Quant) -> str:
@@ -384,6 +394,8 @@ class PassTag(StrEnum):
     # blocks - one member a type of `stored_quants()`, valued "quant_<type>" (`quant_tag`), held equal to it by
     # tests/cert/test_runtime_guards.py
     QUANT_DEQUANT = "quant_dequant"  # a bf16 slot (float weights, or a GGUF dequantized to bf16)
+    QUANT_BF16 = "quant_bf16"  # a GGUF's bf16 expert multiplied as stored (`EXPERT_FLOATS`)
+    QUANT_F16 = "quant_f16"  # a GGUF's f16 expert multiplied as stored, widened exactly
     QUANT_Q4_0 = "quant_q4_0"
     QUANT_Q4_1 = "quant_q4_1"
     QUANT_Q8_0 = "quant_q8_0"

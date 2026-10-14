@@ -42,6 +42,7 @@ from tests.helpers import (
     need_cached,
     need_mlx,
     safetensors_state,
+    speculation,
     stored_blocks,
 )
 
@@ -271,6 +272,45 @@ def test_the_reader_decodes_each_type_to_the_packages_numbers(q: Quant) -> None:
                 assert not np.any((got.view(np.uint32) != want.view(np.uint32)) & (want != 0)), (stem, name, e)
                 n += 1
         assert n, f"{stem}: no {q.value} tensor"
+
+
+@pytest.mark.parametrize("device", ["cpu", "mlx"])
+def test_a_mixture_with_f16_down_experts_keeps_them_stored(device: str, tmp_path: Path) -> None:
+    """a Q4_0 file whose down experts are F16, as llama.cpp's quantizer leaves a type whose rows are no whole blocks
+    (Qwen3.5-MoE 0.87B's 400 columns under Q2_K): the store holds every expert as the file's, down multiplied in
+    f16 exactly; the logits are those of the experts decoded into bf16 slots to bf16's rounding, and a speculative
+    decode, its verify rows through the same kernels, is the plain one"""
+    from btb.gguf import GGUFModel
+    from tests.make_fixtures import retyped_gguf
+
+    if device == "mlx":
+        need_mlx()
+    native_library()
+    src = os.path.join(GGUF, "tiny_q35moe-q4_0.gguf")
+    out = str(tmp_path / "tiny_q35moe-q4_0-down-f16.gguf")
+    retyped_gguf(src, out, {n for n in GGUFModel(src).tensors if n.endswith("ffn_down_exps.weight")}, Quant.F16)
+    logits = []
+    for packed in (1, 0):
+        with loaded_model(out, device=device, gguf_packed=packed) as sm:
+            cache = sm.new_cache()
+            lg = [forward_logits(sm, PROMPT, cache)[0, -1]]
+            for _ in range(4):
+                lg.append(forward_logits(sm, [[int(lg[-1].argmax())]], cache)[0, -1])
+            logits.append(torch.stack(lg).float())
+            store = sm.expert_store
+            assert store is not None
+            if not packed:
+                assert store.dequant and not store.types, "gguf_packed off: the experts decoded into bf16 slots"
+                continue
+            assert store.types and all(t == (Quant.Q4_0, Quant.Q4_0, Quant.F16) for t in store.types.values()), (
+                store.types
+            )
+            plain = sm.generate_greedy(PROMPT, 12)
+            speculation(sm, tree_budget=8, tree_min_prob=0.0, ngram_p=0.0, v_max=4, price=False)
+            toks, census = sm.generate_speculative(PROMPT, 12, proposer="mtp_tree", v_max=4)
+            assert toks == plain and census["proposed"] > 0, (toks, plain, census["proposed"])
+    # bf16's rounding of the decoded weights: ~0.3% of the largest logit on the cold-slot test's model
+    assert_close(logits[0], logits[1], atol_frac=0.02, msg=device)
 
 
 def test_a_refused_prefill_decode_takes_the_types_gemv() -> None:

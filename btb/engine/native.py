@@ -179,8 +179,8 @@ from ..kinds import (
     Weight,
     Widened,
     ZColumn,
+    expert_quants,
     quant_key,
-    stored_quants,
 )
 from ..native_files import kernels_path, native_path
 from ..sysinfo import raise_file_limit
@@ -427,7 +427,7 @@ def quiet_omp() -> None:
 
 class QuantGemv:
     """The GGUF types' as-stored gemvs a library carries, one `btb_gemv_<key>_rows` and `_group` a type of
-    `kinds.stored_quants()` (`kinds.quant_key`): `q in` asks for a type, a call runs one over a `QuantWeight`,
+    `kinds.expert_quants()` (`kinds.quant_key`): `q in` asks for a type, a call runs one over a `QuantWeight`,
     y[b, rows] = x[b, cols] . W^T in f32. Each is bit-identical for every thread count and batch width. `dequant`
     (`btb_dequant_<key>_rows`) decodes a whole matrix as the gemv widens it, for a prefill's GEMM."""
 
@@ -467,7 +467,7 @@ class QuantGemv:
         groups: dict[Quant, Callable[[Sequence[QuantWeight], Sequence[torch.Tensor], Sequence[torch.Tensor]], None]]
         groups = {}
         dequants: dict[Quant, Callable[[QuantWeight, torch.Tensor], None]] = {}
-        for q in stored_quants():
+        for q in expert_quants():
             sym, gsym = f"btb_gemv_{quant_key(q)}_rows", f"btb_gemv_{quant_key(q)}_group"
             if not hasattr(lib, sym):
                 continue

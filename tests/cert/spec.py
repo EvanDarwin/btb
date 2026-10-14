@@ -32,6 +32,7 @@ from btb.kinds import (
     Quant,
     QuantClass,
     api_tags,
+    expert_quants,
     quant_tag,
     quants_of,
     stored_quants,
@@ -516,7 +517,9 @@ def expert_tag(kind: FamilyKind, storage: Storage, hw: Hardware, packed: bool) -
     checkpoint (gpt-oss): the twin keeps their packed blocks as they are, so it is an FP8 trunk over MXFP4
     experts, and its cells assert the experts it has. `storage_tag`'s FP8 tag alone would pass on the trunk.
     A GGUF's are MXFP4 for such a family and in an MXFP4 file; another stored type's are read as stored under
-    `packed` (`gguf_packed`) off the card and dequantized on read otherwise (model.py `stored_experts`)."""
+    `packed` (`gguf_packed`) off the card and dequantized on read otherwise (model.py `stored_experts`). A float
+    file's are held as stored there too (`kinds.EXPERT_FLOATS`), its type's tag the proof: no dense float linear
+    records it, only the store's expert kernel."""
     fl = core.flags(kind)
     if Cap.MOE not in fl:
         return None
@@ -529,6 +532,9 @@ def expert_tag(kind: FamilyKind, storage: Storage, hw: Hardware, packed: bool) -
         return PassTag.EXPERT_MXFP4_ASSTORED
     if qc in STORED_CLASSES:
         return PassTag.EXPERT_QUANT_ASSTORED if packed and hw is not Hardware.CUDA else PassTag.EXPERT_QUANT_DEQUANT
+    if qc is QuantClass.FLOAT:
+        # else its bf16 read as a float checkpoint's, nothing widened
+        return quant_tag(STORAGE[storage].quants[0]) if packed and hw is not Hardware.CUDA else None
     return None
 
 
@@ -936,15 +942,15 @@ def totality_problems() -> list[str]:
     for q in Quant:
         if q not in bound:
             problems.append(f"{q.value!r} has no Storage member; a new stored type needs one to be certified")
-    # one tag a type a linear multiplies as stored, and no other "quant_" tag but the bf16 slot's
+    # one tag a type a linear or an expert multiplies as stored, and no other "quant_" tag but the bf16 slot's
     tagged = {t for t in PassTag if t.value.startswith("quant_") and t is not PassTag.QUANT_DEQUANT}
-    for q in stored_quants():
+    for q in expert_quants():
         try:
             tagged.discard(quant_tag(q))
         except ValueError:
             problems.append(f"{q.value!r} is multiplied as stored but kinds.PassTag has no {q.value.lower()} tag")
     for t in sorted(tagged):
-        problems.append(f"PassTag {t.value!r} names no stored type kinds.stored_quants() holds")
+        problems.append(f"PassTag {t.value!r} names no stored type kinds.expert_quants() holds")
     for s in Storage:
         if s not in STORAGE:
             problems.append(f"{s.value!r} has no STORAGE row")

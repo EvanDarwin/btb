@@ -168,6 +168,17 @@ pub const FORMATS: &[Format] = &[
         btb_dequant_q80_rows,
         q80,
     ),
+    // a GGUF expert's f16 tensor, a block of one weight: the block's half is the weight
+    plain(
+        "F16",
+        1,
+        2,
+        &[0],
+        btb_gemv_f16_rows,
+        btb_gemv_f16_group,
+        btb_dequant_f16_rows,
+        f16w,
+    ),
     plain(
         "IQ4_NL",
         32,
@@ -680,6 +691,10 @@ fn q41(b: &[u8], _t: &Tables, i: usize) -> f64 {
 
 fn q80(b: &[u8], _t: &Tables, i: usize) -> f64 {
     half_at(b, 0) * b[2 + i] as i8 as f64
+}
+
+fn f16w(b: &[u8], _t: &Tables, _i: usize) -> f64 {
+    half_at(b, 0)
 }
 
 fn iq4nl(b: &[u8], _t: &Tables, i: usize) -> f64 {

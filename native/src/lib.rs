@@ -322,6 +322,12 @@ quant_rows!(
     btb_gemv_iq4xs_rows,
     gemv_iq4xs_core
 );
+quant_rows!(
+    /// F16: IEEE halves, a block of one (a GGUF's float tensor, such as an expert whose rows are no whole
+    /// blocks of the file's type), widened exactly; `raw` aligned to two bytes.
+    btb_gemv_f16_rows,
+    gemv_f16_core
+);
 
 /// `quant_rows!` over a GGUF i-quant lattice (256-weight superblocks): `grid` the type's int8 codebook
 /// flattened (entries x values), `ksigns` the shared 128-entry sign table, read by IQ3_XXS, IQ2_XXS and
@@ -393,6 +399,7 @@ quant_group!(btb_gemv_q6k_group, gemv_q6k_group_core);
 quant_group!(btb_gemv_q40_group, gemv_q40_group_core);
 quant_group!(btb_gemv_q41_group, gemv_q41_group_core);
 quant_group!(btb_gemv_q80_group, gemv_q80_group_core);
+quant_group!(btb_gemv_f16_group, gemv_f16_group_core);
 quant_group!(btb_gemv_iq4nl_group, gemv_iq4nl_group_core);
 quant_group!(btb_gemv_iq4xs_group, gemv_iq4xs_group_core);
 
@@ -460,6 +467,7 @@ quant_dequant!(btb_dequant_q41_rows, dequant_q41_core);
 quant_dequant!(btb_dequant_q80_rows, dequant_q80_core);
 quant_dequant!(btb_dequant_iq4nl_rows, dequant_iq4nl_core);
 quant_dequant!(btb_dequant_iq4xs_rows, dequant_iq4xs_core);
+quant_dequant!(btb_dequant_f16_rows, dequant_f16_core);
 
 /// `quant_dequant!` over a lattice type, with its `grid` and `ksigns` (`latt_rows!`).
 macro_rules! latt_dequant {

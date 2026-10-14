@@ -22,7 +22,7 @@ import numpy as np
 import torch
 
 from .hf import ARCH_MODEL_TYPES, QWEN4EXP, gguf_lib, is_gguf
-from .kinds import QUANT_KIND, STORED_CLASSES, Json, LayerKind, ModelType, Quant, QuantClass
+from .kinds import EXPERT_FLOATS, QUANT_KIND, STORED_CLASSES, Json, LayerKind, ModelType, Quant, QuantClass
 from .options import NotAModel, UnsupportedModel
 
 # a checkpoint tensor rebuilt from several of the file's (qwen4exp's split indexer and experts, its n-gram
@@ -724,12 +724,16 @@ class GGUFModel:
         return {Quant(n) for n in names if n in Quant.__members__}
 
     def _storable_expert(self, name: str) -> bool:
-        """whether expert tensor `name` ([experts, rows, cols]) is one `QuantWeight` an expert"""
-        return QuantWeight.takes(self.tensors[name].tensor_type.name, self._shape(name)[1:])
+        """whether expert tensor `name` ([experts, rows, cols]) is one `QuantWeight` an expert: a stored type's rows
+        whole blocks, or a float type the store multiplies as it is (`EXPERT_FLOATS`) in whole eights of columns,
+        as the MLX matvec reads them"""
+        kind, shape = self.tensors[name].tensor_type.name, self._shape(name)[1:]
+        floats = {q.value for q in EXPERT_FLOATS}
+        return QuantWeight.takes(kind, shape) or (kind in floats and len(shape) == 2 and int(shape[1]) % 8 == 0)
 
     def stored_experts(self, takes: Callable[[Quant], bool]) -> bool:
         """whether the expert store reads the file's experts as its blocks and multiplies them as stored: MXFP4
-        ones always, else where every expert tensor is a stored type `takes` accepts, its rows whole blocks"""
+        ones always, else where every expert tensor is storable (`_storable_expert`) and of a type `takes` accepts"""
         exps = [n for n in self.tensors if n.endswith("_exps.weight")]
         if not exps or self.mxfp4_experts():
             return bool(exps)
