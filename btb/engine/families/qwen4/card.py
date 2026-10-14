@@ -55,7 +55,7 @@ from ...forward import path_of
 from ...host import _Experts
 from ...native import Native, _Cuda
 from ...scheduler import MemoryGrantError
-from ...stored import CardMat, CardStored
+from ...stored import CardMat, CardStored, card_loose
 from .verify import _slots
 
 STEP, TREE = "step", "tree"
@@ -521,6 +521,15 @@ class Qwen4Card:
             "up": self._mat(mod.input_mix_weight_up, what),
         }
 
+    def _read_weights(self) -> None:
+        """every layer's weights (`weights`), and the rows a bf16 piece among a projection's GGUF blocks runs into
+        (`piece`: a tensor the file kept so, Qwen4's indexer derived from two of its own) sized for the widest"""
+        mats = [W for i in (*(self.res or ()), self.L) for W in self.weights(i).values() if isinstance(W, tuple)]
+        loose, B = card_loose(mats), self.B
+        assert B is not None  # the pass buffers come first (`buffers`)
+        if loose and ("piece" not in B or int(B["piece"].shape[1]) < loose):
+            B |= self._alloc("a bf16 piece's rows", {"piece": ((ROWS, loose), torch.bfloat16)}, "scratch")
+
     def weights(self, i: int) -> dict[str, Any]:
         """layer `i`'s weights as the kernels take them (the tail's for `i` == L): the projections a gemv reads
         together merged into one row block, the modules keeping views of it; the DeltaNet's float32 operands"""
@@ -976,8 +985,7 @@ class Qwen4Card:
         B = self.buffers()
         # every layer's weights read before any graph is captured: a merge recorded into a capture would run only at
         # the replay, reading the parts it replaced after they were let go
-        for i in (*(self.res or ()), self.L):
-            self.weights(i)
+        self._read_weights()
         if not self.clean:
             # a pass that raised part way: its graphs may still publish, so the card is let finish first
             torch.cuda.synchronize()
@@ -1039,8 +1047,7 @@ class Qwen4Card:
         self.passes += 1
         self.ids, self.parents = [0] * T, list(range(-1, T - 1))
         B = self.buffers()
-        for i in (*(self.res or ()), self.L):
-            self.weights(i)
+        self._read_weights()
         if not self.clean:
             torch.cuda.synchronize()
         B["hseq_np"][0] = 0
@@ -1134,10 +1141,15 @@ class Qwen4Card:
             off = 0
             for p in W:
                 if isinstance(p, torch.Tensor):
-                    raise RuntimeError(
-                        "[card] a bf16 matrix among a projection's GGUF blocks: the program takes one form"
-                    )
-                k.gemv_stored(p, x, y[:, off:], ldy=int(y.shape[1]))
+                    # a bf16 piece through its own rows (`piece`, from `_read_weights`), then into the projection's
+                    assert self.B is not None
+                    r, c = (int(s) for s in p.shape)
+                    out = self.B["piece"].view(-1)[: M * r].view(M, r)
+                    wp, xi, yo = k.ptr(Weight, p), k.ptr(MatIn, x), k.ptr(MatOut, out)
+                    k.btb_gemv_bf16(M, ((r + 3) // 4, 1, 1), (128, 1, 1), wp, xi, yo, OutDim(r), InDim(c))
+                    y[:, off : off + r].copy_(out)
+                else:
+                    k.gemv_stored(p, x, y[:, off:], ldy=int(y.shape[1]))
                 off += p.shape[0]
             return
         R, C = (int(s) for s in W.shape)

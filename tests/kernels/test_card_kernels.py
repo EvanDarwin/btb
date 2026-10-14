@@ -959,3 +959,26 @@ def test_a_stored_types_kernels_are_ggufs_numbers_and_each_row_its_steps(cu: _Cu
         cu.gemv_stored(w, x[:M].contiguous(), y)
         assert rel_err(y.float(), x[:M].float() @ ref.T) < 1e-2, (q.value, M)
         assert torch.equal(y, steps[:M]), (q.value, M)
+
+
+def test_a_merged_projection_writes_a_bf16_piece_beside_its_blocks(cu: _Cuda) -> None:
+    """Qwen4's card program over a projection whose pieces mix a GGUF type's blocks and a bf16 matrix (its indexer
+    derived from two of the file's): every piece's rows in the projection's are that piece's own gemv's bits"""
+    from btb.engine.families.qwen4.card import ROWS, Qwen4Card
+    from btb.engine.stored import card_loose
+
+    C = 512
+    a, _ = _stored(Quant.Q8_0, 64, C, 0)
+    b = torch.randn(40, C, device=dev, dtype=bf)
+    c, _ = _stored(Quant.Q4_K, 24, C, 1)
+    W = (a, b, c)
+    prog = Qwen4Card.__new__(Qwen4Card)
+    prog.k = cu
+    prog.B = {"piece": torch.empty(ROWS, card_loose([W]), device=dev, dtype=bf)}
+    x = torch.randn(ROWS, C, device=dev, dtype=bf)
+    for M in cu.GEMV_ROWS:
+        y = torch.full((M, 128), float("nan"), device=dev, dtype=bf)
+        prog._gemv(W, x[:M].contiguous(), y)
+        assert torch.equal(y[:, :64], _steps(cu, a, x[:M])), M
+        assert torch.equal(y[:, 64:104], _gemv(cu, b, x[:M])), M
+        assert torch.equal(y[:, 104:], _steps(cu, c, x[:M])), M
