@@ -30,7 +30,7 @@ import os
 import re
 import shutil
 import sys
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import TYPE_CHECKING, Any, Protocol
 
 from btb.kinds import FamilyKind, Json, LayerKind, Quant, QuantClass, TokenRows, quants_of, stored_quants
@@ -455,6 +455,31 @@ def squeezed_gguf(src: str, out: str) -> None:
     _copy_keys(r, w)
     for t in r.tensors:
         w.add_tensor(t.name, np.array(t.data).squeeze(), raw_dtype=t.tensor_type)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
+def retyped_gguf(src: str, out: str, names: Collection[str], q: Quant) -> None:
+    """`src` with the tensors `names` written as type `q` from their dequantized values, every other tensor and key
+    as is: a file whose blocks differ in type, as llama.cpp's quantize leaves one (a drafting block's experts kept
+    wider than the trunk's)"""
+    import numpy as np
+    from gguf import GGMLQuantizationType, GGUFReader, GGUFWriter, Keys, dequantize
+    from gguf.quants import quantize
+
+    qtype = GGMLQuantizationType[q.value]
+    r = GGUFReader(src)
+    w = GGUFWriter(out, str(r.fields[Keys.General.ARCHITECTURE].contents()))
+    _copy_keys(r, w)
+    for t in r.tensors:
+        if t.name in names:
+            shape = [int(x) for x in reversed(list(t.shape))]
+            arr = np.asarray(dequantize(np.asarray(t.data), t.tensor_type), dtype=np.float32).reshape(shape)
+            w.add_tensor(t.name, quantize(arr, qtype), raw_dtype=qtype)
+        else:
+            w.add_tensor(t.name, np.array(t.data), raw_dtype=t.tensor_type)
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()

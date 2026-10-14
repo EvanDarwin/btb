@@ -1478,9 +1478,10 @@ class _ExpertStore:
         return (Pieces(tuple(at), nbytes), 0, k * nbytes, (k * shape[0], *shape[1:])), dtype
 
     def _widest(self) -> tuple[int, ...]:
-        """each of (gate, up, down)'s most bytes an expert of any layer takes in the file"""
+        """each of (gate, up, down)'s most bytes an expert of any layer takes in the file, a drafting head's NextN
+        blocks past the trunk's among them (the drafter reads its experts through the store)"""
         gg, out = self.sm.gguf, [0, 0, 0]
-        for i in range(int(self.sm.L)):
+        for i in range(int(self.sm.L) + gg.nextn()):
             for j, k in enumerate(("gate", "up", "down")):
                 t = gg.tensors.get(f"blk.{i}.ffn_{k}_exps.weight")
                 if t is not None:

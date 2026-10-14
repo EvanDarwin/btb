@@ -8,6 +8,10 @@ drafter proposes, so the block is held to the reference itself."""
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -90,6 +94,30 @@ def test_the_mixture_drafter_on_mlx() -> None:
         assert dr._mlx_ready(), "the drafter's step is not its MLX graph"
         _held_to_the_reference(sm, dr)
         _speculates_as_plain(sm)
+
+
+def test_the_mixture_drafter_reads_experts_wider_than_the_trunks(tmp_path: Path) -> None:
+    """a GGUF whose drafting block keeps its experts Q8_0 beside the trunk's Q4_0: the store's slot parts are sized
+    for the widest expert of any block, the NextN one's included, so the drafter reads its experts whole and the
+    decode with it drafting is the plain one"""
+    from btb.kinds import Quant
+    from tests.helpers import GGUF_FIXTURES
+    from tests.make_fixtures import retyped_gguf
+
+    L = int(json.load(open(os.path.join(fixture("tiny_q35moe"), "config.json"), encoding="utf-8"))["num_hidden_layers"])
+    out = str(tmp_path / "tiny_q35moe-q4_0-nextn-q8_0.gguf")
+    nextn = {f"blk.{L}.ffn_{k}_exps.weight" for k in ("gate", "up", "down")}
+    retyped_gguf(os.path.join(GGUF_FIXTURES, "tiny_q35moe-q4_0.gguf"), out, nextn, Quant.Q8_0)
+    StreamedTextModel.register_attention()
+    sm = host_model(out, cpu_layers=range(L))
+    try:
+        _speculates_as_plain(sm)
+        store = sm.expert_store
+        assert store is not None and store.types, "the experts are not read as stored"
+        trunk = store.types[min(store.types)]
+        assert set(store.types[L]) == {Quant.Q8_0} and set(trunk) == {Quant.Q4_0}, (store.types[L], trunk)
+    finally:
+        sm.close()
 
 
 @pytest.mark.parametrize("stem", ["tiny_q35moe-f8_e4m3"])
