@@ -19,6 +19,7 @@ from .cache import GrowLayer, indexer_keys, set_rows
 from .fixed_rows import RowLinear
 from .host import _HostLinear
 from .native import Native
+from .stored import CardStored
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -48,6 +49,13 @@ def mlx_topk_ids(logits: mx_.array, k: int) -> mx_.array:
     vals = m.take_along_axis(logits, part, axis=-1)
     order = m.argsort(-vals, axis=-1)
     return m.take_along_axis(part, order, axis=-1)
+
+
+def _dense_head(sm: Any) -> torch.Tensor:
+    """the output head as one matrix: the module's weight, else the file's (a head on the card as a GGUF type's
+    blocks, `CardStored`, holds none)"""
+    head = sm.head
+    return (head.weight if head is not None and not isinstance(head, CardStored) else sm._get(sm.head_key)).detach()
 
 
 class _Int8Linear(torch.nn.Module):
@@ -190,8 +198,18 @@ class MTPDrafter:
         head = getattr(self, "_head_t", None)
         if head is None:
             sm = self.sm
-            W = (sm.head.weight if sm.head is not None else sm._get(sm.head_key)).detach()
             n = int(getattr(sm, "draft_vocab", 0) or 0)
+            if isinstance(sm.head, CardStored):
+                if sm.head.raw.device.type != self.dev.type:
+                    return None
+                # a GGUF head kept as its type's blocks on the card: its first n rows' blocks, a view
+                rows, cols = sm.head.shape
+                w = sm.head.stored
+                if 0 < n < rows:
+                    w = QuantWeight(w.raw[: w.raw.numel() // rows * n], w.q, (n, cols), w.grid, w.ksigns)
+                self._head_t = CardStored(w, sm.head_key, scratch=sm.scratch)
+                return self._head_t
+            W = _dense_head(sm)
             whole = not (0 < n < int(W.shape[0]))
             if whole and W.device.type != self.dev.type:
                 return None
@@ -248,12 +266,12 @@ class MTPDrafter:
             return (sm._head_host() if head is None else head)(hn.float()).float()
         head = self._torch_head()
         if head is None:
-            W = (sm.head.weight if sm.head is not None else sm._get(sm.head_key)).detach()
+            W = _dense_head(sm)
             step = 32768
             return torch.cat(
                 [hn.to(self.cd) @ W[c : c + step].to(self.dev, self.cd).T for c in range(0, W.shape[0], step)], dim=-1
             ).float()
-        if isinstance(head, _Int8Linear):
+        if isinstance(head, (_Int8Linear, CardStored)):
             return head(hn).float()
         return (hn.to(head.dtype) @ head.T).float()
 

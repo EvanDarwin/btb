@@ -19,7 +19,7 @@ from ....kinds import LayerKind
 from ....mlx import fused as fk
 from ....options import Device
 from ...cache import GrowLayer
-from ...drafter import MTPDrafter, _Int8Linear, mlx_topk_ids
+from ...drafter import MTPDrafter, mlx_topk_ids
 from ...host import _HostLinear
 from ...native import Native
 
@@ -444,23 +444,7 @@ class Qwen35Drafter(MTPDrafter):
             self.step_s += time.time() - t0
             self.steps += 1
             return None, out
-        hn = self.norm(out)
-        if self.dev.type == Device.CPU and (sm.dev.type != Device.CPU or Native.gemv is not None or sm.mlx is not None):
-            head = self._host_head()
-            logits = (sm._head_host() if head is None else head)(hn.float()).float()
-        else:
-            head = self._torch_head()
-            if head is None:
-                W = (sm.head.weight if sm.head is not None else sm._get(sm.head_key)).detach()
-                step = 32768
-                logits = torch.cat(
-                    [hn.to(self.cd) @ W[c : c + step].to(self.dev, self.cd).T for c in range(0, W.shape[0], step)],
-                    dim=-1,
-                ).float()
-            elif isinstance(head, _Int8Linear):
-                logits = head(hn).float()
-            else:
-                logits = (hn.to(head.dtype) @ head.T).float()
+        logits = self._head_logits(self.norm(out))
         sm._sync()
         self.step_s += time.time() - t0
         self.steps += 1
