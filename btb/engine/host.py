@@ -21,6 +21,7 @@ from ..mxfp4_torch import dequant_blocks
 from ..options import Device
 from .native import Native
 from .pack import unpack_bf16
+from .scheduler import MemoryGrantError
 
 if TYPE_CHECKING:
     from ..mlx.backend import Backend, Weight
@@ -137,22 +138,26 @@ def stored_matmul(w: QuantWeight, x2: torch.Tensor, scratch: Scratch | None) -> 
     """`x2` [b, cols] float32 times a stored matrix, [b, rows] float32: a step's or a verify pass's rows through
     its type's gemv, one batch-invariant row each; a prefill's through its weights decoded once to float32
     (`QuantGemv.dequant`) into the engine's `scratch` for torch's GEMM, from the row count a bf16 weight's take it
-    (4x the gemv at 512 rows)"""
+    (4x the gemv at 512 rows). Where the scheduler refuses the decoded weight's room, the rows take the gemv"""
     gq = Native.gemv_quant
     assert gq is not None  # bound only where the library carries the type's gemv
     rows, cols = w.shape
-    if x2.shape[0] < Native.gemm_rows or w.q not in gq.dequants:
-        y = torch.empty(x2.shape[0], rows, dtype=torch.float32)
-        gq(w, x2, y)
-        return y
-    why = "a stored matrix decoded for a prefill's GEMM"
-    W = (
-        scratch.take("stored_gemm", (rows, cols), torch.float32, "cpu", why)
-        if scratch is not None
-        else torch.empty(rows, cols, dtype=torch.float32)
-    )
-    gq.dequant(w, W)
-    return torch.nn.functional.linear(x2, W)
+    if x2.shape[0] >= Native.gemm_rows and w.q in gq.dequants:
+        try:
+            why = "a stored matrix decoded for a prefill's GEMM"
+            W = (
+                scratch.take("stored_gemm", (rows, cols), torch.float32, "cpu", why)
+                if scratch is not None
+                else torch.empty(rows, cols, dtype=torch.float32)
+            )
+        except MemoryGrantError:
+            pass
+        else:
+            gq.dequant(w, W)
+            return torch.nn.functional.linear(x2, W)
+    y = torch.empty(x2.shape[0], rows, dtype=torch.float32)
+    gq(w, x2, y)
+    return y
 
 
 def stored_tags(module: torch.nn.Module) -> frozenset[PassTag]:

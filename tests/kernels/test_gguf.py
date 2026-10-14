@@ -11,7 +11,7 @@ import json
 import os
 import shutil
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import pytest
@@ -21,6 +21,7 @@ from btb.kinds import PassTag, Quant, quant_tag, stored_quants
 from tests.cert.manifest import QWEN3_06B_GGUF
 
 if TYPE_CHECKING:
+    from btb.engine.scratch import Scratch
     from btb.gguf import GGUFModel, QuantWeight
 
 from tests.helpers import (
@@ -245,6 +246,30 @@ def test_each_stored_types_dequant_feeds_the_prefills_gemm(q: Quant) -> None:
     y = stored_matmul(w, torch.from_numpy(x), None).numpy()
     want, mag = x.astype(np.float64) @ ref.T, np.abs(x.astype(np.float64)) @ np.abs(ref.T)
     assert float(np.max(np.abs(y - want) / np.maximum(mag, 1e-30))) < 1e-2, q.value
+
+
+def test_a_refused_prefill_decode_takes_the_types_gemv() -> None:
+    """a prefill whose decoded weight the scheduler has no room for: `stored_matmul`'s rows through the type's gemv,
+    each row the bits its step gives, instead of the refusal escaping"""
+    from btb.engine.host import stored_matmul
+    from btb.engine.native import Native
+    from btb.engine.scheduler import MemoryGrantError
+    from btb.gguf import QuantWeight
+
+    native_library()
+    gq = Native.gemv_quant
+    assert gq is not None and Quant.Q4_K in gq.dequants
+
+    class Refusing:
+        def take(self, *_a: object) -> torch.Tensor:
+            raise MemoryGrantError("no room for the decoded weight")
+
+    rows, cols = 40, 512
+    w = QuantWeight.of(torch.from_numpy(stored_blocks(Quant.Q4_K, rows, cols, 3)), Quant.Q4_K, rows, cols)
+    x = torch.from_numpy(np.random.default_rng(4).standard_normal((Native.gemm_rows, cols)).astype(np.float32))
+    want = torch.empty(Native.gemm_rows, rows)
+    gq(w, x, want)
+    assert torch.equal(stored_matmul(w, x, cast("Scratch", Refusing())), want)
 
 
 @pytest.mark.parametrize("q", [Quant.IQ4_NL, Quant.IQ1_M], ids=lambda q: q.value)
