@@ -10,7 +10,7 @@ import time
 from abc import abstractmethod
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Self, TypeAlias
 
 import torch
 from transformers.cache_utils import DynamicCache
@@ -49,7 +49,7 @@ if TYPE_CHECKING:
 
     # a row's own attention rows taken out of the batch: a fork's torch (k, v[, indexer keys]), or the MLX step
     # buffer's slices (k, v[, their int8 scales])
-    RowKV = tuple[torch.Tensor, ...] | list[mx_.array]
+    RowKV: TypeAlias = tuple[torch.Tensor, ...] | list[mx_.array]
 
 
 @dataclass

@@ -5,7 +5,7 @@ of rows, a forest of prompts; bit-exact to the one-row step), rope for rows at t
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeAlias
 
 import numpy as np
 
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from .core import MetalKernel
 
     # what `rows_meta` and `tree_meta` make once for a pass's layers: (meta, path, splits)
-    NodeMeta = tuple[mx_.array, mx_.array, int]
+    NodeMeta: TypeAlias = tuple[mx_.array, mx_.array, int]
 ATTN_MAXG = 8
 
 

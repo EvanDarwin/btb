@@ -29,7 +29,7 @@ import os
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias, cast
 
 import numpy as np
 import pytest
@@ -84,7 +84,7 @@ if TYPE_CHECKING:
 
     from btb.engine.native import _Cuda
 
-    Matvec = Callable[[mx_.array, mx_.array, int, int], mx_.array]  # (w_bytes, x, rows, cols) -> out
+    Matvec: TypeAlias = Callable[[mx_.array, mx_.array, int, int], mx_.array]  # (w_bytes, x, rows, cols) -> out
 
 # per-op benches gate on their backend; the e2e loop runs on every device the box has (below)
 mlx_only = pytest.mark.skipif(not btb.mlx_available(), reason="MLX is Apple-silicon only")

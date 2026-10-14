@@ -8,7 +8,7 @@ import math
 import time
 import weakref
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 import torch
 
@@ -28,9 +28,9 @@ if TYPE_CHECKING:
 
     # the drafting layer's K/V written to its cache on MLX (a layer's `mx_update`): the step's rows in, the layer's
     # whole K and V out
-    MxAppend = Callable[[mx_.array, mx_.array], tuple[mx_.array, mx_.array]]
+    MxAppend: TypeAlias = Callable[[mx_.array, mx_.array], tuple[mx_.array, mx_.array]]
     # the attention the caller computes over the shared cache (the tree's node kernel): q, k, v in, [B, Hq, T, D] out
-    MxAttend = Callable[[mx_.array, mx_.array, mx_.array], mx_.array]
+    MxAttend: TypeAlias = Callable[[mx_.array, mx_.array, mx_.array], mx_.array]
 
 
 def mx_rows(a: mx_.array) -> list[list[float]]:

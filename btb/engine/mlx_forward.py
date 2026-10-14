@@ -7,7 +7,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, TypeGuard
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, TypeGuard
 
 import numpy as np
 import torch
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from .cache import KvCache
 
     # a pass's attention mask: causal, a boolean one over its rows (a tree's), or none (one row)
-    AttnMask = Literal["causal"] | mx_.array | None
+    AttnMask: TypeAlias = Literal["causal"] | mx_.array | None
     # a verify pass's nodes as the node kernel takes them: (past, parents)
     PassNodes = tuple[int, Parents]
 
