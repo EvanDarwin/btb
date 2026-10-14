@@ -11,6 +11,7 @@ import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -18,6 +19,7 @@ from pytest import CaptureFixture
 
 from btb.engine.cuda import _CudaMixin
 from btb.engine.native import NativeArgsError
+from btb.gguf import QuantWeight
 from btb.kinds import (
     Arrivals,
     AttnOut,
@@ -50,6 +52,7 @@ from btb.kinds import (
     QHeads,
     Qkv,
     QNorm,
+    Quant,
     Query,
     Residual,
     RopeCos,
@@ -61,9 +64,10 @@ from btb.kinds import (
     VCache,
     Weight,
     Window,
+    stored_quants,
 )
 from tests.cert.cuda_ops import bindings
-from tests.helpers import need_card_kernels
+from tests.helpers import need_card_kernels, rel_err, stored_blocks
 
 if TYPE_CHECKING:
     from btb.engine.native import _Cuda
@@ -915,3 +919,43 @@ def test_one_attention_reads_rows_where_they_lie(cu: _Cuda, Hq: int, Hk: int, D:
     via = RowMap(int(rows.data_ptr()) - 4 * first)
     node = _flash(cu, q[:1], Kp, Vp, pos, [-1], scale, win, tbl=via, cap=cap)
     assert torch.equal(node, _flash(cu, q[:1], K, V, pos, [-1], scale, win)), "a node through its named keys"
+
+
+# --- a GGUF type's blocks on the card -------------------------------------------------------------------------
+
+
+def _stored(q: Quant, R: int, C: int, seed: int) -> tuple[QuantWeight, torch.Tensor]:
+    """random valid blocks of type `q` for an [R, C] matrix on the card, and gguf's float32 decode of them"""
+    from gguf import GGMLQuantizationType, dequantize
+
+    raw = stored_blocks(q, R, C, seed)
+    ref = dequantize(raw.reshape(R, -1), GGMLQuantizationType[q.value]).reshape(R, C).astype(np.float32)
+    return QuantWeight.of(torch.from_numpy(raw), q, R, C).to(dev), torch.from_numpy(ref).to(dev)
+
+
+def _steps(cu: _Cuda, w: QuantWeight, x: torch.Tensor) -> torch.Tensor:
+    """each row of `x` through the type's gemv alone: the one-row steps' outputs"""
+    ys = []
+    for r in range(int(x.shape[0])):
+        y = torch.empty(1, w.shape[0], device=dev, dtype=bf)
+        cu.gemv_stored(w, x[r : r + 1].contiguous(), y)
+        ys.append(y[0])
+    return torch.stack(ys)
+
+
+@pytest.mark.parametrize("q", stored_quants(), ids=lambda q: q.value)
+def test_a_stored_types_kernels_are_ggufs_numbers_and_each_row_its_steps(cu: _Cuda, q: Quant) -> None:
+    """the whole weight decoded is gguf's numbers to bf16's rounding; a pass at every width is x times them to the
+    bf16 output's rounding, row r of it the one-row step's bits"""
+    R, C = 72, 512
+    w, ref = _stored(q, R, C, stored_quants().index(q))
+    W = torch.empty(R, C, device=dev, dtype=bf)
+    cu.dequant_stored(w, W)
+    assert rel_err(W.float(), ref) <= 2**-8, q.value
+    x = torch.randn(max(cu.GEMV_ROWS), C, device=dev, dtype=bf)
+    steps = _steps(cu, w, x)
+    for M in cu.GEMV_ROWS:
+        y = torch.empty(M, R, device=dev, dtype=bf)
+        cu.gemv_stored(w, x[:M].contiguous(), y)
+        assert rel_err(y.float(), x[:M].float() @ ref.T) < 1e-2, (q.value, M)
+        assert torch.equal(y, steps[:M]), (q.value, M)
