@@ -633,5 +633,8 @@ def test_only_the_converted_gguf_twins_are_committed() -> None:
 
     derived = [os.path.join(spec.GGUF_DIR, spec.gguf_name(*t)) for t in spec.derived_gguf()]
     converted = [os.path.join(spec.GGUF_DIR, spec.gguf_name(spec.CONVERTED_STEM, q)) for q in spec.CONVERTED_QUANTS]
-    run = subprocess.run(["git", "check-ignore", "--no-index", *derived, *converted], capture_output=True, text=True)
-    assert set(run.stdout.split()) == set(derived), run.stderr
+    # the paths in and out NUL-separated, so none comes back quoted (git C-quotes a Windows path's backslashes)
+    paths = "\0".join([*derived, *converted])
+    cmd = ["git", "check-ignore", "-z", "--stdin", "--no-index"]
+    run = subprocess.run(cmd, input=paths, capture_output=True, text=True)
+    assert set(filter(None, run.stdout.split("\0"))) == set(derived), run.stderr

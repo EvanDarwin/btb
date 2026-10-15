@@ -16,7 +16,7 @@ import torch
 
 import btb
 from btb.engine.native import Native
-from btb.kinds import PassReport, PassTag, Quant, quant_tag, stored_quants
+from btb.kinds import PassReport, PassTag, Quant, expert_quants, quant_tag
 from tests.helpers import FIXTURES, loaded_model
 
 BTB = os.path.dirname(os.path.abspath(btb.__file__))  # the package under test: the checkout's, or the wheel's
@@ -152,7 +152,7 @@ def test_every_pass_tag_is_emitted() -> None:
                     src = f.read()
                 used |= set(_TAG_RE.findall(src))
                 if _QUANT_TAG_RE.search(src):
-                    used |= {quant_tag(q).name for q in stored_quants()}
+                    used |= {quant_tag(q).name for q in expert_quants()}
     orphans = sorted(t.name for t in PassTag if t.name not in used)
     assert not orphans, f"these PassTag members are never recorded in btb/ (wire the fork, or drop them): {orphans}"
 
