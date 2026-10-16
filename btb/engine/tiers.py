@@ -12,7 +12,7 @@ import struct
 import threading
 import time
 import weakref
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import CancelledError
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -22,17 +22,18 @@ import torch
 from .. import fp8
 from .. import mlx as mlxdev
 from ..fp8 import F8Weight
-from ..kinds import Json, LayerKind, Tier
-from ..mlx.legacyq import KINDS as LEGACY_KINDS
+from ..gguf import QuantWeight
+from ..kinds import Json, LayerKind, Quant, SlotKind, Tier
 from ..options import Device
 from ..pack12 import entries, unpack_bf16
 from ..sysinfo import process_working_set_bytes
 from .cache import CardRowsLayer, ForkIndexedLayer, ForkLayer, GrowLayer
 from .device import where
-from .fixed_rows import fix_linears, fix_rows_cls
+from .fixed_rows import RowLinear, fix_linears, fix_rows_cls
 from .host import _Experts, _HostLinear, _NGramRows, bf16_in_place, copy_bytes
 from .native import Native
-from .state import DRAFT_VOCAB, _State
+from .state import DRAFT_VOCAB, Shard, _State
+from .stored import CardStored, held_bytes
 
 if TYPE_CHECKING:
     from ..mlx import Shared
@@ -62,6 +63,29 @@ def card_bps(dev: Any) -> float:
     return peak * CARD_EFF if peak > 0 else float(CARD_BPS)
 
 
+@dataclass(frozen=True)
+class ColdItem:
+    """One linear's place in a cold ring slot: `nb` bytes at slot offset `at` as its kernel reads them, filled per
+    `kind` from the drive at `path`/`off`, or from memory each pass where `path` is None (MEM: `_get` of the
+    linear's key; QUANT: the GGUF tensor `src` gathered as stored). A P12 item carries its store entry, a CAST
+    item the (bytes, dtype) it is read as before it is rewritten as bf16 in place."""
+
+    m: _HostLinear
+    kind: SlotKind
+    at: int
+    nb: int
+    path: str | None = None
+    off: int = 0
+    p12: Json | None = None
+    cast: tuple[int, torch.dtype] | None = None
+    src: str | None = None
+
+    @property
+    def read_nb(self) -> int:
+        """the bytes this item lands in its slot: a cast float's as stored"""
+        return self.cast[0] if self.cast is not None else self.nb
+
+
 @dataclass
 class ColdRing:
     """The cold layers' ring, built by `_cold_start` and torn down by `_cold_stop`; its slots are shared with
@@ -71,7 +95,7 @@ class ColdRing:
     shared: list[Shared] | None = None
     slots: list[torch.Tensor] = field(default_factory=list)
     slot_of: dict[int, int] = field(default_factory=dict)
-    recipe: Any = None
+    recipe: dict[int, list[ColdItem]] = field(default_factory=dict)
     order: list[int] = field(default_factory=list)
     ready: dict[int, threading.Event] = field(default_factory=dict)
     free: list[threading.Event] = field(default_factory=list)
@@ -429,6 +453,63 @@ class _TiersMixin(_State):
             },
         }
 
+    def _stored_name(self, key: str) -> str | None:
+        """the GGUF tensor of checkpoint weight `key` the host's native kernels multiply in its blocks: a stored
+        type the library has the gemv for, under `gguf_packed`; None for any other"""
+        gg, gq = self.gguf, Native.gemv_quant
+        if gg is None or gq is None or not self.gguf_packed:
+            return None
+        name = self._gguf_names.get(key)
+        return name if name is not None and gg.storable(name) and gg.tensors[name].tensor_type.name in gq else None
+
+    def _host_stored_keys(self, i: int, linears: Iterable[str]) -> dict[str, str]:
+        """layer `i`'s linear weights (`linears`, named in the layer) that its native kernels multiply in their GGUF
+        blocks (`_stored_name`), by checkpoint key -> file tensor. None on an MLX layer, whose binders take the
+        blocks to its own kernels (`_bind_mlx_linears`)"""
+        if self.mlx is not None and i in self.mlx_layers:
+            return {}
+        base = f"{self.prefix}layers.{i}."
+        return {base + n: name for n in linears if (name := self._stored_name(base + n)) is not None}
+
+    def _mlx_slot_keys(self, i: int, linears: Iterable[str]) -> dict[str, str]:
+        """MLX layer `i`'s linear weights (`linears`, named in the layer) a cold slot holds as their GGUF blocks for
+        the type's Metal kernel to read in place (`Backend.weight_stored_slot`), by checkpoint key -> file tensor"""
+        gg = self.gguf
+        if gg is None or self.mlx is None or not self.gguf_packed:
+            return {}
+        base = f"{self.prefix}layers.{i}."
+        out: dict[str, str] = {}
+        for n in linears:
+            name = self._gguf_names.get(base + n)
+            if name is not None and gg.storable(name):
+                out[base + n] = name
+        return out
+
+    def _stored_type(self, m: _HostLinear) -> Quant:
+        """the GGUF type of a stored linear's file tensor"""
+        assert self.gguf is not None and m.key is not None  # a stored linear is a GGUF's checkpoint linear
+        return Quant(self.gguf.tensors[self._gguf_names[m.key]].tensor_type.name)
+
+    def _bind_host_stored(self, i: int, layer: Any) -> None:
+        """host layer `i`'s linears its native kernels multiply as stored (`_host_stored_keys`) bound to the file's
+        blocks (`_bind_stored`)"""
+        lins = {n + ".weight": m for n, m in layer.named_modules() if isinstance(m, _HostLinear)}
+        keys = self._host_stored_keys(i, lins)
+        base = f"{self.prefix}layers.{i}."
+        self._bind_stored({base + n: m for n, m in lins.items() if base + n in keys})
+
+    def _bind_stored(self, lins: Mapping[str, _HostLinear]) -> None:
+        """host linears, by checkpoint key, bound to the GGUF blocks their native kernels multiply (`_stored_name`,
+        `_HostLinear.quant`), each weight a shape with no bytes behind it; a key with none keeps its weight"""
+        for key, m in lins.items():
+            name = self._stored_name(key)
+            if name is None:
+                continue
+            assert self.gguf is not None  # a stored name is a GGUF's
+            m.quant, m.scratch = self.gguf.stored(name), self.scratch
+            shape = m.weight.shape
+            m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*shape), requires_grad=False)
+
     def _bind_host_packed_layer(self, layer: Any) -> Any:
         n_b = n_all = 0
         for m in layer.modules():
@@ -457,9 +538,27 @@ class _TiersMixin(_State):
         self._bind_cold()
         return n_b
 
+    def _head_stored(self) -> str | None:
+        """the head's GGUF tensor where the native kernels multiply it as stored (a type the library has the gemv
+        for, under `gguf_packed`), else None"""
+        gg, gq = self.gguf, Native.gemv_quant
+        name = self._gguf_names.get(self.head_key) if gg is not None else None
+        if gg is None or gq is None or name is None or not self.gguf_packed or not gg.storable(name):
+            return None
+        return name if gg.tensors[name].tensor_type.name in gq else None
+
     def _head_host(self) -> Any:
+        """the head as a host linear, made once: on its stored blocks where the native kernels take its type
+        (`_head_stored`), else the checkpoint's bf16"""
         if self.head_host is None:
-            self.head_host = _HostLinear(self._get(self.head_key), key=self.head_key)
+            name = self._head_stored() if self.mlx is None else None
+            if name is not None:
+                assert self.gguf is not None  # a stored name is a GGUF's
+                w = self.gguf.stored(name)
+                self.head_host = _HostLinear(torch.zeros((), dtype=torch.bfloat16).expand(*w.shape), key=self.head_key)
+                self.head_host.quant, self.head_host.scratch = w, self.scratch
+            else:
+                self.head_host = _HostLinear(self._get(self.head_key), key=self.head_key)
         return self.head_host
 
     def _span(self, key: str) -> tuple[str | None, int, int]:
@@ -701,40 +800,64 @@ class _TiersMixin(_State):
     def _realloc_bytes(self) -> int:
         n = 0
         if self.resident_head and self.head is not None:
-            n += self.head.weight.numel() * self.head.weight.element_size()
+            n += held_bytes(self.head)
         aj = getattr(self, "aj", None)
         if aj is not None and aj.dev.type == Device.CUDA:
             n += self._drafter_bytes()
         return n
 
+    def _cold_item(self, m: _HostLinear, at: int, gguf: str | None) -> ColdItem:
+        """where linear `m` of a cold layer sits in its slot from `at`, and how the ring fills it (`SlotKind`);
+        `gguf` its file tensor where the layer's native kernels multiply it as stored (`_host_stored_keys`)"""
+        assert m.key is not None  # a ring item is a checkpoint linear
+        if gguf is not None:
+            assert self.gguf is not None  # a stored name is a GGUF's
+            span = self.gguf.stored_span(gguf)
+            nb = int(self.gguf.tensors[gguf].n_bytes)
+            if span is None:
+                return ColdItem(m, SlotKind.QUANT, at, nb, src=gguf)
+            return ColdItem(m, SlotKind.QUANT, at, nb, span[0], span[1])
+        pk = getattr(self, "_packed", {}).get(m.key)
+        if pk is not None and not pk["raw"]:
+            nb = pk["lo"] + pk["hi4"] + pk["pad"] + 5 * pk["esc"]
+            return ColdItem(m, SlotKind.P12, at, nb, os.path.join(self.dir, pk["shard"]), int(pk["off"]), p12=pk)
+        path, off, nb = self._span(m.key)
+        stored = self._stored_span(m.key)
+        if stored is not None:
+            # a float at another precision, read as stored into its region and rewritten as bf16 there as it lands
+            # (`_cold_cast`)
+            spath, soff, cast = stored
+            return ColdItem(m, SlotKind.CAST, at, nb, spath, soff, cast=cast)
+        # not on the drive as bf16 (a GGUF tensor of a type no native gemv takes here): each pass takes it from
+        # `_get`, which reads and dequantizes it
+        return ColdItem(m, SlotKind.BF16 if path is not None else SlotKind.MEM, at, nb, path, off)
+
+    def _cold_fill(self, it: ColdItem, slot: torch.Tensor) -> None:
+        """a memory item's bytes into its region: a GGUF tensor's blocks gathered as stored, or `_get`'s bf16"""
+        if it.kind is SlotKind.QUANT:
+            assert self.gguf is not None and it.src is not None  # a QUANT item from memory names its tensor
+            copy_bytes(slot[it.at : it.at + it.nb], self.gguf.raw(it.src))
+        else:
+            assert it.m.key is not None  # a ring item is a checkpoint linear
+            copy_bytes(slot[it.at : it.at + it.nb], self._get(it.m.key))
+
     def _bind_cold(self) -> None:
         if not self.cold:
             return
-        recipes, sizes = {}, {}
+        recipes: dict[int, list[ColdItem]] = {}
+        sizes: dict[int, int] = {}
         for i in sorted(self.cold):
-            items, cur = [], 0
-            for m in self.host[i].modules():
-                if not (isinstance(m, _HostLinear) and m.key):
-                    continue
-                pk = getattr(self, "_packed", {}).get(m.key)
-                path: str | None
-                if pk is not None and not pk["raw"]:
-                    path = os.path.join(self.dir, pk["shard"])
-                    off, nb, kind, e = int(pk["off"]), pk["lo"] + pk["hi4"] + pk["pad"] + 5 * pk["esc"], "p12", pk
-                else:
-                    path, off, nb = self._span(m.key)
-                    # "mem": the bytes are not on the drive as bf16 (a GGUF tensor of another type): each pass
-                    # takes them from `_get`, which reads and dequantizes them
-                    kind, e = ("bf16", None) if path is not None else ("mem", m.key)
-                    stored = self._stored_span(m.key)
-                    if stored is not None:
-                        # "cast": a float at another precision, read as stored into its region and rewritten as
-                        # bf16 there as it lands (`_cold_cast`); e is (stored bytes, dtype)
-                        path, off, e = stored
-                        kind = "cast"
+            items: list[ColdItem] = []
+            cur = 0
+            layer = self.host[i]
+            lins = {n + ".weight": m for n, m in layer.named_modules() if isinstance(m, _HostLinear) and m.key}
+            stored = self._mlx_slot_keys(i, lins) if i in self.mlx_layers else self._host_stored_keys(i, lins)
+            for m in lins.values():
                 cur = (cur + 63) // 64 * 64
-                items.append((m, path, off, nb, cur, kind, e))
-                cur += e[0] if kind == "cast" else nb
+                assert m.key is not None  # filtered above
+                it = self._cold_item(m, cur, stored.get(m.key))
+                items.append(it)
+                cur += max(it.nb, it.read_nb)
             recipes[i], sizes[i] = items, cur
         slot_bytes = max(sizes.values())
         R = max(1, min(self.cold_slots, len(self.cold)))
@@ -749,46 +872,56 @@ class _TiersMixin(_State):
         self.cold_ring.recipe = recipes
         for i, items in recipes.items():
             slot = self.cold_ring.slots[self.cold_ring.slot_of[i]]
-            for m, _path, _off, nb, so, kind, e in items:
-                region = slot[so : so + nb]
+            for it in items:
+                m, region = it.m, slot[it.at : it.at + it.nb]
                 rows, cols = m.weight.shape
-                if self.cold_ring.shared is not None and i in self.mlx_layers:
-                    sh = self.cold_ring.shared[self.cold_ring.slot_of[i]]
+                shared = self.cold_ring.shared
+                mlx_slot = shared is not None and i in self.mlx_layers
+                if shared is not None and mlx_slot:
+                    sh = shared[self.cold_ring.slot_of[i]]
                     assert self.mlx is not None  # the ring is shared only on the MLX device
-                    # "mem" lands in the slot as bf16 too; only a 12-bit record is read packed
-                    m.mx = (
-                        self.mlx.weight_slot_packed(sh, so, e, (rows, cols))
-                        if kind == "p12"
-                        else self.mlx.weight_slot(sh, so, nb, (rows, cols))
-                    )
-                if kind != "p12":
+                    # MEM lands in the slot as bf16 too; a 12-bit record and a GGUF type's blocks are read as stored
+                    if it.p12 is not None:
+                        m.mx = self.mlx.weight_slot_packed(sh, it.at, it.p12, (rows, cols))
+                    elif it.kind is SlotKind.QUANT:
+                        m.mx = self.mlx.weight_stored_slot(sh, it.at, it.nb, self._stored_type(m), (rows, cols))
+                    else:
+                        m.mx = self.mlx.weight_slot(sh, it.at, it.nb, (rows, cols))
+                m.packed = m.quant = None
+                if it.kind not in (SlotKind.P12, SlotKind.QUANT):
                     m.weight = torch.nn.Parameter(region.view(torch.bfloat16).view(rows, cols), requires_grad=False)
-                    m.packed = None
-                else:
-                    # a bf16 view bound earlier (the ring before the pack was opened) would hold that ring's slot:
-                    # the shape stays (the host path reads it), over no memory
-                    m.weight = torch.nn.Parameter(
-                        torch.zeros((), dtype=torch.bfloat16).expand(rows, cols), requires_grad=False
-                    )
-                    a1 = e["lo"]
-                    a2 = a1 + e["hi4"] + e["pad"]
-                    a3 = a2 + 4 * e["esc"]
-                    esc_idx = region[a2:a3].view(torch.int32) if e["esc"] else torch.zeros(0, dtype=torch.int32)
-                    esc_val = region[a3:] if e["esc"] else torch.zeros(0, dtype=torch.uint8)
-                    m.packed = (
-                        region[:a1],
-                        region[a1 : a1 + e["hi4"]],
-                        torch.tensor(e["table"], dtype=torch.uint8),
-                        esc_idx,
-                        esc_val,
-                        int(e["esc"]),
-                    )
-        if self.cold_ring.shared is not None:
-            for i in recipes:
-                if i in self.mlx_layers:
-                    self._mlx_fuse(self.host[i])
+                    continue
+                # a bf16 view bound earlier (the ring before the pack was opened) would hold that ring's slot: the
+                # shape stays (the host path reads it), over no memory
+                m.weight = torch.nn.Parameter(
+                    torch.zeros((), dtype=torch.bfloat16).expand(rows, cols), requires_grad=False
+                )
+                if it.kind is SlotKind.QUANT:
+                    if not mlx_slot:  # the native kernels read the slot's blocks; an MLX layer's its view (above)
+                        m.quant = QuantWeight.of(region, self._stored_type(m), rows, cols)
+                        m.scratch = self.scratch
+                    continue
+                e = it.p12
+                assert e is not None  # a P12 item carries its store entry
+                a1 = e["lo"]
+                a2 = a1 + e["hi4"] + e["pad"]
+                a3 = a2 + 4 * e["esc"]
+                esc_idx = region[a2:a3].view(torch.int32) if e["esc"] else torch.zeros(0, dtype=torch.int32)
+                esc_val = region[a3:] if e["esc"] else torch.zeros(0, dtype=torch.uint8)
+                m.packed = (
+                    region[:a1],
+                    region[a1 : a1 + e["hi4"]],
+                    torch.tensor(e["table"], dtype=torch.uint8),
+                    esc_idx,
+                    esc_val,
+                    int(e["esc"]),
+                )
+        for i in recipes:
+            if self.cold_ring.shared is not None and i in self.mlx_layers:
+                self._mlx_fuse(self.host[i])
+            self._bind_tags(i, self.host[i])
         self.cold_ring.bytes_per_pass = sum(sizes.values())
-        kinds = sorted({it[5] for items in recipes.values() for it in items})
+        kinds = sorted({it.kind for items in recipes.values() for it in items})
         self.log(
             f"[stream] cold tier: {len(order)} layers {order[:6]}{'...' if len(order) > 6 else ''} x "
             f"{self.cold_ring.bytes_per_pass / 2**30:.2f} GB per pass ({'/'.join(kinds)}), {R} slots x "
@@ -811,16 +944,11 @@ class _TiersMixin(_State):
                 raise RuntimeError(f"[cold] short read: {path} @ {off}+{got} of {nb}")
             got += n
 
-    @staticmethod
-    def _cold_nb(it: Any) -> int:
-        """the bytes a cold recipe item reads: a cast float's as stored"""
-        return int(it[6][0]) if it[5] == "cast" else int(it[3])
-
     def _cold_cast(self, i: int, slot: torch.Tensor) -> None:
         """layer `i`'s floats read as stored rewritten as bf16 where they landed, once all its reads are in"""
-        for _m, _path, _off, _nb, so, kind, e in self.cold_ring.recipe[i]:
-            if kind == "cast":
-                bf16_in_place(slot[so : so + e[0]], e[1])
+        for it in self.cold_ring.recipe[i]:
+            if it.cast is not None:
+                bf16_in_place(slot[it.at : it.at + it.cast[0]], it.cast[1])
 
     def _cold_start(self, n_layers: int) -> None:
         """The cold reader as a ring across passes: one thread reads the cold layers into their slots as they free
@@ -855,24 +983,22 @@ class _TiersMixin(_State):
             assert route is not None  # submit runs only where the Route reads the cold tier
             futs = []
             for it in self.cold_ring.recipe[i]:
-                _m, path, off, nb, so, kind, e = it
-                if kind == "mem":
-                    copy_bytes(slot[so : so + nb], self._get(e))
+                if it.path is None:
+                    self._cold_fill(it, slot)
                     continue
-                nb = self._cold_nb(it)
                 futs.append(
                     route.disk_read(
-                        path,
-                        off,
-                        nb,
-                        slot[so : so + nb],
+                        it.path,
+                        it.off,
+                        it.read_nb,
+                        slot[it.at : it.at + it.read_nb],
                         route.DISK_AHEAD,
                         key=("cold", i),
                         chunk=self.cold_chunk,
                         depth=1,
                     )
                 )
-                self.cold_ring.bytes += nb
+                self.cold_ring.bytes += it.read_nb
             return futs
 
         def land(i: int, s: int, t_sub: float, futs: list[Any], nbytes: int) -> None:
@@ -906,20 +1032,18 @@ class _TiersMixin(_State):
                         if route is None:
                             nbytes = 0
                             for it in self.cold_ring.recipe[i]:
-                                _m, path, off, _nb, so, kind, e = it
-                                nb = self._cold_nb(it)
-                                if kind == "mem":
-                                    copy_bytes(slot[so : so + nb], self._get(e))
+                                if it.path is None:
+                                    self._cold_fill(it, slot)
                                 else:
-                                    self._cold_read(path, off, nb, slot[so : so + nb])
-                                self.cold_ring.bytes += nb
-                                nbytes += nb
+                                    self._cold_read(it.path, it.off, it.read_nb, slot[it.at : it.at + it.read_nb])
+                                self.cold_ring.bytes += it.read_nb
+                                nbytes += it.read_nb
                             self._cold_cast(i, slot)
                             stat[i] = {"t0": a, "t1": time.time(), "bytes": nbytes}
                             holds[s] = i
                             ready[i].set()
                             continue
-                        queued.append((i, s, a, submit(i, slot), sum(map(self._cold_nb, self.cold_ring.recipe[i]))))
+                        queued.append((i, s, a, submit(i, slot), sum(it.read_nb for it in self.cold_ring.recipe[i])))
                         while len(queued) > 1:
                             land(*queued.pop(0))
                     while queued:
@@ -972,21 +1096,26 @@ class _TiersMixin(_State):
         self.cold_ring.free[self.cold_ring.slot_of[i]].set()
 
     def _rebind_warm(self, i: int) -> None:
-        """layer `i` back on the store it came from: every linear's weight the checkpoint's mapped bytes again,
-        its packed form beside it under the 12-bit store, no slot of the ring behind it"""
+        """layer `i` back on the store it came from: every linear's weight the checkpoint's mapped bytes again, its
+        packed form beside it under the 12-bit store, a GGUF type its native gemv takes on the file's blocks again,
+        no slot of the ring behind it"""
         layer = self.host[i]
         on_mlx = self.mlx is not None and i in self.mlx_layers
-        for m in layer.modules():
-            if isinstance(m, _HostLinear) and m.key:
-                m.weight = torch.nn.Parameter(self._get(m.key), requires_grad=False)
-                m.packed = None
-                if on_mlx:
-                    m.mx = None  # a view of a ring slot, which the rebuilt ring fills with another layer
+        lins = {n + ".weight": m for n, m in layer.named_modules() if isinstance(m, _HostLinear) and m.key}
+        stored = self._host_stored_keys(i, lins)
+        for m in lins.values():
+            m.packed = m.quant = None
+            if m.key not in stored:
+                m.weight = torch.nn.Parameter(self._get(m.key or ""), requires_grad=False)
+            if on_mlx:
+                m.mx = None  # a view of a ring slot, which the rebuilt ring fills with another layer
+        self._bind_host_stored(i, layer)
         if on_mlx:
             self._bind_mlx_resident(layer)
             self._mlx_fuse(layer)
         if getattr(self, "_packed", None):
             self._bind_host_packed_layer(layer)
+        self._bind_tags(i, layer)
 
     def _next_template(self, lt: str) -> Any:
         k = self._toggle[lt]
@@ -1134,21 +1263,23 @@ class _TiersMixin(_State):
             self._card_ms_min = ms if prev is None else min(prev, ms)
             self._events = []
 
-    def _new_layer(self, idx: int) -> Any:
+    def _new_layer(self, idx: int, base: str | None = None, at: int | None = None) -> Any:
+        """a layer of trunk layer `idx`'s kind; `base` and `at` one whose tensors sit under another prefix (a
+        drafting head's `mtp.layers.0.`), its experts the store's layer `at`"""
         with self._meta:
             layer = self.fam.layer(self.cfg, idx).eval()
-        layer = self.fam.shape_layer(self, layer, idx)
+        layer = self.fam.shape_layer(self, layer, idx if at is None else at, base=base)
         # a card layer's torch path row-invariant: its matmuls and norms at the fixed shape for a small pass, so a
         # step and a verify pass over the same token agree to the bit (fixed_rows.py); a no-op off the card
         fix_linears(layer)
         fix_rows_cls(self.fam.norm)
-        base = f"{self.prefix}layers.{idx}."
+        base = f"{self.prefix}layers.{idx}." if base is None else base
         for name, _b in layer.named_buffers():
             if base + name not in self.weight_map:
                 raise RuntimeError(f"[stream] layer has a buffer {name!r} the loader would not fill")
         return layer
 
-    def _shard(self, shard: str) -> tuple[Any, dict[str, Any], Any]:
+    def _shard(self, shard: str) -> Shard:
         if shard not in self._maps:
             gg = getattr(self, "gguf", None)
             if gg is not None and shard == gg.file:
@@ -1206,37 +1337,12 @@ class _TiersMixin(_State):
         return blob, torch.tensor(e["table"], dtype=torch.uint8), e
 
     def _gguf_binds_packed(self, name: str) -> bool:
-        """Whether the GGUF tensor `name` binds to one of its own MLX kernels (mlx_forward.py's `_bind_gguf_*`)
+        """Whether the GGUF tensor `name` binds to its type's own MLX kernel (mlx_forward.py's `_bind_gguf_stored`)
         instead of a plain bf16 slot, so `_get` can skip the bf16 dequant the binder would discard for its own
-        raw-byte read: the binders' type and shape gates, nothing read."""
-        if self.mlx is None or not bool(int(getattr(self, "gguf_packed", 1))):
-            return False
+        raw-byte read: the binder's gate, nothing read. A synthesized name (gpt-oss's interleaved expert biases) is
+        no file tensor and reads for real."""
         assert self.gguf is not None
-        t = self.gguf.tensors.get(name)
-        if t is None:  # a synthesized name, not a file tensor (gpt-oss's interleaved expert biases): read for real
-            return False
-        shape = tuple(int(x) for x in reversed(list(t.shape)))
-        if len(shape) != 2:
-            return False
-        kind = t.tensor_type.name
-        # own-kernel binders' shape gate; no fallback binder catches a miss
-        if kind in (
-            "Q6_K",
-            "Q5_K",
-            "Q4_K",
-            "Q3_K",
-            "Q2_K",
-            "IQ4_XS",
-            "IQ3_XXS",
-            "IQ2_XXS",
-            "IQ2_XS",
-            "IQ2_S",
-            "IQ1_S",
-            "IQ3_S",
-            "IQ1_M",
-        ):
-            return shape[1] % 256 == 0
-        return (kind == "IQ4_NL" or kind.lower() in LEGACY_KINDS) and shape[1] % 32 == 0
+        return self.mlx is not None and self.gguf_packed and self.gguf.storable(name)
 
     def _gguf_layer_index(self, key: str) -> int | None:
         """The layer index a weight key names, or None for a non-layer tensor (head, embed, norm, ...)."""
@@ -1306,12 +1412,68 @@ class _TiersMixin(_State):
             t = t.clone()
         self._set_param(module, dotted, t, buffer=buffer)
 
+    def _card_stores(self) -> bool:
+        """whether the card's kernels multiply a GGUF's stored types here: under `gguf_packed`, with the kernels
+        loaded and a bf16 compute (they take bf16 rows; a float32 one keeps the dequantized weights)"""
+        if self.gguf is None or not self.gguf_packed or self.dev.type != Device.CUDA or self.mlx is not None:
+            return False
+        return self.compute_dtype in (None, torch.bfloat16) and Native.card_kernels() is not None
+
+    def _card_stored_keys(self, i: int, linears: Iterable[str]) -> dict[str, str]:
+        """card layer `i`'s linear weights (`linears`, named in the layer) that the card's kernels multiply in
+        their GGUF blocks (`_card_stores`), by checkpoint key -> file tensor"""
+        gg = self.gguf
+        if gg is None or not self._card_stores():
+            return {}
+        base = f"{self.prefix}layers.{i}."
+        out: dict[str, str] = {}
+        for n in linears:
+            name = self._gguf_names.get(base + n)
+            if name is not None and gg.storable(name):
+                out[base + n] = name
+        return out
+
+    def _make_head(self) -> RowLinear | CardStored:
+        """the resident head, built and rebuilt (the VRAM policy's shed and regrow) the one way: its GGUF blocks on
+        the card where the card's kernels take its type (a Q*_K_M file keeps its output in Q6_K), else a bf16
+        linear whose small passes run at the fixed shape, as the card layers' (fixed_rows.py)"""
+        gg = self.gguf
+        name = self._gguf_names.get(self.head_key) if gg is not None else None
+        if gg is not None and name is not None and self._card_stores() and gg.storable(name):
+            return CardStored(gg.stored(name).to(self.dev), self.head_key, scratch=self.scratch)
+        with self._meta:
+            head = RowLinear(self.cfg.hidden_size, self.cfg.vocab_size, bias=False)
+        self._adopt(head, "weight", self._get(self.head_key))
+        return head
+
+    def _bind_card_stored(self, tmpl: Any, stored: dict[str, str], base: str) -> None:
+        """each linear of a card layer `stored` names replaced by its GGUF blocks on the card (`CardStored`), the
+        one-element stand-in the load adopted going with the module"""
+        assert self.gguf is not None  # stored keys are a GGUF's
+        for key, name in stored.items():
+            *path, leaf = key[len(base) : -len(".weight")].split(".")
+            parent = tmpl
+            for p in path:
+                parent = getattr(parent, p)
+            bias = getattr(getattr(parent, leaf), "bias", None)
+            w = self.gguf.stored(name).to(self.dev)
+            setattr(parent, leaf, CardStored(w, key, scratch=self.scratch, bias=None if bias is None else bias.data))
+
     def _load_layer(self, i: int, tmpl: Any, first: bool = False) -> None:
         t0 = time.time()
         base = f"{self.prefix}layers.{i}."
         seen = 0
+        # a resident layer's GGUF linears the card multiplies as stored: a one-element stand-in adopted in place of
+        # the bf16 dequant, then the module swapped for the blocks on the card - nothing expanded is read or moved
+        stored = (
+            self._card_stored_keys(
+                i, [n + ".weight" for n, m in tmpl.named_modules() if isinstance(m, torch.nn.Linear)]
+            )
+            if first
+            else {}
+        )
         for name, p, is_buf in self._named_tensors(tmpl):
-            t = self._get(base + name)
+            t = torch.zeros(1, dtype=torch.bfloat16) if base + name in stored else self._get(base + name)
             if first:
                 self._adopt(tmpl, name, t, writable=True, buffer=is_buf)
             else:
@@ -1327,6 +1489,11 @@ class _TiersMixin(_State):
         self._retarget(tmpl, i)
         if first:
             tmpl.to(self.dev)
+            if stored:
+                self._bind_card_stored(tmpl, stored, base)
+            self._bind_tags(i, tmpl)
+        else:
+            self.weight_tags.pop(i, None)  # a template streamed in: bf16 slots
         self._sync()
         self.load_s += time.time() - t0
 

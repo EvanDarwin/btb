@@ -7,40 +7,35 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, TypeGuard
 
 import numpy as np
 import torch
 
 from .. import mlx as mlxdev
 from .. import pool
-from ..kinds import (
-    LayerKind,
-    NodePath,
-    Parents,
-    PassTag,
-    Quant,
-    QuantClass,
-    TokenRows,
-    Tokens,
-    latt_backend_key,
-    quants_of,
-)
+from ..kinds import LayerKind, NodePath, Parents, PassTag, TokenRows, Tokens
 from ..mlx import fused as fk
-from ..mlx.legacyq import KINDS as LEGACY_KINDS
-from ..mlx.q6k import gather_q6k
 from ..sampling import GREEDY
 from ..session import Session
 from .cache import GraphStates, GrowLayer, forked
 from .families import act_name
 from .host import _HostLinear, copy_bytes
 from .native import Native
+from .paged import PagedCache, PagedLayer
 from .state import _State
 
 if TYPE_CHECKING:
     import mlx.core as mx_
 
     from ..mlx import Shared
+    from ..mlx.attn import NodeMeta
+    from .cache import KvCache
+
+    # a pass's attention mask: causal, a boolean one over its rows (a tree's), or none (one row)
+    AttnMask: TypeAlias = Literal["causal"] | mx_.array | None
+    # a verify pass's nodes as the node kernel takes them: (past, parents)
+    PassNodes = tuple[int, Parents]
 
 # the head sizes the engine routes to its attention kernels (decode, tree, rows, forest, head-256 prefill); any
 # other size runs MLX's own attention (PassTag.MLX_SDPA)
@@ -77,6 +72,32 @@ class _AttnParams:
 
     n: int
     by_window: dict[int | None, tuple[mx_.array, int]] = field(default_factory=dict)
+
+
+@dataclass
+class _PagedRows:
+    """A paged layer's rows as one pass's attention reads them: the pool's K and V regions [1, Hk, rows, D], the
+    conversation's rows before the pass through `old` (uint32, at least one entry), and the pass's own `k2`/`v2`
+    [1, Hk, T, D] in the regions' dtype, read as made: MLX orders no read of a region after `kv_scatter`'s write
+    into it, so the pass's rows are read from the regions by the passes after it."""
+
+    k: mx_.array
+    v: mx_.array
+    old: mx_.array
+    past: int
+    k2: mx_.array
+    v2: mx_.array
+
+    def rows(self) -> tuple[mx_.array, mx_.array]:
+        """every row in order, [1, Hk, past + T, D]: a gathered copy, for MLX's own attention"""
+        m = mlxdev.mx()
+        if not self.past:
+            return self.k2, self.v2
+        idx = self.old[: self.past]
+        return (
+            m.concatenate([m.take(self.k, idx, axis=2), self.k2], axis=2),
+            m.concatenate([m.take(self.v, idx, axis=2), self.v2], axis=2),
+        )
 
 
 def _pick_keys(pick: Any, positions: Any, last_only: bool) -> list[int] | None:
@@ -142,6 +163,10 @@ class _MlxMixin(_State):
         sh = self.mlx_state.ahead
         if sh is None or sh.nbytes != nbytes:
             sh = mlxdev.Shared(nbytes, stream=m.cpu)
+        else:
+            # its fill was queued on this thread: waited for here, as an MLX array is evaluated on the thread that
+            # made it - the readers that write into it next run on other threads (a crash there)
+            sh.np  # noqa: B018
         self.mlx_state.ahead = mlxdev.Shared(nbytes, stream=m.cpu, defer=True)
         return sh, 0
 
@@ -158,28 +183,7 @@ class _MlxMixin(_State):
         lins = [m for m in lins if m.mx is None]
         if not lins:
             return 0
-        lins = [m for m in lins if not self._bind_gguf_q4k(m)]
-        if not lins:
-            return 0
-        lins = [m for m in lins if not self._bind_gguf_q5k(m)]
-        if not lins:
-            return 0
-        lins = [m for m in lins if not self._bind_gguf_q2k(m)]
-        if not lins:
-            return 0
-        lins = [m for m in lins if not self._bind_gguf_q3k(m)]
-        if not lins:
-            return 0
-        lins = [m for m in lins if not self._bind_gguf_iq4(m)]
-        if not lins:
-            return 0
-        lins = [m for m in lins if not self._bind_gguf_lattice(m)]
-        if not lins:
-            return 0
-        lins = [m for m in lins if not self._bind_gguf_legacy(m)]
-        if not lins:
-            return 0
-        lins = [m for m in lins if not self._bind_gguf_q6k(m)]
+        lins = [m for m in lins if not self._bind_gguf_stored(m)]
         if not lins:
             return 0
         be = self.mlx
@@ -231,194 +235,23 @@ class _MlxMixin(_State):
         self.mlx_state.bytes += cur
         return cur
 
-    def _bind_gguf_legacy(self, m: Any) -> bool:
-        """a GGUF Q4_0/Q4_1/Q8_0 tensor bound as its own blocks for `matvec_legacy` (`gguf_packed`): batch-invariant,
-        so a verify pass computes each row as the one-row step does. The torch weight becomes a shape-only
-        placeholder, so the bf16 copy `_get` made is released; False when the linear is not such a tensor."""
-        gg = getattr(self, "gguf", None)
-        if gg is None or not getattr(self, "gguf_packed", True) or m.key not in getattr(self, "_gguf_names", {}):
+    def _bind_gguf_stored(self, m: Any) -> bool:
+        """a GGUF tensor of a stored type bound as its own blocks for its type's kernel (`gguf_packed`): batch-
+        invariant, so a verify pass computes each row as the one-row step does. The torch weight becomes a shape,
+        so the bf16 copy `_get` made, if any, is released; False when the linear is not such a tensor."""
+        gg = self.gguf
+        if gg is None or not self.gguf_packed or m.key not in self._gguf_names:
             return False
         name = self._gguf_names[m.key]
-        t = gg.tensors.get(name)
-        kind = t.tensor_type.name.lower() if t is not None else ""
-        shape = tuple(m.weight.shape)
-        if kind not in LEGACY_KINDS or len(shape) != 2 or shape[1] % 32:
+        if not gg.storable(name):
             return False
         be = self.mlx
         assert be is not None
-        raw = gg.raw(name).numpy()
-        m.mx = be.weight_legacy(kind, raw, shape)
-        m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*shape), requires_grad=False)
+        w = gg.stored(name)
+        m.mx = be.weight_stored(w.q, w.raw.numpy(), w.shape)
+        m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*w.shape), requires_grad=False)
         self.mlx_state.affine = True  # not a plain bf16 slot: stays on the per-op path, off the megakernel
-        self.mlx_state.bytes += int(raw.nbytes)
-        return True
-
-    def _bind_gguf_q4k(self, m: Any) -> bool:
-        """a GGUF Q4_K tensor bound as its own native bytes for `matvec_q4k` (batch-invariant, so affine
-        speculation is bit-exact) instead of the bf16-scale affine repack: the 144 B/256 superblocks stay packed
-        and the torch weight becomes a placeholder, so the bf16 copy `_get` made is released. Runs before the
-        affine binder, which would otherwise repack Q4_K. False when the linear is not a Q4_K tensor."""
-        gg = getattr(self, "gguf", None)
-        if gg is None or not getattr(self, "gguf_packed", True) or m.key not in getattr(self, "_gguf_names", {}):
-            return False
-        name = self._gguf_names[m.key]
-        t = gg.tensors.get(name)
-        if t is None or t.tensor_type.name != Quant.Q4_K:
-            return False
-        shape = tuple(m.weight.shape)
-        if len(shape) != 2 or shape[1] % 256:
-            return False
-        be = self.mlx
-        assert be is not None
-        raw = gg.raw(name).numpy()
-        m.mx = be.weight_q4k(raw, shape)
-        m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*shape), requires_grad=False)
-        self.mlx_state.affine = True  # not a plain bf16 slot: stays on the per-op path, off the megakernel
-        self.mlx_state.bytes += int(raw.nbytes)
-        return True
-
-    def _bind_gguf_q5k(self, m: Any) -> bool:
-        """a GGUF Q5_K tensor bound as its own native bytes for `matvec_q5k` (batch-invariant, and beats the
-        bf16-dequant path that lost to llama.cpp): the 176 B/256 superblocks stay packed, the torch weight a
-        placeholder. False when the linear is not a Q5_K tensor."""
-        gg = getattr(self, "gguf", None)
-        if gg is None or not getattr(self, "gguf_packed", True) or m.key not in getattr(self, "_gguf_names", {}):
-            return False
-        name = self._gguf_names[m.key]
-        t = gg.tensors.get(name)
-        if t is None or t.tensor_type.name != Quant.Q5_K:
-            return False
-        shape = tuple(m.weight.shape)
-        if len(shape) != 2 or shape[1] % 256:
-            return False
-        be = self.mlx
-        assert be is not None
-        raw = gg.raw(name).numpy()
-        m.mx = be.weight_q5k(raw, shape)
-        m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*shape), requires_grad=False)
-        self.mlx_state.affine = True  # not a plain bf16 slot: stays on the per-op path, off the megakernel
-        self.mlx_state.bytes += int(raw.nbytes)
-        return True
-
-    def _bind_gguf_q2k(self, m: Any) -> bool:
-        """a GGUF Q2_K tensor bound as its own native bytes for `matvec_q2k` (batch-invariant, beats the
-        bf16-dequant path): the 84 B/256 superblocks stay packed, the torch weight a placeholder."""
-        gg = getattr(self, "gguf", None)
-        if gg is None or not getattr(self, "gguf_packed", True) or m.key not in getattr(self, "_gguf_names", {}):
-            return False
-        name = self._gguf_names[m.key]
-        t = gg.tensors.get(name)
-        if t is None or t.tensor_type.name != Quant.Q2_K:
-            return False
-        shape = tuple(m.weight.shape)
-        if len(shape) != 2 or shape[1] % 256:
-            return False
-        be = self.mlx
-        assert be is not None
-        raw = gg.raw(name).numpy()
-        m.mx = be.weight_q2k(raw, shape)
-        m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*shape), requires_grad=False)
-        self.mlx_state.affine = True  # not a plain bf16 slot: stays on the per-op path, off the megakernel
-        self.mlx_state.bytes += int(raw.nbytes)
-        return True
-
-    def _bind_gguf_q3k(self, m: Any) -> bool:
-        """a GGUF Q3_K tensor bound as its own native bytes for `matvec_q3k` (batch-invariant, beats the
-        bf16-dequant path): the 110 B/256 superblocks stay packed, the torch weight a placeholder."""
-        gg = getattr(self, "gguf", None)
-        if gg is None or not getattr(self, "gguf_packed", True) or m.key not in getattr(self, "_gguf_names", {}):
-            return False
-        name = self._gguf_names[m.key]
-        t = gg.tensors.get(name)
-        if t is None or t.tensor_type.name != Quant.Q3_K:
-            return False
-        shape = tuple(m.weight.shape)
-        if len(shape) != 2 or shape[1] % 256:
-            return False
-        be = self.mlx
-        assert be is not None
-        raw = gg.raw(name).numpy()
-        m.mx = be.weight_q3k(raw, shape)
-        m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*shape), requires_grad=False)
-        self.mlx_state.affine = True  # not a plain bf16 slot: stays on the per-op path, off the megakernel
-        self.mlx_state.bytes += int(raw.nbytes)
-        return True
-
-    def _bind_gguf_iq4(self, m: Any) -> bool:
-        """a GGUF IQ4_NL/IQ4_XS tensor bound as its own native bytes for `matvec_iq4nl`/`matvec_iq4xs`
-        (batch-invariant, beats the bf16-dequant path): the codebook blocks stay packed, the torch weight a
-        placeholder."""
-        gg = getattr(self, "gguf", None)
-        if gg is None or not getattr(self, "gguf_packed", True) or m.key not in getattr(self, "_gguf_names", {}):
-            return False
-        name = self._gguf_names[m.key]
-        t = gg.tensors.get(name)
-        if t is None or t.tensor_type.name not in quants_of(QuantClass.IQ4):
-            return False
-        shape = tuple(m.weight.shape)
-        blkw = 32 if t.tensor_type.name == Quant.IQ4_NL else 256
-        if len(shape) != 2 or shape[1] % blkw:
-            return False
-        be = self.mlx
-        assert be is not None
-        raw = gg.raw(name).numpy()
-        m.mx = be.weight_iq4nl(raw, shape) if t.tensor_type.name == Quant.IQ4_NL else be.weight_iq4xs(raw, shape)
-        m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*shape), requires_grad=False)
-        self.mlx_state.affine = True  # not a plain bf16 slot: stays on the per-op path, off the megakernel
-        self.mlx_state.bytes += int(raw.nbytes)
-        return True
-
-    # GGUF IQ lattice type name -> the backend's lattice-kernel kind, from the LATTICE members of kinds.Quant
-    # (the backend's `_LATT` carries the matching keys and their byte layouts); a new lattice quant is one member.
-    _LATT_KINDS = {q.value: latt_backend_key(q) for q in quants_of(QuantClass.LATTICE)}
-
-    def _bind_gguf_lattice(self, m: Any) -> bool:
-        """a GGUF IQ lattice tensor (the grid-codebook quants behind the Unsloth dynamic mixes) bound as its own
-        native bytes for `matvec_lattice` (batch-invariant, beats the bf16-dequant path); the torch weight a
-        placeholder."""
-        gg = getattr(self, "gguf", None)
-        if gg is None or not getattr(self, "gguf_packed", True) or m.key not in getattr(self, "_gguf_names", {}):
-            return False
-        name = self._gguf_names[m.key]
-        t = gg.tensors.get(name)
-        if t is None:
-            return False
-        kind = self._LATT_KINDS.get(t.tensor_type.name)
-        if kind is None:
-            return False
-        shape = tuple(m.weight.shape)
-        if len(shape) != 2 or shape[1] % 256:
-            return False
-        be = self.mlx
-        assert be is not None
-        raw = gg.raw(name).numpy()
-        m.mx = be.weight_lattice(kind, raw, shape)
-        m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*shape), requires_grad=False)
-        self.mlx_state.affine = True  # not a plain bf16 slot: stays on the per-op path, off the megakernel
-        self.mlx_state.bytes += int(raw.nbytes)
-        return True
-
-    def _bind_gguf_q6k(self, m: Any) -> bool:
-        """a GGUF Q6_K tensor bound as its own bytes for `matvec_q6k` (the head and every ffn_down of a k-quant
-        file): the 6-bit blocks stay packed instead of a bf16 copy, and the torch weight becomes a placeholder so
-        the bf16 copy `_get` made is released. False when the linear is not a Q6_K tensor."""
-        gg = getattr(self, "gguf", None)
-        if gg is None or not getattr(self, "gguf_packed", True) or m.key not in getattr(self, "_gguf_names", {}):
-            return False
-        name = self._gguf_names[m.key]
-        t = gg.tensors.get(name)
-        if t is None or t.tensor_type.name != "Q6_K":
-            return False
-        shape = tuple(m.weight.shape)
-        if len(shape) != 2 or shape[1] % 256:
-            return False
-        be = self.mlx
-        assert be is not None
-        raw = gg.raw(name).numpy()
-        m.mx = be.weight_q6k(raw, shape)
-        m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*shape), requires_grad=False)
-        self.mlx_state.affine = True  # not a plain bf16 slot: stays on the per-op path, off the megakernel
-        self.mlx_state.bytes += int(raw.nbytes)
+        self.mlx_state.bytes += int(w.raw.numel())
         return True
 
     def _mlx_act(self) -> Callable[[mx_.array], mx_.array] | None:
@@ -468,15 +301,17 @@ class _MlxMixin(_State):
             return False
         return all(i in self.mlx_layers and i in self.host for i in range(n_layers))
 
-    def _mlx_tree_prep(self, cache: Any, past: int, parents: Parents) -> tuple[Any, list[int]]:
+    def _mlx_tree_prep(self, cache: Any, past: int, parents: Parents) -> tuple[NodeMeta | None, list[int]]:
         """What a tree verify pass needs once, not per layer: the node kernel's metadata (a cache with no row
-        selected) and every node's position, past + depth, for the one-launch rope."""
+        selected; a paged cache's prefix through its row map, the pass's rows as made) and every node's position,
+        past + depth, for the one-launch rope."""
         T = len(parents)
         depth = [0] * T
         for j in range(T):
             depth[j] = 0 if parents[j] < 0 else depth[parents[j]] + 1
         cl0 = cache.layers[0] if getattr(cache, "layers", None) else None
-        prep = mlxdev.tree_meta(past, parents) if (cl0 is None or getattr(cl0, "_row", None) is None) else None
+        seg = int(past) if isinstance(cache, PagedCache) else None
+        prep = mlxdev.tree_meta(past, parents, seg=seg) if (cl0 is None or getattr(cl0, "_row", None) is None) else None
         return prep, [int(past) + d for d in depth]
 
     def mlx_attn_cost(self) -> None:
@@ -578,8 +413,8 @@ class _MlxMixin(_State):
         return len(cost)
 
     def _mlx_tree_able(self, cache: Any) -> bool:
-        """Whether a tree of drafts can verify on the fused dense path: a shared cache (bf16 or int8), a head size
-        and query grouping the node kernel takes, the kernel on."""
+        """Whether a tree of drafts can verify on the fused dense path: a shared cache (bf16 or int8) or a paged one
+        (bf16), a head size and query grouping the node kernel takes, the kernel on."""
         if self.mlx is None or not self.fam.dense:
             return False
         cl = cache.layers[0] if getattr(cache, "layers", None) else None
@@ -587,11 +422,17 @@ class _MlxMixin(_State):
         Hq = int(c.num_attention_heads)
         Hk = int(getattr(c, "num_key_value_heads", None) or Hq)
         hd = int(getattr(c, "head_dim", None) or int(c.hidden_size) // Hq)
+        if isinstance(cl, PagedLayer):
+            rows = cl.pool.host.dtype == torch.bfloat16
+        else:
+            rows = (
+                isinstance(cl, GrowLayer)
+                and cl.shared
+                and cl._mx is not None
+                and (cl._mx[0].dtype == mlxdev.mx().bfloat16 or bool(cl.bits))
+            )
         return (
-            isinstance(cl, GrowLayer)
-            and cl.shared
-            and cl._mx is not None
-            and (cl._mx[0].dtype == mlxdev.mx().bfloat16 or bool(cl.bits))
+            rows
             and hd in ATTN_KERNEL_HEADS
             and Hq // Hk <= mlxdev.ATTN_MAXG
             and bool(getattr(self, "mlx_attn_kernel", True))
@@ -775,21 +616,28 @@ class _MlxMixin(_State):
             return m.fast.rms_norm(a.astype(wt.dtype), wt, eps).astype(a.dtype)
         return m.fast.rms_norm(a, wt, eps)
 
-    def _mlx_prefill_able(self, cl: Any, T: int, hd: int, Hq: int, Hk: int) -> bool:
-        """The fused prefill kernel's gate: a causal chunk of more than 16 rows at head size 256 (the size MLX's own
-        fused attention lacks) over a shared bf16 cache layer with no row selected, `mlx_attn_prefill` on."""
+    def _mlx_prefill_able(self, cl: object, T: int, hd: int, Hq: int, Hk: int) -> TypeGuard[GrowLayer]:
+        """The fused prefill kernel's gate: a causal chunk the kernel takes (`_mlx_prefill_on`) over a shared bf16
+        cache layer with no row selected."""
         return (
-            T > 16
-            and hd == 256
+            self._mlx_prefill_on(T, hd, Hq, Hk)
             and isinstance(cl, GrowLayer)
             and cl.shared
             and not cl.bits
             and cl._mx is not None
             and cl._mx[0].dtype == mlxdev.mx().bfloat16
-            and Hq // Hk <= mlxdev.ATTN_MAXG
-            and 8 % (Hq // Hk) == 0
             and getattr(cl, "_row", None) is None
             and not getattr(cl, "_flat", False)
+        )
+
+    def _mlx_prefill_on(self, T: int, hd: int, Hq: int, Hk: int) -> bool:
+        """a chunk the prefill kernel takes: more than 16 rows at head size 256 (the size MLX's own fused attention
+        lacks), a query grouping it tiles, `mlx_attn_prefill` on"""
+        return (
+            T > 16
+            and hd == 256
+            and Hq // Hk <= mlxdev.ATTN_MAXG
+            and 8 % (Hq // Hk) == 0
             and bool(getattr(self, "mlx_attn_kernel", True))
             and bool(getattr(self, "mlx_attn_prefill", True))
         )
@@ -799,48 +647,57 @@ class _MlxMixin(_State):
         qh: mx_.array,
         K: mx_.array,
         V: mx_.array,
-        cl: Any,
+        cl: GrowLayer | _PagedRows | None,
         T: int,
         hd: int,
         Hq: int,
         Hk: int,
         scale: float,
-        mask: Any,
+        mask: AttnMask,
         attn_pa: _AttnParams | None,
-        nodes: Any = None,
-        prepared: Any = None,
+        nodes: PassNodes | None = None,
+        prepared: NodeMeta | None = None,
         win: int | None = None,
     ) -> tuple[mx_.array, _AttnParams | None]:
         """Attention for the fused paths: the node kernel for a decode row past `mlx_attn_rows` (0 with speculation
         on: every row and node computes as the one-row step would) and for `nodes` = (past, parents) of a
         verify pass; MLX's fused attention otherwise. `win` is a sliding layer's window (Gemma 3), passed to the
-        node kernels and, on the SDPA fallback (a small-cache decode, a sliding prefill), applied as the mask.
-        Returns ([T, Hq*hd], attn_pa)."""
+        node kernels and, on the SDPA fallback (a small-cache decode, a sliding prefill), applied as the mask. A
+        paged layer's rows (`_PagedRows`) take the same kernels where the contiguous layer's would, and MLX's attention
+        over its rows gathered otherwise. Returns ([T, Hq*hd], attn_pa)."""
         m = mlxdev.mx()
-        able = (
-            cl is not None
-            and isinstance(cl, GrowLayer)
+        if isinstance(cl, _PagedRows):
+            got = self._mlx_attend_paged(qh, cl, T, hd, Hq, Hk, scale, mask, attn_pa, nodes, prepared, win)
+            if got is not None:
+                return got
+            K, V = cl.rows()
+            cl = None
+        # the layer the kernels read in place, None where MLX's attention takes the pass
+        kl = (
+            cl
+            if cl is not None
             and cl.shared
             and hd in ATTN_KERNEL_HEADS
             and Hq // Hk <= mlxdev.ATTN_MAXG
             and (cl._mx[0].dtype == m.bfloat16 or cl.bits)
             and getattr(self, "mlx_attn_kernel", True)
+            else None
         )
         # an int8 layer's rows and their scales go to the kernel as they are
-        kq: dict[str, Any] = {"ks": cl._mx[2], "vs": cl._mx[3]} if (able and cl.bits) else {}
+        kq: dict[str, Any] = {"ks": kl._mx[2], "vs": kl._mx[3]} if (kl is not None and kl.bits) else {}
         # a batched cache with one row selected reads that row's slice of the buffer (or, of a flat buffer,
         # its stretch from its offset)
-        b = int(cl._row) if (able and getattr(cl, "_row", None) is not None) else 0
+        b = int(kl._row) if (kl is not None and getattr(kl, "_row", None) is not None) else 0
         place: dict[str, Any] = {"batch": b}
-        if b and getattr(cl, "_flat", False):
-            place = {"batch": b, "pbase": int(cl._offs[b]), "kbatch": 0}
-        if able and nodes is not None:
+        if kl is not None and b and getattr(kl, "_flat", False):
+            place = {"batch": b, "pbase": int(kl._offs[b]), "kbatch": 0}
+        if kl is not None and nodes is not None:
             past, parents = nodes
             self._tag(PassTag.MLX_ATTN_KERNEL)
             a = mlxdev.attn_tree(
                 qh[0].transpose(1, 0, 2).astype(m.float32),
-                cl._mx[0],
-                cl._mx[1],
+                kl._mx[0],
+                kl._mx[1],
                 past,
                 parents,
                 scale,
@@ -850,22 +707,22 @@ class _MlxMixin(_State):
                 **kq,
             )
             return a.astype(qh.dtype).reshape(T, Hq * hd), attn_pa
-        if able and T == 1 and mask is None and cl._n >= self.mlx_attn_rows:
+        if kl is not None and T == 1 and mask is None and kl._n >= self.mlx_attn_rows:
             if b:
-                pa = mlxdev.attn_params(cl._n, win, **place)
+                pa = mlxdev.attn_params(kl._n, win, **place)
             else:
-                if attn_pa is None or attn_pa.n != cl._n:
-                    attn_pa = _AttnParams(cl._n)
+                if attn_pa is None or attn_pa.n != kl._n:
+                    attn_pa = _AttnParams(kl._n)
                 if win not in attn_pa.by_window:
-                    attn_pa.by_window[win] = mlxdev.attn_params(cl._n, win)
+                    attn_pa.by_window[win] = mlxdev.attn_params(kl._n, win)
                 pa = attn_pa.by_window[win]
             self._tag(PassTag.MLX_ATTN_KERNEL)
-            a = mlxdev.attn_decode(qh[0, :, 0].astype(m.float32), cl._mx[0], cl._mx[1], cl._n, scale, params=pa, **kq)
+            a = mlxdev.attn_decode(qh[0, :, 0].astype(m.float32), kl._mx[0], kl._mx[1], kl._n, scale, params=pa, **kq)
             return a.astype(qh.dtype).reshape(1, Hq * hd), attn_pa
-        if able and mask == "causal" and win is None and self._mlx_prefill_able(cl, T, hd, Hq, Hk):
+        if kl is not None and mask == "causal" and win is None and self._mlx_prefill_able(kl, T, hd, Hq, Hk):
             # the chunk's rows are appended already: row t at cache row past + t
             self._tag(PassTag.MLX_ATTN_KERNEL)
-            a = mlxdev.attn_prefill(qh[0].transpose(1, 0, 2), cl._mx[0], cl._mx[1], cl._n - T, scale, odt=qh.dtype)
+            a = mlxdev.attn_prefill(qh[0].transpose(1, 0, 2), kl._mx[0], kl._mx[1], kl._n - T, scale, odt=qh.dtype)
             return a.reshape(T, Hq * hd), attn_pa
         if nodes is not None and isinstance(mask, str) and any(p != j - 1 for j, p in enumerate(nodes[1])):
             # a causal mask would let a node attend its siblings as if they were its ancestors
@@ -883,18 +740,131 @@ class _MlxMixin(_State):
         a = m.fast.scaled_dot_product_attention(qh, K, V, scale=scale, mask=mask)
         return a[0].transpose(1, 0, 2).reshape(T, Hq * hd), attn_pa
 
-    def _mlx_cache(self, cache: Any, i: int, kh: mx_.array, vh: mx_.array) -> tuple[Any, mx_.array, mx_.array]:
-        """Append this layer's K/V rows: in place on the GPU for a shared cache layer, through torch otherwise."""
+    def _mlx_attend_paged(
+        self,
+        qh: mx_.array,
+        pr: _PagedRows,
+        T: int,
+        hd: int,
+        Hq: int,
+        Hk: int,
+        scale: float,
+        mask: AttnMask,
+        attn_pa: _AttnParams | None,
+        nodes: PassNodes | None,
+        prepared: NodeMeta | None,
+        win: int | None,
+    ) -> tuple[mx_.array, _AttnParams | None] | None:
+        """`_mlx_attend`'s kernels over a paged layer's rows, each where the contiguous layer's takes it and with its
+        bits: the node kernel for a verify pass's nodes and for a decode row, the prefill kernel for a causal chunk.
+        None where MLX's attention takes the pass"""
+        m = mlxdev.mx()
+        if not (
+            hd in ATTN_KERNEL_HEADS
+            and Hq // Hk <= mlxdev.ATTN_MAXG
+            and pr.k.dtype == m.bfloat16
+            and getattr(self, "mlx_attn_kernel", True)
+        ):
+            return None
+        n = pr.past + T
+        if nodes is not None:
+            past, parents = nodes
+            self._tag(PassTag.MLX_ATTN_KERNEL)
+            a = mlxdev.attn_tree(
+                qh[0].transpose(1, 0, 2).astype(m.float32),
+                pr.k,
+                pr.v,
+                past,
+                parents,
+                scale,
+                window=win,
+                prepared=prepared,
+                rmap=pr.old,
+                k2=pr.k2,
+                v2=pr.v2,
+            )
+            return a.astype(qh.dtype).reshape(T, Hq * hd), attn_pa
+        if T == 1 and mask is None and n >= self.mlx_attn_rows:
+            if attn_pa is None or attn_pa.n != n:
+                attn_pa = _AttnParams(n)
+            if win not in attn_pa.by_window:
+                attn_pa.by_window[win] = mlxdev.attn_params(n, win, seg=n - 1)
+            self._tag(PassTag.MLX_ATTN_KERNEL)
+            a = mlxdev.attn_decode(
+                qh[0, :, 0].astype(m.float32),
+                pr.k,
+                pr.v,
+                n,
+                scale,
+                params=attn_pa.by_window[win],
+                rmap=pr.old,
+                k2=pr.k2,
+                v2=pr.v2,
+            )
+            return a.astype(qh.dtype).reshape(1, Hq * hd), attn_pa
+        if mask == "causal" and win is None and self._mlx_prefill_on(T, hd, Hq, Hk):
+            self._tag(PassTag.MLX_ATTN_KERNEL)
+            a = mlxdev.attn_prefill(
+                qh[0].transpose(1, 0, 2), pr.k, pr.v, pr.past, scale, odt=qh.dtype, rmap=pr.old, k2=pr.k2, v2=pr.v2
+            )
+            return a.reshape(T, Hq * hd), attn_pa
+        return None
+
+    def _mlx_cache(
+        self, cache: KvCache | None, i: int, kh: mx_.array, vh: mx_.array, writes: list[mx_.array]
+    ) -> tuple[GrowLayer | _PagedRows | None, mx_.array, mx_.array]:
+        """Append this layer's K/V rows: in place on the GPU for a shared cache layer, through torch otherwise; a
+        paged layer's into its pages (`_mlx_page_append`), the writes' flags onto `writes` for the pass to evaluate."""
         m = mlxdev.mx()
         if cache is None:
             return None, kh, vh
         cl = cache.layers[i]
+        if isinstance(cl, PagedLayer):
+            assert isinstance(cache, PagedCache)
+            pr = self._mlx_page_append(cache, cl, kh, vh, writes)
+            return pr, pr.k2, pr.v2
         if isinstance(cl, GrowLayer) and cl.shared:
             K, V = cl.mx_update(kh, vh)
             return cl, K, V
         m.eval(kh, vh)
         kf, vf = cache.update(mlxdev.from_mx(kh), mlxdev.from_mx(vh), i)
         return None, mlxdev.to_mx(kf), mlxdev.to_mx(vf)
+
+    def _mlx_page_append(
+        self, cache: PagedCache, cl: PagedLayer, kh: mx_.array, vh: mx_.array, writes: list[mx_.array]
+    ) -> _PagedRows:
+        """A pass's rows `kh`/`vh` [1, Hk, T, D] of a paged layer written in place where its table puts them
+        (`mlx.kv_scatter`), the flag onto `writes`; returns what its attention reads."""
+        T = int(kh.shape[2])
+        n = cl.n
+        old, at = self._mlx_page_maps(cache, cl, kh, n, T)
+        rk, rv = cl.pool.host.mx_view(cl.i)
+        # a cast of rows already in the region's dtype is a copy of its own (MLX's astype makes one)
+        k2 = kh if kh.dtype == rk.dtype else kh.astype(rk.dtype)
+        v2 = vh if vh.dtype == rv.dtype else vh.astype(rv.dtype)
+        writes.append(mlxdev.kv_scatter(rk, rv, k2, v2, at))
+        cl.n = n + T
+        return _PagedRows(rk, rv, old, n, k2, v2)
+
+    def _mlx_page_maps(
+        self, cache: PagedCache, cl: PagedLayer, kh: mx_.array, past: int, T: int
+    ) -> tuple[mx_.array, mx_.array]:
+        """A pass's row maps as MLX's kernels take them, made at its first paged layer for every layer
+        (`PrefixCache.lists`): the conversation's rows before the pass (one entry at least: a kernel takes no empty
+        input) and the rows its own land at. The region is shaped and the table grown there, before any of the
+        pass's writes: a region regrown later would leave them in the old buffer"""
+        key = (int(past), int(T))
+        got = cache.prefix.lists(cache.table).mlx.get(key)
+        if got is None:
+            m = mlxdev.mx()
+            _, Hk, _, D = (int(x) for x in kh.shape)
+            cl.pool.shape(cl.i, torch.empty(1, Hk, 0, D, dtype=mlxdev.torch_dtype(kh.dtype)))
+            cl.table.extend(past + T)
+            rows = cache.table.rows()[: past + T].numpy().astype(np.uint32)
+            got = (m.array(rows[:past] if past else np.zeros(1, np.uint32)), m.array(rows[past:]))
+            # the grown table's lists: growing it moved its version
+            cache.prefix.lists(cache.table).mlx[key] = got
+        return got
 
     def _mlx_finish(
         self,
@@ -975,7 +945,9 @@ class _MlxMixin(_State):
             inv[b] = i
         return m.take(m.concatenate(parts, axis=0), m.array(inv, dtype=m.int32), axis=0)
 
-    def _mlx_attend_rows(self, qh: mx_.array, cl: GrowLayer, scale: float, prepared: Any = None) -> mx_.array:
+    def _mlx_attend_rows(
+        self, qh: mx_.array, cl: GrowLayer, scale: float, prepared: NodeMeta | None = None
+    ) -> mx_.array:
         """One decode step's attention for B rows: `qh` [B, Hq, hd], each row over its own cache slice at its own
         length through the node kernel; a head size the kernel lacks runs MLX's attention per row."""
         m = mlxdev.mx()
@@ -1004,6 +976,7 @@ class _MlxMixin(_State):
                 prepared=prepared,
                 odt=qh.dtype,
                 pbases=cl._offs if cl._flat else None,
+                rmap=cl._rmap,
                 **kq,
             )
             return a.reshape(B, Hq * hd)
@@ -1101,7 +1074,7 @@ class _MlxMixin(_State):
         step (hm[b] at position rows[b]); `forest` a batched prefill (the logits each row's last token's); `pick`
         the ids picked in the graph (a chain's rows at past + j, a tree's at past + depth)."""
         self._tag_tiers(n_layers)
-        self._tag_quant()
+        self._tag_quant(n_layers)
         if self.fam.hybrid:
             return self._forward_mlx_hybrid(
                 h, pe, cache, on_layer, last_only, head, n_layers, hm=hm, lazy=lazy, pick=pick
@@ -1132,6 +1105,7 @@ class _MlxMixin(_State):
         t0 = time.time()
         attn_pa: _AttnParams | None = None
         taps = []
+        writes: list[mx_.array] = []
         # under speculation a chain or a tree of drafted tokens attends through the decode kernel node by node, as the
         # one-row step would, so its verdicts are the greedy loop's
         spec_chain = bool(getattr(self, "aq", False)) and past > 0
@@ -1240,7 +1214,7 @@ class _MlxMixin(_State):
                 kh = be.rope_fast(k.transpose(1, 0, 2), rd, fq, rscale, past)[None]
                 vh = v.transpose(1, 0, 2)[None]
             if not batched:
-                cl, K, V = self._mlx_cache(cache, i, kh, vh)
+                cl, K, V = self._mlx_cache(cache, i, kh, vh, writes)
                 a, attn_pa = self._mlx_attend(
                     qh,
                     K,
@@ -1309,6 +1283,9 @@ class _MlxMixin(_State):
             if on_layer is not None:
                 # handed over after the one eval at the end: an eval here would sync the GPU every layer
                 taps.append((i, hm))
+        if writes:
+            # a paged cache's rows into its pages with the pass, whatever evaluates it (a pipelined step its pick)
+            hm = m.depends(hm, writes)
         if taps:
             return self._mlx_finish(
                 hm,
@@ -1329,14 +1306,13 @@ class _MlxMixin(_State):
     def _mega_ok(self, cache: Any, T: int, on_layer: Any, head: bool, pick: Any, positions: Any) -> bool:
         """the megakernel takes a pass of 1..16 rows over an arena cache of the dense family, the head and the
         pick in the graph (the argmax in the kernel; a sample over the logits it leaves), every layer resident"""
-        mg = getattr(self, "_mega", None)
-        if mg is None or cache is None or not (1 <= T <= 16) or on_layer is not None or not head or pick is None:
+        if not self._mega_serves() or cache is None or not (1 <= T <= 16) or on_layer is not None:
             return False
-        if self.cold or not self.fam.mega or self.mlx_state.affine:
+        if not head or pick is None:
             return False
+        mg = self._mega
+        assert mg is not None  # _mega_serves holds it built
         if positions is not None and not self._mega_positions_ok(cache, T, positions):
-            return False
-        if self.compute_dtype is not None and self.compute_dtype != torch.bfloat16:
             return False
         layers = getattr(cache, "layers", None)
         if not layers or any(not isinstance(cl, GrowLayer) or cl.arena is None for cl in layers):
@@ -1346,6 +1322,13 @@ class _MlxMixin(_State):
         from ..mlx.attn import ATTN_BLOCK
 
         return past + T <= cap and past + T <= mg.SPL * ATTN_BLOCK
+
+    def _mega_serves(self) -> bool:
+        """whether the megakernel takes this engine's passes, the engine's half of `_mega_ok`: built, every layer
+        resident, the family's block, its weights in slot buffers, a bf16 state"""
+        if getattr(self, "_mega", None) is None or self.cold or not self.fam.mega or self.mlx_state.affine:
+            return False
+        return self.compute_dtype is None or self.compute_dtype == torch.bfloat16
 
     def _mega_positions_ok(self, cache: Any, T: int, positions: Any) -> bool:
         """the tree's natural positions (past + a node's depth), the only ones the kernel computes"""
@@ -1369,7 +1352,7 @@ class _MlxMixin(_State):
         it leaves in its scratch); the cache's rows appended in the kernel."""
         self._tag(PassTag.MLX_MEGA)
         self._tag_tiers(self.L)
-        self._tag_quant()
+        self._tag_quant(self.L)
         m = mlxdev.mx()
         mg = self._mega
         assert mg is not None  # _forward_mega runs only when the megakernel is built
@@ -1433,17 +1416,17 @@ class _MlxMixin(_State):
         return w
 
     def _mlx_embed_rows(self, tok: Any) -> mx_.array:
-        """the embedding rows for token ids `tok` (an MLX int array): gathered straight from the packed bytes when
-        the tied head is Q6_K (no bf16 copy of the whole table), else a take on the resident table; scaled as
+        """the embedding rows for token ids `tok` (an MLX int array): decoded from the tied head's own blocks where
+        it is stored as a GGUF type (no bf16 copy of the whole table), else a take on the resident table; scaled as
         `embed` scales them (Gemma's sqrt(hidden)), so every graph entry embeds alike"""
         hh = self.head_host
         if (
             hh is not None
-            and getattr(hh.mx, "q6k", None) is not None
+            and getattr(hh.mx, "q", None) is not None
             and self.head_key == self.prefix + "embed_tokens.weight"
         ):
-            raw, _rows, cols = hh.mx.q6k
-            rows = gather_q6k(raw, tok, cols)
+            assert self.mlx is not None  # a head bound to MLX means the backend is up
+            rows = self.mlx.gather_rows(hh.mx, tok)
         else:
             rows = mlxdev.mx().take(self._mlx_embed(), tok, axis=0)
         return rows if self.embed_scale is None else rows * self.embed_scale
@@ -1631,9 +1614,10 @@ class _MlxMixin(_State):
         m = mlxdev.mx()
         smp = sampling or GREEDY
         prompt = ids[0].tolist()
-        cache, reuse, _anchored = session._begin_decode(self, prompt) if session is not None else (None, 0, None)
+        # no drafting head nor taps re-run the last token: a fed session goes on from the logits it holds
+        cache, reuse, _anchored = session._begin_decode(self, prompt, True) if session is not None else (None, 0, None)
         if cache is None:
-            cache = self.new_cache()
+            cache = self._decode_cache()
         logits, anchors = self._session_prefill(ids, cache, reuse, session)
         self.vram_trim("prefill")
         first = int(smp.pick_torch(logits[0, -1:], [smp.key_for(len(prompt) - 1)])[0])
@@ -1691,6 +1675,8 @@ class _MlxMixin(_State):
                 if nxt is not None:
                     # the lookahead step is undone: its cache rows and its DeltaNet states
                     m.eval(nxt)
+                    if isinstance(cache, PagedCache):
+                        cache.crop_to(len(cache.table) - 1)
                     for cl in cache.layers:
                         if isinstance(cl, GrowLayer) and cl.shared and cl._mx is not None:
                             cl._n -= 1
@@ -1777,6 +1763,7 @@ class _MlxMixin(_State):
         fresh: list[Any] = []
         ckpts: list[Any] = []
         taps = []
+        writes: list[mx_.array] = []
 
         def write_back() -> None:
             for cl_, cn, rn in pending:
@@ -1822,7 +1809,7 @@ class _MlxMixin(_State):
                     qh = be.rope_fast(q.transpose(1, 0, 2), rd, freqs, rscale, past)[None]
                     kh = be.rope_fast(k.transpose(1, 0, 2), rd, freqs, rscale, past)[None]
                 vh = v.transpose(1, 0, 2)[None]
-                cl, K, V = self._mlx_cache(cache, i, kh, vh)
+                cl, K, V = self._mlx_cache(cache, i, kh, vh, writes)
                 a, attn_pa = self._mlx_attend(
                     qh,
                     K,
@@ -1978,6 +1965,9 @@ class _MlxMixin(_State):
             if on_layer is not None:
                 # handed over after the one eval at the end: an eval here would sync the GPU every layer
                 taps.append((i, hm))
+        if writes:
+            # a paged cache's rows into its pages with the pass, whatever evaluates it (a pipelined step its pick)
+            hm = m.depends(hm, writes)
         if lazy and not fresh:
             for cl_, cn, rn in pending:
                 # kept with the batch axis, the shape the cache's tensors and `_mlx_lin_adopt` use

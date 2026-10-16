@@ -7,20 +7,40 @@ import heapq
 import math
 import time
 import weakref
-from collections.abc import Sequence
-from typing import Any
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 import torch
 
 from .. import mlx as mlxdev
+from ..gguf import QuantWeight
 from ..kinds import Tokens
 from .cache import GrowLayer, indexer_keys, set_rows
 from .fixed_rows import RowLinear
 from .host import _HostLinear
 from .native import Native
+from .stored import CardStored
+
+if TYPE_CHECKING:
+    import mlx.core as mx_
+
+    from ..sampling import Sampling
+
+    # the drafting layer's K/V written to its cache on MLX (a layer's `mx_update`): the step's rows in, the layer's
+    # whole K and V out
+    MxAppend: TypeAlias = Callable[[mx_.array, mx_.array], tuple[mx_.array, mx_.array]]
+    # the attention the caller computes over the shared cache (the tree's node kernel): q, k, v in, [B, Hq, T, D] out
+    MxAttend: TypeAlias = Callable[[mx_.array, mx_.array, mx_.array], mx_.array]
 
 
-def mlx_topk_ids(logits: Any, k: int) -> Any:
+def mx_rows(a: mx_.array) -> list[list[float]]:
+    """a 2-D MLX array's rows as `tolist` reads them: Python numbers, an id array's ints"""
+    if a.ndim != 2:
+        raise ValueError(f"[mtp] rows of a 2-D array, not a {a.ndim}-D one")
+    return cast("list[list[float]]", a.tolist())
+
+
+def mlx_topk_ids(logits: mx_.array, k: int) -> mx_.array:
     """the top-k ids [T, k] a row of an MLX logits array, sorted by value descending, the reduction (argpartition
     then sort) on the graph so a caller reads k ids a row instead of the whole vocab; lazy."""
     m = mlxdev.mx()
@@ -29,6 +49,13 @@ def mlx_topk_ids(logits: Any, k: int) -> Any:
     vals = m.take_along_axis(logits, part, axis=-1)
     order = m.argsort(-vals, axis=-1)
     return m.take_along_axis(part, order, axis=-1)
+
+
+def _dense_head(sm: Any) -> torch.Tensor:
+    """the output head as one matrix: the module's weight, else the file's (a head on the card as a GGUF type's
+    blocks, `CardStored`, holds none)"""
+    head = sm.head
+    return (head.weight if head is not None and not isinstance(head, CardStored) else sm._get(sm.head_key)).detach()
 
 
 class _Int8Linear(torch.nn.Module):
@@ -117,28 +144,46 @@ class MTPDrafter:
         """whether the MLX tree steps its nodes through the node kernel over the shared cache"""
         return False
 
-    def _mx_dtype(self) -> Any:
+    def _mx_dtype(self) -> mx_.Dtype:
         """the MLX graph's activation dtype"""
         raise NotImplementedError
 
-    def _mlx_body(self, em: Any, hm: Any, pos0: int, append: Any, attn: Any = None, layer: Any = None) -> Any:
+    def _mlx_body(
+        self,
+        em: mx_.array,
+        hm: mx_.array,
+        pos0: int,
+        append: MxAppend | None,
+        attn: MxAttend | None = None,
+        layer: GrowLayer | None = None,
+    ) -> mx_.array:
         """the drafting layer over MLX rows `em`/`hm` [B, T, H]: its output [B, T, H], lazily; `append(kh, vh)`
         gives the attention its K/V, or `attn(qh, kh, vh)` computes the attention itself"""
         raise NotImplementedError
 
-    def _mlx_draw(self, out: Any, k: int, sampling: Any, keys: Sequence[int]) -> tuple[Any, Any, Any]:
+    def _mlx_draw(
+        self, out: mx_.array, k: int, sampling: Sampling, keys: Sequence[int]
+    ) -> tuple[mx_.array, mx_.array, mx_.array]:
         """`k` children a row of `out` [B, 1, H] drawn under `sampling`: their log-probabilities, ids and the
         distribution, lazily"""
         raise NotImplementedError
 
-    def _mlx_topk(self, out: Any, k: int) -> tuple[Any, Any]:
+    def _mlx_topk(self, out: mx_.array, k: int) -> tuple[mx_.array, mx_.array]:
         """the top-k log-probabilities and ids [B, k] of `out` [B, 1, H]'s next token, lazily"""
         raise NotImplementedError
 
-    def _step(self, tok_ids: torch.Tensor, h: torch.Tensor, pos0: int, need_logits: bool = True) -> tuple[Any, Any]:
+    def _pass(
+        self, tok_ids: torch.Tensor, h: torch.Tensor, pos0: int, need_logits: bool
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """the drafting head over `tok_ids` [B, T] and the hidden rows `h` under them at `pos0`: (the logits, or None
         without `need_logits`; the hidden rows it leaves, which the next step reads). Each family's own"""
         raise NotImplementedError
+
+    def _step(self, tok_ids: torch.Tensor, h: torch.Tensor, pos0: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """`_pass` with its logits"""
+        logits, out = self._pass(tok_ids, h, pos0, True)
+        assert logits is not None  # asked for
+        return logits, out
 
     def reset(self) -> None:
         from transformers.cache_utils import DynamicCache
@@ -153,8 +198,18 @@ class MTPDrafter:
         head = getattr(self, "_head_t", None)
         if head is None:
             sm = self.sm
-            W = (sm.head.weight if sm.resident_head else sm._get(sm.head_key)).detach()
             n = int(getattr(sm, "draft_vocab", 0) or 0)
+            if isinstance(sm.head, CardStored):
+                if sm.head.raw.device.type != self.dev.type:
+                    return None
+                # a GGUF head kept as its type's blocks on the card: its first n rows' blocks, a view
+                rows, cols = sm.head.shape
+                w = sm.head.stored
+                if 0 < n < rows:
+                    w = QuantWeight(w.raw[: w.raw.numel() // rows * n], w.q, (n, cols), w.grid, w.ksigns)
+                self._head_t = CardStored(w, sm.head_key, scratch=sm.scratch)
+                return self._head_t
+            W = _dense_head(sm)
             whole = not (0 < n < int(W.shape[0]))
             if whole and W.device.type != self.dev.type:
                 return None
@@ -183,8 +238,16 @@ class MTPDrafter:
             n = int(getattr(sm, "draft_vocab", 0) or 0)
             head = False
             if sm.mlx is None and Native.gemv is not None and n > 0:
-                W = sm._get(sm.head_key)
-                if n < int(W.shape[0]):
+                w = sm._head_host().quant if sm._head_stored() is not None else None
+                rows = int(sm._shape(sm.head_key)[0])
+                if n < rows and w is not None:
+                    # the first n rows of a head stored as a GGUF type: its first n rows of blocks, no copy
+                    head = _HostLinear(torch.zeros((), dtype=torch.bfloat16).expand(n, w.shape[1]), key=sm.head_key)
+                    head.quant = QuantWeight.of(w.raw[: w.raw.numel() // rows * n], w.q, n, w.shape[1])
+                    head.scratch = sm.scratch
+                    sm.log(f"[draft] the drafter's head on the host: the first {n} ids ({w.q.value}, as stored)")
+                elif n < rows:
+                    W = sm._get(sm.head_key)
                     head = _HostLinear(W[:n], key=sm.head_key)
                     sm.log(
                         f"[draft] the drafter's head on the host: the first {n} ids "
@@ -203,12 +266,12 @@ class MTPDrafter:
             return (sm._head_host() if head is None else head)(hn.float()).float()
         head = self._torch_head()
         if head is None:
-            W = (sm.head.weight if sm.resident_head else sm._get(sm.head_key)).detach()
+            W = _dense_head(sm)
             step = 32768
             return torch.cat(
                 [hn.to(self.cd) @ W[c : c + step].to(self.dev, self.cd).T for c in range(0, W.shape[0], step)], dim=-1
             ).float()
-        if isinstance(head, _Int8Linear):
+        if isinstance(head, (_Int8Linear, CardStored)):
             return head(hn).float()
         return (hn.to(head.dtype) @ head.T).float()
 
@@ -272,7 +335,7 @@ class MTPDrafter:
         while a < len(toks):
             C = int(self.sm.prefill_chunk or self.sm._auto_chunk(pos0 + a))
             b = min(len(toks), a + C)
-            self._step(torch.tensor([toks[a:b]]), h[:, a:b], pos0 + a, need_logits=False)
+            self._pass(torch.tensor([toks[a:b]]), h[:, a:b], pos0 + a, need_logits=False)
             a = b
 
     def ar(self, toks: Tokens, h: torch.Tensor, pos0: int, k: int) -> Any:
@@ -363,6 +426,7 @@ class MTPDrafter:
         root_pos = pos0 + len(toks) - 1  # the cache row the root's children are proposed at
         layer = self.cache.layers[0]
         mlx_tree = self._mlx_ready() and isinstance(layer, GrowLayer) and layer.shared and not layer.bits
+        root_hin: mx_.array | torch.Tensor  # the root's hidden row, on the tree's side
         if mlx_tree:
             m = mlxdev.mx()
             t0 = time.time()
@@ -382,7 +446,7 @@ class MTPDrafter:
             root_len = self.cache.get_seq_length()
             kernel_tree = self._tree_kernel()
             kv_root: Any = None if kernel_tree else layer.mx_kv(0, root_len)
-            root_vals, root_inds, root_hin = vals0.tolist()[0], ids0.tolist()[0], out[:, -1:]
+            root_vals, root_inds, root_hin = mx_rows(vals0)[0], mx_rows(ids0)[0], out[:, -1:]
             if kernel_tree:
                 # the tree's rows go after the prefix, in stepping order; the prefix is never copied
                 Hk_ = (
@@ -400,10 +464,10 @@ class MTPDrafter:
             # every per-row tensor of the layer (a sparse attention's indexer keys with its K/V) branches with the tree
             kv_root = tuple(t.clone() for t in self.layer_rows(layer))
             if smp is not None:
-                ids0, q0 = smp.draw_torch(logits[0, -1:].float(), [smp.key_for(root_pos, salt=1)], top_k)
-                qrows[-1] = q0[0]
-                root_vals = torch.log(q0[0][ids0[0]]).tolist()
-                root_inds, root_hin = ids0[0].tolist(), hout[:, -1:]
+                ids_t, q_t = smp.draw_torch(logits[0, -1:].float(), [smp.key_for(root_pos, salt=1)], top_k)
+                qrows[-1] = q_t[0]
+                root_vals = torch.log(q_t[0][ids_t[0]]).tolist()
+                root_inds, root_hin = ids_t[0].tolist(), hout[:, -1:]
             else:
                 tb0 = torch.topk(torch.log_softmax(logits[0, -1].float(), dim=-1), min(top_k, logits.shape[-1]))
                 root_vals, root_inds, root_hin = tb0.values.tolist(), tb0.indices.tolist(), hout[:, -1:]
@@ -521,7 +585,7 @@ class MTPDrafter:
                     m.eval(vals, inds)
                     self.step_s += time.time() - t0
                     self.steps += 1
-                    vals_l, inds_l = vals.tolist(), inds.tolist()
+                    vals_l, inds_l = mx_rows(vals), mx_rows(inds)
                     for b, (idx, neg, _parent, _tok, _hin) in enumerate(group):
                         az(idx, neg, depth, vals_l[b], inds_l[b], ho[b : b + 1, -1:], paths[idx])
                     continue
@@ -552,7 +616,7 @@ class MTPDrafter:
                     m.eval(vals, inds)
                     self.step_s += time.time() - t0
                     self.steps += 1
-                    vals_l, inds_l = vals.tolist(), inds.tolist()
+                    vals_l, inds_l = mx_rows(vals), mx_rows(inds)
                     for b, (idx, neg, _parent, _tok, _hin) in enumerate(group):
                         kv_after[idx] = (kn[0][b : b + 1], kn[1][b : b + 1])
                         az(idx, neg, depth, vals_l[b], inds_l[b], ho[b : b + 1, -1:], paths[idx])
@@ -564,8 +628,8 @@ class MTPDrafter:
                         for j in range(len(kv_root))
                     ],
                 )
-                hs = torch.cat([hin for _, _, _, _, hin in group], dim=0)
-                lg, ho = self._step(ts, hs, root_len + depth - 1)
+                hs_t = torch.cat([hin for _, _, _, _, hin in group], dim=0)
+                lg, ho_t = self._step(ts, hs_t, root_len + depth - 1)
                 if smp is not None:
                     gk = [smp.key_for(root_pos + depth, salt=2 + idx) for idx, _, _, _, _ in group]
                     ids_g, qg = smp.draw_torch(lg[:, -1].float(), gk, top_k)
@@ -578,10 +642,10 @@ class MTPDrafter:
                     vals_l, inds_l = tb.values.tolist(), tb.indices.tolist()
                 for b, (idx, neg, _parent, _tok, _hin) in enumerate(group):
                     kv_after[idx] = tuple(t[b : b + 1].clone() for t in self.layer_rows(layer))
-                    az(idx, neg, depth, vals_l[b], inds_l[b], ho[b : b + 1, -1:], paths[idx])
+                    az(idx, neg, depth, vals_l[b], inds_l[b], ho_t[b : b + 1, -1:], paths[idx])
         if not mlx_tree:
             self.set_layer_rows(layer, kv_root)
-        out = ([n[0] for n in nodes], [n[1] for n in nodes], [n[2] for n in nodes])
+        res = ([n[0] for n in nodes], [n[1] for n in nodes], [n[2] for n in nodes])
         if with_tags and smp is not None:
-            return (*out, [tags[i] for i in range(len(nodes))], qrows, draws)
-        return (*out, [tags[i] for i in range(len(nodes))]) if with_tags else out
+            return (*res, [tags[i] for i in range(len(nodes))], qrows, draws)
+        return (*res, [tags[i] for i in range(len(nodes))]) if with_tags else res

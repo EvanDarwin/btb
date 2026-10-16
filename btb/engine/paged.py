@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from transformers.cache_utils import DynamicCache, DynamicLayer
 
+from .. import mlx as mlxdev
 from ..kinds import LayerKind
 from .arena import KvArena, RowArena
 from .fused import DELTA_BLOCK
@@ -33,6 +34,8 @@ from .kvpool import PAGE, Page, PagePool
 from .scheduler import MemoryGrantError
 
 if TYPE_CHECKING:
+    import mlx.core as mx_
+
     from .prefix import PrefixCache
     from .radix import RadixTree
 
@@ -85,7 +88,8 @@ def _runs(pairs: Iterable[tuple[int, int]]) -> list[tuple[int, int, int]]:
 class HostRegion:
     """the rows of the layers the host runs: K and V [Hk, rows, D] a layer (`hk` heads of `d`) by page id, in the rows'
     own dtype unless one is given, grown by GROW as the ledger grants it - a buffer at a time, as a layer cache grows
-    its own, each let go once its rows are copied over"""
+    its own, each let go once its rows are copied over. `shared` (an MLX engine): each buffer MLX's, the torch region a
+    view of its bytes and `mk`/`mv` MLX's [1, Hk, rows, D], so MLX's kernels write and read the rows the host's do"""
 
     GROW = 1.5
     MIN_PAGES = 16
@@ -97,6 +101,7 @@ class HostRegion:
         d: int,
         grant: Callable[..., None] | None = None,
         dtype: torch.dtype | None = None,
+        shared: bool = False,
     ) -> None:
         self.layers = [int(i) for i in layers]
         self.hk, self.d = int(hk), int(d)
@@ -106,6 +111,9 @@ class HostRegion:
         self.dtype: torch.dtype | None = None  # the regions' dtype, from the first rows written
         self.k: dict[int, torch.Tensor] = {}
         self.v: dict[int, torch.Tensor] = {}
+        self.shared = shared
+        self.mk: dict[int, mx_.array] = {}
+        self.mv: dict[int, mx_.array] = {}
         # a layer's regions short of `cap` pages: a fill the ledger refused part way (`_fill`), finished at the next
         # ask - a write's `shape`, a growth - before any row lands in them
         self._short = False
@@ -168,10 +176,27 @@ class HostRegion:
             self._regrow(i, pages)
         self._short = False
 
+    def _settle(self) -> None:
+        """MLX's writes in flight landed (a pipelined step's rows) before the host touches a shared region"""
+        if self.shared:
+            mlxdev.mx().synchronize()
+
+    def _new(self, i: int, views: dict[int, mx_.array], rows: int) -> torch.Tensor:
+        """a fresh K or V region of layer i, `rows` rows: MLX's buffer under `shared`, its view kept in `views`
+        (`mk` or `mv`)"""
+        assert self.dtype is not None
+        if not self.shared:
+            return torch.empty(self.hk, rows, self.d, dtype=self.dtype)
+        sh = mlxdev.Shared(self.hk * rows * self.d * self._el())
+        a = sh.mx.view(mlxdev._dtypes()[self.dtype]).reshape(1, self.hk, rows, self.d)
+        mlxdev.mx().eval(a)
+        views[i] = a
+        return sh.torch.view(self.dtype).view(self.hk, rows, self.d)
+
     @_kept
     def _regrow(self, i: int, new: int) -> None:
         rows, el = new * PAGE, self._el()
-        for store in (self.k, self.v):
+        for store, views in ((self.k, self.mk), (self.v, self.mv)):
             old = store.get(i)
             if old is not None and old.shape[1] >= rows:
                 continue  # grown by an attempt the ledger refused part way
@@ -185,9 +210,9 @@ class HostRegion:
                     device="cpu",
                     held=old.numel() * el if old is not None else 0,
                 )
-            assert self.dtype is not None
-            buf = torch.empty(self.hk, rows, self.d, dtype=self.dtype)
+            buf = self._new(i, views, rows)
             if old is not None:
+                self._settle()
                 buf[:, : old.shape[1]] = old
             store[i] = buf
 
@@ -206,8 +231,8 @@ class HostRegion:
         """layer i's rows held elsewhere from now on (it came onto the card): its regions let go"""
         if i in self.layers:
             self.layers.remove(i)
-        self.k.pop(i, None)
-        self.v.pop(i, None)
+        for store in (self.k, self.v, self.mk, self.mv):
+            store.pop(i, None)
 
     @_kept
     def shrink(self, pages: int) -> int:
@@ -220,8 +245,9 @@ class HostRegion:
         pages = max(0, int(pages))
         before = self.nbytes()
         rows, el = pages * PAGE, self._el()
+        self._settle()
         try:
-            for store in (self.k, self.v):
+            for store, views in ((self.k, self.mk), (self.v, self.mv)):
                 for i in list(store):
                     old = store[i]
                     if old.shape[1] <= rows:
@@ -236,9 +262,12 @@ class HostRegion:
                                 device="cpu",
                                 draws="",
                             )
-                        store[i] = old[:, :rows].clone()
+                        buf = self._new(i, views, rows)
+                        buf.copy_(old[:, :rows])
+                        store[i] = buf
                     else:
                         del store[i]
+                        views.pop(i, None)
                     del old
         except MemoryGrantError:
             pass
@@ -247,27 +276,36 @@ class HostRegion:
 
     def write(self, i: int, rows: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
         """layer i's `k`, `v` [Hk, T, D] at `rows` (T of them, int64 on the host)"""
+        self._settle()
         self.k[i].index_copy_(1, rows, k.to("cpu", self.dtype))
         self.v[i].index_copy_(1, rows, v.to("cpu", self.dtype))
 
     def view(self, i: int) -> tuple[torch.Tensor, torch.Tensor]:
         """layer i's K and V regions [1, Hk, rows, D], read through a table's rows"""
+        self._settle()
         return self.k[i][None], self.v[i][None]
+
+    def mx_view(self, i: int) -> tuple[mx_.array, mx_.array]:
+        """a shared region's MLX arrays [1, Hk, rows, D] of layer i, which `mlx.kv_scatter` writes in place"""
+        return self.mk[i], self.mv[i]
 
     def gather(self, i: int, rows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """layer i's `rows` in order as [1, Hk, n, D] tensors of their own: a copy"""
+        self._settle()
         return self.k[i][:, rows][None], self.v[i][:, rows][None]
 
     def move(self, src: torch.Tensor, dst: torch.Tensor) -> None:
         """every layer's rows at `src` copied to `dst` (the source read whole first, so the two may overlap)"""
+        self._settle()
         for store in (self.k, self.v):
             for buf in store.values():
                 buf[:, dst] = buf[:, src]
 
     def close(self) -> None:
         """the regions let go with the engine: nothing reads them after"""
-        self.k.clear()
-        self.v.clear()
+        self._settle()
+        for store in (self.k, self.v, self.mk, self.mv):
+            store.clear()
         self.cap = 0
 
 
@@ -927,11 +965,12 @@ class KvPool:
         card_layers: Sequence[int] = (),
         dev: torch.device | None = None,
         ceiling: int = 1,
+        shared: bool = False,
     ) -> None:
         self.hk, self.d = int(hk), int(d)
         self.grant = grant  # the scheduler's, which a fork of a paged layer asks as its own rows grow
         self.pages = PagePool(grow=self._grow, freed=self._freed)
-        self.host = HostRegion(host_layers, hk, d, grant, dtype)
+        self.host = HostRegion(host_layers, hk, d, grant, dtype, shared)
         # a card's region whether or not it runs a layer now: the layers coming onto it later find their pages placed
         self.card: CardRegion | None = None
         if dev is not None and torch.device(dev).type == "cuda":

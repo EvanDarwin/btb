@@ -121,6 +121,7 @@ class GrowLayer(_DynamicLayer):
     _flat: bool
     _flat_len: int
     _rows_total: int
+    _rmap: mx_.array | None
 
     def __init__(
         self,
@@ -163,6 +164,9 @@ class GrowLayer(_DynamicLayer):
         self._mx2 = None
         self._dec_cap = 0
         self._t = 0
+        # a fork's rows over a paged session (`Branches._alias_paged`): `_mx` the pool's regions, the prefix rows
+        # where the session's row map puts them (uint32, row j at region row `_rmap[j]`), the steps in `_mx2`
+        self._rmap = None
         self._buf = None
         self._keys_t = None
         self._values_t = None
@@ -285,7 +289,11 @@ class GrowLayer(_DynamicLayer):
 
     def mx_kv(self, start: int, n: int, row: int = 0) -> tuple[mx_.array, mx_.array]:
         """the cache rows [start, n) of every head of batch row `row` as bf16 MLX arrays (K, V): views for a
-        bf16 layer, a dequantized copy for an int8 one"""
+        bf16 layer, a dequantized copy for an int8 one, a gathered copy over a paged session's rows"""
+        if self._rmap is not None:
+            m = mlxdev.mx()
+            idx = self._rmap[int(start) : int(n)]
+            return m.take(self._mx[0], idx, axis=2), m.take(self._mx[1], idx, axis=2)
         if self._flat:
             # the row's rows are a stretch of the one flat buffer
             off = int(self._offs[int(row)])
@@ -331,6 +339,7 @@ class GrowLayer(_DynamicLayer):
         self._row = None
         self._n = 0
         self._seg = None
+        self._rmap = None
         self._mx2 = None
         self._dec_cap = int(dec_cap)
         self._t = 0
@@ -623,6 +632,9 @@ class GrowLayer(_DynamicLayer):
         m = mlxdev.mx()
         mdt = m.int8 if self.bits else mlxdev._dtypes()[dtype]
         old = self._mx
+        if old is not None and self._n and old[0].dtype != mdt:
+            # a new buffer starts empty: rows of another dtype would drop the ones held
+            raise RuntimeError(f"[cache] rows of {mdt} for a layer holding {self._n} rows of {old[0].dtype}")
         same = old is not None and self._shape[1] == Hk and self._shape[-1] == d and old[0].dtype == mdt
         if same and self._shape[0] >= B and self._shape[2] >= need:
             # the buffer holds the largest batch seen; a smaller batch uses its first rows
@@ -913,6 +925,11 @@ class GrowLayer(_DynamicLayer):
         if not self.is_initialized:
             self.lazy_initialization(key_states, value_states)
         if self.shared and key_states.device.type == "cpu":
+            if self._mx is not None and not self.bits and self._n:
+                # the rows stay in the dtype the buffer keeps them in: a host layer's float32 step after an MLX
+                # prefill's bf16 rows is cast to them (`_ensure` would make a new buffer for another dtype)
+                kept = mlxdev.torch_dtype(self._mx[0].dtype)
+                key_states, value_states = key_states.to(kept), value_states.to(kept)
             B, Hk, T, d = key_states.shape
             n = self.get_seq_length()
             self._ensure(B, Hk, n + T, d, key_states.dtype)

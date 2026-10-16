@@ -43,11 +43,9 @@ FIXTURES = spec.FIXTURES
 GGUF_DIR = spec.GGUF_DIR
 
 # the shapes the card's step-graph kernels are written for (btb/engine/cuda.py:295: a lane holds D/32 dims of a
-# head), the megakernel's head multiple (btb/mlx/mega.py:599), and the heads the engine sends to its MLX attention
-# kernels (mlx_forward.ATTN_KERNEL_HEADS). None is reachable from a torch-free module, so test_manifest holds
-# each against the source it is quoted from.
+# head) and the heads the engine sends to its MLX attention kernels (mlx_forward.ATTN_KERNEL_HEADS). Neither is
+# reachable from a torch-free module, so test_manifest holds each against the source it is quoted from.
 CARD_HEAD_DIMS: tuple[int, ...] = (64, 128, 256)
-MEGA_HEAD_MULTIPLE = 64
 MLX_ATTN_HEAD_DIMS: tuple[int, ...] = (128, 256)
 # a family that brings its own layer (Qwen4) verifies a speculative pass exactly through btb's own kernels for the
 # layers that carry state - the host's node steps, the card's DeltaNet node kernel - and the rest row-invariant
@@ -69,8 +67,6 @@ class Missing(StrEnum):
     A new gap kind is one member here and one row in MISSING - the natural-language taxonomy lives in one place."""
 
     GGUF_LOAD = "gguf-load"
-    GPTOSS_GGUF_TWIN = "gptoss-gguf-twin"
-    KIQUANT_FIXTURE = "kiquant-fixture"
     MEGAKERNEL = "megakernel"
     MEGA_STORAGE = "mega-storage"
     MEGA_SHAPE = "mega-shape"
@@ -101,17 +97,6 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "hf.ARCH_MODEL_TYPES, so no GGUF path exists for it",
         "add the family's architecture to hf.ARCH_MODEL_TYPES with its GGUF tensor-name mapping, then commit a "
         "tiny GGUF fixture (tests/make_fixtures.py) so the storage cells can bind",
-    ),
-    Missing.GPTOSS_GGUF_TWIN: (
-        "gpt-oss ships only an mxfp4 GGUF; no GGUF twin of it in any other stored type is produced",
-        "produce a bf16/affine GGUF of gpt-oss and add the fixture, or record it as a DNR with the reason it "
-        "cannot exist",
-    ),
-    Missing.KIQUANT_FIXTURE: (
-        "no committed k-quant/i-quant tiny fixture exists (gguf-py cannot write these block types), so the "
-        "as-stored k/i-quant kernels are exercised by nothing in CI",
-        "cache the real Qwen3-0.6B GGUFs the manifest lists (--strict tracks them) so test_gguf runs the k/i-quant "
-        "kernels, or add a fixture-generation path that can emit these block types",
     ),
     Missing.MEGAKERNEL: (
         "the fused MLX megakernel is not written for this family: it takes the dense kernel layout alone "
@@ -166,11 +151,12 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "spec.has_mtp_head reads the fixture, so the cells follow with no list to edit",
     ),
     Missing.GGUF_MTP_HEAD: (
-        "the GGUF reader maps no MTP drafting head: llama.cpp keeps a checkpoint's head as NextN layers "
-        "(blk.N.nextn.*, counted into block_count), which btb/gguf.py does not map to the engine's `mtp.*`, and "
-        "the tiny twins are written without them (write_gguf drops mtp.*, as the converter's --no-mtp does)",
-        "map the NextN layers to `mtp.*` in GGUFModel.weight_map (inverting what the converter wrote), keep them "
-        "in the twins write_gguf writes, and the MTP cells run on the GGUF storages",
+        "the family's GGUF twins keep no MTP drafting head: llama.cpp's converter keeps a checkpoint's head as "
+        "NextN layers (blk.N.nextn.*, counted into block_count), which btb/gguf.py maps to the engine's `mtp.*`, "
+        "but it exports none for this architecture (qwen4exp's `supports_mtp_export = False`), so the twins are "
+        "converted without it",
+        "once llama.cpp's converter exports the family's head, convert its twins with it (tests/make_fixtures.py) "
+        "and map any NextN tensor of its own; spec.gguf_has_mtp_head reads the files, so the cells follow",
     ),
     Missing.SPEC_OWN_LAYER: (
         "a family that brings its own layer (Qwen4) verifies a speculative pass only through btb's own node steps "
@@ -206,20 +192,22 @@ MISSING: dict[Missing, tuple[str, str]] = {
     Missing.QUANT_FIXTURE: (
         "this storage stands for several stored types (one kernel each) and only some have a tiny GGUF twin, so "
         "certifying the cell off the ones that exist would claim kernels nothing reads",
-        "write the missing twins in tests/make_fixtures.py - the cell binds one file per kinds.Quant member of "
-        "its class, so the report names exactly which are absent",
+        "write the derived twins (`python tests/make_fixtures.py gguf_twins`, which a test run does itself); a type "
+        "no matrix of the family fits stops that writer, and the fixture is widened to a multiple of 256 - the cell "
+        "binds one file per kinds.Quant member of its class, so the report names exactly which are absent",
     ),
     Missing.NO_FIXTURE: (
         "this family is served but has no tiny fixture for this storage at all",
         "add the family's fixture stem to spec.FIXTURE_STEM and generate the twin in tests/make_fixtures.py",
     ),
     Missing.PREFIX_CACHE: (
-        "this tier's attention reads no pages yet (btb/engine/prefix.py `why_not`): its sessions keep one "
+        "MLX's megakernel reads each conversation's own arena, not the pool's pages, so where it serves an engine's "
+        "passes the prefix cache stands aside for it (btb/engine/prefix.py `why_not`): its sessions keep one "
         "conversation's cache each and drop it whole for a prompt that shares nothing with it, so a conversation's "
         "next turn after another request is prefilled again from its first token, and a prefix two conversations "
         "share is computed and held once each",
-        "land the paged prefix cache on this tier - MLX's per-op kernels and megakernel over one pool buffer (plan "
-        "phase P8) - then take the tier out of `why_not` and spec.paged; the runner's prefix cells run there",
+        "have the megakernel read the pool's regions through the conversation's row map, as the per-token graph's "
+        "kernels do (mlx_forward.py `_mlx_attend_paged`), then take its refusal out of `why_not` and spec.paged",
     ),
     Missing.PREFIX_WIDE: (
         "the card's paged attention kernels read bf16 rows with heads of 64, 128 or 256 dims, and this sub-path's "
@@ -257,14 +245,6 @@ TITLE: dict[Missing, tuple[str, str]] = {
         "Family can't load from GGUF",
         "Map its architecture in hf.ARCH_MODEL_TYPES, add a GGUF fixture",
     ),
-    Missing.GPTOSS_GGUF_TWIN: (
-        "No gpt-oss GGUF besides MXFP4",
-        "Add a bf16 or affine GGUF fixture, or mark it did-not-run",
-    ),
-    Missing.KIQUANT_FIXTURE: (
-        "No k-quant or i-quant fixture",
-        "Cache the real Qwen3-0.6B GGUFs, or generate these types",
-    ),
     Missing.MEGAKERNEL: ("MLX megakernel not written for this family", "Write it, or mark it did-not-run"),
     Missing.MEGA_STORAGE: ("MLX megakernel refuses this storage", "Teach it packed weights, or mark it did-not-run"),
     Missing.MEGA_SHAPE: (
@@ -282,7 +262,10 @@ TITLE: dict[Missing, tuple[str, str]] = {
     ),
     Missing.MLX_ATTN_SHAPE: ("Fixture's head width doesn't fit MLX attention", "Widen the fixture's head"),
     Missing.SPEC_MTP_HEAD: ("Fixture has no MTP head", "Add one in tests/make_fixtures.py"),
-    Missing.GGUF_MTP_HEAD: ("GGUF reader maps no MTP head", "Map the NextN layers to mtp.* in GGUFModel.weight_map"),
+    Missing.GGUF_MTP_HEAD: (
+        "GGUF twins keep no MTP head: the converter exports none",
+        "Convert the twins with the head once llama.cpp exports it",
+    ),
     Missing.SPEC_OWN_LAYER: ("Qwen4 can't speculate on MLX", "Give its MLX layers node steps"),
     Missing.FP16_FIXTURE: ("No fp16 fixture", "Run python tests/make_fixtures.py twins"),
     Missing.FP32_FIXTURE: ("No fp32 fixture", "Run python tests/make_fixtures.py twins"),
@@ -293,7 +276,10 @@ TITLE: dict[Missing, tuple[str, str]] = {
         "Write the missing fixtures in tests/make_fixtures.py",
     ),
     Missing.NO_FIXTURE: ("No fixture for this storage", "Add the fixture to spec.FIXTURE_STEM and generate it"),
-    Missing.PREFIX_CACHE: ("No prefix cache on this tier yet", "Land the paged prefix cache here (plan P8)"),
+    Missing.PREFIX_CACHE: (
+        "MLX megakernel reads its own arena, not the pages",
+        "Have the megakernel read the pages through the row map",
+    ),
     Missing.PREFIX_WIDE: ("Prefix cache doesn't serve fp32 card layers", "Give the paged attention a float32 form"),
     Missing.PREFIX_INVARIANCE: (
         "Prompt rows differ from decode rows here",
@@ -381,7 +367,8 @@ def expected_tags() -> frozenset[PassTag]:
     for dev in spec.DEVICE_SUBPATHS:
         for kind in core.served_kinds():
             for st in spec.Storage:
-                out |= dev.expects(kind, st)
+                for q in spec.STORAGE[st].quants or (None,):
+                    out |= dev.expects(kind, st, q)
     for surface, tags in spec.SURFACE_TAGS.items():
         for key in spec.SURFACE_SUBPATHS[surface]:
             for kind in core.served_kinds():
@@ -552,22 +539,25 @@ def dnr(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath, decode
             "not a distinct cell: llama.cpp's MXFP4_MOE stores only 3-D expert tensors as MXFP4 and every other "
             "as Q8_0 (src/llama-quant.cpp), so a dense family's MXFP4 file is its Q8_0 file (the gguf-affine run)"
         )
+    if storage is spec.Storage.GGUF_BF16 and Cap.MXFP4 in core.flags(kind):
+        return (
+            "not a distinct cell: gpt-oss ships its experts as MXFP4 alone, so every GGUF of it holds them so and its "
+            "BF16 file - the trunk as the checkpoint stores it - is its MXFP4 file (the gguf-mxfp4 run)"
+        )
     return None
+
+
+MEGA_GAP: dict[spec.MegaRefusal, Missing] = {
+    spec.MegaRefusal.LAYOUT: Missing.MEGAKERNEL,
+    spec.MegaRefusal.STORAGE: Missing.MEGA_STORAGE,
+    spec.MegaRefusal.SHAPE: Missing.MEGA_SHAPE,
+}
 
 
 def _mega_gap(kind: FamilyKind, storage: spec.Storage) -> Missing | None:
-    """why the megakernel cannot engage, by the engine's own gates: the family's layout (mlx_forward.py:1320
-    takes kernel_layout and refuses a sandwich), the weight binding it reads through, then the head width."""
-    fl = core.flags(kind)
-    if Cap.KERNEL_LAYOUT not in fl or Cap.SANDWICH in fl:
-        return Missing.MEGAKERNEL
-    qc = spec.quant_class(storage)
-    if spec.STORAGE[storage].container is spec.Container.PACK12 or qc not in (None, QuantClass.FLOAT):
-        return Missing.MEGA_STORAGE
-    hd = spec.head_dim(kind)
-    if hd is None or hd % MEGA_HEAD_MULTIPLE:
-        return Missing.MEGA_SHAPE
-    return None
+    """why the megakernel cannot engage, by the engine's own gates (`spec.mega_refusal`)"""
+    why = spec.mega_refusal(kind, storage)
+    return MEGA_GAP[why] if why is not None else None
 
 
 def _card_graph_gap(kind: FamilyKind) -> Missing | None:
@@ -603,7 +593,7 @@ def subpath_gap(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath
 def prefix_gap(kind: FamilyKind, dev: spec.DeviceSubpath) -> Missing | None:
     """why the prefix axis's conversations cannot hold on this family and sub-path, in the order the engine hits
     it: a sub-path that does not engage at all (its own gap), then the engine's own reasons (`PrefixCache.why_not`,
-    whose rule `spec.paged` is): a tier the prefix cache is not on yet, a family's own attention, then the card's own
+    whose rule `spec.paged` is): a family's own attention, MLX's megakernel where it serves, then the card's own
     conditions (its kernels' widths). Served on the card, a hit equals its cold decode where every layer runs the card
     graph's kernels, whose prefill makes each row as the step does; elsewhere on the card it cannot yet
     (`PREFIX_INVARIANCE`), a hybrid's resumed from the snapshots its prefill kept among them"""
@@ -614,11 +604,10 @@ def prefix_gap(kind: FamilyKind, dev: spec.DeviceSubpath) -> Missing | None:
         if dev.hardware is not spec.Hardware.CUDA or (dev.card_graph and spec.card_rows(kind)):
             return None
         return Missing.PREFIX_INVARIANCE
-    if dev.hardware not in (spec.Hardware.CPU, spec.Hardware.CUDA):
-        return Missing.PREFIX_CACHE
-    if spec.paged(kind, spec.Hardware.CPU):
-        return Missing.PREFIX_WIDE  # served on the host, so the card's own conditions refuse it
-    return Missing.PREFIX_FAMILY
+    if not spec.paged(kind, spec.Hardware.CPU):
+        return Missing.PREFIX_FAMILY
+    # served on the host, so the sub-path's own conditions refuse it: MLX's megakernel, the card's widths
+    return Missing.PREFIX_CACHE if dev.hardware is spec.Hardware.MLX else Missing.PREFIX_WIDE
 
 
 def shape_gap(surface: spec.Surface, kind: FamilyKind, dev: spec.DeviceSubpath) -> Missing | None:
@@ -648,7 +637,6 @@ def gap_reason(
     then a decode path nothing drives. The deepest true reason wins, so a cell that would still not run with every fixture in place says so."""
     fl = core.flags(kind)
     info = spec.STORAGE[storage]
-    qc = spec.quant_class(storage)
     # 0. hardware the engine has no backend for: nothing else about the cell matters
     if dev.hardware in spec.NO_BACKEND:
         return Missing.ROCM_BACKEND
@@ -656,8 +644,6 @@ def gap_reason(
     if info.container is spec.Container.GGUF:
         if kind not in core.gguf_kinds():
             return Missing.GGUF_LOAD
-        if Cap.MXFP4 in fl and qc is not QuantClass.MXFP4:
-            return Missing.GPTOSS_GGUF_TWIN
     if SAFE_PRECISION_GAP.get(storage) in UNIMPLEMENTED:
         return SAFE_PRECISION_GAP[storage]
     # 2. the device sub-path the engine does not engage for this family or this fixture
@@ -668,8 +654,6 @@ def gap_reason(
     paths = spec.fixture_paths(kind, storage)
     if info.container is spec.Container.SAFETENSORS and storage in SAFE_PRECISION_GAP and not paths:
         return SAFE_PRECISION_GAP[storage]
-    if qc in (QuantClass.KQUANT, QuantClass.IQ4, QuantClass.LATTICE):
-        return Missing.KIQUANT_FIXTURE
     absent = [p for p in paths if not os.path.exists(p)]
     if not paths or len(absent) == len(paths):
         return Missing.NO_FIXTURE
@@ -682,7 +666,7 @@ def gap_reason(
     if proposer is not None and proposer.mtp:
         if not spec.has_mtp_head(kind):
             return Missing.SPEC_MTP_HEAD
-        if info.container is spec.Container.GGUF:
+        if info.container is spec.Container.GGUF and not spec.gguf_has_mtp_head(kind, storage):
             return Missing.GGUF_MTP_HEAD
     return None
 
@@ -784,8 +768,15 @@ def _grid(cells: list[Cell], col_of: Callable[[Cell], str], cols: list[str], tit
 # by name) - never a hand list. A type exercised by no fixture or cached model is an uncovered quant; a new
 # kernel is a new Quant member, and it appears here on its own.
 SUPPORTED_QUANTS: frozenset[GQ] = frozenset(GQ[q.name] for q in Quant)
-# what the committed tiny GGUF fixtures already exercise (make_fixtures writes only these); always credited
-TINY_FIXTURE_QUANTS: frozenset[GQ] = frozenset({GQ.BF16, GQ.F16, GQ.Q4_0, GQ.Q8_0, GQ.MXFP4})
+
+
+def tiny_fixture_quants() -> frozenset[GQ]:
+    """what the committed tiny GGUF fixtures exercise, read off the twins on disk by the type each one's name
+    declares; always credited"""
+    names = sorted(os.listdir(GGUF_DIR)) if os.path.isdir(GGUF_DIR) else []
+    return frozenset(GQ[q.name] for n in names if n.endswith(".gguf") and (q := spec.quant_of_gguf(n)) is not None)
+
+
 # the Unsloth Qwen3-0.6B GGUF file names -> the GGML type each exercises (the mixes to their dominant block type)
 QWEN3_06B_GGUF: dict[str, GQ] = {
     "BF16": GQ.BF16, "Q8_0": GQ.Q8_0, "Q6_K": GQ.Q6_K, "Q5_K_M": GQ.Q5_K, "Q5_K_S": GQ.Q5_K,
@@ -854,7 +845,7 @@ def target_status() -> list[tuple[Target, bool]]:
 
 def covered_quants() -> set[GQ]:
     """GGML quants exercised here: the committed tiny fixtures (always) plus what cached real targets add."""
-    return set(TINY_FIXTURE_QUANTS) | {t.quant for t, ok in target_status() if ok and t.quant is not None}
+    return set(tiny_fixture_quants()) | {t.quant for t, ok in target_status() if ok and t.quant is not None}
 
 
 # --- the support table: the grid rolled up for users ---------------------------------------------------------

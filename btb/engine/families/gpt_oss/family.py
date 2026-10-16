@@ -50,11 +50,11 @@ class GptOssFamily(Family):
             return True
         return super().dense_key(key)
 
-    def shape_layer(self, sm: _State, layer: Any, i: int) -> Any:
+    def shape_layer(self, sm: _State, layer: Any, i: int, base: str | None = None) -> Any:
         ex = layer.mlp.experts
         layer.mlp.experts = _Experts(
             sm,
-            f"{sm.prefix}layers.{i}.mlp.experts.",
+            (f"{sm.prefix}layers.{i}." if base is None else base) + "mlp.experts.",
             ex.num_experts,
             None,
             layer=i,
@@ -66,15 +66,14 @@ class GptOssFamily(Family):
         )
         return layer
 
-    def finish_host_layer(self, sm: _State, layer: Any, i: int) -> None:
+    def finish_host_layer(self, sm: _State, layer: Any, i: int, base: str | None = None) -> None:
         # the attention finds the engine (its cache, the speculative pass's tree) through the module
         layer.self_attn._sm = sm
         # the router's matvec through the batch-invariant kernels on the bf16 weight (F.linear's sums depend on
         # how many rows travel together)
         r = layer.mlp.router
-        layer.mlp.router = _Router(
-            _HostLinear(r.weight.data, key=f"{sm.prefix}layers.{i}.mlp.router.weight", bias=r.bias.data), int(r.top_k)
-        )
+        key = (f"{sm.prefix}layers.{i}." if base is None else base) + "mlp.router.weight"
+        layer.mlp.router = _Router(_HostLinear(r.weight.data, key=key, bias=r.bias.data), int(r.top_k))
 
     def open_sweep(self, sm: _State, C: int, keys: int, B: int) -> bool:
         # the sink attention's scores - the buffers that grow with every chunk's position - taken once, sized for

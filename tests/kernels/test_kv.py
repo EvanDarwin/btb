@@ -1,8 +1,9 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
-"""The megakernel arena's in-place writes (btb/mlx/kv.py) against a numpy copy of the arena: `kv_store` and
-`kv_gather` put exactly the reference's bf16 bits where the cache and the drafter aim them, through the layer's
-views of the one shared array, and leave every other byte of the arena as it was. Bit-exact: the kernels move
-16-bit rows and do no arithmetic. Skips when MLX is not available."""
+"""The in-place KV writes (btb/mlx/kv.py) against a numpy copy of what they write into: `kv_store` and `kv_gather`
+put exactly the reference's bf16 bits where the cache and the drafter aim them, through the layer's views of the
+megakernel's one shared array, and `kv_scatter` puts a pass's rows where a paged cache's table puts them in the
+prefix cache's MLX-shared regions; each leaves every other byte as it was. Bit-exact: the kernels move rows and do
+no arithmetic. Skips when MLX is not available."""
 
 from __future__ import annotations
 
@@ -166,6 +167,44 @@ def test_gather_moves_the_kept_rows_in_place(Hk: int, d: int) -> None:
             ref[slot, :, base : len(keep)] = before[:, keep[base:]]
             assert np.array_equal(arena, ref), f"slot {slot} gather from {base}: arena differs"
             assert np.array_equal(_view_bits(buf), ref[slot])
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("Hk,d", SHAPES)
+def test_scatter_writes_a_passes_rows_where_the_table_puts_them(Hk: int, d: int, dtype: torch.dtype) -> None:
+    """kv_scatter into an MLX-shared HostRegion (the prefix cache's on MLX, in the rows' dtype): a prompt's rows over
+    pages taken out of order, a step's row, a verify pass's rows written over the same rows again, float32 rows cast
+    to a bf16 region, a pass's K as it comes out of the step (strided); after each the region's K and V, read through
+    their torch views, equal the reference and nothing else moved"""
+    from btb import mlx as mlxdev
+    from btb.engine.kvpool import PAGE
+    from btb.engine.paged import HostRegion
+
+    m = mlxdev.mx()
+    pages = 6
+    region = HostRegion([0], Hk, d, shared=True)
+    region.shape(torch.empty(1, Hk, 0, d, dtype=dtype))
+    region.grow(pages)
+    kb, vb = region.mx_view(0)
+    ref = [torch.zeros(Hk, region.cap * PAGE, d, dtype=dtype) for _ in range(2)]
+    rng = random.Random(Hk * 13 + d)
+    order = rng.sample(range(region.cap), region.cap)
+    rows = [p * PAGE + r for p in order for r in range(PAGE)]
+    g = torch.Generator().manual_seed(Hk + d)
+    # (the sequence's first position, rows, their dtype): the last pass's rows written again from float32, then
+    # rows as [T, Hk, D] transposed to [1, Hk, T, D], as the step hands them
+    for at, T, src in ((0, 150, dtype), (150, 1, dtype), (151, 7, dtype), (151, 7, torch.float32), (158, 5, dtype)):
+        k, v = ((torch.randn(T, Hk, d, generator=g) * 4).to(src) for _ in range(2))
+        idx = rows[at : at + T]
+        mk, mv = (mlxdev.to_mx(x).transpose(1, 0, 2)[None] for x in (k, v))
+        flag = mlxdev.kv_scatter(kb, vb, mk, mv, m.array(np.asarray(idx, dtype=np.uint32)))
+        m.eval(flag)
+        assert flag.tolist() == [1]
+        for r, x in zip(ref, (k, v), strict=True):
+            r[:, idx] = x.transpose(0, 1).to(dtype)
+        got = region.view(0)
+        for which, r in enumerate(ref):
+            assert torch.equal(got[which][0], r), f"{T} rows at {at}: the region's {'KV'[which]} differs"
 
 
 @pytest.mark.parametrize("Hk,d", SHAPES)

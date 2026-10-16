@@ -138,7 +138,20 @@ def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> 
 
 def pytest_configure(config: Config) -> None:
     _require_native()
+    _derived_fixtures()
     _warn_missing_prereqs(config)
+
+
+def _derived_fixtures() -> None:
+    """the GGUF twins derived from the committed fixtures, written before collection (the cert runner's cells are the
+    files on disk); the generator, and torch, imported only when one is missing"""
+    from tests.cert import spec
+
+    missing = [t for t in spec.derived_gguf() if not os.path.isfile(os.path.join(spec.GGUF_DIR, spec.gguf_name(*t)))]
+    if missing:
+        from tests.make_fixtures import ensure_gguf
+
+        ensure_gguf(missing)
 
 
 def _require_native() -> None:

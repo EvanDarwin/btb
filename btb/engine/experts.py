@@ -23,17 +23,20 @@ import torch
 from .. import mlx as mlxdev
 from .. import trace
 from ..fp8 import F8Weight
-from ..kinds import PassTag
-from ..mxfp4 import BLOCK, MxGateUp, MxWeight, stored_mxfp4
+from ..gguf import QuantWeight
+from ..kinds import QUANT_KIND, PassTag, Quant, QuantClass
+from ..mxfp4 import BLOCK, GateUp, MxWeight, stored_mxfp4
 from ..options import Device
 from .device import where
-from .host import bf16_in_place, stored_parts
+from .host import PIECES, bf16_in_place, stored_parts
 from .native import Native
 from .scheduler import MemoryGrantError, _size
 
 if TYPE_CHECKING:
     from concurrent.futures import ThreadPoolExecutor
     from types import ModuleType
+
+    from .scheduler import Route
 
 
 class ExpertProfile:
@@ -199,6 +202,28 @@ class ExpertProfile:
             f"{int((k == cls.RELEASE).sum())} releases; waited {wait:.1f} s; a part read "
             f"{rd.mean():.1f} ms mean, {np.percentile(rd, 99):.1f} p99, {rd.max():.1f} max"
         )
+
+
+@dataclass(frozen=True)
+class Pieces:
+    """a recipe's part read from per-expert tensors (`PIECES`): `at[e]` the (file, offset) of each of expert e's
+    pieces, `nbytes` a piece's bytes, landing back to back in the part"""
+
+    at: tuple[tuple[tuple[str, int], ...], ...]
+    nbytes: int
+
+
+# a recipe's part: the file its experts sit in back to back (or their `Pieces`), the first expert's offset, an
+# expert's bytes, and an expert's shape
+RecipePart = tuple[str | Pieces, int, int, tuple[int, ...]]
+
+
+def part_reads(part: RecipePart, e: int) -> list[tuple[str, int, int, int]]:
+    """expert `e`'s reads of recipe part `part`: (file, offset, bytes, offset in the part)"""
+    path, off, n_e, _shape = part
+    if isinstance(path, Pieces):
+        return [(p, o, path.nbytes, k * path.nbytes) for k, (p, o) in enumerate(path.at[e])]
+    return [(path, off + e * n_e, n_e, 0)]
 
 
 class Parts:
@@ -883,7 +908,7 @@ class _ExpertStore:
     parked: list[int]
     per: int | None
     pool: ThreadPoolExecutor
-    recipes: dict[int, Any]
+    recipes: dict[int, list[RecipePart]]
     reserve: int
     scratch_n: int
     shapes: Any
@@ -906,11 +931,18 @@ class _ExpertStore:
         # an FP8 checkpoint's experts: each projection's e4m3 bytes and its scale grid, multiplied as stored
         self.f8 = bool(getattr(sm, "fp8_experts", False))
         self.f8_sdt = torch.float32  # the scale grids' stored dtype, from the first recipe
-        # a GGUF's experts: gate, up and down in ggml's block layout, multiplied as stored (btb/mxfp4.py)
-        self.ggml = self.mx and getattr(sm, "gguf", None) is not None
-        # a GGUF's other experts, which no kernel multiplies as stored: a read dequantizes the expert (its layout
+        # a GGUF's experts read as stored (`sm.stored_experts`): gate, up and down in the file's blocks, MXFP4
+        # (btb/mxfp4.py) or another stored type, each layer's three types in `types`
+        gg = getattr(sm, "gguf", None)
+        self.ggml = gg is not None and (self.mx or bool(getattr(sm, "stored_experts", False)))
+        self.types: dict[int, tuple[Quant, ...]] = {}
+        # a GGUF's other experts, which no kernel here multiplies as stored: a read dequantizes the expert (its layout
         # inverted, `GGUFModel.get`) into the slot as the bf16 a checkpoint's read would land there
-        self.dequant = not self.mx and getattr(sm, "gguf", None) is not None
+        self.dequant = gg is not None and not self.ggml
+        # those experts are a quantized type's, not a float file's: widened to bf16 on every read
+        self.widened = (
+            gg is not None and self.dequant and any(QUANT_KIND[q] is not QuantClass.FLOAT for q in gg.expert_quants())
+        )
         self.keys: dict[int, tuple[str, ...]] = {}  # the dequantized experts' tensor names by layer
         self.n_slots = 0
         self.budget = int(budget_bytes)
@@ -1328,7 +1360,7 @@ class _ExpertStore:
             )
         return freed
 
-    def _recipe(self, layer: int, base: str) -> Any:
+    def _recipe(self, layer: int, base: str) -> list[RecipePart]:
         r = self.recipes.get(layer)
         if r is None:
             # bf16 experts are two tensors per expert, MXFP4 four (blocks then scales), each as the checkpoint has
@@ -1341,39 +1373,48 @@ class _ExpertStore:
                 names = ("gate_up_proj", "gate_up_proj_scale_inv", "down_proj", "down_proj_scale_inv")
             else:
                 names = ("gate_up_proj", "down_proj")
-            parts = []
+            parts: list[RecipePart] = []
             for name in names:
                 key = name if self.ggml else base + name
-                shard = self.sm.weight_map[key]
-                _mm, hdr, hoff = self.sm._shard(shard)
-                info = hdr[key]
-                a, b = info["data_offsets"]
-                shape = tuple(int(x) for x in info["shape"])
-                if (b - a) % shape[0]:
-                    raise RuntimeError(f"[experts] {key}: {b - a} bytes do not divide by {shape[0]} experts")
-                parts.append((self._os.path.join(self.sm.dir, shard), hoff + a, (b - a) // shape[0], shape[1:]))
+                if key in self.sm.weight_map or self.ggml or name not in PIECES:
+                    shard = self.sm.weight_map[key]
+                    _mm, hdr, hoff = self.sm._shard(shard)
+                    info = hdr[key]
+                    a, b = info["data_offsets"]
+                    shape = tuple(int(x) for x in info["shape"])
+                    if (b - a) % shape[0]:
+                        raise RuntimeError(f"[experts] {key}: {b - a} bytes do not divide by {shape[0]} experts")
+                    parts.append((self._os.path.join(self.sm.dir, shard), hoff + a, (b - a) // shape[0], shape[1:]))
+                    dtype = info["dtype"]
+                else:
+                    part, dtype = self._pieces(base, name)
+                    parts.append(part)
                 if self.f8 and name.endswith("_scale_inv"):
-                    self.f8_sdt = self.sm.ST_DTYPES[info["dtype"]]
+                    self.f8_sdt = self.sm.ST_DTYPES[dtype]
                 elif not (self.ggml or self.mx or self.f8):
-                    self.dt = self.sm.ST_DTYPES[info["dtype"]]
+                    self.dt = self.sm.ST_DTYPES[dtype]
             if self.dequant:
                 self.keys[layer] = tuple(base + name for name in names)
+            if self.ggml and not self.mx:
+                self.types[layer] = tuple(Quant(self.sm.gguf.tensors[n].tensor_type.name) for n in names)
             r = self.recipes[layer] = parts
             sched = getattr(self.sm, "scheduler", None)
             if sched is not None and hasattr(sched, "disk"):
                 # the drive under the shard, probed on the first recipe that touches it
                 for p in parts:
-                    d = sched.disk(p[0])
+                    d = sched.disk(part_reads(p, 0)[0][0])
                     if self.drive is None and d.get("measured"):
                         self.drive = d
-            per = sum(p[2] for p in parts)
+            # a stored type's slot parts take the widest layer's expert: a mix such as Q4_K_M widens some layers' down
+            widest = self._widest() if self.types else ()
+            per = sum(widest or (p[2] for p in parts))
             shapes = tuple(p[3] for p in parts)
             if self.shapes is None:
                 self.per = per
                 # bf16: (gate_up bytes, gate_up shape, down shape), what `_views` splits the slot on;
-                # MXFP4: the four tensors' per-expert shapes, and `sizes` their byte counts
-                self.shapes = shapes if self.mx or self.f8 else (parts[0][2], *shapes)
-                self.sizes = tuple(p[2] for p in parts)
+                # MXFP4 and the stored types: the tensors' per-expert shapes, and `sizes` their byte counts
+                self.shapes = shapes if self.mx or self.f8 or widest else (parts[0][2], *shapes)
+                self.sizes = widest or tuple(p[2] for p in parts)
                 # reads straight into the slot (padded regions) unless BTB_STORE_PADDED=0 asks for the bounce
                 self.padded = (
                     self.sm.mlx is None
@@ -1407,9 +1448,45 @@ class _ExpertStore:
                 )
                 if self.drive is not None:
                     self.sm.log(self.drive_report(self.drive, self.n_slots, total, per))
-            elif per != self.per or tuple(p[2] for p in parts) != self.sizes:
+            elif per != self.per or (shapes != self.shapes if widest else tuple(p[2] for p in parts) != self.sizes):
                 raise RuntimeError(f"[experts] layer {layer} expert shape differs from layer 0")
         return r
+
+    def _pieces(self, base: str, name: str) -> tuple[RecipePart, str]:
+        """stacked part `name` of the experts under `base` from the checkpoint's per-expert tensors (`PIECES`): the
+        recipe's part, its per-expert shape the pieces' rows stacked, and the pieces' dtype"""
+        at: list[tuple[tuple[str, int], ...]] = []
+        nbytes, dtype = 0, ""
+        shape: tuple[int, ...] = ()
+        for e in range(int(self.sm.n_experts)):
+            row = []
+            for piece in PIECES[name]:
+                key = f"{base}{e}.{piece}"
+                shard = self.sm.weight_map[key]
+                _mm, hdr, hoff = self.sm._shard(shard)
+                info = hdr[key]
+                a, b = info["data_offsets"]
+                if not nbytes:
+                    nbytes, shape, dtype = b - a, tuple(int(x) for x in info["shape"]), info["dtype"]
+                elif b - a != nbytes or info["dtype"] != dtype:
+                    raise RuntimeError(
+                        f"[experts] {key}: {info['dtype']} x {b - a} bytes, its peers {dtype} x {nbytes}"
+                    )
+                row.append((self._os.path.join(self.sm.dir, shard), hoff + a))
+            at.append(tuple(row))
+        k = len(PIECES[name])
+        return (Pieces(tuple(at), nbytes), 0, k * nbytes, (k * shape[0], *shape[1:])), dtype
+
+    def _widest(self) -> tuple[int, ...]:
+        """each of (gate, up, down)'s most bytes an expert of any layer takes in the file, a drafting head's NextN
+        blocks past the trunk's among them (the drafter reads its experts through the store)"""
+        gg, out = self.sm.gguf, [0, 0, 0]
+        for i in range(int(self.sm.L) + gg.nextn()):
+            for j, k in enumerate(("gate", "up", "down")):
+                t = gg.tensors.get(f"blk.{i}.ffn_{k}_exps.weight")
+                if t is not None:
+                    out[j] = max(out[j], int(t.n_bytes) // int(t.shape[-1]))
+        return tuple(out)
 
     def _open_vram(self) -> None:
         """the card's seats for the bf16 experts, or the MXFP4 ones in the checkpoint's layout as stored, sized by
@@ -1575,13 +1652,13 @@ class _ExpertStore:
             n = self._sizes_of[path] = self._os.path.getsize(path)
         return n
 
-    def _region(self, slot: Any) -> Any:
+    def _region(self, slot: int) -> torch.Tensor:
         assert self.per is not None  # the store is sized before this runs
         sl = self.slots[slot]
         stride = int(self.stride or self.per)
         return self.blocks[sl.block][0][sl.row * stride : (sl.row + 1) * stride]
 
-    def _part(self, slot: Any, region: Any, p: int) -> Any:
+    def _part(self, slot: int | None, region: torch.Tensor, p: int) -> torch.Tensor:
         """part `p` of the expert in `slot`, as the bytes sit in the region"""
         sl = self.slots.get(slot) if slot is not None else None
         at = (self.part_at[p] if self.part_at else sum(self.sizes[:p])) + (
@@ -1622,13 +1699,26 @@ class _ExpertStore:
     def _views(self, slot: Any) -> Any:
         return self._views_in(self._region(slot), slot)
 
+    def _layer_of(self, slot: Any) -> int:
+        """the layer whose expert `slot` holds, the first recipe's for no slot (a layout read off no expert)"""
+        key = self.slots[slot].key if slot is not None else None
+        return key[0] if key is not None else next(iter(self.recipes))
+
     def _views_in(self, region: Any, slot: Any = None) -> Any:
         """an expert's views over `region`, its slot's bytes (`slot` for where a direct read left them)"""
+        if self.types:
+            # a stored type's (gate, up, down), each its layer's own type and bytes from its part's start
+            layer = self._layer_of(slot)
+            ws = [
+                QuantWeight.of(self._part(slot, region, p)[:n_e], q, *(int(s) for s in shape))
+                for p, ((_path, _off, n_e, shape), q) in enumerate(zip(self.recipes[layer], self.types[layer]))
+            ]
+            return GateUp(ws[0], ws[1]), ws[2]
         if self.ggml:
             (rows, k), _, (drows, dk) = self.shapes
             gate = MxWeight.from_ggml(self._part(slot, region, 0), int(rows), int(k))
             up = MxWeight.from_ggml(self._part(slot, region, 1), int(rows), int(k))
-            return MxGateUp(gate, up), MxWeight.from_ggml(self._part(slot, region, 2), int(drows), int(dk))
+            return GateUp(gate, up), MxWeight.from_ggml(self._part(slot, region, 2), int(drows), int(dk))
         if self.mx:
             out = []
             for i in (0, 2):
@@ -1680,6 +1770,17 @@ class _ExpertStore:
         sh = self.shared[sl.block]
         off = sl.row * int(self.stride or self.per)
         be = self.sm.mlx
+        if self.types:
+            # a stored type's (gate, up, down) read by the type's kernel straight from the shared block
+            layer, at = (
+                self._layer_of(slot),
+                [self.part_at[p] if self.part_at else sum(self.sizes[:p]) for p in range(3)],
+            )
+            ws = [
+                be.weight_stored_slot(sh, off + at[p], n_e, q, shape)
+                for p, ((_path, _off, n_e, shape), q) in enumerate(zip(self.recipes[layer], self.types[layer]))
+            ]
+            return (ws[0], ws[1]), ws[2]
         if self.mx:
             # the slot as the GPU's MXFP4 matvec reads it: gate_up's blocks then scales, then down's (a GGUF's:
             # gate, up, down in ggml's blocks), as uint8 views of the shared block (the store's readers write,
@@ -1713,23 +1814,28 @@ class _ExpertStore:
             if dt > st["read_max_s"]:
                 st["read_max_s"] = dt
 
-    def _read(self, parts: Any, e: Any, slot: Any, layer: int = -1) -> None:
+    def _read(self, parts: Sequence[RecipePart], e: int, slot: int, layer: int = -1) -> None:
         """the expert's parts read on this thread (the path without a scheduler's Route)"""
         sl = self.slots[slot]
         sl.bf16, sl.delta = False, (0,) * len(parts)
         region = self._region(slot)
         prof = getattr(self.sm, "expert_profile", None)
-        for j, (path, off, n_e, _) in enumerate(parts):
+        for j, part in enumerate(parts):
             at = self.part_at[j] if self.part_at else sum(self.sizes[:j])
-            tp = time.perf_counter_ns()
             if self.dequant:
+                # a GGUF's part, one stacked tensor of the file: filled through the reader's dequantization
+                ((path, o, n_e, _inner),) = part_reads(part, int(e))
+                tp = time.perf_counter_ns()
                 w = self.sm.gguf.get(self.sm._gguf_names[self.keys[layer][j]], expert=int(e))
                 region[at : at + n_e].view(torch.bfloat16).copy_(w.reshape(-1))
-            else:
-                Native.read_direct(path, off + e * n_e, n_e, region[at : at + n_e], self.sm.cold_chunk)
-            self._note_read(prof, layer, e, j, path, off + e * n_e, n_e, slot, time.perf_counter_ns() - tp)
+                self._note_read(prof, layer, e, j, path, o, n_e, slot, time.perf_counter_ns() - tp)
+                continue
+            for path, o, n, inner in part_reads(part, int(e)):
+                tp = time.perf_counter_ns()
+                Native.read_direct(path, o, n, region[at + inner : at + inner + n], self.sm.cold_chunk)
+                self._note_read(prof, layer, e, j, path, o, n, slot, time.perf_counter_ns() - tp)
 
-    def _submit(self, sched: Any, parts: Any, e: Any, slot: Any, layer: int, priority: int) -> Any:
+    def _submit(self, sched: Route, parts: Sequence[RecipePart], e: int, slot: int, layer: int, priority: int) -> Parts:
         """the expert's parts queued on the Route, one read each, with the profile's row and the counters
         taken as each lands; returns what `wait` and the layer's forward call `.result()` on. In a padded slot
         the read is the sector-aligned span around the part, straight into its region. A dequantized expert is
@@ -1741,36 +1847,38 @@ class _ExpertStore:
         prof = getattr(self.sm, "expert_profile", None)
         futs = []
         deltas = []
-        for j, (path, off, n_e, _) in enumerate(parts):
-            o = off + e * n_e
+        for j, part in enumerate(parts):
             at = self.part_at[j] if self.part_at else sum(self.sizes[:j])
-            if self.padded:
-                delta = o % 4096
-                o0 = o - delta
-                n0 = -(-(delta + n_e) // 4096) * 4096
-                if o0 + n0 > self._size_of(path):
-                    # the file's tail: the span is cut at the end, and the reader bounces this one read
-                    n0 = self._size_of(path) - o0
-            else:
-                delta, o0, n0 = 0, o, n_e
-            deltas.append(delta)
+            # a per-expert part's pieces land back to back at the part's start: each read as it lies
+            pieces = isinstance(part[0], Pieces)
+            for path, o, n_e, inner in part_reads(part, int(e)):
+                if self.padded and not pieces:
+                    delta = o % 4096
+                    o0 = o - delta
+                    n0 = -(-(delta + n_e) // 4096) * 4096
+                    if o0 + n0 > self._size_of(path):
+                        # the file's tail: the span is cut at the end, and the reader bounces this one read
+                        n0 = self._size_of(path) - o0
+                else:
+                    delta, o0, n0 = 0, o, n_e
 
-            def landed(dur_ns: int, j: int = j, path: str = path, o: int = o, n_e: int = n_e) -> None:
-                self._note_read(prof, layer, e, j, path, o, n_e, slot, dur_ns)
+                def landed(dur_ns: int, j: int = j, path: str = path, o: int = o, n_e: int = n_e) -> None:
+                    self._note_read(prof, layer, e, j, path, o, n_e, slot, dur_ns)
 
-            futs.append(
-                sched.disk_read(
-                    path,
-                    o0,
-                    n0,
-                    region[at : at + n0],
-                    priority,
-                    key=(layer, e),
-                    on_done=landed,
-                    chunk=self.sm.cold_chunk,
-                    cached=self.cached_reads,
+                futs.append(
+                    sched.disk_read(
+                        path,
+                        o0,
+                        n0,
+                        region[at + inner : at + inner + n0],
+                        priority,
+                        key=(layer, e),
+                        on_done=landed,
+                        chunk=self.sm.cold_chunk,
+                        cached=self.cached_reads,
+                    )
                 )
-            )
+            deltas.append(delta)
         self.slots[slot].delta = tuple(deltas)
         return Parts(futs)
 

@@ -338,6 +338,44 @@ def test_a_base_curve_that_priced_every_pass_plain_is_measured_again_after_a_run
         assert pc2.plan(1, 5) == (1, False)
 
 
+def test_an_unpriced_budget_lets_the_drafts_swim_before_it_sinks_them() -> None:
+    """a base curve pricing a 2-row pass at 2.2 steps (tiny_q35moe's warm-up on the host): the first SWIM passes that
+    draft take the whole width, then the tokens they returned size the passes - drafts returning 3 a pass keep the
+    width they pay for, drafts returning 1 sink to the step, probed at the whole width every `swim_gap` passes, the
+    gap doubling with each probe that does not pay, to SWIM_FAR, and back to PROBE when one does. A curve whose
+    widths cost their rows leaves no room: no yield could pay for them, so nothing is tried"""
+    curve = {1: 1.0, 2: 2.21, 4: 2.35, 8: 2.6, 9: 2.75}
+
+    def swum(accepted: int) -> SpecCost:
+        pc = SpecCost()
+        pc.price(9, curve, 0.0)
+        for _ in range(SpecCost.SWIM):
+            assert pc.budget(curve, 9) == 9
+            pc.record_pass(9, curve[9], 0.0, 0.01, accepted=("mtp",) * accepted)
+        return pc
+
+    assert swum(2).budget(curve, 9) == 9, "three tokens a pass pay for the whole width's 2.75 steps"
+    pc = swum(0)
+    gaps = []
+    for _ in range(7):
+        plain = 0
+        while (k := pc.budget(curve, 9)) == 1:
+            pc.record_pass(1, curve[1], 0.0, None)
+            plain += 1
+        assert k == 9
+        gaps.append(plain)
+        pc.record_pass(9, curve[9], 0.0, 0.01)  # the probe: no draft accepted
+    assert gaps == [16, 32, 64, 128, 256, 256, 256], gaps
+    while pc.budget(curve, 9) == 1:
+        pc.record_pass(1, curve[1], 0.0, None)
+    pc.record_pass(9, curve[9], 0.0, 0.01, accepted=("mtp",) * 8)
+    assert pc.swim_gap == SpecCost.PROBE, "a probe that paid for its rows: the next after PROBE passes"
+    dense = {1: 1.0, 2: 2.0, 4: 4.0, 8: 8.0}
+    flat = SpecCost()
+    flat.price(8, dense, 0.0)
+    assert flat.budget(dense, 8) == 1 and not flat.swim_probe
+
+
 def test_the_expected_gain_of_a_trees_first_nodes() -> None:
     """before any tree, the prior's PRIOR_Q + PRIOR_Q**2 + ...; after, the decayed gain of the recent trees' first
     j nodes, and past the widest tree drafted what that one gained; nothing for no node. A priced store's widest

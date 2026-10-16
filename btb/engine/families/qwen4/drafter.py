@@ -182,7 +182,9 @@ class Qwen4Drafter(MTPDrafter):
         cos, sin = self.rotary(like, pos)
         return cos.expand(B, -1, -1), sin.expand(B, -1, -1)
 
-    def _step(self, tok_ids: torch.Tensor, h: torch.Tensor, pos0: int, need_logits: bool = True) -> tuple[Any, Any]:
+    def _pass(
+        self, tok_ids: torch.Tensor, h: torch.Tensor, pos0: int, need_logits: bool
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
         from transformers.masking_utils import create_causal_mask
 
         self._pack_torch()

@@ -1,0 +1,8 @@
+{
+ "tokenizer_class": "PreTrainedTokenizerFast",
+ "chat_template": "{% for m in messages %}{{ m['role'] }}: {{ m['content'] }}\n{% endfor %}{% if add_generation_prompt %}assistant:{% endif %}",
+ "eos_token": "ā",
+ "pad_token": "ā",
+ "clean_up_tokenization_spaces": false,
+ "model_max_length": 1048576
+}

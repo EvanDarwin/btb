@@ -51,7 +51,7 @@ from .gemv import (
     read_bps,
     unpack_bf16,
 )
-from .kv import kv_gather, kv_store
+from .kv import kv_gather, kv_scatter, kv_store
 
 __all__ = [
     "ATTN_MAXG",
@@ -91,6 +91,7 @@ __all__ = [
     "kv_dequantize",
     "kv_gather",
     "kv_quantize",
+    "kv_scatter",
     "kv_store",
     "matmul_mxfp4",
     "matmul_mxfp4_pair",

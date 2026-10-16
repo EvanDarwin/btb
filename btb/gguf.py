@@ -9,17 +9,20 @@ the memmapped file by the `gguf` package, which also dequantizes it, and a tenso
 
 from __future__ import annotations
 
+import functools
+import math
 import os
+import warnings
 from collections import Counter
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import torch
 
-from .hf import AFFINE_TYPES, ARCH_MODEL_TYPES, QWEN4EXP, gguf_lib, is_gguf
-from .kinds import Json, ModelType
+from .hf import ARCH_MODEL_TYPES, QWEN4EXP, gguf_lib, is_gguf
+from .kinds import EXPERT_FLOATS, QUANT_KIND, STORED_CLASSES, Json, LayerKind, ModelType, Quant, QuantClass
 from .options import NotAModel, UnsupportedModel
 
 # a checkpoint tensor rebuilt from several of the file's (qwen4exp's split indexer and experts, its n-gram
@@ -28,9 +31,21 @@ Invert = Callable[[list[np.ndarray]], np.ndarray]
 Derived = tuple[tuple[str, ...], Invert]
 NameMap = Callable[[str], str | None]
 
-# the architectures whose converter rewrites the linear attention and the norms (Qwen3_5TextModel.modify_tensors,
-# which qwen4exp's converter runs under its own)
-REWRITTEN = frozenset({"qwen35", QWEN4EXP})
+# the architectures whose converter rewrites tensors: the linear attention and the norms (Qwen3_5TextModel's
+# modify_tensors, which Qwen3.5-MoE's and qwen4exp's converters run under their own), the norms alone (Gemma3Model's,
+# + 1: llama.cpp's RMSNorm scales by the weight, Gemma's by 1 + weight)
+REWRITTEN = frozenset({"qwen35", "qwen35moe", QWEN4EXP, "gemma3"})
+# the architectures whose converter splits the checkpoint's stacked experts' gate_up_proj in two (`_rebuild_experts`)
+SPLIT_EXPERTS = frozenset({"qwen35moe", QWEN4EXP})
+# a drafting head's own tensors (`mtp.<name>`) as llama.cpp's converter renames them onto the first NextN block
+# (`_QwenMtpMixin.filter_tensors`), and the gguf package's member each is stored as; the head's layers are those
+# blocks' ordinary tensors
+NEXTN_HEAD: dict[str, tuple[str, str]] = {
+    "fc": ("eh_proj", "NEXTN_EH_PROJ"),
+    "pre_fc_norm_embedding": ("enorm", "NEXTN_ENORM"),
+    "pre_fc_norm_hidden": ("hnorm", "NEXTN_HNORM"),
+    "norm": ("shared_head.norm", "NEXTN_SHARED_HEAD_NORM"),
+}
 
 # btb's own names for an architecture the installed gguf package does not know yet, modelled on llama.cpp's tree
 # (gguf-py's constants.py and tensor_mapping.py; MIT, Copyright (c) 2023 Georgi Gerganov): the checkpoint name
@@ -141,9 +156,22 @@ def meta_key(arch: str, path: str) -> str:
     return (obj if isinstance(obj, str) else OWN_KEYS[path]).format(arch=arch)
 
 
+def converted(hf: str, n_layers: int) -> str:
+    """checkpoint tensor `hf` as llama.cpp's converter names it before its tensor map (`_QwenMtpMixin`): a drafting
+    head's layer `mtp.layers.i.*` block `n_layers + i`, its own tensors that first block's NextN ones (`NEXTN_HEAD`);
+    any other name as it is"""
+    if not hf.startswith("mtp."):
+        return hf
+    parts = hf.split(".", 3)
+    if len(parts) == 4 and parts[1] == "layers" and parts[2].isdecimal():
+        return f"model.layers.{n_layers + int(parts[2])}.{parts[3]}"
+    name, _, suffix = hf.removeprefix("mtp.").rpartition(".")
+    return f"model.layers.{n_layers}.{NEXTN_HEAD[name][0]}.{suffix}" if name in NEXTN_HEAD else hf
+
+
 def _plus_one(hf: str) -> bool:
-    """the gammas llama.cpp's converter stores +1: Qwen3-Next's norm.weight rule (the gated norm aside) and
-    qwen4exp's PLE norms"""
+    """the gammas llama.cpp's converter stores +1: Qwen3-Next's norm.weight rule (the gated norm aside, which Gemma
+    3 has none of) and qwen4exp's PLE norms"""
     return hf.endswith(("norm.weight", ".ple.norm_key.weight", ".ple.norm_query.weight", ".ple.norm_conv.weight")) and (
         not hf.endswith("linear_attn.norm.weight")
     )
@@ -164,6 +192,82 @@ def _grouped(nk: int, per: int, width: int) -> np.ndarray:
     """the file positions of the checkpoint's value heads (grouped by key head) in the converter's tiled order,
     which `_LinearAttentionVReorderBase._reorder_v_heads` writes for `nk` key heads of `per` value heads each"""
     return np.arange(nk * per * width).reshape(per, nk, width).transpose(1, 0, 2).reshape(-1)
+
+
+def block_of(q: Quant) -> tuple[int, int]:
+    """(weights, bytes) a block of type `q` holds, gguf's own table"""
+    g = gguf_lib()
+    weights, nbytes = g.GGML_QUANT_SIZES[g.GGMLQuantizationType[q.value]]
+    return int(weights), int(nbytes)
+
+
+@functools.cache
+def lattice_tables(q: Quant) -> tuple[torch.Tensor, torch.Tensor]:
+    """a lattice type's codebook (int8, entries x values, flattened) and the 128-entry sign table its kernels
+    index, from the gguf package's own dequantizer; the types that carry explicit signs ignore the table"""
+    from gguf import quants
+
+    cls = getattr(quants, q.value)
+    cls.init_grid()
+    grid = torch.from_numpy(np.ascontiguousarray(cls.grid).reshape(-1).astype(np.int8))
+    return grid, torch.from_numpy(np.frombuffer(quants.IQ2_XXS.ksigns, np.uint8).copy())
+
+
+@dataclass(frozen=True)
+class QuantWeight:
+    """One matrix of a type `kinds.stored_quants()` names, as stored for the type's own gemv: `raw` its blocks row
+    after row (uint8: the file's bytes, or a slot holding them), `q` the type, `shape` (rows, cols); a lattice
+    type's codebook and sign table beside them (`lattice_tables`)."""
+
+    raw: torch.Tensor
+    q: Quant
+    shape: tuple[int, int]
+    grid: torch.Tensor | None = None
+    ksigns: torch.Tensor | None = None
+
+    @classmethod
+    def of(cls, raw: torch.Tensor, q: Quant, rows: int, cols: int) -> QuantWeight:
+        """`raw` as a [rows, cols] matrix of type `q`, its tables attached where the type reads them"""
+        weights, nbytes = block_of(q)
+        if cols % weights or raw.numel() != rows * cols // weights * nbytes:
+            raise ValueError(f"[gguf] {q.value} [{rows}, {cols}] is not {raw.numel()} bytes of whole blocks")
+        grid, ksigns = lattice_tables(q) if QUANT_KIND[q] is QuantClass.LATTICE else (None, None)
+        return cls(raw, q, (int(rows), int(cols)), grid, ksigns)
+
+    def to(self, dev: torch.device | str) -> QuantWeight:
+        """the same blocks and tables on `dev`"""
+        move = lambda t: None if t is None else t.to(dev)
+        return QuantWeight(self.raw.to(dev), self.q, self.shape, move(self.grid), move(self.ksigns))
+
+    def rows(self, ids: torch.Tensor) -> torch.Tensor:
+        """rows `ids` of the matrix as bf16 [len(ids), cols], each decoded from its own blocks by the gguf package -
+        a tied head's table read without a bf16 copy of the vocabulary"""
+        rows, cols = self.shape
+        picked = self.raw.view(rows, -1)[ids.reshape(-1).cpu()].numpy()
+        g = gguf_lib()
+        out = g.dequantize(picked, g.GGMLQuantizationType[self.q.value])
+        return torch.from_numpy(np.ascontiguousarray(out, dtype=np.float32)).reshape(-1, cols).to(torch.bfloat16)
+
+    @property
+    def nbytes(self) -> int:
+        return int(self.raw.numel())
+
+    def dequantize(self, dtype: torch.dtype | None = None) -> torch.Tensor:
+        """the whole [rows, cols] matrix as the gguf package decodes it, float32 unless `dtype`"""
+        g = gguf_lib()
+        out = g.dequantize(self.raw.reshape(self.shape[0], -1).numpy(), g.GGMLQuantizationType[self.q.value])
+        t = torch.from_numpy(np.ascontiguousarray(out, dtype=np.float32)).reshape(self.shape)
+        return t if dtype is None else t.to(dtype)
+
+    @staticmethod
+    def takes(q: str, shape: Sequence[int]) -> bool:
+        """whether a tensor of type `q` (gguf's name) and `shape` (outermost first) is one: a stored type, a matrix
+        whose rows are whole blocks"""
+        try:
+            t = Quant(q)
+        except ValueError:
+            return False
+        return QUANT_KIND[t] in STORED_CLASSES and len(shape) == 2 and int(shape[1]) % block_of(t)[0] == 0
 
 
 class GGUFModel:
@@ -215,14 +319,17 @@ class GGUFModel:
         from transformers.modeling_gguf_pytorch_utils import GGUF_TO_TRANSFORMERS_MAPPING, read_field
 
         arch, mt = self.arch, self.model_type
-        out: dict[str, Json] = {k: {} for k in GGUF_TO_TRANSFORMERS_MAPPING}
+        tables: dict[str, Any] = GGUF_TO_TRANSFORMERS_MAPPING
+        out: dict[str, Json] = {k: {} for k in tables}
+        # the table's name for the family: its model_type, or the architecture where the table keys it so (Gemma 3
+        # under `gemma3`, its text model `gemma3_text`)
+        under = mt if mt in tables["config"] or arch not in tables["config"] else arch
         for key in self.reader.fields:
-            k = mt + key[len(arch) :] if key.startswith(arch + ".") else key
+            k = under + key[len(arch) :] if key.startswith(arch + ".") else key
             prefix, _, rest = k.partition(".")
             value = read_field(self.reader, key)
             if len(value) == 1:
                 value = value[0]
-            tables: dict[str, Any] = GGUF_TO_TRANSFORMERS_MAPPING
             for part, table in tables.items():
                 if prefix in table and rest in table[prefix]:
                     renamed = table[prefix][rest]
@@ -249,7 +356,8 @@ class GGUFModel:
     def _qwen35_fields(self) -> Json:
         """Qwen3.5's config off its typed keys (transformers has no GGUF table for it), inverting what llama.cpp's
         converter writes: MTP blocks counted into block_count, the value head width folded into ssm.inner_size,
-        the rotary as a dimension count and the layer pattern as full_attention_interval"""
+        the rotary as a dimension count and the layer pattern as full_attention_interval; Qwen3.5-MoE's experts
+        and shared expert besides"""
         g = gguf_lib()
         llm, att, ssm, rope = g.Keys.LLM, g.Keys.Attention, g.Keys.SSM, g.Keys.Rope
         out: Json = {}
@@ -258,6 +366,10 @@ class GGUFModel:
             (llm.EMBEDDING_LENGTH, "hidden_size"),
             (llm.FEED_FORWARD_LENGTH, "intermediate_size"),
             (llm.VOCAB_SIZE, "vocab_size"),
+            (llm.EXPERT_COUNT, "num_experts"),
+            (llm.EXPERT_USED_COUNT, "num_experts_per_tok"),
+            (llm.EXPERT_FEED_FORWARD_LENGTH, "moe_intermediate_size"),
+            (llm.EXPERT_SHARED_FEED_FORWARD_LENGTH, "shared_expert_intermediate_size"),
             (att.HEAD_COUNT, "num_attention_heads"),
             (att.HEAD_COUNT_KV, "num_key_value_heads"),
             (ssm.CONV_KERNEL, "linear_conv_kernel_dim"),
@@ -271,7 +383,7 @@ class GGUFModel:
         eps = self._num(att.LAYERNORM_RMS_EPS)
         if eps is not None:
             out["rms_norm_eps"] = eps
-        n = (self._ints(llm.BLOCK_COUNT) or [0])[0] - (self._ints(llm.NEXTN_PREDICT_LAYERS) or [0])[0]
+        n = (self._ints(llm.BLOCK_COUNT) or [0])[0] - self.nextn()
         every = (self._ints(llm.FULL_ATTENTION_INTERVAL) or [4])[0]  # llama.cpp's qwen35 loader default
         out["num_hidden_layers"] = n
         out["layer_types"] = ["full_attention" if (i + 1) % every == 0 else "linear_attention" for i in range(n)]
@@ -297,7 +409,7 @@ class GGUFModel:
         from transformers import AutoConfig
 
         fields = self._parsed()["config"]
-        if self.model_type is ModelType.QWEN3_5_TEXT:
+        if self.model_type in (ModelType.QWEN3_5_TEXT, ModelType.QWEN3_5_MOE_TEXT):
             fields.update(self._qwen35_fields())
         if self.arch == QWEN4EXP:
             fields.update(self._qwen4exp_config())
@@ -339,8 +451,17 @@ class GGUFModel:
         if rope.get("rope_type") not in (None, "none"):
             for c in targets:
                 params = dict(getattr(c, "rope_parameters", None) or getattr(c, "rope_scaling", None) or {})
-                params.update(rope)
+                if isinstance(params.get(LayerKind.FULL), dict):
+                    # a rope a layer type (Gemma 3's): llama.cpp scales the global layers', the sliding ones' as stated
+                    params[LayerKind.FULL] = {**params[LayerKind.FULL], **rope}
+                else:
+                    params.update(rope)
                 c.rope_parameters = params
+        if self.arch == "gemma3":
+            # the query scale llama.cpp takes (llm_build_gemma3): 1/sqrt(the head size), the 27B's (its 62 layers)
+            # 1/sqrt(hidden / heads) - the file carries no key for it
+            heads, layers = int(inner.num_attention_heads), int(inner.num_hidden_layers)
+            inner.query_pre_attn_scalar = inner.hidden_size // heads if layers == 62 else int(inner.head_dim)
         return cfg
 
     def _meta(self, path: str) -> Any:
@@ -505,27 +626,35 @@ class GGUFModel:
             "gguf": {"type": kind or t.tensor_type.name, "offset": int(t.data_offset), "nbytes": int(t.n_bytes)},
         }
 
-    def weight_map(self, hf_names: Iterable[str], n_layers: int) -> tuple[dict[str, str], Json]:
+    def weight_map(
+        self, hf_names: Iterable[str], n_layers: int, stored_experts: bool = False
+    ) -> tuple[dict[str, str], Json]:
         """The family's tensor names (HF's, `model.layers.0.self_attn.q_proj.weight`) against the file's through
         llama.cpp's table: returns (HF name -> the file's tensor name, for the names the file holds) and a
-        safetensors-shaped header (shape, bf16 byte span) the engine's size readers take as they take a shard's."""
-        get_name = name_map(self.arch, n_layers)
+        safetensors-shaped header (shape, bf16 byte span) the engine's size readers take as they take a shard's.
+        `stored_experts` (`stored_experts()`'s answer): the experts are the file's spans, read as stored. A drafting
+        head (`mtp.*`) is matched as the converter wrote it, onto the NextN blocks past the trunk's `n_layers`."""
+        get_name = name_map(self.arch, n_layers + self.nextn())
+        # the head's own tensors: no name in the package's table for the architecture, their members' names instead
+        head = {f"model.layers.{n_layers}.{conv}": member for conv, member in NEXTN_HEAD.values()}
         rewritten = self.arch in REWRITTEN
         hf_names = list(hf_names)
         names: dict[str, str] = {}
         hdr: Json = {}
         for hf in hf_names:
-            base, suffix = hf, ""
+            conv = converted(hf, n_layers)
+            base, suffix = conv, ""
             # llama.cpp stores the linear attention's dt_bias as its dt projection's bias
-            src = hf.removesuffix(".dt_bias") + ".dt_proj.bias" if hf.endswith(".linear_attn.dt_bias") else hf
+            src = conv.removesuffix(".dt_bias") + ".dt_proj.bias" if conv.endswith(".linear_attn.dt_bias") else conv
             if src.endswith((".weight", ".bias")):
                 base, suffix = src.rsplit(".", 1)
                 suffix = "." + suffix
-            g = get_name(base)
+            g = get_name(base) or (tensor_name(self.arch, head[base], n_layers) if base in head else None)
             if g is None or g + suffix not in self.tensors:
                 continue
             file = g + suffix
-            undo = self._undo(hf, self._shape(file)) if rewritten else None
+            # the converter's rewrites by the name it gave the tensor (a head's norm is renamed, then made 1 + w)
+            undo = self._undo(conv, self._shape(file)) if rewritten else None
             if undo is None:
                 names[hf], hdr[hf] = file, self._entry(file)
                 continue
@@ -539,21 +668,83 @@ class GGUFModel:
             self.undo[name] = (file, undo)
             names[hf] = name
             hdr[hf] = self._entry(file, list(undo.shape or self._shape(file)), None if name == file else "undone")
-        mx_experts = self.mxfp4_experts()
+        spans = stored_experts or self.mxfp4_experts()
         if self.arch == QWEN4EXP:
-            self._map_qwen4exp(hf_names, get_name, names, hdr, rebuild_experts=not mx_experts)
-        if self.arch != QWEN4EXP or mx_experts:
-            self._map_experts(hf_names, n_layers, names, hdr)
+            self._map_qwen4exp(hf_names, get_name, names, hdr)
+        if spans or not self.split_experts():
+            self._map_experts(hf_names, n_layers + self.nextn(), names, hdr, stored_experts)
+        else:
+            self._rebuild_experts(hf_names, n_layers, get_name, names, hdr)
         return names, hdr
+
+    def nextn(self) -> int:
+        """the drafting head's layers the converter kept as NextN blocks past the trunk's (`block_count` counts
+        them)"""
+        return (self._ints(gguf_lib().Keys.LLM.NEXTN_PREDICT_LAYERS) or [0])[0]
+
+    def split_experts(self) -> bool:
+        """whether the file's experts are llama.cpp's split gate and up (`ffn_gate_exps`, `ffn_up_exps`) of a family
+        whose checkpoint stacks them as one `gate_up_proj` [experts, gate rows then up rows, hidden] - qwen4exp's and
+        Qwen3.5-MoE's, against gpt-oss's interleaved rows (always MXFP4, so always the store's spans)"""
+        return self.arch in SPLIT_EXPERTS and any(n.endswith("ffn_gate_exps.weight") for n in self.tensors)
+
+    def _rebuild_experts(
+        self, hf_names: list[str], n_layers: int, get_name: NameMap, names: dict[str, str], hdr: Json
+    ) -> None:
+        """the experts the store dequantizes, under the checkpoint's stacked names: gate/up joined from the file's two
+        tensors on read, the down projection the file's own; a drafting layer's from its NextN block"""
+        for hf in hf_names:
+            layer, _, rest = converted(hf, n_layers).removeprefix("model.layers.").partition(".")
+            pre = f"model.layers.{layer}.mlp.experts."
+            if rest == "mlp.experts.gate_up_proj":
+                gu = tuple(f"{get_name(pre + k)}.weight" for k in ("gate_proj", "up_proj"))
+                if gu[0] not in self.tensors:
+                    continue  # a dense layer between MoE ones
+                e, i, h = self._shape(gu[0])
+                names[hf] = hf
+                hdr[hf] = {
+                    "dtype": "BF16",
+                    "shape": [e, 2 * i, h],
+                    "data_offsets": [0, 2 * e * 2 * i * h],
+                    "gguf": {"type": "derived", "offset": 0, "nbytes": 0},
+                }
+                self.derived[hf] = (gu, lambda a: np.concatenate(a, axis=-2))
+            elif rest == "mlp.experts.down_proj":
+                f = f"{get_name(pre + 'down_proj')}.weight"
+                if f in self.tensors:
+                    names[hf], hdr[hf] = f, self._entry(f)
 
     def mxfp4_experts(self) -> bool:
         """whether the file stores its experts as MXFP4 (gpt-oss's, or llama.cpp's MXFP4_MOE of any MoE)"""
         return any(n.endswith("_exps.weight") and t.tensor_type.name == "MXFP4" for n, t in self.tensors.items())
 
+    def expert_quants(self) -> set[Quant]:
+        """the supported types the file's expert tensors (`*_exps.weight`) are stored in"""
+        names = {t.tensor_type.name for n, t in self.tensors.items() if n.endswith("_exps.weight")}
+        return {Quant(n) for n in names if n in Quant.__members__}
+
+    def _storable_expert(self, name: str) -> bool:
+        """whether expert tensor `name` ([experts, rows, cols]) is one `QuantWeight` an expert: a stored type's rows
+        whole blocks, or a float type the store multiplies as it is (`EXPERT_FLOATS`) in whole eights of columns,
+        as the MLX matvec reads them"""
+        kind, shape = self.tensors[name].tensor_type.name, self._shape(name)[1:]
+        floats = {q.value for q in EXPERT_FLOATS}
+        return QuantWeight.takes(kind, shape) or (kind in floats and len(shape) == 2 and int(shape[1]) % 8 == 0)
+
+    def stored_experts(self, takes: Callable[[Quant], bool]) -> bool:
+        """whether the expert store reads the file's experts as its blocks and multiplies them as stored: MXFP4
+        ones always, else where every expert tensor is storable (`_storable_expert`) and of a type `takes` accepts"""
+        exps = [n for n in self.tensors if n.endswith("_exps.weight")]
+        if not exps or self.mxfp4_experts():
+            return bool(exps)
+        return all(self._storable_expert(n) and takes(Quant(self.tensors[n].tensor_type.name)) for n in exps)
+
     def _undo(self, hf: str, shape: list[int]) -> Undo | None:
         """the inverse of llama.cpp's Qwen3.5 converter (`Qwen3_5TextModel.modify_tensors`, which qwen4exp's runs
         too) on the tensor HF calls `hf`, whose file shape is `shape`: its value heads back from the tiled order
-        to grouped by key head, A_log from -exp(A_log), the +1 gammas, the squeezed convolutions"""
+        to grouped by key head, A_log from -exp(A_log), the +1 gammas, the squeezed convolutions and shared-expert
+        gate. Gemma 3's converter rewrites its gammas alone, the same +1 (a file with no linear attention has no
+        heads to move)"""
         ssm = gguf_lib().Keys.SSM
         nk = (self._ints(ssm.GROUP_COUNT) or [1])[0]
         nv = (self._ints(ssm.TIME_STEP_RANK) or [nk])[0]
@@ -576,6 +767,8 @@ class GGUFModel:
             undo = Undo(rows=qkv, shape=(shape[0], 1, shape[-1]))
         elif hf.endswith(".ple.conv1d.weight"):
             undo = Undo(shape=(shape[0], 1, shape[-1]))
+        elif hf.endswith(".mlp.shared_expert_gate.weight") and len(shape) == 1:
+            undo = Undo(shape=(1, shape[0]))  # an older converter's squeeze(); llama.cpp reads either
         elif hf.endswith(lin + "out_proj.weight"):
             undo = Undo(cols=heads)
         elif _plus_one(hf):
@@ -599,14 +792,11 @@ class GGUFModel:
             b = b.reshape(rows, -1, size)[:, blocks].reshape(rows, -1)
         return np.ascontiguousarray(b)
 
-    def _map_qwen4exp(
-        self, hf_names: list[str], get_name: NameMap, names: dict[str, str], hdr: Json, rebuild_experts: bool
-    ) -> None:
+    def _map_qwen4exp(self, hf_names: list[str], get_name: NameMap, names: dict[str, str], hdr: Json) -> None:
         """qwen4exp's checkpoint tensors that are not one file tensor each (conversion/qwen4exp.py): the indexer's
-        projection and (`rebuild_experts`: experts the store dequantizes) the experts' gate/up, each split in two
-        by the converter and joined on read, the experts' down projection under its stacked name, and the n-gram
-        table as its one shard with its hash constants off the metadata. Its per-tensor rewrites are the Qwen3.5
-        converter's, inverted in `weight_map`; MXFP4 experts are `_map_experts`' spans, multiplied as stored."""
+        projection, split in two by the converter and joined on read, and the n-gram table as its one shard with its
+        hash constants off the metadata. Its per-tensor rewrites are the Qwen3.5 converter's, inverted in
+        `weight_map`; its experts are `_map_experts`' spans or `_rebuild_experts`'."""
 
         def rows(a: list[np.ndarray]) -> np.ndarray:
             return np.concatenate(a, axis=-2)
@@ -639,13 +829,6 @@ class GGUFModel:
                     tensor_name(self.arch, m, int(layer)) + ".weight" for m in ("INDEXER_Q_PROJ", "INDEXER_K_PROJ")
                 )
                 derive(hf, qk_proj, rows, [shape(qk_proj[0])[0] + shape(qk_proj[1])[0], shape(qk_proj[0])[1]])
-            elif rest == "mlp.experts.gate_up_proj" and rebuild_experts:
-                gu = tuple(f"{get_name(pre + 'mlp.experts.' + k)}.weight" for k in ("gate_proj", "up_proj"))
-                e, i, h = shape(gu[0])
-                derive(hf, gu, rows, [e, 2 * i, h])
-            elif rest == "mlp.experts.down_proj" and rebuild_experts:
-                f = f"{get_name(pre + 'mlp.experts.down_proj')}.weight"
-                names[hf], hdr[hf] = f, self._entry(f)
             elif rest.startswith("ple.ple_embedding.") and rest.rpartition(".")[2] in consts:
                 c = const(consts[rest.rpartition(".")[2]])
                 derive(hf, (), c, [len(c([]))], "I64")
@@ -653,10 +836,13 @@ class GGUFModel:
                 table = tensor_name(self.arch, "PER_LAYER_TOKEN_EMBD") + ".weight"
                 names[shard], hdr[shard] = table, self._entry(table)
 
-    def _map_experts(self, hf_names: Iterable[str], n_layers: int, names: dict[str, str], hdr: Json) -> None:
-        """gpt-oss's experts, which llama.cpp's table does not name: the file's `ffn_{gate,up,down}_exps` tensors
-        under their own names with their byte spans (the expert store reads an expert's span straight into its
-        slot and the kernels multiply ggml's blocks as stored), the down bias under its HF name, and the HF
+    def _map_experts(
+        self, hf_names: Iterable[str], n_layers: int, names: dict[str, str], hdr: Json, stored: bool
+    ) -> None:
+        """the experts the store reads as stored, which llama.cpp's table does not name: the file's
+        `ffn_{gate,up,down}_exps` tensors under their own names with their byte spans (the expert store reads an
+        expert's span straight into its slot and the kernels multiply ggml's blocks as stored) - MXFP4, or
+        (`stored`) the types `stored_experts` accepted - and gpt-oss's down bias under its HF name and its HF
         `gate_up_proj_bias` as the two biases interleaved on read (`get`)"""
         for i in range(int(n_layers)):
             pre = f"blk.{i}.ffn_"
@@ -664,14 +850,17 @@ class GGUFModel:
                 continue  # a dense layer between MoE ones
             for k in ("gate", "up", "down"):
                 t = self.tensors[pre + k + "_exps.weight"]
-                if t.tensor_type.name != "MXFP4":
-                    raise RuntimeError(f"[gguf] {self.file}: {t.name} is {t.tensor_type.name}; btb runs MXFP4 experts")
+                if t.tensor_type.name != "MXFP4" and not (stored and self._storable_expert(t.name)):
+                    raise RuntimeError(
+                        f"[gguf] {self.file}: {t.name} is {t.tensor_type.name}; btb reads experts as stored only "
+                        "in MXFP4 or a type its kernels multiply"
+                    )
                 names[t.name] = t.name
                 hdr[t.name] = {
                     "dtype": "U8",
                     "shape": [int(x) for x in reversed(list(t.shape))],
                     "data_offsets": [int(t.data_offset), int(t.data_offset) + int(t.n_bytes)],
-                    "gguf": {"type": "MXFP4", "offset": int(t.data_offset), "nbytes": int(t.n_bytes)},
+                    "gguf": {"type": t.tensor_type.name, "offset": int(t.data_offset), "nbytes": int(t.n_bytes)},
                 }
             base = f"model.layers.{i}.mlp.experts."
             if pre + "down_exps.bias" in self.tensors and base + "down_proj_bias" in hf_names:
@@ -696,25 +885,72 @@ class GGUFModel:
                 }
 
     def raw(self, name: str) -> torch.Tensor:
-        """the file's tensor `name` as its stored bytes, a uint8 copy (the kernels read ggml's blocks as they are)"""
+        """the file's tensor `name` as its stored bytes (uint8; the kernels read ggml's blocks as they are): the
+        mapped file's own pages, read-only, or a copy gathered into the checkpoint's order where the converter
+        reordered them"""
         t = self.tensors[name]
-        data = self._stored(t, self.undo[name][1]) if name in self.undo else np.asarray(t.data)
-        return torch.from_numpy(np.array(data, dtype=np.uint8).reshape(-1))
+        if name in self.undo:
+            return torch.from_numpy(self._stored(t, self.undo[name][1]).reshape(-1))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # the memmap is read-only, and nothing writes through this view
+            return torch.from_numpy(np.asarray(t.data).view(np.uint8).reshape(-1))
 
     def packable(self) -> int:
-        """how many of the file's tensors the packed kernels take as stored"""
-        return sum(1 for t in self.tensors.values() if t.tensor_type.name in AFFINE_TYPES)
+        """how many of the file's tensors a type's own gemv takes as stored"""
+        return sum(1 for n in self.tensors if self.storable(n))
+
+    def storable(self, name: str) -> bool:
+        """whether the file's tensor `name` multiplies as stored (`QuantWeight.takes`), nothing read: a converter
+        rewrite only gathers its rows or whole blocks (weight_map keeps the file's name for those alone)"""
+        t = self.tensors.get(name)
+        return t is not None and QuantWeight.takes(t.tensor_type.name, self._shape(name))
+
+    def stored(self, name: str) -> QuantWeight:
+        """the file's tensor `name` as stored for its type's gemv (a `storable` one), in the checkpoint's order"""
+        rows, cols = self._shape(name)
+        return QuantWeight.of(self.raw(name), Quant(self.tensors[name].tensor_type.name), rows, cols)
+
+    def stored_span(self, name: str) -> tuple[str, int, int] | None:
+        """where a `storable` tensor's bytes lie in the file, in the checkpoint's order: (path, offset, bytes); None
+        where the converter reordered them, so `raw` gathers them"""
+        if name in self.undo:
+            return None
+        t = self.tensors[name]
+        return self.path, int(t.data_offset), int(t.n_bytes)
 
     def _float32(self, name: str, expert: int | None) -> np.ndarray:
-        """the file's tensor `name` (its `expert`-th slice where given) dequantized to float32 by the gguf package"""
+        """the file's tensor `name` (its `expert`-th slice where given) in float32: a type btb's library decodes by
+        that decode, the gguf package's numbers to the bit but a zero's sign (its fused multiply-add rounds an exact
+        zero to +0 where the package's product keeps -0); a float type widened; any other by the gguf package"""
+        from .engine.native import Native
+
         t = self.tensors[name]
         data = np.asarray(t.data)
-        return np.asarray(gguf_lib().dequantize(data if expert is None else data[expert], t.tensor_type))
+        data = data if expert is None else data[expert]
+        kind = t.tensor_type.name
+        if kind == "F32":
+            return data.view(np.float32)
+        if kind == "F16":
+            return data.view(np.float16).astype(np.float32)
+        if kind == "BF16":
+            return (data.view(np.int16).astype(np.int32) << 16).view(np.float32)
+        gq = Native.gemv_quant
+        q = next((q for q in gq.dequants if q.value == kind), None) if gq is not None else None
+        if gq is None or q is None:
+            return np.asarray(gguf_lib().dequantize(data, t.tensor_type))
+        weights, nbytes = block_of(q)
+        rows, cols = math.prod(data.shape[:-1]), data.shape[-1] // nbytes * weights
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # the memmap is read-only, and the decode only reads it
+            raw = torch.from_numpy(np.ascontiguousarray(data).view(np.uint8).reshape(-1))
+        out = torch.empty(rows, cols, dtype=torch.float32)
+        gq.dequant(QuantWeight.of(raw, q, rows, cols), out)
+        return out.numpy().reshape(*data.shape[:-1], cols)
 
     def get(self, name: str, expert: int | None = None) -> torch.Tensor:
         """the file's tensor `name` as bf16 (the `expert`-th of a stacked expert tensor where given): read off the
-        memmap and, for a quantized type, dequantized by the gguf package to the numbers llama.cpp itself would
-        compute; a `fused` name is its two biases interleaved, an `undo` one the converter's rewrite inverted and
+        memmap and, for a quantized type, decoded to the numbers llama.cpp itself would compute (`_float32`); a
+        `fused` name is its two biases interleaved, an `undo` one the converter's rewrite inverted and
         a `derived` one rebuilt from the file's, both in float32 (int64 for a hash constant)"""
         if name in self.fused:
             gate, up = (self.get(n) for n in self.fused[name])

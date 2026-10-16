@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from types import ModuleType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
 import torch
@@ -15,6 +15,24 @@ from ..kinds import Json
 
 if TYPE_CHECKING:
     import mlx.core as mx_
+
+
+class MetalKernel(Protocol):
+    """what `mx.fast.metal_kernel` builds (its stub says `object`): a launch, its outputs lazily"""
+
+    def __call__(
+        self,
+        *,
+        inputs: Sequence[mx_.array],
+        output_shapes: Sequence[Sequence[int]],
+        output_dtypes: Sequence[mx_.Dtype],
+        grid: tuple[int, int, int],
+        threadgroup: tuple[int, int, int],
+        template: Sequence[tuple[str, mx_.Dtype | int | bool]] = ...,
+        init_value: float | None = ...,
+    ) -> list[mx_.array]: ...
+
+
 _mx: Any = None
 _TorchTensor = torch.Tensor
 _TorchDtype = torch.dtype

@@ -7,7 +7,7 @@ from __future__ import annotations
 import functools
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -16,6 +16,8 @@ from .core import mx
 
 if TYPE_CHECKING:
     import mlx.core as mx_
+
+    from .core import MetalKernel
 _UNPACK_SRC = """
     // one thread per pair of weights (one byte of codes): out[2i] and out[2i + 1]
     uint i = thread_position_in_grid.x;
@@ -63,19 +65,25 @@ def unpack_bf16(
 
 GEMV_ROWS = 16
 
-_GEMM16_HEADER = "#include <metal_simdgroup_matrix>\n"
+# the rows one launch of `gemv` takes, by whether x is bf16; a wider pass runs in launches of about equal rows. A
+# launch reads the weight once, so bf16 takes 32 (on [9728, 2560] 0.72 ms, against 1.0 for two 16-row launches and
+# 0.87 for MLX's gemm); a float32 tile past 16 leaves a threadgroup too few simdgroups (1.9 ms at 32 rows, 1.16 split)
+TILE_ROWS = {True: 32, False: 16}
 
-_GEMM16_SRC = """
-    // y[b, n] = sum_k x[b, k] w[n, k] for NB <= 16 rows of x. A simdgroup owns 8 rows of w and streams K in steps
-    // of 64: its lanes stage the 8 x 64 weight tile and the 16 x 64 activation tile (rows past NB zero) in the
-    // simdgroup's own threadgroup memory, then eight 8x8 matrix multiply-accumulates into float accumulators;
-    // no threadgroup barrier, the next step's pieces loading while this one computes. A row's chain is the
-    // hardware's fixed order over K whatever else the tile holds, so row b is the same bits alone or in a
-    // 16-row tile, and the tile's rows cost no memory traffic beyond the one weight read.
+_GEMM_HEADER = "#include <metal_simdgroup_matrix>\n"
+
+_GEMM_SRC = """
+    // y[b, n] = sum_k x[b, k] w[n, k] for NB rows of x. A simdgroup owns 8 rows of w and streams K in steps of 64:
+    // its lanes stage the 8 x 64 weight tile and the NB x 64 activation tile (rows past NB zero, to a whole 8) in the
+    // simdgroup's own threadgroup memory, then 8x8 matrix multiply-accumulates, one float accumulator an 8-row
+    // block of x; no threadgroup barrier, the next step's pieces loading while this one computes. A row's chain is
+    // the hardware's fixed order over K whatever else the tile holds, so row b is the same bits alone or in a tile
+    // of any width, and the tile's rows cost no memory traffic beyond the one weight read.
     // XB: bf16 x and bf16 tiles, y bf16 (round to nearest even); else float32 x and float tiles (the weight
-    // widened at the stage), y float32.
+    // widened at the stage), y float32. SGN simdgroups a threadgroup, as many as its memory holds the tiles of.
     constexpr uint KT = 64;
-    constexpr uint SGN = XB ? 8 : 4;
+    constexpr uint NA = (NB + 7) / 8;  // the 8-row blocks of x
+    constexpr uint NX = 2 * NA;        // the 4-row groups a lane stages
     uint sg = simdgroup_index_in_threadgroup;
     uint lane = thread_index_in_simdgroup;
     uint n0 = (threadgroup_position_in_grid.x * SGN + sg) * 8;
@@ -90,7 +98,7 @@ _GEMM16_SRC = """
     typedef simdgroup_float8x8 SM;
 #endif
     threadgroup ST ws_all[SGN][8 * KT];
-    threadgroup ST xs_all[SGN][16 * KT];
+    threadgroup ST xs_all[SGN][NA * 8 * KT];
     threadgroup ST* ws = ws_all[sg];
     threadgroup ST* xs = xs_all[sg];
     // the weight tile: lane l stages uint4 l and l + 32 of its 8 x 8 uint4s (row i / 8, k (i % 8) * 8)
@@ -98,36 +106,44 @@ _GEMM16_SRC = """
     const device uint4* wp0 = (const device uint4*)(w + (size_t)min(n0 + wr0, N - 1) * K + wc);
     const device uint4* wp1 = (const device uint4*)(w + (size_t)min(n0 + wr1, N - 1) * K + wc);
     bool ok0 = n0 + wr0 < N, ok1 = n0 + wr1 < N;
-    // the activation tile: rows lane / 8 + 4i; the second 8-row half only past 8 rows
-    constexpr uint XR = NB > 8 ? 4 : 2;
-    uint xr[4];
-    bool xok[4];
-    const device uint4* xp[4];
+    // the activation tile: rows lane / 8 + 4i
+    uint xr[NX];
+    bool xok[NX];
+    const device uint4* xp[NX];
     #pragma unroll
-    for (uint i = 0; i < 4; ++i) {
+    for (uint i = 0; i < NX; ++i) {
         xr[i] = lane / 8 + 4 * i;
         xok[i] = xr[i] < NB;
         xp[i] = (const device uint4*)(x + (size_t)min(xr[i], (uint)NB - 1) * K + wc);
     }
-    simdgroup_float8x8 acc0(0.0f), acc1(0.0f);
-    uint nstep = (K + KT - 1) / KT;
-    uint4 w0 = uint4(0u), w1 = uint4(0u), xv[4], xv2[4];
+    simdgroup_float8x8 acc[NA];
     #pragma unroll
-    for (uint i = 0; i < 4; ++i) { xv[i] = uint4(0u); xv2[i] = uint4(0u); }
+    for (uint j = 0; j < NA; ++j) acc[j] = simdgroup_float8x8(0.0f);
+    uint nstep = (K + KT - 1) / KT;
+    uint4 w0 = uint4(0u), w1 = uint4(0u), xv[NX], xv2[NX];
+    #pragma unroll
+    for (uint i = 0; i < NX; ++i) { xv[i] = uint4(0u); xv2[i] = uint4(0u); }
     if (ok0 && wc < K) w0 = wp0[0];
     if (ok1 && wc < K) w1 = wp1[0];
     #pragma unroll
-    for (uint i = 0; i < XR; ++i) if (xok[i] && wc < K) { xv[i] = xp[i][0]; if (!XB) xv2[i] = xp[i][1]; }
+    for (uint i = 0; i < NX; ++i) if (xok[i] && wc < K) { xv[i] = xp[i][0]; if (!XB) xv2[i] = xp[i][1]; }
     for (uint st = 0; st < nstep; ++st) {
 #if XB
         *((threadgroup uint4*)(ws + wr0 * KT + wc)) = w0;
         *((threadgroup uint4*)(ws + wr1 * KT + wc)) = w1;
         #pragma unroll
-        for (uint i = 0; i < XR; ++i) *((threadgroup uint4*)(xs + xr[i] * KT + wc)) = xv[i];
+        for (uint i = 0; i < NX; ++i) *((threadgroup uint4*)(xs + xr[i] * KT + wc)) = xv[i];
 #else
         {
             threadgroup float4* d0 = (threadgroup float4*)(ws + wr0 * KT + wc);
             threadgroup float4* d1 = (threadgroup float4*)(ws + wr1 * KT + wc);
+#if WF16
+            // an f16 weight (a GGUF's float expert): each half widened exactly, the low one of a word first
+            d0[0] = float4(float2(as_type<half2>(w0.x)), float2(as_type<half2>(w0.y)));
+            d0[1] = float4(float2(as_type<half2>(w0.z)), float2(as_type<half2>(w0.w)));
+            d1[0] = float4(float2(as_type<half2>(w1.x)), float2(as_type<half2>(w1.y)));
+            d1[1] = float4(float2(as_type<half2>(w1.z)), float2(as_type<half2>(w1.w)));
+#else
             d0[0] = float4(as_type<float>(w0.x << 16), as_type<float>(w0.x & 0xffff0000u),
                            as_type<float>(w0.y << 16), as_type<float>(w0.y & 0xffff0000u));
             d0[1] = float4(as_type<float>(w0.z << 16), as_type<float>(w0.z & 0xffff0000u),
@@ -136,8 +152,9 @@ _GEMM16_SRC = """
                            as_type<float>(w1.y << 16), as_type<float>(w1.y & 0xffff0000u));
             d1[1] = float4(as_type<float>(w1.z << 16), as_type<float>(w1.z & 0xffff0000u),
                            as_type<float>(w1.w << 16), as_type<float>(w1.w & 0xffff0000u));
+#endif
             #pragma unroll
-            for (uint i = 0; i < XR; ++i) {
+            for (uint i = 0; i < NX; ++i) {
                 threadgroup uint4* dx = (threadgroup uint4*)(xs + xr[i] * KT + wc);
                 dx[0] = xv[i];
                 dx[1] = xv2[i];
@@ -150,7 +167,7 @@ _GEMM16_SRC = """
         w0 = (more && ok0 && kn + wc < K) ? wp0[(st + 1) * (KT / 8)] : uint4(0u);
         w1 = (more && ok1 && kn + wc < K) ? wp1[(st + 1) * (KT / 8)] : uint4(0u);
         #pragma unroll
-        for (uint i = 0; i < XR; ++i) {
+        for (uint i = 0; i < NX; ++i) {
             bool g = more && xok[i] && kn + wc < K;
             if (XB) {
                 xv[i] = g ? xp[i][(st + 1) * (KT / 8)] : uint4(0u);
@@ -161,20 +178,20 @@ _GEMM16_SRC = """
         }
         #pragma unroll
         for (uint ks = 0; ks < KT / 8; ++ks) {
-            SM A0, A1, B;
+            SM B;
             simdgroup_load(B, ws + ks * 8, KT, ulong2(0, 0), true);
-            simdgroup_load(A0, xs + ks * 8, KT);
-            simdgroup_multiply_accumulate(acc0, A0, B, acc0);
-            if (NB > 8) {
-                simdgroup_load(A1, xs + 8 * KT + ks * 8, KT);
-                simdgroup_multiply_accumulate(acc1, A1, B, acc1);
+            #pragma unroll
+            for (uint j = 0; j < NA; ++j) {
+                SM A;
+                simdgroup_load(A, xs + j * 8 * KT + ks * 8, KT);
+                simdgroup_multiply_accumulate(acc[j], A, B, acc[j]);
             }
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
     }
     threadgroup float* out = (threadgroup float*)xs;
-    simdgroup_store(acc0, out, 8);
-    if (NB > 8) simdgroup_store(acc1, out + 64, 8);
+    #pragma unroll
+    for (uint j = 0; j < NA; ++j) simdgroup_store(acc[j], out + 64 * j, 8);
     simdgroup_barrier(mem_flags::mem_threadgroup);
     for (uint o = lane; o < NB * 8; o += 32) {
         uint b = o / 8, n = o % 8;
@@ -191,43 +208,63 @@ _GEMM16_SRC = """
 """
 
 
-_gemm16_kernels: dict[int, Any] = {}
+_gemm_kernels: dict[tuple[int, int, int], MetalKernel] = {}
 _gemv_lock = threading.Lock()
 
 
-def _gemm16_kernel(xb: int) -> Any:
+def _sgn(nb: int, xb: bool) -> int:
+    """the simdgroups a threadgroup takes for an `nb`-row tile: each stages its 8 weight rows and its own x tile,
+    within the 32 KB of threadgroup memory"""
+    tile = (8 + 8 * ((nb + 7) // 8)) * 64 * (2 if xb else 4)
+    return max(1, min(8 if xb else 4, 32768 // tile))
+
+
+def _gemm_kernel(xb: int, sgn: int, wf16: int = 0) -> MetalKernel:
     m = mx()
     with _gemv_lock:
-        k = _gemm16_kernels.get(xb)
+        k = _gemm_kernels.get((xb, sgn, wf16))
         if k is None:
-            k = _gemm16_kernels[xb] = m.fast.metal_kernel(
-                name=f"btb_gemm16_x{xb}",
+            k = _gemm_kernels[(xb, sgn, wf16)] = m.fast.metal_kernel(
+                name=f"btb_gemm_rows_x{xb}_s{sgn}" + ("_f16" if wf16 else ""),
                 input_names=["w", "x"],
                 output_names=["y"],
-                header=_GEMM16_HEADER + f"#define XB {xb}\n",
-                source=_GEMM16_SRC,
+                header=_GEMM_HEADER + f"#define XB {xb}\n#define SGN {sgn}\n#define WF16 {wf16}\n",
+                source=_GEMM_SRC,
             )
     return k
 
 
 def gemv(w_bf16: mx_.array, x: mx_.array) -> mx_.array:
-    """y[b, rows] = x[b, cols] w[rows, cols]^T for 1..16 rows of x (bf16 or float32), float32 accumulation over
-    the bf16 weight as it is, y in x's dtype. Batch-invariant: row i of y is the same bits for 1 row or 16.
-    Needs cols % 8 == 0."""
+    """y[b, rows] = x[b, cols] w[rows, cols]^T for any rows of x (bf16 or float32), float32 accumulation over the
+    bf16 weight as it is, y in x's dtype: launches of about equal rows, `TILE_ROWS` at most. Batch-invariant: row i
+    of y is the same bits whatever rows travel with it. Needs cols % 8 == 0. An f16 weight (a GGUF's float expert)
+    is widened exactly into the float32 tiles, a bf16 x with it and y rounded back to bf16."""
     m = mx()
-    rows = int(w_bf16.shape[0])
     b = int(x.shape[0])
-    if not 1 <= b <= GEMV_ROWS:
-        raise ValueError(f"[mlx] the matvec takes 1..{GEMV_ROWS} rows, got {b}")
+    if b < 1:
+        raise ValueError(f"[mlx] the matvec takes at least one row, got {b}")
+    wf16 = w_bf16.dtype == m.float16
+    if wf16 and x.dtype == m.bfloat16:
+        return gemv(w_bf16, x.astype(m.float32)).astype(m.bfloat16)
     xb = x.dtype == m.bfloat16
-    sgn = 8 if xb else 4
+    n = -(-b // TILE_ROWS[xb])
+    size = -(-b // n)
+    if n == 1:
+        return _gemv_tile(w_bf16, x, xb, wf16)
+    return m.concatenate([_gemv_tile(w_bf16, x[s : s + size], xb, wf16) for s in range(0, b, size)], axis=0)
+
+
+def _gemv_tile(w_bf16: mx_.array, x: mx_.array, xb: bool, wf16: bool = False) -> mx_.array:
+    m = mx()
+    rows, nb = int(w_bf16.shape[0]), int(x.shape[0])
+    sgn = _sgn(nb, xb)
     tg = (rows + 8 * sgn - 1) // (8 * sgn)
-    y = _gemm16_kernel(1 if xb else 0)(
+    y = _gemm_kernel(int(xb), sgn, int(wf16))(
         inputs=[w_bf16.view(m.uint16), x.view(m.uint16) if xb else x],
-        template=[("NB", b)],
+        template=[("NB", nb)],
         grid=(tg * 32 * sgn, 1, 1),
         threadgroup=(32 * sgn, 1, 1),
-        output_shapes=[(b, rows)],
+        output_shapes=[(nb, rows)],
         output_dtypes=[m.uint16 if xb else m.float32],
     )[0]
     return y.view(m.bfloat16) if xb else y
@@ -586,12 +623,22 @@ def gemv_mxfp4_pair(
     return _mxfp4_call([(gate.reshape(-1), up.reshape(-1))], 2 * int(inter), k, x[None], tm, True, True)[0]
 
 
-def matmul_mxfp4_pair(gate: mx_.array, up: mx_.array, inter: int, k: int, x: mx_.array) -> mx_.array:
-    """`matmul_mxfp4` for a GGUF's gate and up: the pair matvec up to 16 rows, a gemm over the interleaved
-    dequantized rows past that"""
+def _tiles(f: Callable[[mx_.array], mx_.array], x: mx_.array) -> mx_.array:
+    """`f` (a batch-invariant matvec of up to 16 rows) over x's rows 16 at a time"""
+    n = int(x.shape[0])
+    if n <= GEMV_ROWS:
+        return f(x)
+    return mx().concatenate([f(x[s : s + GEMV_ROWS]) for s in range(0, n, GEMV_ROWS)], axis=0)
+
+
+def matmul_mxfp4_pair(
+    gate: mx_.array, up: mx_.array, inter: int, k: int, x: mx_.array, gemm_rows: int = GEMV_ROWS + 1
+) -> mx_.array:
+    """`matmul_mxfp4` for a GGUF's gate and up: the pair matvec under `gemm_rows` rows, a gemm over the interleaved
+    dequantized rows from there"""
     m = mx()
-    if int(x.shape[0]) <= GEMV_ROWS:
-        return gemv_mxfp4_pair(gate, up, inter, k, x)
+    if int(x.shape[0]) < gemm_rows:
+        return _tiles(lambda t: gemv_mxfp4_pair(gate, up, inter, k, t), x)
     dt = m.bfloat16 if x.dtype == m.bfloat16 else m.float32
     w = m.stack([mxfp4_dequant(gate, inter, k, dt, ggml=True), mxfp4_dequant(up, inter, k, dt, ggml=True)], axis=1)
     return m.matmul(x, w.reshape(2 * int(inter), int(k)).T)
@@ -624,12 +671,14 @@ def mxfp4_dequant(slot: mx_.array, rows: int, k: int, dtype: Any = None, ggml: b
     )[0]
 
 
-def matmul_mxfp4(slot: mx_.array, rows: int, k: int, x: mx_.array, ggml: bool = False) -> mx_.array:
-    """y = W x for any number of rows: the batch-invariant matvec up to 16 rows, MLX's gemm over a
-    dequantized copy past that (prefill, where the engine does not verify a tree)."""
+def matmul_mxfp4(
+    slot: mx_.array, rows: int, k: int, x: mx_.array, ggml: bool = False, gemm_rows: int = GEMV_ROWS + 1
+) -> mx_.array:
+    """y = W x for any number of rows: under `gemm_rows` the batch-invariant matvec 16 rows a launch (a step, a
+    verify pass, a batch: each row the bits it has alone), from there MLX's gemm over a dequantized copy (prefill)."""
     m = mx()
-    if int(x.shape[0]) <= GEMV_ROWS:
-        return gemv_mxfp4(slot, rows, k, x, ggml=ggml)
+    if int(x.shape[0]) < gemm_rows:
+        return _tiles(lambda t: gemv_mxfp4(slot, rows, k, t, ggml=ggml), x)
     w = mxfp4_dequant(slot, rows, k, m.bfloat16 if x.dtype == m.bfloat16 else m.float32, ggml=ggml)
     return m.matmul(x, w.T)
 

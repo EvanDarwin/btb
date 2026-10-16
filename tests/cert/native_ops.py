@@ -24,7 +24,7 @@ import sys
 from dataclasses import dataclass
 from enum import StrEnum
 
-from btb.kinds import Quant
+from btb.kinds import STORED_CLASSES, Quant, quant_key, quants_of
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 NATIVE_TESTS = os.path.join(ROOT, "native", "tests")
@@ -114,6 +114,23 @@ class Stored(StrEnum):
     MXFP4_GGML = "mxfp4_ggml"
     FP8 = "fp8"
     BYTES = "bytes"
+    Q4_0 = "q4_0"
+    Q4_1 = "q4_1"
+    Q8_0 = "q8_0"
+    Q2_K = "q2_k"
+    Q3_K = "q3_k"
+    Q4_K = "q4_k"
+    Q5_K = "q5_k"
+    Q6_K = "q6_k"
+    IQ4_NL = "iq4_nl"
+    IQ4_XS = "iq4_xs"
+    IQ3_XXS = "iq3_xxs"
+    IQ3_S = "iq3_s"
+    IQ2_XXS = "iq2_xxs"
+    IQ2_XS = "iq2_xs"
+    IQ2_S = "iq2_s"
+    IQ1_S = "iq1_s"
+    IQ1_M = "iq1_m"
 
 
 # the Stored forms that are not GGUF quant types, each with what btb stores under it. A member absent here and
@@ -138,6 +155,9 @@ class Op:
     pointer_math: bool = True  # whether the op walks raw pointers (so a guard test is required)
 
 
+# every stored type's exports, by its `quant_key`
+QUANT_EXPORTS = ("btb_gemv_{}_rows", "btb_gemv_{}_group", "btb_dequant_{}_rows")
+
 # Every logical op the matrix certifies, each claiming the crate's C-ABI exports it stands for. The claimed
 # `exports` are cross-checked against native/src/lib.rs by `export_gaps()`, so a new btb_* export that no op
 # covers is a reported gap - the OPS table cannot silently fall behind the crate.
@@ -160,6 +180,29 @@ OPS: tuple[Op, ...] = (
         "gemv.rs",
     ),
     Op("gemv_fp8", (Stored.FP8,), ("btb_gemv_fp8_rows",), "guard_scalar.rs", "guard_fp8.rs", "gemv.rs"),
+    # the GGUF types a linear multiplies as stored, a row a bind class: each type's own `btb_gemv_<key>_rows`, its
+    # `_group` (a layer's experts in one dispatch) and `btb_dequant_<key>_rows` (a prefill's weights for the GEMM)
+    *(
+        Op(
+            f"gemv_{c.value}",
+            tuple(Stored(q.value.lower()) for q in quants_of(c)),
+            tuple(e.format(quant_key(q)) for q in quants_of(c) for e in QUANT_EXPORTS),
+            "gemv_quant.rs",
+            "guard_gemv_quant.rs",
+            "gemv.rs",
+        )
+        for c in sorted(STORED_CLASSES)
+    ),
+    # a GGUF expert's f16 tensor multiplied as stored (`kinds.EXPERT_FLOATS`; a bf16 one is `gemv_bf16`'s): its rows,
+    # group and dequantization, a format of one weight a block in the stored types' tests and bench
+    Op(
+        "gemv_f16",
+        (Stored.F16,),
+        tuple(e.format(quant_key(Quant.F16)) for e in QUANT_EXPORTS),
+        "gemv_quant.rs",
+        "guard_gemv_quant.rs",
+        "gemv.rs",
+    ),
     Op(
         "gemv_group",
         (Stored.BF16, Stored.MXFP4, Stored.FP8),
@@ -220,6 +263,8 @@ def op_families() -> list[str]:
 LIB_RS = os.path.join(ROOT, "native", "src", "lib.rs")
 GEMV_RS = os.path.join(ROOT, "native", "src", "gemv.rs")
 _EXPORT_RE = re.compile(r'pub\s+(?:unsafe\s+)?extern\s+"C"\s+fn\s+(btb_\w+)')
+# a `macro_rules!` whose body defines `extern "C" fn $name`: each btb_* name it is invoked with is an export
+_EXPORT_MACRO_RE = re.compile(r'macro_rules!\s+(\w+)\s*\{(?:(?!macro_rules!).)*?extern\s+"C"\s+fn\s+\$\w+', re.S)
 _ISA_RE = re.compile(r"pub enum Isa \{(.*?)\n\}", re.S)
 _VARIANT_RE = re.compile(r"^\s{4}(\w+),?\s*$", re.M)
 SCALAR = "scalar"
@@ -270,9 +315,14 @@ def family_tiers(family: str) -> frozenset[str]:
 
 def crate_exports() -> set[str]:
     """the btb_* C-ABI functions the crate actually exports, read from native/src/lib.rs - the truth the OPS
-    table's `exports` claims are checked against."""
+    table's `exports` claims are checked against: each written out, and each a generating macro is invoked with
+    (the GGUF quant matvecs)."""
     with open(LIB_RS, encoding="utf-8") as f:
-        return set(_EXPORT_RE.findall(f.read()))
+        src = f.read()
+    out = set(_EXPORT_RE.findall(src))
+    for macro in _EXPORT_MACRO_RE.findall(src):
+        out |= set(re.findall(rf"\b{macro}!\(\s*(?:///[^\n]*\n\s*)*(btb_\w+)", src))
+    return out
 
 
 def _exists(base: str, name: str | None) -> bool:

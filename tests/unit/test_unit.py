@@ -185,6 +185,29 @@ def test_stored_parts_are_the_bytes_the_card_takes_of_each_form() -> None:
     assert stored_parts(meta, dn) is None, "an expert off the host is the card's already"
 
 
+def test_a_qwen4_cards_piece_rows_reach_its_hyper_connections() -> None:
+    """the card program's `piece` rows are sized from every mixed projection of a layer's weights
+    (families/qwen4/card.py `pieced`), a hyper-connection's down and inject in its own dict among them: a GGUF
+    keeping `hc_attn_down` stored and `hc_attn_inject` bf16 found no buffer, or one too narrow, from the top level"""
+    from btb.engine.families.qwen4.card import pieced
+    from btb.engine.stored import card_loose
+    from btb.gguf import QuantWeight
+    from btb.kinds import Quant
+    from tests.helpers import stored_blocks
+
+    stored = QuantWeight.of(torch.from_numpy(stored_blocks(Quant.Q8_0, 16, 256, 0)), Quant.Q8_0, 16, 256)
+    bf = lambda rows: torch.zeros(rows, 256, dtype=torch.bfloat16)
+    W = {
+        "hcA": {"norm": torch.ones(256, dtype=torch.bfloat16), "dn": (stored, bf(40)), "up": (stored,)},
+        "qkv": (stored, bf(24)),
+        "o": bf(256),
+        "_own": [torch.zeros(4)],
+        "scale": 0.5,
+    }
+    assert card_loose(list(pieced(W))) == 40
+    assert card_loose([v for v in W.values() if isinstance(v, tuple)]) == 24, "the top level alone: too narrow"
+
+
 def test_the_experts_linear_widens_what_no_kernel_multiplies(monkeypatch: MonkeyPatch) -> None:
     """`_Experts._linear` without the kernel for a form (a native library built without it): MXFP4 in either layout,
     a GGUF's gate and up apart, and FP8 are widened and multiplied in float32 - the dequantized matrix's product,
@@ -196,7 +219,7 @@ def test_the_experts_linear_widens_what_no_kernel_multiplies(monkeypatch: Monkey
     from btb.engine.native import Native
     from btb.fp8 import F8Weight, quantize
     from btb.kinds import PassTag
-    from btb.mxfp4 import MxGateUp, MxWeight, hf_to_ggml
+    from btb.mxfp4 import GateUp, MxWeight, hf_to_ggml
     from tests.helpers import mxfp4_random
 
     native_library()
@@ -209,7 +232,7 @@ def test_the_experts_linear_widens_what_no_kernel_multiplies(monkeypatch: Monkey
     gg = MxWeight.from_ggml(torch.from_numpy(hf_to_ggml(b, s)).reshape(-1), 32, 64)
     q, sc = quantize(torch.randn(32, 64, generator=g), (16, 16))
     f8 = F8Weight(q, sc, 32, 64)
-    forms: dict[str, Any] = {"mxfp4": mx, "ggml": gg, "fp8": f8, "gate_up": MxGateUp(gg, gg)}
+    forms: dict[str, Any] = {"mxfp4": mx, "ggml": gg, "fp8": f8, "gate_up": GateUp(gg, gg)}
     kernel = {name: ex._linear(x, w) for name, w in forms.items()}
     assert tags == {PassTag.EXPERT_MXFP4_ASSTORED, PassTag.EXPERT_FP8_ASSTORED}
     for name in ("gemv_mx4", "gemv_mx4_ggml", "gemv_fp8"):
@@ -217,7 +240,7 @@ def test_the_experts_linear_widens_what_no_kernel_multiplies(monkeypatch: Monkey
     tags.clear()
     for name, w in forms.items():
         got = ex._linear(x, w)
-        if isinstance(w, MxGateUp):
+        if isinstance(w, GateUp):
             # the gate and the up are each their own widened product, joined: one product of the two stacked is
             # not the same bits on every host's BLAS (arm64's sums a row of a taller matrix otherwise)
             half = F.linear(x, mx.dequantize(torch.float32))
@@ -601,17 +624,27 @@ def test_the_indexers_masks_are_told_apart_by_shape() -> None:
 def test_the_shared_drafter_leaves_its_steps_to_each_family() -> None:
     """btb/engine/drafter.py's base: no MLX graph of its own, and the step and the MLX graph's parts each family's
     drafter supplies - asked of the base, they refuse"""
+    from btb import mlx_available
     from btb.engine.drafter import MTPDrafter
+    from btb.sampling import Sampling
 
     dr = MTPDrafter(types.SimpleNamespace(dev=torch.device("cpu")))
     assert not dr._mlx_ready() and not dr._tree_kernel()
-    for call in (
+    calls: list[Callable[[], object]] = [
+        lambda: dr._pass(torch.zeros(1, 1, dtype=torch.long), torch.zeros(1, 1, 4), 0, True),
         lambda: dr._step(torch.zeros(1, 1, dtype=torch.long), torch.zeros(1, 1, 4), 0),
         dr._mx_dtype,
-        lambda: dr._mlx_body(None, None, 0, None),
-        lambda: dr._mlx_draw(None, 1, None, ()),
-        lambda: dr._mlx_topk(None, 1),
-    ):
+    ]
+    if mlx_available():  # the graph's parts take MLX rows, which only an MLX machine makes
+        import mlx.core as mx
+
+        rows = mx.zeros((1, 1, 4))
+        calls += [
+            lambda: dr._mlx_body(rows, rows, 0, None),
+            lambda: dr._mlx_draw(rows, 1, Sampling(), ()),
+            lambda: dr._mlx_topk(rows, 1),
+        ]
+    for call in calls:
         with pytest.raises(NotImplementedError):
             call()
 
