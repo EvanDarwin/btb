@@ -171,7 +171,7 @@ class QwenXml(ToolFormat):
     text; each is typed by the tool's schema (a string parameter is never re-read as a number), and an object or
     array parameter parses from the JSON the template told the model to write."""
 
-    kinds = (FamilyKind.QWEN3_5,)
+    kinds = (FamilyKind.QWEN3_5, FamilyKind.QWEN3_5_MOE)
     openers = ("<tool_call>", "<function=")
     block = re.compile(
         r"(?:<tool_call>\s*)?<function\s*=\s*([^>\s]+)\s*>(.*?)</function>(?:\s*</tool_call>)?", re.DOTALL

@@ -44,8 +44,8 @@ def test_a_wildcard_kind_in_a_row_is_a_gap() -> None:
 def test_the_lattice_kinds_are_the_supported_quants() -> None:
     """the kind table btb/mlx/iquant.py dispatches on and btb.kinds' LATTICE quants are the same set: a lattice
     quant declared in kinds with no kernel (or the reverse) is drift between the two."""
-    from btb.kinds import QuantClass, latt_backend_key, quants_of
+    from btb.kinds import QuantClass, quant_key, quants_of
 
     src = dict(mlx_ops._mlx_modules())["iquant"]
     parsed = mlx_ops.dispatch_kinds(src)["kind"]
-    assert {latt_backend_key(q) for q in quants_of(QuantClass.LATTICE)} <= parsed
+    assert {quant_key(q) for q in quants_of(QuantClass.LATTICE)} <= parsed

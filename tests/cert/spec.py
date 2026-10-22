@@ -22,6 +22,7 @@ from typing import Any
 from btb.kinds import (
     PROPOSER_TAG,
     QUANT_KIND,
+    STORED_CLASSES,
     Cap,
     FamilyKind,
     Json,
@@ -31,7 +32,10 @@ from btb.kinds import (
     Quant,
     QuantClass,
     api_tags,
+    expert_quants,
+    quant_tag,
     quants_of,
+    stored_quants,
 )
 
 from . import core
@@ -168,6 +172,7 @@ class Decode(StrEnum):
 FIXTURE_STEM: dict[FamilyKind, str] = {
     FamilyKind.QWEN3: "tiny_qwen3",
     FamilyKind.QWEN3_5: "tiny_q35",
+    FamilyKind.QWEN3_5_MOE: "tiny_q35moe",
     FamilyKind.PHI3: "tiny_phi3",
     FamilyKind.QWEN4: "tiny_q4",
     FamilyKind.GPT_OSS: "tiny_gpt_oss",
@@ -251,9 +256,60 @@ def has_mtp_head(kind: FamilyKind) -> bool:
     return any(str(k).startswith("mtp.") for k in _read_once(index, _json).get("weight_map", {}))
 
 
+def _nextn(path: str) -> int:
+    """a GGUF file's NextN layers: the drafting head's, by the count llama.cpp's converter writes"""
+    from gguf import GGUFReader, Keys
+
+    r = GGUFReader(path)
+    arch = str(r.fields[Keys.General.ARCHITECTURE].contents())
+    f = r.fields.get(Keys.LLM.NEXTN_PREDICT_LAYERS.format(arch=arch))
+    return int(f.contents()) if f is not None else 0
+
+
+def gguf_has_mtp_head(kind: FamilyKind, storage: Storage) -> bool:
+    """whether every GGUF twin a cell binds keeps the drafting head as NextN layers, which the engine maps to its
+    `mtp.*` (btb/gguf.py `converted`), read from the files, never from a stem list"""
+    paths = fixture_paths(kind, storage)
+    return bool(paths) and all(os.path.isfile(p) and _read_once(p, _nextn) > 0 for p in paths)
+
+
 def gguf_name(stem: str, q: Quant) -> str:
     """the tiny GGUF twin's file name for one stored type (tests/make_fixtures.py's rule)."""
     return f"{stem}-{q.value.lower()}.gguf"
+
+
+# tiny_q4's twins in these types are llama.cpp's own converter's (tests/make_fixtures.py make_q4_gguf) and committed:
+# a run has no llama.cpp checkout. Every other twin is derived from the committed fixtures where a run needs it
+# (make_fixtures.ensure_gguf) and never committed
+CONVERTED_STEM = "tiny_q4"
+CONVERTED_QUANTS: tuple[Quant, ...] = tuple(
+    q for c in (QuantClass.FLOAT, QuantClass.AFFINE, QuantClass.MXFP4) for q in quants_of(c)
+)
+
+
+def gguf_quants(stem: str) -> tuple[Quant, ...]:
+    """the types `stem` has a GGUF twin in: the float and affine ones, MXFP4 where its config has experts, and every
+    other stored type. A checkpoint whose experts are MXFP4 already (gpt-oss's U8 blocks) has no bf16 twin: its bf16
+    run is the MXFP4 one"""
+    with open(os.path.join(FIXTURES, stem, "config.json"), encoding="utf-8") as f:
+        cfg: Json = json.load(f)
+    native = "U8" in header_dtypes(os.path.join(FIXTURES, stem))
+    out = [q for c in (QuantClass.FLOAT, QuantClass.AFFINE) for q in quants_of(c) if not (native and q is Quant.BF16)]
+    if cfg.get("num_experts") or cfg.get("num_local_experts"):
+        out += quants_of(QuantClass.MXFP4)
+    return (*out, *(q for q in stored_quants() if q not in out))
+
+
+def derived_gguf() -> list[tuple[str, Quant]]:
+    """every (stem, type) GGUF twin derived from the committed fixtures, the float, affine and MXFP4 ones (written
+    from a checkpoint) before the types written from them"""
+    twins = [
+        (stem, q)
+        for stem in FIXTURE_STEM.values()
+        for q in gguf_quants(stem)
+        if not (stem == CONVERTED_STEM and q in CONVERTED_QUANTS)
+    ]
+    return sorted(twins, key=lambda t: t[1] not in CONVERTED_QUANTS)
 
 
 def quant_of_gguf(fname: str) -> Quant | None:
@@ -342,24 +398,30 @@ def fused_step(kind: FamilyKind) -> bool:
 
 
 def mlx_compute_tag(kind: FamilyKind, *, fused: bool) -> PassTag:
-    """the MLX compute tag a step-path pass must show: a hybrid family runs the DeltaNet forward, a MoE family
-    the per-op host path, and the rest the step - fused where the layout and the bf16 state allow it."""
+    """the MLX compute tag a step-path pass must show, by the engine's own order (`Family.mlx_path`): a MoE family -
+    a hybrid one too - the per-op host path, a hybrid family the DeltaNet forward, and the rest the step - fused
+    where the layout and the bf16 state allow it."""
     fl = core.flags(kind)
+    if Cap.MOE in fl:
+        return PassTag.MLX_PEROP  # its experts are picked on the host between layers: no fused step, no hybrid graph
     if Cap.HYBRID in fl:
         return PassTag.MLX_HYBRID
-    if Cap.MOE in fl:
-        return PassTag.MLX_PEROP  # MoE has no fused step; its layers run the per-op host path on MLX
     return PassTag.MLX_STEP_FUSED if fused and fused_step(kind) else PassTag.MLX_STEP_UNFUSED
 
 
-def _quant_tag(storage: Storage) -> PassTag:
-    """the stored-weight tag an as-stored MLX run must show: a float GGUF has no packed kernel, so it binds a
-    bf16 slot even with gguf_packed on, and an MXFP4 GGUF's weight is the expert block - it never reaches
-    `mlx_state.affine`, so what the run proves is the expert store's as-stored MXFP4 matvec (host.py:317)."""
+def packed_tag(storage: Storage, quant: Quant | None) -> PassTag:
+    """the stored-weight tag an as-stored run of a file of type `quant` must show, on any tier: the type's own
+    (`kinds.quant_tag`) where a linear's gemv multiplies its blocks; a float GGUF has no such kernel, so it binds a
+    bf16 slot even with gguf_packed on; and an MXFP4 GGUF's weight is the expert block, so what the run proves is
+    the expert store's as-stored MXFP4 matvec (host.py:317)."""
     qc = quant_class(storage)
     if qc is QuantClass.MXFP4:
         return PassTag.EXPERT_MXFP4_ASSTORED
-    return PassTag.QUANT_DEQUANT if qc in (None, QuantClass.FLOAT) else PassTag.QUANT_ASSTORED
+    if qc in (None, QuantClass.FLOAT):
+        return PassTag.QUANT_DEQUANT
+    if quant is None or quant not in STORAGE[storage].quants:
+        raise ValueError(f"{storage.value} names several stored types; a cell asks for its file's own, not {quant}")
+    return quant_tag(quant)
 
 
 def residency_tag(kind: FamilyKind, knobs: dict[str, object]) -> PassTag | None:
@@ -381,53 +443,113 @@ def storage_tag(storage: Storage, hw: Hardware) -> PassTag | None:
 
 # the head widths the card's paged attention kernels are built for (btb/engine/prefix.py CARD_HEAD_DIMS)
 CARD_HEAD_DIMS = (64, 128, 256)
+# the megakernel's head multiple (btb/mlx/mega.py: `self.hd % 64`), which test_manifest holds against its source
+MEGA_HEAD_MULTIPLE = 64
 
 
-def paged(kind: FamilyKind, hw: Hardware, knobs: dict[str, object] | None = None) -> bool:
-    """whether the prefix cache serves the family on this hardware and with these load options - its attention
-    reading every one-sequence cache through the pages - by the engine's own rule (`PrefixCache.why_not`), in its
-    order: the host's tier and the card's, not MLX's yet (a hybrid's recurrent layers resumed from its snapshots on
-    both); not a family's own layer (Qwen4) or its own attention module (gpt-oss); on the card, heads its kernels take
-    and bf16 compute (`fp32` keeps the card's layers wider than its kernels read)"""
+class MegaRefusal(StrEnum):
+    """why MLX's megakernel cannot take a family's fixture in a storage (`mega_refusal`)"""
+
+    LAYOUT = "layout"
+    STORAGE = "storage"
+    SHAPE = "shape"
+
+
+def mega_refusal(kind: FamilyKind, storage: Storage, packed: bool = True) -> MegaRefusal | None:
+    """why the megakernel cannot take this family's fixture in this storage, by the engine's own gates, in their
+    order: the family's block (`Family.mega`: the kernel layout, not the sandwich's), the weights it reads out of slot
+    buffers (a GGUF's quant blocks bound as stored under `packed`, `mlx_state.affine`, and the 12-bit store's packed
+    weights fall to the step; blocks dequantized on load are bf16 slots it reads), then the head width"""
     fl = core.flags(kind)
+    if Cap.KERNEL_LAYOUT not in fl or Cap.SANDWICH in fl:
+        return MegaRefusal.LAYOUT
+    qc = quant_class(storage)
+    if STORAGE[storage].container is Container.PACK12 or (packed and qc not in (None, QuantClass.FLOAT)):
+        return MegaRefusal.STORAGE
+    hd = head_dim(kind)
+    if hd is None or hd % MEGA_HEAD_MULTIPLE:
+        return MegaRefusal.SHAPE
+    return None
+
+
+def mega_serves(kind: FamilyKind, storage: Storage, knobs: dict[str, object] | None = None) -> bool:
+    """whether MLX's megakernel takes a load's passes (`_mega_serves`): its knob on (`mlx_mega`, on by default), a
+    bf16 state, and a family, storage and fixture it takes (`gguf_packed`, on by default, keeping a GGUF's blocks)"""
+    k = knobs or {}
+    packed = bool(k.get("gguf_packed", 1))
+    return bool(k.get("mlx_mega", 1)) and not k.get("fp32") and mega_refusal(kind, storage, packed) is None
+
+
+def paged(
+    kind: FamilyKind, hw: Hardware, knobs: dict[str, object] | None = None, storage: Storage = Storage.SAFE_BF16
+) -> bool:
+    """whether the prefix cache serves the family on this hardware, with these load options and this storage - its
+    attention reading every one-sequence cache through the pages - by the engine's own rule (`PrefixCache.why_not`):
+    the host's tier, MLX's (not where its megakernel serves, which reads arenas of its own, nor int8 rows) and the
+    card's (heads its kernels take, bf16 compute: `fp32` keeps the card's layers wider than its kernels read), a
+    hybrid's recurrent layers resumed from its snapshots on each; not a family's own layer (Qwen4) or its own attention
+    module (gpt-oss)"""
+    fl = core.flags(kind)
+    k = knobs or {}
     if hw is Hardware.CUDA:
         hd = head_dim(kind)
-        tier = not (knobs or {}).get("fp32") and (hd is None or hd in CARD_HEAD_DIMS)
+        tier = not k.get("fp32") and (hd is None or hd in CARD_HEAD_DIMS)
+    elif hw is Hardware.MLX:
+        tier = not k.get("kv_bits") and not mega_serves(kind, storage, k)
     else:
         tier = hw is Hardware.CPU
     return tier and Cap.OWN not in fl and Cap.FAST in fl
 
 
-def kv_tag(kind: FamilyKind, hw: Hardware, knobs: dict[str, object] | None = None) -> PassTag:
+def kv_tag(
+    kind: FamilyKind, hw: Hardware, knobs: dict[str, object] | None = None, storage: Storage = Storage.SAFE_BF16
+) -> PassTag:
     """the reader a cell's attention must take its cache rows through: the engine's pool of pages where the prefix
     cache serves the family there (`paged`), else each conversation's own contiguous buffers - the line that flips
     per tier as each lands, so a receipt banked on the old reader stops proving the cell"""
-    return PassTag.KV_PAGED if paged(kind, hw, knobs) else PassTag.KV_CONTIGUOUS
+    return PassTag.KV_PAGED if paged(kind, hw, knobs, storage) else PassTag.KV_CONTIGUOUS
 
 
-def expert_tag(kind: FamilyKind, storage: Storage) -> PassTag | None:
+def expert_tag(kind: FamilyKind, storage: Storage, hw: Hardware, packed: bool) -> PassTag | None:
     """the stored form a MoE family's experts must be multiplied in where the storage decides it, or None: an FP8
     twin stores its fused expert tensors e4m3, multiplied as stored on every tier (MLX has no FP8 matvec, and a
     card's few-row pass takes the host's kernels) - except where the family's experts are MXFP4 in every
     checkpoint (gpt-oss): the twin keeps their packed blocks as they are, so it is an FP8 trunk over MXFP4
-    experts, and its cells assert the experts it has. `storage_tag`'s FP8 tag alone would pass on the trunk."""
+    experts, and its cells assert the experts it has. `storage_tag`'s FP8 tag alone would pass on the trunk.
+    A GGUF's are MXFP4 for such a family and in an MXFP4 file; another stored type's are read as stored under
+    `packed` (`gguf_packed`) off the card and dequantized on read otherwise (model.py `stored_experts`). A float
+    file's are held as stored there too (`kinds.EXPERT_FLOATS`), its type's tag the proof: no dense float linear
+    records it, only the store's expert kernel."""
     fl = core.flags(kind)
-    if storage is not Storage.SAFE_FP8 or Cap.MOE not in fl:
+    if Cap.MOE not in fl:
         return None
-    return PassTag.EXPERT_MXFP4_ASSTORED if Cap.MXFP4 in fl else PassTag.EXPERT_FP8_ASSTORED
+    if storage is Storage.SAFE_FP8:
+        return PassTag.EXPERT_MXFP4_ASSTORED if Cap.MXFP4 in fl else PassTag.EXPERT_FP8_ASSTORED
+    qc = quant_class(storage)
+    if STORAGE[storage].container is not Container.GGUF:
+        return None
+    if Cap.MXFP4 in fl or qc is QuantClass.MXFP4:
+        return PassTag.EXPERT_MXFP4_ASSTORED
+    if qc in STORED_CLASSES:
+        return PassTag.EXPERT_QUANT_ASSTORED if packed and hw is not Hardware.CUDA else PassTag.EXPERT_QUANT_DEQUANT
+    if qc is QuantClass.FLOAT:
+        # else its bf16 read as a float checkpoint's, nothing widened
+        return quant_tag(STORAGE[storage].quants[0]) if packed and hw is not Hardware.CUDA else None
+    return None
 
 
 @dataclass(frozen=True)
 class DeviceSubpath:
     """one set of engine branches, named by `key` and selected by `knobs` (every one a real `options.KNOWN`
     load option). `expect` is the PassTag a run of this sub-path MUST carry for the cell to count - it travels
-    with the sub-path so the runner cannot assert the wrong tag, or none, by mis-spelling a key. `only` names
-    the container whose knob this is, `needs` the family capability it acts on: without either the knob is a
-    no-op and the run is not distinct."""
+    with the sub-path so the runner cannot assert the wrong tag, or none, by mis-spelling a key; it is asked for
+    a family, a storage and the cell's file's stored type (None off GGUF). `only` names the container whose knob
+    this is, `needs` the family capability it acts on: without either the knob is a no-op and the run is not
+    distinct."""
 
     key: str
     hardware: Hardware
-    expect: Callable[[FamilyKind, Storage], PassTag]
+    expect: Callable[[FamilyKind, Storage, Quant | None], PassTag]
     knobs: dict[str, object] = field(default_factory=dict)
     note: str = ""
     only: Container | None = None
@@ -445,51 +567,78 @@ class DeviceSubpath:
         # the host, the card's path never run. How btb yields is test_never_oom's to hold, not a cell's
         object.__setattr__(self, "knobs", {**self.knobs, "adapt": 0})
 
-    def expects(self, kind: FamilyKind, storage: Storage) -> frozenset[PassTag]:
-        """every tag a run of this cell must carry: the sub-path's own, the reader its attention takes the cache's
-        rows through (`kv_tag`), the residency policy this cell's own knobs select where the family has an expert
-        store - so the default's Bus Pass is asserted too - and the storage's own read where it leaves one
-        (`storage_tag`), and the form a MoE family's experts take there (`expert_tag`)."""
-        extra = (residency_tag(kind, self.knobs), storage_tag(storage, self.hardware), expert_tag(kind, storage))
+    def expects(self, kind: FamilyKind, storage: Storage, quant: Quant | None = None) -> frozenset[PassTag]:
+        """every tag a run of this cell must carry - `quant` the stored type of its GGUF file: the sub-path's own,
+        the reader its attention takes the cache's rows through (`kv_tag`), the residency policy this cell's own
+        knobs select where the family has an expert store - so the default's Bus Pass is asserted too - and the
+        storage's own read where it leaves one (`storage_tag`), and the form a MoE family's experts take there
+        (`expert_tag`)."""
+        packed = bool(self.knobs.get("gguf_packed", 1))
+        experts = expert_tag(kind, storage, self.hardware, packed)
+        extra = (residency_tag(kind, self.knobs), storage_tag(storage, self.hardware), experts)
         return frozenset(
-            {self.expect(kind, storage), kv_tag(kind, self.hardware, self.knobs), *(t for t in extra if t is not None)}
+            {
+                self.expect(kind, storage, quant),
+                kv_tag(kind, self.hardware, self.knobs, storage),
+                *(t for t in extra if t is not None),
+            }
         )
 
 
 # device sub-paths, not devices: each a distinct set of branches
 DEVICE_SUBPATHS: tuple[DeviceSubpath, ...] = (
     DeviceSubpath(
-        "cpu", Hardware.CPU, lambda k, s: PassTag.CPU_NATIVE, {"device": "cpu"}, "fp32 over bf16, native gemv"
+        "cpu", Hardware.CPU, lambda k, s, q: PassTag.CPU_NATIVE, {"device": "cpu"}, "fp32 over bf16, native gemv"
     ),
     DeviceSubpath(
         "cpu-headstream",
         Hardware.CPU,
-        lambda k, s: PassTag.HEAD_STREAMED,
+        lambda k, s, q: PassTag.HEAD_STREAMED,
         {"device": "cpu", "resident_head": 0},
         "the head read from the checkpoint per pass instead of held",
     ),
     DeviceSubpath(
         "cpu-riders",
         Hardware.CPU,
-        lambda k, s: PassTag.EXPERT_LINE,
+        lambda k, s, q: PassTag.EXPERT_LINE,
         {"device": "cpu", "bus_pass": 0},
         "the expert store's plain line instead of the default Bus Pass",
         needs=Cap.MOE,
     ),
     DeviceSubpath(
-        "mlx-mega", Hardware.MLX, lambda k, s: PassTag.MLX_MEGA, {"device": "mlx"}, "fused megakernel (qwen3's layout)"
+        "cpu-packed",
+        Hardware.CPU,
+        lambda k, s, q: packed_tag(s, q),
+        {"device": "cpu", "gguf_packed": 1},
+        "GGUF blocks as stored, each type's native gemv",
+        Container.GGUF,
+    ),
+    DeviceSubpath(
+        "cpu-dequant",
+        Hardware.CPU,
+        lambda k, s, q: PassTag.QUANT_DEQUANT,
+        {"device": "cpu", "gguf_packed": 0},
+        "GGUF dequantized to bf16",
+        Container.GGUF,
+    ),
+    DeviceSubpath(
+        "mlx-mega",
+        Hardware.MLX,
+        lambda k, s, q: PassTag.MLX_MEGA,
+        {"device": "mlx"},
+        "fused megakernel (qwen3's layout)",
     ),
     DeviceSubpath(
         "mlx-step",
         Hardware.MLX,
-        lambda k, s: mlx_compute_tag(k, fused=True),
+        lambda k, s, q: mlx_compute_tag(k, fused=True),
         {"device": "mlx", "mlx_mega": 0},
         "the per-token graph, megakernel off",
     ),
     DeviceSubpath(
         "mlx-attn-kernel",
         Hardware.MLX,
-        lambda k, s: PassTag.MLX_ATTN_KERNEL,
+        lambda k, s, q: PassTag.MLX_ATTN_KERNEL,
         {"device": "mlx", "mlx_mega": 0, "v_max": 4},
         "the engine's attention kernels over the cache buffers, where the head size routes a decode row to them "
         "(speculation on at load sends every row, however short the cache)",
@@ -497,15 +646,15 @@ DEVICE_SUBPATHS: tuple[DeviceSubpath, ...] = (
     DeviceSubpath(
         "mlx-packed",
         Hardware.MLX,
-        lambda k, s: _quant_tag(s),
+        lambda k, s, q: packed_tag(s, q),
         {"device": "mlx", "gguf_packed": 1},
-        "GGUF blocks as stored",
+        "GGUF blocks as stored, each type's Metal kernel",
         Container.GGUF,
     ),
     DeviceSubpath(
         "mlx-dequant",
         Hardware.MLX,
-        lambda k, s: PassTag.QUANT_DEQUANT,
+        lambda k, s, q: PassTag.QUANT_DEQUANT,
         {"device": "mlx", "gguf_packed": 0},
         "GGUF dequantized to bf16",
         Container.GGUF,
@@ -513,21 +662,21 @@ DEVICE_SUBPATHS: tuple[DeviceSubpath, ...] = (
     DeviceSubpath(
         "mlx-kvbits",
         Hardware.MLX,
-        lambda k, s: mlx_compute_tag(k, fused=True),
+        lambda k, s, q: mlx_compute_tag(k, fused=True),
         {"device": "mlx", "mlx_mega": 0, "kv_bits": 8},
         "int8 KV rows",
     ),
     DeviceSubpath(
         "mlx-fp32",
         Hardware.MLX,
-        lambda k, s: mlx_compute_tag(k, fused=False),
+        lambda k, s, q: mlx_compute_tag(k, fused=False),
         {"device": "mlx", "fp32": 1},
         "fp32 compute: the fused kernels take a bf16 state, so the step runs unfused",
     ),
     DeviceSubpath(
         "mlx-riders",
         Hardware.MLX,
-        lambda k, s: PassTag.EXPERT_LINE,
+        lambda k, s, q: PassTag.EXPERT_LINE,
         {"device": "mlx", "bus_pass": 0},
         "the expert store's plain line instead of the default Bus Pass",
         needs=Cap.MOE,
@@ -535,7 +684,7 @@ DEVICE_SUBPATHS: tuple[DeviceSubpath, ...] = (
     DeviceSubpath(
         "cuda-graph",
         Hardware.CUDA,
-        lambda k, s: PassTag.CUDA_GRAPH,
+        lambda k, s, q: PassTag.CUDA_GRAPH,
         {"device": "cuda"},
         "card step graph",
         card_graph=True,
@@ -543,21 +692,21 @@ DEVICE_SUBPATHS: tuple[DeviceSubpath, ...] = (
     DeviceSubpath(
         "cuda-torch",
         Hardware.CUDA,
-        lambda k, s: PassTag.CUDA_TORCH_FALLBACK,
+        lambda k, s, q: PassTag.CUDA_TORCH_FALLBACK,
         {"device": "cuda", "fp32": 1},
         "fp32 compute: the card kernels are bf16's, so every layer runs the torch modules",
     ),
     DeviceSubpath(
         "cuda-split",
         Hardware.CUDA,
-        lambda k, s: PassTag.TIER_HOST,
+        lambda k, s, q: PassTag.TIER_HOST,
         {"device": "cuda", "cpu_layers": 1},
         "cpu/card split",
     ),
     DeviceSubpath(
         "cuda-prefill",
         Hardware.CUDA,
-        lambda k, s: PassTag.PREFILL_CARD,
+        lambda k, s, q: PassTag.PREFILL_CARD,
         {"device": "cuda", "cpu_layers": 1, "prefill_chunk": 64},
         "a long prompt's host layers prefilled on the card a 64-row chunk at a time (a chunk reaches the card's "
         "row floor, `Native.gemm_rows`): a mixture layer by layer, its experts grouped on the card",
@@ -566,24 +715,40 @@ DEVICE_SUBPATHS: tuple[DeviceSubpath, ...] = (
     DeviceSubpath(
         "cuda-kvhost",
         Hardware.CUDA,
-        lambda k, s: PassTag.CUDA_TORCH_FALLBACK,
+        lambda k, s, q: PassTag.CUDA_TORCH_FALLBACK,
         {"device": "cuda", "kv_host": 1},
         "KV in host RAM, which the card graph cannot read (cuda.py:303)",
     ),
     DeviceSubpath(
         "cuda-riders",
         Hardware.CUDA,
-        lambda k, s: PassTag.EXPERT_LINE,
+        lambda k, s, q: PassTag.EXPERT_LINE,
         {"device": "cuda", "bus_pass": 0},
         "the expert store's plain line instead of the default Bus Pass",
         needs=Cap.MOE,
+    ),
+    DeviceSubpath(
+        "cuda-packed",
+        Hardware.CUDA,
+        lambda k, s, q: packed_tag(s, q),
+        {"device": "cuda", "gguf_packed": 1},
+        "GGUF blocks as stored on the card, each type's gemv kernel",
+        Container.GGUF,
+    ),
+    DeviceSubpath(
+        "cuda-dequant",
+        Hardware.CUDA,
+        lambda k, s, q: PassTag.QUANT_DEQUANT,
+        {"device": "cuda", "gguf_packed": 0},
+        "GGUF dequantized to bf16",
+        Container.GGUF,
     ),
     # torch's ROCm build answers to device "cuda"; the tag is the torch modules', the only path such a run could
     # take, and never asserted while the hardware is in NO_BACKEND
     DeviceSubpath(
         "rocm",
         Hardware.ROCM,
-        lambda k, s: PassTag.CUDA_TORCH_FALLBACK,
+        lambda k, s, q: PassTag.CUDA_TORCH_FALLBACK,
         {"device": "cuda"},
         "an AMD card through torch's ROCm build",
     ),
@@ -665,7 +830,7 @@ def prefill_tags(kind: FamilyKind, dev: DeviceSubpath) -> frozenset[PassTag]:
     if not dev.long_prompt:
         return frozenset()
     fl = core.flags(kind)
-    out = {dev.expect(kind, Storage.SAFE_BF16)}
+    out = {dev.expect(kind, Storage.SAFE_BF16, None)}
     if Cap.MOE in fl:
         out.add(PassTag.EXPERT_CARD_GROUPED)
         if Cap.MXFP4 in fl:
@@ -777,6 +942,15 @@ def totality_problems() -> list[str]:
     for q in Quant:
         if q not in bound:
             problems.append(f"{q.value!r} has no Storage member; a new stored type needs one to be certified")
+    # one tag a type a linear or an expert multiplies as stored, and no other "quant_" tag but the bf16 slot's
+    tagged = {t for t in PassTag if t.value.startswith("quant_") and t is not PassTag.QUANT_DEQUANT}
+    for q in expert_quants():
+        try:
+            tagged.discard(quant_tag(q))
+        except ValueError:
+            problems.append(f"{q.value!r} is multiplied as stored but kinds.PassTag has no {q.value.lower()} tag")
+    for t in sorted(tagged):
+        problems.append(f"PassTag {t.value!r} names no stored type kinds.expert_quants() holds")
     for s in Storage:
         if s not in STORAGE:
             problems.append(f"{s.value!r} has no STORAGE row")

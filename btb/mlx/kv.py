@@ -15,6 +15,8 @@ from .core import mx
 if TYPE_CHECKING:
     import mlx.core as mx_
 
+    from .core import MetalKernel
+
 _STORE_SRC = """
     // rows [Hk, T, D] (16-bit) written into buf [1, Hk, cap, D] from row n0[0], in place
     uint i = thread_position_in_grid.x;
@@ -26,8 +28,24 @@ _STORE_SRC = """
     if (i == 0) done[0] = 1u;
 """
 
+_SCATTER_SRC = """
+    // a pass's K and V rows [1, Hk, T, D] written into kb / vb [1, Hk, cap, D] (all of the buffers' dtype E) at rows
+    // at[0..T), in place: a paged cache's rows where its table puts them, K's threads first, then V's
+    uint i = thread_position_in_grid.x;
+    uint Hk = k_shape[1], T = k_shape[2], D = k_shape[3];
+    uint cap = kb_shape[2];
+    uint n = Hk * T * D;
+    if (i >= 2 * n) return;
+    uint e = i < n ? i : i - n;
+    uint h = e / (T * D), r = (e / D) % T, c = e % D;
+    size_t o = ((size_t)h * cap + at[r]) * D + c;
+    if (i < n) ((device E*)kb)[o] = k[e]; else ((device E*)vb)[o] = v[e];
+    if (i == 0) done[0] = 1u;
+"""
+
 _lock = threading.Lock()
-_store_kernel = None
+_store_kernel: MetalKernel | None = None
+_scatter_kernel: MetalKernel | None = None
 
 
 def kv_store(buf: mx_.array, rows: mx_.array, n0: int) -> mx_.array:
@@ -44,6 +62,34 @@ def kv_store(buf: mx_.array, rows: mx_.array, n0: int) -> mx_.array:
     return _store_kernel(
         inputs=[buf.view(m.uint16), rows.astype(buf.dtype).view(m.uint16), at],
         grid=(int(rows.size), 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(1,)],
+        output_dtypes=[m.uint32],
+    )[0]
+
+
+def kv_scatter(kb: mx_.array, vb: mx_.array, k: mx_.array, v: mx_.array, at: mx_.array) -> mx_.array:
+    """`k`/`v` [1, Hk, T, D] into `kb`/`vb` [1, Hk, cap, D] at rows `at` (uint32 [T]), in the buffers' dtype, through
+    their own bytes, in one launch. Returns the kernel's flag to evaluate: the write has no graph edge, and MLX orders
+    no read of the buffers in the same evaluation after it (`mx.depends` neither), so the rows are read by a later
+    one"""
+    global _scatter_kernel
+    m = mx()
+    with _lock:
+        if _scatter_kernel is None:
+            _scatter_kernel = m.fast.metal_kernel(
+                name="btb_kv_scatter",
+                input_names=["kb", "vb", "k", "v", "at"],
+                output_names=["done"],
+                source=_SCATTER_SRC,
+            )
+    # a cast of rows already in the buffers' dtype is a copy of its own (MLX's astype makes one)
+    k = k if k.dtype == kb.dtype else k.astype(kb.dtype)
+    v = v if v.dtype == vb.dtype else v.astype(vb.dtype)
+    return _scatter_kernel(
+        inputs=[kb, vb, k, v, at],
+        template=[("E", kb.dtype)],
+        grid=(2 * int(k.size), 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(1,)],
         output_dtypes=[m.uint32],

@@ -18,7 +18,7 @@ import torch
 
 from btb.engine import StreamedTextModel, generate
 from btb.engine.cache import indexer_keys
-from btb.engine.experts import ExpertProfile
+from btb.engine.experts import ExpertProfile, part_reads
 from btb.engine.families.qwen4.drafter import Qwen4Drafter
 from btb.engine.host import _Experts
 from btb.kinds import Proposer
@@ -154,7 +154,8 @@ def test_the_drafter_reads_its_experts_through_the_store_and_its_speculation_is_
             # the drafter's calls were the store's: its layer's picks recorded under L, its recipe read from mtp.*
             assert any(layer == L for layer, _picks in sm.expert_trace), "the drafter's layer never called the store"
             shard = sm.weight_map["mtp.layers.0.mlp.experts.gate_up_proj"]
-            assert L in store.recipes and os.path.basename(store.recipes[L][0][0]) == os.path.basename(shard)
+            assert L in store.recipes
+            assert os.path.basename(part_reads(store.recipes[L][0], 0)[0][0]) == os.path.basename(shard)
             assert any(key[0] == L for key in store.rides), "no expert of the drafter's layer rode the store"
             # the profile's calls are the trace's, one for one: the layer, the rows, and every row's picks
             calls = prof.a[: prof.n][prof.a[: prof.n, 2] == prof.CALL]

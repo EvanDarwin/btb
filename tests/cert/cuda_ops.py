@@ -26,6 +26,8 @@ from enum import StrEnum
 from types import ModuleType
 from typing import TypeGuard
 
+from btb.kinds import quant_key, stored_quants
+
 from .core import BTB_SRC
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -180,15 +182,33 @@ def temp_pointers(sources: list[tuple[str, ast.Module]] | None = None) -> list[s
     return out
 
 
+def _by_type(node: ast.JoinedStr) -> set[str]:
+    """the names an f-string spells over every stored GGUF type where its one hole is the type's key
+    (`f"btb_gemv_{quant_key(w.q)}_bf16"`: a type's launcher picked by its key), else none"""
+    holes = [v for v in node.values if isinstance(v, ast.FormattedValue)]
+    if len(holes) != 1 or not isinstance(holes[0].value, ast.Call):
+        return set()
+    fn = holes[0].value.func
+    if (fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)) != quant_key.__name__:
+        return set()
+    return {
+        "".join(str(v.value) if isinstance(v, ast.Constant) else quant_key(q) for v in node.values)
+        for q in stored_quants()
+    }
+
+
 def reached_launchers(sources: list[tuple[str, ast.Module]] | None = None) -> set[str]:
     """the launchers btb/ reaches: each named as a function (`btb_silu_mul(k, ...)`) or as the card module's method
     (`k.btb_silu_mul(...)`), called there or picked and called later (`glu = k.btb_gemv_mma_glu_gelu if gelu else
-    k.btb_gemv_mma_glu_silu`)"""
+    k.btb_gemv_mma_glu_silu`), or a stored type's picked by its key (`_by_type`)"""
     sources = _sources(BTB_SRC) if sources is None else sources
     names = set(launchers())
     out: set[str] = set()
     for _, tree in sources:
         for node in ast.walk(tree):
+            if isinstance(node, ast.JoinedStr):
+                out |= _by_type(node) & names
+                continue
             name = node.attr if isinstance(node, ast.Attribute) else node.id if isinstance(node, ast.Name) else None
             if name in names:
                 out.add(name)

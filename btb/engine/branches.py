@@ -10,7 +10,7 @@ import time
 from abc import abstractmethod
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Self, cast
+from typing import TYPE_CHECKING, Self, TypeAlias
 
 import torch
 from transformers.cache_utils import DynamicCache
@@ -35,6 +35,7 @@ from .cache import (
 )
 from .generate import lin_layer
 from .hooks import Hooks, LogitsProcessor, OnPass, OnRowToken, Taps
+from .paged import PagedCache, PagedLayer
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -44,12 +45,11 @@ if TYPE_CHECKING:
     from .cache import CacheLayer, KvCache
     from .generate import LinLayer, LinSnap
     from .model import StreamedTextModel
-    from .paged import PagedCache, PagedLayer
     from .text import BatchGeneration
 
     # a row's own attention rows taken out of the batch: a fork's torch (k, v[, indexer keys]), or the MLX step
     # buffer's slices (k, v[, their int8 scales])
-    RowKV = tuple[torch.Tensor, ...] | list[mx_.array]
+    RowKV: TypeAlias = tuple[torch.Tensor, ...] | list[mx_.array]
 
 
 @dataclass
@@ -112,13 +112,14 @@ class _Rows:
         self.mode = "fork"
 
     def _rows_ok(self, sessions: Sequence[Session], B: int) -> bool:
-        """the MLX batched decode takes these rows: a dense family, every attention layer an MLX buffer"""
+        """the MLX batched decode takes these rows: a dense family, every attention layer an MLX buffer or a paged
+        layer in the pool's MLX regions"""
         eng = self.eng
         return bool(
             getattr(eng, "mlx", None) is not None
             and eng._mlx_batch_ok(max(2, B), None, False)
             and all(
-                isinstance(cl, GrowLayer) and cl.shared and cl._mx is not None
+                (isinstance(cl, GrowLayer) and cl.shared and cl._mx is not None) or _mlx_paged(cl) is not None
                 for s in sessions
                 for i, cl in enumerate(_cache_of(s).layers)
                 if eng.layer_types[i] != LayerKind.LINEAR
@@ -132,8 +133,8 @@ class _Rows:
         """the rows' own cache, its layers the parent's until the fork's replace them. A paged session's is a plain
         one: copied, it kept the session's table and read as paged - priced as the table's growth, bound to the table
         every step (parking another conversation's pages for it), its own rows never counted"""
-        if getattr(parent, "paged", False):
-            cache = DynamicCache(config=cast("PagedCache", parent).prefix.cfg)
+        if isinstance(parent, PagedCache):
+            cache = DynamicCache(config=parent.prefix.cfg)
         else:
             cache = copy.copy(parent)
         cache.layers = list(parent.layers)
@@ -531,14 +532,16 @@ class _Rows:
         off = self._off_route
 
         def write(cache: KvCache) -> None:
-            if off and getattr(cache, "paged", False):
+            if off and isinstance(cache, PagedCache):
                 # the row's own rows made through the torch pass, other bits than a step's: the session reads them,
                 # the tree is never given them - a prompt opening on them decoded otherwise than the same prompt cold
-                pc = cast("PagedCache", cache)
-                pc.off_route(len(pc.table))
+                cache.off_route(len(cache.table))
             for i, kv in row.kv.items():
                 pl = cache.layers[i]
-                if isinstance(kv, list):
+                if isinstance(kv, list) and isinstance(pl, PagedLayer):
+                    # the MLX step buffer's slices onto a paged session's table, in pages of its own
+                    pl.append(mlxdev.from_mx(kv[0]), mlxdev.from_mx(kv[1]))
+                elif isinstance(kv, list):
                     # the MLX step buffer's slices, into the session's MLX buffer
                     assert isinstance(pl, GrowLayer)
                     if pl.bits:
@@ -548,9 +551,9 @@ class _Rows:
                         k, v = kv[0], kv[1]
                     pl.mx_update(k, v)
                     mlxdev.mx().eval(*[x for x in pl._mx if x is not None])
-                elif getattr(pl, "paged", False):
+                elif isinstance(pl, PagedLayer):
                     # the row's own rows onto the session's table, in pages of its own
-                    cast("PagedLayer", pl).append(kv[0], kv[1])
+                    pl.append(kv[0], kv[1])
                 else:
                     assert isinstance(pl, CacheLayerMixin)
                     pl.update(kv[0], kv[1])
@@ -640,8 +643,12 @@ class Branches(_Rows):
             if eng.layer_types[i] == LayerKind.LINEAR:
                 cache.layers[i] = self._lin_layer([pl], B)
             elif rows_ok:
-                assert isinstance(pl, GrowLayer)
-                cache.layers[i] = self._alias(pl, B)
+                paged = _mlx_paged(pl)
+                if paged is not None:
+                    cache.layers[i] = self._alias_paged(paged, B)
+                else:
+                    assert isinstance(pl, GrowLayer)
+                    cache.layers[i] = self._alias(pl, B)
             elif card_ok:
                 continue  # every layer formed below, together, over the session's rows in the card's arena
             else:
@@ -672,6 +679,24 @@ class Branches(_Rows):
         cl._offs = [0] * B
         cl._mx = list(pl._mx)
         cl._shape, cl._b, cl._ptr = pl._shape, 1, pl._ptr
+        cl._ns = [P] * B
+        cl.select_row(None)
+        return cl
+
+    @staticmethod
+    def _alias_paged(pl: PagedLayer, B: int) -> GrowLayer:
+        """`_alias` over a paged session's rows: the pool's MLX regions read through the session's row map, every row
+        the same prefix, a copy of none"""
+        P = int(pl.n)
+        k, v, rows = _page_rows(pl)
+        cl = GrowLayer(shared=True)
+        empty = torch.empty(0, dtype=pl.pool.host.dtype)
+        cl.lazy_initialization(empty, empty)
+        cl.batch_rows(B, dec_cap=256, lens=[P] * B)
+        cl._offs = [0] * B
+        cl._mx = [k, v]
+        cl._rmap = rows
+        cl._shape, cl._b = tuple(int(x) for x in k.shape), 1
         cl._ns = [P] * B
         cl.select_row(None)
         return cl
@@ -801,9 +826,7 @@ class Batch(_Rows):
             if eng.layer_types[i] == LayerKind.LINEAR:
                 cache.layers[i] = self._lin_layer(pls, B)
             elif rows_ok:
-                grows = [pl for pl in pls if isinstance(pl, GrowLayer)]
-                assert len(grows) == len(pls)
-                cache.layers[i] = self._flat(grows, lens)
+                cache.layers[i] = self._flat(pls, lens)
             elif card_ok:
                 continue  # every layer formed below, together: the sessions' rows end to end in the card's arena
             else:
@@ -846,20 +869,31 @@ class Batch(_Rows):
         self._pend = None
 
     @staticmethod
-    def _flat(pls: list[GrowLayer], lens: list[int]) -> GrowLayer:
-        """the MLX batched layer: the sessions' rows end to end in one flat buffer, a copy"""
+    def _flat(pls: list[CacheLayer], lens: list[int]) -> GrowLayer:
+        """the MLX batched layer: the sessions' rows end to end in one flat buffer, a copy - a paged session's
+        gathered out of the pool's MLX regions through its row map"""
         m = mlxdev.mx()
+        srcs: list[list[mx_.array]] = []
         for pl in pls:
-            pl._apply_overrides()
-        p0 = pls[0]
-        cl = GrowLayer(shared=True, bits=p0.bits)
-        empty = torch.empty(0, dtype=p0.dtype)
+            paged = _mlx_paged(pl)
+            if paged is not None:
+                k, v, rows = _page_rows(paged)
+                srcs.append([m.take(k, rows[: paged.n], axis=2), m.take(v, rows[: paged.n], axis=2)])
+            else:
+                assert isinstance(pl, GrowLayer)
+                pl._apply_overrides()
+                srcs.append(list(pl._mx))
+        p0, k0 = pls[0], srcs[0][0]
+        bits = p0.bits if isinstance(p0, GrowLayer) else None
+        dt = p0.dtype if isinstance(p0, GrowLayer) else mlxdev.torch_dtype(k0.dtype)
+        cl = GrowLayer(shared=True, bits=bits)
+        empty = torch.empty(0, dtype=dt)
         cl.lazy_initialization(empty, empty)
         cl.batch_rows(len(pls), dec_cap=256, lens=lens)
-        cl._ensure_flat(int(p0._shape[1]), int(p0._shape[-1]), p0.dtype)
-        for pl, off, n in zip(pls, cl._offs, lens):
-            for dst, src in zip(cl._mx, pl._mx):
-                dst[0:1, :, off : off + n] = src[0:1, :, :n]
+        cl._ensure_flat(int(k0.shape[1]), int(k0.shape[-1]), dt)
+        for src, off, n in zip(srcs, cl._offs, lens):
+            for dst, s in zip(cl._mx, src):
+                dst[0:1, :, off : off + n] = s[0:1, :, :n]
         m.eval(*cl._mx)
         cl._ns = list(lens)
         cl.select_row(None)
@@ -923,6 +957,24 @@ def _cache_of(s: Session) -> KvCache:
     if s.cache is None:
         raise ValueError("an empty session has nothing to decode: feed it a prompt first")
     return s.cache
+
+
+def _mlx_paged(cl: object) -> PagedLayer | None:
+    """`cl` where it is a paged layer whose rows lie in the pool's MLX regions (an MLX engine's), else None"""
+    if not isinstance(cl, PagedLayer):
+        return None
+    return cl if cl.pool.host.shared and cl.i in cl.pool.host.mk else None
+
+
+def _page_rows(pl: PagedLayer) -> tuple[mx_.array, mx_.array, mx_.array]:
+    """a paged layer's MLX regions (K, V) and its rows' places in them, uint32 (one entry at least: a kernel takes
+    no empty input)"""
+    import numpy as np
+
+    m = mlxdev.mx()
+    k, v = pl.pool.host.mx_view(pl.i)
+    rows = pl.table.rows()[: pl.n].numpy().astype(np.uint32)
+    return k, v, m.array(rows if len(rows) else np.zeros(1, np.uint32))
 
 
 def _index(slots: list[int], like: torch.Tensor) -> torch.Tensor:

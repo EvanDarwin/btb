@@ -30,6 +30,15 @@ vtune_*
 !tests/fixtures/**/*.json
 # the oracle's reference bank is a committed fixture (tests/cert/oracle.py), not a run artifact
 !tests/cert/oracle/bank.json
+# the GGUF twins derived from the committed fixtures (tests/cert/spec.py derived_gguf), written by a test run; only
+# tiny_q4's, llama.cpp's own converter's (spec.CONVERTED_QUANTS), are committed
+tests/fixtures/gguf/*.gguf
+!tests/fixtures/gguf/tiny_q4-bf16.gguf
+!tests/fixtures/gguf/tiny_q4-f16.gguf
+!tests/fixtures/gguf/tiny_q4-q4_0.gguf
+!tests/fixtures/gguf/tiny_q4-q4_1.gguf
+!tests/fixtures/gguf/tiny_q4-q8_0.gguf
+!tests/fixtures/gguf/tiny_q4-mxfp4.gguf
 
 # macOS
 **/.DS_Store

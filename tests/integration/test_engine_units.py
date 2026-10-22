@@ -23,7 +23,8 @@ from btb.engine import StreamedTextModel
 from btb.engine.cache import GrowLayer
 from btb.engine.device import where
 from btb.engine.generate import _chains_tree
-from btb.kinds import Json, LayerKind, TokenRows
+from btb.engine.host import _HostLinear
+from btb.kinds import Json, LayerKind, Quant, SlotKind, TokenRows, quant_tag
 from tests.cert import spec
 from tests.helpers import (
     NO_LOG,
@@ -1022,9 +1023,10 @@ def test_the_host_layers_take_a_bf16_activation_through_their_widened_modules(na
 
 
 def test_spec_budget_without_a_cost_curve_is_the_wider_of_the_tree_and_the_chain() -> None:
-    """The speculative loop caps a pass's rows at the budget; without the card's cost curve (the CPU and MLX
-    tiers) the budget must be the configured width, the chain's included: a tree budget of 0 with v_max 4 once
-    returned 1 and switched speculation off on every model without a drafting head."""
+    """The speculative loop caps a pass's rows at the budget; without a cost curve the budget must be the
+    configured width, the chain's included: a tree budget of 0 with v_max 4 once returned 1 and switched
+    speculation off on every model without a drafting head. With one, the drafts swim at the whole width before
+    what they return sizes the passes."""
     from btb.engine.cuda import _CudaMixin
     from btb.engine.families.base import Family
     from btb.kinds import FamilyKind
@@ -1034,13 +1036,19 @@ def test_spec_budget_without_a_cost_curve_is_the_wider_of_the_tree_and_the_chain
             self.tree_budget = tree_budget
             self.fam = Family(kind=FamilyKind.QWEN3)  # the plain block's: no bound on a pass's rows
 
-    assert _Engine(0)._spec_budget(1.0, 0, v_max=4) == 5, "a chain of four drafts and the root"
-    assert _Engine(16)._spec_budget(1.0, 0, v_max=4) == 17, "the tree's rows when wider"
-    assert _Engine(0)._spec_budget(1.0, 0) == 1, "nothing configured: one row"
+    assert _Engine(0)._spec_budget(v_max=4) == 5, "a chain of four drafts and the root"
+    assert _Engine(16)._spec_budget(v_max=4) == 17, "the tree's rows when wider"
+    assert _Engine(0)._spec_budget() == 1, "nothing configured: one row"
     e = _Engine(15)
     e._card_cost = {1: 1.0, 2: 1.1, 4: 1.2, 8: 1.6, 16: 2.0}
-    assert e._spec_budget(1.0, 1, v_max=4) == 4, "with a curve: the widest pass within a quarter over a step"
-    assert e._spec_budget(2.0, 1, v_max=4) == 16, "and wider while the passes yield the tokens to pay for it"
+    pc = e._spec_pricer(4)
+    for _ in range(pc.SWIM):
+        assert e._spec_budget(v_max=4) == 16, "with a curve, before the drafts have returned anything: the whole width"
+        pc.record_pass(16, 2.0, 0.0, 0.01)  # no draft accepted: one token
+    assert e._spec_budget(v_max=4) == 4, "then the widest pass within a quarter over a step"
+    for _ in range(3):
+        pc.record_pass(4, 1.2, 0.0, 0.01, accepted=("mtp",) * 3)  # every draft accepted: four tokens
+    assert e._spec_budget(v_max=4) == 16, "and wider while the passes yield the tokens to pay for it"
 
 
 def test_int8_linear_packs_in_memory_and_multiplies() -> None:
@@ -1385,23 +1393,27 @@ def test_every_native_kernel_refuses_a_dtype_it_was_not_built_for(monkeypatch: p
 @pytest.mark.parametrize("name", ["tiny_qwen3-f16", "tiny_qwen3-f32", "gguf/tiny_qwen3-q8_0.gguf"])
 def test_a_layer_shed_to_the_drive_off_a_weight_not_stored_as_bf16_answers_as_from_ram(name: str, device: str) -> None:
     """the cold ring over weights it cannot read off the drive as bf16: a cast twin's floats are read as stored
-    and rewritten as bf16 where they land ("cast"), a GGUF's Q8_0 blocks are taken from `_get` each pass
-    ("mem"). `_bind_cold` read such a tensor's key as a 12-bit record and raised when a busy machine shed a
-    layer mid-decode; shed under the decode's inference mode, the layer now answers as it did from RAM, and
-    regrown it still does"""
+    and rewritten as bf16 where they land (CAST); a GGUF's Q8_0 blocks are read off the drive as stored (QUANT),
+    the native kernels' and the Metal kernel's to read in the slot. `_bind_cold` read such a tensor's key as a
+    12-bit record and raised when a busy machine shed a layer mid-decode; shed under the decode's inference mode,
+    the layer now answers as it did from RAM, and regrown it still does - its blocks bound as stored again"""
     path = fixture(name)
     if device == "mlx":
         need_mlx()
+    gguf = name.startswith("gguf/")
     with loaded_model(path, device=device, v_max=0) as sm:
         before = sm.generate(REPEATING, 12, speculate=False).tokens
         with torch.inference_mode():
             i = sm.ram_shed("the test")
         assert i is not None and sm.cold == {i}
-        kind = "mem" if name.startswith("gguf/") else "cast"
-        assert {it[5] for it in sm.cold_ring.recipe[i]} == {kind}, "every linear of the shed layer is read cast"
+        kind = SlotKind.QUANT if gguf else SlotKind.CAST
+        assert {it.kind for it in sm.cold_ring.recipe[i]} == {kind}, f"every linear of the shed layer is read {kind}"
         during = sm.generate(REPEATING, 12, speculate=False).tokens
         assert during == before, "a layer read through the ring each pass answers as it did from RAM"
         assert sm.ram_regrow() == i and not sm.cold
+        if gguf:
+            lins = [m for m in sm.host[i].modules() if isinstance(m, _HostLinear)]
+            assert lins and all(m.stored_tag() is quant_tag(Quant.Q8_0) for m in lins), "not bound as stored again"
         after = sm.generate(REPEATING, 12, speculate=False).tokens
         assert after == before
 

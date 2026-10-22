@@ -19,8 +19,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from .hf import AFFINE_TYPES, is_gguf
-from .kinds import Log
+from .hf import is_gguf
+from .kinds import Log, stored_quants
 
 if TYPE_CHECKING:
     from .mlx import Shared
@@ -120,14 +120,19 @@ def _headers(model_dir: str) -> dict[str, tuple[str, list[int], int]]:
 
 def _gguf_sizes(path: str, packed: bool) -> list[int]:
     """`sizes_for` of a GGUF file off its tensor list (llama.cpp's names: `token_embd`, `output`, `blk.N.*`): the
-    2-D tensors as bf16, less those the packed kernels take as stored when `packed`"""
+    2-D tensors as bf16, less those a type's own gemv multiplies as stored when `packed` (kinds.stored_quants, a
+    matrix of whole blocks)"""
     import gguf
 
+    stored = {q.value for q in stored_quants()}
     al = lambda nb: (nb + ALIGN - 1) // ALIGN * ALIGN
     per: dict[int, int] = {}
     head = 0
     for t in gguf.GGUFReader(path).tensors:
-        if len(t.shape) != 2 or (packed and t.tensor_type.name in AFFINE_TYPES):
+        kind = t.tensor_type.name
+        if len(t.shape) != 2 or (
+            packed and kind in stored and int(t.shape[0]) % gguf.GGML_QUANT_SIZES[t.tensor_type][0] == 0
+        ):
             continue
         nb = 2 * int(t.n_elements)
         if t.name == "output.weight" or (t.name == "token_embd.weight" and not head):

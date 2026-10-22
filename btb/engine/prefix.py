@@ -8,7 +8,8 @@ between two turns leaves the conversation where it was, and a system prompt two 
 The rows of the layers the card runs lie on the card, in the reserved room the conversation the card decodes takes
 (`CardRegion`); the other conversations' rows of those layers stay there until their room is wanted, then wait in
 pinned RAM, least recently used first, until one of them is decoded again.
-The host's layers' rows lie in RAM (`HostRegion`). A layer moving between the two takes its rows along (`place`).
+The host's layers' rows lie in RAM (`HostRegion`), on an MLX engine in buffers MLX's kernels write and read in place.
+A layer moving between the two takes its rows along (`place`).
 
 `why_not(sm)` says why an engine has none yet, tier by tier as the phases land: the engine's sessions then keep the
 contiguous cache they always had, never a copied prefix.
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import weakref
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -30,6 +32,8 @@ from .radix import Match, RadixTree
 from .scheduler import MemoryGrantError
 
 if TYPE_CHECKING:
+    import mlx.core as mx_
+
     from .state import _State
 
 # the head widths the card's one attention is built for (btb_attn_flash.cuh: its prefill and decode forms)
@@ -44,6 +48,16 @@ def card_runs(sm: Any, i: int) -> bool:
         and i in sm.resident
         and not getattr(sm, "kv_host", False)
     )
+
+
+@dataclass
+class PassLists:
+    """what a pass reads a table's rows by, keyed by the pass's base and rows: the host's spans (rows, starts, ends)
+    and node lists (offs, idx) by its window too, the node lists by its parents; MLX's row maps (before, own)"""
+
+    spans: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = field(default_factory=dict)
+    nodes: dict[tuple[int, int, tuple[int, ...], int], tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
+    mlx: dict[tuple[int, int], tuple[mx_.array, mx_.array]] = field(default_factory=dict)
 
 
 class PrefixCache:
@@ -79,6 +93,7 @@ class PrefixCache:
             card_layers=card,
             dev=sm.dev if on_card else None,
             ceiling=ceiling,
+            shared=getattr(sm, "mlx", None) is not None,
         )
         self.grant = sched.grant if sched is not None else None
         self.tree = RadixTree(self.pool.pages)
@@ -88,18 +103,29 @@ class PrefixCache:
         self._held: dict[int, Table] = {}
         self._asking: Table | None = None
         self.tree.before = self.flush
-        # the row lists the host's attention reads a pass's rows by (`_CudaMixin._pass_lists`): the last conversation's
-        # alone - its table, the map's version they were made for, the lists
-        self._lists: tuple[weakref.ref[Table], int, dict[Any, Any]] | None = None
+        # what a pass reads its rows by (`lists`): the last conversation's alone - its table, the map's version they
+        # were made for, the lists
+        self._lists: tuple[weakref.ref[Table], int, PassLists] | None = None
 
     @staticmethod
     def why_not(sm: Any) -> str | None:
         """why the engine's sessions keep a contiguous cache of their own instead, None where the prefix cache serves
         them: the tiers and families whose attention reads the pages land phase by phase"""
-        if getattr(sm, "mlx", None) is not None:
-            return "MLX's attention reads no pages yet: the prefix cache serves the CPU's and the card's"
-        if sm.dev.type not in (Device.CPU, Device.CUDA):
-            return f"a {sm.dev.type} engine's attention reads no pages, only the host's and the card's do"
+        mlx = getattr(sm, "mlx", None) is not None
+        if mlx:
+            if sm._mega_serves():
+                return "MLX's megakernel reads each conversation's own arena, and it serves this engine's passes"
+            if getattr(sm, "kv_bits", None):
+                return "int8 rows (`kv_bits`): the pool's pages hold the rows as they are made"
+        elif sm.dev.type not in (Device.CPU, Device.CUDA):
+            return f"a {sm.dev.type} engine's attention reads no pages, only the host's, MLX's and the card's do"
+        if sm.dev.type == Device.CPU or mlx:
+            placed = {*getattr(sm, "host", {}), *getattr(sm, "cold", ())}
+            off = [i for i in range(int(getattr(sm, "L", 0))) if i not in placed]
+            if off:
+                # an engine built with layers outside its host tier (`cpu_layers` short of the model): those run their
+                # modules, which read one buffer; the host tier's attention, native or MLX's, is what reads the pages
+                return f"{len(off)} of the engine's layers run their own modules, which read no pages"
         if sm.fam.own:
             return "a family that brings its own layer (Qwen4) reads its rows through programs of its own"
         if not sm.fam.fast:
@@ -191,10 +217,20 @@ class PrefixCache:
                 if not self.tree.drop_snaps(lambda dropped: dropped >= 1):
                     return False
 
+    def lists(self, table: Table) -> PassLists:
+        """what a pass reads `table`'s rows by (the host's row lists, MLX's row maps), made once for every layer: those
+        of its map's present version alone, which every change to the map moves. One set, the last conversation's:
+        kept on each conversation, an idle one held its last pass's. Let go as another conversation's pass begins
+        (`reading`)"""
+        held = self._lists
+        if held is None or held[0]() is not table or held[1] != table.version:
+            held = self._lists = (weakref.ref(table), table.version, PassLists())
+        return held[2]
+
     def reading(self, table: Table) -> None:
         """a pass over `table` begins: the row lists another conversation's pass left (`_lists`) let go. Made only by
-        the host's attention, a pass whose layers never read them (the card's, under kv_host or a split placement)
-        left the idle conversation's held"""
+        the host's attention and MLX's, a pass whose layers never read them (the card's, under kv_host or a split
+        placement) left the idle conversation's held"""
         held = self._lists
         if held is not None and held[0]() is not table:
             self._lists = None

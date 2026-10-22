@@ -24,6 +24,7 @@ from .phi3.family import Phi3Family
 from .qwen3.family import Qwen3Family
 from .qwen4.family import Qwen4Family
 from .qwen35.family import Qwen35Family
+from .qwen35moe.family import Qwen35MoeFamily
 
 
 def act_name(cfg: Any) -> str:
@@ -38,7 +39,8 @@ SUPPORTED_MODEL_TYPES = tuple(KIND_OF)  # the served model_types, from the one d
 
 # each family's class, by the kind it builds
 FAMILIES: dict[FamilyKind, type[Family]] = {
-    cls.KIND: cls for cls in (Qwen3Family, Qwen35Family, Phi3Family, Qwen4Family, GptOssFamily, Gemma3Family)
+    cls.KIND: cls
+    for cls in (Qwen3Family, Qwen35Family, Qwen35MoeFamily, Phi3Family, Qwen4Family, GptOssFamily, Gemma3Family)
 }
 
 
@@ -78,14 +80,20 @@ class _FamiliesMixin(_State):
             Native.gemv_fp8 is not None and i not in self.cold and not (self.mlx is not None and i in self.mlx_layers)
         )
         f8_keys: set[str] = set()
+        # a GGUF linear the native kernels run is multiplied in its stored blocks (`_HostLinear.quant`), bound so here
+        # and by the ring for a cold layer (`_bind_cold`); an MLX layer's binds to its own kernels
+        # (`_bind_mlx_resident`). Its weight is a shape: no bf16 copy is made
+        lins = [n + ".weight" for n, m in layer.named_modules() if isinstance(m, torch.nn.Linear)]
+        stored = self._host_stored_keys(i, lins)
         for name, _p, is_buf in self._named_tensors(layer):
             key = base + name
             f8 = self._fp8(key)
             # widened once: norms, biases and sinks (below), and the matrices the family runs in float32 - the conv,
             # a router, gpt-oss's per-expert biases
             widened = self.fam.widened(name)
-            if f8 and f8_host and not widened and len(shape := self._shape(key)) == 2:
-                f8_keys.add(key)
+            if ((f8 and f8_host) or key in stored) and not widened and len(shape := self._shape(key)) == 2:
+                if f8:
+                    f8_keys.add(key)
                 self._set_param(layer, name, torch.zeros((), dtype=torch.bfloat16).expand(*shape), buffer=is_buf)
                 continue
             t = self._get(key, stored=True)
@@ -112,6 +120,8 @@ class _FamiliesMixin(_State):
                 if isinstance(m, _HostLinear) and m.key in f8_keys:
                     m.f8 = self._f8_weights(m.key)[0]
             self.fp8_layers.add(i)
+        if stored and i not in self.cold:
+            self._bind_host_stored(i, layer)
         if hasattr(layer, "linear_attn"):
             layer.linear_attn.layer_idx = i
         if hasattr(layer, "self_attn"):
@@ -121,4 +131,5 @@ class _FamiliesMixin(_State):
             self._mlx_fuse(layer)
         if getattr(self, "_packed", None):
             self._bind_host_packed_layer(layer)
+        self._bind_tags(i, layer)
         return layer

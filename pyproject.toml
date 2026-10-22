@@ -58,6 +58,7 @@ packages = [
   "btb.engine.families.phi3",
   "btb.engine.families.qwen3",
   "btb.engine.families.qwen35",
+  "btb.engine.families.qwen35moe",
   "btb.engine.families.qwen4",
   "btb.mlx",
 ]
@@ -142,6 +143,12 @@ exclude = ["\\.venv", "\\.venv-compare", "native/", "bench/results/"]
 # instead of being silently ignored, which a global ignore_missing_imports would hide.
 module = ["mlx.*", "mlx_lm.*", "llama_cpp.*", "airllm.*", "wheel.*", "setuptools.*"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# setuptools ships no py.typed but its vendored _distutils does: a test importing that (the host C++ compiler) had
+# mypy check setuptools from source, where it lost `setuptools.setup` for setup.py. The build tooling stays unchecked
+module = ["setuptools.*"]
+follow_imports = "skip"
 
 [tool.pyright]
 # Pylance/Pyright in the editor, matched to the mypy gate in build.py so a contributor's IDE does not light

@@ -130,6 +130,7 @@ C_TYPES: dict[str, tuple[str, str, str]] = {
     "long long": ("c_longlong", "_LL", "int"),
     "unsigned long long": ("c_ulonglong", "_ULL", "int"),
     "unsigned char": ("c_ubyte", "_UB", "int"),
+    "signed char": ("c_byte", "_B", "int"),
     "float": ("c_float", "_F", "float"),
     "bf16": ("", "", ""),
 }

@@ -36,7 +36,7 @@ import numpy as np
 import torch
 
 if TYPE_CHECKING:
-    from .gguf import GGUFModel
+    from .gguf import GGUFModel, QuantWeight
 
 FP4_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 
@@ -168,15 +168,16 @@ class MxWeight:
         return t if dtype is None else t.to(dtype)
 
 
-class MxGateUp:
-    """gpt-oss's gate_up as a GGUF keeps it: `gate` and `up` two `[I, H]` matrices whose outputs interleave
-    into the checkpoint's `[2I]` (gate at the even positions); `shape` = (2I, H) as one matrix would be."""
+class GateUp:
+    """an expert's gate_up as a GGUF keeps it: `gate` and `up` two `[I, H]` matrices as stored (MXFP4, or another
+    stored type's `QuantWeight`); `shape` = (2I, H) as one matrix would be. gpt-oss's outputs interleave into the
+    checkpoint's `[2I]` (gate at the even positions, `interleave`), the other families' concatenate."""
 
     __slots__ = ("gate", "shape", "up")
 
-    def __init__(self, gate: MxWeight, up: MxWeight) -> None:
+    def __init__(self, gate: MxWeight | QuantWeight, up: MxWeight | QuantWeight) -> None:
         if gate.shape != up.shape:
-            raise ValueError(f"[mxfp4] gate {gate.shape} and up {up.shape} differ")
+            raise ValueError(f"[gguf] gate {gate.shape} and up {up.shape} differ")
         self.gate, self.up = gate, up
         self.shape = (2 * gate.shape[0], gate.shape[1])
 
@@ -185,7 +186,7 @@ class MxGateUp:
         return self.gate.nbytes + self.up.nbytes
 
     def __repr__(self) -> str:
-        return f"MxGateUp[{self.shape[0]}, {self.shape[1]}]"
+        return f"GateUp[{self.shape[0]}, {self.shape[1]}]"
 
     @staticmethod
     def interleave(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
@@ -193,6 +194,6 @@ class MxGateUp:
         return torch.stack([gate, up], dim=-1).reshape(*gate.shape[:-1], 2 * gate.shape[-1])
 
     def dequantize(self, dtype: torch.dtype | None = None) -> torch.Tensor:
-        """the `[2I, H]` matrix the checkpoint would hold: gate and up rows interleaved"""
+        """the `[2I, H]` matrix gpt-oss's checkpoint would hold: gate and up rows interleaved"""
         g, u = self.gate.dequantize(dtype), self.up.dequantize(dtype)
         return torch.stack([g, u], dim=1).reshape(self.shape)

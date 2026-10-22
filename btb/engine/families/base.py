@@ -141,10 +141,11 @@ class Family:
     @property
     def mlx_path(self) -> PassTag:
         """the MLX forward the family's layers take: the per-token graph (a dense or sandwich block), the hybrid's
-        DeltaNet forward, or else each host layer's linears through the per-op path (a mixture's)"""
+        DeltaNet forward (its MLP a dense one in the graph), or else each host layer's linears through the per-op path
+        (a mixture's, a hybrid one's too: its experts are picked on the host between layers)"""
         if self.dense or self.sandwich:
             return PassTag.MLX_STEP
-        if self.hybrid:
+        if self.hybrid and not self.moe:
             return PassTag.MLX_HYBRID
         return PassTag.MLX_PEROP
 
@@ -179,6 +180,11 @@ class Family:
         plain block's checkpoints carry no such head)"""
         return None
 
+    def drafting_names(self, cfg: Any) -> list[str]:
+        """the drafting head's tensors its drafter reads, by checkpoint name: what a GGUF file's NextN blocks are
+        matched against (a safetensors checkpoint names its own). None for the plain block"""
+        return []
+
     def attn_index_bytes(self, cfg: Any, rows: int) -> tuple[int, int]:
         """what a resident attention layer's index adds to its cache at `rows` positions, as the placement prices
         it: (the bytes that stay on the card wherever the rows live - what every pass reads whole; the bytes that
@@ -208,15 +214,16 @@ class Family:
         stored"""
         return "conv1d" in name or ".experts." in name or name.endswith("mlp.gate.weight")
 
-    def shape_layer(self, sm: _State, layer: Any, i: int) -> Any:
+    def shape_layer(self, sm: _State, layer: Any, i: int, base: str | None = None) -> Any:
         """layer `i` as the engine runs it, made on the meta device and not yet loaded: the family's modules the
-        engine replaces with its own (a mixture's experts through the store, say) swapped in. The plain block's
-        layer runs as transformers made it"""
+        engine replaces with its own (a mixture's experts through the store, say) swapped in. `base` the layer's
+        checkpoint prefix where it is not the trunk's layer `i` (a drafting head's `mtp.layers.0.`, its experts the
+        store's layer `i`). The plain block's layer runs as transformers made it"""
         return layer
 
-    def finish_host_layer(self, sm: _State, layer: Any, i: int) -> None:
-        """the family's own part of host layer `i`, once its tensors are read and its linears are the host's: the
-        plain block's has none"""
+    def finish_host_layer(self, sm: _State, layer: Any, i: int, base: str | None = None) -> None:
+        """the family's own part of host layer `i`, once its tensors are read and its linears are the host's
+        (`base` as `shape_layer`'s): the plain block's has none"""
 
     def closing(self, cfg: Any) -> tuple[str, torch.nn.Module]:
         """the module the last layer's rows pass through before the head, made on the current device (the engine

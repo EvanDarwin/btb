@@ -12,7 +12,7 @@ import os
 import shutil
 from typing import TYPE_CHECKING
 
-from btb.kinds import QUANT_KIND, Cap, FamilyKind, PassTag, Proposer, Quant, QuantClass
+from btb.kinds import QUANT_KIND, STORED_CLASSES, Cap, FamilyKind, PassTag, Proposer, Quant, QuantClass, quant_tag
 
 from . import core, manifest, native_ops, spec
 
@@ -259,8 +259,27 @@ def test_every_subpath_declares_its_tag() -> None:
     for dev in spec.DEVICE_SUBPATHS:
         for kind in core.served_kinds():
             for storage in spec.Storage:
-                assert isinstance(dev.expect(kind, storage), PassTag), f"{dev.key} has no tag for {kind.value}"
-                assert dev.expect(kind, storage) in dev.expects(kind, storage)
+                for q in spec.STORAGE[storage].quants or (None,):
+                    tag = dev.expect(kind, storage, q)
+                    assert isinstance(tag, PassTag), f"{dev.key} has no tag for {kind.value}"
+                    assert tag in dev.expects(kind, storage, q)
+
+
+def test_a_packed_cell_shows_its_own_files_type_on_every_tier() -> None:
+    """every hardware's as-stored GGUF sub-path asks a file's cell for that type's own tag, never one tag for
+    every type: a Q4_K file's cell is satisfied by the Q4_K gemv alone, not by a Q6_K head beside dequantized
+    layers. The dequant twin of each asks for the bf16 slot."""
+    packed = [d for d in spec.DEVICE_SUBPATHS if d.only is spec.Container.GGUF and d.knobs.get("gguf_packed") == 1]
+    dequant = [d for d in spec.DEVICE_SUBPATHS if d.only is spec.Container.GGUF and d.knobs.get("gguf_packed") == 0]
+    assert {d.hardware for d in packed} == {d.hardware for d in dequant} == set(spec.Hardware) - spec.NO_BACKEND
+    for storage, info in spec.STORAGE.items():
+        if spec.quant_class(storage) not in STORED_CLASSES:
+            continue
+        for q in info.quants:
+            for dev in packed:
+                assert dev.expect(FamilyKind.QWEN3, storage, q) is quant_tag(q), (dev.key, q)
+            for dev in dequant:
+                assert dev.expect(FamilyKind.QWEN3, storage, q) is PassTag.QUANT_DEQUANT, (dev.key, q)
 
 
 def test_the_mlx_step_fork_is_tagged_per_family() -> None:
@@ -268,12 +287,12 @@ def test_the_mlx_step_fork_is_tagged_per_family() -> None:
     partial rotary and the MoE and hybrid families do not - and mlx-fp32 never does, its state is not bf16."""
     step, fp32 = spec.SUBPATH["mlx-step"], spec.SUBPATH["mlx-fp32"]
     bf16 = spec.Storage.SAFE_BF16
-    assert step.expect(FamilyKind.QWEN3, bf16) is PassTag.MLX_STEP_FUSED
-    assert step.expect(FamilyKind.GEMMA3, bf16) is PassTag.MLX_STEP_FUSED
-    assert step.expect(FamilyKind.PHI3, bf16) is PassTag.MLX_STEP_UNFUSED
-    assert step.expect(FamilyKind.QWEN3_5, bf16) is PassTag.MLX_HYBRID
-    assert step.expect(FamilyKind.GPT_OSS, bf16) is PassTag.MLX_PEROP
-    assert fp32.expect(FamilyKind.QWEN3, bf16) is PassTag.MLX_STEP_UNFUSED
+    assert step.expect(FamilyKind.QWEN3, bf16, None) is PassTag.MLX_STEP_FUSED
+    assert step.expect(FamilyKind.GEMMA3, bf16, None) is PassTag.MLX_STEP_FUSED
+    assert step.expect(FamilyKind.PHI3, bf16, None) is PassTag.MLX_STEP_UNFUSED
+    assert step.expect(FamilyKind.QWEN3_5, bf16, None) is PassTag.MLX_HYBRID
+    assert step.expect(FamilyKind.GPT_OSS, bf16, None) is PassTag.MLX_PEROP
+    assert fp32.expect(FamilyKind.QWEN3, bf16, None) is PassTag.MLX_STEP_UNFUSED
 
 
 def test_the_residency_fork_is_a_cell_per_hardware() -> None:
@@ -285,9 +304,10 @@ def test_the_residency_fork_is_a_cell_per_hardware() -> None:
         assert spec.SUBPATH[riders].knobs == {"device": hw, "bus_pass": 0, "adapt": 0}
         assert PassTag.EXPERT_BUS_PASS in spec.SUBPATH[default].expects(FamilyKind.GPT_OSS, bf16)
         assert PassTag.EXPERT_LINE in spec.SUBPATH[riders].expects(FamilyKind.GPT_OSS, bf16)
-        assert spec.SUBPATH[default].expects(FamilyKind.QWEN3, bf16) == {
-            spec.SUBPATH[default].expect(FamilyKind.QWEN3, bf16),
-            spec.kv_tag(FamilyKind.QWEN3, spec.SUBPATH[default].hardware),
+        on = spec.SUBPATH[default]
+        assert on.expects(FamilyKind.QWEN3, bf16) == {
+            on.expect(FamilyKind.QWEN3, bf16, None),
+            spec.kv_tag(FamilyKind.QWEN3, on.hardware, on.knobs),
         }
     assert {d.hardware for d in spec.DEVICE_SUBPATHS if d.needs is Cap.MOE} == set(spec.Hardware) - spec.NO_BACKEND
     dense = manifest.dnr(FamilyKind.QWEN3, bf16, spec.SUBPATH["cpu-riders"], spec.DecodePath.GREEDY)
@@ -323,8 +343,9 @@ def test_the_option_selected_forks_have_cells() -> None:
     for tag in (PassTag.HEAD_STREAMED, PassTag.EXPERT_MXFP4_ASSTORED, PassTag.EXPERT_BUS_PASS, PassTag.EXPERT_LINE):
         assert tag in asserted and tag not in manifest.FORK_NOTES, tag
     assert spec.SUBPATH["cpu-headstream"].knobs["resident_head"] == 0
-    packed = spec.SUBPATH["mlx-packed"].expect(FamilyKind.GPT_OSS, spec.Storage.GGUF_MXFP4)
-    assert packed is PassTag.EXPERT_MXFP4_ASSTORED
+    for key in ("cpu-packed", "mlx-packed", "cuda-packed"):
+        packed = spec.SUBPATH[key].expect(FamilyKind.GPT_OSS, spec.Storage.GGUF_MXFP4, Quant.MXFP4)
+        assert packed is PassTag.EXPERT_MXFP4_ASSTORED, key
 
 
 # --- the replicated engine predicates still match their source ----------------------------------------------
@@ -342,7 +363,7 @@ def test_card_family_predicate_matches_cuda_source() -> None:
     assert "self.fam.card_graph" in body, "cuda.py's card gate no longer asks the family"
     assert f"D in {manifest.CARD_HEAD_DIMS}" in body, "the card's head widths moved; CARD_HEAD_DIMS is stale"
     rejected = sorted(k.value for k in core.served_kinds() if not core.card_family_ok(k))
-    assert rejected == ["gpt_oss", "phi3", "qwen3_5", "qwen4"]
+    assert rejected == ["gpt_oss", "phi3", "qwen3_5", "qwen3_5_moe", "qwen4"]
 
 
 def test_own_layer_speculation_gate_matches_its_source() -> None:
@@ -362,14 +383,15 @@ def test_own_layer_speculation_gate_matches_its_source() -> None:
 
 def test_mega_head_multiple_matches_its_source() -> None:
     """the megakernel's head gate, quoted from mega.py so MEGA_SHAPE cannot outlive the constraint."""
-    assert f"self.hd % {manifest.MEGA_HEAD_MULTIPLE}" in _source("mlx", "mega.py")
+    assert f"self.hd % {spec.MEGA_HEAD_MULTIPLE}" in _source("mlx", "mega.py")
 
 
 def test_mlx_attn_heads_match_their_source() -> None:
     """the engine's MLX attention-kernel head gate, quoted from mlx_forward.py so MLX_ATTN_SHAPE cannot outlive it."""
     src = _source("engine", "mlx_forward.py")
     assert f"ATTN_KERNEL_HEADS = {manifest.MLX_ATTN_HEAD_DIMS}" in src
-    assert src.count("hd in ATTN_KERNEL_HEADS") == 4, "a kernel gate stopped reading ATTN_KERNEL_HEADS"
+    # the tree, the contiguous and paged attention, the rows, the forest
+    assert src.count("hd in ATTN_KERNEL_HEADS") == 5, "a kernel gate stopped reading ATTN_KERNEL_HEADS"
 
 
 def test_mtp_head_is_read_from_the_fixture() -> None:
@@ -416,10 +438,19 @@ def test_every_cell_asserts_the_reader_its_cache_rows_take() -> None:
             assert spec.kv_tag(kind, dev.hardware, dev.knobs) in dev.expects(kind, bf16), (dev.key, kind)
     assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.CPU) is PassTag.KV_PAGED
     assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.CUDA) is PassTag.KV_PAGED
+    # MLX's per-token graph reads the pages; its megakernel, where it serves, the conversation's own arena
+    assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.MLX, spec.SUBPATH["mlx-step"].knobs) is PassTag.KV_PAGED
     assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.MLX) is PassTag.KV_CONTIGUOUS
+    # a GGUF's blocks as stored keep the megakernel off; dequantized on load they are bf16 slots it reads
+    kq = spec.Storage.GGUF_KQUANT
+    assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.MLX, spec.SUBPATH["mlx-packed"].knobs, kq) is PassTag.KV_PAGED
+    dequant = spec.SUBPATH["mlx-dequant"].knobs
+    assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.MLX, dequant, kq) is PassTag.KV_CONTIGUOUS
+    assert PassTag.KV_CONTIGUOUS in spec.SUBPATH["mlx-kvbits"].expects(FamilyKind.QWEN3, bf16)
     # a hybrid on the pages too, its states resumed from its snapshots
     assert spec.kv_tag(FamilyKind.QWEN3_5, spec.Hardware.CPU) is PassTag.KV_PAGED
     assert spec.kv_tag(FamilyKind.QWEN3_5, spec.Hardware.CUDA) is PassTag.KV_PAGED
+    assert spec.kv_tag(FamilyKind.QWEN3_5, spec.Hardware.MLX) is PassTag.KV_PAGED
     # the card's layers computing in float32 are wider than its paged kernels read
     assert PassTag.KV_CONTIGUOUS in spec.SUBPATH["cuda-torch"].expects(FamilyKind.QWEN3, bf16)
     for key in ("cuda-graph", "cuda-split", "cuda-kvhost", "cuda-prefill"):
@@ -447,24 +478,37 @@ def test_the_cert_reads_the_engines_own_rule_for_the_paged_reader(monkeypatch: M
         flash_prefill_kernel=lambda d, kq=None: f"btb_attn_flash_prefill_d{d}",
     )
     monkeypatch.setattr(Native, "card_kernels", classmethod(lambda cls: kernels))
-    devices = {spec.Hardware.CPU: torch.device("cpu"), spec.Hardware.CUDA: torch.device("cuda")}
+    devices = {
+        spec.Hardware.CPU: torch.device("cpu"),
+        spec.Hardware.CUDA: torch.device("cuda"),
+        spec.Hardware.MLX: torch.device("cpu"),
+    }
+    # an MLX engine's megakernel is built at load (`_mega_serves`): these the knobs under which it never serves - off,
+    # or a float32 state; where it serves the runner's mega cells hold the rule
+    options: dict[spec.Hardware, tuple[dict[str, object], ...]] = {
+        spec.Hardware.CPU: ({}, {"fp32": 1}),
+        spec.Hardware.CUDA: ({}, {"fp32": 1}),
+        spec.Hardware.MLX: ({"mlx_mega": 0}, {"mlx_mega": 0, "kv_bits": 8}, {"fp32": 1}),
+    }
     for kind in core.served_kinds():
         if kind not in spec.FIXTURE_STEM:
             continue
         cfg = spec.fixture_config(kind)
         types_ = [LayerKind.of(t) for t in cfg.get("layer_types") or [LayerKind.FULL]]
-        options: tuple[dict[str, object], ...] = ({}, {"fp32": 1})
         for hw, dev in devices.items():
-            for knobs in options:
+            for knobs in options[hw]:
+                fp32 = bool(knobs.get("fp32"))
                 sm = types.SimpleNamespace(
                     dev=dev,
-                    mlx=None,
+                    mlx=object() if hw is spec.Hardware.MLX else None,
+                    _mega_serves=lambda: False,
+                    kv_bits=knobs.get("kv_bits"),
                     layer_types=types_,
                     fam=types.SimpleNamespace(**_flags(kind)),
                     flat_cache=lambda: True,
                     cfg=types.SimpleNamespace(**{**cfg, "_attn_implementation": "btb_sdpa"}),
-                    compute_dtype=torch.float32 if knobs else None,
-                    resident_fp32=bool(knobs),
+                    compute_dtype=torch.float32 if fp32 else None,
+                    resident_fp32=fp32,
                     shadow={},
                 )
                 why = PrefixCache.why_not(sm)
@@ -505,11 +549,17 @@ def test_the_prefix_axis_runs_where_the_prefix_cache_serves_and_is_a_gap_elsewhe
         )
     assert spec.card_rows(FamilyKind.QWEN3) and spec.card_rows(FamilyKind.GEMMA3)
     assert by[(FamilyKind.QWEN3, "cuda-torch")] is manifest.Missing.PREFIX_WIDE
+    # MLX's per-token graph reads the pages for every family the host serves; its megakernel, where it serves, stands
+    # in the prefix cache's way
+    assert "mlx-step" not in {key for (kind, key) in by if kind in served - set(cpu)}, by
+    assert by[(FamilyKind.QWEN3, "mlx-mega")] is manifest.Missing.PREFIX_CACHE
     for (kind, key), why in by.items():
         dev = spec.SUBPATH[key]
         own = manifest.subpath_gap(kind, spec.Storage.SAFE_BF16, dev)
-        if own is not None or dev.hardware is spec.Hardware.MLX:
-            assert why is (own or manifest.Missing.PREFIX_CACHE), (kind, key, why)
+        if own is not None:
+            assert why is own, (kind, key, why)
+        elif dev.hardware is spec.Hardware.MLX:
+            assert why is (cpu.get(kind) or manifest.Missing.PREFIX_CACHE), (kind, key, why)
     ran = {i for i in manifest.runnable_ids() if i.startswith(f"{spec.Surface.PREFIX.value}/")}
     want = {
         manifest.stem_id(spec.Surface.PREFIX, spec.FIXTURE_STEM[k], key)
@@ -551,7 +601,9 @@ def test_a_cell_never_forbids_what_it_expects() -> None:
         for kind in core.served_kinds():
             bad = spec.forbidden_tags(kind, dev)
             for st in spec.Storage:
-                assert not bad & dev.expects(kind, st), (dev.key, kind, st)
+                # a storage of several stored types is asked for each file's own
+                for q in spec.STORAGE[st].quants or (None,):
+                    assert not bad & dev.expects(kind, st, q), (dev.key, kind, st, q)
             for surface, forbids in spec.SURFACE_FORBIDS.items():
                 if dev.key in spec.SURFACE_SUBPATHS[surface]:
                     assert not forbids(kind, dev) & spec.SURFACE_TAGS[surface](kind, dev), (surface, dev.key, kind)
@@ -572,3 +624,17 @@ def test_the_gate_stays_red_while_gaps_are_open() -> None:
     (It writes its FAIL lines to stderr, which pytest captures.)"""
     if manifest.missing_items():
         assert manifest.check() == 1
+
+
+def test_only_the_converted_gguf_twins_are_committed() -> None:
+    """.gitignore keeps every derived GGUF twin out of the tree (spec.derived_gguf) and tiny_q4's converter twins in
+    it (spec.CONVERTED_QUANTS): its negations name the latter, so the two lists cannot drift apart"""
+    import subprocess
+
+    derived = [os.path.join(spec.GGUF_DIR, spec.gguf_name(*t)) for t in spec.derived_gguf()]
+    converted = [os.path.join(spec.GGUF_DIR, spec.gguf_name(spec.CONVERTED_STEM, q)) for q in spec.CONVERTED_QUANTS]
+    # the paths in and out NUL-separated, so none comes back quoted (git C-quotes a Windows path's backslashes)
+    paths = "\0".join([*derived, *converted])
+    cmd = ["git", "check-ignore", "-z", "--stdin", "--no-index"]
+    run = subprocess.run(cmd, input=paths, capture_output=True, text=True)
+    assert set(filter(None, run.stdout.split("\0"))) == set(derived), run.stderr

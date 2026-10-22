@@ -18,7 +18,7 @@ from collections.abc import Callable, Iterable
 from enum import StrEnum
 from typing import Any, TypedDict, TypeVar
 
-from .kinds import KIND_OF, Json, ModelType, Quant, QuantClass, quants_of
+from .kinds import KIND_OF, Json, ModelType
 
 T = TypeVar("T")
 
@@ -84,16 +84,9 @@ ARCH_MODEL_TYPES = {
     "phi3": ModelType.PHI3,
     "gpt-oss": ModelType.GPT_OSS,
     "qwen35": ModelType.QWEN3_5_TEXT,
+    "qwen35moe": ModelType.QWEN3_5_MOE_TEXT,
+    "gemma3": ModelType.GEMMA3_TEXT,
 }
-# the bits an integer takes in each type the affine decoder reads; the only part of the table below that no
-# declaration derives
-_AFFINE_BITS = {Quant.Q4_0: 4, Quant.Q4_1: 4, Quant.Q8_0: 8, Quant.Q4_K: 4}
-# the GGUF storage types the affine decoder can produce (blocks an affine quantization at group 32: a scale and
-# an offset per 32 values), the form the packed kernels multiply as stored -> the bits an integer takes. The
-# AFFINE class from kinds.QUANT_KIND, plus Q4_K, which the affine decoder also produces though it is classified
-# by the k-quant kernel it binds through first.
-AFFINE_TYPES: dict[Quant, int] = {q: _AFFINE_BITS[q] for q in [*quants_of(QuantClass.AFFINE), Quant.Q4_K]}
-
 # llama.cpp's architecture for transformers' qwen4_exp, which the gguf package's releases (0.19) do not know yet:
 # btb carries its tensor names until they do (gguf.OWN_NAMES)
 QWEN4EXP = "qwen4exp"

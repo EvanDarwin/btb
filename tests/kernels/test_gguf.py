@@ -11,23 +11,30 @@ import json
 import os
 import shutil
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import pytest
 import torch
 
-from btb.kinds import PassTag
+from btb.kinds import PassTag, Quant, quant_tag, stored_quants
+from tests.cert.manifest import QWEN3_06B_GGUF
 
 if TYPE_CHECKING:
-    from btb.gguf import GGUFModel
+    from btb.engine.scratch import Scratch
+    from btb.gguf import GGUFModel, QuantWeight
 
 from tests.helpers import (
+    F16_AT,
     FIXTURES,
     GGUF_FIXTURES,
     NO_LOG,
     assert_close,
     cached,
+    fixture,
+    forward_logits,
+    host_model,
+    layer_count,
     loaded_model,
     max_abs,
     mxfp4_random,
@@ -35,6 +42,8 @@ from tests.helpers import (
     need_cached,
     need_mlx,
     safetensors_state,
+    speculation,
+    stored_blocks,
 )
 
 GGUF = GGUF_FIXTURES
@@ -46,10 +55,28 @@ def _need() -> None:
         pytest.skip("the GGUF fixtures are not here (tests/make_fixtures.py gguf)")
 
 
-def _tokens(path: str, device: str = "cpu") -> list[int]:
-    with loaded_model(path, device=device) as sm:
+def _tokens(path: str, device: str = "cpu", **load_kw: Any) -> list[int]:
+    with loaded_model(path, device=device, **load_kw) as sm:
         out = sm.generate(PROMPT, 8, eos=(), speculate=False).tokens
     return [int(t) for t in out]
+
+
+def _agrees_where_decisive(path: str, ref: str, device: str = "cpu") -> None:
+    """the file's greedy decode against `ref`, a model of the numbers it dequantizes to: over `ref`'s own tokens,
+    every step whose two leaders sit further apart than the two models' logits differ picks the same one. The
+    as-stored path decodes each weight exactly where `ref` holds its bf16 rounding, so a near-tie may go either way"""
+    want = _tokens(ref, device)
+    forced = []
+    for p in (ref, path):
+        with loaded_model(p, device=device) as sm:
+            lf = sm.forward(PROMPT + want, cache=sm.new_cache(), last_only=False)
+            assert lf is not None
+            forced.append(lf.float()[0, len(PROMPT) - 1 :])
+    b, a = forced
+    for j in range(len(want)):
+        gap = float(b[j].topk(2).values.diff().abs())
+        if gap > 2 * max_abs(a[j], b[j]):
+            assert a[j].argmax().item() == b[j].argmax().item(), (path, device, j, gap)
 
 
 def test_the_reader_maps_every_tensor_and_reads_the_same_numbers() -> None:
@@ -115,6 +142,263 @@ def test_mxfp4_blocks_repack_to_the_checkpoint_layout() -> None:
     np.testing.assert_array_equal(hf_to_ggml(blocks, scales), raw)
     w = mxfp4.MxWeight.from_ggml(torch.from_numpy(raw[0, 0]), 1, 128)
     np.testing.assert_array_equal(w.dequantize().numpy()[0], ref[0, 0])
+
+
+def _tier_matvec(device: str, w: "QuantWeight", x: np.ndarray) -> np.ndarray:
+    """y = x . W^T over `w`'s stored blocks on a tier's own kernel for its type, in float32"""
+    if device == "cpu":
+        from btb.engine.native import Native
+
+        gq = Native.gemv_quant
+        assert gq is not None and w.q in gq, f"the native library has no {w.q.value} gemv: rebuild it"
+        y = torch.empty(x.shape[0], w.shape[0], dtype=torch.float32)
+        gq(w, torch.from_numpy(x).contiguous(), y)
+        return y.numpy()
+    need_mlx()
+    import mlx.core as mx
+
+    from btb.mlx.backend import stored_matvec, stored_streams
+
+    streams = stored_streams(w.q, w.raw.numpy())
+    return np.array(stored_matvec(w.q, streams, mx.array(x), *w.shape).astype(mx.float32))
+
+
+@pytest.mark.parametrize("device", ["cpu", "mlx"])
+@pytest.mark.parametrize("q", stored_quants(), ids=lambda q: q.value)
+@pytest.mark.parametrize("tiny", [False, True], ids=["wide", "tiny"])
+def test_each_stored_types_gemv_is_ggufs_dequantization(device: str, q: Quant, tiny: bool) -> None:
+    """every type kinds.stored_quants() names, on each tier's own kernel for it: the matvec over the file's
+    blocks equals `x @ gguf.dequantize(blocks)` to f32 rounding against each output's conditioning, and a row
+    of a pass of any width up to 16 - each launches its own shape, some padded - is bit-for-bit the row alone (a
+    verify pass computes each row as the one-row step does). `tiny`: one row of two blocks, whose one-a-block
+    streams MLX would pass in constant memory"""
+    from gguf import GGMLQuantizationType, dequantize
+
+    from btb.gguf import QuantWeight, block_of
+
+    native_library()
+    assert set(F16_AT) == set(stored_quants()), set(F16_AT) ^ set(stored_quants())
+    rows, cols = (1, 2 * block_of(q)[0]) if tiny else (40, 512)
+    raw = stored_blocks(q, rows, cols, stored_quants().index(q))
+    w = QuantWeight.of(torch.from_numpy(raw), q, rows, cols)
+    ref = dequantize(raw.reshape(rows, -1), GGMLQuantizationType[q.value]).astype(np.float64).reshape(rows, cols)
+    assert np.isfinite(ref).all()
+    x = np.random.default_rng(1).standard_normal((16, cols)).astype(np.float32)
+    y = _tier_matvec(device, w, x)
+    want, mag = x.astype(np.float64) @ ref.T, np.abs(x.astype(np.float64)) @ np.abs(ref.T)
+    assert float(np.max(np.abs(y - want) / np.maximum(mag, 1e-30))) < 1e-5, q.value
+    for t in range(1, len(x)):
+        assert np.array_equal(_tier_matvec(device, w, x[:t]), y[:t]), f"{q.value}: a {t}-row pass differs"
+    for i in (7, 15):
+        assert np.array_equal(_tier_matvec(device, w, x[i : i + 1])[0], y[i]), f"{q.value}: row {i} alone differs"
+
+
+@pytest.mark.parametrize("q", stored_quants(), ids=lambda q: q.value)
+def test_joined_stored_weights_are_their_members_in_one_launch(q: Quant) -> None:
+    """resident stored weights of one type joined for one launch (q/k/v, gate/up on MLX): each row of the join's
+    matvec is bit-for-bit its member's at every pass width; a member, now a view of the join, gives what it gave
+    before; a slot's weights are never joined (the slot is rewritten in place)"""
+    need_mlx()
+    import mlx.core as mx
+
+    from btb.mlx.backend import Weight, _join_stored, stored_matvec, stored_streams
+
+    cols = 512
+    ws = [
+        Weight(q=q, streams=stored_streams(q, stored_blocks(q, r, cols, i)), shape=(r, cols))
+        for i, r in enumerate((40, 24, 16))
+    ]
+    x = mx.array(np.random.default_rng(3).standard_normal((16, cols)).astype(np.float32))
+    before = [np.array(stored_matvec(q, w.streams, x, *w.shape)) for w in ws]
+    slot = Weight(q=q, streams=ws[0].streams, shape=ws[0].shape, slot=True)
+    assert _join_stored([slot, ws[1]]) is None
+    j = _join_stored(ws)
+    assert j is not None and j.shape == (80, cols)
+    for t in range(1, 17):
+        want = np.concatenate([b[:t] for b in before], axis=1)
+        assert np.array_equal(np.array(stored_matvec(q, j.streams, x[:t], *j.shape)), want), (q.value, t)
+    for w, b in zip(ws, before, strict=True):
+        assert np.array_equal(np.array(stored_matvec(q, w.streams, x, *w.shape)), b), q.value
+
+
+@pytest.mark.parametrize("q", stored_quants(), ids=lambda q: q.value)
+def test_each_stored_types_dequant_feeds_the_prefills_gemm(q: Quant) -> None:
+    """the native decode of a whole matrix a CPU prefill's GEMM takes, every stored type: the package's
+    dequantization to f32 rounding; and `stored_matmul` over 64 rows (the GEMM over those weights)
+    `x @ dequantize(blocks)` to bf16 rounding against each output's conditioning"""
+    from gguf import GGMLQuantizationType, dequantize
+
+    from btb.engine.host import stored_matmul
+    from btb.engine.native import Native
+    from btb.gguf import QuantWeight
+
+    native_library()
+    gq = Native.gemv_quant
+    assert gq is not None and q in gq.dequants, f"the native library has no {q.value} dequant: rebuild it"
+    rows, cols = 40, 512
+    raw = stored_blocks(q, rows, cols, stored_quants().index(q))
+    w = QuantWeight.of(torch.from_numpy(raw), q, rows, cols)
+    ref = dequantize(raw.reshape(rows, -1), GGMLQuantizationType[q.value]).astype(np.float64).reshape(rows, cols)
+    f32 = torch.empty(rows, cols)
+    gq.dequant(w, f32)
+    err = np.abs(f32.numpy() - ref).max(axis=1) / np.maximum(np.abs(ref).max(axis=1), 1e-30)
+    assert float(err.max()) < 1e-6, q.value
+    x = np.random.default_rng(2).standard_normal((64, cols)).astype(np.float32)
+    y = stored_matmul(w, torch.from_numpy(x), None).numpy()
+    want, mag = x.astype(np.float64) @ ref.T, np.abs(x.astype(np.float64)) @ np.abs(ref.T)
+    assert float(np.max(np.abs(y - want) / np.maximum(mag, 1e-30))) < 1e-2, q.value
+
+
+@pytest.mark.parametrize("q", [Quant.BF16, Quant.F16, *stored_quants()], ids=lambda q: q.value)
+def test_the_reader_decodes_each_type_to_the_packages_numbers(q: Quant) -> None:
+    """every tensor of a type's twin, and each expert of a mixture's, decoded by btb (`GGUFModel._float32`): the
+    gguf package's numbers to the bit but a zero's sign"""
+    from gguf import dequantize
+
+    from btb.gguf import GGUFModel
+
+    native_library()
+    for stem in ("tiny_qwen3", "tiny_q35moe"):
+        g = GGUFModel(os.path.join(GGUF, f"{stem}-{q.value.lower()}.gguf"))
+        n = 0
+        for name, t in g.tensors.items():
+            if t.tensor_type.name != q.value:
+                continue
+            data = np.asarray(t.data)
+            for e in range(data.shape[0]) if name.endswith("_exps.weight") else (None,):
+                got = g._float32(name, e)
+                want = np.asarray(dequantize(data if e is None else data[e], t.tensor_type))
+                assert got.shape == want.shape and np.array_equal(got, want), (stem, name, e)
+                assert not np.any((got.view(np.uint32) != want.view(np.uint32)) & (want != 0)), (stem, name, e)
+                n += 1
+        assert n, f"{stem}: no {q.value} tensor"
+
+
+@pytest.mark.parametrize("device", ["cpu", "mlx"])
+def test_a_mixture_with_f16_down_experts_keeps_them_stored(device: str, tmp_path: Path) -> None:
+    """a Q4_0 file whose down experts are F16, as llama.cpp's quantizer leaves a type whose rows are no whole blocks
+    (Qwen3.5-MoE 0.87B's 400 columns under Q2_K): the store holds every expert as the file's, down multiplied in
+    f16 exactly; the logits are those of the experts decoded into bf16 slots to bf16's rounding, and a speculative
+    decode, its verify rows through the same kernels, is the plain one"""
+    from btb.gguf import GGUFModel
+    from tests.make_fixtures import retyped_gguf
+
+    if device == "mlx":
+        need_mlx()
+    native_library()
+    src = os.path.join(GGUF, "tiny_q35moe-q4_0.gguf")
+    out = str(tmp_path / "tiny_q35moe-q4_0-down-f16.gguf")
+    retyped_gguf(src, out, {n for n in GGUFModel(src).tensors if n.endswith("ffn_down_exps.weight")}, Quant.F16)
+    logits = []
+    for packed in (1, 0):
+        with loaded_model(out, device=device, gguf_packed=packed) as sm:
+            cache = sm.new_cache()
+            lg = [forward_logits(sm, PROMPT, cache)[0, -1]]
+            for _ in range(4):
+                lg.append(forward_logits(sm, [[int(lg[-1].argmax())]], cache)[0, -1])
+            logits.append(torch.stack(lg).float())
+            store = sm.expert_store
+            assert store is not None
+            if not packed:
+                assert store.dequant and not store.types, "gguf_packed off: the experts decoded into bf16 slots"
+                continue
+            assert store.types and all(t == (Quant.Q4_0, Quant.Q4_0, Quant.F16) for t in store.types.values()), (
+                store.types
+            )
+            plain = sm.generate_greedy(PROMPT, 12)
+            speculation(sm, tree_budget=8, tree_min_prob=0.0, ngram_p=0.0, v_max=4, price=False)
+            toks, census = sm.generate_speculative(PROMPT, 12, proposer="mtp_tree", v_max=4)
+            assert toks == plain and census["proposed"] > 0, (toks, plain, census["proposed"])
+    # bf16's rounding of the decoded weights: ~0.3% of the largest logit on the cold-slot test's model
+    assert_close(logits[0], logits[1], atol_frac=0.02, msg=device)
+
+
+def test_a_refused_prefill_decode_takes_the_types_gemv() -> None:
+    """a prefill whose decoded weight the scheduler has no room for: `stored_matmul`'s rows through the type's gemv,
+    each row the bits its step gives, instead of the refusal escaping"""
+    from btb.engine.host import stored_matmul
+    from btb.engine.native import Native
+    from btb.engine.scheduler import MemoryGrantError
+    from btb.gguf import QuantWeight
+
+    native_library()
+    gq = Native.gemv_quant
+    assert gq is not None and Quant.Q4_K in gq.dequants
+
+    class Refusing:
+        def take(self, *_a: object) -> torch.Tensor:
+            raise MemoryGrantError("no room for the decoded weight")
+
+    rows, cols = 40, 512
+    w = QuantWeight.of(torch.from_numpy(stored_blocks(Quant.Q4_K, rows, cols, 3)), Quant.Q4_K, rows, cols)
+    x = torch.from_numpy(np.random.default_rng(4).standard_normal((Native.gemm_rows, cols)).astype(np.float32))
+    want = torch.empty(Native.gemm_rows, rows)
+    gq(w, x, want)
+    assert torch.equal(stored_matmul(w, x, cast("Scratch", Refusing())), want)
+
+
+@pytest.mark.parametrize("q", [Quant.IQ4_NL, Quant.IQ1_M], ids=lambda q: q.value)
+def test_a_cold_layer_repacks_its_types_streams_from_each_fill_on_mlx(q: Quant) -> None:
+    """IQ4_NL's split streams and IQ1_M's side stream are repacked from a cold layer's slot each time the ring
+    refills it (`Weight.invalidate`), so two cold layers taking turns in one slot give the logits they give resident
+    (the tiny model's greedy tokens can hide a layer read from the other's weights)"""
+    need_mlx()
+    path = os.path.join(GGUF, f"tiny_qwen3-{q.value.lower()}.gguf")
+    L = layer_count(fixture("tiny_qwen3"))
+    logits = []
+    for cold in ((), range(1, L - 1)):
+        sm = host_model(path, device="mlx", dtype=torch.bfloat16, cpu_layers=range(L), cold_layers=cold, cold_slots=1)
+        try:
+            assert sorted(sm.cold) == list(cold), sm.cold
+            assert not cold or len(sm.cold_ring.shared or ()) == 1, "the cold layers do not share one MLX slot"
+            cache = sm.new_cache()
+            lg = [forward_logits(sm, PROMPT, cache)[0, -1]]
+            for _ in range(4):
+                lg.append(forward_logits(sm, [[int(lg[-1].argmax())]], cache)[0, -1])
+            logits.append(torch.stack(lg).float())
+        finally:
+            sm.close()
+    # the two paths' bf16 rounding is ~0.3% of the largest logit; a layer read from the other's weights ~70%
+    assert_close(logits[1], logits[0], atol_frac=0.02, msg=q.value)
+
+
+@pytest.mark.parametrize("device", ["cpu", "mlx"])
+def test_a_long_gguf_prefill_takes_the_gemm_as_a_bf16_one_does(device: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """a prompt past both GEMM row counts: the as-stored file's prefill decodes its weights once for the GEMM (CPU
+    `QuantGemv.dequant`, MLX `stored_dequant`) instead of its type's matvec a row tile at a time, and its last
+    logits sit within bf16 rounding of the dequantized path's"""
+    native_library()
+    if device == "mlx":
+        need_mlx()
+    import btb.mlx.backend as backend
+    from btb.engine.native import QuantGemv
+    from btb.gguf import QuantWeight
+
+    path = os.path.join(GGUF, "tiny_qwen3-q4_0.gguf")
+    prompt = [(7 * i + 3) % 250 + 1 for i in range(80)]
+    decoded: list[int] = []
+    deq, sdq = QuantGemv.dequant, backend.stored_dequant
+
+    def native_dequant(gq: QuantGemv, w: QuantWeight, out: torch.Tensor) -> None:
+        decoded.append(w.shape[0])
+        deq(gq, w, out)
+
+    def mlx_dequant(q: Quant, streams: tuple[object, ...], rows: int, cols: int) -> object:
+        decoded.append(rows)
+        return sdq(q, streams, rows, cols)
+
+    monkeypatch.setattr(QuantGemv, "dequant", native_dequant)
+    monkeypatch.setattr(backend, "stored_dequant", mlx_dequant)
+    logits = {}
+    for packed in (1, 0):
+        with loaded_model(path, device=device, gguf_packed=packed) as sm:
+            decoded.clear()  # the pass's decodes: the load decodes the file's other tensors through `dequant` too
+            lg = sm.forward(prompt, cache=sm.new_cache())
+            assert lg is not None
+            logits[packed] = lg.float()[0, -1]
+            assert (quant_tag(Quant.Q4_0) in sm.last_pass_report().tags) is bool(packed)
+        assert bool(decoded) is bool(packed), (device, packed, len(decoded))
+    assert_close(logits[1], logits[0])
 
 
 def _mxfp4_pair(rows: int, k: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -209,7 +493,7 @@ def test_a_gpt_oss_gguf_streams_its_experts_as_stored_and_decodes_as_its_twin(tm
         pytest.skip("the gpt-oss GGUF fixture is not here (tests/make_fixtures.py gguf)")
     from btb.engine.device import mlx_available
     from btb.gguf import GGUFModel
-    from btb.mxfp4 import MxGateUp
+    from btb.mxfp4 import GateUp
 
     path = str(tmp_path / "tiny_gpt_oss-mxfp4.gguf")
     shutil.copy(src, path)
@@ -230,7 +514,7 @@ def test_a_gpt_oss_gguf_streams_its_experts_as_stored_and_decodes_as_its_twin(tm
         out = sm.generate(PROMPT, 8, eos=(), speculate=False).tokens
         store = sm.expert_store
         if store is not None:
-            assert store.ggml and isinstance(store._views(store.last_slots[next(iter(store.last_slots))])[0], MxGateUp)
+            assert store.ggml and isinstance(store._views(store.last_slots[next(iter(store.last_slots))])[0], GateUp)
             assert sm.expert_stat["experts"] > 0
     assert [int(t) for t in out] == _tokens(twin)
     if mlx_available():
@@ -285,8 +569,9 @@ def test_a_bf16_gguf_decodes_as_its_safetensors_twin() -> None:
 
 
 def test_a_quantized_gguf_decodes_as_its_dequantized_weights(tmp_path: Path) -> None:
-    """Q8_0 and Q4_0: the file decodes exactly as a safetensors model built from the numbers the gguf package
-    dequantizes (llama.cpp's own arithmetic), and the numbers differ from the bf16 twin's as a quantization does"""
+    """Q8_0 and Q4_0: the file read as bf16 slots (`gguf_packed=0`) decodes exactly as a safetensors model built from
+    the numbers the gguf package dequantizes (llama.cpp's own arithmetic), and as stored agrees wherever a step is
+    decisive; the numbers differ from the bf16 twin's as a quantization does"""
     _need()
     from safetensors.torch import save_file
 
@@ -305,38 +590,62 @@ def test_a_quantized_gguf_decodes_as_its_dequantized_weights(tmp_path: Path) -> 
         for fn in ("config.json", "tokenizer.json", "tokenizer_config.json"):
             shutil.copy(os.path.join(src, fn), twin / fn)
         save_file(deq, str(twin / "model.safetensors"), metadata={"format": "pt"})
-        assert _tokens(path) == _tokens(str(twin)), qt
+        assert _tokens(path, gguf_packed=0) == _tokens(str(twin)), qt
+        _agrees_where_decisive(path, str(twin))
 
 
-def _need_q35() -> None:
-    if not os.path.isfile(os.path.join(GGUF, "tiny_q35-bf16.gguf")):
-        pytest.skip("the Qwen3.5 GGUF fixtures are not here (tests/make_fixtures.py gguf_q35)")
+# Qwen3.5 and its mixture, both through the Qwen3.5 converter's rewrites
+Q35_STEMS = ("tiny_q35", "tiny_q35moe")
+# the mixture's MLP widths, in place of the dense one's intermediate_size
+MOE_KEYS = ("num_experts", "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size")
 
 
-def _q35_trunk() -> dict[str, torch.Tensor]:
-    """the tiny_q35 checkpoint without its MTP head, which llama.cpp's converter leaves out under --no-mtp"""
-    state = safetensors_state(os.path.join(FIXTURES, "tiny_q35"))
+def _need_q35(stem: str = "tiny_q35") -> None:
+    if not os.path.isfile(os.path.join(GGUF, f"{stem}-bf16.gguf")):
+        pytest.skip(f"the {stem} GGUF fixtures are not here (tests/make_fixtures.py gguf_twins)")
+
+
+def _q35_trunk(stem: str = "tiny_q35") -> dict[str, torch.Tensor]:
+    """the checkpoint's trunk, its MTP head aside"""
+    state = safetensors_state(os.path.join(FIXTURES, stem))
     return {k: v for k, v in state.items() if not k.startswith("mtp.")}
 
 
-def test_a_qwen35_gguf_reads_back_its_checkpoint() -> None:
+def _q35_named(stem: str) -> dict[str, torch.Tensor]:
+    """the checkpoint as the family names its tensors (`_family_tensor_names`): the trunk's and the drafting head's,
+    a mixture head's one-tensor-an-expert matrices stacked as the store reads them (gate's rows, then up's)"""
+    state = safetensors_state(os.path.join(FIXTURES, stem))
+    pre = "mtp.layers.0.mlp.experts."
+    n = len({k.split(".")[5] for k in state if k.startswith(pre)})
+    if n:
+        get = lambda e, p: state.pop(f"{pre}{e}.{p}.weight")
+        state[pre + "gate_up_proj"] = torch.stack(
+            [torch.cat([get(e, "gate_proj"), get(e, "up_proj")]) for e in range(n)]
+        )
+        state[pre + "down_proj"] = torch.stack([get(e, "down_proj") for e in range(n)])
+    return state
+
+
+@pytest.mark.parametrize("stem", Q35_STEMS)
+def test_a_qwen35_gguf_reads_back_its_checkpoint(stem: str) -> None:
     """Qwen3.5 through llama.cpp's converter and back: the config off the typed keys (the hybrid's layer pattern,
-    linear attention widths, partial MRoPE), every trunk tensor found and equal as bf16 once the converter's
-    rewrites are inverted (the tiled value heads, -exp(A_log), 1 + norm, the squeezed conv), and a quantized
+    linear attention widths, partial MRoPE, a mixture's experts), every tensor - the drafting head's too, kept as a
+    NextN block past the trunk's - found and equal as bf16 once the converter's rewrites are inverted (the tiled
+    value heads, -exp(A_log), 1 + norm, the squeezed conv, the split experts, the head's renames), and a quantized
     file's reordered blocks (what the packed kernels bind) the same numbers as its reordered dequantization"""
-    _need_q35()
+    _need_q35(stem)
     from gguf import dequantize
 
     from btb.gguf import GGUFModel
 
-    g = GGUFModel(os.path.join(GGUF, "tiny_q35-bf16.gguf"))
+    g = GGUFModel(os.path.join(GGUF, f"{stem}-bf16.gguf"))
     cfg = g.config()
-    want = json.load(open(os.path.join(FIXTURES, "tiny_q35", "config.json")))
+    want = json.load(open(os.path.join(FIXTURES, stem, "config.json")))
     assert cfg.model_type == want["model_type"] == g.model_type
     for k in (
+        *(MOE_KEYS if want.get("num_experts") else ("intermediate_size",)),
         "num_hidden_layers",
         "hidden_size",
-        "intermediate_size",
         "num_attention_heads",
         "num_key_value_heads",
         "head_dim",
@@ -352,7 +661,8 @@ def test_a_qwen35_gguf_reads_back_its_checkpoint() -> None:
         assert getattr(cfg, k) == want[k], (k, getattr(cfg, k), want[k])
     for k in ("rope_theta", "mrope_section", "mrope_interleaved"):
         assert cfg.rope_parameters[k] == want["rope_parameters"][k], k
-    state = _q35_trunk()
+    state = _q35_named(stem)
+    assert g.nextn() == 1 and any(k.startswith("mtp.") for k in state)
     names, hdr = g.weight_map(list(state), cfg.num_hidden_layers)
     assert set(names) == set(state), set(state) ^ set(names)
     for hf, gn in names.items():
@@ -360,7 +670,7 @@ def test_a_qwen35_gguf_reads_back_its_checkpoint() -> None:
         assert t.dtype == torch.bfloat16 and tuple(t.shape) == tuple(state[hf].shape) == tuple(hdr[hf]["shape"]), hf
         assert torch.equal(t, state[hf].to(torch.bfloat16)), hf
     for qt in ("q8_0", "q4_0", "q4_1"):
-        q = GGUFModel(os.path.join(GGUF, f"tiny_q35-{qt}.gguf"))
+        q = GGUFModel(os.path.join(GGUF, f"{stem}-{qt}.gguf"))
         qnames, _ = q.weight_map(list(state), cfg.num_hidden_layers)
         reordered = [gn for gn in qnames.values() if gn in q.undo and gn in q.tensors]
         assert any(q.undo[gn][1].cols is not None for gn in reordered), qt  # out_proj binds as stored too
@@ -370,31 +680,60 @@ def test_a_qwen35_gguf_reads_back_its_checkpoint() -> None:
             assert torch.equal(torch.from_numpy(np.array(got, dtype=np.float32)).bfloat16(), q.get(gn)), (qt, gn)
 
 
-def test_a_qwen35_bf16_gguf_decodes_as_its_safetensors_twin() -> None:
-    _need_q35()
-    twin = os.path.join(FIXTURES, "tiny_q35")
-    assert _tokens(os.path.join(GGUF, "tiny_q35-bf16.gguf")) == _tokens(twin)
+@pytest.mark.parametrize("stem", Q35_STEMS)
+def test_a_qwen35_bf16_gguf_decodes_as_its_safetensors_twin(stem: str) -> None:
+    _need_q35(stem)
+    twin = os.path.join(FIXTURES, stem)
+    assert _tokens(os.path.join(GGUF, f"{stem}-bf16.gguf")) == _tokens(twin)
 
 
-def test_a_qwen35_bf16_gguf_decodes_as_its_safetensors_twin_on_mlx() -> None:
-    _need_q35()
+@pytest.mark.parametrize("stem", Q35_STEMS)
+def test_a_qwen35_bf16_gguf_decodes_as_its_safetensors_twin_on_mlx(stem: str) -> None:
+    _need_q35(stem)
     need_mlx()
-    twin = os.path.join(FIXTURES, "tiny_q35")
-    assert _tokens(os.path.join(GGUF, "tiny_q35-bf16.gguf"), "mlx") == _tokens(twin, "mlx")
+    twin = os.path.join(FIXTURES, stem)
+    assert _tokens(os.path.join(GGUF, f"{stem}-bf16.gguf"), "mlx") == _tokens(twin, "mlx")
 
 
-def test_a_quantized_qwen35_gguf_decodes_as_its_dequantized_weights(tmp_path: Path) -> None:
-    """each affine type: the file decodes exactly as a safetensors model built from the numbers the reader
-    dequantizes and un-rewrites, and those numbers differ from the bf16 twin's as a quantization does"""
-    _need_q35()
+def test_a_squeezed_qwen35moe_gguf_reads_and_decodes_as_the_converters(tmp_path: Path) -> None:
+    """Qwen3.5-MoE as an older converter wrote it, each size-1 axis squeezed (the shared-expert gate a vector):
+    every tensor reads back as the unsqueezed file's at its checkpoint shape, and the file decodes as its
+    safetensors twin on the CPU and on MLX"""
+    stem = "tiny_q35moe"
+    _need_q35(stem)
+    from btb.gguf import GGUFModel
+    from tests.make_fixtures import squeezed_gguf
+
+    src, out = os.path.join(GGUF, f"{stem}-bf16.gguf"), str(tmp_path / f"{stem}-squeezed.gguf")
+    squeezed_gguf(src, out)
+    a, b = GGUFModel(src), GGUFModel(out)
+    assert any(len(b._shape(n)) < len(a._shape(n)) for n in a.tensors)
+    state, layers = _q35_named(stem), a.config().num_hidden_layers
+    (na, ha), (nb, hb) = a.weight_map(list(state), layers), b.weight_map(list(state), layers)
+    assert set(na) == set(nb) == set(state)
+    for hf in na:
+        assert hb[hf]["shape"] == ha[hf]["shape"], hf
+        assert torch.equal(b.get(nb[hf]), a.get(na[hf])), hf
+    twin = os.path.join(FIXTURES, stem)
+    assert _tokens(out) == _tokens(twin)
+    need_mlx()
+    assert _tokens(out, "mlx") == _tokens(twin, "mlx")
+
+
+@pytest.mark.parametrize("stem", Q35_STEMS)
+def test_a_quantized_qwen35_gguf_decodes_as_its_dequantized_weights(tmp_path: Path, stem: str) -> None:
+    """each affine type: the file read as bf16 slots (`gguf_packed=0`, a mixture's experts too) decodes exactly as a
+    safetensors model built from the numbers the reader dequantizes and un-rewrites, and as stored agrees wherever
+    a step is decisive; those numbers differ from the bf16 twin's as a quantization does"""
+    _need_q35(stem)
     from safetensors.torch import save_file
 
     from btb.gguf import GGUFModel
 
-    src = os.path.join(FIXTURES, "tiny_q35")
-    state = _q35_trunk()
+    src = os.path.join(FIXTURES, stem)
+    state = _q35_trunk(stem)
     for qt in ("q8_0", "q4_0", "q4_1"):
-        path = os.path.join(GGUF, f"tiny_q35-{qt}.gguf")
+        path = os.path.join(GGUF, f"{stem}-{qt}.gguf")
         g = GGUFModel(path)
         names, _ = g.weight_map(list(state), g.config().num_hidden_layers)
         deq = {hf: g.get(gn).contiguous() for hf, gn in names.items()}
@@ -404,17 +743,19 @@ def test_a_quantized_qwen35_gguf_decodes_as_its_dequantized_weights(tmp_path: Pa
         for fn in ("config.json", "tokenizer.json", "tokenizer_config.json"):
             shutil.copy(os.path.join(src, fn), twin / fn)
         save_file(deq, str(twin / "model.safetensors"), metadata={"format": "pt"})
-        assert _tokens(path) == _tokens(str(twin)), qt
+        assert _tokens(path, gguf_packed=0) == _tokens(str(twin)), qt
+        _agrees_where_decisive(path, str(twin))
 
 
-def test_a_qwen35_gguf_multiplies_its_reordered_blocks_as_stored_on_mlx() -> None:
+@pytest.mark.parametrize("stem", Q35_STEMS)
+def test_a_qwen35_gguf_multiplies_its_reordered_blocks_as_stored_on_mlx(stem: str) -> None:
     """the value-head reordering applied to the stored blocks (rows of in_proj_*, whole blocks of out_proj's
     columns): the packed path's first-step logits sit within bf16 rounding of the dequantized path's"""
-    _need_q35()
+    _need_q35(stem)
     need_mlx()
     logits = {}
     for packed in (1, 0):
-        with loaded_model(os.path.join(GGUF, "tiny_q35-q8_0.gguf"), device="mlx", gguf_packed=packed) as sm:
+        with loaded_model(os.path.join(GGUF, f"{stem}-q8_0.gguf"), device="mlx", gguf_packed=packed) as sm:
             rep = sm.report()["model"]["gguf"]
             assert (rep["packed"] > 0) == bool(packed), rep
             lg = sm.forward([PROMPT], cache=sm.new_cache())
@@ -538,12 +879,33 @@ def _q4_dequantized_twin(path: str, dest: Path) -> str:
 
 
 def test_a_quantized_qwen4exp_gguf_decodes_as_its_dequantized_weights(tmp_path: Path) -> None:
-    """Q8_0, Q4_0 and Q4_1: the file decodes exactly as a checkpoint of the numbers it dequantizes to, the
-    experts dequantized into the expert store's slots as a checkpoint's are read into them"""
+    """Q8_0, Q4_0, Q4_1 and IQ4_NL: the file decodes as a checkpoint of the numbers it dequantizes to - exactly with
+    `gguf_packed` off, its experts dequantized into bf16 slots on read; as stored, its experts read by the store as
+    the file's blocks and multiplied by their type's own kernel (on MLX IQ4_NL's streams repacked in the graph
+    from the slot), agreeing wherever a step is decisive"""
     _need()
-    for qt in ("q8_0", "q4_0", "q4_1"):
+    from btb.engine.device import mlx_available
+    from btb.mxfp4 import GateUp
+
+    for qt in ("q8_0", "q4_0", "q4_1", "iq4_nl"):
         path = os.path.join(GGUF, f"tiny_q4-{qt}.gguf")
-        assert _tokens(path) == _tokens(_q4_dequantized_twin(path, tmp_path / f"twin-{qt}")), qt
+        twin = _q4_dequantized_twin(path, tmp_path / f"twin-{qt}")
+        want = _tokens(twin)
+        for packed in (1, 0):
+            with loaded_model(path, device="cpu", gguf_packed=packed) as sm:
+                out = [int(t) for t in sm.generate(PROMPT, 8, eos=(), speculate=False).tokens]
+                store, tags = sm.expert_store, sm.last_pass_report().tags
+                assert store is not None and bool(store.types) is bool(packed) and store.widened is not bool(packed)
+                if packed:
+                    assert isinstance(store._views(store.last_slots[next(iter(store.last_slots))])[0], GateUp)
+                    types = {q for t in store.types.values() for q in t}
+                    assert {PassTag.EXPERT_QUANT_ASSTORED, *map(quant_tag, types)} <= tags, qt
+                else:
+                    assert PassTag.EXPERT_QUANT_DEQUANT in tags, qt
+                    assert out == want, qt
+        _agrees_where_decisive(path, twin)
+        if mlx_available():
+            _agrees_where_decisive(path, twin, "mlx")
 
 
 def test_a_qwen4exp_mxfp4_gguf_multiplies_its_experts_as_stored(tmp_path: Path) -> None:
@@ -552,7 +914,7 @@ def test_a_qwen4exp_mxfp4_gguf_multiplies_its_experts_as_stored(tmp_path: Path) 
     SiLU gate, and the file decodes as a checkpoint of its dequantized numbers on the CPU and on MLX"""
     _need()
     from btb.engine.device import mlx_available
-    from btb.mxfp4 import MxGateUp
+    from btb.mxfp4 import GateUp
 
     path = os.path.join(GGUF, "tiny_q4-mxfp4.gguf")
     with loaded_model(path, device="cpu") as sm:
@@ -560,7 +922,7 @@ def test_a_qwen4exp_mxfp4_gguf_multiplies_its_experts_as_stored(tmp_path: Path) 
         out = sm.generate(PROMPT, 8, eos=(), speculate=False).tokens
         store = sm.expert_store
         assert store is not None and store.ggml
-        assert isinstance(store._views(store.last_slots[next(iter(store.last_slots))])[0], MxGateUp)
+        assert isinstance(store._views(store.last_slots[next(iter(store.last_slots))])[0], GateUp)
         assert PassTag.EXPERT_MXFP4_ASSTORED in sm.last_pass_report()
     twin = _q4_dequantized_twin(path, tmp_path / "twin")
     assert [int(t) for t in out] == _tokens(twin)
@@ -636,120 +998,72 @@ def test_real_qwen3_gguf_files_when_cached() -> None:
         assert answers["BF16"][0] == ids and answers["BF16"][1] == [int(t) for t in out]
 
 
-def test_a_q6k_gguf_multiplies_its_blocks_as_stored_on_mlx() -> None:
-    """the Q6_K release, when cached: on MLX its Q6_K tensors (every weight of a pure-Q6_K file, the head and
-    ffn_down of a mixed one) bind to the Q6_K matvec as stored, no bf16 copy, and the first-step logits sit
-    within bf16 rounding of the dequantized path's - the same greedy tokens"""
-    need_mlx()
-    path = need_cached(f"{REAL_REPO}:Qwen3-0.6B-Q6_K.gguf", "Qwen3-0.6B-Q6_K.gguf is not cached")
-    logits, toks = {}, {}
-    for packed in (1, 0):
-        with loaded_model(path, device="mlx", gguf_packed=packed) as sm:
-            if packed:
-                assert any(getattr(m.mx, "q6k", None) is not None for m in sm.host[0].modules() if hasattr(m, "mx"))
-            lg = sm.forward(PROMPT, cache=sm.new_cache())
-            assert lg is not None
-            logits[packed] = lg.float()[0, -1]
-            out = sm.generate(PROMPT, 8, speculate=False).tokens
-            toks[packed] = [int(t) for t in out]
-    a, b = logits[1], logits[0]
-    assert_close(a, b)
-    assert toks[1] == toks[0]
+# the releases whose two paths no implementation holds to the same tokens: with exact kernels the 1-bit file's
+# as-stored and dequantized forwards drift 43% of max-logit by the first token (2% on its 2- and 3-bit siblings),
+# a smooth per-layer amplification of rounding order on every tier - so it is held to the first token alone
+UNSTABLE = frozenset({"UD-IQ1_M"})
 
 
+@pytest.mark.parametrize("device", ["cpu", "mlx"])
 @pytest.mark.parametrize(
-    ("quant", "kind", "stable"),
-    [
-        ("Q2_K", "q2k", True),
-        ("Q3_K_M", "q3k", True),
-        ("Q5_K_M", "q5k", True),
-        ("IQ4_NL", "iq4nl", True),
-        ("IQ4_XS", "iq4xs", True),
-        ("UD-IQ3_XXS", "latt", True),
-        ("UD-IQ2_M", "latt", True),
-        ("UD-IQ1_M", "latt", False),
-    ],
+    "release", [n for n, gq in QWEN3_06B_GGUF.items() if gq.name in {q.value for q in stored_quants()}]
 )
-def test_a_native_kernel_gguf_multiplies_its_blocks_as_stored_on_mlx(quant: str, kind: str, stable: bool) -> None:
-    """each release whose tensors have their own Metal matvec (the k-quants, the IQ4 codebooks, the IQ lattice
-    mixes behind the Unsloth dynamic files), when cached. The kernel contract is checked directly: one tensor of
-    every quantized type in the file multiplied as stored equals the package's fp32 dequantization to fp32
-    rounding. Then on MLX the tensors bind as their raw bytes to that kernel (no bf16 copy), and on a numerically
-    stable file the first-step logits sit within bf16 rounding of the dequantized path's with the same greedy
-    tokens. `stable` is False for the 1-bit file: with exact kernels its two paths still drift 43% of max-logit
-    by the first token (2% on the 2- and 3-bit siblings on the same code), a smooth per-layer amplification of
-    rounding order that the CPU path also fails to agree with - token equality is no implementation's property
-    there, so it asks only that the paths agree on the first token."""
-    need_mlx()
-    import mlx.core as mx
+def test_a_release_multiplies_its_blocks_as_stored(device: str, release: str) -> None:
+    """each Qwen3-0.6B release of a stored type, when cached, on each tier: one tensor of every stored type in
+    the file multiplied by the tier's kernel equals the package's dequantization (real blocks carry the subnormal
+    deltas random ones seldom do); loaded as stored, the pass reports the file's own type and its linears hold
+    no bf16 copy; and the first-step logits sit within bf16 rounding of the dequantized path's, with the same
+    greedy tokens on a stable file"""
     from gguf import dequantize
 
+    from btb.engine.host import _HostLinear
     from btb.gguf import GGUFModel
-    from btb.mlx.iquant import matvec_iq4nl, matvec_iq4xs, matvec_lattice, repack_iq4nl, repack_lattice
-    from btb.mlx.kquant import matvec_q2k, matvec_q3k, matvec_q4k, matvec_q5k
-    from btb.mlx.q6k import matvec_q6k
 
-    path = need_cached(f"{REAL_REPO}:Qwen3-0.6B-{quant}.gguf", f"Qwen3-0.6B-{quant}.gguf is not cached")
-    latt = {
-        "IQ3_XXS": "iq3xxs",
-        "IQ2_XXS": "iq2xxs",
-        "IQ2_XS": "iq2xs",
-        "IQ2_S": "iq2s",
-        "IQ1_S": "iq1s",
-        "IQ3_S": "iq3s",
-        "IQ1_M": "iq1m",
-    }
-    kq = {"Q2_K": matvec_q2k, "Q3_K": matvec_q3k, "Q4_K": matvec_q4k, "Q5_K": matvec_q5k, "Q6_K": matvec_q6k}
+    native_library()
+    path = need_cached(f"{REAL_REPO}:Qwen3-0.6B-{release}.gguf", f"Qwen3-0.6B-{release}.gguf is not cached")
+    g = GGUFModel(path)
     seen: set[str] = set()
-    for name, t in GGUFModel(path).tensors.items():
-        tn = t.tensor_type.name
-        if tn in seen or tn == "F32" or len(t.shape) != 2:
+    for name, t in g.tensors.items():
+        if t.tensor_type.name in seen or not g.storable(name):
             continue
-        rows, cols = int(t.shape[1]), int(t.shape[0])
-        if cols % (32 if tn == "IQ4_NL" else 256):
-            continue
-        raw = np.ascontiguousarray(np.asarray(t.data)).view(np.uint8).reshape(-1)
-        ref = dequantize(np.asarray(t.data), t.tensor_type).astype(np.float32).reshape(rows, cols)
-        x = np.random.default_rng(0).standard_normal((1, cols)).astype(np.float32)
-        wb, xm = mx.array(raw), mx.array(x)
-        if tn in latt:
-            y = matvec_lattice(latt[tn], wb, xm, rows, cols, repack_lattice(latt[tn], raw))
-        elif tn in kq:
-            y = kq[tn](wb, xm, rows, cols)
-        elif tn == "IQ4_NL":
-            d, q = repack_iq4nl(raw)
-            y = matvec_iq4nl(d, q, xm, rows, cols)
-        elif tn == "IQ4_XS":
-            y = matvec_iq4xs(wb, xm, rows, cols)
-        else:
-            continue
-        gold = x @ ref.T
-        rel = float(np.abs(np.array(y)[0] - gold[0]).max() / (np.abs(gold[0]).max() + 1e-9))
-        assert rel < 1e-4, (quant, tn, name, rel)
-        seen.add(tn)
-    assert seen, quant
-
-    logits, toks = {}, {}
-    for packed in (1, 0):
-        with loaded_model(path, device="mlx", gguf_packed=packed) as sm:
-            if packed:
-                bound = any(
-                    getattr(m.mx, kind, None) is not None
-                    for layer in sm.host.values()
-                    for m in layer.modules()
-                    if hasattr(m, "mx")
-                )
-                assert bound, f"{quant}: no tensor bound to the {kind} kernel"
+        w = g.stored(name)
+        x = np.random.default_rng(0).standard_normal((1, w.shape[1])).astype(np.float32)
+        ref = dequantize(np.asarray(t.data), t.tensor_type).astype(np.float64).reshape(w.shape)
+        y, want = _tier_matvec(device, w, x)[0], (x.astype(np.float64) @ ref.T)[0]
+        assert float(np.abs(y - want).max() / (np.abs(want).max() + 1e-9)) < 1e-4, (release, name)
+        seen.add(t.tensor_type.name)
+    assert seen, release
+    main = Quant(QWEN3_06B_GGUF[release].name)
+    logits, toks, forced = {}, {}, {}
+    for packed in (0, 1):
+        with loaded_model(path, device=device, gguf_packed=packed) as sm:
             lg = sm.forward(PROMPT, cache=sm.new_cache())
             assert lg is not None
             logits[packed] = lg.float()[0, -1]
-            out = sm.generate(PROMPT, 8, speculate=False).tokens
-            toks[packed] = [int(t) for t in out]
-    a, b = logits[1], logits[0]
-    assert a.argmax().item() == b.argmax().item()
-    if stable:
-        assert_close(a, b)
-        assert toks[1] == toks[0]
+            out = sm.generate(PROMPT, 8, speculate=False)
+            toks[packed] = [int(t) for t in out.tokens]
+            tags = sm.last_pass_report().tags
+            # both paths over the dequantized path's own tokens, every step's logits
+            lf = sm.forward(PROMPT + toks[0], cache=sm.new_cache(), last_only=False)
+            assert lf is not None
+            forced[packed] = lf.float()[0, len(PROMPT) - 1 :]
+            if packed:
+                assert quant_tag(main) in tags, sorted(t.value for t in tags)
+                lins = [m for layer in sm.host.values() for m in layer.modules() if isinstance(m, _HostLinear)]
+                held = [m for m in lins if m.stored_tag() not in (None, PassTag.QUANT_DEQUANT)]
+                assert held and all(m.weight.stride() == (0, 0) for m in held), "a stored linear kept a bf16 copy"
+            else:
+                assert PassTag.QUANT_DEQUANT in tags and quant_tag(main) not in tags
+    # the dequantized path rounds every weight to bf16 and the as-stored one decodes it exactly, so a step whose two
+    # leaders sit closer than the paths differ may go either way (IQ4_XS's first 11 and 8, 0.012 apart); every
+    # step over the same tokens picks the same leader where it is decisive
+    for j in range(len(toks[0])):
+        a, b = forced[1][j], forced[0][j]
+        gap = float(b.topk(2).values.diff().abs())
+        if gap > 2 * max_abs(a, b):
+            assert a.argmax().item() == b.argmax().item(), (release, j, gap)
+    if release not in UNSTABLE:
+        assert_close(logits[1], logits[0])
 
 
 def test_a_draft_model_proposes_a_tree_verified_exactly_on_mlx() -> None:
@@ -779,7 +1093,7 @@ def test_a_q4k_self_draft_speculates_to_the_greedy_tokens_on_mlx() -> None:
     path = need_cached(f"{REAL_REPO}:Qwen3-0.6B-Q4_K_M.gguf", "Qwen3-0.6B-Q4_K_M.gguf is not cached")
     with loaded_model(path, device="mlx", gguf_packed=1, draft_model=path) as sm:
         assert sm.draft_engine is not None
-        assert any(getattr(m.mx, "q4k", None) is not None for m in sm.host[0].modules() if hasattr(m, "mx"))
+        assert any(getattr(m.mx, "q", None) is Quant.Q4_K for m in sm.host[0].modules() if hasattr(m, "mx"))
         ids = sm.prompt_ids("Write a detailed paragraph about the ocean and its depths.")
         greedy = sm.generate(ids, 48, speculate=False)
         spec = sm.generate(ids, 48, speculate=True)

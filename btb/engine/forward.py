@@ -24,6 +24,7 @@ from .fused import DELTA_BLOCK
 from .native import Native
 from .scheduler import EPOCH, MemoryGrantError
 from .state import _State
+from .stored import CardStored
 
 # the ledger's tag for a layer-by-layer prefill's own working set, for the sweep: on the card, and on the host where
 # its host chunks run and its rows wait between layers
@@ -275,7 +276,7 @@ class _ForwardMixin(_State):
         self._tag_tiers(n_layers)
         self._tag_kv(cache)
         self._bind_kv(cache, T)
-        self._tag_quant()
+        self._tag_quant(n_layers)
         if (
             attention_mask is None
             and not own
@@ -638,8 +639,9 @@ class _ForwardMixin(_State):
         # a prompt's later chunks (`pas.batched`) too, an attention layer's: its rows through the host's native
         # attention as every pass past a cache's first rows reads them (a paged cache has no other reader, and a
         # contiguous one takes the same so the two keep one set of bits); a linear layer's chunk through the module's
-        # chunked rule, and MLX's host layers as they were
-        chunk_ok = not pas.batched or (lt != LayerKind.LINEAR and self.mlx is None)
+        # chunked rule, and MLX's host layers over a contiguous cache as they were
+        paged = bool(getattr(cache, "paged", False))
+        chunk_ok = not pas.batched or (lt != LayerKind.LINEAR and (self.mlx is None or paged))
         cont = cache is not None and T > 1 and past > 0 and am is None and chunk_ok
         # `ai` is the single-sequence host path (it also serves speculative decode, always one row); it stores
         # k/v as [1, heads, ...] and would merge a real batch into the head dim, so a batched decode takes the
@@ -828,7 +830,8 @@ class _ForwardMixin(_State):
         if self.head is None and self.head_host is not None:
             return self.head_host(hf.float().cpu()).float()
         assert self.head is not None  # no head_host means the head is resident
-        if self.head.weight.dtype != cd:
+        # a head of a GGUF type's blocks on the card takes bf16 rows, the compute's (`_card_stores`)
+        if not isinstance(self.head, CardStored) and self.head.weight.dtype != cd:
             # the resident head is bf16, the compute float32: the native gemv reads the head once and widens on the
             # fly (no float32 copy of a ~1 Gelem head per token) for the few rows a decode or verify pass carries. Its
             # accumulation order moves the logits ~20 ulp from the widen's; the tokens are identical. BTB_HEAD_GEMV=0
@@ -1293,7 +1296,7 @@ class _ForwardMixin(_State):
         # a paged cache's prompt rows reserved in the card's region before the sweep cuts its working set: grown
         # mid-sweep, the region's arenas would sit inside it
         self._bind_kv(cache, T)
-        self._tag_quant()
+        self._tag_quant(self.L)
         self._attn_ctx = cache
         cd = self.compute_dtype
         spans = [(a, min(T, a + C)) for a in range(0, T, C)]

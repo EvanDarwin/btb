@@ -5,6 +5,7 @@
 //
 //   btb_gemv_bf16_m{1,..,32}      y[m][r] = sum_c w[r][c] * x[m][c]      (bf16 in, f32 accumulate, bf16 out)
 //   btb_gemv_{silu,gelu}_bf16_m{1,..,32}  the down projection with act(g) * u folded into its x load
+//   btb_gemv_<key>_bf16_m{1,..,32}, btb_dequant_<key>_bf16  a GGUF type's blocks as stored (btb_gemv_quant.cuh)
 //   btb_gemv_mma*, btb_gemm_{mma,mma_small,f32}_bf16  the tensor-core matvec, and a prompt's matmuls in the bits of the matvec
 //                                 the warm-up picked (btb_gemv_mma.cuh, btb_gemm.cuh)
 //   btb_attn_flash_d{64,128,256}  the one attention (btb_attn_flash.cuh), its decode form: a step, or a verify pass's
@@ -224,6 +225,8 @@ GEMV_ACT(4)
 GEMV_ACT(8)
 GEMV_ACT(16)
 GEMV_ACT(32)
+
+#include "btb_gemv_quant.cuh"
 
 // ---------------------------------------------------------------------------------------------------------
 // the rows layout: a pass's T rows as T sequences a token each - a fork's rows, or a batch's - each at its own

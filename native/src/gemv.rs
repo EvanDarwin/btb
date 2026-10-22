@@ -7,8 +7,31 @@ pub(crate) const LANES: usize = 16;
 
 const ROW_UNROLL: usize = 4;
 
-/// Row chunks per thread a call is cut into; rayon steals across the box's cores of unequal speed.
-const SPLIT: usize = 4;
+/// How a call's rows are cut over the pool: `split` chunks a thread (rayon steals across the box's cores of
+/// unequal speed), each of at least `min` weights.
+#[derive(Clone, Copy)]
+struct Cut {
+    split: usize,
+    min: usize,
+}
+
+/// Streamed weights and the dequant: memory-bound, so a few long chunks a thread.
+const CUT_STREAM: Cut = Cut { split: 4, min: 0 };
+
+/// A stored GGUF type's gemv is compute-bound, its last chunk on a slow core holding the call: 16 a thread measured
+/// 5-10% ahead of 4 on 6+6 cores, where bf16 lost 4-8%. The floor keeps a small matrix from being cut finer than a
+/// dispatch is worth.
+const CUT_STORED: Cut = Cut {
+    split: 16,
+    min: 1 << 16,
+};
+
+/// a call's chunk in rows under `cut`, never under `ROW_UNROLL` (`row_len` weights a row)
+fn chunk_rows(rows: usize, row_len: usize, nt: usize, cut: Cut) -> usize {
+    rows.div_ceil(nt * cut.split)
+        .max(ROW_UNROLL)
+        .max(cut.min.div_ceil(row_len.max(1)))
+}
 
 const COL_TILE: usize = 512;
 
@@ -521,6 +544,159 @@ def_task_bf16!(
     widen_avx512,
     "avx512f,avx512bw"
 );
+
+/// The f16 rows of a task (a GGUF's float tensor, multiplied as stored), `Send + Sync` for the row partition.
+#[derive(Clone, Copy)]
+struct F16(*const u16);
+
+// SAFETY: a task reads its rows and writes its own rows of `y`; the caller's buffers do not overlap
+unsafe impl Send for F16 {}
+unsafe impl Sync for F16 {}
+
+#[inline]
+unsafe fn widen_f16_scalar<const R: usize>(
+    dst: *mut f32,
+    w: *const u16,
+    row_stride: usize,
+    dst_stride: usize,
+    n: usize,
+) {
+    for r in 0..R {
+        let src = w.add(r * row_stride);
+        let out = dst.add(r * dst_stride);
+        for j in 0..n {
+            *out.add(j) = f16_to_f32(*src.add(j));
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn widen_f16_neon<const R: usize>(
+    dst: *mut f32,
+    w: *const u16,
+    row_stride: usize,
+    dst_stride: usize,
+    n: usize,
+) {
+    use std::arch::aarch64::*;
+    let nb = n / 8;
+    for r in 0..R {
+        let src = w.add(r * row_stride);
+        let out = dst.add(r * dst_stride);
+        for k in 0..nb {
+            let c = k * 8;
+            let h = vreinterpretq_f16_u16(vld1q_u16(src.add(c)));
+            vst1q_f32(out.add(c), vcvt_f32_f16(vget_low_f16(h)));
+            vst1q_f32(out.add(c + 4), vcvt_high_f32_f16(h));
+        }
+        for j in (nb * 8)..n {
+            *out.add(j) = f16_to_f32(*src.add(j));
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c")]
+unsafe fn widen_f16_avx2<const R: usize>(
+    dst: *mut f32,
+    w: *const u16,
+    row_stride: usize,
+    dst_stride: usize,
+    n: usize,
+) {
+    use std::arch::x86_64::*;
+    let nb = n / 8;
+    for r in 0..R {
+        let src = w.add(r * row_stride);
+        let out = dst.add(r * dst_stride);
+        for k in 0..nb {
+            let c = k * 8;
+            _mm256_storeu_ps(
+                out.add(c),
+                _mm256_cvtph_ps(_mm_loadu_si128(src.add(c) as *const __m128i)),
+            );
+        }
+        for j in (nb * 8)..n {
+            *out.add(j) = f16_to_f32(*src.add(j));
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn widen_f16_avx512<const R: usize>(
+    dst: *mut f32,
+    w: *const u16,
+    row_stride: usize,
+    dst_stride: usize,
+    n: usize,
+) {
+    use std::arch::x86_64::*;
+    let nb = n / LANES;
+    for r in 0..R {
+        let src = w.add(r * row_stride);
+        let out = dst.add(r * dst_stride);
+        for k in 0..nb {
+            let c = k * LANES;
+            _mm512_storeu_ps(
+                out.add(c),
+                _mm512_cvtph_ps(_mm256_loadu_si256(src.add(c) as *const __m256i)),
+            );
+        }
+        for j in (nb * LANES)..n {
+            *out.add(j) = f16_to_f32(*src.add(j));
+        }
+    }
+}
+
+// every vector count widens the tile and accumulates it as the bf16 path's wider passes do: one path, so the bits
+// never depend on `b`, and the widening is exact
+macro_rules! def_task_f16 {
+    ($group:ident, $task:ident, $accum:ident, $widen:ident $(, $feat:literal)?) => {
+        def_task!($group, $task, F16, $accum $(, $feat)?,
+            prep |p, r, cols, cur| {},
+            tile |scratch, wide, x, i0, bt, p, r, c0, cols, n, cur| {
+                $widen::<R>(wide, p.0.add(r * cols + c0), cols, COL_TILE, n);
+                false
+            });
+    };
+}
+
+def_task_f16!(
+    group_f16_scalar,
+    task_f16_scalar,
+    accum_scalar,
+    widen_f16_scalar
+);
+#[cfg(target_arch = "x86_64")]
+def_task_f16!(
+    group_f16_avx2,
+    task_f16_avx2,
+    accum_avx2,
+    widen_f16_avx2,
+    "avx2,fma,f16c"
+);
+#[cfg(target_arch = "aarch64")]
+def_task_f16!(group_f16_neon, task_f16_neon, accum_neon, widen_f16_neon);
+#[cfg(target_arch = "x86_64")]
+def_task_f16!(
+    group_f16_avx512,
+    task_f16_avx512,
+    accum_avx512,
+    widen_f16_avx512,
+    "avx512f,avx512bw,f16c"
+);
+
+/// `isa` where its f16 widen can run: an x86 core without F16C (none with AVX2 ships so) takes the scalar one
+#[inline]
+fn f16_isa(isa: Isa) -> Isa {
+    #[cfg(target_arch = "x86_64")]
+    if matches!(isa, Isa::Avx2 | Isa::Avx512) && !std::arch::is_x86_feature_detected!("f16c") {
+        return Isa::Scalar;
+    }
+    isa
+}
 
 #[derive(Clone, Copy)]
 struct P12 {
@@ -1096,6 +1272,1717 @@ def_task_mx4!(
 );
 
 // ---------------------------------------------------------------------------------------------------
+// GGUF k-quants (Q4_K here; the others follow the same shape below): a 256-weight superblock read as
+// stored and decoded into `wide` a tile, so the matvec never expands a quantized weight to a bf16 copy.
+// A superblock's few float factors (the sub-block scales and mins, from its f16 delta) are computed once
+// in scalar and shared by both paths; only the 256 per-weight decodes are vectorized. Every weight is one
+// `scale * q - min` (a mul then a sub, each one rounding), so the scalar and NEON widenings write the same
+// bits and the accumulation after them is the shared `accum_*`, exactly as the bf16 and MXFP4 paths.
+
+/// weights a k-quant superblock holds.
+pub(crate) const KQ_SB: usize = 256;
+
+/// IEEE 754 half to f32, exact (a k-quant's delta, and its packed 6-bit scales/mins derive from it): the
+/// same value numpy and llama.cpp read, subnormals and inf/nan included. On aarch64 the base FP set's own
+/// conversion (`fcvt` from a half, no FP16 extension), once a block on every type's decode.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn f16_to_f32(h: u16) -> f32 {
+    let out: f32;
+    // SAFETY: two register-only instructions of the base FP set
+    unsafe {
+        std::arch::asm!(
+            "fmov {t:s}, {h:w}",
+            "fcvt {o:s}, {t:h}",
+            h = in(reg) h as u32,
+            t = out(vreg) _,
+            o = lateout(vreg) out,
+            options(pure, nomem, nostack),
+        );
+    }
+    out
+}
+
+/// [`f16_to_f32`] where the ISA has no conversion this crate reaches for.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = ((h & 0x8000) as u32) << 16;
+    let exp = (h >> 10) & 0x1F;
+    let mant = (h & 0x03FF) as u32;
+    let bits = if exp == 0 {
+        if mant == 0 {
+            sign
+        } else {
+            // subnormal: normalize the mantissa's leading 1 into the implicit bit. `e` shifts to reach bit 10,
+            // so the leading bit is at 10 - e and the value is 2^(10-e-24); the f32 exponent field is
+            // (10 - e - 24) + 127 = 113 - e.
+            let mut e: i32 = 0;
+            let mut m = mant;
+            while m & 0x0400 == 0 {
+                m <<= 1;
+                e += 1;
+            }
+            sign | (((113 - e) as u32) << 23) | ((m & 0x03FF) << 13)
+        }
+    } else if exp == 0x1F {
+        sign | 0x7F80_0000 | (mant << 13)
+    } else {
+        sign | ((exp as u32 + (127 - 15)) << 23) | (mant << 13)
+    };
+    f32::from_bits(bits)
+}
+
+#[inline(always)]
+unsafe fn f16_at(p: *const u8) -> f32 {
+    f16_to_f32(u16::from_le_bytes([*p, *p.add(1)]))
+}
+
+// -- the NEON decodes: each stored type's row span decoded sixteen weights at a time in increasing column order
+// into a `Sink` - the tile `accum_neon` reads (`Store`), or, for a one-vector pass, straight into its sixteen lane
+// accumulators (`Fma`): the same fused multiply-adds in the same column order `accum_neon` takes them, so the same
+// bits with no tile written and read back (the bf16 path's direct one-vector pass, for the stored types). --
+
+/// Where a decode puts a row's sixteen weights at column `c` of its span.
+#[cfg(target_arch = "aarch64")]
+trait Sink {
+    /// # Safety
+    /// `c + 16` within the span the sink was made for.
+    unsafe fn put(&mut self, c: usize, w: [std::arch::aarch64::float32x4_t; 4]);
+}
+
+/// The span's weights written to the tile row at `.0`.
+#[cfg(target_arch = "aarch64")]
+struct Store(*mut f32);
+
+#[cfg(target_arch = "aarch64")]
+impl Sink for Store {
+    #[inline(always)]
+    unsafe fn put(&mut self, c: usize, w: [std::arch::aarch64::float32x4_t; 4]) {
+        use std::arch::aarch64::*;
+        for (j, v) in w.iter().enumerate() {
+            vst1q_f32(self.0.add(c + 4 * j), *v);
+        }
+    }
+}
+
+/// The span's weights times `x` (its sixteen-column chunks) added into the row's sixteen lane accumulators.
+#[cfg(target_arch = "aarch64")]
+struct Fma {
+    x: *const f32,
+    a: [std::arch::aarch64::float32x4_t; 4],
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Sink for Fma {
+    #[inline(always)]
+    unsafe fn put(&mut self, c: usize, w: [std::arch::aarch64::float32x4_t; 4]) {
+        use std::arch::aarch64::*;
+        for (q, v) in w.iter().enumerate() {
+            self.a[q] = vfmaq_f32(self.a[q], *v, vld1q_f32(self.x.add(c + 4 * q)));
+        }
+    }
+}
+
+/// A stored type's NEON decode.
+#[cfg(target_arch = "aarch64")]
+trait DecNeon: Copy {
+    /// the `n` weights from element `s` of the matrix (a row's span, whole blocks), sixteen at a time in increasing
+    /// column order, each the value its scalar widen gives
+    ///
+    /// # Safety
+    /// The span within the matrix the weights hold.
+    unsafe fn dec<S: Sink>(self, s: usize, n: usize, sink: &mut S);
+}
+
+/// sixteen uint8 codes to `code * scale + neg_min` (`neg_min` the negated min), one fused multiply-add per four -
+/// the scalar path's `mul_add`
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn scaled_u8x16(
+    codes: std::arch::aarch64::uint8x16_t,
+    scale: std::arch::aarch64::float32x4_t,
+    neg_min: std::arch::aarch64::float32x4_t,
+) -> [std::arch::aarch64::float32x4_t; 4] {
+    use std::arch::aarch64::*;
+    cvt_u8x16(codes).map(|v| vfmaq_f32(neg_min, v, scale))
+}
+
+/// sixteen signed codes to `code * scale`
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn signed_x16(
+    codes: std::arch::aarch64::int8x16_t,
+    scale: std::arch::aarch64::float32x4_t,
+) -> [std::arch::aarch64::float32x4_t; 4] {
+    use std::arch::aarch64::*;
+    // the byte in the top of a signed 32-bit lane keeps its sign: `TOP_BYTE`'s convert, signed
+    let c = vreinterpretq_u8_s8(codes);
+    [0, 1, 2, 3].map(|k| {
+        let top = vqtbl1q_u8(c, vld1q_u8(TOP_BYTE[k].as_ptr()));
+        vmulq_f32(vcvtq_n_f32_s32::<24>(vreinterpretq_s32_u8(top)), scale)
+    })
+}
+
+/// `R` rows' spans decoded into the tile `dst` (`dst_stride` floats a row): the k-quant tasks' widen.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn widen_dec<W: DecNeon, const R: usize>(
+    dst: *mut f32,
+    dst_stride: usize,
+    p: W,
+    start: usize,
+    row_stride: usize,
+    n: usize,
+) {
+    for r in 0..R {
+        p.dec(
+            start + r * row_stride,
+            n,
+            &mut Store(dst.add(r * dst_stride)),
+        );
+    }
+}
+
+/// `R` rows' spans multiplied into their lane accumulators at `acc` (`LANES` a row) against one vector `x`, as
+/// `widen_dec` then `accum_neon` would: the one-vector pass with no tile.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn fuse_dec<W: DecNeon, const R: usize>(
+    acc: *mut f32,
+    p: W,
+    start: usize,
+    row_stride: usize,
+    x: *const f32,
+    n: usize,
+) {
+    use std::arch::aarch64::*;
+    for r in 0..R {
+        let row = acc.add(r * LANES);
+        let mut f = Fma {
+            x,
+            a: [0, 4, 8, 12].map(|q| vld1q_f32(row.add(q))),
+        };
+        p.dec(start + r * row_stride, n, &mut f);
+        for (q, v) in f.a.iter().enumerate() {
+            vst1q_f32(row.add(4 * q), *v);
+        }
+    }
+}
+
+/// a type's `widen_<t>_neon`, its decode into the tile (the in-crate tests hold it to the scalar widen)
+macro_rules! widen_neon {
+    ($name:ident, $w:ty) => {
+        #[cfg(target_arch = "aarch64")]
+        #[inline]
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn $name<const R: usize>(
+            dst: *mut f32,
+            dst_stride: usize,
+            p: $w,
+            start: usize,
+            row_stride: usize,
+            n: usize,
+        ) {
+            widen_dec::<$w, R>(dst, dst_stride, p, start, row_stride, n);
+        }
+    };
+}
+
+/// A stored type's NEON task: a one-vector pass fused (`fuse_dec`), a batch through the tile.
+macro_rules! def_task_kq_neon {
+    ($group:ident, $task:ident, $w:ty) => {
+        #[cfg(target_arch = "aarch64")]
+        def_task!(
+            $group,
+            $task,
+            $w,
+            accum_neon,
+            prep | p,
+            r,
+            cols,
+            cur | {},
+            tile | scratch,
+            wide,
+            x,
+            i0,
+            bt,
+            p,
+            r,
+            c0,
+            cols,
+            n,
+            cur | {
+                if bt == 1 {
+                    fuse_dec::<$w, R>(scratch, p, r * cols + c0, cols, x.add(i0 * cols + c0), n);
+                    true
+                } else {
+                    widen_dec::<$w, R>(wide, COL_TILE, p, r * cols + c0, cols, n);
+                    false
+                }
+            }
+        );
+    };
+}
+
+/// Q4_K: 144 bytes a superblock - d (f16), dmin (f16), 12 packed scale/min bytes, then 128 nibble bytes.
+pub(crate) const Q4K_BYTES: usize = 144;
+
+#[derive(Clone, Copy)]
+struct Q4k(*const u8);
+// SAFETY: read-only input, checked at the boundary; tasks read it over disjoint row ranges
+unsafe impl Send for Q4k {}
+unsafe impl Sync for Q4k {}
+
+/// llama.cpp's `get_scale_min_k4`: the 6-bit scale and min of sub-block `j` from the 12 packed bytes at `s`.
+#[inline(always)]
+unsafe fn q4k_scale_min(s: *const u8, j: usize) -> (f32, f32) {
+    if j < 4 {
+        ((*s.add(j) & 63) as f32, (*s.add(j + 4) & 63) as f32)
+    } else {
+        let sc = (*s.add(j + 4) & 0x0F) | ((*s.add(j - 4) >> 6) << 4);
+        let mn = (*s.add(j + 4) >> 4) | ((*s.add(j) >> 6) << 4);
+        (sc as f32, mn as f32)
+    }
+}
+
+/// the eight sub-blocks' `(d*scale, dmin*min)` for a Q4_K superblock, in f32 as the decode multiplies.
+#[inline(always)]
+unsafe fn q4k_factors(blk: *const u8) -> ([f32; 8], [f32; 8]) {
+    let d = f16_at(blk);
+    let dmin = f16_at(blk.add(2));
+    let s = blk.add(4);
+    let mut dsc = [0.0f32; 8];
+    let mut dmm = [0.0f32; 8];
+    for j in 0..8 {
+        let (sc, mn) = q4k_scale_min(s, j);
+        dsc[j] = d * sc;
+        dmm[j] = dmin * mn;
+    }
+    (dsc, dmm)
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn widen_q4k_scalar<const R: usize>(
+    dst: *mut f32,
+    dst_stride: usize,
+    p: Q4k,
+    start: usize,
+    row_stride: usize,
+    n: usize,
+) {
+    for r in 0..R {
+        let s = start + r * row_stride;
+        let out = dst.add(r * dst_stride);
+        for sb in 0..(n / KQ_SB) {
+            let blk = p.0.add((s / KQ_SB + sb) * Q4K_BYTES);
+            let (dsc, dmm) = q4k_factors(blk);
+            let qs = blk.add(16);
+            let o = out.add(sb * KQ_SB);
+            for k in 0..4 {
+                let (lo, hi) = (2 * k, 2 * k + 1);
+                for lane in 0..32 {
+                    let byte = *qs.add(32 * k + lane);
+                    // scale*q - min as one fused multiply-add (one rounding); the NEON path fuses the same way
+                    *o.add(lo * 32 + lane) = ((byte & 0x0F) as f32).mul_add(dsc[lo], -dmm[lo]);
+                    *o.add(hi * 32 + lane) = ((byte >> 4) as f32).mul_add(dsc[hi], -dmm[hi]);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl DecNeon for Q4k {
+    #[inline(always)]
+    unsafe fn dec<S: Sink>(self, s: usize, n: usize, sink: &mut S) {
+        use std::arch::aarch64::*;
+        let mask = vdupq_n_u8(0x0F);
+        for sb in 0..(n / KQ_SB) {
+            let blk = self.0.add((s / KQ_SB + sb) * Q4K_BYTES);
+            let (dsc, dmm) = q4k_factors(blk);
+            let qs = blk.add(16);
+            let o = sb * KQ_SB;
+            for k in 0..4 {
+                let (lo, hi) = (2 * k, 2 * k + 1);
+                let (scl, nml) = (vdupq_n_f32(dsc[lo]), vdupq_n_f32(-dmm[lo]));
+                let (sch, nmh) = (vdupq_n_f32(dsc[hi]), vdupq_n_f32(-dmm[hi]));
+                let v0 = vld1q_u8(qs.add(32 * k));
+                let v1 = vld1q_u8(qs.add(32 * k + 16));
+                let base = o + 64 * k;
+                sink.put(base, scaled_u8x16(vandq_u8(v0, mask), scl, nml));
+                sink.put(base + 16, scaled_u8x16(vandq_u8(v1, mask), scl, nml));
+                sink.put(base + 32, scaled_u8x16(vshrq_n_u8::<4>(v0), sch, nmh));
+                sink.put(base + 48, scaled_u8x16(vshrq_n_u8::<4>(v1), sch, nmh));
+            }
+        }
+    }
+}
+widen_neon!(widen_q4k_neon, Q4k);
+
+/// A k-quant task: the tile is always decoded into `wide` (never accumulated straight), so one macro serves
+/// every kind and ISA - only the widen differs.
+macro_rules! def_task_kq {
+    ($group:ident, $task:ident, $w:ty, $widen:ident, $accum:ident $(, $feat:literal)?) => {
+        def_task!($group, $task, $w, $accum $(, $feat)?,
+            prep |p, r, cols, cur| {},
+            tile |scratch, wide, x, i0, bt, p, r, c0, cols, n, cur| {
+                $widen::<R>(wide, COL_TILE, p, r * cols + c0, cols, n);
+                false
+            });
+    };
+}
+
+def_task_kq!(
+    group_q4k_scalar,
+    task_q4k_scalar,
+    Q4k,
+    widen_q4k_scalar,
+    accum_scalar
+);
+def_task_kq_neon!(group_q4k_neon, task_q4k_neon, Q4k);
+
+/// the table lookups that put byte `4k + i` of a vector in the top byte of lane `i` of the `k`th 32-bit four, the
+/// rest zero: a byte becomes `byte << 24`, which a fixed-point convert by 2^24 makes the byte's exact value - one
+/// lookup and one convert a four, where widening takes two levels of moves first (8 operations a sixteen, not 10)
+#[cfg(target_arch = "aarch64")]
+const TOP_BYTE: [[u8; 16]; 4] = {
+    let mut t = [[255u8; 16]; 4];
+    let mut k = 0;
+    while k < 4 {
+        let mut i = 0;
+        while i < 4 {
+            t[k][4 * i + 3] = (4 * k + i) as u8;
+            i += 1;
+        }
+        k += 1;
+    }
+    t
+};
+
+/// sixteen uint8 to four f32 vectors, one lane a value (the widenings' shared conversion).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn cvt_u8x16(codes: std::arch::aarch64::uint8x16_t) -> [std::arch::aarch64::float32x4_t; 4] {
+    use std::arch::aarch64::*;
+    [0, 1, 2, 3].map(|k| {
+        let top = vqtbl1q_u8(codes, vld1q_u8(TOP_BYTE[k].as_ptr()));
+        vcvtq_n_f32_u32::<24>(vreinterpretq_u32_u8(top))
+    })
+}
+
+/// `cvt_u8x16` by two levels of widening moves: the same values, for Q3_K, whose codes come of enough vector shifts
+/// that the lookups measured 10% slower there
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn cvt_u8x16_widen(
+    codes: std::arch::aarch64::uint8x16_t,
+) -> [std::arch::aarch64::float32x4_t; 4] {
+    use std::arch::aarch64::*;
+    let lo = vmovl_u8(vget_low_u8(codes));
+    let hi = vmovl_u8(vget_high_u8(codes));
+    [
+        vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo))),
+        vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo))),
+        vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi))),
+        vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi))),
+    ]
+}
+
+/// Q6_K: 210 bytes a superblock - 128 low-nibble bytes, 64 high-2-bit bytes, 16 int8 scales, then the
+/// f16 delta. A weight is `d * scale * (q - 32)`, q a 6-bit value (four low bits from `ql`, two high from
+/// `qh`), with no min term.
+pub(crate) const Q6K_BYTES: usize = 210;
+
+#[derive(Clone, Copy)]
+struct Q6k(*const u8);
+// SAFETY: read-only input, checked at the boundary; tasks read it over disjoint row ranges
+unsafe impl Send for Q6k {}
+unsafe impl Sync for Q6k {}
+
+/// the sixteen sub-blocks' `d * scale` for a Q6_K superblock, in f32 as the decode multiplies (the scales
+/// are signed int8).
+#[inline(always)]
+unsafe fn q6k_factors(blk: *const u8) -> [f32; 16] {
+    let d = f16_at(blk.add(208));
+    let sc = blk.add(192) as *const i8;
+    let mut dsc = [0.0f32; 16];
+    for (i, v) in dsc.iter_mut().enumerate() {
+        *v = d * (*sc.add(i)) as f32;
+    }
+    dsc
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn widen_q6k_scalar<const R: usize>(
+    dst: *mut f32,
+    dst_stride: usize,
+    p: Q6k,
+    start: usize,
+    row_stride: usize,
+    n: usize,
+) {
+    for r in 0..R {
+        let s = start + r * row_stride;
+        let out = dst.add(r * dst_stride);
+        for sb in 0..(n / KQ_SB) {
+            let blk = p.0.add((s / KQ_SB + sb) * Q6K_BYTES);
+            let dsc = q6k_factors(blk);
+            let o = out.add(sb * KQ_SB);
+            for h in 0..2 {
+                let (base, qlo, qho, sco) = (h * 128, h * 64, h * 32, h * 8);
+                let ql = blk.add(qlo);
+                let qh = blk.add(128 + qho);
+                for lane in 0..32 {
+                    let isc = sco + lane / 16;
+                    let l0 = *ql.add(lane);
+                    let l1 = *ql.add(lane + 32);
+                    let hb = *qh.add(lane);
+                    // code*scale - 32*scale as one fused multiply-add (one rounding); the NEON path fuses the same
+                    let c0 = ((l0 & 0x0F) | ((hb & 3) << 4)) as f32;
+                    let c1 = ((l1 & 0x0F) | (((hb >> 2) & 3) << 4)) as f32;
+                    let c2 = ((l0 >> 4) | (((hb >> 4) & 3) << 4)) as f32;
+                    let c3 = ((l1 >> 4) | (((hb >> 6) & 3) << 4)) as f32;
+                    *o.add(base + lane) = c0.mul_add(dsc[isc], -32.0 * dsc[isc]);
+                    *o.add(base + lane + 32) = c1.mul_add(dsc[isc + 2], -32.0 * dsc[isc + 2]);
+                    *o.add(base + lane + 64) = c2.mul_add(dsc[isc + 4], -32.0 * dsc[isc + 4]);
+                    *o.add(base + lane + 96) = c3.mul_add(dsc[isc + 6], -32.0 * dsc[isc + 6]);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl DecNeon for Q6k {
+    #[inline(always)]
+    unsafe fn dec<S: Sink>(self, s: usize, n: usize, sink: &mut S) {
+        use std::arch::aarch64::*;
+        let m3f = vdupq_n_u8(0x3F);
+        let m30 = vdupq_n_u8(0x30);
+        for sb in 0..(n / KQ_SB) {
+            let blk = self.0.add((s / KQ_SB + sb) * Q6K_BYTES);
+            let dsc = q6k_factors(blk);
+            let o = sb * KQ_SB;
+            for h in 0..2 {
+                let (base, qlo, qho, sco) = (h * 128, h * 64, h * 32, h * 8);
+                let ql = blk.add(qlo);
+                let qh = blk.add(128 + qho);
+                // the two 16-lane halves' codes (lanes 0..15 read scale `sco`, 16..31 `sco + 1`), the four
+                // 32-weight quarters each half feeds put out quarter by quarter, so the columns come in order. A
+                // code's nibble and its two high bits joined by shift-and-insert: nine operations, not nineteen
+                let mut c = [[vdupq_n_u8(0); 4]; 2];
+                for (hh, ch) in c.iter_mut().enumerate() {
+                    let off = hh * 16;
+                    let l0 = vld1q_u8(ql.add(off));
+                    let l1 = vld1q_u8(ql.add(off + 32));
+                    let hb = vld1q_u8(qh.add(off));
+                    let hb2 = vshrq_n_u8::<2>(hb);
+                    *ch = [
+                        vandq_u8(vsliq_n_u8::<4>(l0, hb), m3f),
+                        vandq_u8(vsliq_n_u8::<4>(l1, hb2), m3f),
+                        vsriq_n_u8::<4>(vandq_u8(hb, m30), l0),
+                        vsriq_n_u8::<4>(vandq_u8(hb2, m30), l1),
+                    ];
+                }
+                for j in 0..4 {
+                    for (hh, ch) in c.iter().enumerate() {
+                        // scale and its -32*scale addend per sub-block; the fma reads them the way the scalar does
+                        let i = sco + hh + 2 * j;
+                        let (sc, n32) = (vdupq_n_f32(dsc[i]), vdupq_n_f32(-32.0 * dsc[i]));
+                        sink.put(o + base + 32 * j + 16 * hh, scaled_u8x16(ch[j], sc, n32));
+                    }
+                }
+            }
+        }
+    }
+}
+widen_neon!(widen_q6k_neon, Q6k);
+
+def_task_kq!(
+    group_q6k_scalar,
+    task_q6k_scalar,
+    Q6k,
+    widen_q6k_scalar,
+    accum_scalar
+);
+def_task_kq_neon!(group_q6k_neon, task_q6k_neon, Q6k);
+
+/// Q5_K: 176 bytes a superblock - Q4_K's delta, min and 12 scale/min bytes, then a 32-byte high-bit plane
+/// (`qh`) and 128 nibble bytes. A weight is Q4_K's `scale*q - min` with a 5-bit `q`: the nibble plus one bit
+/// from `qh`. The scale/min factors are Q4_K's (`q4k_factors`).
+pub(crate) const Q5K_BYTES: usize = 176;
+
+#[derive(Clone, Copy)]
+struct Q5k(*const u8);
+// SAFETY: read-only input, checked at the boundary; tasks read it over disjoint row ranges
+unsafe impl Send for Q5k {}
+unsafe impl Sync for Q5k {}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn widen_q5k_scalar<const R: usize>(
+    dst: *mut f32,
+    dst_stride: usize,
+    p: Q5k,
+    start: usize,
+    row_stride: usize,
+    n: usize,
+) {
+    for r in 0..R {
+        let s = start + r * row_stride;
+        let out = dst.add(r * dst_stride);
+        for sb in 0..(n / KQ_SB) {
+            let blk = p.0.add((s / KQ_SB + sb) * Q5K_BYTES);
+            let (dsc, dmm) = q4k_factors(blk);
+            let qh = blk.add(16);
+            let qs = blk.add(48);
+            let o = out.add(sb * KQ_SB);
+            for lane in 0..32 {
+                let hbit = *qh.add(lane);
+                for k in 0..4 {
+                    let (lo, hi) = (2 * k, 2 * k + 1);
+                    let byte = *qs.add(32 * k + lane);
+                    let qlo = (byte & 0x0F) | (((hbit >> (2 * k)) & 1) << 4);
+                    let qhi = (byte >> 4) | (((hbit >> (2 * k + 1)) & 1) << 4);
+                    *o.add(lo * 32 + lane) = (qlo as f32).mul_add(dsc[lo], -dmm[lo]);
+                    *o.add(hi * 32 + lane) = (qhi as f32).mul_add(dsc[hi], -dmm[hi]);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl DecNeon for Q5k {
+    #[inline(always)]
+    unsafe fn dec<S: Sink>(self, s: usize, n: usize, sink: &mut S) {
+        use std::arch::aarch64::*;
+        let one = vdupq_n_u8(1);
+        for sb in 0..(n / KQ_SB) {
+            let blk = self.0.add((s / KQ_SB + sb) * Q5K_BYTES);
+            let (dsc, dmm) = q4k_factors(blk);
+            let qh = blk.add(16);
+            let qs = blk.add(48);
+            let o = sb * KQ_SB;
+            for k in 0..4 {
+                let (lo, hi) = (2 * k, 2 * k + 1);
+                let (scl, nml) = (vdupq_n_f32(dsc[lo]), vdupq_n_f32(-dmm[lo]));
+                let (sch, nmh) = (vdupq_n_f32(dsc[hi]), vdupq_n_f32(-dmm[hi]));
+                // the qh bit for this k, shifted to bit 4 (value 16): a runtime right shift, mask, then <<4
+                let shl = vdupq_n_s8(-(2 * k as i32) as i8);
+                let shh = vdupq_n_s8(-((2 * k + 1) as i32) as i8);
+                // both halves' codes first, so the low sub-block's 32 columns come before the high one's
+                let mut q = [[vdupq_n_u8(0); 2]; 2];
+                for (hh, qq) in q.iter_mut().enumerate() {
+                    let off = hh * 16;
+                    let v = vld1q_u8(qs.add(32 * k + off));
+                    let h = vld1q_u8(qh.add(off));
+                    // the fifth bit inserted above the nibble (shift-and-insert keeps the nibble's four bits)
+                    let bl = vandq_u8(vshlq_u8(h, shl), one);
+                    let bh = vandq_u8(vshlq_u8(h, shh), one);
+                    *qq = [
+                        vsliq_n_u8::<4>(v, bl),
+                        vsliq_n_u8::<4>(vshrq_n_u8::<4>(v), bh),
+                    ];
+                }
+                for (hh, qq) in q.iter().enumerate() {
+                    sink.put(o + lo * 32 + hh * 16, scaled_u8x16(qq[0], scl, nml));
+                }
+                for (hh, qq) in q.iter().enumerate() {
+                    sink.put(o + hi * 32 + hh * 16, scaled_u8x16(qq[1], sch, nmh));
+                }
+            }
+        }
+    }
+}
+widen_neon!(widen_q5k_neon, Q5k);
+
+def_task_kq!(
+    group_q5k_scalar,
+    task_q5k_scalar,
+    Q5k,
+    widen_q5k_scalar,
+    accum_scalar
+);
+def_task_kq_neon!(group_q5k_neon, task_q5k_neon, Q5k);
+
+/// Q2_K: 84 bytes a superblock - 16 scale/min bytes (a 4-bit scale and 4-bit min a 16-weight sub-block), 64
+/// 2-bit weight bytes, then the delta and min (f16). A weight is `d*scale*q - dmin*min` with a 2-bit `q`.
+pub(crate) const Q2K_BYTES: usize = 84;
+
+#[derive(Clone, Copy)]
+struct Q2k(*const u8);
+// SAFETY: read-only input, checked at the boundary; tasks read it over disjoint row ranges
+unsafe impl Send for Q2k {}
+unsafe impl Sync for Q2k {}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn widen_q2k_scalar<const R: usize>(
+    dst: *mut f32,
+    dst_stride: usize,
+    p: Q2k,
+    start: usize,
+    row_stride: usize,
+    n: usize,
+) {
+    for r in 0..R {
+        let s = start + r * row_stride;
+        let out = dst.add(r * dst_stride);
+        for sb in 0..(n / KQ_SB) {
+            let blk = p.0.add((s / KQ_SB + sb) * Q2K_BYTES);
+            let d = f16_at(blk.add(80));
+            let dmin = f16_at(blk.add(82));
+            let scales = blk;
+            let qs = blk.add(16);
+            let o = out.add(sb * KQ_SB);
+            for h in 0..2 {
+                for lane in 0..32 {
+                    let sub = lane >> 4;
+                    let byte = *qs.add(h * 32 + lane);
+                    for j in 0..4 {
+                        let sc = *scales.add(h * 8 + 2 * j + sub);
+                        let dsc = d * (sc & 0x0F) as f32;
+                        let dmm = dmin * (sc >> 4) as f32;
+                        let q = ((byte >> (2 * j)) & 3) as f32;
+                        *o.add(h * 128 + j * 32 + lane) = q.mul_add(dsc, -dmm);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl DecNeon for Q2k {
+    #[inline(always)]
+    unsafe fn dec<S: Sink>(self, s: usize, n: usize, sink: &mut S) {
+        use std::arch::aarch64::*;
+        let three = vdupq_n_u8(3);
+        for sb in 0..(n / KQ_SB) {
+            let blk = self.0.add((s / KQ_SB + sb) * Q2K_BYTES);
+            let d = f16_at(blk.add(80));
+            let dmin = f16_at(blk.add(82));
+            let scales = blk;
+            let qs = blk.add(16);
+            let o = sb * KQ_SB;
+            for h in 0..2 {
+                for j in 0..4 {
+                    let shift = vdupq_n_s8(-(2 * j as i32) as i8);
+                    for hh in 0..2 {
+                        let sc = *scales.add(h * 8 + 2 * j + hh);
+                        let dsc = vdupq_n_f32(d * (sc & 0x0F) as f32);
+                        let ndm = vdupq_n_f32(-(dmin * (sc >> 4) as f32));
+                        let v = vld1q_u8(qs.add(h * 32 + hh * 16));
+                        let q = vandq_u8(vshlq_u8(v, shift), three);
+                        sink.put(o + h * 128 + j * 32 + hh * 16, scaled_u8x16(q, dsc, ndm));
+                    }
+                }
+            }
+        }
+    }
+}
+widen_neon!(widen_q2k_neon, Q2k);
+
+def_task_kq!(
+    group_q2k_scalar,
+    task_q2k_scalar,
+    Q2k,
+    widen_q2k_scalar,
+    accum_scalar
+);
+def_task_kq_neon!(group_q2k_neon, task_q2k_neon, Q2k);
+
+/// Q3_K: 110 bytes a superblock - a 32-byte high-bit mask, 64 low-2-bit weight bytes, 12 packed 6-bit scale
+/// bytes, then the delta. A weight is `d*(scale-32)*q`, no min; `q` is a signed 2+1-bit value (two bits from
+/// `qs`, the third from `hmask`, biased by -4 when the mask bit is clear).
+pub(crate) const Q3K_BYTES: usize = 110;
+
+#[derive(Clone, Copy)]
+struct Q3k(*const u8);
+// SAFETY: read-only input, checked at the boundary; tasks read it over disjoint row ranges
+unsafe impl Send for Q3k {}
+unsafe impl Sync for Q3k {}
+
+/// the sixteen sub-blocks' `d*(scale-32)` for a Q3_K superblock, in f32. The 6-bit scales are unpacked from
+/// the 12 bytes the way llama.cpp does (four little-endian words recombined).
+#[inline(always)]
+unsafe fn q3k_scales(blk: *const u8) -> [f32; 16] {
+    let d = f16_at(blk.add(108));
+    let sc = blk.add(96);
+    let word =
+        |i: usize| u32::from_le_bytes([*sc.add(i), *sc.add(i + 1), *sc.add(i + 2), *sc.add(i + 3)]);
+    let (a0, a1, a2) = (word(0), word(4), word(8));
+    let (k1, k2) = (0x0303_0303u32, 0x0F0F_0F0Fu32);
+    let aux = [
+        (a0 & k2) | (((a2) & k1) << 4),
+        (a1 & k2) | (((a2 >> 2) & k1) << 4),
+        ((a0 >> 4) & k2) | (((a2 >> 4) & k1) << 4),
+        ((a1 >> 4) & k2) | (((a2 >> 6) & k1) << 4),
+    ];
+    let mut dsc = [0.0f32; 16];
+    for (w, a) in aux.iter().enumerate() {
+        for (t, b) in a.to_le_bytes().iter().enumerate() {
+            dsc[w * 4 + t] = d * (*b as i32 - 32) as f32;
+        }
+    }
+    dsc
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn widen_q3k_scalar<const R: usize>(
+    dst: *mut f32,
+    dst_stride: usize,
+    p: Q3k,
+    start: usize,
+    row_stride: usize,
+    n: usize,
+) {
+    for r in 0..R {
+        let s = start + r * row_stride;
+        let out = dst.add(r * dst_stride);
+        for sb in 0..(n / KQ_SB) {
+            let blk = p.0.add((s / KQ_SB + sb) * Q3K_BYTES);
+            let dsc = q3k_scales(blk);
+            // -4*scale per sub-block, the fma bias precomputed so the inner loop is one fma per weight; the same
+            // value the NEON path broadcasts, so the two decode bit-for-bit alike.
+            let neg4: [f32; 16] = std::array::from_fn(|i| -4.0 * dsc[i]);
+            let hmask = blk;
+            let qs = blk.add(32);
+            let o = out.add(sb * KQ_SB);
+            for h in 0..2 {
+                for lane in 0..32 {
+                    let sub = lane >> 4;
+                    let hm = *hmask.add(lane);
+                    let byte = *qs.add(h * 32 + lane);
+                    for j in 0..4 {
+                        let q2 = ((byte >> (2 * j)) & 3) as i32;
+                        let bit = ((hm >> (h * 4 + j)) & 1) as i32;
+                        let i = h * 8 + 2 * j + sub;
+                        // code = q2 + 4*bit in [0,7]; the weight is scale*(code-4), the -4 folded into the fma
+                        *o.add(h * 128 + j * 32 + lane) =
+                            ((q2 + 4 * bit) as f32).mul_add(dsc[i], neg4[i]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// hoisted qs/hmask loads (the same two bytes feed all four j) + the unsigned-code fma of `store_scaled_u8x16`:
+// 1.21x over the scalar decode. The first NEON attempt (signed code + plain multiply, no hoist) was a 0.94x
+// loss - see the kquant_throughput microbench.
+#[cfg(target_arch = "aarch64")]
+impl DecNeon for Q3k {
+    #[inline(always)]
+    unsafe fn dec<S: Sink>(self, s: usize, n: usize, sink: &mut S) {
+        use std::arch::aarch64::*;
+        let three = vdupq_n_u8(3);
+        let one = vdupq_n_u8(1);
+        for sb in 0..(n / KQ_SB) {
+            let blk = self.0.add((s / KQ_SB + sb) * Q3K_BYTES);
+            let dsc = q3k_scales(blk);
+            let hmask = blk;
+            let qs = blk.add(32);
+            let o = sb * KQ_SB;
+            for h in 0..2 {
+                // the qs and hmask bytes of each 16-lane half are the same across all four j: loaded once,
+                // then the quarters j put out in column order
+                let v = [vld1q_u8(qs.add(h * 32)), vld1q_u8(qs.add(h * 32 + 16))];
+                let hm = [vld1q_u8(hmask), vld1q_u8(hmask.add(16))];
+                for j in 0..4 {
+                    for hh in 0..2 {
+                        let sc = dsc[h * 8 + 2 * j + hh];
+                        let scale = vdupq_n_f32(sc);
+                        let neg4 = vdupq_n_f32(-4.0 * sc);
+                        let q2 =
+                            vandq_u8(vshlq_u8(v[hh], vdupq_n_s8(-(2 * j as i32) as i8)), three);
+                        let bit = vandq_u8(
+                            vshlq_u8(hm[hh], vdupq_n_s8(-((h * 4 + j) as i32) as i8)),
+                            one,
+                        );
+                        // code = q2 + 4*bit in [0, 7]; the weight is scale*(code - 4), the -4 an exact
+                        // power-of-two so folding it into the fma stays bit-identical to `(code-4)*scale`.
+                        let code = vaddq_u8(q2, vshlq_n_u8::<2>(bit));
+                        let w = cvt_u8x16_widen(code).map(|v| vfmaq_f32(neg4, v, scale));
+                        sink.put(o + h * 128 + j * 32 + hh * 16, w);
+                    }
+                }
+            }
+        }
+    }
+}
+widen_neon!(widen_q3k_neon, Q3k);
+
+def_task_kq!(
+    group_q3k_scalar,
+    task_q3k_scalar,
+    Q3k,
+    widen_q3k_scalar,
+    accum_scalar
+);
+def_task_kq_neon!(group_q3k_neon, task_q3k_neon, Q3k);
+
+/// the fixed IQ4 non-linear codebook (ggml's kvalues_iq4nl): a 4-bit index maps to one of 16 signed levels.
+const IQ4_KV: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
+
+/// IQ4_NL: 18 bytes a block of 32 - an f16 delta then 16 nibble bytes; weight j (0..15) is the low nibble of
+/// byte j, weight j+16 the high nibble, and a weight is `d * KV[code]`.
+pub(crate) const IQ4NL_BYTES: usize = 18;
+pub(crate) const IQ4NL_BLK: usize = 32;
+
+#[derive(Clone, Copy)]
+struct Iq4nl(*const u8);
+// SAFETY: read-only input, checked at the boundary; tasks read it over disjoint row ranges
+unsafe impl Send for Iq4nl {}
+unsafe impl Sync for Iq4nl {}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn widen_iq4nl_scalar<const R: usize>(
+    dst: *mut f32,
+    dst_stride: usize,
+    p: Iq4nl,
+    start: usize,
+    row_stride: usize,
+    n: usize,
+) {
+    for r in 0..R {
+        let s = start + r * row_stride;
+        let out = dst.add(r * dst_stride);
+        for blk in 0..(n / IQ4NL_BLK) {
+            let b = p.0.add((s / IQ4NL_BLK + blk) * IQ4NL_BYTES);
+            let d = f16_at(b);
+            let nib = b.add(2);
+            let o = out.add(blk * IQ4NL_BLK);
+            for j in 0..16 {
+                let byte = *nib.add(j);
+                *o.add(j) = d * IQ4_KV[(byte & 0x0F) as usize] as f32;
+                *o.add(16 + j) = d * IQ4_KV[(byte >> 4) as usize] as f32;
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl DecNeon for Iq4nl {
+    #[inline(always)]
+    unsafe fn dec<S: Sink>(self, s: usize, n: usize, sink: &mut S) {
+        use std::arch::aarch64::*;
+        let kv = vld1q_s8(IQ4_KV.as_ptr());
+        let lo4 = vdupq_n_u8(0x0F);
+        for blk in 0..(n / IQ4NL_BLK) {
+            let b = self.0.add((s / IQ4NL_BLK + blk) * IQ4NL_BYTES);
+            let dd = vdupq_n_f32(f16_at(b));
+            let v = vld1q_u8(b.add(2));
+            let o = blk * IQ4NL_BLK;
+            sink.put(o, signed_x16(vqtbl1q_s8(kv, vandq_u8(v, lo4)), dd));
+            sink.put(o + 16, signed_x16(vqtbl1q_s8(kv, vshrq_n_u8::<4>(v)), dd));
+        }
+    }
+}
+widen_neon!(widen_iq4nl_neon, Iq4nl);
+
+def_task_kq!(
+    group_iq4nl_scalar,
+    task_iq4nl_scalar,
+    Iq4nl,
+    widen_iq4nl_scalar,
+    accum_scalar
+);
+def_task_kq_neon!(group_iq4nl_neon, task_iq4nl_neon, Iq4nl);
+
+/// IQ4_XS: 136 bytes a superblock of 256 - an f16 delta, a u16 high-scale word, four low-scale bytes, then
+/// 128 nibble bytes. Eight 32-blocks: block `ib` has a 6-bit scale `ls`, and a weight is `d*(ls-32)*KV[code]`.
+pub(crate) const IQ4XS_BYTES: usize = 136;
+
+#[derive(Clone, Copy)]
+struct Iq4xs(*const u8);
+// SAFETY: read-only input, checked at the boundary; tasks read it over disjoint row ranges
+unsafe impl Send for Iq4xs {}
+unsafe impl Sync for Iq4xs {}
+
+/// block `ib`'s 6-bit scale from the packed low nibbles and the two-bit high word.
+#[inline(always)]
+unsafe fn iq4xs_ls(sl: *const u8, sh: u32, ib: usize) -> i32 {
+    (((*sl.add(ib >> 1) >> (4 * (ib & 1))) & 0x0F) as i32) | (((sh >> (2 * ib)) & 3) << 4) as i32
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn widen_iq4xs_scalar<const R: usize>(
+    dst: *mut f32,
+    dst_stride: usize,
+    p: Iq4xs,
+    start: usize,
+    row_stride: usize,
+    n: usize,
+) {
+    for r in 0..R {
+        let s = start + r * row_stride;
+        let out = dst.add(r * dst_stride);
+        for sb in 0..(n / KQ_SB) {
+            let blk = p.0.add((s / KQ_SB + sb) * IQ4XS_BYTES);
+            let d = f16_at(blk);
+            let sh = u16::from_le_bytes([*blk.add(2), *blk.add(3)]) as u32;
+            let sl = blk.add(4);
+            let qs = blk.add(8);
+            let o = out.add(sb * KQ_SB);
+            for ib in 0..8 {
+                let dl = d * (iq4xs_ls(sl, sh, ib) - 32) as f32;
+                for col in 0..16 {
+                    let byte = *qs.add(16 * ib + col);
+                    *o.add(32 * ib + col) = dl * IQ4_KV[(byte & 0x0F) as usize] as f32;
+                    *o.add(32 * ib + 16 + col) = dl * IQ4_KV[(byte >> 4) as usize] as f32;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl DecNeon for Iq4xs {
+    #[inline(always)]
+    unsafe fn dec<S: Sink>(self, s: usize, n: usize, sink: &mut S) {
+        use std::arch::aarch64::*;
+        let kv = vld1q_s8(IQ4_KV.as_ptr());
+        let lo4 = vdupq_n_u8(0x0F);
+        for sb in 0..(n / KQ_SB) {
+            let blk = self.0.add((s / KQ_SB + sb) * IQ4XS_BYTES);
+            let d = f16_at(blk);
+            let sh = u16::from_le_bytes([*blk.add(2), *blk.add(3)]) as u32;
+            let sl = blk.add(4);
+            let qs = blk.add(8);
+            let o = sb * KQ_SB;
+            for ib in 0..8 {
+                let dl = vdupq_n_f32(d * (iq4xs_ls(sl, sh, ib) - 32) as f32);
+                let v = vld1q_u8(qs.add(16 * ib));
+                sink.put(
+                    o + 32 * ib,
+                    signed_x16(vqtbl1q_s8(kv, vandq_u8(v, lo4)), dl),
+                );
+                sink.put(
+                    o + 32 * ib + 16,
+                    signed_x16(vqtbl1q_s8(kv, vshrq_n_u8::<4>(v)), dl),
+                );
+            }
+        }
+    }
+}
+widen_neon!(widen_iq4xs_neon, Iq4xs);
+
+def_task_kq!(
+    group_iq4xs_scalar,
+    task_iq4xs_scalar,
+    Iq4xs,
+    widen_iq4xs_scalar,
+    accum_scalar
+);
+def_task_kq_neon!(group_iq4xs_neon, task_iq4xs_neon, Iq4xs);
+
+// -- the affine types (Q4_0, Q4_1, Q8_0): a scale (and offset) a 32-weight block, multiplied as stored. --
+
+/// Q4_0: 18 bytes a block of 32 - an f16 delta then 16 nibble bytes; a weight is `d*(code-8)` (nibble j the
+/// low half of byte j, j+16 the high). Q4_1: 20 bytes - a delta and min, `d*code + m`. Q8_0: 34 bytes - a
+/// delta and 32 int8 weights, `d*code`.
+pub(crate) const Q40_BYTES: usize = 18;
+pub(crate) const Q41_BYTES: usize = 20;
+pub(crate) const Q80_BYTES: usize = 34;
+pub(crate) const AFFINE_BLK: usize = 32;
+
+#[derive(Clone, Copy)]
+struct Q40(*const u8);
+#[derive(Clone, Copy)]
+struct Q41(*const u8);
+#[derive(Clone, Copy)]
+struct Q80(*const u8);
+// SAFETY: read-only input, checked at the boundary; tasks read it over disjoint row ranges
+unsafe impl Send for Q40 {}
+unsafe impl Sync for Q40 {}
+unsafe impl Send for Q41 {}
+unsafe impl Sync for Q41 {}
+unsafe impl Send for Q80 {}
+unsafe impl Sync for Q80 {}
+
+/// Q4_0 / Q4_1 share the nibble layout: a weight is `code * d + add` (add = -8*d for Q4_0, the min for Q4_1),
+/// one fused multiply-add. `mbytes` is the block size (18 or 20), `qoff` where the nibbles start (2 or 4).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn widen_q4affine_scalar<const R: usize>(
+    dst: *mut f32,
+    dst_stride: usize,
+    base: *const u8,
+    mbytes: usize,
+    qoff: usize,
+    add: unsafe fn(*const u8) -> f32,
+    start: usize,
+    row_stride: usize,
+    n: usize,
+) {
+    for r in 0..R {
+        let s = start + r * row_stride;
+        let out = dst.add(r * dst_stride);
+        for blk in 0..(n / AFFINE_BLK) {
+            let b = base.add((s / AFFINE_BLK + blk) * mbytes);
+            let d = f16_at(b);
+            let a = add(b);
+            let qs = b.add(qoff);
+            let o = out.add(blk * AFFINE_BLK);
+            for j in 0..16 {
+                let byte = *qs.add(j);
+                // code*d + add as one fused multiply-add, matching the NEON path bit for bit
+                *o.add(j) = ((byte & 0x0F) as f32).mul_add(d, a);
+                *o.add(16 + j) = ((byte >> 4) as f32).mul_add(d, a);
+            }
+        }
+    }
+}
+
+/// Q4_0 / Q4_1's NEON decode, as `widen_q4affine_scalar` takes the layout.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn dec_q4affine<S: Sink>(
+    base: *const u8,
+    mbytes: usize,
+    qoff: usize,
+    add: unsafe fn(*const u8) -> f32,
+    s: usize,
+    n: usize,
+    sink: &mut S,
+) {
+    use std::arch::aarch64::*;
+    let lo4 = vdupq_n_u8(0x0F);
+    for blk in 0..(n / AFFINE_BLK) {
+        let b = base.add((s / AFFINE_BLK + blk) * mbytes);
+        let d = vdupq_n_f32(f16_at(b));
+        let a = vdupq_n_f32(add(b));
+        let v = vld1q_u8(b.add(qoff));
+        let o = blk * AFFINE_BLK;
+        sink.put(o, scaled_u8x16(vandq_u8(v, lo4), d, a));
+        sink.put(o + 16, scaled_u8x16(vshrq_n_u8::<4>(v), d, a));
+    }
+}
+
+#[inline(always)]
+unsafe fn q40_add(b: *const u8) -> f32 {
+    -8.0 * f16_at(b)
+}
+#[inline(always)]
+unsafe fn q41_add(b: *const u8) -> f32 {
+    f16_at(b.add(2))
+}
+
+macro_rules! widen_q4affine {
+    ($scalar:ident, $neon:ident, $w:ty, $mbytes:expr, $qoff:expr, $add:ident) => {
+        #[inline]
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn $scalar<const R: usize>(
+            dst: *mut f32,
+            ds: usize,
+            p: $w,
+            start: usize,
+            rs: usize,
+            n: usize,
+        ) {
+            widen_q4affine_scalar::<R>(dst, ds, p.0, $mbytes, $qoff, $add, start, rs, n);
+        }
+        #[cfg(target_arch = "aarch64")]
+        impl DecNeon for $w {
+            #[inline(always)]
+            unsafe fn dec<S: Sink>(self, s: usize, n: usize, sink: &mut S) {
+                dec_q4affine(self.0, $mbytes, $qoff, $add, s, n, sink);
+            }
+        }
+        widen_neon!($neon, $w);
+    };
+}
+widen_q4affine!(widen_q40_scalar, widen_q40_neon, Q40, Q40_BYTES, 2, q40_add);
+widen_q4affine!(widen_q41_scalar, widen_q41_neon, Q41, Q41_BYTES, 4, q41_add);
+
+def_task_kq!(
+    group_q40_scalar,
+    task_q40_scalar,
+    Q40,
+    widen_q40_scalar,
+    accum_scalar
+);
+def_task_kq_neon!(group_q40_neon, task_q40_neon, Q40);
+def_task_kq!(
+    group_q41_scalar,
+    task_q41_scalar,
+    Q41,
+    widen_q41_scalar,
+    accum_scalar
+);
+def_task_kq_neon!(group_q41_neon, task_q41_neon, Q41);
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn widen_q80_scalar<const R: usize>(
+    dst: *mut f32,
+    dst_stride: usize,
+    p: Q80,
+    start: usize,
+    row_stride: usize,
+    n: usize,
+) {
+    for r in 0..R {
+        let s = start + r * row_stride;
+        let out = dst.add(r * dst_stride);
+        for blk in 0..(n / AFFINE_BLK) {
+            let b = p.0.add((s / AFFINE_BLK + blk) * Q80_BYTES);
+            let d = f16_at(b);
+            let qs = b.add(2) as *const i8;
+            let o = out.add(blk * AFFINE_BLK);
+            for j in 0..32 {
+                *o.add(j) = *qs.add(j) as f32 * d;
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl DecNeon for Q80 {
+    #[inline(always)]
+    unsafe fn dec<S: Sink>(self, s: usize, n: usize, sink: &mut S) {
+        use std::arch::aarch64::*;
+        for blk in 0..(n / AFFINE_BLK) {
+            let b = self.0.add((s / AFFINE_BLK + blk) * Q80_BYTES);
+            let d = vdupq_n_f32(f16_at(b));
+            let qs = b.add(2);
+            let o = blk * AFFINE_BLK;
+            sink.put(o, signed_x16(vld1q_s8(qs as *const i8), d));
+            sink.put(o + 16, signed_x16(vld1q_s8(qs.add(16) as *const i8), d));
+        }
+    }
+}
+widen_neon!(widen_q80_neon, Q80);
+
+def_task_kq!(
+    group_q80_scalar,
+    task_q80_scalar,
+    Q80,
+    widen_q80_scalar,
+    accum_scalar
+);
+def_task_kq_neon!(group_q80_neon, task_q80_neon, Q80);
+
+// -- the IQ lattice family (grid-codebook quants): a packed index into a shared grid table, signed and scaled.
+// The decode is a scalar gather from the grid (256-512 entries, no NEON gather), so one widen feeds both the
+// scalar and NEON accumulation - the NEON win is the shared `accum_neon` over the decoded tile. The grid (and,
+// for the ksigns-based types, the 128-entry sign table) come from the gguf package and ride in the weight
+// struct as buffers. All are 256-weight superblocks. --
+
+/// one lattice weight: the raw superblocks, the type's int8 grid, and the shared sign table (null where the
+/// type carries explicit signs or none).
+macro_rules! latt_struct {
+    ($n:ident) => {
+        #[derive(Clone, Copy)]
+        struct $n {
+            raw: *const u8,
+            grid: *const i8,
+            ksigns: *const u8,
+        }
+        // SAFETY: read-only inputs, checked at the boundary; tasks read them over disjoint row ranges
+        unsafe impl Send for $n {}
+        unsafe impl Sync for $n {}
+    };
+}
+latt_struct!(Iq3xxs);
+latt_struct!(Iq2xxs);
+latt_struct!(Iq2xs);
+latt_struct!(Iq2s);
+latt_struct!(Iq1s);
+latt_struct!(Iq1m);
+latt_struct!(Iq3s);
+
+#[inline(always)]
+unsafe fn u32le(p: *const u8) -> u32 {
+    u32::from_le_bytes([*p, *p.add(1), *p.add(2), *p.add(3)])
+}
+#[inline(always)]
+unsafe fn u16le(p: *const u8) -> u32 {
+    (*p as u32) | ((*p.add(1) as u32) << 8)
+}
+/// sign from a ksigns/explicit byte's bit `b`: -1.0 when set, else +1.0.
+#[inline(always)]
+fn signf(byte: u8, b: usize) -> f32 {
+    if byte & (1 << b) != 0 {
+        -1.0
+    } else {
+        1.0
+    }
+}
+
+/// A lattice widen a group of eight at a time (2-2.5x the per-weight one on the ksigns and IQ1 types, measured):
+/// `$body` decodes group `$g` (0..4) of sub-block `$ib` (0..8) of the superblock at `$blk`, the
+/// eight weights at `$o` - what the eight share read once (the u8 blocks may alias the f32 tile, so a read the
+/// body repeats a weight is a read the compiler repeats too), then each weight its own value.
+macro_rules! latt_widen {
+    ($name:ident, $w:ty, $bytes:expr, |$blk:ident, $grid:ident, $ks:ident, $ib:ident, $g:ident, $o:ident| $body:block) => {
+        #[inline]
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn $name<const R: usize>(
+            dst: *mut f32,
+            dst_stride: usize,
+            p: $w,
+            start: usize,
+            row_stride: usize,
+            n: usize,
+        ) {
+            let $grid = p.grid;
+            let $ks = p.ksigns;
+            for r in 0..R {
+                let s = start + r * row_stride;
+                let out = dst.add(r * dst_stride);
+                for sbk in 0..(n / KQ_SB) {
+                    let $blk = p.raw.add((s / KQ_SB + sbk) * $bytes);
+                    let sb = out.add(sbk * KQ_SB);
+                    for $ib in 0..8usize {
+                        for $g in 0..4usize {
+                            let $o = sb.add(32 * $ib + 8 * $g);
+                            $body
+                        }
+                    }
+                }
+            }
+        }
+    };
+}
+
+latt_widen!(widen_iq3xxs, Iq3xxs, 98, |blk, grid, ks, ib, g, o| {
+    let d = f16_at(blk);
+    let qs = blk.add(2 + 8 * ib + 2 * g);
+    let aux = u32le(blk.add(66 + 4 * ib));
+    let db = d * (0.5 + (aux >> 28) as f32) * 0.5;
+    let signs = *ks.add(((aux >> (7 * g)) & 127) as usize);
+    let idx = [*qs as usize, *qs.add(1) as usize];
+    for m in 0..8usize {
+        let gval = *grid.add(idx[m >> 2] * 4 + (m & 3)) as f32;
+        *o.add(m) = db * gval * signf(signs, m);
+    }
+});
+
+latt_widen!(widen_iq2xxs, Iq2xxs, 66, |blk, grid, ks, ib, g, o| {
+    let d = f16_at(blk);
+    let grp = blk.add(2 + 8 * ib);
+    let w1 = u32le(grp.add(4));
+    let db = d * (0.5 + (w1 >> 28) as f32) * 0.25;
+    let gi = *grp.add(g) as usize;
+    let signs = *ks.add(((w1 >> (7 * g)) & 127) as usize);
+    for j in 0..8usize {
+        let gval = *grid.add(gi * 8 + j) as f32;
+        *o.add(j) = db * gval * signf(signs, j);
+    }
+});
+
+latt_widen!(widen_iq2xs, Iq2xs, 74, |blk, grid, ks, ib, g, o| {
+    let d = f16_at(blk);
+    let grp = 4 * ib + g;
+    let q16 = u16le(blk.add(2 + 2 * grp));
+    let sci = grp >> 1;
+    let sc4 = (*blk.add(66 + (sci >> 1)) >> (4 * (sci & 1))) & 0x0F;
+    let db = d * (0.5 + sc4 as f32) * 0.25;
+    let gi = (q16 & 511) as usize;
+    let signs = *ks.add((q16 >> 9) as usize);
+    for j in 0..8usize {
+        let gval = *grid.add(gi * 8 + j) as f32;
+        *o.add(j) = db * gval * signf(signs, j);
+    }
+});
+
+/// [`latt_widen`] a weight at a time, `$lane` (0..32) of sub-block `$ib`, written at `$o + 32 * $ib + $lane`: the
+/// shape IQ2_S and IQ3_S compile faster in (their signs explicit bytes, no table), 2x the grouped one, measured.
+macro_rules! latt_widen_lanes {
+    ($name:ident, $w:ty, $bytes:expr, |$blk:ident, $grid:ident, $ks:ident, $ib:ident, $lane:ident, $o:ident| $body:block) => {
+        #[inline]
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn $name<const R: usize>(
+            dst: *mut f32,
+            dst_stride: usize,
+            p: $w,
+            start: usize,
+            row_stride: usize,
+            n: usize,
+        ) {
+            let $grid = p.grid;
+            let $ks = p.ksigns;
+            for r in 0..R {
+                let s = start + r * row_stride;
+                let out = dst.add(r * dst_stride);
+                for sbk in 0..(n / KQ_SB) {
+                    let $blk = p.raw.add((s / KQ_SB + sbk) * $bytes);
+                    let $o = out.add(sbk * KQ_SB);
+                    for $ib in 0..8usize {
+                        for $lane in 0..32usize {
+                            $body
+                        }
+                    }
+                }
+            }
+        }
+    };
+}
+
+latt_widen_lanes!(widen_iq2s, Iq2s, 82, |blk, grid, _ks, ib, lane, o| {
+    let d = f16_at(blk);
+    let qs = blk.add(2);
+    let sgn = blk.add(34);
+    let qh = blk.add(66);
+    let sc = blk.add(74);
+    let l = lane >> 3;
+    let j = lane & 7;
+    let grp = 4 * ib + l;
+    let idx =
+        *qs.add(grp) as usize | ((((*qh.add(grp >> 2) >> (2 * (grp & 3))) & 3) as usize) << 8);
+    let b = grp >> 1;
+    let sc4 = (*sc.add(b >> 1) >> (4 * (b & 1))) & 0x0F;
+    let db = d * (0.5 + sc4 as f32) * 0.25;
+    let gval = *grid.add(idx * 8 + j) as f32;
+    *o.add(32 * ib + lane) = db * gval * signf(*sgn.add(grp), j);
+});
+
+latt_widen!(widen_iq1s, Iq1s, 50, |blk, grid, _ks, ib, g, o| {
+    let d = f16_at(blk);
+    let qhv = u16le(blk.add(34 + 2 * ib));
+    let idx = *blk.add(2 + ib * 4 + g) as usize | ((((qhv >> (3 * g)) & 7) as usize) << 8);
+    let dl = d * (2 * ((qhv >> 12) & 7) + 1) as f32;
+    let delta = if qhv & 0x8000 != 0 { -0.125 } else { 0.125 };
+    for j in 0..8usize {
+        *o.add(j) = dl * (*grid.add(idx * 8 + j) as f32 + delta);
+    }
+});
+
+latt_widen_lanes!(widen_iq3s, Iq3s, 110, |blk, grid, _ks, ib, lane, o| {
+    let d = f16_at(blk);
+    let qs = blk.add(2);
+    let qh = blk.add(66);
+    let sgn = blk.add(74);
+    let sc = blk.add(106);
+    let ql = lane >> 2;
+    let j = lane & 3;
+    let qb = 8 * ib + ql;
+    let idx = *qs.add(qb) as usize | ((((*qh.add(qb >> 3) >> (qb & 7)) & 1) as usize) << 8);
+    let sc4 = (*sc.add(ib >> 1) >> (4 * (ib & 1))) & 0x0F;
+    let db = d * (1 + 2 * sc4) as f32;
+    let gval = *grid.add(idx * 4 + j) as f32;
+    *o.add(32 * ib + lane) = db * gval * signf(*sgn.add(4 * ib + (lane >> 3)), lane & 7);
+});
+
+latt_widen!(widen_iq1m, Iq1m, 56, |blk, grid, _ks, ib, g, o| {
+    let scb = blk.add(48);
+    let s = [
+        u16le(scb),
+        u16le(scb.add(2)),
+        u16le(scb.add(4)),
+        u16le(scb.add(6)),
+    ];
+    let dbits = (s[0] >> 12) | ((s[1] >> 12) << 4) | ((s[2] >> 12) << 8) | ((s[3] >> 12) << 12);
+    let d = f16_to_f32(dbits as u16);
+    let jj = 4 * ib + g;
+    let nib = (*blk.add(32 + (jj >> 1)) >> (4 * (jj & 1))) & 0x0F;
+    let idx = *blk.add(jj) as usize | (((nib & 7) as usize) << 8);
+    let delta = if nib & 8 != 0 { -0.125 } else { 0.125 };
+    let si = 2 * ib + (g >> 1);
+    let sub = (s[si >> 2] >> (3 * (si & 3))) & 7;
+    let dl = d * (2 * sub + 1) as f32;
+    for e in 0..8usize {
+        *o.add(e) = dl * (*grid.add(idx * 8 + e) as f32 + delta);
+    }
+});
+
+// -- the lattice types' NEON decode: a group of eight weights from one 8-value grid row (or two 4-value rows side
+// by side) widened at once, the scale multiplied and the signs flipped by XOR - the scalar's `db * gval * signf`,
+// the flip exact - two groups a sixteen-column put. --
+
+/// eight int8 grid values as two f32x4
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn grid8_f32(v: std::arch::aarch64::int8x8_t) -> [std::arch::aarch64::float32x4_t; 2] {
+    use std::arch::aarch64::*;
+    let w = vmovl_s8(v);
+    [
+        vcvtq_f32_s32(vmovl_s16(vget_low_s16(w))),
+        vcvtq_f32_s32(vmovl_high_s16(w)),
+    ]
+}
+
+/// two 4-value grid rows `a` then `b` as eight int8 values
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn grid4x2(grid: *const i8, a: usize, b: usize) -> std::arch::aarch64::int8x8_t {
+    use std::arch::aarch64::*;
+    let lo = (grid.add(a * 4) as *const u32).read_unaligned() as u64;
+    let hi = (grid.add(b * 4) as *const u32).read_unaligned() as u64;
+    vcreate_s8(lo | (hi << 32))
+}
+
+/// a sign byte's eight lanes' f32 sign bits: bit `j` set puts the sign bit in lane `j` (two loads, not the seven
+/// operations that make the masks from the byte)
+#[cfg(target_arch = "aarch64")]
+const SIGN_FLIPS: [[u32; 8]; 256] = {
+    let mut t = [[0u32; 8]; 256];
+    let mut b = 0;
+    while b < 256 {
+        let mut j = 0;
+        while j < 8 {
+            if b & (1 << j) != 0 {
+                t[b][j] = 0x8000_0000;
+            }
+            j += 1;
+        }
+        b += 1;
+    }
+    t
+};
+
+/// eight grid values times `db`, lane `j`'s sign flipped where bit `j` of `signs` is set
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn latt8(
+    v: std::arch::aarch64::int8x8_t,
+    db: f32,
+    signs: u8,
+) -> [std::arch::aarch64::float32x4_t; 2] {
+    use std::arch::aarch64::*;
+    let f = SIGN_FLIPS[signs as usize].as_ptr();
+    let flip = [vld1q_u32(f), vld1q_u32(f.add(4))];
+    let g = grid8_f32(v);
+    let d = vdupq_n_f32(db);
+    [0, 1].map(|i| {
+        vreinterpretq_f32_u32(veorq_u32(
+            vreinterpretq_u32_f32(vmulq_f32(g[i], d)),
+            flip[i],
+        ))
+    })
+}
+
+/// eight grid values plus `delta`, times `dl` (IQ1_S / IQ1_M)
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn latt8_delta(
+    v: std::arch::aarch64::int8x8_t,
+    dl: f32,
+    delta: f32,
+) -> [std::arch::aarch64::float32x4_t; 2] {
+    use std::arch::aarch64::*;
+    let g = grid8_f32(v);
+    let (l, a) = (vdupq_n_f32(dl), vdupq_n_f32(delta));
+    [0, 1].map(|i| vmulq_f32(vaddq_f32(g[i], a), l))
+}
+
+/// a lattice type's NEON decode: `$sub` gives sub-block `ib` (0..8) of the superblock at `blk` as its four groups of
+/// eight f32 - what the groups share read once - two groups a sixteen-column put, in column order
+macro_rules! latt_neon {
+    ($w:ty, $bytes:expr, $wide:ident, |$blk:ident, $grid:ident, $ks:ident, $ib:ident| $sub:block) => {
+        #[cfg(target_arch = "aarch64")]
+        impl DecNeon for $w {
+            #[inline(always)]
+            unsafe fn dec<S: Sink>(self, s: usize, n: usize, sink: &mut S) {
+                let $grid = self.grid;
+                let $ks = self.ksigns;
+                for sbk in 0..(n / KQ_SB) {
+                    let $blk = self.raw.add((s / KQ_SB + sbk) * $bytes);
+                    for $ib in 0..8usize {
+                        let q: [[std::arch::aarch64::float32x4_t; 2]; 4] = $sub;
+                        let c = sbk * KQ_SB + 32 * $ib;
+                        sink.put(c, [q[0][0], q[0][1], q[1][0], q[1][1]]);
+                        sink.put(c + 16, [q[2][0], q[2][1], q[3][0], q[3][1]]);
+                    }
+                }
+            }
+        }
+        widen_neon!($wide, $w);
+    };
+}
+
+latt_neon!(Iq3xxs, 98, widen_iq3xxs_neon, |blk, grid, ks, ib| {
+    let d = f16_at(blk);
+    let qs = blk.add(2 + 8 * ib);
+    let aux = u32le(blk.add(66 + 4 * ib));
+    let db = d * (0.5 + (aux >> 28) as f32) * 0.5;
+    [0, 1, 2, 3].map(|g| {
+        let signs = *ks.add(((aux >> (7 * g)) & 127) as usize);
+        latt8(
+            grid4x2(grid, *qs.add(2 * g) as usize, *qs.add(2 * g + 1) as usize),
+            db,
+            signs,
+        )
+    })
+});
+
+latt_neon!(Iq2xxs, 66, widen_iq2xxs_neon, |blk, grid, ks, ib| {
+    let d = f16_at(blk);
+    let grp = blk.add(2 + 8 * ib);
+    let w1 = u32le(grp.add(4));
+    let db = d * (0.5 + (w1 >> 28) as f32) * 0.25;
+    [0, 1, 2, 3].map(|g| {
+        let signs = *ks.add(((w1 >> (7 * g)) & 127) as usize);
+        latt8(
+            std::arch::aarch64::vld1_s8(grid.add(*grp.add(g) as usize * 8)),
+            db,
+            signs,
+        )
+    })
+});
+
+latt_neon!(Iq2xs, 74, widen_iq2xs_neon, |blk, grid, ks, ib| {
+    let d = f16_at(blk);
+    // a 4-bit scale a pair of groups
+    let sc = *blk.add(66 + ib);
+    let db = [sc & 0x0F, sc >> 4].map(|sc4| d * (0.5 + sc4 as f32) * 0.25);
+    [0, 1, 2, 3].map(|g| {
+        let q16 = u16le(blk.add(2 + 2 * (4 * ib + g)));
+        let signs = *ks.add((q16 >> 9) as usize);
+        latt8(
+            std::arch::aarch64::vld1_s8(grid.add((q16 & 511) as usize * 8)),
+            db[g >> 1],
+            signs,
+        )
+    })
+});
+
+latt_neon!(Iq2s, 82, widen_iq2s_neon, |blk, grid, _ks, ib| {
+    let d = f16_at(blk);
+    let qh = *blk.add(66 + ib);
+    let sc = *blk.add(74 + ib);
+    let db = [sc & 0x0F, sc >> 4].map(|sc4| d * (0.5 + sc4 as f32) * 0.25);
+    [0, 1, 2, 3].map(|g| {
+        let grp = 4 * ib + g;
+        let idx = *blk.add(2 + grp) as usize | ((((qh >> (2 * g)) & 3) as usize) << 8);
+        latt8(
+            std::arch::aarch64::vld1_s8(grid.add(idx * 8)),
+            db[g >> 1],
+            *blk.add(34 + grp),
+        )
+    })
+});
+
+latt_neon!(Iq1s, 50, widen_iq1s_neon, |blk, grid, _ks, ib| {
+    let d = f16_at(blk);
+    let qhv = u16le(blk.add(34 + 2 * ib));
+    let dl = d * (2 * ((qhv >> 12) & 7) + 1) as f32;
+    let delta = if qhv & 0x8000 != 0 { -0.125 } else { 0.125 };
+    [0, 1, 2, 3].map(|g| {
+        let idx = *blk.add(2 + ib * 4 + g) as usize | ((((qhv >> (3 * g)) & 7) as usize) << 8);
+        latt8_delta(std::arch::aarch64::vld1_s8(grid.add(idx * 8)), dl, delta)
+    })
+});
+
+latt_neon!(Iq3s, 110, widen_iq3s_neon, |blk, grid, _ks, ib| {
+    let d = f16_at(blk);
+    let sc4 = (*blk.add(106 + (ib >> 1)) >> (4 * (ib & 1))) & 0x0F;
+    let db = d * (1 + 2 * sc4) as f32;
+    let qh = *blk.add(66 + ib) as usize;
+    [0, 1, 2, 3].map(|g| {
+        let idx = [0, 1].map(|h| {
+            let qb = 2 * g + h;
+            *blk.add(2 + 8 * ib + qb) as usize | (((qh >> qb) & 1) << 8)
+        });
+        latt8(grid4x2(grid, idx[0], idx[1]), db, *blk.add(74 + 4 * ib + g))
+    })
+});
+
+latt_neon!(Iq1m, 56, widen_iq1m_neon, |blk, grid, _ks, ib| {
+    let scb = blk.add(48);
+    let s = [
+        u16le(scb),
+        u16le(scb.add(2)),
+        u16le(scb.add(4)),
+        u16le(scb.add(6)),
+    ];
+    let dbits = (s[0] >> 12) | ((s[1] >> 12) << 4) | ((s[2] >> 12) << 8) | ((s[3] >> 12) << 12);
+    let d = f16_to_f32(dbits as u16);
+    // a 3-bit sub-scale a pair of groups
+    let dl = [0, 1].map(|h| {
+        let si = 2 * ib + h;
+        d * (2 * ((s[si >> 2] >> (3 * (si & 3))) & 7) + 1) as f32
+    });
+    [0, 1, 2, 3].map(|g| {
+        let jj = 4 * ib + g;
+        let nib = (*blk.add(32 + (jj >> 1)) >> (4 * (jj & 1))) & 0x0F;
+        let idx = *blk.add(jj) as usize | (((nib & 7) as usize) << 8);
+        let delta = if nib & 8 != 0 { -0.125 } else { 0.125 };
+        latt8_delta(
+            std::arch::aarch64::vld1_s8(grid.add(idx * 8)),
+            dl[g >> 1],
+            delta,
+        )
+    })
+});
+
+/// a lattice type's tasks: the scalar one through its widen and the tile, the NEON one fused for one vector
+macro_rules! def_task_latt {
+    ($w:ty, $ss:ident, $ts:ident, $sn:ident, $tn:ident, $widen:ident) => {
+        def_task_kq!($ss, $ts, $w, $widen, accum_scalar);
+        def_task_kq_neon!($sn, $tn, $w);
+    };
+}
+def_task_latt!(
+    Iq3xxs,
+    group_iq3xxs_s,
+    task_iq3xxs_s,
+    group_iq3xxs_n,
+    task_iq3xxs_n,
+    widen_iq3xxs
+);
+def_task_latt!(
+    Iq2xxs,
+    group_iq2xxs_s,
+    task_iq2xxs_s,
+    group_iq2xxs_n,
+    task_iq2xxs_n,
+    widen_iq2xxs
+);
+def_task_latt!(
+    Iq2xs,
+    group_iq2xs_s,
+    task_iq2xs_s,
+    group_iq2xs_n,
+    task_iq2xs_n,
+    widen_iq2xs
+);
+def_task_latt!(
+    Iq2s,
+    group_iq2s_s,
+    task_iq2s_s,
+    group_iq2s_n,
+    task_iq2s_n,
+    widen_iq2s
+);
+def_task_latt!(
+    Iq1s,
+    group_iq1s_s,
+    task_iq1s_s,
+    group_iq1s_n,
+    task_iq1s_n,
+    widen_iq1s
+);
+def_task_latt!(
+    Iq3s,
+    group_iq3s_s,
+    task_iq3s_s,
+    group_iq3s_n,
+    task_iq3s_n,
+    widen_iq3s
+);
+def_task_latt!(
+    Iq1m,
+    group_iq1m_s,
+    task_iq1m_s,
+    group_iq1m_n,
+    task_iq1m_n,
+    widen_iq1m
+);
+
+// ---------------------------------------------------------------------------------------------------
 // FP8, the form fine-grained FP8 checkpoints ship their linears in: one e4m3fn byte a weight (1 sign, 4
 // exponent bits biased by 7, 3 mantissa bits, no infinity, 0x7F/0xFF NaN) and an f32 scale per block of a
 // `[sr, sc]` grid over the matrix, the block `rows / sr` by `cols / sc` (a 1x1 grid is one per-tensor
@@ -1339,6 +3226,161 @@ def_task_f8!(
     "avx512f,avx512bw,avx2,fma"
 );
 
+// x86 has no quant widen of its own yet: each tier decodes a tile with the scalar widen (whose one fused
+// multiply-add a weight rounds as the NEON widen does) into its own accumulation, the lattice types' NEON
+// arrangement, so the bits are every other tier's.
+macro_rules! def_task_kq_x86 {
+    ($w:ty, $widen:ident, $g2:ident, $t2:ident, $g5:ident, $t5:ident) => {
+        #[cfg(target_arch = "x86_64")]
+        def_task_kq!($g2, $t2, $w, $widen, accum_avx2, "avx2,fma");
+        #[cfg(target_arch = "x86_64")]
+        def_task_kq!(
+            $g5,
+            $t5,
+            $w,
+            $widen,
+            accum_avx512,
+            "avx512f,avx512bw,avx2,fma"
+        );
+    };
+}
+def_task_kq_x86!(
+    Q4k,
+    widen_q4k_scalar,
+    group_q4k_avx2,
+    task_q4k_avx2,
+    group_q4k_avx512,
+    task_q4k_avx512
+);
+def_task_kq_x86!(
+    Q6k,
+    widen_q6k_scalar,
+    group_q6k_avx2,
+    task_q6k_avx2,
+    group_q6k_avx512,
+    task_q6k_avx512
+);
+def_task_kq_x86!(
+    Q5k,
+    widen_q5k_scalar,
+    group_q5k_avx2,
+    task_q5k_avx2,
+    group_q5k_avx512,
+    task_q5k_avx512
+);
+def_task_kq_x86!(
+    Q2k,
+    widen_q2k_scalar,
+    group_q2k_avx2,
+    task_q2k_avx2,
+    group_q2k_avx512,
+    task_q2k_avx512
+);
+def_task_kq_x86!(
+    Q3k,
+    widen_q3k_scalar,
+    group_q3k_avx2,
+    task_q3k_avx2,
+    group_q3k_avx512,
+    task_q3k_avx512
+);
+def_task_kq_x86!(
+    Iq4nl,
+    widen_iq4nl_scalar,
+    group_iq4nl_avx2,
+    task_iq4nl_avx2,
+    group_iq4nl_avx512,
+    task_iq4nl_avx512
+);
+def_task_kq_x86!(
+    Iq4xs,
+    widen_iq4xs_scalar,
+    group_iq4xs_avx2,
+    task_iq4xs_avx2,
+    group_iq4xs_avx512,
+    task_iq4xs_avx512
+);
+def_task_kq_x86!(
+    Q40,
+    widen_q40_scalar,
+    group_q40_avx2,
+    task_q40_avx2,
+    group_q40_avx512,
+    task_q40_avx512
+);
+def_task_kq_x86!(
+    Q41,
+    widen_q41_scalar,
+    group_q41_avx2,
+    task_q41_avx2,
+    group_q41_avx512,
+    task_q41_avx512
+);
+def_task_kq_x86!(
+    Q80,
+    widen_q80_scalar,
+    group_q80_avx2,
+    task_q80_avx2,
+    group_q80_avx512,
+    task_q80_avx512
+);
+def_task_kq_x86!(
+    Iq3xxs,
+    widen_iq3xxs,
+    group_iq3xxs_avx2,
+    task_iq3xxs_avx2,
+    group_iq3xxs_avx512,
+    task_iq3xxs_avx512
+);
+def_task_kq_x86!(
+    Iq2xxs,
+    widen_iq2xxs,
+    group_iq2xxs_avx2,
+    task_iq2xxs_avx2,
+    group_iq2xxs_avx512,
+    task_iq2xxs_avx512
+);
+def_task_kq_x86!(
+    Iq2xs,
+    widen_iq2xs,
+    group_iq2xs_avx2,
+    task_iq2xs_avx2,
+    group_iq2xs_avx512,
+    task_iq2xs_avx512
+);
+def_task_kq_x86!(
+    Iq2s,
+    widen_iq2s,
+    group_iq2s_avx2,
+    task_iq2s_avx2,
+    group_iq2s_avx512,
+    task_iq2s_avx512
+);
+def_task_kq_x86!(
+    Iq1s,
+    widen_iq1s,
+    group_iq1s_avx2,
+    task_iq1s_avx2,
+    group_iq1s_avx512,
+    task_iq1s_avx512
+);
+def_task_kq_x86!(
+    Iq3s,
+    widen_iq3s,
+    group_iq3s_avx2,
+    task_iq3s_avx2,
+    group_iq3s_avx512,
+    task_iq3s_avx512
+);
+def_task_kq_x86!(
+    Iq1m,
+    widen_iq1m,
+    group_iq1m_avx2,
+    task_iq1m_avx2,
+    group_iq1m_avx512,
+    task_iq1m_avx512
+);
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Isa {
     Avx512,
@@ -1504,6 +3546,8 @@ macro_rules! by_isa {
 
 /// A matrix in one of its stored forms, run as tasks over row ranges.
 trait Weights: Copy + Send + Sync {
+    const CUT: Cut = CUT_STREAM;
+
     /// Rows `r0..r1` of `rows_total` times the `b` vectors of `x` into `y` (`[b, rows_total]`).
     ///
     /// # Safety
@@ -1541,6 +3585,30 @@ impl Weights for Bf16 {
             task_avx2,
             task_avx512,
             task_neon,
+            (self, cols, x, b, y, rows_total, r0, r1)
+        )
+    }
+}
+
+impl Weights for F16 {
+    #[inline]
+    unsafe fn rows(
+        self,
+        isa: Isa,
+        cols: usize,
+        x: *const f32,
+        b: usize,
+        y: *mut f32,
+        rows_total: usize,
+        r0: usize,
+        r1: usize,
+    ) {
+        by_isa!(
+            f16_isa(isa),
+            task_f16_scalar,
+            task_f16_avx2,
+            task_f16_avx512,
+            task_f16_neon,
             (self, cols, x, b, y, rows_total, r0, r1)
         )
     }
@@ -1593,6 +3661,194 @@ impl Weights for Mx4 {
         )
     }
 }
+
+impl Weights for Q4k {
+    const CUT: Cut = CUT_STORED;
+
+    #[inline]
+    unsafe fn rows(
+        self,
+        isa: Isa,
+        cols: usize,
+        x: *const f32,
+        b: usize,
+        y: *mut f32,
+        rows_total: usize,
+        r0: usize,
+        r1: usize,
+    ) {
+        by_isa!(
+            isa,
+            task_q4k_scalar,
+            task_q4k_avx2,
+            task_q4k_avx512,
+            task_q4k_neon,
+            (self, cols, x, b, y, rows_total, r0, r1)
+        )
+    }
+}
+
+impl Weights for Q6k {
+    const CUT: Cut = CUT_STORED;
+
+    #[inline]
+    unsafe fn rows(
+        self,
+        isa: Isa,
+        cols: usize,
+        x: *const f32,
+        b: usize,
+        y: *mut f32,
+        rows_total: usize,
+        r0: usize,
+        r1: usize,
+    ) {
+        by_isa!(
+            isa,
+            task_q6k_scalar,
+            task_q6k_avx2,
+            task_q6k_avx512,
+            task_q6k_neon,
+            (self, cols, x, b, y, rows_total, r0, r1)
+        )
+    }
+}
+
+macro_rules! impl_weights_kq {
+    ($w:ty, $scalar:ident, $avx2:ident, $avx512:ident, $neon:ident) => {
+        impl Weights for $w {
+            const CUT: Cut = CUT_STORED;
+
+            #[inline]
+            unsafe fn rows(
+                self,
+                isa: Isa,
+                cols: usize,
+                x: *const f32,
+                b: usize,
+                y: *mut f32,
+                rows_total: usize,
+                r0: usize,
+                r1: usize,
+            ) {
+                by_isa!(
+                    isa,
+                    $scalar,
+                    $avx2,
+                    $avx512,
+                    $neon,
+                    (self, cols, x, b, y, rows_total, r0, r1)
+                )
+            }
+        }
+    };
+}
+
+impl_weights_kq!(
+    Q5k,
+    task_q5k_scalar,
+    task_q5k_avx2,
+    task_q5k_avx512,
+    task_q5k_neon
+);
+impl_weights_kq!(
+    Q2k,
+    task_q2k_scalar,
+    task_q2k_avx2,
+    task_q2k_avx512,
+    task_q2k_neon
+);
+impl_weights_kq!(
+    Q3k,
+    task_q3k_scalar,
+    task_q3k_avx2,
+    task_q3k_avx512,
+    task_q3k_neon
+);
+impl_weights_kq!(
+    Iq4nl,
+    task_iq4nl_scalar,
+    task_iq4nl_avx2,
+    task_iq4nl_avx512,
+    task_iq4nl_neon
+);
+impl_weights_kq!(
+    Iq4xs,
+    task_iq4xs_scalar,
+    task_iq4xs_avx2,
+    task_iq4xs_avx512,
+    task_iq4xs_neon
+);
+impl_weights_kq!(
+    Q40,
+    task_q40_scalar,
+    task_q40_avx2,
+    task_q40_avx512,
+    task_q40_neon
+);
+impl_weights_kq!(
+    Q41,
+    task_q41_scalar,
+    task_q41_avx2,
+    task_q41_avx512,
+    task_q41_neon
+);
+impl_weights_kq!(
+    Q80,
+    task_q80_scalar,
+    task_q80_avx2,
+    task_q80_avx512,
+    task_q80_neon
+);
+impl_weights_kq!(
+    Iq3xxs,
+    task_iq3xxs_s,
+    task_iq3xxs_avx2,
+    task_iq3xxs_avx512,
+    task_iq3xxs_n
+);
+impl_weights_kq!(
+    Iq2xxs,
+    task_iq2xxs_s,
+    task_iq2xxs_avx2,
+    task_iq2xxs_avx512,
+    task_iq2xxs_n
+);
+impl_weights_kq!(
+    Iq2xs,
+    task_iq2xs_s,
+    task_iq2xs_avx2,
+    task_iq2xs_avx512,
+    task_iq2xs_n
+);
+impl_weights_kq!(
+    Iq2s,
+    task_iq2s_s,
+    task_iq2s_avx2,
+    task_iq2s_avx512,
+    task_iq2s_n
+);
+impl_weights_kq!(
+    Iq1s,
+    task_iq1s_s,
+    task_iq1s_avx2,
+    task_iq1s_avx512,
+    task_iq1s_n
+);
+impl_weights_kq!(
+    Iq3s,
+    task_iq3s_s,
+    task_iq3s_avx2,
+    task_iq3s_avx512,
+    task_iq3s_n
+);
+impl_weights_kq!(
+    Iq1m,
+    task_iq1m_s,
+    task_iq1m_avx2,
+    task_iq1m_avx512,
+    task_iq1m_n
+);
 
 impl Weights for F8 {
     #[inline]
@@ -1649,7 +3905,7 @@ unsafe fn run_one<W: Weights>(t: Task<W>, threads: usize) -> i32 {
         t.w.rows(isa, t.cols, t.x, t.b, t.y, t.rows, 0, t.rows);
         return OK;
     }
-    spread(t.rows, nt, global, move |r0, r1| {
+    spread(t.rows, t.cols, W::CUT, nt, global, move |r0, r1| {
         let t = t; // the whole task captured, not its pointer fields one by one
         unsafe { t.w.rows(isa, t.cols, t.x, t.b, t.y, t.rows, r0, r1) }
     });
@@ -1674,7 +3930,8 @@ unsafe fn run_group<W: Weights>(tasks: &[Task<W>], total: usize, threads: usize)
         }
         return OK;
     }
-    let chunk = total.div_ceil(nt * SPLIT).max(ROW_UNROLL);
+    let weights: usize = tasks.iter().map(|t| t.rows * t.cols).sum();
+    let chunk = chunk_rows(total, weights / total.max(1), nt, W::CUT);
     let mut work: Vec<(usize, usize)> = Vec::new();
     for (i, t) in tasks.iter().enumerate() {
         let mut r0 = 0usize;
@@ -1719,6 +3976,34 @@ pub(crate) unsafe fn gemv_core(
     y: *mut f32,
     threads: usize,
 ) -> i32 {
+    gemv_u16(Bf16, w, rows, cols, x, b, y, threads)
+}
+
+/// [`gemv_core`] over an f16 matrix (`raw`, `[rows, cols]` IEEE halves): a GGUF's float tensor as stored.
+pub(crate) unsafe fn gemv_f16_core(
+    raw: *const u8,
+    rows: usize,
+    cols: usize,
+    x: *const f32,
+    b: usize,
+    y: *mut f32,
+    threads: usize,
+) -> i32 {
+    gemv_u16(F16, raw as *const u16, rows, cols, x, b, y, threads)
+}
+
+/// One matrix of 16-bit weights checked and run, `wrap` naming their form.
+#[allow(clippy::too_many_arguments)]
+unsafe fn gemv_u16<W: Weights>(
+    wrap: fn(*const u16) -> W,
+    w: *const u16,
+    rows: usize,
+    cols: usize,
+    x: *const f32,
+    b: usize,
+    y: *mut f32,
+    threads: usize,
+) -> i32 {
     if w.is_null() || x.is_null() || y.is_null() {
         return ERR_NULL;
     }
@@ -1731,7 +4016,7 @@ pub(crate) unsafe fn gemv_core(
     }
     run_one(
         Task {
-            w: Bf16(w),
+            w: wrap(w),
             x,
             y,
             rows,
@@ -1752,8 +4037,15 @@ fn dispatch<F: Fn(usize) + Send + Sync>(nt: usize, global: usize, nchunks: usize
     }
 }
 
-fn spread<F: Fn(usize, usize) + Send + Sync>(rows: usize, nt: usize, global: usize, each: F) {
-    let chunk = rows.div_ceil(nt * SPLIT).max(ROW_UNROLL);
+fn spread<F: Fn(usize, usize) + Send + Sync>(
+    rows: usize,
+    row_len: usize,
+    cut: Cut,
+    nt: usize,
+    global: usize,
+    each: F,
+) {
+    let chunk = chunk_rows(rows, row_len, nt, cut);
     dispatch(nt, global, rows.div_ceil(chunk), |k| {
         let r0 = k * chunk;
         each(r0, (r0 + chunk).min(rows));
@@ -1771,6 +4063,47 @@ pub(crate) unsafe fn gemv_group_core(
     y: *mut *mut f32,
     threads: usize,
 ) -> i32 {
+    group_u16(Bf16, n, w, rows, cols, x, b, y, threads)
+}
+
+/// [`gemv_group_core`] over f16 matrices (each `raw[t]` `[rows[t], cols[t]]` IEEE halves).
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn gemv_f16_group_core(
+    n: usize,
+    raw: *const *const u8,
+    rows: *const usize,
+    cols: *const usize,
+    x: *const *const f32,
+    b: *const usize,
+    y: *mut *mut f32,
+    threads: usize,
+) -> i32 {
+    group_u16(
+        F16,
+        n,
+        raw as *const *const u16,
+        rows,
+        cols,
+        x,
+        b,
+        y,
+        threads,
+    )
+}
+
+/// `n` matrices of 16-bit weights checked and run under one dispatch, `wrap` naming their form.
+#[allow(clippy::too_many_arguments)]
+unsafe fn group_u16<W: Weights>(
+    wrap: fn(*const u16) -> W,
+    n: usize,
+    w: *const *const u16,
+    rows: *const usize,
+    cols: *const usize,
+    x: *const *const f32,
+    b: *const usize,
+    y: *mut *mut f32,
+    threads: usize,
+) -> i32 {
     if w.is_null() || rows.is_null() || cols.is_null() || x.is_null() || b.is_null() || y.is_null()
     {
         return ERR_NULL;
@@ -1779,25 +4112,26 @@ pub(crate) unsafe fn gemv_group_core(
         return ERR_DOMAIN;
     }
 
-    let mut tasks: Vec<Task<Bf16>> = Vec::with_capacity(n);
+    let mut tasks: Vec<Task<W>> = Vec::with_capacity(n);
     let mut total = 0usize;
     for t in 0..n {
+        let wt = *w.add(t);
         let job = Task {
-            w: Bf16(*w.add(t)),
+            w: wrap(wt),
             x: *x.add(t),
             y: *y.add(t),
             rows: *rows.add(t),
             cols: *cols.add(t),
             b: *b.add(t),
         };
-        if job.w.0.is_null() || job.x.is_null() || job.y.is_null() {
+        if wt.is_null() || job.x.is_null() || job.y.is_null() {
             return ERR_NULL;
         }
         if job.rows == 0 || job.cols == 0 || job.b == 0 {
             return ERR_DOMAIN;
         }
         if !shape_ok(job.rows, job.cols, job.b)
-            || !aligned(job.w.0)
+            || !aligned(wt)
             || !aligned(job.x)
             || !aligned(job.y)
         {
@@ -1927,6 +4261,538 @@ pub(crate) unsafe fn gemv_mxfp4_core(
         threads,
     )
 }
+
+/// a packed matvec's shape: whole `blk`-weight blocks a row (256 for the k-quants and IQ4_XS, 32 for
+/// IQ4_NL), and the element counts fit `usize`.
+#[inline]
+fn blk_shape_ok(rows: usize, cols: usize, b: usize, blk: usize) -> bool {
+    rows != 0 && cols != 0 && b != 0 && cols.is_multiple_of(blk) && shape_ok(rows, cols, b)
+}
+
+#[inline]
+fn kq_shape_ok(rows: usize, cols: usize, b: usize) -> bool {
+    blk_shape_ok(rows, cols, b, KQ_SB)
+}
+
+/// `y[i][r] = sum_c dequant(W)[r][c] * x[i][c]` in f32 for a Q4_K matrix `raw` ([rows, cols] as
+/// `rows * cols / 256` superblocks). Bit-identical for every `threads` and every `b`, row `r` the same at
+/// any `b` (the verify pass's contract).
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn gemv_q4k_core(
+    raw: *const u8,
+    rows: usize,
+    cols: usize,
+    x: *const f32,
+    b: usize,
+    y: *mut f32,
+    threads: usize,
+) -> i32 {
+    if raw.is_null() || x.is_null() || y.is_null() {
+        return ERR_NULL;
+    }
+    if !kq_shape_ok(rows, cols, b) || !aligned(x) || !aligned(y) {
+        return ERR_DOMAIN;
+    }
+    run_one(
+        Task {
+            w: Q4k(raw),
+            x,
+            y,
+            rows,
+            cols,
+            b,
+        },
+        threads,
+    )
+}
+
+/// [`gemv_q4k_core`] for a Q6_K matrix `raw` ([rows, cols] as `rows * cols / 256` superblocks of 210 bytes).
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn gemv_q6k_core(
+    raw: *const u8,
+    rows: usize,
+    cols: usize,
+    x: *const f32,
+    b: usize,
+    y: *mut f32,
+    threads: usize,
+) -> i32 {
+    if raw.is_null() || x.is_null() || y.is_null() {
+        return ERR_NULL;
+    }
+    if !kq_shape_ok(rows, cols, b) || !aligned(x) || !aligned(y) {
+        return ERR_DOMAIN;
+    }
+    run_one(
+        Task {
+            w: Q6k(raw),
+            x,
+            y,
+            rows,
+            cols,
+            b,
+        },
+        threads,
+    )
+}
+
+/// [`gemv_q4k_core`] for the other k-quants: `raw` the file's superblocks of that type, `cols` a multiple of 256.
+macro_rules! kq_core {
+    ($name:ident, $w:ident) => {
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) unsafe fn $name(
+            raw: *const u8,
+            rows: usize,
+            cols: usize,
+            x: *const f32,
+            b: usize,
+            y: *mut f32,
+            threads: usize,
+        ) -> i32 {
+            if raw.is_null() || x.is_null() || y.is_null() {
+                return ERR_NULL;
+            }
+            if !kq_shape_ok(rows, cols, b) || !aligned(x) || !aligned(y) {
+                return ERR_DOMAIN;
+            }
+            run_one(
+                Task {
+                    w: $w(raw),
+                    x,
+                    y,
+                    rows,
+                    cols,
+                    b,
+                },
+                threads,
+            )
+        }
+    };
+}
+
+kq_core!(gemv_q5k_core, Q5k);
+kq_core!(gemv_q2k_core, Q2k);
+kq_core!(gemv_q3k_core, Q3k);
+kq_core!(gemv_iq4xs_core, Iq4xs);
+
+/// [`gemv_q4k_core`] for IQ4_NL, whose blocks are 32 weights (not 256): `cols` a multiple of 32.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn gemv_iq4nl_core(
+    raw: *const u8,
+    rows: usize,
+    cols: usize,
+    x: *const f32,
+    b: usize,
+    y: *mut f32,
+    threads: usize,
+) -> i32 {
+    if raw.is_null() || x.is_null() || y.is_null() {
+        return ERR_NULL;
+    }
+    if !blk_shape_ok(rows, cols, b, IQ4NL_BLK) || !aligned(x) || !aligned(y) {
+        return ERR_DOMAIN;
+    }
+    run_one(
+        Task {
+            w: Iq4nl(raw),
+            x,
+            y,
+            rows,
+            cols,
+            b,
+        },
+        threads,
+    )
+}
+
+/// [`gemv_q4k_core`] for the affine types (Q4_0, Q4_1, Q8_0): 32-weight blocks, `cols` a multiple of 32.
+macro_rules! affine_core {
+    ($name:ident, $w:ident) => {
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) unsafe fn $name(
+            raw: *const u8,
+            rows: usize,
+            cols: usize,
+            x: *const f32,
+            b: usize,
+            y: *mut f32,
+            threads: usize,
+        ) -> i32 {
+            if raw.is_null() || x.is_null() || y.is_null() {
+                return ERR_NULL;
+            }
+            if !blk_shape_ok(rows, cols, b, AFFINE_BLK) || !aligned(x) || !aligned(y) {
+                return ERR_DOMAIN;
+            }
+            run_one(
+                Task {
+                    w: $w(raw),
+                    x,
+                    y,
+                    rows,
+                    cols,
+                    b,
+                },
+                threads,
+            )
+        }
+    };
+}
+affine_core!(gemv_q40_core, Q40);
+affine_core!(gemv_q41_core, Q41);
+affine_core!(gemv_q80_core, Q80);
+
+/// [`gemv_q4k_core`] for an IQ lattice type: the raw superblocks plus the type's grid and (where used) the
+/// shared sign table, both passed as buffers. All are 256-weight superblocks. `$ks`: the type reads `ksigns`.
+macro_rules! latt_core {
+    ($name:ident, $w:ident, $ks:literal) => {
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) unsafe fn $name(
+            raw: *const u8,
+            grid: *const i8,
+            ksigns: *const u8,
+            rows: usize,
+            cols: usize,
+            x: *const f32,
+            b: usize,
+            y: *mut f32,
+            threads: usize,
+        ) -> i32 {
+            if raw.is_null()
+                || grid.is_null()
+                || x.is_null()
+                || y.is_null()
+                || ($ks && ksigns.is_null())
+            {
+                return ERR_NULL;
+            }
+            if !kq_shape_ok(rows, cols, b) || !aligned(x) || !aligned(y) {
+                return ERR_DOMAIN;
+            }
+            run_one(
+                Task {
+                    w: $w { raw, grid, ksigns },
+                    x,
+                    y,
+                    rows,
+                    cols,
+                    b,
+                },
+                threads,
+            )
+        }
+    };
+}
+latt_core!(gemv_iq3xxs_core, Iq3xxs, true);
+latt_core!(gemv_iq2xxs_core, Iq2xxs, true);
+latt_core!(gemv_iq2xs_core, Iq2xs, true);
+latt_core!(gemv_iq2s_core, Iq2s, false);
+latt_core!(gemv_iq1s_core, Iq1s, false);
+latt_core!(gemv_iq3s_core, Iq3s, false);
+latt_core!(gemv_iq1m_core, Iq1m, false);
+
+/// `n` matrices of one stored type under one dispatch ([`run_group`]): task `t` reads `raw[t]` (`[rows[t],
+/// cols[t]]` in whole `blk`-weight blocks) and `x[t]` (`[b[t], cols[t]]` f32) and writes `y[t]` (`[b[t],
+/// rows[t]]` f32), `make` the type's weights over its bytes. Each task's output is its own call's, bit for bit.
+#[allow(clippy::too_many_arguments)]
+unsafe fn quant_group<W: Weights>(
+    n: usize,
+    raw: *const *const u8,
+    rows: *const usize,
+    cols: *const usize,
+    x: *const *const f32,
+    b: *const usize,
+    y: *mut *mut f32,
+    threads: usize,
+    blk: usize,
+    make: impl Fn(*const u8) -> W,
+) -> i32 {
+    if raw.is_null()
+        || rows.is_null()
+        || cols.is_null()
+        || x.is_null()
+        || b.is_null()
+        || y.is_null()
+    {
+        return ERR_NULL;
+    }
+    if n == 0 {
+        return ERR_DOMAIN;
+    }
+    let mut tasks: Vec<Task<W>> = Vec::with_capacity(n);
+    let mut total = 0usize;
+    for t in 0..n {
+        let (w, xt, yt) = (*raw.add(t), *x.add(t), *y.add(t));
+        let (r, c, bt) = (*rows.add(t), *cols.add(t), *b.add(t));
+        if w.is_null() || xt.is_null() || yt.is_null() {
+            return ERR_NULL;
+        }
+        if !blk_shape_ok(r, c, bt, blk) || !aligned(xt) || !aligned(yt) {
+            return ERR_DOMAIN;
+        }
+        total = match total.checked_add(r) {
+            Some(v) => v,
+            None => return ERR_DOMAIN,
+        };
+        tasks.push(Task {
+            w: make(w),
+            x: xt,
+            y: yt,
+            rows: r,
+            cols: c,
+            b: bt,
+        });
+    }
+    run_group(&tasks, total, threads)
+}
+
+/// [`quant_group`] for a type that reads its blocks alone: `$w` over a task's bytes, `$blk` weights a block.
+macro_rules! quant_group_core {
+    ($name:ident, $w:ident, $blk:expr) => {
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) unsafe fn $name(
+            n: usize,
+            raw: *const *const u8,
+            rows: *const usize,
+            cols: *const usize,
+            x: *const *const f32,
+            b: *const usize,
+            y: *mut *mut f32,
+            threads: usize,
+        ) -> i32 {
+            quant_group(n, raw, rows, cols, x, b, y, threads, $blk, $w)
+        }
+    };
+}
+quant_group_core!(gemv_q2k_group_core, Q2k, KQ_SB);
+quant_group_core!(gemv_q3k_group_core, Q3k, KQ_SB);
+quant_group_core!(gemv_q4k_group_core, Q4k, KQ_SB);
+quant_group_core!(gemv_q5k_group_core, Q5k, KQ_SB);
+quant_group_core!(gemv_q6k_group_core, Q6k, KQ_SB);
+quant_group_core!(gemv_iq4xs_group_core, Iq4xs, KQ_SB);
+quant_group_core!(gemv_iq4nl_group_core, Iq4nl, IQ4NL_BLK);
+quant_group_core!(gemv_q40_group_core, Q40, AFFINE_BLK);
+quant_group_core!(gemv_q41_group_core, Q41, AFFINE_BLK);
+quant_group_core!(gemv_q80_group_core, Q80, AFFINE_BLK);
+
+/// [`quant_group`] for a lattice type: every task shares the type's grid and (`$ks`) sign table.
+macro_rules! latt_group_core {
+    ($name:ident, $w:ident, $ks:literal) => {
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) unsafe fn $name(
+            n: usize,
+            raw: *const *const u8,
+            grid: *const i8,
+            ksigns: *const u8,
+            rows: *const usize,
+            cols: *const usize,
+            x: *const *const f32,
+            b: *const usize,
+            y: *mut *mut f32,
+            threads: usize,
+        ) -> i32 {
+            if grid.is_null() || ($ks && ksigns.is_null()) {
+                return ERR_NULL;
+            }
+            quant_group(n, raw, rows, cols, x, b, y, threads, KQ_SB, |raw| $w {
+                raw,
+                grid,
+                ksigns,
+            })
+        }
+    };
+}
+latt_group_core!(gemv_iq3xxs_group_core, Iq3xxs, true);
+latt_group_core!(gemv_iq2xxs_group_core, Iq2xxs, true);
+latt_group_core!(gemv_iq2xs_group_core, Iq2xs, true);
+latt_group_core!(gemv_iq2s_group_core, Iq2s, false);
+latt_group_core!(gemv_iq1s_group_core, Iq1s, false);
+latt_group_core!(gemv_iq3s_group_core, Iq3s, false);
+latt_group_core!(gemv_iq1m_group_core, Iq1m, false);
+
+/// A stored type's row decoded to f32 exactly as its gemv widens it (the selected tier's widen, the scalar one
+/// where the tier has none of its own).
+trait Widen: Copy + Send + Sync {
+    /// row `r` of a `[_, cols]` matrix into `dst` (`cols` floats).
+    ///
+    /// # Safety
+    /// The weights valid for row `r`, `dst` writable for `cols` floats.
+    unsafe fn widen_row(self, isa: Isa, dst: *mut f32, r: usize, cols: usize);
+}
+
+macro_rules! impl_widen {
+    ($w:ty, $scalar:ident, $neon:ident) => {
+        impl Widen for $w {
+            #[inline]
+            unsafe fn widen_row(self, _isa: Isa, dst: *mut f32, r: usize, cols: usize) {
+                #[cfg(target_arch = "aarch64")]
+                if matches!(_isa, Isa::Neon) {
+                    return $neon::<1>(dst, cols, self, r * cols, cols, cols);
+                }
+                $scalar::<1>(dst, cols, self, r * cols, cols, cols)
+            }
+        }
+    };
+}
+impl_widen!(Q2k, widen_q2k_scalar, widen_q2k_neon);
+impl_widen!(Q3k, widen_q3k_scalar, widen_q3k_neon);
+impl_widen!(Q4k, widen_q4k_scalar, widen_q4k_neon);
+impl_widen!(Q5k, widen_q5k_scalar, widen_q5k_neon);
+impl_widen!(Q6k, widen_q6k_scalar, widen_q6k_neon);
+impl_widen!(Q40, widen_q40_scalar, widen_q40_neon);
+impl_widen!(Q41, widen_q41_scalar, widen_q41_neon);
+impl_widen!(Q80, widen_q80_scalar, widen_q80_neon);
+impl_widen!(Iq4nl, widen_iq4nl_scalar, widen_iq4nl_neon);
+impl_widen!(Iq4xs, widen_iq4xs_scalar, widen_iq4xs_neon);
+impl_widen!(Iq3xxs, widen_iq3xxs, widen_iq3xxs_neon);
+impl_widen!(Iq2xxs, widen_iq2xxs, widen_iq2xxs_neon);
+impl_widen!(Iq2xs, widen_iq2xs, widen_iq2xs_neon);
+impl_widen!(Iq2s, widen_iq2s, widen_iq2s_neon);
+impl_widen!(Iq1s, widen_iq1s, widen_iq1s_neon);
+impl_widen!(Iq3s, widen_iq3s, widen_iq3s_neon);
+impl_widen!(Iq1m, widen_iq1m, widen_iq1m_neon);
+
+impl Widen for F16 {
+    #[inline]
+    unsafe fn widen_row(self, isa: Isa, dst: *mut f32, r: usize, cols: usize) {
+        let src = self.0.add(r * cols);
+        match f16_isa(isa) {
+            #[cfg(target_arch = "aarch64")]
+            Isa::Neon => widen_f16_neon::<1>(dst, src, cols, cols, cols),
+            #[cfg(target_arch = "x86_64")]
+            Isa::Avx2 | Isa::Avx512 => widen_f16_avx2::<1>(dst, src, cols, cols, cols),
+            _ => widen_f16_scalar::<1>(dst, src, cols, cols, cols),
+        }
+    }
+}
+
+/// One dequantization: the weights and where the rows go.
+#[derive(Clone, Copy)]
+struct Dequant<W> {
+    w: W,
+    out: *mut f32,
+    cols: usize,
+}
+// SAFETY: a chunk writes only its own rows of `out`; the caller's buffers do not overlap (the C ABI's contract)
+unsafe impl<W: Widen> Send for Dequant<W> {}
+unsafe impl<W: Widen> Sync for Dequant<W> {}
+
+impl<W: Widen> Dequant<W> {
+    /// rows `r0..r1` decoded
+    unsafe fn rows(self, isa: Isa, r0: usize, r1: usize) {
+        for r in r0..r1 {
+            self.w
+                .widen_row(isa, self.out.add(r * self.cols), r, self.cols);
+        }
+    }
+}
+
+/// `out` (`[rows, cols]` f32) = a stored matrix decoded as its gemv widens it, its rows spread over the pool: the
+/// weights a prefill's GEMM takes in place of the type's gemv.
+unsafe fn dequant<W: Widen>(
+    w: W,
+    rows: usize,
+    cols: usize,
+    blk: usize,
+    out: *mut f32,
+    threads: usize,
+) -> i32 {
+    if out.is_null() {
+        return ERR_NULL;
+    }
+    if !blk_shape_ok(rows, cols, 1, blk) || !aligned(out as *const f32) {
+        return ERR_DOMAIN;
+    }
+    let isa = isa();
+    let global = rayon::current_num_threads().max(1);
+    let nt = match resolve_threads(threads) {
+        Some(v) => v,
+        None => return ERR_DOMAIN,
+    };
+    let job = Dequant { w, out, cols };
+    if nt <= 1 {
+        job.rows(isa, 0, rows);
+        return OK;
+    }
+    spread(rows, cols, CUT_STREAM, nt, global, move |r0, r1| {
+        let job = job; // the whole job captured, not its pointer fields one by one
+        unsafe { job.rows(isa, r0, r1) }
+    });
+    OK
+}
+
+/// [`dequant`] for a type that reads its blocks alone.
+macro_rules! quant_dequant_core {
+    ($name:ident, $w:ident, $blk:expr) => {
+        pub(crate) unsafe fn $name(
+            raw: *const u8,
+            rows: usize,
+            cols: usize,
+            out: *mut f32,
+            threads: usize,
+        ) -> i32 {
+            if raw.is_null() {
+                return ERR_NULL;
+            }
+            dequant($w(raw), rows, cols, $blk, out, threads)
+        }
+    };
+}
+quant_dequant_core!(dequant_q2k_core, Q2k, KQ_SB);
+quant_dequant_core!(dequant_q3k_core, Q3k, KQ_SB);
+quant_dequant_core!(dequant_q4k_core, Q4k, KQ_SB);
+quant_dequant_core!(dequant_q5k_core, Q5k, KQ_SB);
+quant_dequant_core!(dequant_q6k_core, Q6k, KQ_SB);
+quant_dequant_core!(dequant_iq4xs_core, Iq4xs, KQ_SB);
+quant_dequant_core!(dequant_iq4nl_core, Iq4nl, IQ4NL_BLK);
+quant_dequant_core!(dequant_q40_core, Q40, AFFINE_BLK);
+quant_dequant_core!(dequant_q41_core, Q41, AFFINE_BLK);
+quant_dequant_core!(dequant_q80_core, Q80, AFFINE_BLK);
+
+/// [`dequant`] for an f16 matrix (`raw`, `[rows, cols]` IEEE halves): its numbers exactly, in f32.
+pub(crate) unsafe fn dequant_f16_core(
+    raw: *const u8,
+    rows: usize,
+    cols: usize,
+    out: *mut f32,
+    threads: usize,
+) -> i32 {
+    let w = raw as *const u16;
+    if w.is_null() {
+        return ERR_NULL;
+    }
+    if !aligned(w) {
+        return ERR_DOMAIN;
+    }
+    dequant(F16(w), rows, cols, 1, out, threads)
+}
+
+/// [`dequant`] for a lattice type, with its grid and (`$ks`) sign table.
+macro_rules! latt_dequant_core {
+    ($name:ident, $w:ident, $ks:literal) => {
+        pub(crate) unsafe fn $name(
+            raw: *const u8,
+            grid: *const i8,
+            ksigns: *const u8,
+            rows: usize,
+            cols: usize,
+            out: *mut f32,
+            threads: usize,
+        ) -> i32 {
+            if raw.is_null() || grid.is_null() || ($ks && ksigns.is_null()) {
+                return ERR_NULL;
+            }
+            dequant($w { raw, grid, ksigns }, rows, cols, KQ_SB, out, threads)
+        }
+    };
+}
+latt_dequant_core!(dequant_iq3xxs_core, Iq3xxs, true);
+latt_dequant_core!(dequant_iq2xxs_core, Iq2xxs, true);
+latt_dequant_core!(dequant_iq2xs_core, Iq2xs, true);
+latt_dequant_core!(dequant_iq2s_core, Iq2s, false);
+latt_dequant_core!(dequant_iq1s_core, Iq1s, false);
+latt_dequant_core!(dequant_iq3s_core, Iq3s, false);
+latt_dequant_core!(dequant_iq1m_core, Iq1m, false);
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn gemv_mxfp4_group_core(
@@ -2513,112 +5379,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn mxfp4_group_matches_the_single_calls() {
-        let shapes = [(12usize, 64usize), (7, 128), (20, 96)];
-        let mut mats = Vec::new();
-        let mut xs = Vec::new();
-        for (i, (rows, cols)) in shapes.iter().enumerate() {
-            mats.push(mx4_random(*rows, *cols, 0x9e37_79b9_7f4a_7c15 ^ i as u64));
-            let mut state = 0x2545_f491_4f6c_dd1du64 ^ (i as u64) << 8;
-            let mut next = move || {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                ((state >> 40) as f32 / 16_777_216.0) * 2.0 - 1.0
-            };
-            xs.push((0..2 * cols).map(|_| next()).collect::<Vec<f32>>());
-        }
-        let want: Vec<Vec<f32>> = shapes
-            .iter()
-            .enumerate()
-            .map(|(i, (rows, cols))| mx4_call(&mats[i].0, &mats[i].1, *rows, *cols, &xs[i], 2, 0))
-            .collect();
-        let mut got: Vec<Vec<f32>> = shapes.iter().map(|(r, _)| vec![0.0f32; 2 * r]).collect();
-        let bp: Vec<*const u8> = mats.iter().map(|m| m.0.as_ptr()).collect();
-        let sp: Vec<*const u8> = mats.iter().map(|m| m.1.as_ptr()).collect();
-        let rp: Vec<usize> = shapes.iter().map(|(r, _)| *r).collect();
-        let cp: Vec<usize> = shapes.iter().map(|(_, c)| *c).collect();
-        let xp: Vec<*const f32> = xs.iter().map(|v| v.as_ptr()).collect();
-        let bs: Vec<usize> = shapes.iter().map(|_| 2usize).collect();
-        let mut yp: Vec<*mut f32> = got.iter_mut().map(|v| v.as_mut_ptr()).collect();
-        let code = unsafe {
-            gemv_mxfp4_group_core(
-                shapes.len(),
-                bp.as_ptr(),
-                sp.as_ptr(),
-                rp.as_ptr(),
-                cp.as_ptr(),
-                xp.as_ptr(),
-                bs.as_ptr(),
-                yp.as_mut_ptr(),
-                0,
-                false,
-            )
-        };
-        assert_eq!(code, OK);
-        for (i, (w, g)) in want.iter().zip(got.iter()).enumerate() {
-            assert_eq!(
-                w.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                g.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                "task {i}"
-            );
-        }
-    }
-
-    #[test]
-    fn mxfp4_rejects_bad_shapes() {
-        let blocks = [0u8; 64];
-        let scales = [127u8; 4];
-        let x = [0.0f32; 64];
-        let mut y = [0.0f32; 4];
-        unsafe {
-            assert_eq!(
-                gemv_mxfp4_core(
-                    std::ptr::null(),
-                    scales.as_ptr(),
-                    2,
-                    64,
-                    x.as_ptr(),
-                    1,
-                    y.as_mut_ptr(),
-                    0,
-                    false
-                ),
-                ERR_NULL
-            );
-            // cols must be a whole number of 32-weight blocks
-            assert_eq!(
-                gemv_mxfp4_core(
-                    blocks.as_ptr(),
-                    scales.as_ptr(),
-                    2,
-                    48,
-                    x.as_ptr(),
-                    1,
-                    y.as_mut_ptr(),
-                    0,
-                    false
-                ),
-                ERR_DOMAIN
-            );
-            assert_eq!(
-                gemv_mxfp4_core(
-                    blocks.as_ptr(),
-                    scales.as_ptr(),
-                    0,
-                    64,
-                    x.as_ptr(),
-                    1,
-                    y.as_mut_ptr(),
-                    0,
-                    false
-                ),
-                ERR_DOMAIN
-            );
-        }
-    }
-
     /// An e4m3fn byte's value from the definition: (-1)^s * 2^(e-7) * (1 + m/8), 2^-6 * m/8 at e == 0.
     fn f8_reference(b: u8) -> f64 {
         let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
@@ -2935,5 +5695,806 @@ mod tests {
         assert_eq!(call(w.as_ptr(), s.as_ptr(), 2, 32, 4, 1, yp), ERR_DOMAIN);
         assert_eq!(call(w.as_ptr(), s.as_ptr(), 2, 32, 0, 1, yp), ERR_DOMAIN);
         assert_eq!(call(w.as_ptr(), s.as_ptr(), 0, 32, 1, 1, yp), ERR_DOMAIN);
+    }
+
+    #[test]
+    fn mxfp4_group_matches_the_single_calls() {
+        let shapes = [(12usize, 64usize), (7, 128), (20, 96)];
+        let mut mats = Vec::new();
+        let mut xs = Vec::new();
+        for (i, (rows, cols)) in shapes.iter().enumerate() {
+            mats.push(mx4_random(*rows, *cols, 0x9e37_79b9_7f4a_7c15 ^ i as u64));
+            let mut state = 0x2545_f491_4f6c_dd1du64 ^ (i as u64) << 8;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 40) as f32 / 16_777_216.0) * 2.0 - 1.0
+            };
+            xs.push((0..2 * cols).map(|_| next()).collect::<Vec<f32>>());
+        }
+        let want: Vec<Vec<f32>> = shapes
+            .iter()
+            .enumerate()
+            .map(|(i, (rows, cols))| mx4_call(&mats[i].0, &mats[i].1, *rows, *cols, &xs[i], 2, 0))
+            .collect();
+        let mut got: Vec<Vec<f32>> = shapes.iter().map(|(r, _)| vec![0.0f32; 2 * r]).collect();
+        let bp: Vec<*const u8> = mats.iter().map(|m| m.0.as_ptr()).collect();
+        let sp: Vec<*const u8> = mats.iter().map(|m| m.1.as_ptr()).collect();
+        let rp: Vec<usize> = shapes.iter().map(|(r, _)| *r).collect();
+        let cp: Vec<usize> = shapes.iter().map(|(_, c)| *c).collect();
+        let xp: Vec<*const f32> = xs.iter().map(|v| v.as_ptr()).collect();
+        let bs: Vec<usize> = shapes.iter().map(|_| 2usize).collect();
+        let mut yp: Vec<*mut f32> = got.iter_mut().map(|v| v.as_mut_ptr()).collect();
+        let code = unsafe {
+            gemv_mxfp4_group_core(
+                shapes.len(),
+                bp.as_ptr(),
+                sp.as_ptr(),
+                rp.as_ptr(),
+                cp.as_ptr(),
+                xp.as_ptr(),
+                bs.as_ptr(),
+                yp.as_mut_ptr(),
+                0,
+                false,
+            )
+        };
+        assert_eq!(code, OK);
+        for (i, (w, g)) in want.iter().zip(got.iter()).enumerate() {
+            assert_eq!(
+                w.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                g.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "task {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn mxfp4_rejects_bad_shapes() {
+        let blocks = [0u8; 64];
+        let scales = [127u8; 4];
+        let x = [0.0f32; 64];
+        let mut y = [0.0f32; 4];
+        unsafe {
+            assert_eq!(
+                gemv_mxfp4_core(
+                    std::ptr::null(),
+                    scales.as_ptr(),
+                    2,
+                    64,
+                    x.as_ptr(),
+                    1,
+                    y.as_mut_ptr(),
+                    0,
+                    false
+                ),
+                ERR_NULL
+            );
+            // cols must be a whole number of 32-weight blocks
+            assert_eq!(
+                gemv_mxfp4_core(
+                    blocks.as_ptr(),
+                    scales.as_ptr(),
+                    2,
+                    48,
+                    x.as_ptr(),
+                    1,
+                    y.as_mut_ptr(),
+                    0,
+                    false
+                ),
+                ERR_DOMAIN
+            );
+            assert_eq!(
+                gemv_mxfp4_core(
+                    blocks.as_ptr(),
+                    scales.as_ptr(),
+                    0,
+                    64,
+                    x.as_ptr(),
+                    1,
+                    y.as_mut_ptr(),
+                    0,
+                    false
+                ),
+                ERR_DOMAIN
+            );
+        }
+    }
+
+    // ---- k-quants -------------------------------------------------------------------------------
+
+    /// `rows * cols / 256` Q4_K superblocks of random bytes, the two f16 factors held to a small finite
+    /// positive range (a real quantizer's deltas, never inf/nan) so the weights stay finite.
+    #[cfg(target_arch = "aarch64")]
+    fn q4k_random(rows: usize, cols: usize, seed: u64) -> Vec<u8> {
+        let nsb = rows * cols / KQ_SB;
+        let mut state = seed;
+        let mut byte = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 32) as u8
+        };
+        let mut raw = vec![0u8; nsb * Q4K_BYTES];
+        for sb in 0..nsb {
+            let o = sb * Q4K_BYTES;
+            // half in [2^-4, 2^-3): exponent field 11, a random mantissa - finite and modest
+            let d = 0x2C00u16 | (((byte() as u16) << 2) & 0x03FF);
+            let dmin = 0x2C00u16 | (((byte() as u16) << 2) & 0x03FF);
+            raw[o..o + 2].copy_from_slice(&d.to_le_bytes());
+            raw[o + 2..o + 4].copy_from_slice(&dmin.to_le_bytes());
+            for b in raw[o + 4..o + Q4K_BYTES].iter_mut() {
+                *b = byte();
+            }
+        }
+        raw
+    }
+
+    /// finite halves, a few subnormals among them: the exponent field drawn over 0..=30
+    fn f16_random(n: usize, seed: u64) -> Vec<u16> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let h = (s >> 32) as u16;
+                (h & 0x83FF) | ((((h >> 10) & 0x1F) % 31) << 10)
+            })
+            .collect()
+    }
+
+    fn f16_call(
+        w: &[u16],
+        rows: usize,
+        cols: usize,
+        x: &[f32],
+        b: usize,
+        threads: usize,
+    ) -> Vec<f32> {
+        let mut y = vec![f32::NAN; b * rows];
+        let code = unsafe {
+            gemv_f16_core(
+                w.as_ptr() as *const u8,
+                rows,
+                cols,
+                x.as_ptr(),
+                b,
+                y.as_mut_ptr(),
+                threads,
+            )
+        };
+        assert_eq!(code, OK);
+        y
+    }
+
+    #[test]
+    fn f16_matches_the_f64_reference() {
+        for (i, (rows, cols)) in [
+            (1usize, 1usize),
+            (3, 17),
+            (7, 400),
+            (16, 16),
+            (17, 1025),
+            (33, 512),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let w = f16_random(rows * cols, 0x5151_a0a0_1234_0000 ^ i as u64);
+            let x = f8_x(cols, 0x0f0f_1616_2525_3434 ^ i as u64);
+            let y = f16_call(&w, rows, cols, &x, 1, 1);
+            for r in 0..rows {
+                let row = &w[r * cols..(r + 1) * cols];
+                let terms = row
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(a, b)| f16_to_f32(*a) as f64 * *b as f64);
+                let want: f64 = terms.clone().sum();
+                let scale = terms.map(f64::abs).sum::<f64>().max(1e-30);
+                assert!(
+                    ((y[r] as f64 - want).abs() / scale) < 1e-6,
+                    "{rows}x{cols} row {r}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn f16_tiling_threads_and_batching_do_not_move_a_single_bit() {
+        let (rows, cols) = (67usize, 1040usize);
+        let w = f16_random(rows * cols, 0xf16f_16f1_6f16_f16f);
+        let x = f8_x(3 * cols, 0x0bad_f16f_ee00_0dd1);
+        let base = f16_call(&w, rows, cols, &x, 3, 1);
+        for t in [2usize, 3, 5, 8, 0] {
+            let got = f16_call(&w, rows, cols, &x, 3, t);
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                base.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "threads = {t}"
+            );
+        }
+        for i in 0..3 {
+            let solo = f16_call(&w, rows, cols, &x[i * cols..(i + 1) * cols], 1, 0);
+            for r in 0..rows {
+                assert_eq!(
+                    solo[r].to_bits(),
+                    base[i * rows + r].to_bits(),
+                    "vector {i} row {r}"
+                );
+            }
+        }
+    }
+
+    /// Every half through each widening this machine runs against the scalar one, over a run that cuts the SIMD
+    /// width, to the bit (a NaN to a NaN).
+    #[test]
+    fn f16_widenings_agree_across_isas() {
+        let n = 65536 + 7;
+        let w: Vec<u16> = (0..n).map(|i| (i % 65536) as u16).collect();
+        let mut want = vec![0.0f32; n];
+        unsafe { widen_f16_scalar::<1>(want.as_mut_ptr(), w.as_ptr(), n, n, n) };
+        let same = |got: &[f32], isa: &str| {
+            for (j, (g, e)) in got.iter().zip(want.iter()).enumerate() {
+                assert!(
+                    g.to_bits() == e.to_bits() || (g.is_nan() && e.is_nan()),
+                    "{isa} half {:#06x}",
+                    w[j]
+                );
+            }
+        };
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mut got = vec![0.0f32; n];
+            unsafe { widen_f16_neon::<1>(got.as_mut_ptr(), w.as_ptr(), n, n, n) };
+            same(&got, "neon");
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("f16c")
+            {
+                let mut got = vec![0.0f32; n];
+                unsafe { widen_f16_avx2::<1>(got.as_mut_ptr(), w.as_ptr(), n, n, n) };
+                same(&got, "avx2");
+            }
+            if std::arch::is_x86_feature_detected!("avx512f") {
+                let mut got = vec![0.0f32; n];
+                unsafe { widen_f16_avx512::<1>(got.as_mut_ptr(), w.as_ptr(), n, n, n) };
+                same(&got, "avx512");
+            }
+        }
+        let _ = same;
+    }
+
+    #[test]
+    fn f16_group_and_dequant_match_the_single_calls() {
+        let shapes = [(12usize, 64usize), (7, 400), (20, 96)];
+        let mats: Vec<Vec<u16>> = shapes
+            .iter()
+            .enumerate()
+            .map(|(i, (r, c))| f16_random(r * c, 0x16_0000 ^ i as u64))
+            .collect();
+        let xs: Vec<Vec<f32>> = shapes
+            .iter()
+            .enumerate()
+            .map(|(i, (_, c))| f8_x(2 * c, 0x16_1111 ^ (i as u64) << 8))
+            .collect();
+        let want: Vec<Vec<f32>> = shapes
+            .iter()
+            .enumerate()
+            .map(|(i, (r, c))| f16_call(&mats[i], *r, *c, &xs[i], 2, 0))
+            .collect();
+        let mut got: Vec<Vec<f32>> = shapes.iter().map(|s| vec![0.0f32; 2 * s.0]).collect();
+        let wp: Vec<*const u8> = mats.iter().map(|m| m.as_ptr() as *const u8).collect();
+        let rp: Vec<usize> = shapes.iter().map(|s| s.0).collect();
+        let cp: Vec<usize> = shapes.iter().map(|s| s.1).collect();
+        let xp: Vec<*const f32> = xs.iter().map(|v| v.as_ptr()).collect();
+        let bs: Vec<usize> = shapes.iter().map(|_| 2usize).collect();
+        let mut yp: Vec<*mut f32> = got.iter_mut().map(|v| v.as_mut_ptr()).collect();
+        let code = unsafe {
+            gemv_f16_group_core(
+                shapes.len(),
+                wp.as_ptr(),
+                rp.as_ptr(),
+                cp.as_ptr(),
+                xp.as_ptr(),
+                bs.as_ptr(),
+                yp.as_mut_ptr(),
+                0,
+            )
+        };
+        assert_eq!(code, OK);
+        for (i, (w, g)) in want.iter().zip(got.iter()).enumerate() {
+            assert_eq!(
+                w.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                g.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "task {i}"
+            );
+        }
+        let (rows, cols) = shapes[1];
+        let mut out = vec![f32::NAN; rows * cols];
+        let code = unsafe {
+            dequant_f16_core(
+                mats[1].as_ptr() as *const u8,
+                rows,
+                cols,
+                out.as_mut_ptr(),
+                0,
+            )
+        };
+        assert_eq!(code, OK);
+        for (o, h) in out.iter().zip(mats[1].iter()) {
+            assert_eq!(o.to_bits(), f16_to_f32(*h).to_bits());
+        }
+    }
+
+    #[test]
+    fn f16_to_f32_matches_ieee() {
+        // (half bits, exact f32) across normals, both signs, and subnormals (a tiny k-quant delta/min: the
+        // case real weights hit and uniform-random bytes miss)
+        let p = |n: i32| 2.0f32.powi(n);
+        for (h, want) in [
+            (0x0000u16, 0.0f32),
+            (0x8000, -0.0),
+            (0x3C00, 1.0),
+            (0xC000, -2.0),
+            (0x4900, 10.0),             // exp 18, mant 0x100: 8 * 1.25
+            (0x7BFF, 65504.0),          // max normal
+            (0x0400, p(-14)),           // min normal
+            (0x0200, 512.0 * p(-24)),   // subnormal 2^-15
+            (0x0001, p(-24)),           // smallest subnormal
+            (0x83FF, -1023.0 * p(-24)), // largest negative subnormal
+        ] {
+            assert_eq!(f16_to_f32(h).to_bits(), want.to_bits(), "half {h:#06x}");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn q4k_scalar_and_neon_widen_to_the_same_bits() {
+        let (rows, cols) = (4usize, 512usize);
+        let raw = q4k_random(rows, cols, 0x1111_2222_3333_4444);
+        let p = Q4k(raw.as_ptr());
+        let mut a = vec![0.0f32; ROW_UNROLL * COL_TILE];
+        let mut b = vec![0.0f32; ROW_UNROLL * COL_TILE];
+        unsafe {
+            widen_q4k_scalar::<4>(a.as_mut_ptr(), COL_TILE, p, 0, cols, cols.min(COL_TILE));
+            widen_q4k_neon::<4>(b.as_mut_ptr(), COL_TILE, p, 0, cols, cols.min(COL_TILE));
+        }
+        for (i, (av, bv)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(av.to_bits(), bv.to_bits(), "lane {i}");
+        }
+    }
+
+    /// `rows * cols / 256` Q6_K superblocks of random bytes with a finite positive f16 delta.
+    #[cfg(target_arch = "aarch64")]
+    fn q6k_random(rows: usize, cols: usize, seed: u64) -> Vec<u8> {
+        let nsb = rows * cols / KQ_SB;
+        let mut state = seed;
+        let mut byte = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 32) as u8
+        };
+        let mut raw = vec![0u8; nsb * Q6K_BYTES];
+        for sb in 0..nsb {
+            let o = sb * Q6K_BYTES;
+            for b in raw[o..o + 208].iter_mut() {
+                *b = byte();
+            }
+            // the f16 delta in [2^-4, 2^-3): finite and modest
+            let d = 0x2C00u16 | (((byte() as u16) << 2) & 0x03FF);
+            raw[o + 208..o + 210].copy_from_slice(&d.to_le_bytes());
+        }
+        raw
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn q6k_scalar_and_neon_widen_to_the_same_bits() {
+        let (rows, cols) = (4usize, 512usize);
+        let raw = q6k_random(rows, cols, 0x4444_3333_2222_1111);
+        let p = Q6k(raw.as_ptr());
+        let mut a = vec![0.0f32; ROW_UNROLL * COL_TILE];
+        let mut b = vec![0.0f32; ROW_UNROLL * COL_TILE];
+        unsafe {
+            widen_q6k_scalar::<4>(a.as_mut_ptr(), COL_TILE, p, 0, cols, cols.min(COL_TILE));
+            widen_q6k_neon::<4>(b.as_mut_ptr(), COL_TILE, p, 0, cols, cols.min(COL_TILE));
+        }
+        for (i, (av, bv)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(av.to_bits(), bv.to_bits(), "lane {i}");
+        }
+    }
+
+    // ---- Q5_K / Q2_K / Q3_K ---------------------------------------------------------------------
+
+    /// `rows * cols / 256` superblocks of `nb` random bytes, the f16 fields at `f16_offs` held finite positive.
+    fn kq_random(
+        nb: usize,
+        bw: usize,
+        f16_offs: &[usize],
+        rows: usize,
+        cols: usize,
+        seed: u64,
+    ) -> Vec<u8> {
+        let n = rows * cols / bw;
+        let mut state = seed;
+        let mut byte = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 32) as u8
+        };
+        let mut raw = vec![0u8; n * nb];
+        for sb in 0..n {
+            let o = sb * nb;
+            for b in raw[o..o + nb].iter_mut() {
+                *b = byte();
+            }
+            for &off in f16_offs {
+                let d = 0x2C00u16 | (((byte() as u16) << 2) & 0x03FF);
+                raw[o + off..o + off + 2].copy_from_slice(&d.to_le_bytes());
+            }
+        }
+        raw
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn affine_scalar_and_neon_widen_to_the_same_bits() {
+        let (rows, cols) = (4usize, 512usize);
+        let mut a = vec![0.0f32; ROW_UNROLL * COL_TILE];
+        let mut b = vec![0.0f32; ROW_UNROLL * COL_TILE];
+        let n = cols.min(COL_TILE);
+        unsafe {
+            let q40 = kq_random(Q40_BYTES, AFFINE_BLK, &[0], rows, cols, 0x40);
+            widen_q40_scalar::<4>(a.as_mut_ptr(), COL_TILE, Q40(q40.as_ptr()), 0, cols, n);
+            widen_q40_neon::<4>(b.as_mut_ptr(), COL_TILE, Q40(q40.as_ptr()), 0, cols, n);
+            assert!(
+                a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "Q4_0"
+            );
+            let q41 = kq_random(Q41_BYTES, AFFINE_BLK, &[0, 2], rows, cols, 0x41);
+            widen_q41_scalar::<4>(a.as_mut_ptr(), COL_TILE, Q41(q41.as_ptr()), 0, cols, n);
+            widen_q41_neon::<4>(b.as_mut_ptr(), COL_TILE, Q41(q41.as_ptr()), 0, cols, n);
+            assert!(
+                a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "Q4_1"
+            );
+            let q80 = kq_random(Q80_BYTES, AFFINE_BLK, &[0], rows, cols, 0x80);
+            widen_q80_scalar::<4>(a.as_mut_ptr(), COL_TILE, Q80(q80.as_ptr()), 0, cols, n);
+            widen_q80_neon::<4>(b.as_mut_ptr(), COL_TILE, Q80(q80.as_ptr()), 0, cols, n);
+            assert!(
+                a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "Q8_0"
+            );
+        }
+    }
+
+    // ---- IQ lattice: the throughput probe's cores and bytes; the C-ABI parity is tests/gemv_quant.rs ----------
+
+    type LattCore = unsafe fn(
+        *const u8,
+        *const i8,
+        *const u8,
+        usize,
+        usize,
+        *const f32,
+        usize,
+        *mut f32,
+        usize,
+    ) -> i32;
+
+    fn latt_bytes(n: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 32) as u8
+            })
+            .collect()
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn q5k_q2k_q3k_scalar_and_neon_widen_to_the_same_bits() {
+        let (rows, cols) = (4usize, 512usize);
+        let mut a = vec![0.0f32; ROW_UNROLL * COL_TILE];
+        let mut b = vec![0.0f32; ROW_UNROLL * COL_TILE];
+        let n = cols.min(COL_TILE);
+        unsafe {
+            let q5 = kq_random(Q5K_BYTES, KQ_SB, &[0, 2], rows, cols, 0x51);
+            widen_q5k_scalar::<4>(a.as_mut_ptr(), COL_TILE, Q5k(q5.as_ptr()), 0, cols, n);
+            widen_q5k_neon::<4>(b.as_mut_ptr(), COL_TILE, Q5k(q5.as_ptr()), 0, cols, n);
+            assert!(
+                a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "Q5_K"
+            );
+            let q2 = kq_random(Q2K_BYTES, KQ_SB, &[80, 82], rows, cols, 0x52);
+            widen_q2k_scalar::<4>(a.as_mut_ptr(), COL_TILE, Q2k(q2.as_ptr()), 0, cols, n);
+            widen_q2k_neon::<4>(b.as_mut_ptr(), COL_TILE, Q2k(q2.as_ptr()), 0, cols, n);
+            assert!(
+                a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "Q2_K"
+            );
+            let q3 = kq_random(Q3K_BYTES, KQ_SB, &[108], rows, cols, 0x53);
+            widen_q3k_scalar::<4>(a.as_mut_ptr(), COL_TILE, Q3k(q3.as_ptr()), 0, cols, n);
+            widen_q3k_neon::<4>(b.as_mut_ptr(), COL_TILE, Q3k(q3.as_ptr()), 0, cols, n);
+            assert!(
+                a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "Q3_K"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn iq4_scalar_and_neon_widen_to_the_same_bits() {
+        let (rows, cols) = (4usize, 512usize);
+        let mut a = vec![0.0f32; ROW_UNROLL * COL_TILE];
+        let mut b = vec![0.0f32; ROW_UNROLL * COL_TILE];
+        let n = cols.min(COL_TILE);
+        unsafe {
+            let nl = kq_random(IQ4NL_BYTES, IQ4NL_BLK, &[0], rows, cols, 0x4E);
+            widen_iq4nl_scalar::<4>(a.as_mut_ptr(), COL_TILE, Iq4nl(nl.as_ptr()), 0, cols, n);
+            widen_iq4nl_neon::<4>(b.as_mut_ptr(), COL_TILE, Iq4nl(nl.as_ptr()), 0, cols, n);
+            assert!(
+                a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "IQ4_NL"
+            );
+            let xs = kq_random(IQ4XS_BYTES, KQ_SB, &[0], rows, cols, 0x4C);
+            widen_iq4xs_scalar::<4>(a.as_mut_ptr(), COL_TILE, Iq4xs(xs.as_ptr()), 0, cols, n);
+            widen_iq4xs_neon::<4>(b.as_mut_ptr(), COL_TILE, Iq4xs(xs.as_ptr()), 0, cols, n);
+            assert!(
+                a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "IQ4_XS"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn lattice_scalar_and_neon_widen_to_the_same_bits() {
+        let (rows, cols) = (4usize, 512usize);
+        let n = cols.min(COL_TILE);
+        let mut a = vec![0.0f32; ROW_UNROLL * COL_TILE];
+        let mut b = vec![0.0f32; ROW_UNROLL * COL_TILE];
+        // a grid as wide as the widest type's (IQ1's 2048 rows of 8) and a sign table, values over the full int8 range
+        let grid: Vec<i8> = (0..2048 * 8)
+            .map(|i| ((i * 37 + 11) % 256) as u8 as i8)
+            .collect();
+        let ks: Vec<u8> = (0..128).map(|i| (i * 73 + 5) as u8).collect();
+        macro_rules! check {
+            ($name:expr, $w:ident, $bytes:expr, $sc:ident, $ne:ident, $seed:expr) => {{
+                let raw = kq_random($bytes, KQ_SB, &[0], rows, cols, $seed);
+                let p = $w {
+                    raw: raw.as_ptr(),
+                    grid: grid.as_ptr(),
+                    ksigns: ks.as_ptr(),
+                };
+                unsafe {
+                    $sc::<4>(a.as_mut_ptr(), COL_TILE, p, 0, cols, n);
+                    $ne::<4>(b.as_mut_ptr(), COL_TILE, p, 0, cols, n);
+                }
+                assert!(
+                    a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                    $name
+                );
+            }};
+        }
+        check!("IQ3_XXS", Iq3xxs, 98, widen_iq3xxs, widen_iq3xxs_neon, 0x31);
+        check!("IQ2_XXS", Iq2xxs, 66, widen_iq2xxs, widen_iq2xxs_neon, 0x32);
+        check!("IQ2_XS", Iq2xs, 74, widen_iq2xs, widen_iq2xs_neon, 0x33);
+        check!("IQ2_S", Iq2s, 82, widen_iq2s, widen_iq2s_neon, 0x34);
+        check!("IQ1_S", Iq1s, 50, widen_iq1s, widen_iq1s_neon, 0x35);
+        check!("IQ3_S", Iq3s, 110, widen_iq3s, widen_iq3s_neon, 0x36);
+        check!("IQ1_M", Iq1m, 56, widen_iq1m, widen_iq1m_neon, 0x37);
+    }
+
+    /// throughput of every quant matvec at batch 1 (a decode step) and 16 (a verify pass), single core, on a
+    /// matrix well past the caches, beside the bf16 matvec as the machine's single-core bandwidth yardstick (a
+    /// known memory-bound kernel). If a format's `GB/s (weights)` sits near bf16's it is memory-bound too and as
+    /// fast as its byte budget allows; a format that sits well under bf16's byte rate is decode-bound, and its
+    /// second section below (NEON widen vs the scalar definition, decode in isolation) is the whole story of how
+    /// far that decode was taken. The 7 lattice types decode by a scalar grid gather (no NEON widen exists), so
+    /// they appear only in the full-matvec section. Ignored by default (a number, and a debug build's is
+    /// meaningless): `cargo test --release -- --ignored --nocapture kquant_throughput`.
+    #[test]
+    #[ignore]
+    fn kquant_throughput() {
+        use std::time::Instant;
+        let (rows, cols) = (4096usize, 4096usize);
+        let bf: Vec<u16> = (0..rows * cols)
+            .map(|i| ((i as u32 * 2 + 1) & 0xFFFF) as u16)
+            .collect();
+        // one raw matrix per format; kq_random lays out rows*cols weights as that type's superblocks. Decoded
+        // values are irrelevant to timing, so the f16 scale offsets only keep the scales finite.
+        let (q2, q3) = (
+            kq_random(Q2K_BYTES, KQ_SB, &[80, 82], rows, cols, 0x02),
+            kq_random(Q3K_BYTES, KQ_SB, &[108], rows, cols, 0x03),
+        );
+        let q4 = kq_random(Q4K_BYTES, KQ_SB, &[0, 2], rows, cols, 0x04);
+        let q5 = kq_random(Q5K_BYTES, KQ_SB, &[0, 2], rows, cols, 0x05);
+        let q6 = kq_random(Q6K_BYTES, KQ_SB, &[208], rows, cols, 0x06);
+        let q40 = kq_random(Q40_BYTES, AFFINE_BLK, &[0], rows, cols, 0x40);
+        let q41 = kq_random(Q41_BYTES, AFFINE_BLK, &[0, 2], rows, cols, 0x41);
+        let q80 = kq_random(Q80_BYTES, AFFINE_BLK, &[0], rows, cols, 0x80);
+        let nl = kq_random(IQ4NL_BYTES, AFFINE_BLK, &[0], rows, cols, 0x4E);
+        let xs = kq_random(IQ4XS_BYTES, KQ_SB, &[0], rows, cols, 0x4C);
+        let i1s = kq_random(50, KQ_SB, &[0], rows, cols, 0x11);
+        let i1m = kq_random(56, KQ_SB, &[0], rows, cols, 0x1D);
+        let i2xxs = kq_random(66, KQ_SB, &[0], rows, cols, 0x22);
+        let i2xs = kq_random(74, KQ_SB, &[0], rows, cols, 0x23);
+        let i2s = kq_random(82, KQ_SB, &[0], rows, cols, 0x25);
+        let i3xxs = kq_random(98, KQ_SB, &[0], rows, cols, 0x33);
+        let i3s = kq_random(110, KQ_SB, &[0], rows, cols, 0x35);
+        // grid + sign table for the lattice cores, sized past every lattice type's largest gather index.
+        let grid: Vec<i8> = latt_bytes(16384, 0xA1).iter().map(|&u| u as i8).collect();
+        let ks = latt_bytes(128, 0xB2);
+
+        fn bench(label: &str, wbytes: usize, gflop_w: usize, mut call: impl FnMut()) {
+            call();
+            let mut best = f64::MAX;
+            for _ in 0..30 {
+                let t = Instant::now();
+                call();
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            eprintln!(
+                "{label:16}: {:.3} ms  {:6.1} GB/s (weights)  {:6.1} Gflop/s",
+                best * 1e3,
+                wbytes as f64 / best / 1e9,
+                gflop_w as f64 / best / 1e9,
+            );
+        }
+
+        type KqCore = unsafe fn(*const u8, usize, usize, *const f32, usize, *mut f32, usize) -> i32;
+        let kqs: [(&str, &[u8], usize, usize, KqCore); 10] = [
+            ("Q2_K", q2.as_slice(), KQ_SB, Q2K_BYTES, gemv_q2k_core),
+            ("Q3_K", q3.as_slice(), KQ_SB, Q3K_BYTES, gemv_q3k_core),
+            ("Q4_K", q4.as_slice(), KQ_SB, Q4K_BYTES, gemv_q4k_core),
+            ("Q5_K", q5.as_slice(), KQ_SB, Q5K_BYTES, gemv_q5k_core),
+            ("Q6_K", q6.as_slice(), KQ_SB, Q6K_BYTES, gemv_q6k_core),
+            ("Q4_0", q40.as_slice(), AFFINE_BLK, Q40_BYTES, gemv_q40_core),
+            ("Q4_1", q41.as_slice(), AFFINE_BLK, Q41_BYTES, gemv_q41_core),
+            ("Q8_0", q80.as_slice(), AFFINE_BLK, Q80_BYTES, gemv_q80_core),
+            (
+                "IQ4_NL",
+                nl.as_slice(),
+                AFFINE_BLK,
+                IQ4NL_BYTES,
+                gemv_iq4nl_core,
+            ),
+            ("IQ4_XS", xs.as_slice(), KQ_SB, IQ4XS_BYTES, gemv_iq4xs_core),
+        ];
+        let latts: [(&str, &[u8], usize, LattCore); 7] = [
+            ("IQ1_S", i1s.as_slice(), 50, gemv_iq1s_core),
+            ("IQ1_M", i1m.as_slice(), 56, gemv_iq1m_core),
+            ("IQ2_XXS", i2xxs.as_slice(), 66, gemv_iq2xxs_core),
+            ("IQ2_XS", i2xs.as_slice(), 74, gemv_iq2xs_core),
+            ("IQ2_S", i2s.as_slice(), 82, gemv_iq2s_core),
+            ("IQ3_XXS", i3xxs.as_slice(), 98, gemv_iq3xxs_core),
+            ("IQ3_S", i3s.as_slice(), 110, gemv_iq3s_core),
+        ];
+
+        for &b in &[1usize, 16] {
+            let x: Vec<f32> = (0..b * cols).map(|i| (i as f32 * 0.001).sin()).collect();
+            let mut y = vec![0.0f32; b * rows];
+            let flop = 2 * rows * cols * b;
+            bench(&format!("bf16 b={b}"), rows * cols * 2, flop, || unsafe {
+                assert_eq!(
+                    gemv_core(bf.as_ptr(), rows, cols, x.as_ptr(), b, y.as_mut_ptr(), 1),
+                    OK
+                );
+            });
+            for &(label, raw, blk, bytes, core) in &kqs {
+                bench(
+                    &format!("{label} b={b}"),
+                    rows * cols / blk * bytes,
+                    flop,
+                    || unsafe {
+                        assert_eq!(
+                            core(raw.as_ptr(), rows, cols, x.as_ptr(), b, y.as_mut_ptr(), 1),
+                            OK
+                        );
+                    },
+                );
+            }
+            for &(label, raw, bytes, core) in &latts {
+                bench(
+                    &format!("{label} b={b}"),
+                    rows * cols / KQ_SB * bytes,
+                    flop,
+                    || unsafe {
+                        assert_eq!(
+                            core(
+                                raw.as_ptr(),
+                                grid.as_ptr(),
+                                ks.as_ptr(),
+                                rows,
+                                cols,
+                                x.as_ptr(),
+                                b,
+                                y.as_mut_ptr(),
+                                1,
+                            ),
+                            OK
+                        );
+                    },
+                );
+            }
+        }
+
+        // decode compute, NEON widen vs the scalar definition, in isolation. Each timed call decodes `reps`
+        // cache-resident 4x512 strips (well past the ~40ns timer granularity), the strip offset cycling over 8
+        // superblocks so the compiler can't fold the repeats into one, and a per-iteration `black_box` keeps the
+        // stores from being eliminated. A ratio near 1.0 would mean the NEON path bought nothing.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let (mcols, n, reps) = (512usize, 512usize, 4096usize);
+            let mut a = vec![0.0f32; ROW_UNROLL * COL_TILE];
+            let ap = a.as_mut_ptr();
+            let w = reps * 4 * mcols;
+            fn decode(label: &str, w: usize, mut sc: impl FnMut(), mut ne: impl FnMut()) {
+                sc();
+                ne();
+                let (mut bs, mut bn) = (f64::MAX, f64::MAX);
+                for _ in 0..25 {
+                    let t = Instant::now();
+                    sc();
+                    bs = bs.min(t.elapsed().as_secs_f64());
+                    let t = Instant::now();
+                    ne();
+                    bn = bn.min(t.elapsed().as_secs_f64());
+                }
+                eprintln!(
+                    "{label:8} decode: scalar {:6.2} Gw/s   neon {:6.2} Gw/s   ({:.2}x)",
+                    w as f64 / bs / 1e9,
+                    w as f64 / bn / 1e9,
+                    bs / bn,
+                );
+            }
+            macro_rules! dec {
+                ($lbl:expr, $sc:ident, $ne:ident, $W:expr, $raw:expr) => {{
+                    let rp = $raw.as_ptr();
+                    decode(
+                        $lbl,
+                        w,
+                        || {
+                            for i in 0..reps {
+                                unsafe {
+                                    $sc::<4>(ap, COL_TILE, $W(rp), (i & 7) * KQ_SB, mcols, n)
+                                };
+                                std::hint::black_box(ap);
+                            }
+                        },
+                        || {
+                            for i in 0..reps {
+                                unsafe {
+                                    $ne::<4>(ap, COL_TILE, $W(rp), (i & 7) * KQ_SB, mcols, n)
+                                };
+                                std::hint::black_box(ap);
+                            }
+                        },
+                    );
+                }};
+            }
+            dec!("Q2_K", widen_q2k_scalar, widen_q2k_neon, Q2k, q2);
+            dec!("Q3_K", widen_q3k_scalar, widen_q3k_neon, Q3k, q3);
+            dec!("Q4_K", widen_q4k_scalar, widen_q4k_neon, Q4k, q4);
+            dec!("Q5_K", widen_q5k_scalar, widen_q5k_neon, Q5k, q5);
+            dec!("Q6_K", widen_q6k_scalar, widen_q6k_neon, Q6k, q6);
+            dec!("Q4_0", widen_q40_scalar, widen_q40_neon, Q40, q40);
+            dec!("Q4_1", widen_q41_scalar, widen_q41_neon, Q41, q41);
+            dec!("Q8_0", widen_q80_scalar, widen_q80_neon, Q80, q80);
+            dec!("IQ4_NL", widen_iq4nl_scalar, widen_iq4nl_neon, Iq4nl, nl);
+            dec!("IQ4_XS", widen_iq4xs_scalar, widen_iq4xs_neon, Iq4xs, xs);
+        }
     }
 }

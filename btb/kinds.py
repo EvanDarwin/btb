@@ -92,6 +92,7 @@ class FamilyKind(StrEnum):
 
     QWEN3 = "qwen3"
     QWEN3_5 = "qwen3_5"
+    QWEN3_5_MOE = "qwen3_5_moe"
     QWEN4 = "qwen4"
     PHI3 = "phi3"
     GPT_OSS = "gpt_oss"
@@ -102,6 +103,7 @@ class FamilyKind(StrEnum):
 FAMILY_NAMES: dict[FamilyKind, str] = {
     FamilyKind.QWEN3: "Qwen3",
     FamilyKind.QWEN3_5: "Qwen3.5",
+    FamilyKind.QWEN3_5_MOE: "Qwen3.5-MoE",
     FamilyKind.PHI3: "Phi-3",
     FamilyKind.QWEN4: "Qwen4",
     FamilyKind.GPT_OSS: "GPT-OSS",
@@ -117,6 +119,8 @@ class ModelType(StrEnum):
     QWEN3 = "qwen3"
     QWEN3_5 = "qwen3_5"
     QWEN3_5_TEXT = "qwen3_5_text"
+    QWEN3_5_MOE = "qwen3_5_moe"
+    QWEN3_5_MOE_TEXT = "qwen3_5_moe_text"
     PHI3 = "phi3"
     QWEN4_EXP = "qwen4_exp"
     QWEN4_EXP_TEXT = "qwen4_exp_text"
@@ -153,6 +157,8 @@ KIND_OF: dict[ModelType, FamilyKind] = {
     ModelType.QWEN3: FamilyKind.QWEN3,
     ModelType.QWEN3_5: FamilyKind.QWEN3_5,
     ModelType.QWEN3_5_TEXT: FamilyKind.QWEN3_5,
+    ModelType.QWEN3_5_MOE: FamilyKind.QWEN3_5_MOE,
+    ModelType.QWEN3_5_MOE_TEXT: FamilyKind.QWEN3_5_MOE,
     ModelType.PHI3: FamilyKind.PHI3,
     ModelType.QWEN4_EXP: FamilyKind.QWEN4,
     ModelType.QWEN4_EXP_TEXT: FamilyKind.QWEN4,
@@ -166,6 +172,7 @@ KIND_OF: dict[ModelType, FamilyKind] = {
 CAPS: dict[FamilyKind, frozenset[Cap]] = {
     FamilyKind.QWEN3: frozenset({Cap.DENSE, Cap.KERNEL_LAYOUT, Cap.FAST}),
     FamilyKind.QWEN3_5: frozenset({Cap.HYBRID, Cap.MROPE, Cap.ATTN_GATE, Cap.NORM_CENTERED, Cap.FAST}),
+    FamilyKind.QWEN3_5_MOE: frozenset({Cap.HYBRID, Cap.MOE, Cap.MROPE, Cap.ATTN_GATE, Cap.NORM_CENTERED, Cap.FAST}),
     FamilyKind.PHI3: frozenset({Cap.DENSE, Cap.FAST}),
     FamilyKind.QWEN4: frozenset({Cap.MOE, Cap.MROPE, Cap.ATTN_GATE, Cap.OWN, Cap.FAST}),
     FamilyKind.GPT_OSS: frozenset({Cap.MOE, Cap.MXFP4, Cap.EAGER, Cap.FLAT_CACHE}),
@@ -177,7 +184,7 @@ CAPS: dict[FamilyKind, frozenset[Cap]] = {
 
 class Quant(StrEnum):
     """A stored weight type btb can read, spelled once as its GGUF type name (a tensor's `tensor_type.name`),
-    so `t.tensor_type.name == Quant.Q4_K` and `name in AFFINE_TYPES` work with the member in the string's place.
+    so `t.tensor_type.name == Quant.Q4_K` works with the member in the string's place.
     This is the single set of supported types: the engine's binders and the cert's quant coverage both read it,
     so a type is declared here and nowhere else. Torch-free."""
 
@@ -204,12 +211,10 @@ class Quant(StrEnum):
 
 
 class QuantClass(StrEnum):
-    """the bind path that reads a Quant - the engine's dispatch group and the cert's storage bucket. Q4_K is
-    KQUANT (it binds via its k-quant kernel first); `AFFINE_TYPES` separately lists the types the affine decoder
-    can also produce, Q4_K among them."""
+    """the bind path that reads a Quant - the engine's dispatch group and the cert's storage bucket"""
 
-    FLOAT = "float"  # BF16 / F16: dequantized, no as-stored kernel
-    AFFINE = "affine"  # Q4_0 / Q4_1 / Q8_0: the packed affine kernel
+    FLOAT = "float"  # BF16 / F16: a linear read as bf16; an expert multiplied as stored (`EXPERT_FLOATS`)
+    AFFINE = "affine"  # Q4_0 / Q4_1 / Q8_0: one scale (and Q4_1's min) a 32-weight block
     KQUANT = "kquant"  # Q2_K..Q6_K: the k-quant as-stored kernels
     IQ4 = "iq4"  # IQ4_NL / IQ4_XS: the non-linear 4-bit codebook
     LATTICE = "lattice"  # the grid-codebook i-quants (the Unsloth dynamic mixes)
@@ -248,10 +253,37 @@ def quants_of(cls: QuantClass) -> list[Quant]:
     return [q for q in Quant if QUANT_KIND[q] is cls]
 
 
-def latt_backend_key(q: Quant) -> str:
-    """the backend lattice-kernel key for a LATTICE quant: its GGUF name lowercased, underscores dropped
-    (IQ3_XXS -> iq3xxs), the one rule the engine's name map and the backend's `_LATT` both follow."""
+# the classes whose linears every backend multiplies in their stored blocks, a gemv per type (CPU, MLX, card);
+# FLOAT is read into a bf16 slot, MXFP4 is the expert store's
+STORED_CLASSES: frozenset[QuantClass] = frozenset(
+    {QuantClass.AFFINE, QuantClass.KQUANT, QuantClass.IQ4, QuantClass.LATTICE}
+)
+
+
+def stored_quants() -> list[Quant]:
+    """the types a linear multiplies as stored, in declaration order"""
+    return [q for q in Quant if QUANT_KIND[q] in STORED_CLASSES]
+
+
+# the float types a GGUF's expert store also holds as the file's and multiplies with its own kernel, so a quantizer's
+# float fallback beside a stored type keeps the experts stored (a Q2_K file's down at 400 columns, no whole block)
+EXPERT_FLOATS: tuple[Quant, ...] = (Quant.BF16, Quant.F16)
+
+
+def expert_quants() -> list[Quant]:
+    """the types an expert store multiplies as stored: the stored types and `EXPERT_FLOATS`"""
+    return [*stored_quants(), *EXPERT_FLOATS]
+
+
+def quant_key(q: Quant) -> str:
+    """the stem every backend names a type's kernels by: its GGUF name lowercased, underscores dropped (Q4_K ->
+    q4k, IQ3_XXS -> iq3xxs) - `btb_gemv_<key>_rows` natively, `btb_gemv_<key>_bf16_m<M>` on the card, the MLX
+    backend's kernel keys."""
     return q.value.lower().replace("_", "")
+
+
+# the row counts the card's gemv kernels are built for (btb_gemv_*_bf16_m{M}); a pass pads to the next one up
+CARD_ROWS: tuple[int, ...] = (1, 2, 4, 8, 16, 32)
 
 
 class Tier(StrEnum):
@@ -295,6 +327,19 @@ class HostCacheTotal(StrEnum):
     L1D = "host_l1d_total"
     L2 = "host_l2_total"
     L3 = "host_l3_total"
+
+
+class SlotKind(StrEnum):
+    """what a cold ring slot holds for one linear: the checkpoint's bf16 off the drive, a 12-bit store entry off the
+    drive, bf16 the engine dequantizes into it each pass (a GGUF tensor no native gemv takes), a float of another
+    precision off the drive rewritten as bf16 where it lands, or a GGUF tensor's own blocks for its type's gemv - off
+    the drive, or gathered in memory where the converter reordered them"""
+
+    BF16 = "bf16"
+    P12 = "p12"
+    MEM = "mem"
+    CAST = "cast"
+    QUANT = "quant"
 
 
 class Proposer(StrEnum):
@@ -345,9 +390,29 @@ class PassTag(StrEnum):
     CUDA_TORCH_FALLBACK = "cuda_torch_fallback"  # a card layer through torch modules, btb's kernels absent
     CPU_NATIVE = "cpu_native"  # a host layer through the native CPU gemv kernels
     MLX_PEROP = "mlx_perop"  # a host layer's linears through Native.mlx.linear (the non-fused MLX path: MoE, offload)
-    # the stored weight path a linear read (mlx_state.affine; only on MLX)
-    QUANT_ASSTORED = "quant_asstored"  # a GGUF quant bound as its own bytes (matvec kernels)
+    # the stored weight path a linear read, on every tier: a bf16 slot, or a GGUF type multiplied in its own
+    # blocks - one member a type of `stored_quants()`, valued "quant_<type>" (`quant_tag`), held equal to it by
+    # tests/cert/test_runtime_guards.py
     QUANT_DEQUANT = "quant_dequant"  # a bf16 slot (float weights, or a GGUF dequantized to bf16)
+    QUANT_BF16 = "quant_bf16"  # a GGUF's bf16 expert multiplied as stored (`EXPERT_FLOATS`)
+    QUANT_F16 = "quant_f16"  # a GGUF's f16 expert multiplied as stored, widened exactly
+    QUANT_Q4_0 = "quant_q4_0"
+    QUANT_Q4_1 = "quant_q4_1"
+    QUANT_Q8_0 = "quant_q8_0"
+    QUANT_Q2_K = "quant_q2_k"
+    QUANT_Q3_K = "quant_q3_k"
+    QUANT_Q4_K = "quant_q4_k"
+    QUANT_Q5_K = "quant_q5_k"
+    QUANT_Q6_K = "quant_q6_k"
+    QUANT_IQ4_NL = "quant_iq4_nl"
+    QUANT_IQ4_XS = "quant_iq4_xs"
+    QUANT_IQ3_XXS = "quant_iq3_xxs"
+    QUANT_IQ3_S = "quant_iq3_s"
+    QUANT_IQ2_XXS = "quant_iq2_xxs"
+    QUANT_IQ2_XS = "quant_iq2_xs"
+    QUANT_IQ2_S = "quant_iq2_s"
+    QUANT_IQ1_S = "quant_iq1_s"
+    QUANT_IQ1_M = "quant_iq1_m"
     FP8_ASSTORED = "fp8_asstored"  # FP8 weights multiplied as stored, e4m3 bytes and scale grid (the native kernel)
     FP8_WIDENED = "fp8_widened"  # FP8 weights widened by their scales to bf16 before the matmul
     # where a MoE layer's experts came from, and how their blocks were multiplied (host.py, experts.py)
@@ -358,6 +423,10 @@ class PassTag(StrEnum):
     EXPERT_VRAM_SEAT = "expert_vram_seat"  # an expert multiplied from its seat on the card (`vram_experts_gb`)
     EXPERT_MXFP4_ASSTORED = "expert_mxfp4_asstored"  # MXFP4 experts multiplied in their stored blocks
     EXPERT_MXFP4_DEQUANT = "expert_mxfp4_dequant"  # MXFP4 experts widened to float before the matmul
+    # a GGUF's experts of another stored type: read into the store's slots as the file's blocks and multiplied by
+    # their type's own kernel (each type's `quant_<type>` tag beside it), or dequantized to bf16 slots on read
+    EXPERT_QUANT_ASSTORED = "expert_quant_asstored"
+    EXPERT_QUANT_DEQUANT = "expert_quant_dequant"
     EXPERT_FP8_ASSTORED = "expert_fp8_asstored"  # FP8 experts multiplied as stored, e4m3 bytes and scale grid
     EXPERT_FP8_WIDENED = "expert_fp8_widened"  # FP8 experts widened by their scales to bf16 before the matmul
     # a prefill's expert call as grouped matmuls over the depot's slots on the card (`_card_grouped`)
@@ -442,6 +511,11 @@ class PassTag(StrEnum):
     API_BATCH_CLOSE = "batch.close"
 
 
+def quant_tag(q: Quant) -> PassTag:
+    """the tag a linear of type `q` multiplied in its stored blocks records"""
+    return PassTag(f"quant_{q.value.lower()}")
+
+
 def api_tags(owner: str) -> frozenset[PassTag]:
     """the declared API calls of `owner` (a class's `api(owner)`), from the PassTag values"""
     return frozenset(t for t in PassTag if t.value.partition(".")[0] == owner and "." in t.value)
@@ -511,6 +585,18 @@ GateUp = NewType("GateUp", int)
 MlpAct = NewType("MlpAct", int)
 # int: I: the MLP's intermediate width
 Intermediate = NewType("Intermediate", int)
+# unsigned char*: [R, C / block * bytes]: a GGUF type's blocks as the file holds them
+QuantBlocks = NewType("QuantBlocks", int)
+# signed char*: a lattice type's int8 codebook; null for the rest
+QuantGrid = NewType("QuantGrid", int)
+# unsigned char*: the lattice types' 128-entry sign table; null for the rest
+QuantSigns = NewType("QuantSigns", int)
+# int: the elements between two rows of a matvec's output (a merged projection's piece)
+OutStride = NewType("OutStride", int)
+# bf16*: [R, C]: a GGUF type's weight as bf16
+Dequant = NewType("Dequant", int)
+# long long: R * C: the values a dequant writes
+QuantValues = NewType("QuantValues", int)
 # unsigned char*: [seats, groups, 16]: MXFP4 experts' 32-value blocks, two fp4 codes a byte
 Mx4Blocks = NewType("Mx4Blocks", int)
 # unsigned char*: [seats, groups]: each block's power-of-two scale, biased by 127

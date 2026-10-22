@@ -255,13 +255,13 @@ def _nodes(
             c[k] for k in ("conv_w", "conv_b", "a_log", "dt_bias", "norm_w", "eps", "gate")
         )
         if parents is None:
-            if conv.dtype != torch.float32 or not conv.is_contiguous():
-                conv = conv.float().contiguous()
-                sm._lin_set(cl, conv, rec)
+            # the step slides a float32 window; the cache keeps its own dtype, the window's values being the
+            # projections' (exact in it), so a later pass of several rows reads the state a fresh session's would
+            work = conv if conv.dtype == torch.float32 and conv.is_contiguous() else conv.float().contiguous()
             for j in range(T):
                 step(
                     mixed[j].clone(),
-                    conv[row],
+                    work[row],
                     w,
                     cb,
                     z[j],
@@ -279,6 +279,8 @@ def _nodes(
                     out[j],
                     gate,
                 )
+            if work is not conv:
+                conv.copy_(work)
             return out
         slot, fresh = _slots(parents)
         n = max(slot) + 1

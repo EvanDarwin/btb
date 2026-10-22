@@ -5,7 +5,7 @@ of rows, a forest of prompts; bit-exact to the one-row step), rope for rows at t
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, TypeAlias
 
 import numpy as np
 
@@ -15,6 +15,11 @@ from .gemv import _gemv_lock
 
 if TYPE_CHECKING:
     import mlx.core as mx_
+
+    from .core import MetalKernel
+
+    # what `rows_meta` and `tree_meta` make once for a pass's layers: (meta, path, splits)
+    NodeMeta: TypeAlias = tuple[mx_.array, mx_.array, int]
 ATTN_MAXG = 8
 
 
@@ -196,6 +201,11 @@ _ATTN_SRC = """
 #else
         const device uint4* kr[NT];
 #endif
+#if MAP
+        // the row this lane's K read took per node (in the region, or in k2 where `own`), handed to the lane that
+        // reads it as a V row below: the map read once a row
+        uint mrow[NT], own[NT];
+#endif
         for (uint t = 0; t < NT; ++t) {
             live[t] = has[t] && j >= lo[t] && j < hi[t];
             for (uint i = 0; i < G; ++i) sd[t][i] = live[t] ? 0.0f : -INFINITY;
@@ -204,6 +214,10 @@ _ATTN_SRC = """
             ksc[t] = 0.0f;
 #else
             kr[t] = kh[0];
+#endif
+#if MAP
+            mrow[t] = 0;
+            own[t] = 0;
 #endif
             if (live[t]) {
                 uint pj = j < past_[t] ? j : past_[t] + path[(size_t)node[t] * PD + (j - past_[t])];
@@ -223,6 +237,13 @@ _ATTN_SRC = """
                 const device uint4* kh_ = kh[t];
 #if SEG
                 if (pj >= seg[t]) { kh_ = (const device uint4*)kb2[t]; pj -= seg[t]; }
+#if MAP
+                // a paged cache's rows before the pass, through the conversation's row map to where they lie in
+                // the pool's region; the pass's own rows (past seg) from k2, as made
+                else pj = rmap[pj];
+                mrow[t] = pj;
+                own[t] = kh_ != kh[t];
+#endif
 #endif
                 kr[t] = kh_ + (size_t)pj * KC;
 #endif
@@ -320,7 +341,11 @@ _ATTN_SRC = """
                 }
 #else
                 const device uint16_t* vhb_ = vhb[t];
-#if SEG
+#if MAP
+                // lane r read this row's K: the row it took, where it lies (rr is uniform, so every lane is here)
+                pr = simd_shuffle(mrow[t], r);
+                if (simd_shuffle(own[t], r)) vhb_ = vb2[t];
+#elif SEG
                 if (pr >= seg[t]) { vhb_ = vb2[t]; pr -= seg[t]; }
 #endif
                 const device char* vp = (const device char*)(vhb_ + (size_t)pr * D);
@@ -410,13 +435,13 @@ _ATTN_FOLD_SRC = """
 """
 
 
-_attn_kernels: dict[Any, Any] = {}
+_attn_kernels: dict[tuple[int, int, bool, bool, int, bool], MetalKernel] = {}
 
 
-_attn_fold = None
+_attn_fold: MetalKernel | None = None
 
 
-_NO_SINKS = None
+_NO_SINKS: mx_.array | None = None
 
 
 def attn_splits(n: int, start: int = 0) -> int:
@@ -441,14 +466,17 @@ def attn_params(
     batch: int = 0,
     pbase: int = 0,
     kbatch: int | None = None,
+    seg: int | None = None,
 ) -> tuple[mx_.array, int]:
     """`attn_decode`'s (meta, splits) for one row over `n` rows, built once per forward (per (n, window) when the
-    windows alternate); `batch` the cache slice, `pbase` / `kbatch` the row's place in the k buffer."""
+    windows alternate); `batch` the cache slice, `pbase` / `kbatch` the row's place in the k buffer, `seg` the rows
+    before the step's own (in k2/v2 past it: a paged cache's, `n - 1`)."""
     n = int(n)
     start = attn_window_start(n, window)
     splits = attn_splits(n, start)
     kb = int(batch) if kbatch is None else int(kbatch)
-    meta = mx().array([[n, splits, n, start, int(batch), n, int(pbase), kb]], dtype=mx().uint32)
+    sg = n if seg is None else int(seg)
+    meta = mx().array([[n, splits, n, start, int(batch), sg, int(pbase), kb]], dtype=mx().uint32)
     return meta, splits
 
 
@@ -480,7 +508,7 @@ _ROPE_ROWS_SRC = """
 """
 
 
-_rope_rows_kernel = None
+_rope_rows_kernel: MetalKernel | None = None
 
 
 def rope_rows(x: mx_.array, rd: int, freqs: mx_.array, scaling: float, pos: Sequence[int] | mx_.array) -> mx_.array:
@@ -511,7 +539,7 @@ def rope_rows(x: mx_.array, rd: int, freqs: mx_.array, scaling: float, pos: Sequ
 
 def rows_meta(
     ns: Sequence[int], window: int | None = None, segs: Sequence[int] | None = None, pbases: Sequence[int] | None = None
-) -> tuple[mx_.array, mx_.array, int]:
+) -> NodeMeta:
     """A batched decode step's node metadata (meta [B, 8], path [B, 1], splits): row b has ns[b] live rows, its
     rows past segs[b] in the step buffer, its prefill in slice b or at pbases[b] of one flat buffer."""
     m = mx()
@@ -527,9 +555,7 @@ def rows_meta(
     return m.array(meta), m.array(path), int(meta[:, 1].max())
 
 
-def forest_meta(
-    lens: Sequence[int], pbases: Sequence[int], window: int | None = None
-) -> tuple[mx_.array, mx_.array, int]:
+def forest_meta(lens: Sequence[int], pbases: Sequence[int], window: int | None = None) -> NodeMeta:
     """A batched prefill's node metadata: token p of a row is a node of p + 1 rows, all in place, row b's from
     pbases[b] of one flat buffer - causal attention as T decode-shaped nodes in one launch."""
     m = mx()
@@ -582,7 +608,7 @@ _ROPE_ROWS2_SRC = """
 """
 
 
-_rope_rows2_kernel = None
+_rope_rows2_kernel: MetalKernel | None = None
 
 
 def rope_rows2(
@@ -632,44 +658,66 @@ def attn_rows(
     v2: mx_.array | None = None,
     ks2: mx_.array | None = None,
     vs2: mx_.array | None = None,
-    prepared: tuple[mx_.array, mx_.array, int] | None = None,
-    odt: Any = None,
+    prepared: NodeMeta | None = None,
+    odt: mx_.Dtype | None = None,
     pbases: Sequence[int] | None = None,
+    rmap: mx_.array | None = None,
 ) -> mx_.array:
     """A batched decode step: `q[b]` ([B, Hq, D] float32) over cache slice b of ns[b] live rows, each row as the
     one-row step at its length computes it. `segs`: rows past segs[b] come from `k2`/`v2`; `pbases`: the prefill
-    rows in one flat buffer; `prepared` = `rows_meta(...)` shared across layers. Returns [B, Hq, D], lazily."""
+    rows in one flat buffer; `rmap`: a fork's rows over a paged session, the prefill rows (every row's the same)
+    through its row map; `prepared` = `rows_meta(...)` shared across layers. Returns [B, Hq, D], lazily."""
     meta, path, splits = prepared if prepared is not None else rows_meta(ns, window, segs, pbases)
     return attn_nodes(
-        q, k, v, meta, path, scale, splits, sinks=sinks, ks=ks, vs=vs, k2=k2, v2=v2, ks2=ks2, vs2=vs2, odt=odt
+        q,
+        k,
+        v,
+        meta,
+        path,
+        scale,
+        splits,
+        sinks=sinks,
+        ks=ks,
+        vs=vs,
+        k2=k2,
+        v2=v2,
+        ks2=ks2,
+        vs2=vs2,
+        odt=odt,
+        rmap=rmap,
     )
 
 
-def _attn_kernel(D: int, g: int, kq: bool = False, seg: bool = False, nt: int = 1) -> tuple[Any, Any]:
+def _attn_kernel(
+    D: int, g: int, kq: bool = False, seg: bool = False, nt: int = 1, mapped: bool = False
+) -> tuple[MetalKernel, MetalKernel]:
     """the node kernel for head_dim D and g query heads per kv head over groups of `nt` nodes, compiled once per
-    shape; `kq` reads an int8 cache with a scale per row, `seg` a two-segment cache (rows past `seg` from k2/v2)"""
+    shape; `kq` reads an int8 cache with a scale per row, `seg` a two-segment cache (rows past `seg` from k2/v2),
+    `mapped` a paged one (each row through the conversation's row map)"""
     global _attn_fold
     m = mx()
     with _gemv_lock:
-        k = _attn_kernels.get((D, g, kq, seg, nt))
+        k = _attn_kernels.get((D, g, kq, seg, nt, mapped))
         if k is None:
             names = (
                 ["q", "k", "v", "meta", "path", "sc"]
                 + (["ks", "vs"] if kq else [])
                 + (["k2", "v2"] if seg else [])
                 + (["ks2", "vs2"] if (kq and seg) else [])
+                + (["rmap"] if mapped else [])
             )
+            rows = "i8" if kq else "bf16"
             k = m.fast.metal_kernel(
-                name=f"btb_attn_nodes_{'i8' if kq else 'bf16'}{'_seg' if seg else ''}_d{D}_g{g}_n{nt}",
+                name=f"btb_attn_nodes_{rows}{'_seg' if seg else ''}{'_map' if mapped else ''}_d{D}_g{g}_n{nt}",
                 input_names=names,
                 output_names=["pm", "pl", "pacc"],
-                header=f"#define KQ {1 if kq else 0}\n#define SEG {1 if seg else 0}\n",
+                header=f"#define KQ {int(kq)}\n#define SEG {int(seg)}\n#define MAP {int(mapped)}\n",
                 source=_ATTN_SRC.replace("G_VALUE", str(g))
                 .replace("D_VALUE", str(D))
                 .replace("NT_VALUE", str(nt))
                 .replace("P_VALUE", str(ATTN_BLOCK)),
             )
-            _attn_kernels[(D, g, kq, seg, nt)] = k
+            _attn_kernels[(D, g, kq, seg, nt, mapped)] = k
         if _attn_fold is None:
             _attn_fold = m.fast.metal_kernel(
                 name="btb_attn_fold",
@@ -680,7 +728,7 @@ def _attn_kernel(D: int, g: int, kq: bool = False, seg: bool = False, nt: int = 
     return k, _attn_fold
 
 
-_SCALES: dict[Any, Any] = {}
+_SCALES: dict[float, mx_.array] = {}
 
 
 def attn_nodes(
@@ -698,12 +746,15 @@ def attn_nodes(
     v2: mx_.array | None = None,
     ks2: mx_.array | None = None,
     vs2: mx_.array | None = None,
-    odt: Any = None,
+    odt: mx_.Dtype | None = None,
+    rmap: mx_.array | None = None,
 ) -> mx_.array:
     """Attention for T query nodes over a cache: `q` [T, Hq, D] float32, `k`/`v` the cache buffers [1, Hk, cap, D]
     as they are, `meta` uint32 [T, 8] per node, `path` uint32 [T, PD] the node's rows as offsets after `past`,
-    `sinks` [Hq] float32 an extra softmax column with no value (gpt-oss), `ks`/`vs` an int8 cache's scales.
-    float32 throughout; returns [T, Hq, D], lazily. Needs head_dim 64/128/256 and Hq / Hk <= ATTN_MAXG."""
+    `sinks` [Hq] float32 an extra softmax column with no value (gpt-oss), `ks`/`vs` an int8 cache's scales,
+    `rmap` uint32 a paged cache's row map: its rows before a node's `seg` through it (row j at buffer row rmap[j]),
+    the pass's own from `k2`/`v2` as the step buffer's are (bf16 rows). float32 throughout; returns [T, Hq, D],
+    lazily. Needs head_dim 64/128/256 and Hq / Hk <= ATTN_MAXG."""
     global _NO_SINKS
     m = mx()
     T, Hq, D = (int(x) for x in q.shape)
@@ -713,8 +764,11 @@ def attn_nodes(
     g = Hq // Hk
     kq = ks is not None
     seg = k2 is not None
+    mapped = rmap is not None
+    if mapped and (kq or not seg):
+        raise ValueError("[mlx] a paged cache's rows are bf16, the pass's own beside them in k2/v2")
     nt = max(1, min(T, ATTN_NODES if g <= 4 else max(1, ATTN_NODES // 2)))
-    kern, fold = _attn_kernel(D, g, kq, seg, nt)
+    kern, fold = _attn_kernel(D, g, kq, seg, nt, mapped)
     if sinks is None:
         if _NO_SINKS is None:
             _NO_SINKS = m.zeros((1,), dtype=m.float32)
@@ -735,6 +789,7 @@ def attn_nodes(
             + ([ks, vs] if kq else [])
             + ([k2, v2] if seg else [])
             + ([ks2, vs2] if (kq and seg) else [])
+            + ([rmap] if rmap is not None else [])
         ),
         template=[("QT", q.dtype)],
         grid=(Hk * 256, splits, (T + nt - 1) // nt),
@@ -752,7 +807,7 @@ def attn_nodes(
     )[0]
 
 
-_NO_PATH = None
+_NO_PATH: mx_.array | None = None
 
 
 # the prefill kernel's tiling: keys a block, simdgroups a threadgroup (four pairs)
@@ -802,6 +857,13 @@ _ATTN_PREFILL_SRC = """
     float scale = sc[0];
     const device bfloat* kh = (const device bfloat*)k + (size_t)h * cap * D;
     const device bfloat* vh = (const device bfloat*)v + (size_t)h * cap * D;
+#if MAP
+    // a paged cache: the rows before the chunk through the conversation's row map, the chunk's own from k2/v2
+    // [1, Hk, cap2, D] (row past + t at row t)
+    uint cap2 = k2_shape[2];
+    const device bfloat* k2h = (const device bfloat*)k2 + (size_t)h * cap2 * D;
+    const device bfloat* v2h = (const device bfloat*)v2 + (size_t)h * cap2 * D;
+#endif
     threadgroup bfloat Ks[BK * LD];
     threadgroup bfloat Vs[BK * LD];
     threadgroup float xs[NS][8 * BK];
@@ -813,15 +875,29 @@ _ATTN_PREFILL_SRC = """
     #pragma clang loop unroll(full)
     for (uint c = 0; c < HF; ++c) O[c] = simdgroup_float8x8(0.0f);
     for (uint j0 = 0; j0 < jmax; j0 += BK) {
+#if MAP
+        // a row past the chunk's end read as its last: masked, as every row outside [j0, jrow) is
+        uint jb = j0;
+        bool masked = j0 + BK > jall;
+#else
         // the last block is read from cap - BK when the cache ends short of a full block: the rows outside
         // [j0, jrow) are masked either way
         uint jb = min(j0, cap - BK);
         bool masked = (j0 + BK > jall) || (jb != j0);
+#endif
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint e = tid; e < BK * (D / 8); e += NT) {
             uint r = e / (D / 8), c = (e % (D / 8)) * 8;
-            *(threadgroup uint4*)(Ks + r * LD + c) = *(const device uint4*)(kh + (size_t)(jb + r) * D + c);
-            *(threadgroup uint4*)(Vs + r * LD + c) = *(const device uint4*)(vh + (size_t)(jb + r) * D + c);
+#if MAP
+            uint j = min(jb + r, past + T - 1);
+            const device bfloat* kr = j < past ? kh + (size_t)rmap[j] * D : k2h + (size_t)(j - past) * D;
+            const device bfloat* vr = j < past ? vh + (size_t)rmap[j] * D : v2h + (size_t)(j - past) * D;
+#else
+            const device bfloat* kr = kh + (size_t)(jb + r) * D;
+            const device bfloat* vr = vh + (size_t)(jb + r) * D;
+#endif
+            *(threadgroup uint4*)(Ks + r * LD + c) = *(const device uint4*)(kr + c);
+            *(threadgroup uint4*)(Vs + r * LD + c) = *(const device uint4*)(vr + c);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         simdgroup_float8x8 S[KF];
@@ -904,19 +980,21 @@ _ATTN_PREFILL_SRC = """
 """
 
 
-_prefill_kernels: dict[int, Any] = {}
+_prefill_kernels: dict[tuple[int, bool], MetalKernel] = {}
 
 
-def _attn_prefill_kernel(g: int) -> Any:
-    """the prefill kernel for g query heads per kv head at head_dim 256, compiled once per g"""
+def _attn_prefill_kernel(g: int, mapped: bool = False) -> MetalKernel:
+    """the prefill kernel for g query heads per kv head at head_dim 256, compiled once per g; `mapped` a paged
+    cache's (its older rows through the conversation's row map, the chunk's own in k2/v2)"""
     m = mx()
     with _gemv_lock:
-        k = _prefill_kernels.get(g)
+        k = _prefill_kernels.get((g, mapped))
         if k is None:
-            k = _prefill_kernels[g] = m.fast.metal_kernel(
-                name=f"btb_attn_prefill_d256_g{g}",
-                input_names=["q", "k", "v", "par", "sc"],
+            k = _prefill_kernels[(g, mapped)] = m.fast.metal_kernel(
+                name=f"btb_attn_prefill_d256_g{g}{'_map' if mapped else ''}",
+                input_names=["q", "k", "v", "par", "sc", *(["k2", "v2", "rmap"] if mapped else [])],
                 output_names=["out"],
+                header=f"#define MAP {int(mapped)}\n",
                 source=_ATTN_PREFILL_SRC.replace("G_VALUE", str(g))
                 .replace("BK_VALUE", str(ATTN_PF_BLOCK))
                 .replace("NS_VALUE", str(ATTN_PF_SIMD)),
@@ -924,17 +1002,36 @@ def _attn_prefill_kernel(g: int) -> Any:
     return k
 
 
-def attn_prefill(q: mx_.array, k: mx_.array, v: mx_.array, past: int, scale: float, odt: Any = None) -> mx_.array:
+def attn_prefill(
+    q: mx_.array,
+    k: mx_.array,
+    v: mx_.array,
+    past: int,
+    scale: float,
+    odt: mx_.Dtype | None = None,
+    rmap: mx_.array | None = None,
+    k2: mx_.array | None = None,
+    v2: mx_.array | None = None,
+) -> mx_.array:
     """Causal attention for a prefill chunk at head size 256: `q` [T, Hq, 256] (bf16 or float32), `k`/`v` the cache
     buffers [1, Hk, cap, 256] bf16 holding the chunk's rows at [past, past + T); row t attends over cache rows
-    [0, past + t]. float32 accumulation (P rounded to bf16 for the value product); returns [T, Hq, 256] in `odt`
-    (q's dtype by default), lazily. Needs Hq / Hk in (1, 2, 4, 8) and cap >= ATTN_PF_BLOCK."""
+    [0, past + t]. A paged cache's rows before `past` through its row map `rmap` (uint32, row j at buffer row
+    rmap[j], at least one entry), the chunk's own in `k2`/`v2` [1, Hk, T, 256]. float32 accumulation (P rounded to
+    bf16 for the value product); returns [T, Hq, 256] in `odt` (q's dtype by default), lazily. Needs Hq / Hk in
+    (1, 2, 4, 8) and cap >= ATTN_PF_BLOCK."""
     m = mx()
     T, Hq, D = (int(x) for x in q.shape)
     Hk, cap = int(k.shape[1]), int(k.shape[2])
     g = Hq // Hk
     past = int(past)
-    if D != 256 or g * Hk != Hq or 8 % g or k.dtype != m.bfloat16 or cap < ATTN_PF_BLOCK or past + T > cap:
+    paged: list[mx_.array] = []
+    if rmap is not None:
+        assert k2 is not None and v2 is not None
+        paged = [k2, v2, rmap]
+        fits = int(rmap.shape[0]) >= max(past, 1) and int(k2.shape[2]) >= T and k2.dtype == m.bfloat16
+    else:
+        fits = cap >= ATTN_PF_BLOCK and past + T <= cap
+    if D != 256 or g * Hk != Hq or 8 % g or k.dtype != m.bfloat16 or not fits:
         raise ValueError(
             f"[attn] attn_prefill: head 256, Hq/Hk in (1, 2, 4, 8), a bf16 cache; got {q.shape} over {k.shape}"
         )
@@ -944,8 +1041,8 @@ def attn_prefill(q: mx_.array, k: mx_.array, v: mx_.array, past: int, scale: flo
         m.eval(sc)
     odt = odt if odt is not None else q.dtype
     rows = ATTN_PF_SIMD // 2 * (8 // g)
-    return _attn_prefill_kernel(g)(
-        inputs=[q, k, v, m.array([past, T], dtype=m.uint32), sc],
+    return _attn_prefill_kernel(g, bool(paged))(
+        inputs=[q, k, v, m.array([past, T], dtype=m.uint32), sc, *paged],
         template=[("QT", q.dtype), ("OT", odt)],
         grid=(Hk * ATTN_PF_SIMD * 32, (T + rows - 1) // rows, 1),
         threadgroup=(ATTN_PF_SIMD * 32, 1, 1),
@@ -968,18 +1065,23 @@ def attn_decode(
     batch: int = 0,
     pbase: int = 0,
     kbatch: int | None = None,
+    rmap: mx_.array | None = None,
+    k2: mx_.array | None = None,
+    v2: mx_.array | None = None,
 ) -> mx_.array:
     """One query row per head over the first `n` rows: `q` [Hq, D] float32 -> [Hq, D] float32, lazily
-    (`attn_nodes` over one node); `params` = `attn_params(n, window=...)` when shared across layers."""
+    (`attn_nodes` over one node); `params` = `attn_params(n, window=...)` when shared across layers. A paged cache's:
+    `rmap` its row map over the rows before the step's, the step's own row in `k2`/`v2` [1, Hk, 1, D]"""
     global _NO_PATH
     m = mx()
     if params is None:
-        params = attn_params(n, window, batch, pbase, kbatch)
+        params = attn_params(n, window, batch, pbase, kbatch, seg=int(n) - 1 if rmap is not None else None)
     meta, splits = params
     if _NO_PATH is None:
         _NO_PATH = m.zeros((1, 1), dtype=m.uint32)
         m.eval(_NO_PATH)
-    return attn_nodes(q[None], k, v, meta, _NO_PATH, scale, splits, sinks=sinks, ks=ks, vs=vs)[0]
+    out = attn_nodes(q[None], k, v, meta, _NO_PATH, scale, splits, sinks=sinks, ks=ks, vs=vs, rmap=rmap, k2=k2, v2=v2)
+    return out[0]
 
 
 def attn_tree(
@@ -996,12 +1098,21 @@ def attn_tree(
     batch: int = 0,
     pbase: int = 0,
     kbatch: int | None = None,
-    prepared: tuple[mx_.array, mx_.array, int] | None = None,
+    prepared: NodeMeta | None = None,
+    rmap: mx_.array | None = None,
+    k2: mx_.array | None = None,
+    v2: mx_.array | None = None,
 ) -> mx_.array:
     """`attn_nodes` for a speculative pass: `parents` (-1 for the prefix) gives each node its path, the rows sit
-    after `past` in node order; `sinks` and `window` are gpt-oss's; `prepared` = `tree_meta(...)`."""
-    meta, path, splits = prepared if prepared is not None else tree_meta(past, parents, window, batch, pbase, kbatch)
-    return attn_nodes(q, k, v, meta, path, scale, splits, sinks=sinks, ks=ks, vs=vs)
+    after `past` in node order; `sinks` and `window` are gpt-oss's; `prepared` = `tree_meta(...)`. A paged cache's:
+    `rmap` its row map over the prefix, the tree's own rows in `k2`/`v2` [1, Hk, T, D] in node order"""
+    paged = rmap is not None
+    meta, path, splits = (
+        prepared
+        if prepared is not None
+        else tree_meta(past, parents, window, batch, pbase, kbatch, seg=int(past) if paged else None)
+    )
+    return attn_nodes(q, k, v, meta, path, scale, splits, sinks=sinks, ks=ks, vs=vs, rmap=rmap, k2=k2, v2=v2)
 
 
 def tree_meta(
@@ -1011,9 +1122,10 @@ def tree_meta(
     batch: int = 0,
     pbase: int = 0,
     kbatch: int | None = None,
-) -> tuple[mx_.array, mx_.array, int]:
+    seg: int | None = None,
+) -> NodeMeta:
     """`attn_tree`'s (meta [T, 8], path [T, D], splits), which depend on the tree and the cache's geometry, not on
-    the layer: built once per pass."""
+    the layer: built once per pass. `seg` the rows before the pass's own (a paged cache's prefix, `past`)."""
     m = mx()
     T = len(parents)
     paths = []
@@ -1036,7 +1148,7 @@ def tree_meta(
             int(past),
             start,
             int(batch),
-            n,
+            n if seg is None else int(seg),
             int(pbase),
             int(batch) if kbatch is None else int(kbatch),
         )
@@ -1053,7 +1165,7 @@ def kv_quantize(x: mx_.array) -> tuple[mx_.array, mx_.array]:
     return q, s
 
 
-def kv_dequantize(q: mx_.array, s: mx_.array, dtype: Any = None) -> mx_.array:
+def kv_dequantize(q: mx_.array, s: mx_.array, dtype: mx_.Dtype | None = None) -> mx_.array:
     """the int8 rows back to `dtype` (bf16 by default): q * s, one scale per row"""
     m = mx()
     return (q.astype(m.float32) * s[..., None]).astype(dtype or m.bfloat16)

@@ -20,7 +20,6 @@ from .. import trace
 from ..gguf import GGUFModel
 from ..hf import is_gguf, pack_format, shard_map
 from ..kinds import LayerKind, Log, Tokens
-from ..mlx.q6k import gather_q6k
 from ..options import Device as DeviceKind
 from ..options import DeviceName
 from ..pack12 import parent_dir
@@ -32,7 +31,7 @@ from .device import Device, where
 from .drafter import MTPDrafter
 from .experts import _ExpertStore
 from .families import _FamiliesMixin, family, register_attention
-from .fixed_rows import RowLinear, fix_linears, fix_rows_cls
+from .fixed_rows import fix_linears, fix_rows_cls
 from .forward import _ForwardMixin
 from .generate import _GenerateMixin
 from .holdings import Holdings, Stage, last_on_card, on_card
@@ -225,9 +224,18 @@ class StreamedTextModel(
         self.L = int(cfg.num_hidden_layers)
         self.layer_types = [LayerKind.of(t) for t in (getattr(cfg, "layer_types", None) or [LayerKind.FULL] * self.L)]
         self.pack = None if self.gguf is not None else pack_format(model_dir)
+        self.stored_experts = False
         if self.gguf is not None:
+            # experts read as the file's blocks: MXFP4 always, another type under `gguf_packed` where the host has its
+            # grouped gemv (MLX reads every stored type from a slot); a card's prefill multiplies its experts as bf16
+            gq = Native.gemv_quant
+            self.stored_experts = self.gguf.stored_experts(
+                lambda q: self.gguf_packed and self.dev.type != DeviceKind.CUDA and gq is not None and q in gq.groups
+            )
             # the family's tensor names against the file's, through llama.cpp's table; the file is the one shard
-            self._gguf_names, self._gguf_hdr = self.gguf.weight_map(self._family_tensor_names(cfg), self.L)
+            self._gguf_names, self._gguf_hdr = self.gguf.weight_map(
+                self._family_tensor_names(cfg), self.L, self.stored_experts
+            )
             self.weight_map = dict.fromkeys(self._gguf_names, self.gguf.file)
             self.log(f"[gguf] {self.gguf.describe()}")
         elif self.pack is None:
@@ -257,6 +265,7 @@ class StreamedTextModel(
         self.fp8_experts = any(self._fp8(k) for k in self.weight_map if k.endswith(".mlp.experts.gate_up_proj"))
         self.fp8_layers = set()
         self.fp8_widened = False
+        self.weight_tags = {}
         # set by close(): every decode loop ends at its next step, so no thread is mid-pass when the buffers go
         self.abort = threading.Event()
         self._decode_lock = threading.RLock()  # one decode at a time on the engine (MLX's worker serializes too)
@@ -287,15 +296,15 @@ class StreamedTextModel(
             # discarded immediately -- unlike the embed table below, which needs real values for row-gather
             self.head_host = _HostLinear(self._get(self.head_key, gguf_shortcut=True), key=self.head_key)
             self._bind_mlx_linears([self.head_host])
+        elif resident_head and self.dev.type == DeviceKind.CPU and self._head_stored() is not None:
+            self._head_host()  # the native kernels multiply the head in its stored blocks
         elif resident_head:
-            with self._meta:
-                # the head's small passes at the fixed shape, as the card layers' (fixed_rows.py)
-                self.head = RowLinear(cfg.hidden_size, cfg.vocab_size, bias=False)
-            self._adopt(self.head, "weight", self._get(self.head_key))
-        # the embedding table, unless the tied head is Q6_K: then its packed bytes are the table, gathered on demand
-        # (embed / _mlx_embed_rows) instead of a bf16 copy of the whole vocabulary
-        tied_q6k = self.head_host is not None and getattr(self.head_host.mx, "q6k", None) is not None
-        if tied_q6k and self.head_key == self.prefix + "embed_tokens.weight":
+            self.head = self._make_head()
+        # the embedding table, unless the tied head is stored as a GGUF type: then its blocks are the table, decoded
+        # on demand (embed / _mlx_embed_rows) instead of a bf16 copy of the whole vocabulary
+        hh = self.head_host
+        stored_head = hh is not None and (hh.quant is not None or getattr(hh.mx, "q", None) is not None)
+        if stored_head and self.head_key == self.prefix + "embed_tokens.weight":
             self.embed_table = None
         else:
             self.embed_table = self._get(self.prefix + "embed_tokens.weight")
@@ -556,19 +565,22 @@ class StreamedTextModel(
     def _embed_rows(self, ids: torch.Tensor) -> torch.Tensor:
         head = self.head
         if (
-            head is not None
+            isinstance(head, torch.nn.Linear)  # a head of a GGUF type's blocks holds no table: `embed_table` does
             and self.head_key == self.prefix + "embed_tokens.weight"
             and head.weight.device.type != "cpu"
         ):
             # tied embeddings: the head on the card is the table - one gather there, no host round trip
             return torch.nn.functional.embedding(ids.to(head.weight.device), head.weight)
-        if self.embed_table is None:  # tied Q6_K: gather the rows straight from the head's packed bytes
+        if self.embed_table is None:  # a tied head stored as a GGUF type: its rows decoded from its own blocks
             hh = self.head_host
             assert hh is not None
-            raw, _rows, cols = hh.mx.q6k
-            tok = mlxdev.mx().array(ids.reshape(-1).to(torch.int32).cpu().numpy())
-            rows = mlxdev.from_mx(gather_q6k(raw, tok, cols))
-            return rows.view(*ids.shape, cols).to(self.dev)
+            if hh.quant is not None:
+                rows = hh.quant.rows(ids)
+            else:
+                assert self.mlx is not None  # a stored head is the native kernels' or MLX's
+                tok = mlxdev.mx().array(ids.reshape(-1).to(torch.int32).cpu().numpy())
+                rows = mlxdev.from_mx(self.mlx.gather_rows(hh.mx, tok))
+            return rows.view(*ids.shape, rows.shape[-1]).to(self.dev)
         rows = self.embed_table[ids.reshape(-1).cpu()]
         return rows.view(*ids.shape, self.embed_table.shape[1]).to(self.dev)
 
@@ -670,9 +682,9 @@ class StreamedTextModel(
         return len(cost)
 
     def _family_tensor_names(self, cfg: Any) -> list[str]:
-        """every tensor the family's layers, embedding, norm (Qwen4's closing mixer) and head are loaded from, by
-        its HF name: what a GGUF file's tensors are matched against. Each layer is its own: a hybrid family's
-        layers differ in kind."""
+        """every tensor the family's layers, embedding, norm (Qwen4's closing mixer), head and drafting head are
+        loaded from, by its HF name: what a GGUF file's tensors are matched against. Each layer is its own: a hybrid
+        family's layers differ in kind."""
         names = ["model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"]
         with torch.device("meta"):
             closing, last = self.fam.closing(cfg)
@@ -680,7 +692,7 @@ class StreamedTextModel(
             names += [n for t, _, _ in self._named_tensors(last) if (n := f"model.{closing}.{t}") not in names]
             for i in range(self.L):
                 names += [f"model.layers.{i}.{n}" for n, _, _ in self._named_tensors(self.fam.layer(cfg, i))]
-        return names
+        return names + self.fam.drafting_names(cfg)
 
     def close(self) -> None:
         """Stop any decode in flight and let go of everything the engine holds (`holdings`): the threads writing
@@ -803,7 +815,7 @@ class StreamedTextModel(
         self.aj = None
         self._attn_ctx = None
         # the recipe with the slots: its entries hold the cold layers' modules, whose weights are views of the slots
-        self.cold_ring.slots, self.cold_ring.shared, self.cold_ring.recipe = [], None, None
+        self.cold_ring.slots, self.cold_ring.shared, self.cold_ring.recipe = [], None, {}
 
     def _close_files(self) -> None:
         """the checkpoint's maps and the drive handles the cold ring read through"""

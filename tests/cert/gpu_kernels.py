@@ -13,7 +13,7 @@ import importlib.util
 import os
 import re
 
-from btb.kinds import Json
+from btb.kinds import Json, quant_key, stored_quants
 
 from . import spec
 
@@ -32,15 +32,17 @@ def _mlx_src() -> str:
 
 _METAL_NAME = re.compile(r'metal_kernel\(\s*name=f?"([^"]+)"')
 _METAL_HELPER = re.compile(r'\b_kernel\(\s*"(btb_\w+)"')  # fused.py builds through one cached helper
+_METAL_LAUNCH = re.compile(r'\blaunch\(\s*f?"(btb_[^"]+)"')  # the stored matvecs name theirs to matvec.launch
 # a name stamped by a macro may carry several `##` parts (`btb_gemv_lane16_mx4_f32_m##M`, `btb_x##A##_d##D`)
 _CUDA_NAME = re.compile(r"__global__\s+void\s+(?:__launch_bounds__\s*\([^)]*\)\s*)?(\w+?)((?:##\w+)*)\s*\(")
 
 # op category -> the stem pattern that claims it, first match wins
 CATEGORIES: tuple[tuple[str, str], ...] = (
     ("Matrix-vector: MXFP4", r"mxfp4|mx4_widen|lane16_mx4"),
-    ("Matrix-vector: bf16", r"gemv_(bf16|silu|gelu|mma|sgate|lane16)|gemm16"),
+    ("Matrix-vector: bf16", r"gemv_(bf16|silu|gelu|mma|sgate|lane16)|gemm_rows"),
     ("Matrix-vector: 12-bit", r"p12"),
-    ("Matrix-vector: GGUF quants", r"<kind>|q\dk|iq4nl"),
+    # a templated type (`<kind>`), or a stored type's own kernels by its key (`btb_gemv_q4k_bf16`)
+    ("Matrix-vector: GGUF quants", "|".join(["<kind>", *(f"_{quant_key(q)}_" for q in stored_quants())])),
     ("Matrix-matrix: bf16", r"gemm_(mma|f32)"),
     ("Attention", r"attn"),
     ("Tensor-core self-check", r"mma_roles"),
@@ -52,7 +54,7 @@ CATEGORIES: tuple[tuple[str, str], ...] = (
     ("Activation", r"silu_mul|gelu_mul|sigmoid_mul"),
     ("DeltaNet", r"delta|conv_window"),
     ("Sampling", r"sample"),
-    ("KV cache", r"kv_store"),
+    ("KV cache", r"kv_store|kv_scatter"),
     ("Whole-pass kernels", r"mega|publish"),
     ("Cache warming", r"l2_warm"),
 )
@@ -71,18 +73,22 @@ def mlx_kernels() -> set[str]:
     for fn in glob.glob(os.path.join(_mlx_src(), "*.py")):
         with open(fn, encoding="utf-8") as f:
             src = f.read()
-        out |= {_stem(n) for n in _METAL_NAME.findall(src) + _METAL_HELPER.findall(src)}
+        names = _METAL_NAME.findall(src) + _METAL_HELPER.findall(src) + _METAL_LAUNCH.findall(src)
+        out |= {_stem(n) for n in names}
     return out
 
 
 def cuda_kernels() -> set[str]:
-    """the `__global__` names; a macro-stamped one (`btb_gemv_bf16_m##M`) loses the stamped letter. A macro's lines
-    folded first, so a name on the line after its launch bounds is read as one declaration"""
+    """the `__global__` names; a macro-stamped one (`btb_gemv_bf16_m##M`) loses the stamped letter, and a type
+    stamped by a word-long parameter (`btb_gemv_##KEY##_bf16_m##M`) reads as `<kind>` (`btb_gemv_<kind>_bf16`).
+    A macro's lines folded first, so a name on the line after its launch bounds is read as one declaration"""
     out: set[str] = set()
     for fn in glob.glob(os.path.join(CUDA_SRC, "*.cu*")):
         with open(fn, encoding="utf-8") as f:
             for name, stamped in _CUDA_NAME.findall(f.read().replace("\\\n", " ")):
-                out.add(re.sub(r"_[A-Za-z]$", "", name) if stamped else name)
+                full = re.sub(r"##[A-Z][A-Z0-9_]+##", "<kind>", name + stamped)
+                head, cut, _ = full.partition("##")
+                out.add(re.sub(r"_[A-Za-z]$", "", head) if cut else head)
     return out
 
 

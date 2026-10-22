@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from .. import mlx as mlxdev
 from .. import trace
 from ..kinds import (
+    CARD_ROWS,
     Arrivals,
     AttnOut,
     AttnScale,
@@ -106,11 +107,16 @@ from .native import Native, NativeDtypeError, _Cuda, kernels_path
 from .scheduler import MemoryGrantError, _size
 from .spec_cost import SpecCost
 from .state import _State
+from .stored import CardMat, CardStored, card_loose, mat_rows
 
 if TYPE_CHECKING:
     from .forward import PassRope, Rope
+    from .paged import PagedCache
+    from .prefix import PassLists
 
 _KERNELS_WARNED = False
+# a layer's projections in `_card_weights`
+CARD_MATS = ("qkv", "gu", "o", "down")
 
 
 class CardPassFailed(RuntimeError):
@@ -1037,24 +1043,36 @@ class _CudaMixin(_State):
 
     def _card_weights(self, st: dict[str, Any], i: int) -> dict[str, Any]:
         """layer i's weights as the kernels take them: q/k/v and gate/up merged into one row block each (the
-        modules keep views of the same memory, so the generic path is unchanged), the norms, the scale"""
+        modules keep views of the same memory, so the generic path is unchanged) - or, where a GGUF type's blocks
+        are on the card, each projection's pieces in row order - the norms, the scale"""
         L = st["layers"].get(i)
         if L is not None:
             return L
         tmpl = self.resident[i]
         at, mlp = tmpl.self_attn, tmpl.mlp
-        W = self._card_merged(i, "q/k/v", [(at.q_proj, "weight"), (at.k_proj, "weight"), (at.v_proj, "weight")])
-        G = self._card_merged(i, "gate/up", [(mlp.gate_proj, "weight"), (mlp.up_proj, "weight")])
-        for t in (W, G, at.o_proj.weight, mlp.down_proj.weight):
-            if t.dtype != torch.bfloat16 or t.device.type != "cuda":
-                raise RuntimeError(
-                    f"[card] layer {i}: the card graph takes bf16 weights on the card, got {t.dtype} {t.device}"
-                )
+
+        def merged(what: str, mods: tuple[Any, ...]) -> CardMat:
+            # one bf16 row block under the modules (`_card_merged`), or where any is stored as a GGUF type, each
+            # module's own weight in row order - each written into its rows of the output
+            for m in mods:
+                if not isinstance(m, CardStored) and (
+                    m.weight.dtype != torch.bfloat16 or m.weight.device.type != "cuda"
+                ):
+                    raise RuntimeError(
+                        f"[card] layer {i}: the card graph takes bf16 weights on the card, got {m.weight.dtype} "
+                        f"{m.weight.device}"
+                    )
+            if any(isinstance(m, CardStored) for m in mods):
+                return tuple(m.stored if isinstance(m, CardStored) else m.weight for m in mods)
+            if len(mods) == 1:
+                return mods[0].weight
+            return self._card_merged(i, what, [(m, "weight") for m in mods])
+
         L = {
-            "qkv": W,
-            "gu": G,
-            "o": at.o_proj.weight,
-            "down": mlp.down_proj.weight,
+            "qkv": merged("q/k/v", (at.q_proj, at.k_proj, at.v_proj)),
+            "gu": merged("gate/up", (mlp.gate_proj, mlp.up_proj)),
+            "o": merged("o", (at.o_proj,)),
+            "down": merged("down", (mlp.down_proj,)),
             "ln1": tmpl.input_layernorm.weight,
             "ln2": tmpl.post_attention_layernorm.weight,
             "wq": at.q_norm.weight,
@@ -1097,6 +1115,18 @@ class _CudaMixin(_State):
                 reads += [("btb_add_rmsnorm", f"layer {i}'s pre-MLP norm", L["pre_ff"])]
                 reads += [("btb_sandwich_add", f"layer {i}'s post-MLP norm", L["post_ff"])]
         return reads
+
+    def _card_head(self) -> CardMat:
+        """the head as the tail's matvec takes it: its bf16 weight, or its GGUF blocks on the card"""
+        assert self.head is not None  # the tail runs only with the head on the card
+        return (self.head.stored,) if isinstance(self.head, CardStored) else self.head.weight
+
+    @staticmethod
+    def _card_on(m: Any) -> bool:
+        """whether a linear's weight is on the card as the graph takes it: bf16, or a GGUF type's blocks"""
+        if isinstance(m, CardStored):
+            return bool(m.raw.device.type == "cuda")
+        return bool(m.weight.device.type == "cuda" and m.weight.dtype == torch.bfloat16)
 
     def _card_merged(self, i: int, what: str, parts: list[tuple[Any, str]]) -> torch.Tensor:
         """layer i's weights `parts` (module, name) as one row block, the modules left viewing it: the block they view
@@ -1485,21 +1515,28 @@ class _CudaMixin(_State):
         M = 32 if mma else self._card_m(T)
         dev, bf = self.dev, torch.bfloat16
         V = 0
+        mats = [W for i in range(a, b) for n, W in self._card_weights(st, i).items() if n in CARD_MATS]
         if tail:
-            assert self.head is not None  # the tail runs the head, so it is on the card
-            V = int(self.head.weight.shape[0])
+            V = mat_rows(self._card_head())
+            mats.append(self._card_head())
+        stored = any(not isinstance(W, torch.Tensor) for W in mats)
+        # a stored down projection reads act(gate) * up from `m` (no kernel of its own folds it); a bf16 piece among
+        # stored ones lands in `piece`, then its rows of the output
+        loose = card_loose(mats)
         cap = int(st["pg"]["cap"]) if paged else int(st["arena"]["cap"])
         S = (cap + self._attn_group(D) - 1) // self._attn_group(D)
         # the graph's own buffers, asked of the ledger first (the GEMV-facing ones at M rows, the tail's logits)
         el = 2
-        own = M * (H * 3 + (Hq + 2 * Hk) * D + 2 * Hq * D + 2 * I + (I if mma else 0)) * el + M * V * el + V * 4
+        act_rows = I if mma or stored else 0
+        own = M * (H * 3 + (Hq + 2 * Hk) * D + 2 * Hq * D + 2 * I + act_rows + loose) * el + M * V * el + V * 4
         who = f"the card graph's buffers for {T} rows, layers {a}..{b - 1}"
         self.scheduler.grant(own, "scratch", requester=who, device=dev)
         g = {
             "key": key,
             "paged": paged,
             "mma": mma,
-            "m": torch.zeros(M, I, dtype=bf, device=dev) if mma else None,
+            "m": torch.zeros(M, I, dtype=bf, device=dev) if mma or stored else None,
+            "piece": torch.zeros(M, loose, dtype=bf, device=dev) if loose else None,
             "h": torch.zeros(M, H, dtype=bf, device=dev),
             "x": torch.zeros(M, H, dtype=bf, device=dev),
             "y": torch.zeros(M, H, dtype=bf, device=dev),
@@ -1613,19 +1650,33 @@ class _CudaMixin(_State):
         reads += [("the layers' kernels", f"the pass's {n} buffer", g[n]) for n in ("h", "x", "y", "qkv", "q", "att")]
         reads += [("the layers' kernels", "the pass's gu buffer", g["gu"]), ("the MLP", "the pass's m buffer", g["m"])]
         if tail and self.head is not None and self.norm is not None:
-            reads += [
-                ("btb_add_rmsnorm", "the final norm", self.norm.weight),
-                ("the head's matvec", "the head weight", self.head.weight),
-            ]
+            reads += [("btb_add_rmsnorm", "the final norm", self.norm.weight)]
+            if not isinstance(self.head, CardStored):  # a GGUF head's blocks are its type's gemv's to check
+                reads += [("the head's matvec", "the head weight", self.head.weight)]
         self._card_need_bf16(reads)
 
         # the pass's matvec weights in launch order, each warmed into L2 on the side stream once the one before it is
         # launched (`_card_warm`): through the kernels between them the chain leaves the DRAM idle
+        def warmed(W: CardMat, R: int, C: int) -> tuple[torch.Tensor, int, int]:
+            # what the L2 warming reads ahead of a matvec: the weight, or a stored projection's first piece - a type's
+            # blocks read as rows of bf16 pairs
+            if isinstance(W, torch.Tensor):
+                return W, R, C
+            p = W[0]
+            if isinstance(p, torch.Tensor):
+                return p, int(p.shape[0]), C
+            return p.raw, p.shape[0], int(p.raw.numel()) // p.shape[0] // 2
+
         seq: list[tuple[torch.Tensor, int, int]] = []
         for L in Ls:
-            seq += [(L["qkv"], (Hq + 2 * Hk) * D, H), (L["o"], H, Hq * D), (L["gu"], 2 * I, H), (L["down"], H, I)]
+            seq += [
+                warmed(L["qkv"], (Hq + 2 * Hk) * D, H),
+                warmed(L["o"], H, Hq * D),
+                warmed(L["gu"], 2 * I, H),
+                warmed(L["down"], H, I),
+            ]
         if tail and self.head is not None:
-            seq.append((self.head.weight, int(self.head.weight.shape[0]), H))
+            seq.append(warmed(self._card_head(), mat_rows(self._card_head()), H))
         warm = self._card_warm(st, seq)
         # the graph's kernel variant (`g["fused"]`, the step lanes' own): the gate, up and activation as one kernel -
         # one kernel fewer, so one edge fewer where another program on the card takes it and btb's L2 with it. The
@@ -1636,15 +1687,33 @@ class _CudaMixin(_State):
         act_mul = k.btb_gelu_mul if gelu else k.btb_silu_mul
         gemv_act = k.btb_gemv_gelu_bf16 if gelu else k.btb_gemv_silu_bf16
         h, x, hidden, row = k.ptr(Residual, g["h"]), k.ptr(Normed, g["x"]), Hidden(H), (T, 1, 1)
+        # a stored projection's rows: the pass's padded to a gemv width, whatever kernels the bf16 weights take
+        Mq = self._card_m(T)
 
-        def matvec(W: torch.Tensor, xin: torch.Tensor, yout: torch.Tensor, R: int, C: int) -> None:
-            w, mi, mo, r, c = k.ptr(Weight, W), k.ptr(MatIn, xin), k.ptr(MatOut, yout), OutDim(R), InDim(C)
-            if mma:
-                grid, block = self._card_mma_launch(R, k.sms)
-                mv = k.btb_gemv_mma8_bf16 if self._card_mma_narrow(R, k.sms) else k.btb_gemv_mma_bf16
-                mv(grid, block, w, mi, mo, r, c, t_rows)
+        def matvec(W: CardMat, xin: torch.Tensor, yout: torch.Tensor, R: int, C: int) -> None:
+            if not isinstance(W, torch.Tensor):
+                # each piece into its own rows of the output: a type's gemv writes there (its rows `ldy` apart), a
+                # bf16 piece through `piece`
+                off = 0
+                for p in W:
+                    if isinstance(p, torch.Tensor):
+                        r = int(p.shape[0])
+                        out = g["piece"].view(-1)[: Mq * r].view(Mq, r)
+                        pw, pi, po = k.ptr(Weight, p), k.ptr(MatIn, xin), k.ptr(MatOut, out)
+                        k.btb_gemv_bf16(Mq, ((r + 3) // 4, 1, 1), (128, 1, 1), pw, pi, po, OutDim(r), InDim(C))
+                        yout[:Mq, off : off + r].copy_(out)
+                    else:
+                        r = p.shape[0]
+                        k.gemv_stored(p, xin[:Mq], yout[:, off:], ldy=int(yout.shape[1]))
+                    off += r
             else:
-                k.btb_gemv_bf16(M, ((R + 3) // 4, 1, 1), (128, 1, 1), w, mi, mo, r, c)
+                w, mi, mo, r, c = k.ptr(Weight, W), k.ptr(MatIn, xin), k.ptr(MatOut, yout), OutDim(R), InDim(C)
+                if mma:
+                    grid, block = self._card_mma_launch(R, k.sms)
+                    mv = k.btb_gemv_mma8_bf16 if self._card_mma_narrow(R, k.sms) else k.btb_gemv_mma_bf16
+                    mv(grid, block, w, mi, mo, r, c, t_rows)
+                else:
+                    k.btb_gemv_bf16(M, ((R + 3) // 4, 1, 1), (128, 1, 1), w, mi, mo, r, c)
             warm()
 
         warm()
@@ -1701,7 +1770,10 @@ class _CudaMixin(_State):
                 k.btb_add_rmsnorm(
                     row, (256, 1, 1), h, k.ptr(BlockOut, g["y"]), k.ptr(NormWeight, L["ln2"]), eps, x, hidden, cen
                 )
-            if glu_on:
+            # the fused gate/up kernel and the folded down projection read bf16 weights; a stored one takes the
+            # matvec over its blocks and `btb_{act}_mul` apart - the same bits as the two kernels
+            glu_l = glu_on and isinstance(L["gu"], torch.Tensor)
+            if glu_l:
                 # gate, up and the activation in one kernel, the activation in its epilogue - the plain matvec's
                 # and btb_{act}_mul's bits, each output one chain over all of k whatever the block (folded into the down
                 # projection's x load instead, each row group recomputed the whole row's act(gate) * up before
@@ -1719,8 +1791,8 @@ class _CudaMixin(_State):
                 warm()
             else:
                 matvec(L["gu"], g["x"], g["gu"], 2 * I, H)
-            if mma:
-                if not glu_on:
+            if mma or not isinstance(L["down"], torch.Tensor):
+                if not glu_l:
                     act_mul(
                         (min(4096, (M * I + 255) // 256), 1, 1),
                         (256, 1, 1),
@@ -1752,10 +1824,10 @@ class _CudaMixin(_State):
         assert sandwich or y_prev is not None  # the segment holds at least one layer, so the loop set the residual
         if tail:
             assert self.head is not None  # the tail runs the final head
-            norm_w, head_w = self.norm.weight, self.head.weight
-            if norm_w.device.type != "cuda" or head_w.device.type != "cuda" or head_w.dtype != torch.bfloat16:
+            norm_w, head_w = self.norm.weight, self._card_head()
+            if norm_w.device.type != "cuda" or not self._card_on(self.head):
                 raise RuntimeError("[card] the tail needs the final norm and the head on the card in bf16")
-            vocab = int(head_w.shape[0])
+            vocab = mat_rows(head_w)
             final_eps = NormEps(float(self.cfg.rms_norm_eps))
             final = k.ptr(NormWeight, norm_w)
             k.btb_add_rmsnorm(row, (256, 1, 1), h, k.ptr(BlockOut, y_prev), final, final_eps, x, hidden, cen)
@@ -1885,6 +1957,7 @@ class _CudaMixin(_State):
         if (
             head is not None
             and self.head_key == self.prefix + "embed_tokens.weight"
+            and not isinstance(head, CardStored)  # stored: no bf16 table there, the embedding table copied below
             and head.weight.device.type == "cuda"
         ):
             st["table"] = head.weight
@@ -1920,7 +1993,7 @@ class _CudaMixin(_State):
             st["segments"] == [(0, self.L)]
             and self.head is not None
             and self.norm is not None
-            and self.head.weight.device.type == "cuda"
+            and self._card_on(self.head)
             and self._card_table(st) is not None
         )
 
@@ -2628,18 +2701,16 @@ class _CudaMixin(_State):
         bound = self.fam.verify_rows(self)
         return full if bound is None else max(1, min(full, int(bound)))
 
-    def _spec_budget(self, ema_tokens: float, passes: int, v_max: int | None = None, past: int = 0) -> int:
-        """Rows a speculative pass may carry, the root included, from the cost curve of the card graph's passes -
-        the warm-up's, as the passes measure it now (`_spec_curve`) - and the running acceptance: the widest pass
-        costing at most a quarter more than the
-        one-row step, and only while the tokens a pass yields pay for its width - otherwise one-row passes,
-        with a wide probe every sixteenth pass so a stretch of accepted drafts can reopen the tree. Without a
-        cost curve (the MLX and host paths) the configured budget stands: the tree's rows, or a chain's
-        `v_max` drafts and the root, whichever is wider."""
+    def _spec_budget(self, v_max: int | None = None, past: int = 0) -> int:
+        """Rows a speculative pass may carry, the root included, from the cost curve of the engine's passes (the
+        card's, MLX's or the host's warm-up, as the passes measure it now: `_spec_curve`) and the tokens its drafted
+        passes return (`SpecCost.budget`). Without a curve the configured budget stands: the tree's rows, or a
+        chain's `v_max` drafts and the root, whichever is wider."""
         full = self._spec_full(v_max)
         cost = self._spec_curve()
         if not cost or 1 not in cost or len(cost) <= 1 or full <= 1:
             return full
+        pc: SpecCost | None = getattr(self, "_spec_cost", None)
         slope = getattr(self, "_mlx_attn_slope", None)
         if slope and getattr(self, "_card_cost", None) is None and past > 0:
             # a pass over `past` rows: every node past the first reads the prefix again, at the warm-up's cost
@@ -2647,20 +2718,9 @@ class _CudaMixin(_State):
             # widths the warm-up's short context prices, not to those the passes measured here, whose seconds hold it
             b = next((s for r, s in slope if past <= r), slope[-1][1])
             n_attn = sum(1 for lt in self.layer_types if lt in (LayerKind.FULL, LayerKind.SLIDING))
-            pc: SpecCost | None = getattr(self, "_spec_cost", None)
             measured = pc.measured() if pc is not None else set()
             cost = {T: c + (0 if T in measured else n_attn * (T - 1) * past * b) for T, c in cost.items()}
-        c1 = cost[1]
-        # a pass may cost what it yields: the widest pass whose cost, in one-row steps, is within the tokens
-        # a pass has been returning (a quarter over a step is always allowed, so a tree can start)
-        allow = max(1.25, float(ema_tokens)) * c1
-        wide = [T for T, c in cost.items() if T <= full and c <= allow]
-        cap = max(wide) if wide else 1
-        if passes % 16 == 0:
-            # the periodic probe: the widest pass within a quarter over a step, whatever the yield has been
-            probe = [T for T, c in cost.items() if T <= full and c <= 1.25 * c1]
-            cap = max(cap, max(probe) if probe else 1)
-        return max(1, cap)
+        return (pc if pc is not None else self._spec_pricer(v_max)).budget(cost, full)
 
     def _spec_pricer(self, v_max: int | None = None) -> SpecCost:
         """The engine's pricing of its speculative passes (`SpecCost`): made on first use and kept across calls,
@@ -2825,6 +2885,8 @@ class _CudaMixin(_State):
         qkv = buf("qkv", (T, (Hq + 2 * Hk) * D))
         q, att = buf("q", (T, Hq, D)), buf("att", (T, Hq * D))
         gu, m = buf("gu", (T, 2 * I)), buf("m", (T, I))
+        loose = card_loose(L[n] for L in Ls for n in CARD_MATS)
+        piece = buf("piece", (T * loose,)) if loose else None
         # the launch's rows ride the norm/rope write's grid.y, which the card caps: a longer chunk writes in slices,
         # each from its own start (a chain's depths from 0 in every slice)
         nsl = (T + self.GRID_Y - 1) // self.GRID_Y
@@ -2865,8 +2927,8 @@ class _CudaMixin(_State):
             run.copy_(torch.as_tensor(list(parents), dtype=torch.int32))
             cnt.zero_()  # the last group of each row folds and leaves its count at 0; a buffer made new holds anything
 
-        def gemm(W: torch.Tensor, xin: torch.Tensor, yout: torch.Tensor, R: int, C: int, rows: int) -> None:
-            self._card_gemm(k, mma, W, xin, yout, R, C, rows)
+        def gemm(W: CardMat, xin: torch.Tensor, yout: torch.Tensor, R: int, C: int, rows: int) -> None:
+            self._card_matmul(k, mma, W, xin, yout, R, C, rows, piece)
 
         G = Hq // Hk
         tpb = k.flash_prefill_rows(D) // G
@@ -3020,12 +3082,48 @@ class _CudaMixin(_State):
         else:
             k.btb_gemm_mma_bf16(((rows + 127) // 128 * ((R + 63) // 64), 1, 1), (128, 1, 1), *args)
 
+    @classmethod
+    def _card_matmul(
+        cls,
+        k: Any,
+        mma: bool,
+        W: CardMat,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        R: int,
+        C: int,
+        rows: int,
+        piece: torch.Tensor | None = None,
+    ) -> None:
+        """`_card_gemm` over a projection as the step's matvec takes it: a bf16 weight's GEMM, or a stored one's
+        pieces each into its own columns of `y` - a type's blocks through its gemv a CARD_ROWS tile of rows at a time
+        (each row's sum its own whatever the tile), a bf16 piece through the fp32 chain the step's `btb_gemv_bf16`
+        sums in, into `piece` (`card_loose` x `rows` elements), then its columns - so each row is the step's"""
+        if isinstance(W, torch.Tensor):
+            cls._card_gemm(k, mma, W, x, y, R, C, rows)
+            return
+        ldy, off = int(y.shape[1]), 0
+        for p in W:
+            r = int(p.shape[0])
+            if isinstance(p, torch.Tensor):
+                assert piece is not None  # taken for the run's widest bf16 piece (`card_loose`)
+                out = piece[: rows * r].view(rows, r)
+                cls._card_gemm(k, False, p, x, out, r, C, rows)
+                y[:rows, off : off + r].copy_(out)
+            else:
+                s0 = 0
+                while s0 < rows:
+                    M = max(m for m in CARD_ROWS if m <= rows - s0)
+                    k.gemv_stored(p, x[s0 : s0 + M], y[s0:, off:], ldy=ldy)
+                    s0 += M
+            off += r
+
     def _card_tail_ok(self) -> bool:
-        """the card graph's kernels run the tail: the card graph on, the final norm and the head on the card, bf16"""
+        """the card graph's kernels run the tail: the card graph on, the final norm and the head on the card, bf16 or
+        a GGUF type's blocks"""
         if not self._card_ready(capture=False) or self.head is None or self.norm is None:
             return False
-        norm_w, head_w = self.norm.weight, self.head.weight
-        return norm_w.device.type == "cuda" and head_w.device.type == "cuda" and head_w.dtype == torch.bfloat16
+        return self.norm.weight.device.type == "cuda" and self._card_on(self.head)
 
     def _card_tail_buffers(self, R: int, H: int) -> tuple[torch.Tensor, torch.Tensor]:
         """the tail's buffers for R rows: their norm (scratch), and the logits [R, V] - the caller's own, as the
@@ -3033,7 +3131,7 @@ class _CudaMixin(_State):
         chunk's for its rows), so never a buffer the next pass writes again"""
         assert self.head is not None  # `_card_tail_ok`
         x = self.scratch.take("card tail x", (R, H), torch.bfloat16, self.dev, "the card's tail over a prompt's rows")
-        logits = torch.empty(R, int(self.head.weight.shape[0]), dtype=torch.bfloat16, device=self.dev)
+        logits = torch.empty(R, mat_rows(self._card_head()), dtype=torch.bfloat16, device=self.dev)
         return x, logits
 
     def _card_tail(
@@ -3048,9 +3146,9 @@ class _CudaMixin(_State):
             return None
         k = self._card_kernels()
         assert k is not None and self.norm is not None and self.head is not None  # `_card_tail_ok`
-        norm_w, head_w = self.norm.weight, self.head.weight
-        self._card_need_bf16([("btb_add_rmsnorm", "the final norm", norm_w)])  # the head's GEMM checks its own
-        R, H, V = int(h.shape[1]), int(h.shape[2]), int(head_w.shape[0])
+        norm_w, head_w = self.norm.weight, self._card_head()
+        self._card_need_bf16([("btb_add_rmsnorm", "the final norm", norm_w)])  # the head's matmul checks its own
+        R, H, V = int(h.shape[1]), int(h.shape[2]), mat_rows(head_w)
         hb = h.reshape(R, H)
         if hb.dtype != torch.bfloat16 or hb.device != self.dev or not hb.is_contiguous():
             hb = self.scratch.take(
@@ -3069,7 +3167,7 @@ class _CudaMixin(_State):
             Hidden(H),
             NormCentered(1 if self.fam.norm_centered else 0),
         )
-        self._card_gemm(k, self._card_mma_for(R), head_w, x, logits, V, H, R)
+        self._card_matmul(k, self._card_mma_for(R), head_w, x, logits, V, H, R)
         return logits.view(1, R, V)
 
     # -- a family's card program: its layers as graphs replayed in turn, the host between them ------------------
@@ -3231,8 +3329,7 @@ class _CudaMixin(_State):
             st["segments"] != [(0, self.L)]
             or head is None
             or norm is None
-            or head.weight.device.type != "cuda"
-            or head.weight.dtype != torch.bfloat16
+            or not self._card_on(head)
             or norm.weight.device.type != "cuda"
         ):
             return False
@@ -3930,30 +4027,23 @@ class _CudaMixin(_State):
         return self._ai_mlp(layer, residual + mix)
 
     @staticmethod
-    def _pass_lists(paged: Any) -> dict[Any, Any]:
-        """a paged cache's lists for the pass (`_span_lists`, `_node_lists`): those of its row map's present version
-        alone, which every change to the map moves - a window's and the whole prefix's (Gemma 3's layers alternate)
-        side by side, made once for every layer that reads them alike. One set for the engine's prefix cache, the last
-        conversation's: kept on each conversation, an idle one held its last pass's. Let go as another conversation's
-        pass begins (`PrefixCache.reading`): replaced only by a pass that builds its own, one whose layers build none
-        (the card's, under a split placement or kv_host) left an idle conversation's held"""
-        pc, table = paged.prefix, paged.table
-        ref, ver, memo = pc._lists or (None, None, {})
-        if ref is None or ref() is not table or ver != table.version:
-            memo = {}
-            pc._lists = (weakref.ref(table), table.version, memo)
-        return cast("dict[Any, Any]", memo)
+    def _pass_lists(paged: PagedCache) -> PassLists:
+        """a paged cache's lists for the pass (`_span_lists`, `_node_lists`), its prefix cache's for its table
+        (`PrefixCache.lists`): a window's and the whole prefix's (Gemma 3's layers alternate) side by side"""
+        return paged.prefix.lists(paged.table)
 
     @staticmethod
-    def _span_lists(paged: Any, base: int, T: int, win: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _span_lists(
+        paged: PagedCache | None, base: int, T: int, win: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """a chain's T rows after `base` as `attn_spans` takes them: (rows, starts, ends) int32, row p over the rows
         before it and itself - the last `win` of them under a window - each a span of one map: the cache's rows in
         order, a paged cache's (`paged`) through its table"""
-        memo = _CudaMixin._pass_lists(paged) if paged is not None else None
-        key = ("spans", base, T, win)
+        memo = _CudaMixin._pass_lists(paged).spans if paged is not None else None
+        key = (base, T, win)
         got = memo.get(key) if memo is not None else None
         if got is not None:
-            return cast("tuple[torch.Tensor, torch.Tensor, torch.Tensor]", got)
+            return got
         ends = torch.arange(base + 1, base + T + 1, dtype=torch.int32)
         starts = (ends - win).clamp_(min=0) if win else torch.zeros(T, dtype=torch.int32)
         if paged is None:
@@ -3964,15 +4054,17 @@ class _CudaMixin(_State):
         return rows, starts, ends
 
     @staticmethod
-    def _node_lists(paged: Any, base: int, T: int, parents: Parents, win: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _node_lists(
+        paged: PagedCache | None, base: int, T: int, parents: Parents, win: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """each of a pass's T rows' cache rows, in the order its committed step reads them, as `attn_nodes` takes
         them: (offs [T + 1], idx) int32. `paged` (a paged cache): the rows are its pool's, through its row map, made
         once a pass (`_pass_lists`)"""
-        memo = _CudaMixin._pass_lists(paged) if paged is not None else None
+        memo = _CudaMixin._pass_lists(paged).nodes if paged is not None else None
         key = (base, T, tuple(parents), win)
         got = memo.get(key) if memo is not None else None
         if got is not None:
-            return cast("tuple[torch.Tensor, torch.Tensor]", got)
+            return got
         lists = []
         for p in range(T):
             rows = node_mask(base, p, parents, win)
@@ -3992,11 +4084,16 @@ class _CudaMixin(_State):
         sandwich = self.fam.sandwich
         x2 = layer.pre_feedforward_layernorm(h) if sandwich else layer.post_attention_layernorm(h)
         mlp = layer.mlp
-        if hasattr(mlp, "gate_up_proj"):  # gate and up as one projection (Phi-3's layout)
-            gate, up = mlp.gate_up_proj(x2).chunk(2, dim=-1)
-            fn = mlp.activation_fn
+        if self.fam.moe:
+            # a mixture's block whole: its router, experts and shared expert the engine's, each row as its own
+            out = mlp(x2)
+            out = out[0] if isinstance(out, tuple) else out
         else:
-            gate, up = mlp.gate_proj(x2), mlp.up_proj(x2)
-            fn = mlp.act_fn
-        out = mlp.down_proj(fn(gate) * up)
+            if hasattr(mlp, "gate_up_proj"):  # gate and up as one projection (Phi-3's layout)
+                gate, up = mlp.gate_up_proj(x2).chunk(2, dim=-1)
+                fn = mlp.activation_fn
+            else:
+                gate, up = mlp.gate_proj(x2), mlp.up_proj(x2)
+                fn = mlp.act_fn
+            out = mlp.down_proj(fn(gate) * up)
         return residual + (layer.post_feedforward_layernorm(out) if sandwich else out)
