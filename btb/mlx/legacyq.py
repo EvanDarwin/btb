@@ -131,19 +131,14 @@ def _defs(kind: str) -> str:
     return _kind(kind) + _WEIGHT
 
 
-# Q8_0 for kernels built on its chain (the megakernel): a row in bf16, a weight a thread as `_DEQUANT` widens it
-KERNELS: dict[Quant, StoredKernel] = {
-    Quant.Q8_0: StoredKernel(
-        MV,
-        _WEIGHT,
-        _kind("q8_0"),
-        32,
-        r"""
+# a row in bf16, a weight a thread as `_DEQUANT` widens it (the step's tied embedding)
+_DECODE_ROW = r"""
     for (uint i = tid; i < NSB * 32; i += 256)
         dst[i] = (bfloat)legacy_weight(W + ((size_t)row * NSB + i / 32) * BLKB, i % 32);
-""",
-        KIND_SHAPES.get("q8_0", SHAPES),
-    )
+"""
+# every kind for kernels built on its chain (the megakernel)
+KERNELS: dict[Quant, StoredKernel] = {
+    Quant[k.upper()]: StoredKernel(MV, _WEIGHT, _kind(k), 32, _DECODE_ROW, KIND_SHAPES.get(k, SHAPES)) for k in KINDS
 }
 
 

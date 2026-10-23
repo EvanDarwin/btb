@@ -142,13 +142,21 @@ class OpName(StrEnum):
     ARGMAX_PART = "argmax_part"
     SANDWICH_ADD = "sandwich_add"
     # a stored type's matvec and embedding row (`STORED`), named by its `kinds.quant_key`
+    MV_Q2K = "mv_q2k"
+    MV_Q3K = "mv_q3k"
     MV_Q4K = "mv_q4k"
     MV_Q5K = "mv_q5k"
     MV_Q6K = "mv_q6k"
+    MV_Q40 = "mv_q40"
+    MV_Q41 = "mv_q41"
     MV_Q80 = "mv_q80"
+    EMBED_Q2K = "embed_q2k"
+    EMBED_Q3K = "embed_q3k"
     EMBED_Q4K = "embed_q4k"
     EMBED_Q5K = "embed_q5k"
     EMBED_Q6K = "embed_q6k"
+    EMBED_Q40 = "embed_q40"
+    EMBED_Q41 = "embed_q41"
     EMBED_Q80 = "embed_q80"
 
 

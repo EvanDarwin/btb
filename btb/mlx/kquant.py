@@ -161,10 +161,6 @@ _DECODE_ROW = r"""
 #endif
     }
 """
-KERNELS: dict[Quant, StoredKernel] = {
-    Quant.Q4_K: StoredKernel(MV_Q45, _SM, _defs("q4k"), 256, _DECODE_ROW),
-    Quant.Q5_K: StoredKernel(MV_Q45, _SM, _defs("q5k"), 256, _DECODE_ROW),
-}
 
 
 def _matvec(kind: str, w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:
@@ -222,11 +218,10 @@ def dequant_q5k(w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
 # a group (l on q[l], q[l+16]). value = d*(scales[si]&0xF)*q - dmin*(scales[si]>>4), col = h*128 + j*32 + m.
 # lane = m (0..31): reads qs[h*32+m], the four j groups share the byte at shifts 0/2/4/6. Register-only,
 # batch-invariant.
-_MATVEC_Q2K = blocks(
-    Frags(
-        "    uint sub = lane >> 4;\n",
-        "        float w[RP][8];\n",
-        r"""
+MV_Q2K = Frags(
+    "    uint sub = lane >> 4;\n",
+    "        float w[RP][8];\n",
+    r"""
             const device uchar* blk = W + ((size_t)row * NSB + c) * 84;
             const device uchar* scales = blk;
             const device uchar* qs = blk + 16;
@@ -242,27 +237,32 @@ _MATVEC_Q2K = blocks(
                 }
             }
 """,
-        _APPLY_HJ,
-    )
+    _APPLY_HJ,
 )
-_DEQUANT_Q2K = r"""
-    uint gid = thread_position_in_grid.x;
-    uint blk_i = gid / 32, lane = gid % 32;
-    if (blk_i >= NBLK) return;
+_MATVEC_Q2K = blocks(MV_Q2K)
+# a superblock's eight weights of lane `lane` (cols h*128 + j*32 + lane) into o: the dequant's, and the embedding's
+_Q2K_LANE = r"""
+template <typename U>
+inline void q2k_decode_lane(const device uchar* blk, uint lane, device U* o) {
     uint sub = lane >> 4;
-    const device uchar* blk = W + (size_t)blk_i * 84;
     const device uchar* scales = blk;
     const device uchar* qs = blk + 16;
     float d  = (float)(*(const device half*)(blk + 80));
     float dm = (float)(*(const device half*)(blk + 82));
-    device T* o = out + (size_t)blk_i * 256;
     for (int h = 0; h < 2; h++) {
         uchar byte = qs[h * 32 + lane];
         for (int j = 0; j < 4; j++) {
             uchar s = scales[h * 8 + 2 * j + sub];
-            o[h * 128 + j * 32 + lane] = (T)(d * (s & 0xF) * ((byte >> (2 * j)) & 3) - dm * (s >> 4));
+            o[h * 128 + j * 32 + lane] = (U)(d * (s & 0xF) * ((byte >> (2 * j)) & 3) - dm * (s >> 4));
         }
     }
+}
+"""
+_DEQUANT_Q2K = r"""
+    uint gid = thread_position_in_grid.x;
+    uint blk_i = gid / 32, lane = gid % 32;
+    if (blk_i >= NBLK) return;
+    q2k_decode_lane<T>(W + (size_t)blk_i * 84, lane, out + (size_t)blk_i * 256);
 """
 _q2k_deq = None
 
@@ -281,7 +281,7 @@ def dequant_q2k(w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
     with _lock:
         if _q2k_deq is None:
             _q2k_deq = metal_kernel(
-                name="btb_q2k_dequant", input_names=["W"], output_names=["out"], header="", source=_DEQUANT_Q2K
+                name="btb_q2k_dequant", input_names=["W"], output_names=["out"], header=_Q2K_LANE, source=_DEQUANT_Q2K
             )
     grid = ((nblk * 32 + 255) // 256) * 256
     return _q2k_deq(
@@ -310,12 +310,30 @@ inline void q3k_aux(const device uchar* sc, thread uint aux[4]) {
     aux[0] = (a0 & k2) | (((a2 >> 0) & k1) << 4);
     aux[1] = (a1 & k2) | (((a2 >> 2) & k1) << 4);
 }
+// a superblock's eight weights of lane `lane` (cols h*128 + j*32 + lane) into o: the dequant's, and the embedding's
+template <typename U>
+inline void q3k_decode_lane(const device uchar* blk, uint lane, device U* o) {
+    uint sub = lane >> 4;
+    const device uchar* qs = blk + 32;
+    thread uint aux[4];
+    q3k_aux(blk + 96, aux);
+    const thread char* scl = (const thread char*)aux;
+    float d = (float)(*(const device half*)(blk + 108));
+    uchar hm = blk[lane];
+    for (int h = 0; h < 2; h++) {
+        uchar byte = qs[h * 32 + lane];
+        for (int j = 0; j < 4; j++) {
+            int q = (byte >> (2 * j)) & 3;
+            if (!(hm & (1 << (h * 4 + j)))) q -= 4;
+            o[h * 128 + j * 32 + lane] = (U)(d * (float)((int)scl[h * 8 + 2 * j + sub] - 32) * (float)q);
+        }
+    }
+}
 """
-_MATVEC_Q3K = blocks(
-    Frags(
-        "    uint sub = lane >> 4;\n",
-        "        float w[RP][8];\n",
-        r"""
+MV_Q3K = Frags(
+    "    uint sub = lane >> 4;\n",
+    "        float w[RP][8];\n",
+    r"""
             const device uchar* blk = W + ((size_t)row * NSB + c) * 110;
             const device uchar* qs = blk + 32;
             thread uint aux[4];
@@ -334,30 +352,14 @@ _MATVEC_Q3K = blocks(
                 }
             }
 """,
-        _APPLY_HJ,
-    )
+    _APPLY_HJ,
 )
+_MATVEC_Q3K = blocks(MV_Q3K)
 _DEQUANT_Q3K = r"""
     uint gid = thread_position_in_grid.x;
     uint blk_i = gid / 32, lane = gid % 32;
     if (blk_i >= NBLK) return;
-    uint sub = lane >> 4;
-    const device uchar* blk = W + (size_t)blk_i * 110;
-    const device uchar* qs = blk + 32;
-    thread uint aux[4];
-    q3k_aux(blk + 96, aux);
-    const thread char* scl = (const thread char*)aux;
-    float d = (float)(*(const device half*)(blk + 108));
-    uchar hm = blk[lane];
-    device T* o = out + (size_t)blk_i * 256;
-    for (int h = 0; h < 2; h++) {
-        uchar byte = qs[h * 32 + lane];
-        for (int j = 0; j < 4; j++) {
-            int q = (byte >> (2 * j)) & 3;
-            if (!(hm & (1 << (h * 4 + j)))) q -= 4;
-            o[h * 128 + j * 32 + lane] = (T)(d * (float)((int)scl[h * 8 + 2 * j + sub] - 32) * (float)q);
-        }
-    }
+    q3k_decode_lane<T>(W + (size_t)blk_i * 110, lane, out + (size_t)blk_i * 256);
 """
 _q3k_deq = None
 
@@ -387,3 +389,20 @@ def dequant_q3k(w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
         output_dtypes=[m.bfloat16],
         template=[("T", m.bfloat16), ("NBLK", nblk)],
     )[0]
+
+
+def _decode_lanes(fn: str, blkb: int) -> str:
+    """a row of the matrix in bf16, a (superblock, lane) a thread as the dequant decodes it through `fn` (the step's
+    tied embedding)"""
+    return (
+        "    for (uint i = tid; i < NSB * 32; i += 256)\n"
+        f"        {fn}<bfloat>(W + ((size_t)row * NSB + i / 32) * {blkb}, i % 32, dst + (size_t)(i / 32) * 256);\n"
+    )
+
+
+KERNELS: dict[Quant, StoredKernel] = {
+    Quant.Q2_K: StoredKernel(MV_Q2K, _Q2K_LANE, "", 256, _decode_lanes("q2k_decode_lane", 84)),
+    Quant.Q3_K: StoredKernel(MV_Q3K, _Q3K_AUX, "", 256, _decode_lanes("q3k_decode_lane", 110)),
+    Quant.Q4_K: StoredKernel(MV_Q45, _SM, _defs("q4k"), 256, _DECODE_ROW),
+    Quant.Q5_K: StoredKernel(MV_Q45, _SM, _defs("q5k"), 256, _DECODE_ROW),
+}

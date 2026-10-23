@@ -265,9 +265,10 @@ def stored_quants() -> list[Quant]:
     return [q for q in Quant if QUANT_KIND[q] in STORED_CLASSES]
 
 
-# the stored types the MLX megakernel multiplies as stored, each through its launch's own chain; its registry
-# (`mlx.mega.kernel.STORED`) is held to this at import, so the torch-free cert reads the same set
-MEGA_STORED: frozenset[Quant] = frozenset({Quant.Q4_K, Quant.Q5_K, Quant.Q6_K, Quant.Q8_0})
+# the stored types the MLX megakernel multiplies as stored, each through its launch's own chain: the affine and
+# k-quant classes whole; its registry (`mlx.mega.kernel.STORED`) is held to this at import, so the torch-free cert
+# reads the same set
+MEGA_STORED: frozenset[Quant] = frozenset(q for q in Quant if QUANT_KIND[q] in (QuantClass.AFFINE, QuantClass.KQUANT))
 
 
 def stored_in_place(q: Quant) -> bool:
