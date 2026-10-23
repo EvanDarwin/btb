@@ -265,6 +265,17 @@ def stored_quants() -> list[Quant]:
     return [q for q in Quant if QUANT_KIND[q] in STORED_CLASSES]
 
 
+# the stored types the MLX megakernel multiplies as stored, each through its launch's own chain; its registry
+# (`mlx.mega.kernel.STORED`) is held to this at import, so the torch-free cert reads the same set
+MEGA_STORED: frozenset[Quant] = frozenset({Quant.Q4_K, Quant.Q5_K, Quant.Q6_K, Quant.Q8_0})
+
+
+def stored_in_place(q: Quant) -> bool:
+    """whether the MLX kernels read a stored type's blocks as the file lays them out, one stream and no repack:
+    IQ4_NL splits its blocks into two and the lattice types add side streams (`mlx.backend.stored_streams`)"""
+    return q is not Quant.IQ4_NL and QUANT_KIND[q] is not QuantClass.LATTICE
+
+
 # the float types a GGUF's expert store also holds as the file's and multiplies with its own kernel, so a quantizer's
 # float fallback beside a stored type keeps the experts stored (a Q2_K file's down at 400 columns, no whole block)
 EXPERT_FLOATS: tuple[Quant, ...] = (Quant.BF16, Quant.F16)

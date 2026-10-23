@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from btb.engine.cache import GrowLayer
-from btb.kinds import Parents, Tokens
+from btb.kinds import MEGA_STORED, Parents, Tokens
 from tests.cert import spec
 from tests.helpers import FIXTURES, NO_LOG, need_cached, need_mlx
 
@@ -24,33 +24,44 @@ if TYPE_CHECKING:
     from btb.engine.model import StreamedTextModel
     from btb.mlx.core import MetalKernel
     from btb.mlx.mega import MegaPass
+    from btb.mlx.mega.model import DenseLayer
 
 MODEL = "Qwen/Qwen3-0.6B"
+# the release's Q4_K_M file: Q4_K blocks with Q6_K ones in the same layers (a v and a down of their own type)
+MODEL_Q4KM = "unsloth/Qwen3-0.6B-GGUF:Qwen3-0.6B-Q4_K_M.gguf"
 
 
-@pytest.fixture(scope="module")
-def engine() -> Iterator[StreamedTextModel]:
+@pytest.fixture(scope="module", params=[MODEL, MODEL_Q4KM])
+def engine(request: pytest.FixtureRequest) -> Iterator[StreamedTextModel]:
     import btb
 
     need_mlx()
-    path = need_cached(MODEL, f"{MODEL} is not in the local cache")
+    spec_ = str(request.param)
+    path = need_cached(spec_, f"{spec_} is not in the local cache")
     sm = btb.load(path, device="mlx", log=NO_LOG, mlx_mega=1)
-    assert sm._mega is not None, "the megakernel did not build on the 0.6B"
+    assert sm._mega is not None, f"the megakernel did not build on {spec_}"
     yield sm
     sm.close()
 
 
 def _pass(
-    sm: StreamedTextModel, mega: MegaPass | None, prompt: Tokens, toks: Tokens, parents: Parents
+    sm: StreamedTextModel,
+    mega: MegaPass | None,
+    prompt: Tokens,
+    toks: Tokens,
+    parents: Parents,
+    arena: MegaPass | None = None,
 ) -> tuple[list[int], list[mx.array]]:
-    """one pass over a fresh cache: (argmax ids, layer 0's and the last layer's K rows of the pass)"""
+    """one pass by `mega` (None: the step) over a fresh cache, the arena of `arena` (else of `mega`; a plain cache
+    without either): (argmax ids, layer 0's and the last layer's K rows after it, the prompt's and the pass's)"""
     import mlx.core as mx
 
-    sm._mega = mega
+    sm._mega = arena or mega
     cache = sm.new_cache(max_len=4096)
     past = len(prompt)
     with torch.inference_mode():
         sm._prefill(torch.tensor([prompt]), cache)
+        sm._mega = mega
         sm.aa(parents)
         try:
             out = sm.forward([toks], cache=cache, last_only=False, pick=True)
@@ -58,8 +69,10 @@ def _pass(
             ids = [int(v) for v in out[0].tolist()]
         finally:
             sm.ab()
+    if arena or mega:
+        assert all(cast(GrowLayer, cl).arena is not None for cl in cache.layers), "the pass left the arena"
     T = len(toks)
-    rows = [cache.layers[i]._mx[0][0, :, past : past + T].astype(mx.float32) for i in (0, len(cache.layers) - 1)]
+    rows = [cache.layers[i]._mx[0][0, :, : past + T].astype(mx.float32) for i in (0, len(cache.layers) - 1)]
     return ids, rows
 
 
@@ -84,6 +97,27 @@ def test_pass_matches_fused(engine: StreamedTextModel, past: int, parents: Paren
     assert m_ids == f_ids, f"the megakernel's ids {m_ids} are not the fused path's {f_ids}"
     for a, b in zip(m_rows, f_rows):
         assert mx.array_equal(a, b), "the megakernel's K rows differ from the fused path's"
+
+
+@pytest.mark.parametrize("past", [51, 300])
+@pytest.mark.parametrize("parents", [[-1], [-1, 0, 1, 2, 3, 0, 5, 6, 1, 8, 0, 10, 11, 12, 13]], ids=["one", "tree15"])
+def test_step_over_the_arena_matches_a_plain_cache(engine: StreamedTextModel, past: int, parents: Parents) -> None:
+    """a pass the step takes over the megakernel's arena (the prompt's rows and its own written with the pass, read as
+    a paged layer's are) gives a plain cache's ids and rows"""
+    import mlx.core as mx
+
+    sm = engine
+    mega = sm._mega
+    prompt = [151644, *range(1000, 1000 + past - 1)]
+    toks = [2000 + 7 * t for t in range(len(parents))]
+    try:
+        p_ids, p_rows = _pass(sm, None, prompt, toks, parents)
+        a_ids, a_rows = _pass(sm, None, prompt, toks, parents, arena=mega)
+    finally:
+        sm._mega = mega
+    assert a_ids == p_ids, f"the step's ids over the arena {a_ids} are not a plain cache's {p_ids}"
+    for a, b in zip(a_rows, p_rows):
+        assert mx.array_equal(a, b), "the step's K rows in the arena differ from a plain cache's"
 
 
 def test_tree_positions_take_the_kernel(engine: StreamedTextModel) -> None:
@@ -156,11 +190,13 @@ def test_arena_layers(engine: StreamedTextModel) -> None:
     assert all(isinstance(cl, GrowLayer) and cl.arena is not None for cl in cache.layers)
 
 
-# the fixtures of every family whose layers the megakernel composes, by the cert's own gate
+# the fixtures of every family whose layers the megakernel composes, by the cert's own gate, then each as a GGUF of
+# every stored type the kernel multiplies as stored
 STEMS = [spec.FIXTURE_STEM[k] for k in spec.FIXTURE_STEM if spec.mega_refusal(k, spec.Storage.SAFE_BF16) is None]
+GGUF_STEMS = [os.path.join("gguf", f"{s}-{q.value.lower()}.gguf") for s in STEMS for q in sorted(MEGA_STORED)]
 
 
-@pytest.fixture(scope="module", params=STEMS)
+@pytest.fixture(scope="module", params=STEMS + GGUF_STEMS)
 def tiny(request: pytest.FixtureRequest) -> Iterator[StreamedTextModel]:
     import btb
 
@@ -212,8 +248,42 @@ def test_family_pass_matches_step(tiny: StreamedTextModel, past: int, parents: P
             f_id, f_rows = _along(sm, prompt, toks, parents, j)
             assert m_ids[j] == f_id, f"node {j}: the megakernel's id {m_ids[j]} is not the step's {f_id}"
             for a, b in zip(m_rows, f_rows):
-                assert mx.array_equal(a[:, j : j + 1], b.astype(mx.float32)), f"node {j}: K rows differ from the step's"
+                row = a[:, past + j : past + j + 1]
+                assert mx.array_equal(row, b.astype(mx.float32)), f"node {j}: K rows differ from the step's"
     finally:
+        sm._mega = mega
+
+
+def test_split_projections_match_step(tiny: StreamedTextModel) -> None:
+    """with q/k/v and gate/up not one weight (a GGUF's v of another type than q and k), each written as its own
+    piece of one output row: every node of a tree pass is still the step's one-row step along its path"""
+    import mlx.core as mx
+
+    from btb.mlx.mega import MegaPass
+
+    sm = tiny
+    mega = sm._mega
+    layers = [cast("DenseLayer", sm.host[i]) for i in range(sm.L)]
+    held = [(ly.self_attn._mx_qkv, ly.mlp._mx_gu) for ly in layers]
+    for ly in layers:
+        ly.self_attn._mx_qkv = ly.mlp._mx_gu = None
+    parents = [-1, 0, 1, 0, 3, 3, 1]
+    V = _vocab(sm)
+    prompt = [1 + (7 * t) % (V - 1) for t in range(70)]
+    toks = [1 + (13 * t + 5) % (V - 1) for t in range(len(parents))]
+    try:
+        split = MegaPass(sm)
+        m_ids, m_rows = _pass(sm, split, prompt, toks, parents)
+        sm._mega = None
+        for j in range(len(parents)):
+            f_id, f_rows = _along(sm, prompt, toks, parents, j)
+            assert m_ids[j] == f_id, f"node {j}: the split pass's id {m_ids[j]} is not the step's {f_id}"
+            for a, b in zip(m_rows, f_rows):
+                row = a[:, len(prompt) + j : len(prompt) + j + 1]
+                assert mx.array_equal(row, b.astype(mx.float32)), f"node {j}: K rows differ from the step's"
+    finally:
+        for ly, (qkv, gu) in zip(layers, held, strict=True):
+            ly.self_attn._mx_qkv, ly.mlp._mx_gu = qkv, gu
         sm._mega = mega
 
 

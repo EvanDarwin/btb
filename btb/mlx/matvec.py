@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from .core import mx
+from .core import metal_kernel, mx
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -62,45 +63,72 @@ EPILOGUE = r"""
         #pragma unroll
         for (int tr = 0; tr < TRS; tr++) {
             float a = simd_sum(acc[r][tr]);
-            if (lane == 0 && tr0 + tr < TRN) out[(size_t)(tr0 + tr) * ROWS + row0 + r] = (T)a;
+            if (lane == 0 && tr0 + tr < TRN) out[(size_t)(tr0 + tr) * LD + row0 + r] = (T)a;
         }
     }
 """
 
 
-def blocks(lanes: str, decl: str, dec: str, apply: str) -> str:
-    """a kernel walking a row's NSB blocks of BW weights: `lanes` the lane's constants, `decl` a block's registers,
-    `dec` decoding row r's block c into them (`row` clamped: a tail group repeats its last row, never written),
-    `apply` adding pass row tr's activations at `xc` into acc[r][tr] for each r - the row's own chain"""
+@dataclass(frozen=True)
+class Frags:
+    """a stored type's matvec as the pieces its launch is built from (the step's and the megakernel's alike):
+    `lanes` the lane's constants, `decl` a block's registers, `dec` decoding row r's block c into them (`row` clamped:
+    a tail group repeats its last row, never written), `apply` adding pass row tr's activations at `xc` into
+    acc[r][tr] for each r. A lane visits blocks `lane_block`, then every `step`-th after it"""
+
+    lanes: str
+    decl: str
+    dec: str
+    apply: str
+    step: int = 1
+    lane_block: str = "0"
+
+
+@dataclass(frozen=True)
+class StoredKernel:
+    """a stored type as the megakernel builds its launch and embedding on it: its matvec `frags`, the device
+    functions they and `decode` call (`header`), the defines both read (`defs`), BW weights a block step, `decode`:
+    statements writing row `row` of the matrix to `dst` (bf16) from thread `tid` of 256, its dequant's numbers, and
+    its launch's `shapes` (None: `SHAPES`)"""
+
+    frags: Frags
+    header: str
+    defs: str
+    bw: int
+    decode: str
+    shapes: Shapes | None = None
+
+
+def blocks(f: Frags) -> str:
+    """the launch over a stored type: its (row group, pass-row group) from the grid, the rows' chains over their NSB
+    blocks of BW weights into acc[RP][TRS] (each lane its blocks in turn: a block decoded for each of the RP rows, then
+    applied to each pass row), the sums"""
     return (
         PROLOGUE
-        + lanes
+        + f.lanes
         + r"""
     float acc[RP][TRS];
     #pragma unroll
     for (int r = 0; r < RP; r++)
         #pragma unroll
         for (int u = 0; u < TRS; u++) acc[r][u] = 0.0f;
-    for (uint c = 0; c < NSB; c++) {
 """
-        + decl
+        + f"    for (uint c = {f.lane_block}; c < NSB; c += {f.step}) {{\n"
+        + f.decl
         + r"""
         #pragma unroll
         for (int r = 0; r < RP; r++) {
             uint row = min(row0 + r, (uint)ROWS - 1);
 """
-        + dec
+        + f.dec
         + r"""
         }
         #pragma unroll
         for (int tr = 0; tr < TRS; tr++) {
             const device T* xc = XROW(tr0 + tr) + (size_t)c * BW;
 """
-        + apply
-        + r"""
-        }
-    }
-"""
+        + f.apply
+        + "        }\n    }\n"
         + EPILOGUE
     )
 
@@ -109,6 +137,23 @@ def shape(shapes: Shapes, tr: int) -> tuple[int, int, int]:
     """(RP, TRS, launch width) for `tr` pass rows: the table's, else 4 rows by all of them"""
     rp, trs = shapes.get(tr) or (4, tr)
     return rp, trs, tr if tr % trs == 0 else trs
+
+
+def threads(rows: int, tr: int, shapes: Shapes | None = None) -> int:
+    """a launch's threads over `rows` output rows at `tr` pass rows: a simdgroup a (row group, pass-row group)"""
+    rp, trs, trl = shape(SHAPES if shapes is None else shapes, tr)
+    return -(-rows // rp) * (trl // trs) * 32
+
+
+def defines(rows: int, cols: int, bw: int, tr: int, shapes: Shapes | None = None, ld: int | None = None) -> str:
+    """a launch's defines: its matrix, its shape at `tr` pass rows, and `ld` the output's row stride (None: `rows`)"""
+    rp, trs, trl = shape(SHAPES if shapes is None else shapes, tr)
+    xrow = "(t)" if trl == tr else "min((uint)(t), (uint)TRN - 1)"
+    return (
+        f"#define ROWS {rows}\n#define NSB {-(-cols // bw)}\n#define BW {bw}\n#define COLS {cols}\n"
+        f"#define TR {trl}\n#define TRN {tr}\n#define RP {rp}\n#define TRS {trs}\n#define LD {ld or rows}\n"
+        f"#define XROW(t) (x + (size_t){xrow} * COLS)\n"
+    )
 
 
 _kernels: dict[tuple[str, int, int, int], MetalKernel] = {}
@@ -130,22 +175,20 @@ def launch(
     `bw` weights (the last one partial where `bw` does not divide `cols`); fp32 accumulation, y in x's dtype. `name`
     is the caller's kernel name for the matrix, the launch shape appended; `shapes` a kernel's own, else `SHAPES`."""
     m = mx()
-    nsb = -(-cols // bw)
     n = int(x.shape[0])
     outs = []
     for s in range(0, n, ROWS_MAX):
         xr = x if n <= ROWS_MAX else x[s : s + ROWS_MAX]
         tr = int(xr.shape[0])
-        rp, trs, trl = shape(SHAPES if shapes is None else shapes, tr)
+        rp, trs, _trl = shape(SHAPES if shapes is None else shapes, tr)
         key = (name, tr, rp, trs)
         k = _kernels.get(key)
         if k is None:
-            k = _compile(key, source, defs, inputs, rows, nsb, bw, cols, trl)
-        groups = -(-rows // rp) * (trl // trs)
+            k = _compile(key, source, defs + defines(rows, cols, bw, tr, shapes), inputs)
         outs.append(
             k(
                 inputs=[a for _, a in inputs] + [xr],
-                grid=(((groups * 32 + 255) // 256) * 256, 1, 1),  # a simdgroup a (row group, pass-row group)
+                grid=(-(-threads(rows, tr, shapes) // 256) * 256, 1, 1),
                 threadgroup=(256, 1, 1),
                 output_shapes=[(tr, rows)],
                 output_dtypes=[x.dtype],
@@ -156,34 +199,18 @@ def launch(
 
 
 def _compile(
-    key: tuple[str, int, int, int],
-    source: str,
-    defs: str,
-    inputs: Sequence[tuple[str, mx_.array]],
-    rows: int,
-    nsb: int,
-    bw: int,
-    cols: int,
-    trl: int,
+    key: tuple[str, int, int, int], source: str, header: str, inputs: Sequence[tuple[str, mx_.array]]
 ) -> MetalKernel:
     name, tr, rp, trs = key
     shaped = f"{name}_{tr}_{rp}_{trs}"  # the caller's name (the kernel the matrix runs), its launch shape appended
     with _lock:
         k = _kernels.get(key)
         if k is None:
-            k = _kernels[key] = mx().fast.metal_kernel(
+            k = _kernels[key] = metal_kernel(
                 name=shaped,
                 input_names=[n for n, _ in inputs] + ["x"],
                 output_names=["out"],
-                header=(
-                    f"{defs}#define ROWS {rows}\n#define NSB {nsb}\n#define BW {bw}\n#define COLS {cols}\n"
-                    f"#define TR {trl}\n#define TRN {tr}\n#define RP {rp}\n#define TRS {trs}\n"
-                    + (
-                        "#define XROW(t) (x + (size_t)(t) * COLS)\n"
-                        if trl == tr
-                        else "#define XROW(t) (x + (size_t)min((uint)(t), (uint)TRN - 1) * COLS)\n"
-                    )
-                ),
+                header=header,
                 source=source,
             )
     return k

@@ -370,6 +370,7 @@ class StreamedTextModel(
         self.cold = {int(x) for x in cold_layers} - set(self.resident)
         self.cold_slots = int(cold_slots)
         self._mega = None
+        self._mega_wanted = False
         self._mlx_attn_slope = None
         self.cold_chunk = int(cold_chunk_mb) << 20
         self.cold_ring = ColdRing()
@@ -876,7 +877,7 @@ class StreamedTextModel(
             per = mg.Hk * cap * mg.hd * 2
             sh = mlxdev.Shared(2 * self.L * per)
             setattr(cache, "_mega_arena", sh)  # noqa: B010  not a DynamicCache slot: the arena pinned to the cache's lifetime
-            arena = [(sh.mx, (2 * i) * per, (2 * i + 1) * per, cap) for i in range(self.L)]
+            arena = [(sh.whole, (2 * i) * per, (2 * i + 1) * per, cap) for i in range(self.L)]
         # a bf16 card engine keeps every layer's rows in bf16, a host layer's too (`host_kv_dtype`)
         kv_dtype = torch.bfloat16 if self.host_kv_dtype() == torch.bfloat16 else None
         for i, layer in enumerate(cache.layers):

@@ -8,7 +8,7 @@ from __future__ import annotations
 import threading
 from typing import Any
 
-from .core import mx
+from .core import metal_kernel, mx
 
 BINS = 2048  # a radix level: 11 bits, three levels resolve a float's 32 ordered bits (11 + 11 + 10)
 THREADS = 1024  # a row's threadgroup: the passes over the row are latency bound, so the widest group
@@ -392,10 +392,9 @@ def _fill(src: str) -> str:
 
 def _get() -> Any:
     global _kernel
-    m = mx()
     with _lock:
         if _kernel is None:
-            _kernel = m.fast.metal_kernel(
+            _kernel = metal_kernel(
                 name="btb_sample_pick",
                 input_names=["x", "keys", "cfg", "fp", "dep"],
                 output_names=["out"],
@@ -407,10 +406,9 @@ def _get() -> Any:
 
 def _get_verify() -> Any:
     global _verify_kernel
-    m = mx()
     with _lock:
         if _verify_kernel is None:
-            _verify_kernel = m.fast.metal_kernel(
+            _verify_kernel = metal_kernel(
                 name="btb_sample_verify",
                 input_names=["x", "q", "kids", "hasq", "keys", "cfg", "fp", "dep"],
                 output_names=["out"],

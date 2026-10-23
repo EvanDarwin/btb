@@ -9,7 +9,7 @@ import threading
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from .core import MetalKernel, mx
+from .core import MetalKernel, metal_kernel, mx
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -133,7 +133,7 @@ def _kernel(name: str, inputs: Sequence[str], outputs: Sequence[str], header: st
         with _lock:
             k = _kernels.get(name)
             if k is None:
-                k = _kernels[name] = mx().fast.metal_kernel(
+                k = _kernels[name] = metal_kernel(
                     name=name, input_names=list(inputs), output_names=list(outputs), header=header, source=source
                 )
     return k

@@ -9,8 +9,9 @@ from __future__ import annotations
 import threading
 from typing import TYPE_CHECKING, Any
 
-from .core import mx
-from .matvec import EPILOGUE, PROLOGUE, Shapes, launch
+from ..kinds import Quant
+from .core import metal_kernel, mx
+from .matvec import Frags, Shapes, StoredKernel, blocks, launch
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -40,20 +41,10 @@ inline float legacy_weight(const device uchar* blk, uint i) {
 # 8q..8q+7, and reads its eight activations of each pass row as two (Q8_0: one) aligned vector loads, applied to
 # its RP rows' weights; fp32 MAC, then simd_sum. A row's chain - its block's widening, the fixed eight-term sum,
 # the accumulate - is the same at any TR and whichever rows share its group, so RP is free to follow TR.
-_MATVEC = (
-    PROLOGUE
-    + r"""
-    uint q = lane & 3;
-    float acc[RP][TRS];
-    #pragma unroll
-    for (int r = 0; r < RP; r++)
-        #pragma unroll
-        for (int u = 0; u < TRS; u++) acc[r][u] = 0.0f;
-    for (uint c = lane >> 2; c < NSB; c += 8) {
-        float w[RP][8];
-        #pragma unroll
-        for (int r = 0; r < RP; r++) {
-            uint row = min(row0 + r, (uint)ROWS - 1);  // a tail group repeats its last row, never written
+MV = Frags(
+    "    uint q = lane & 3;\n",
+    "        float w[RP][8];\n",
+    r"""
             const device uchar* blk = W + ((size_t)row * NSB + c) * BLKB;
             float d = (float)(*(const device half*)(blk));
 #if KIND == 2
@@ -79,16 +70,14 @@ _MATVEC = (
 #endif
             }
 #endif
-        }
-        #pragma unroll
-        for (int tr = 0; tr < TRS; tr++) {
-            const device T* xb = XROW(tr0 + tr) + (size_t)c * 32;
+""",
+    r"""
 #if KIND == 2
-            vec<T, 4> a = *(const device vec<T, 4>*)(xb + 8 * q);
-            vec<T, 4> b = *(const device vec<T, 4>*)(xb + 8 * q + 4);
+            vec<T, 4> a = *(const device vec<T, 4>*)(xc + 8 * q);
+            vec<T, 4> b = *(const device vec<T, 4>*)(xc + 8 * q + 4);
 #else
-            vec<T, 4> a = *(const device vec<T, 4>*)(xb + 4 * q);
-            vec<T, 4> b = *(const device vec<T, 4>*)(xb + 4 * q + 16);
+            vec<T, 4> a = *(const device vec<T, 4>*)(xc + 4 * q);
+            vec<T, 4> b = *(const device vec<T, 4>*)(xc + 4 * q + 16);
 #endif
             float xv[8] = {(float)a[0], (float)a[1], (float)a[2], (float)a[3],
                            (float)b[0], (float)b[1], (float)b[2], (float)b[3]};
@@ -99,11 +88,11 @@ _MATVEC = (
                 for (int t = 0; t < 8; t++) s += w[r][t] * xv[t];
                 acc[r][tr] += s;
             }
-        }
-    }
-"""
-    + EPILOGUE
+""",
+    step=8,
+    lane_block="(lane >> 2)",
 )
+_MATVEC = blocks(MV)
 
 # one thread a block
 _DEQUANT = r"""
@@ -133,9 +122,29 @@ SHAPES: Shapes = {
 KIND_SHAPES: dict[str, Shapes] = {"q8_0": {**SHAPES, 16: (4, 8)}}
 
 
-def _defs(kind: str) -> str:
+def _kind(kind: str) -> str:
     blkb, kid = KINDS[kind]
-    return f"#define BLKB {blkb}\n#define KIND {kid}\n{_WEIGHT}"
+    return f"#define BLKB {blkb}\n#define KIND {kid}\n"
+
+
+def _defs(kind: str) -> str:
+    return _kind(kind) + _WEIGHT
+
+
+# Q8_0 for kernels built on its chain (the megakernel): a row in bf16, a weight a thread as `_DEQUANT` widens it
+KERNELS: dict[Quant, StoredKernel] = {
+    Quant.Q8_0: StoredKernel(
+        MV,
+        _WEIGHT,
+        _kind("q8_0"),
+        32,
+        r"""
+    for (uint i = tid; i < NSB * 32; i += 256)
+        dst[i] = (bfloat)legacy_weight(W + ((size_t)row * NSB + i / 32) * BLKB, i % 32);
+""",
+        KIND_SHAPES.get("q8_0", SHAPES),
+    )
+}
 
 
 def matvec_legacy(kind: str, w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:
@@ -154,7 +163,7 @@ def dequant_legacy(kind: str, w_bytes: mx_.array, rows: int, cols: int) -> mx_.a
     with _lock:
         k = _deq_kernels.get(kind)
         if k is None:
-            k = _deq_kernels[kind] = m.fast.metal_kernel(
+            k = _deq_kernels[kind] = metal_kernel(
                 name=f"btb_{kind}_dequant",
                 input_names=["W"],
                 output_names=["out"],

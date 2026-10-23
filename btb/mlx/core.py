@@ -4,17 +4,23 @@ owns that torch views, so the two sides never copy)."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import contextlib
+import time
+from collections.abc import Callable, Sequence
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, ParamSpec, Protocol, TypeAlias, TypeVar
 
 import numpy as np
 import torch
 
+from .. import trace
 from ..kinds import Json
+from ..metal import paged
 
 if TYPE_CHECKING:
     import mlx.core as mx_
+
+Template: TypeAlias = "Sequence[tuple[str, mx_.Dtype | int | bool]]"  # a kernel's compile-time values, by name
 
 
 class MetalKernel(Protocol):
@@ -28,9 +34,96 @@ class MetalKernel(Protocol):
         output_dtypes: Sequence[mx_.Dtype],
         grid: tuple[int, int, int],
         threadgroup: tuple[int, int, int],
-        template: Sequence[tuple[str, mx_.Dtype | int | bool]] = ...,
-        init_value: float | None = ...,
+        template: Template | None = ...,
     ) -> list[mx_.array]: ...
+
+
+class _Kernel:
+    """a kernel `metal_kernel` builds: MLX's, the first launch of each of its instances timed under the trace"""
+
+    def __init__(self, name: str, k: MetalKernel) -> None:
+        self.name, self.k = name, k
+        self.seen: set[tuple[str, ...]] = set()
+
+    def __call__(
+        self,
+        *,
+        inputs: Sequence[mx_.array],
+        output_shapes: Sequence[Sequence[int]],
+        output_dtypes: Sequence[mx_.Dtype],
+        grid: tuple[int, int, int],
+        threadgroup: tuple[int, int, int],
+        template: Template | None = None,
+    ) -> list[mx_.array]:
+        def launch() -> list[mx_.array]:
+            return self.k(
+                inputs=inputs,
+                output_shapes=output_shapes,
+                output_dtypes=output_dtypes,
+                grid=grid,
+                threadgroup=threadgroup,
+                template=template,
+            )
+
+        if not trace.ON:
+            return launch()
+        key = (repr(template), *(str(a.dtype) for a in inputs), *(str(d) for d in output_dtypes))
+        if key in self.seen:
+            return launch()
+        self.seen.add(key)
+        m = mx()
+        m.eval(*inputs)
+        t0 = time.perf_counter()
+        out = launch()
+        m.eval(*out)
+        values = ", ".join(f"{n}={str(v).removeprefix('mlx.core.')}" for n, v in template or ())
+        trace.event("mlx: kernel %s(%s) compiled and run once in %.1f ms", self.name, values, _ms(t0))
+        return out
+
+
+def metal_kernel(
+    name: str, input_names: Sequence[str], output_names: Sequence[str], source: str, header: str = ""
+) -> MetalKernel:
+    """`mx.fast.metal_kernel`. MLX compiles each instance of a kernel (its template's values, its inputs' and outputs'
+    types) at its first evaluation, inside whatever graph launched it; under the trace (-vv) an instance's first launch
+    is evaluated alone, its inputs first, and said with its time"""
+    k = mx().fast.metal_kernel(
+        name=name, input_names=list(input_names), output_names=list(output_names), source=source, header=header
+    )
+    return _Kernel(name, k)
+
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def compiled(name: str, fn: Callable[P, R]) -> Callable[P, R]:
+    """`mx.compile(fn)`. MLX traces and compiles it again for each new set of argument shapes and constants, at that
+    call; under the trace (-vv) such a call is evaluated alone, its arguments first, and said with its time"""
+    m = mx()
+    c = m.compile(fn)
+    seen: set[tuple[str, ...]] = set()
+
+    def run(*args: P.args, **kw: P.kwargs) -> R:
+        if not trace.ON:
+            return c(*args, **kw)
+        arrays = [a for a in (*args, *kw.values()) if isinstance(a, m.array)]
+        key = tuple(f"{a.shape}{a.dtype}" if isinstance(a, m.array) else repr(a) for a in (*args, *kw.values()))
+        if key in seen:
+            return c(*args, **kw)
+        seen.add(key)
+        m.eval(*arrays)
+        t0 = time.perf_counter()
+        out = c(*args, **kw)
+        m.eval(out)
+        trace.event("mlx: %s compiled and run once in %.1f ms", name, _ms(t0))
+        return out
+
+    return run
+
+
+def _ms(t0: float) -> float:
+    return 1e3 * (time.perf_counter() - t0)
 
 
 _mx: Any = None
@@ -124,9 +217,13 @@ class Shared:
     def __init__(self, nbytes: int, stream: Any = None, defer: bool = False) -> None:
         m = mx()
         self.nbytes = int(nbytes)
+        n = max(1, self.nbytes)
         # `stream=m.cpu` zero-fills on the CPU, so the pages are touched once, by the side that writes the
         # weights next; `defer` queues the fill and returns, and the views wait for it on first use
-        self.mx = m.zeros((max(1, self.nbytes),), dtype=m.uint8, **({"stream": stream} if stream is not None else {}))
+        with m.stream(stream) if stream is not None else contextlib.nullcontext():
+            # whole pages underneath (`whole`, what btb.metal aliases), the views over the bytes asked for
+            self.whole = m.zeros((paged(n),), dtype=m.uint8)
+            self.mx = self.whole if self.whole.size == n else self.whole[:n]
         self._np: Any = None
         self._torch: Any = None
         if defer:
@@ -139,7 +236,7 @@ class Shared:
         """a Shared over an evaluated MLX byte array made elsewhere (the pool's blocks)"""
         self = cls.__new__(cls)
         self.nbytes = int(arr.size)
-        self.mx = arr
+        self.whole = self.mx = arr
         self._np = npview if npview is not None else np.array(arr, copy=False)
         self._torch = torch.from_numpy(self._np)
         return self

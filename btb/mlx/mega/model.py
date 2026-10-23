@@ -1,25 +1,25 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
-"""A model's pass as one megakernel dispatch: the weight buffers and constants its program reads, gathered once,
-and a program per pass shape built from the family's layers (`Family.mega_layer`), each composed of a `Block`'s
-parts. The kernel runs as many threadgroups as this GPU holds at once, measured on the compiled kernel."""
+"""A model's pass as its program replayed on the GPU (`replay`): the weight buffers and constants its program reads,
+gathered once, and a program per pass shape built from the family's layers (`Family.mega_layer`), each composed of a
+`Block`'s parts, every instruction a dispatch of as many threadgroups as its work fills."""
 
 from __future__ import annotations
 
-import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple, Protocol, TypeAlias, cast
+from typing import TYPE_CHECKING, Protocol, TypeAlias, cast
 
 import numpy as np
 import torch
 
-from ...kinds import LayerKind
+from ...kinds import LayerKind, Quant
+from ...metal import paged
 from ..attn import tree_meta
 from ..backend import Weight
-from ..core import MetalKernel, mx, to_mx
-from .gpu import TG_MEMORY, gpu
-from .kernel import CS, DIMS, OpName, kernel
+from ..core import mx, to_mx
+from .kernel import EMBED_OP, MV_OP, STORED, OpName, stored_groups
 from .program import CONSTS, KV, SCR, Program, Refs, Tensor, align
+from .replay import Replay
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -30,15 +30,12 @@ ROWS_MAX = 16  # a pass's rows: the matvec's tile holds 16
 SPL = 8  # the attention blocks a pass may read, 8 x ATTN_BLOCK cache rows
 MV_KT = 64  # the matvec's columns a step
 AMP = 64  # the argmax's parts a row
-BUFS_MAX = 19  # Metal binds 31 buffers a kernel: the weights' beside the scratch, constants, arena, 7 inputs, 2 outputs
-PROBE_SPINS = 1 << 13  # a probe threadgroup's wait for the rest to arrive
-TUNE_LAYERS = 8  # the layers a tuning pass runs
-TUNE_REPS = 3  # the timed tuning passes a grid, the fastest kept
+TG_MEMORY = 32768  # a threadgroup's memory on every Apple GPU family (MTLDevice.maxThreadgroupMemoryLength)
+# Metal binds 31 buffers a kernel: the weights' beside the scratch, constants, arena, 8 inputs and the instruction's
+BUFS_MAX = 19
 
 KvOff: TypeAlias = Callable[[int, int], int]  # the arena offset of layer i's K (0) or V (1)
 ConstKey: TypeAlias = tuple[str, int]  # a packed constant: what it is, and the module it is read from
-# a pass's program by its rows, attention blocks, arena (layer 0's K and V, the last layer's V) and argmax
-TableKey: TypeAlias = tuple[int, int, int, int, int, bool]
 
 
 class NormModule(Protocol):
@@ -51,6 +48,10 @@ class LinearModule(Protocol):
     """a host linear, its weight on the GPU as `mx` (`_HostLinear`)"""
 
     mx: Weight | None
+
+
+Linear: TypeAlias = Weight | LinearModule  # a weight, or a host linear holding one
+Linears: TypeAlias = Linear | tuple[Linear, ...]  # one, or several into one output
 
 
 class AttentionModule(Protocol):
@@ -94,20 +95,11 @@ class Fusions:
     fold_in_attention: bool = True  # a one-block pass's partials folded by the attention's own threadgroup
 
 
-class Table(NamedTuple):
-    """a pass's program on the GPU"""
-
-    tab: mx_.array  # uint32 [instructions, W]
-    instructions: int
-
-
-def mv_items(rows: int, grid: int) -> int:
-    """the threadgroups a matvec of `rows` takes: the fewest whose simdgroups cover its 8-row tiles in the rounds the
-    whole grid would, so no round is left to a few while the rest wait on it"""
-    ntile = (rows + 7) // 8
-    rounds = -(-ntile // (grid * 8))
-    streams = -(-ntile // rounds)
-    return max(1, min(grid, -(-streams // 8)))
+def mv_items(rows: int, per: int) -> int:
+    """the threadgroups a matvec of `rows` takes, its simdgroups `per` rows each (the bf16 tile's 8): every simdgroup
+    its own rows, once"""
+    tiles = -(-rows // per)
+    return max(1, -(-tiles // 8))
 
 
 class Block:
@@ -130,24 +122,20 @@ class Block:
         return cast("SandwichLayer", self.mp.sm.host[i])
 
     @staticmethod
-    def qkv(at: AttentionModule) -> Weight | LinearModule:
-        """q, k and v's weight as one: their adjacent slots, or the module's own fused projection (Phi-3's)"""
+    def qkv(at: AttentionModule) -> Linears:
+        """q, k and v's weight as one where it is (their adjacent slots, or the module's own fused projection: Phi-3's),
+        else the three into one output (a GGUF's v of another type than q and k)"""
         if at._mx_qkv is not None:
             return at._mx_qkv
-        fused: LinearModule | None = getattr(at, "qkv_proj", None)
-        if fused is None:
-            raise ValueError("[mega] q, k and v are not one weight")
-        return fused
+        return _one_or_parts(at, "qkv_proj", ("q_proj", "k_proj", "v_proj"))
 
     @staticmethod
-    def gate_up(mlp: MlpModule) -> Weight | LinearModule:
-        """gate's and up's weight as one: their adjacent slots, or the module's own fused projection (Phi-3's)"""
+    def gate_up(mlp: MlpModule) -> Linears:
+        """gate's and up's weight as one where it is (adjacent slots, or Phi-3's fused projection), else the two into
+        one output"""
         if mlp._mx_gu is not None:
             return mlp._mx_gu
-        fused: LinearModule | None = getattr(mlp, "gate_up_proj", None)
-        if fused is None:
-            raise ValueError("[mega] gate and up are not one weight")
-        return fused
+        return _one_or_parts(mlp, "gate_up_proj", ("gate_proj", "up_proj"))
 
     def embed(self) -> None:
         """the rows' embeddings, scaled where the family scales them (Gemma's sqrt(hidden))"""
@@ -155,7 +143,8 @@ class Block:
         h = self.p.scratch(H)
         scale = mp.sm.embed_scale
         n = (H, int(scale is not None), 0)
-        self.p.emit(OpName.EMBED, self.T, (mp.embed, None, h), n, scale or 0.0, writes=[h])
+        op = OpName.EMBED if mp.embed_q is None else EMBED_OP[mp.embed_q]
+        self.p.emit(op, self.T, (mp.embed, None, h), n, scale or 0.0, writes=[h])
         self.h = h
 
     def norm(self, mod: NormModule) -> Tensor:
@@ -194,14 +183,24 @@ class Block:
             raise ValueError("[mega] two adds to the residual with no norm between them")
         self.y = y
 
-    def linear(self, x: Tensor, w: Weight | LinearModule | None) -> Tensor:
-        """x . w^T for a slot weight `w` (or a host linear holding one)"""
-        wt, rows, cols = self.mp.weight(w)
-        if x.cols != cols or cols % 8:
-            raise ValueError(f"[mega] a linear of {cols} columns over rows of {x.cols}")
-        y = self.p.scratch(rows)
-        items = mv_items(rows, self.p.grid)
-        self.p.emit(OpName.MATVEC, items, (wt, x, y), (rows, cols, 0), reads=[x], writes=[y])
+    def linear(self, x: Tensor, w: Linears) -> Tensor:
+        """x . w^T for a slot weight `w` (bf16, or a stored type the kernel multiplies as stored; or a host linear
+        holding one), several end to end into one output, a piece of each row a weight"""
+        got = [self.mp.weight(v) for v in (w if isinstance(w, tuple) else (w,))]
+        width = sum(rows for _, rows, _, _ in got)
+        y = self.p.scratch(width)
+        pieces, at = [], 0
+        for wt, rows, cols, q in got:
+            if x.cols != cols or (q is None and cols % 8):
+                raise ValueError(f"[mega] a linear of {cols} columns over rows of {x.cols}")
+            out = y if len(got) == 1 else y.piece(at, rows)
+            ld = 0 if len(got) == 1 else width
+            op, items = (OpName.MATVEC, mv_items(rows, 8)) if q is None else (MV_OP[q], stored_groups(q, rows, self.T))
+            self.p.emit(op, items, (wt, x, out), (rows, cols, ld << 1), reads=[x], writes=[out])
+            pieces.append(out)
+            at += rows
+        if len(pieces) > 1:
+            y.parts = tuple(pieces)
         return y
 
     def attention(self, i: int, qkv: Tensor, at: AttentionModule) -> Tensor:
@@ -229,8 +228,8 @@ class Block:
         scale = float(at.scaling)
         tm = T | (mp.wins.index(mp.windows[i]) << 16)  # the rows and the layer's window's row of the metadata
         if self.splits == 1 and mp.fusions.fold_in_attention:
-            n = (Hk, 1 | (1 << 31), tm)
-            p.emit(OpName.ATTN, Hk * T, refs, n, scale, reads=[q, K, V], writes=[part, pl, a])
+            n = (Hk, 1, tm)
+            p.emit(OpName.ATTN_FOLD, Hk * T, refs, n, scale, reads=[q, K, V], writes=[part, pl, a])
         else:
             n = (Hk, self.splits, tm)
             p.emit(OpName.ATTN, Hk * self.splits * T, refs, n, scale, reads=[q, K, V], writes=[part, pl])
@@ -238,10 +237,10 @@ class Block:
         return a
 
     def gated(self, gu: Tensor) -> Tensor:
-        """act(gate) * up over gate and up end to end in `gu`, as the step makes it: silu in the fused kernel or in
-        MLX's own ops, gelu-tanh in MLX's"""
+        """act(gate) * up over gate and up end to end in `gu`, as the step makes it: silu in the fused kernel (gate and
+        up one weight) or in MLX's own ops (the step's split gate and up, an unfused family), gelu-tanh in MLX's"""
         if self.mp.act in ("silu", "swish"):
-            how = 0 if self.mp.fused else 1
+            how = 0 if self.mp.fused and not gu.parts else 1
         elif self.mp.act in ("gelu_pytorch_tanh", "gelu_new"):
             how = 2
         else:
@@ -264,7 +263,11 @@ class Block:
         p.emit(OpName.FNORM, T, (self.h, w, hn, None, y), n, eps, reads=reads, writes=[hn])
         logits = p.scratch(mp.V, 4)
         mp.logits_off = logits.ref[1]
-        p.emit(OpName.HEAD, p.grid, (mp.head, hn, logits), (mp.V, H, 0), reads=[hn], writes=[logits])
+        if mp.head_q is None:
+            p.emit(OpName.HEAD, mv_items(mp.V, 8), (mp.head, hn, logits), (mp.V, H, 0), reads=[hn], writes=[logits])
+        else:  # the type's own chain over float32 rows, as the step multiplies a stored head
+            items = stored_groups(mp.head_q, mp.V, T)
+            p.emit(MV_OP[mp.head_q], items, (mp.head, hn, logits), (mp.V, H, 1), reads=[hn], writes=[logits])
         amax = p.scratch(2 * AMP, 4)
         if argmax:
             n = (mp.V, AMP, p.R * AMP)
@@ -273,9 +276,9 @@ class Block:
 
 
 class MegaPass:
-    """A model's pass of 1..ROWS_MAX rows over an arena cache as one dispatch, bit-exact with the fused path: its
+    """A model's pass of 1..ROWS_MAX rows over an arena cache replayed on the GPU, bit-exact with the fused path: its
     weights in slot buffers, its constants packed once, a write-once scratch for the widest pass, and a program per
-    pass shape (rows, attention blocks, arena, argmax) built from the family's layers and kept."""
+    pass shape (rows, attention blocks, arena, argmax) built from the family's layers, encoded once and replayed."""
 
     def __init__(self, sm: StreamedTextModel, fusions: Fusions | None = None) -> None:
         from ...engine.families import act_name
@@ -295,7 +298,7 @@ class MegaPass:
         self.Hk = int(getattr(c, "num_key_value_heads", None) or self.Hq)
         self.hd = int(sm.host[0].self_attn.head_dim)
         self.V = int(hh.mx.shape[0])
-        self.SPL = SPL
+        self.SPL, self.ROWS = SPL, ROWS_MAX
         if self.hd % 32 or self.hd > 256 or self.H % 8:
             raise ValueError("[mega] the kernel takes a head of 32k dims up to 256 and a width of 8k")
         # the rope: a row of frequencies a layer type (one for most families), turning the first rd dims of a head
@@ -330,55 +333,57 @@ class MegaPass:
         self._consts: dict[ConstKey, Tensor] = {}
         self._frozen = False
         self.logits_off = 0
-        self.head = self._ref(hh.mx)
+        self.head, self.head_q = self._ref(hh.mx), hh.mx.q
         if sm.head_key == sm.prefix + "embed_tokens.weight":
-            self.embed = self.head
+            self.embed, self.embed_q = self.head, self.head_q
         else:
             sm._mlx_embed()
             lin = sm.mlx_state.embed_lin
-            if lin is None or getattr(lin.mx, "sh", None) is None:
+            if lin is None or lin.mx is None or getattr(lin.mx, "sh", None) is None:
                 raise ValueError("[mega] the embedding table is not in a slot buffer")
-            self.embed = self._ref(lin.mx)
+            self.embed, self.embed_q = self._ref(lin.mx), lin.mx.q
         fn: NormModule = sm.norm
         centered = sm.fam.norm_centered
         self.final_norm = (self._const(("final", 0), lambda: _norm_array(fn, True, centered)), _eps(fn))
         # the widest pass, built once: what it reads gathers the weights and the constants, its scratch the size
-        prog = self._program(ROWS_MAX, SPL, lambda i, w: 0, True, 1)
+        prog = self._program(ROWS_MAX, SPL, lambda i, w: 0, True)
         self._frozen = True
         self.nb = len(self.bufs)
         if self.nb > BUFS_MAX:
             raise ValueError(f"[mega] {self.nb} weight buffers, the kernel binds {BUFS_MAX}")
-        self.consts = m.concatenate([p.reshape(-1).view(m.uint8) for p in self._cparts])
-        self.scr = m.zeros((prog.size,), dtype=m.uint8)
+        # the constants and the scratch whole pages, as the replay aliases them
+        consts = [p.reshape(-1).view(m.uint8) for p in self._cparts]
+        self.consts = m.concatenate([*consts, m.zeros((paged(self._csize) - self._csize,), dtype=m.uint8)])
+        self.scr = m.zeros((paged(prog.size),), dtype=m.uint8)
         m.eval(self.consts, self.scr, self.freqs)
-        self.ops = frozenset(prog.ops)
-        self.kernels: dict[int, MetalKernel] = {}
-        self.grid: dict[int, int] = {}
-        for xr in (8, 16):
-            self.kernels[xr] = kernel(self.nb, self.ops, self._defs(xr))
-            self.grid[xr] = self._tune(xr, self._probe(xr))
-        self._tabs: dict[TableKey, Table] = {}
+        # every op a pass shape compiles to: the widest's and a one-block pass's (its attention folding its own)
+        self.ops = frozenset(prog.ops) | self._program(ROWS_MAX, 1, lambda i, w: 0, True).ops
+        self.instructions = len(prog.rows)  # the most a pass has: the widest one's
+        self.replay = Replay(self)
 
     # -- what the program reads, gathered by the widest pass's build --
 
     def _ref(self, w: Weight) -> Tensor:
+        """a weight in a slot or pool buffer, bf16 or of a stored type the kernel reads (`STORED`): its reference"""
         sh = getattr(w, "sh", None)
-        if sh is None or w.packed is not None or w.q is not None:
+        if sh is None or w.packed is not None:
             raise ValueError("[mega] a weight outside a slot buffer")
+        if w.q is not None and w.q not in STORED:
+            raise ValueError(f"[mega] {w.q} weights are not in the kernel's ops")
         i = self._bid.get(id(sh.mx))
         if i is None:
             if self._frozen:
                 raise ValueError("[mega] a pass reads a weight buffer the widest pass did not")
             i = self._bid[id(sh.mx)] = len(self.bufs)
-            self.bufs.append(sh.mx)
+            self.bufs.append(sh.whole)
         return Tensor((i, int(w.off)), int(w.shape[1]))
 
-    def weight(self, w: Weight | LinearModule | None) -> tuple[Tensor, int, int]:
-        """a slot weight (or a host linear holding one): its reference, rows and columns"""
+    def weight(self, w: Linear | None) -> tuple[Tensor, int, int, Quant | None]:
+        """a slot weight (or a host linear holding one): its reference, rows, columns and stored type (None: bf16)"""
         wt = w if w is None or isinstance(w, Weight) else w.mx
         if wt is None:
             raise ValueError("[mega] a linear with no weight on the GPU")
-        return self._ref(wt), int(wt.shape[0]), int(wt.shape[1])
+        return self._ref(wt), int(wt.shape[0]), int(wt.shape[1]), wt.q
 
     def _const(self, key: ConstKey, make: Callable[[], mx_.array]) -> Tensor:
         """a constant packed once (4-byte aligned) behind the others, by `key`"""
@@ -426,111 +431,48 @@ class MegaPass:
 
     # -- the kernel --
 
-    def _defs(self, xr: int) -> dict[str, int]:
+    def defs(self, xr: int) -> dict[str, int]:
+        """the ops' compile-time constants for passes of up to xr rows"""
         from ..attn import ATTN_BLOCK
 
-        G = self.Hq // self.Hk
-        stage = max(8 * (8 + xr) * MV_KT * 2, 8 * (8 * 32 + xr * 32) * 4)
-        tgm = max(stage, G * self.hd * 4, (8 + self.hd) * 4, 2 * 256 * 4)
-        if tgm > TG_MEMORY:
-            raise ValueError(f"[mega] the ops take {tgm} bytes of threadgroup memory, a threadgroup has {TG_MEMORY}")
         return {
             "XROWS": xr,
             "MV_KT": MV_KT,
-            "TGM_BYTES": tgm,
-            "ATT_G": G,
+            "ATT_G": self.Hq // self.Hk,
             "ATT_D": self.hd,
             "ATT_P": ATTN_BLOCK,
             "PACC_OFF": self.pacc_off,
             "A_OFF": align(self.part_bytes),
         }
 
-    def _probe(self, xr: int) -> int:
-        """how many of the kernel's threadgroups this GPU runs at once, measured on it"""
-        m = mx()
-        tgs = 16 * (gpu().cores or 64)
-        z8 = m.zeros((8,), dtype=m.uint32)
-        kv = m.zeros((8,), dtype=m.uint8)
-        dims = m.array([1, 8, 0, 0, PROBE_SPINS, 1, 0, 0], dtype=m.uint32)
-        _, cnt = self.kernels[xr](
-            inputs=[*self.bufs, self.scr, self.consts, kv, self.freqs, z8, z8, z8, z8, z8, dims],
-            grid=(tgs * 256, 1, 1),
-            threadgroup=(256, 1, 1),
-            output_shapes=[(8,), (8,)],
-            output_dtypes=[m.uint32, m.uint32],
-            init_value=0,
-        )
-        m.eval(cnt)
-        return max(1, int(cnt[1]))
+    def tgm(self, xr: int) -> dict[OpName, int]:
+        """each op's threadgroup memory at xr rows: the bf16 matvec's and the head's tiles staged a simdgroup each, the
+        rest their reductions' and the attention's queries"""
+        G = self.Hq // self.Hk
+        small = max(G * self.hd * 4, (8 + self.hd) * 4, 2 * 256 * 4)
+        need = dict.fromkeys(OpName, small)
+        need[OpName.MATVEC] = max(small, 8 * (8 + xr) * MV_KT * 2)
+        need[OpName.HEAD] = max(small, 8 * (8 * 32 + xr * 32) * 4)
+        if max(need.values()) > TG_MEMORY:
+            raise ValueError(
+                f"[mega] an op takes {max(need.values())} bytes of threadgroup memory, a threadgroup has {TG_MEMORY}"
+            )
+        return need
 
-    def _program(
-        self, T: int, splits: int, kv_off: KvOff, argmax: bool, grid: int, layers: int | None = None
-    ) -> Program:
-        """a pass's program: every layer and the head, or (`layers`) the first few without it, as the tuner times"""
-        p = Program(T, ROWS_MAX, grid)
+    def _program(self, T: int, splits: int, kv_off: KvOff, argmax: bool) -> Program:
+        """a pass's program: every layer and the head"""
+        p = Program(T, ROWS_MAX)
         b = Block(self, p, kv_off, splits)
         b.embed()
-        for i in range(self.L if layers is None else layers):
+        for i in range(self.L):
             self.sm.fam.mega_layer(b, i)
-        if layers is None:
-            b.final(argmax)
+        b.final(argmax)
         return p
 
-    def _tune(self, xr: int, most: int) -> int:
-        """the grid the GPU runs the kernel fastest at, timed: two passes of xr rows through the first TUNE_LAYERS
-        layers over an arena of their own, one at its start and one reaching into a second attention block (a short
-        pass runs fastest on fewer threadgroups, a long attention on more: one at past 0 alone chose 18 on an M3 Pro,
-        25% slower than 36 at past 2000), their total least, at grids a step of the core count apart (doubling from 8
-        where the GPU reports no cores), up to `most` (an upper bound: on a light path the GPU admits more than the ops
-        keep running). The first grid a quarter slower than the best ends the search: past it threadgroups wait on
-        others the GPU has set aside"""
-        from ..attn import ATTN_BLOCK
-
-        m = mx()
-        layers = min(self.L, TUNE_LAYERS)
-        cap = 2 * ATTN_BLOCK
-        per = self.Hk * cap * self.hd * 2
-        kv = m.zeros((2 * layers * per,), dtype=m.uint8)
-
-        def kv_off(i: int, w: int) -> int:
-            return (2 * i + w) * per
-
-        parents = list(range(-1, xr - 1))
-        shapes = [(past, *self.metas(past, parents)) for past in (0, cap - ROWS_MAX)]
-        cores = gpu().cores
-        grids = [g for g in (range(cores, most + 1, cores) if cores else (8 << k for k in range(16))) if g <= most]
-        best, best_t = grids[0] if grids else most, float("inf")
-        ids = [0] * xr
-        for g in grids or [most]:
-            took = 0.0
-            for past, meta, path, splits in shapes:
-                tab = self._program(xr, splits, kv_off, False, g, layers).table(self.nb)
-                t = Table(m.array(tab), int(tab.shape[0]))
-                pos = list(range(past, past + xr))
-                m.eval(*self._launch(xr, t, g, kv, cap, ids, pos, meta, path, past))
-                least = float("inf")
-                for _ in range(TUNE_REPS):
-                    t0 = time.perf_counter()
-                    m.eval(*self._launch(xr, t, g, kv, cap, ids, pos, meta, path, past))
-                    least = min(least, time.perf_counter() - t0)
-                took += least
-            if took < best_t:
-                best, best_t = g, took
-            elif took > 1.25 * best_t:
-                break
-        return best
-
-    def table(self, T: int, splits: int, kv_off: KvOff, argmax: bool = True) -> Table:
-        """the program of a pass of T rows on the GPU, built once per (rows, attention blocks, arena, argmax) and
-        kept"""
-        key: TableKey = (T, splits, kv_off(0, 0), kv_off(0, 1), kv_off(self.L - 1, 1), argmax)
-        kept = self._tabs.get(key)
-        if kept is None:
-            tab = self._program(T, splits, kv_off, argmax, self.grid[8 if T <= 8 else 16]).table(self.nb)
-            a = mx().array(tab)
-            mx().eval(a)
-            kept = self._tabs[key] = Table(a, int(tab.shape[0]))
-        return kept
+    def table(self, T: int, splits: int, kv_off: KvOff, argmax: bool = True) -> np.ndarray:
+        """the program of a pass of T rows (`splits` attention blocks, the arena's layers at `kv_off`) as the table the
+        replay encodes, uint32 [instructions, W]"""
+        return self._program(T, splits, kv_off, argmax).table(self.nb)
 
     def logits(self, T: int) -> mx_.array:
         """the logits [T, V] float32 the last pass left in the scratch (a pass without its argmax)"""
@@ -549,46 +491,25 @@ class MegaPass:
         splits: int,
         past: int,
         argmax: bool = True,
-    ) -> tuple[mx_.array, mx_.array]:
-        """the pass: `kv` the arena (uint8), `cap` its rows a head, `ids` and `pos` the rows' tokens and positions,
-        `meta`/`path` the node metadata; (the argmax ids uint32 [T], the counters: the last nonzero where an
-        instruction never saw its inputs), lazily; `argmax` off leaves the ids zero and the logits in the scratch"""
-        xr = 8 if len(ids) <= 8 else 16
-        t = self.table(len(ids), splits, kv_off, argmax)
-        return self._launch(xr, t, self.grid[xr], kv, cap, ids, pos, meta, path, past)
+    ) -> np.ndarray:
+        """the pass, run and waited for: `kv` the arena (uint8), `cap` its rows a head, `ids` and `pos` the rows' tokens
+        and positions, `meta`/`path` the node metadata; the argmax ids uint32 [T] (zeros with `argmax` off, the logits
+        then in the scratch)"""
+        return self.replay.run(kv, cap, kv_off, ids, pos, meta, path, splits, past, argmax)
 
-    def _launch(
-        self,
-        xr: int,
-        t: Table,
-        grid: int,
-        kv: mx_.array,
-        cap: int,
-        ids: Sequence[int],
-        pos: Sequence[int],
-        meta: mx_.array,
-        path: mx_.array,
-        past: int,
-    ) -> tuple[mx_.array, mx_.array]:
-        """program `t` on `grid` threadgroups of the xr-row kernel, its inputs padded to 8 elements and more"""
-        m = mx()
-        T = len(ids)
-        pad = [0] * (ROWS_MAX - T)
-        ids_a = m.array(np.asarray([*ids, *pad], dtype=np.uint32))
-        pos_a = m.array(np.asarray([*pos, *pad], dtype=np.uint32))
-        if path.size < 8:
-            path = m.pad(path, ((0, 0), (0, 8 - int(path.shape[1]))))
-        dims = m.array([T, int(path.shape[1]), int(cap), int(past), 0, t.instructions, 0, 0], dtype=m.uint32)
-        assert dims.size == DIMS
-        out, cnt = self.kernels[xr](
-            inputs=[*self.bufs, self.scr, self.consts, kv, self.freqs, ids_a, pos_a, meta, path, t.tab, dims],
-            grid=(grid * 256, 1, 1),
-            threadgroup=(256, 1, 1),
-            output_shapes=[(T,), ((t.instructions + 2) * CS,)],
-            output_dtypes=[m.uint32, m.uint32],
-            init_value=0,
-        )
-        return out, cnt
+
+def _one_or_parts(mod: object, fused: str, names: tuple[str, ...]) -> Linears:
+    """`mod`'s fused projection `fused` where it has one, else its projections `names`, into one output"""
+    one: LinearModule | None = getattr(mod, fused, None)
+    if one is not None:
+        return one
+    parts: list[Linear] = []
+    for n in names:
+        p: LinearModule | None = getattr(mod, n, None)
+        if p is None:
+            raise ValueError(f"[mega] neither {fused} nor {n}")
+        parts.append(p)
+    return tuple(parts)
 
 
 def _eps(mod: NormModule) -> float:

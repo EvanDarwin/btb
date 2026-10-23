@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
-"""A pass's program: the megakernel's instructions over tensors in a write-once scratch, appended op by op. Each
-instruction waits on the ones that wrote the tensors it reads, recorded as it is appended, so a block is written as
-the ops it runs and the table's tickets and dependencies follow from it."""
+"""A pass's program: its instructions over tensors in a write-once scratch, appended op by op. Each instruction reads
+the output of the ones that wrote the tensors it reads, recorded as it is appended, so a block is written as the ops
+it runs and the table's dependencies follow from it."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from typing import TypeAlias
 
 import numpy as np
 
-from .kernel import CODE, DEPS, NUM, REF0, REFS, TICKETS_MAX, OpName, W
+from .kernel import CODE, DEPS, NUM, REF0, REFS, OpName, W
 
 # the buffers past the weights, placed after them once the weights are counted: the scratch, the constants, the arena
 SCR, CONSTS, KV = -1, -2, -3
@@ -24,13 +24,18 @@ Ref: TypeAlias = tuple[int, int]  # (buffer, byte offset), as the table carries 
 class Tensor:
     """a region an op reads or writes: `ref` its start, `cols` a row's elements of `esize` bytes; `src` the instruction
     that wrote it this pass (-1 before, or for a weight or a constant, which nothing writes); `scratch` a region the
-    pass writes before any op reads it"""
+    pass writes before any op reads it; `parts` the pieces of it that several ops write, a reader waiting on each"""
 
     ref: Ref
     cols: int = 0
     esize: int = 2
     src: int = -1
     scratch: bool = False
+    parts: tuple[Tensor, ...] = ()
+
+    def piece(self, col: int, cols: int) -> Tensor:
+        """`cols` of each row from column `col`, a region of its own an op writes (its rows `self.cols` apart)"""
+        return Tensor((self.ref[0], self.ref[1] + col * self.esize), cols, self.esize, scratch=self.scratch)
 
 
 # an instruction's references in order, A, B (read), C, D (written), E, F (read, or written by the op that says so);
@@ -49,12 +54,10 @@ def align(n: int) -> int:
 
 class Program:
     """the instructions of a pass of `T` rows, its scratch laid out for `rows` rows (the widest pass, so every width's
-    program places its tensors alike) and its work cut for `grid` threadgroups"""
+    program places its tensors alike)"""
 
-    def __init__(self, T: int, rows: int, grid: int) -> None:
-        if grid > TICKETS_MAX:
-            raise ValueError(f"[mega] a grid of {grid} threadgroups, an instruction's claim bits hold {TICKETS_MAX}")
-        self.T, self.R, self.grid = T, rows, grid
+    def __init__(self, T: int, rows: int) -> None:
+        self.T, self.R = T, rows
         self.size = 0  # the scratch's bytes
         self.rows: list[list[int]] = []
         self.ops: set[OpName] = set()
@@ -76,19 +79,17 @@ class Program:
         reads: Iterable[Tensor] = (),
         writes: Iterable[Tensor] = (),
     ) -> int:
-        """append `op` over `items` work items (cut into at most a grid's tickets, ticket k threadgroup k's, a ticket's
-        share of them run in turn) with its references and numbers; it waits on the writers of `reads` and becomes the
-        writer of `writes`, each written once a pass"""
+        """append `op` over `items` work items, a threadgroup each, with its references and numbers; it reads the output
+        of the writers of `reads` and becomes the writer of `writes`, each written once a pass"""
         idx = len(self.rows)
         read: set[int] = set()
-        for t in reads:
+        for t in (u for r in reads for u in r.parts or (r,)):
             if t.scratch and t.src < 0:
                 raise ValueError(f"[mega] {op} reads a region no op has written this pass")
             if t.src >= 0:
                 read.add(t.src)
-        # a writer another waited-on writer already waited on is left out: its writes are seen through that one's
-        # count (each count is published after a device fence and read before one), and every wait is a serial
-        # round trip to memory a ticket makes before its work
+        # a writer another read-from writer already read from is left out: a dispatch ordered after that one is ordered
+        # after it too (the replay's barriers place a command after every one before it)
         deps = {d for d in read if not any(self.before[e] >> d & 1 for e in read)}
         before = 0
         for d in deps:
@@ -104,8 +105,7 @@ class Program:
             raise ValueError(f"[mega] {op} takes {len(refs)} references, the table holds {REFS}")
         flat = [v for r in (*refs, *[None] * (REFS - len(refs))) for v in (r.ref if r is not None else (0, 0))]
         waits = [d + 1 for d in sorted(deps)]
-        tickets = min(int(items), self.grid)
-        self.rows.append([CODE[op], tickets, int(items), *flat, *n, fbits(f0), *waits, *[0] * (DEPS - len(waits))])
+        self.rows.append([CODE[op], int(items), *flat, *n, fbits(f0), *waits, *[0] * (DEPS - len(waits))])
         self.ops.add(op)
         return idx
 

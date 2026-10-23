@@ -20,6 +20,7 @@ from enum import StrEnum
 from typing import Any
 
 from btb.kinds import (
+    MEGA_STORED,
     PROPOSER_TAG,
     QUANT_KIND,
     STORED_CLASSES,
@@ -460,13 +461,15 @@ class MegaRefusal(StrEnum):
 def mega_refusal(kind: FamilyKind, storage: Storage, packed: bool = True) -> MegaRefusal | None:
     """why the megakernel cannot take this family's fixture in this storage, by the engine's own gates, in their
     order: the family's block (`Family.mega`: the plain dense block or the sandwich one), the weights it reads out of
-    slot buffers (a GGUF's quant blocks bound as stored under `packed`, `mlx_state.affine`, and the 12-bit store's
-    packed weights fall to the step; blocks dequantized on load are bf16 slots it reads), then the head width"""
+    slot buffers (a GGUF's quant blocks bound as stored under `packed` read as stored where every type of the storage
+    is one the kernel multiplies, `kinds.MEGA_STORED`; the 12-bit store's packed weights fall to the step; blocks
+    dequantized on load are bf16 slots it reads), then the head width"""
     fl = core.flags(kind)
     if Cap.DENSE not in fl and Cap.SANDWICH not in fl:
         return MegaRefusal.LAYOUT
     qc = quant_class(storage)
-    if STORAGE[storage].container is Container.PACK12 or (packed and qc not in (None, QuantClass.FLOAT)):
+    stored = packed and qc not in (None, QuantClass.FLOAT)
+    if STORAGE[storage].container is Container.PACK12 or (stored and not MEGA_STORED >= set(STORAGE[storage].quants)):
         return MegaRefusal.STORAGE
     hd = head_dim(kind)
     if hd is None or hd % MEGA_HEAD_MULTIPLE or hd > MEGA_HEAD_MAX:

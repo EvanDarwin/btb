@@ -493,16 +493,8 @@ def load(
                 sm.eos_ids = tuple(int(x) for x in (e if isinstance(e, (list, tuple)) else [e]))
         # ready is part of the load, not of one command: the card's graphs and the pass-cost curve (the card graph),
         # the MLX pass-cost curve (the fused tree), over a throwaway prompt - what every entry point is timed at
-        if dev.kind is Device.MLX and int(c.get("mlx_mega", 1)) and sm.fam.mega and not sm.cold:
-            from .mlx.mega import MegaPass
-
-            try:
-                sm._mega = MegaPass(sm)
-                sm.log(
-                    f"[mega] the pass as one dispatch: {sm._mega.nb} weight buffers, scratch {sm._mega.scr.size >> 20} MB"
-                )
-            except ValueError as e:
-                sm.log(f"[mega] off: {e}")
+        sm._mega_wanted = dev.kind is Device.MLX and bool(int(c.get("mlx_mega", 1)))
+        sm._build_mega()
         sm.draft_engine = None
         sm.draft_ks = (4, 3, 2)
         sm.warm()

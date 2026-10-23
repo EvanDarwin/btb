@@ -12,6 +12,8 @@ pub mod attn;
 pub mod delta;
 pub mod direct;
 pub mod gemv;
+#[cfg(target_os = "macos")]
+pub mod metal;
 pub mod sample;
 
 pub mod codes {
@@ -938,10 +940,7 @@ pub unsafe extern "C" fn btb_read_direct(
 /// `path` NUL-terminated UTF-16.
 #[no_mangle]
 pub unsafe extern "C" fn btb_open(path: *const u16) -> i64 {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        direct::open(path)
-    }))
-    .unwrap_or(ERR_PANIC as i64)
+    guard_i64(|| unsafe { direct::open(path) })
 }
 
 /// [`btb_open`], the file read through the system's file cache instead of around it: a read fills the cache,
@@ -952,10 +951,7 @@ pub unsafe extern "C" fn btb_open(path: *const u16) -> i64 {
 /// `path` NUL-terminated UTF-16.
 #[no_mangle]
 pub unsafe extern "C" fn btb_open_cached(path: *const u16) -> i64 {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        direct::open_cached(path)
-    }))
-    .unwrap_or(ERR_PANIC as i64)
+    guard_i64(|| unsafe { direct::open_cached(path) })
 }
 
 /// Release a handle from [`btb_open`]; `ERR_DOMAIN` if it is not open (a second close). Reads still running
@@ -985,4 +981,168 @@ pub unsafe extern "C" fn btb_read_at(
     depth: usize,
 ) -> i32 {
     guard(|| unsafe { direct::read_at(handle, off, len, dst, chunk_bytes, depth) })
+}
+
+/// [`guard`] for an entry returning a handle or an index (>= 0) or a negative `codes` value.
+fn guard_i64<F: FnOnce() -> i64>(f: F) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(ERR_PANIC as i64)
+}
+
+/// A Metal context on the system's GPU (macOS, `metal`): its handle (>= 0), or `ERR_IO` without a Metal device.
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub extern "C" fn btb_metal_open() -> i64 {
+    guard_i64(metal::open)
+}
+
+/// Release a Metal context and everything it holds; `ERR_DOMAIN` if it is not open.
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub extern "C" fn btb_metal_close(h: i64) -> i32 {
+    guard(|| metal::close(h))
+}
+
+/// A zeroed shared buffer of `len` bytes of the context's own: its index (>= 0).
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub extern "C" fn btb_metal_buffer(h: i64, len: u64) -> i64 {
+    guard_i64(|| metal::buffer(h, len))
+}
+
+/// Let go of buffer `b` of a Metal context (an alias: the memory stays its owner's), after every indirect command
+/// buffer binding it ([`btb_metal_free_icb`]); `ERR_DOMAIN` if it is not held.
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub extern "C" fn btb_metal_free_buffer(h: i64, b: i64) -> i32 {
+    guard(|| metal::free_buffer(h, b))
+}
+
+/// Let go of indirect command buffer `i` of a Metal context; `ERR_DOMAIN` if it is not held.
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub extern "C" fn btb_metal_free_icb(h: i64, i: i64) -> i32 {
+    guard(|| metal::free_icb(h, i))
+}
+
+/// A buffer over `len` bytes at `ptr` another allocator owns, not copied: both page-aligned (`ERR_DOMAIN`
+/// otherwise). Its index (>= 0).
+///
+/// # Safety
+/// `ptr` valid for `len` bytes while the context uses the buffer.
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub unsafe extern "C" fn btb_metal_alias(h: i64, ptr: *mut u8, len: u64) -> i64 {
+    guard_i64(|| unsafe { metal::alias(h, ptr, len) })
+}
+
+/// Buffer `b`'s contents pointer and length into `out` and `len`.
+///
+/// # Safety
+/// `out` and `len` writable.
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub unsafe extern "C" fn btb_metal_contents(
+    h: i64,
+    b: i64,
+    out: *mut *mut u8,
+    len: *mut u64,
+) -> i32 {
+    guard(|| unsafe { metal::contents(h, b, out, len) })
+}
+
+/// `src` (NUL-terminated UTF-8) compiled as the context's library, the math safe unless `fast` is nonzero;
+/// `ERR_PARSE` with the compiler's message in `err` (NUL-terminated, `errlen` bytes at most).
+///
+/// # Safety
+/// `src` NUL-terminated; `err` writable for `errlen` bytes, or null.
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub unsafe extern "C" fn btb_metal_compile(
+    h: i64,
+    src: *const std::ffi::c_char,
+    fast: i32,
+    err: *mut std::ffi::c_char,
+    errlen: usize,
+) -> i32 {
+    guard(|| unsafe { metal::compile(h, src, fast != 0, err, errlen) })
+}
+
+/// Function `name` of the context's library as a pipeline an indirect command buffer runs: its index (>= 0), or
+/// `ERR_PARSE` with Metal's message in `err`.
+///
+/// # Safety
+/// `name` NUL-terminated; `err` writable for `errlen` bytes, or null.
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub unsafe extern "C" fn btb_metal_pipeline(
+    h: i64,
+    name: *const std::ffi::c_char,
+    err: *mut std::ffi::c_char,
+    errlen: usize,
+) -> i64 {
+    guard_i64(|| unsafe { metal::pipeline(h, name, err, errlen) })
+}
+
+/// An indirect command buffer of `cmds` compute commands binding `binds` buffers each: its index (>= 0).
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub extern "C" fn btb_metal_icb(h: i64, cmds: u32, binds: u32) -> i64 {
+    guard_i64(|| metal::icb(h, cmds, binds))
+}
+
+/// Command `k` of `icb`: pipeline `pso` over gx x gy x gz threadgroups of `threads`, bind j buffer `bufs[j]` at byte
+/// `offs[j]`, after every command before it where `barrier` is nonzero. `ERR_DOMAIN` for an index or an offset out of
+/// range (nothing encoded).
+///
+/// # Safety
+/// `bufs` and `offs` readable for `nbind` elements.
+#[cfg(target_os = "macos")]
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn btb_metal_cmd(
+    h: i64,
+    icb: i64,
+    k: u32,
+    pso: i64,
+    nbind: u32,
+    bufs: *const i64,
+    offs: *const u64,
+    gx: u32,
+    gy: u32,
+    gz: u32,
+    threads: u32,
+    barrier: i32,
+) -> i32 {
+    guard(|| unsafe {
+        metal::cmd(
+            h,
+            icb,
+            k,
+            pso,
+            nbind,
+            bufs,
+            offs,
+            [gx, gy, gz],
+            threads,
+            barrier != 0,
+        )
+    })
+}
+
+/// The first `n` commands of `icb` replayed and waited for: the GPU's seconds into `gpu_s` (or null), or `ERR_IO`
+/// with the command buffer's error in `err`.
+///
+/// # Safety
+/// `gpu_s` writable or null; `err` writable for `errlen` bytes, or null.
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub unsafe extern "C" fn btb_metal_run(
+    h: i64,
+    icb: i64,
+    n: u32,
+    gpu_s: *mut f64,
+    err: *mut std::ffi::c_char,
+    errlen: usize,
+) -> i32 {
+    guard(|| unsafe { metal::run(h, icb, n, gpu_s, err, errlen) })
 }

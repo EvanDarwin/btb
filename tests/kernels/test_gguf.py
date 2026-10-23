@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 import torch
 
-from btb.kinds import PassTag, Quant, quant_tag, stored_quants
+from btb.kinds import PassTag, Quant, quant_tag, stored_in_place, stored_quants
 from tests.cert.manifest import QWEN3_06B_GGUF
 
 if TYPE_CHECKING:
@@ -219,6 +219,41 @@ def test_joined_stored_weights_are_their_members_in_one_launch(q: Quant) -> None
         assert np.array_equal(np.array(stored_matvec(q, j.streams, x[:t], *j.shape)), want), (q.value, t)
     for w, b in zip(ws, before, strict=True):
         assert np.array_equal(np.array(stored_matvec(q, w.streams, x, *w.shape)), b), q.value
+
+
+@pytest.mark.parametrize("q", [q for q in stored_quants() if stored_in_place(q)], ids=lambda q: q.value)
+def test_pooled_stored_weights_join_as_a_view_of_their_block(q: Quant) -> None:
+    """stored weights of a type read in place, end to end in one pool block (`weight_stored_pool`, as a GGUF binds
+    them): their join (q/k/v, gate/up) is a view over the same bytes, each of its rows bit-for-bit its member's at
+    every pass width; members out of order, of another type or another block are not joined at all (a copy would hold
+    the block's bytes twice)"""
+    need_mlx()
+    import mlx.core as mx
+
+    from btb import mlx as mlxdev
+    from btb.mlx.backend import stored_matvec
+
+    be = mlxdev.Backend.__new__(mlxdev.Backend)
+    cols, base = 512, 64
+    raws = [stored_blocks(q, r, cols, i) for i, r in enumerate((40, 24, 16))]
+    sh = mlxdev.Shared(base + sum(r.size for r in raws))
+    ws, at = [], base
+    for raw, rows in zip(raws, (40, 24, 16), strict=True):
+        sh.torch[at : at + raw.size] = torch.from_numpy(raw.reshape(-1).copy())
+        ws.append(be.weight_stored_pool(sh, at, raw.size, q, (rows, cols)))
+        at += raw.size
+    x = mx.array(np.random.default_rng(3).standard_normal((16, cols)).astype(np.float32))
+    before = [np.array(stored_matvec(q, w.streams, x, *w.shape)) for w in ws]
+    j = be.weight_fused(ws)
+    assert j is not None and j.shape == (80, cols) and j.sh is sh and (j.off, j.nb) == (base, at - base)
+    for t in range(1, 17):
+        want = np.concatenate([b[:t] for b in before], axis=1)
+        assert np.array_equal(np.array(stored_matvec(q, j.streams, x[:t], *j.shape)), want), (q.value, t)
+    other = mlxdev.Shared(raws[1].size)
+    other.torch[:] = torch.from_numpy(raws[1].reshape(-1).copy())
+    apart = be.weight_stored_pool(other, 0, raws[1].size, q, (24, cols))
+    for bad in ([ws[1], ws[0]], [ws[0], apart]):
+        assert be.weight_fused(bad) is None, q.value
 
 
 @pytest.mark.parametrize("q", stored_quants(), ids=lambda q: q.value)

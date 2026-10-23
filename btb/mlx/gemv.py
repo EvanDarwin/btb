@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from .core import mx
+from .core import metal_kernel, mx
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -47,7 +47,7 @@ def unpack_bf16(
     m = mx()
     with _gemv_lock:
         if _unpack_kernel is None:
-            _unpack_kernel = m.fast.metal_kernel(
+            _unpack_kernel = metal_kernel(
                 name="btb_unpack_p12", input_names=["lo", "hi4", "table"], output_names=["out"], source=_UNPACK_SRC
             )
     pairs = (n + 1) // 2
@@ -220,11 +220,10 @@ def _sgn(nb: int, xb: bool) -> int:
 
 
 def _gemm_kernel(xb: int, sgn: int, wf16: int = 0) -> MetalKernel:
-    m = mx()
     with _gemv_lock:
         k = _gemm_kernels.get((xb, sgn, wf16))
         if k is None:
-            k = _gemm_kernels[(xb, sgn, wf16)] = m.fast.metal_kernel(
+            k = _gemm_kernels[(xb, sgn, wf16)] = metal_kernel(
                 name=f"btb_gemm_rows_x{xb}_s{sgn}" + ("_f16" if wf16 else ""),
                 input_names=["w", "x"],
                 output_names=["y"],
@@ -532,7 +531,6 @@ def _mxfp4_pad(a: mx_.array) -> mx_.array:
 
 def _mxfp4_kernel(n: int, ggml: bool = False, pair: bool = False) -> Any:
     """the matvec over n matrices in one dispatch (n = 1 is the single call), compiled once per (n, layout)"""
-    m = mx()
     with _gemv_lock:
         k = _mxfp4_kernels.get((n, ggml, pair))
         if k is None:
@@ -542,7 +540,7 @@ def _mxfp4_kernel(n: int, ggml: bool = False, pair: bool = False) -> Any:
             sel = "const device uint8_t* wb_ = w0;\n    const device uint8_t* sb_ = s0;"
             for i in range(1, n):
                 sel += f"\n    if (mi == {i}) {{ wb_ = w{i}; sb_ = s{i}; }}"
-            k = m.fast.metal_kernel(
+            k = metal_kernel(
                 name=f"btb_gemv_mxfp4{'_ggml' if ggml else ''}{'_pair' if pair else ''}_x{n}",
                 input_names=[*names, "x"],
                 output_names=["y"],
@@ -653,7 +651,7 @@ def mxfp4_dequant(slot: mx_.array, rows: int, k: int, dtype: Any = None, ggml: b
     rows, k = int(rows), int(k)
     with _gemv_lock:
         if _mxfp4_dequant_kernel is None:
-            _mxfp4_dequant_kernel = m.fast.metal_kernel(
+            _mxfp4_dequant_kernel = metal_kernel(
                 name="btb_mxfp4_dequant",
                 input_names=["w", "s"],
                 output_names=["out"],

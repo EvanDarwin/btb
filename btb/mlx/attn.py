@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, TypeAlias
 import numpy as np
 
 from ..kinds import Parents
-from .core import mx
+from .core import metal_kernel, mx
 from .gemv import _gemv_lock
 
 if TYPE_CHECKING:
@@ -585,7 +585,7 @@ def rope_rows(x: mx_.array, rd: int, freqs: mx_.array, scaling: float, pos: Sequ
     global _rope_rows_kernel
     m = mx()
     if _rope_rows_kernel is None:
-        _rope_rows_kernel = m.fast.metal_kernel(
+        _rope_rows_kernel = metal_kernel(
             name="btb_rope_rows", input_names=["x", "freqs", "pos"], output_names=["out"], source=_ROPE_ROWS_SRC
         )
     B, H, D = (int(s) for s in x.shape)
@@ -690,7 +690,7 @@ def rope_rows2(
     if int(rd) != D or q.dtype != k.dtype:
         return rope_rows(q, rd, freqs, scaling, pos), rope_rows(k, rd, freqs, scaling, pos)
     if _rope_rows2_kernel is None:
-        _rope_rows2_kernel = m.fast.metal_kernel(
+        _rope_rows2_kernel = metal_kernel(
             name="btb_rope_rows2",
             input_names=["x", "y", "freqs", "pos"],
             output_names=["ox", "oy"],
@@ -763,7 +763,6 @@ def _attn_kernel(
     shape; `kq` reads an int8 cache with a scale per row, `seg` a two-segment cache (rows past `seg` from k2/v2),
     `mapped` a paged one (each row through the conversation's row map)"""
     global _attn_fold
-    m = mx()
     with _gemv_lock:
         k = _attn_kernels.get((D, g, kq, seg, nt, mapped))
         if k is None:
@@ -775,7 +774,7 @@ def _attn_kernel(
                 + (["rmap"] if mapped else [])
             )
             rows = "i8" if kq else "bf16"
-            k = m.fast.metal_kernel(
+            k = metal_kernel(
                 name=f"btb_attn_nodes_{rows}{'_seg' if seg else ''}{'_map' if mapped else ''}_d{D}_g{g}_n{nt}",
                 input_names=names,
                 output_names=["pm", "pl", "pacc"],
@@ -784,7 +783,7 @@ def _attn_kernel(
             )
             _attn_kernels[(D, g, kq, seg, nt, mapped)] = k
         if _attn_fold is None:
-            _attn_fold = m.fast.metal_kernel(
+            _attn_fold = metal_kernel(
                 name="btb_attn_fold",
                 input_names=["pm", "pl", "pacc", "meta", "sinks"],
                 output_names=["out"],
@@ -1052,11 +1051,10 @@ _prefill_kernels: dict[tuple[int, bool], MetalKernel] = {}
 def _attn_prefill_kernel(g: int, mapped: bool = False) -> MetalKernel:
     """the prefill kernel for g query heads per kv head at head_dim 256, compiled once per g; `mapped` a paged
     cache's (its older rows through the conversation's row map, the chunk's own in k2/v2)"""
-    m = mx()
     with _gemv_lock:
         k = _prefill_kernels.get((g, mapped))
         if k is None:
-            k = _prefill_kernels[(g, mapped)] = m.fast.metal_kernel(
+            k = _prefill_kernels[(g, mapped)] = metal_kernel(
                 name=f"btb_attn_prefill_d256_g{g}{'_map' if mapped else ''}",
                 input_names=["q", "k", "v", "par", "sc", *(["k2", "v2", "rmap"] if mapped else [])],
                 output_names=["out"],
@@ -1136,12 +1134,13 @@ def attn_decode(
     v2: mx_.array | None = None,
 ) -> mx_.array:
     """One query row per head over the first `n` rows: `q` [Hq, D] float32 -> [Hq, D] float32, lazily
-    (`attn_nodes` over one node); `params` = `attn_params(n, window=...)` when shared across layers. A paged cache's:
-    `rmap` its row map over the rows before the step's, the step's own row in `k2`/`v2` [1, Hk, 1, D]"""
+    (`attn_nodes` over one node); `params` = `attn_params(n, window=...)` when shared across layers. The step's own
+    row in `k2`/`v2` [1, Hk, 1, D] (a paged cache's or an arena's), the rows before it through `rmap`, a paged
+    cache's row map, or in place without one"""
     global _NO_PATH
     m = mx()
     if params is None:
-        params = attn_params(n, window, batch, pbase, kbatch, seg=int(n) - 1 if rmap is not None else None)
+        params = attn_params(n, window, batch, pbase, kbatch, seg=int(n) - 1 if k2 is not None else None)
     meta, splits = params
     if _NO_PATH is None:
         _NO_PATH = m.zeros((1, 1), dtype=m.uint32)
@@ -1170,13 +1169,13 @@ def attn_tree(
     v2: mx_.array | None = None,
 ) -> mx_.array:
     """`attn_nodes` for a speculative pass: `parents` (-1 for the prefix) gives each node its path, the rows sit
-    after `past` in node order; `sinks` and `window` are gpt-oss's; `prepared` = `tree_meta(...)`. A paged cache's:
-    `rmap` its row map over the prefix, the tree's own rows in `k2`/`v2` [1, Hk, T, D] in node order"""
-    paged = rmap is not None
+    after `past` in node order; `sinks` and `window` are gpt-oss's; `prepared` = `tree_meta(...)`. The tree's own rows
+    in `k2`/`v2` [1, Hk, T, D] in node order (a paged cache's or an arena's), the prefix through `rmap`, a paged
+    cache's row map, or in place without one"""
     meta, path, splits = (
         prepared
         if prepared is not None
-        else tree_meta(past, parents, window, batch, pbase, kbatch, seg=int(past) if paged else None)
+        else tree_meta(past, parents, window, batch, pbase, kbatch, seg=int(past) if k2 is not None else None)
     )
     return attn_nodes(q, k, v, meta, path, scale, splits, sinks=sinks, ks=ks, vs=vs, rmap=rmap, k2=k2, v2=v2)
 

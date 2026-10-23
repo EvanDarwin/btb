@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from .core import mx
+from .core import metal_kernel, mx
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -55,7 +55,7 @@ def kv_store(buf: mx_.array, rows: mx_.array, n0: int) -> mx_.array:
     m = mx()
     with _lock:
         if _store_kernel is None:
-            _store_kernel = m.fast.metal_kernel(
+            _store_kernel = metal_kernel(
                 name="btb_kv_store", input_names=["buf", "rows", "n0"], output_names=["done"], source=_STORE_SRC
             )
     at = m.array(np.full((8,), int(n0), dtype=np.uint32))
@@ -77,7 +77,7 @@ def kv_scatter(kb: mx_.array, vb: mx_.array, k: mx_.array, v: mx_.array, at: mx_
     m = mx()
     with _lock:
         if _scatter_kernel is None:
-            _scatter_kernel = m.fast.metal_kernel(
+            _scatter_kernel = metal_kernel(
                 name="btb_kv_scatter",
                 input_names=["kb", "vb", "k", "v", "at"],
                 output_names=["done"],

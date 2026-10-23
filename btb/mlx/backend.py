@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from ..kinds import QUANT_KIND, Log, Quant, QuantClass, quant_key
+from ..kinds import QUANT_KIND, Log, Quant, QuantClass, quant_key, stored_in_place
 from .core import bf16_weight, from_mx, info, mx, to_mx
 from .gemv import gemv, matmul_mxfp4, matmul_mxfp4_pair, unpack_bf16
 from .iquant import (
@@ -64,11 +64,7 @@ def stored_streams(q: Quant, raw: Any) -> tuple[Any, ...]:
     m = mx()
     a = raw if isinstance(raw, m.array) else m.array(np.asarray(raw, dtype=np.uint8).reshape(-1))
     out = (
-        repack_iq4nl(a)
-        if q is Quant.IQ4_NL
-        else (a, *repack_lattice(quant_key(q), a))
-        if QUANT_KIND[q] is QuantClass.LATTICE
-        else (a,)
+        (a,) if stored_in_place(q) else repack_iq4nl(a) if q is Quant.IQ4_NL else (a, *repack_lattice(quant_key(q), a))
     )
     if a is not raw:
         m.eval(*out)
@@ -126,6 +122,25 @@ def _join_stored(ws: Sequence[Weight]) -> Weight | None:
         w.streams = tuple(views)
         m.eval(*w.streams)
     return Weight(q=w0.q, streams=joined, shape=(sum(int(w.shape[0]) for w in ws), int(w0.shape[1])))
+
+
+def _join_pooled(ws: Sequence[Weight]) -> Weight | None:
+    """pool-resident stored weights (`Backend.weight_stored_pool`) of one type and width, end to end in one block,
+    as one launch's: a view over their bytes. None where they are not: a copy would hold the bytes twice"""
+    w0 = ws[0]
+    sh: Shared | None = getattr(w0, "sh", None)
+    if sh is None or any(getattr(w, "sh", None) is not sh for w in ws):
+        return None
+    off = w0.off
+    for w in ws:
+        if w.q is not w0.q or w.shape[1] != w0.shape[1] or w.off != off:
+            return None
+        off += w.nb
+    nb = off - w0.off
+    shape = (sum(int(w.shape[0]) for w in ws), int(w0.shape[1]))
+    f = Weight(q=w0.q, streams=(sh.view_mx(w0.off, nb, mx().uint8, (nb,)),), shape=shape)
+    f.sh, f.off, f.nb = sh, w0.off, nb
+    return f
 
 
 class Weight:
@@ -282,7 +297,7 @@ class Backend:
         """One weight over several with the same columns (one matmul instead of several), None where they cannot be
         one: adjacent slot weights as a view, no copy; resident stored weights of one type joined (`_join_stored`)."""
         if ws and all(getattr(w, "q", None) is not None for w in ws):
-            return _join_stored(ws)
+            return _join_pooled(ws) if any(getattr(w, "sh", None) is not None for w in ws) else _join_stored(ws)
         if not ws or any(getattr(w, "sh", None) is None for w in ws):
             return None
         sh = ws[0].sh
@@ -314,6 +329,13 @@ class Backend:
         """a GGUF weight of a stored type `q` kept as its own blocks (`stored_streams`), never a bf16 copy: its
         type's kernel reads them as stored, batch-invariant. `raw` the file's uint8 bytes for `shape`."""
         return Weight(q=q, streams=stored_streams(q, raw), shape=shape)
+
+    def weight_stored_pool(self, shared: Shared, off: int, nb: int, q: Quant, shape: Sequence[int]) -> Weight:
+        """a resident GGUF weight of a type read in place (`kinds.stored_in_place`) as the `nb` bytes of a pool block
+        at `off`, never rewritten: neighbours join as a view (`weight_fused`), the megakernel reads it where it is"""
+        w = Weight(q=q, streams=(shared.view_mx(off, nb, mx().uint8, (nb,)),), shape=shape)
+        w.sh, w.off, w.nb = shared, int(off), int(nb)
+        return w
 
     def weight_stored_slot(self, shared: Shared, off: int, nb: int, q: Quant, shape: Sequence[int]) -> Weight:
         """a stored type's blocks as the `nb` bytes of a shared slot at `off` (a cold layer's or an expert's,

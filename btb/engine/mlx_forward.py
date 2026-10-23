@@ -7,14 +7,14 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, TypeAlias, TypeGuard
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, TypeGuard, cast
 
 import numpy as np
 import torch
 
 from .. import mlx as mlxdev
 from .. import pool
-from ..kinds import LayerKind, NodePath, Parents, PassTag, TokenRows, Tokens
+from ..kinds import LayerKind, NodePath, Parents, PassTag, TokenRows, Tokens, stored_in_place
 from ..mlx import fused as fk
 from ..sampling import GREEDY
 from ..session import Session
@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from ..mlx import Shared
     from ..mlx.attn import NodeMeta
     from .cache import KvCache
+    from .model import StreamedTextModel
 
     # a pass's attention mask: causal, a boolean one over its rows (a tree's), or none (one row)
     AttnMask: TypeAlias = Literal["causal"] | mx_.array | None
@@ -59,7 +60,7 @@ class MlxState:
     ahead: Shared | None = None
     weights: dict[Any, Any] | None = None
     family_ok: bool | None = None
-    affine: bool = False  # linears bound as a GGUF's own quant blocks (their kernels): no megakernel, no fused step
+    affine: bool = False  # linears bound as a GGUF's blocks outside the pool (`_bind_gguf_stored`): no megakernel
     rope_cache: tuple[Any, ...] | None = None
     embed_w: Any = None
     embed_lin: _HostLinear | None = None
@@ -79,7 +80,8 @@ class _PagedRows:
     """A paged layer's rows as one pass's attention reads them: the pool's K and V regions [1, Hk, rows, D], the
     conversation's rows before the pass through `old` (uint32, at least one entry), and the pass's own `k2`/`v2`
     [1, Hk, T, D] in the regions' dtype, read as made: MLX orders no read of a region after `kv_scatter`'s write
-    into it, so the pass's rows are read from the regions by the passes after it."""
+    into it, so the pass's rows are read from the regions by the passes after it. `in_place`: the rows before the
+    pass are the regions' first `past` (an arena's, `old` the identity), read without the map where a kernel can"""
 
     k: mx_.array
     v: mx_.array
@@ -87,17 +89,19 @@ class _PagedRows:
     past: int
     k2: mx_.array
     v2: mx_.array
+    in_place: bool = False
 
     def rows(self) -> tuple[mx_.array, mx_.array]:
         """every row in order, [1, Hk, past + T, D]: a gathered copy, for MLX's own attention"""
         m = mlxdev.mx()
         if not self.past:
             return self.k2, self.v2
-        idx = self.old[: self.past]
-        return (
-            m.concatenate([m.take(self.k, idx, axis=2), self.k2], axis=2),
-            m.concatenate([m.take(self.v, idx, axis=2), self.v2], axis=2),
-        )
+        if self.in_place:
+            k, v = self.k[:, :, : self.past], self.v[:, :, : self.past]
+        else:
+            idx = self.old[: self.past]
+            k, v = m.take(self.k, idx, axis=2), m.take(self.v, idx, axis=2)
+        return m.concatenate([k, self.k2], axis=2), m.concatenate([v, self.v2], axis=2)
 
 
 def _pick_keys(pick: Any, positions: Any, last_only: bool) -> list[int] | None:
@@ -183,9 +187,10 @@ class _MlxMixin(_State):
         lins = [m for m in lins if m.mx is None]
         if not lins:
             return 0
-        lins = [m for m in lins if not self._bind_gguf_stored(m)]
+        placed = self._bind_gguf_pooled(lins)
+        lins = [m for m in lins if m.mx is None and not self._bind_gguf_stored(m)]
         if not lins:
-            return 0
+            return placed
         be = self.mlx
         assert be is not None
         rd = Native.read_direct
@@ -212,7 +217,7 @@ class _MlxMixin(_State):
                 # shape kept for any host path that still reads it
                 m.weight = torch.nn.Parameter(region.view(torch.bfloat16).view(rows, cols), requires_grad=False)
             self.mlx_state.bytes += cur
-            return cur
+            return placed + cur
         items, cur = self._layer_items(lins)
         sh, base = self._shared_ahead(cur)
         chunk = getattr(self, "cold_chunk", 16 << 20)
@@ -232,6 +237,37 @@ class _MlxMixin(_State):
             self.bytes_streamed += nb
         for m, _path, _off, nb, so in items:
             m.mx = be.weight_slot(sh, base + so, nb, tuple(m.weight.shape))
+        self.mlx_state.bytes += cur
+        return placed + cur
+
+    def _bind_gguf_pooled(self, lins: Sequence[Any]) -> int:
+        """the GGUF tensors among `lins` of a stored type read in place (`kinds.stored_in_place`), end to end in one
+        pool buffer (each type's blocks are an even number of bytes, all its kernels' f16 reads need), bound there
+        (`Backend.weight_stored_pool`): neighbours join as a view and the megakernel reads them where they are. The
+        torch weight becomes a shape, as `_bind_gguf_stored` leaves it. Returns the bytes placed."""
+        gg = self.gguf
+        if gg is None or not self.gguf_packed:
+            return 0
+        items, cur = [], 0
+        for m in lins:
+            name = self._gguf_names.get(m.key)
+            if name is None or not gg.storable(name):
+                continue
+            w = gg.stored(name)
+            if not stored_in_place(w.q):
+                continue
+            items.append((m, w, cur))
+            cur += int(w.raw.numel())
+        if not items:
+            return 0
+        be = self.mlx
+        assert be is not None
+        sh, base = self._shared_ahead(cur)
+        for m, w, so in items:
+            nb = int(w.raw.numel())
+            sh.torch[base + so : base + so + nb].copy_(w.raw.reshape(-1))
+            m.mx = be.weight_stored_pool(sh, base + so, nb, w.q, w.shape)
+            m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*w.shape), requires_grad=False)
         self.mlx_state.bytes += cur
         return cur
 
@@ -303,14 +339,15 @@ class _MlxMixin(_State):
 
     def _mlx_tree_prep(self, cache: Any, past: int, parents: Parents) -> tuple[NodeMeta | None, list[int]]:
         """What a tree verify pass needs once, not per layer: the node kernel's metadata (a cache with no row
-        selected; a paged cache's prefix through its row map, the pass's rows as made) and every node's position,
-        past + depth, for the one-launch rope."""
+        selected; a paged cache's prefix through its row map and an arena's in place, the pass's rows as made) and
+        every node's position, past + depth, for the one-launch rope."""
         T = len(parents)
         depth = [0] * T
         for j in range(T):
             depth[j] = 0 if parents[j] < 0 else depth[parents[j]] + 1
         cl0 = cache.layers[0] if getattr(cache, "layers", None) else None
-        seg = int(past) if isinstance(cache, PagedCache) else None
+        rows = isinstance(cache, PagedCache) or (isinstance(cl0, GrowLayer) and cl0.in_arena(int(past) + T))
+        seg = int(past) if rows else None
         prep = mlxdev.tree_meta(past, parents, seg=seg) if (cl0 is None or getattr(cl0, "_row", None) is None) else None
         return prep, [int(past) + d for d in depth]
 
@@ -779,7 +816,7 @@ class _MlxMixin(_State):
                 scale,
                 window=win,
                 prepared=prepared,
-                rmap=pr.old,
+                rmap=None if pr.in_place else pr.old,
                 k2=pr.k2,
                 v2=pr.v2,
             )
@@ -797,7 +834,7 @@ class _MlxMixin(_State):
                 n,
                 scale,
                 params=attn_pa.by_window[win],
-                rmap=pr.old,
+                rmap=None if pr.in_place else pr.old,
                 k2=pr.k2,
                 v2=pr.v2,
             )
@@ -814,7 +851,8 @@ class _MlxMixin(_State):
         self, cache: KvCache | None, i: int, kh: mx_.array, vh: mx_.array, writes: list[mx_.array]
     ) -> tuple[GrowLayer | _PagedRows | None, mx_.array, mx_.array]:
         """Append this layer's K/V rows: in place on the GPU for a shared cache layer, through torch otherwise; a
-        paged layer's into its pages (`_mlx_page_append`), the writes' flags onto `writes` for the pass to evaluate."""
+        paged layer's into its pages (`_mlx_page_append`) and an arena layer's into the arena (`_mlx_arena_append`),
+        the writes' flags onto `writes` for the pass to evaluate."""
         m = mlxdev.mx()
         if cache is None:
             return None, kh, vh
@@ -824,11 +862,40 @@ class _MlxMixin(_State):
             pr = self._mlx_page_append(cache, cl, kh, vh, writes)
             return pr, pr.k2, pr.v2
         if isinstance(cl, GrowLayer) and cl.shared:
+            ar = self._mlx_arena_append(cache, cl, kh, vh, writes)
+            if ar is not None:
+                return ar, ar.k2, ar.v2
             K, V = cl.mx_update(kh, vh)
             return cl, K, V
         m.eval(kh, vh)
         kf, vf = cache.update(mlxdev.from_mx(kh), mlxdev.from_mx(vh), i)
         return None, mlxdev.to_mx(kf), mlxdev.to_mx(vf)
+
+    def _mlx_arena_append(
+        self, cache: KvCache, cl: GrowLayer, kh: mx_.array, vh: mx_.array, writes: list[mx_.array]
+    ) -> _PagedRows | None:
+        """A pass's rows `kh`/`vh` [1, Hk, T, D] of a layer in the megakernel's arena written in place with the pass, as
+        a paged layer's are (`mlx.kv_scatter`, the flag onto `writes`): an eval of each write would split the step's
+        graph at every layer. Returns what its attention reads, the arena's rows before the pass in place (the identity
+        map beside them for the kernel that takes them only through one); None where the layer is not in the arena
+        (`GrowLayer.arena_rows`)"""
+        got = cl.arena_rows(kh, vh)
+        if got is None:
+            return None
+        kb, vb, past = got
+        T = int(kh.shape[2])
+        # the pass's maps, made at its first arena layer for every layer
+        key = (past, T)
+        maps = getattr(cache, "_arena_maps", None)
+        if maps is None or maps[0] != key:
+            m = mlxdev.mx()
+            rows = np.arange(past + T, dtype=np.uint32)
+            maps = (key, m.array(rows[:past] if past else np.zeros(1, np.uint32)), m.array(rows[past:]))
+            setattr(cache, "_arena_maps", maps)  # noqa: B010  not a DynamicCache slot: one pass's maps, every layer's
+        k2 = kh if kh.dtype == kb.dtype else kh.astype(kb.dtype)
+        v2 = vh if vh.dtype == vb.dtype else vh.astype(vb.dtype)
+        writes.append(mlxdev.kv_scatter(kb, vb, k2, v2, maps[2]))
+        return _PagedRows(kb, vb, maps[1], past, k2, v2, in_place=True)
 
     def _mlx_page_append(
         self, cache: PagedCache, cl: PagedLayer, kh: mx_.array, vh: mx_.array, writes: list[mx_.array]
@@ -1323,6 +1390,20 @@ class _MlxMixin(_State):
 
         return past + T <= cap and past + T <= mg.SPL * ATTN_BLOCK
 
+    def _build_mega(self) -> None:
+        """the megakernel over the weights where they lie now, where the engine takes it (asked for at load, the
+        family's block, every layer resident): at load, and again after a regrow moves a layer's weights"""
+        self._mega = None
+        if not self._mega_wanted or not self.fam.mega or self.cold:
+            return
+        from ..mlx.mega import MegaPass
+
+        try:
+            mg = self._mega = MegaPass(cast("StreamedTextModel", self))
+            self.log(f"[mega] the pass as one dispatch: {mg.nb} weight buffers, scratch {mg.scr.size >> 20} MB")
+        except ValueError as e:
+            self.log(f"[mega] off: {e}")
+
     def _mega_serves(self) -> bool:
         """whether the megakernel takes this engine's passes, the engine's half of `_mega_ok`: built, every layer
         resident, the family's block, its weights in slot buffers, a bf16 state"""
@@ -1375,14 +1456,12 @@ class _MlxMixin(_State):
 
         sampled = pick is not None and not pick.greedy
         pos = [past + d for d in depth]
-        out, cnt = mg.run(buf, cap, kv_off, ids, pos, meta, path, splits, past, argmax=not sampled)
+        got = mg.run(buf, cap, kv_off, ids, pos, meta, path, splits, past, argmax=not sampled)
         if sampled:
-            # the sample over the logits the kernel's head op left in its scratch, ordered after the pass by
-            # taking its output as an input, evaluated with it: one sync a pass
-            out = pick.pick_mx(mg.logits(T), [pick.key_for(p) for p in pos], after=out)
-        m.eval(out, cnt)
-        if int(cnt[-1]):
-            raise RuntimeError(f"[mega] instruction {int(cnt[-1]) - 1} never saw its inputs: a scheduling bug")
+            # the sample over the logits the pass's head op left in its scratch, the pass done when `run` returns
+            picked = pick.pick_mx(mg.logits(T), [pick.key_for(p) for p in pos])
+            m.eval(picked)
+            got = np.asarray(picked)
         for cl in cache.layers:
             cl.mx_advance(T, Hk, hd, torch.bfloat16)
         be = self.mlx
@@ -1391,7 +1470,7 @@ class _MlxMixin(_State):
         be.stat["layer_s"] += time.time() - t0
         be.stat["evals"] += 1
         self.compute_s += time.time() - t0
-        return torch.from_numpy(np.asarray(out).astype(np.int32)).view(1, T)
+        return torch.from_numpy(got.astype(np.int32)).view(1, T)
 
     def _mlx_embed(self) -> mx_.array:
         """The token embedding table as an MLX array (the head's, when tied; a copy in unified memory else)."""

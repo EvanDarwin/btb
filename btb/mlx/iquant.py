@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from .core import mx
-from .matvec import SHAPES, Shapes, blocks, launch
+from .core import metal_kernel, mx
+from .matvec import SHAPES, Frags, Shapes, blocks, launch
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -69,13 +69,14 @@ _KV = "constant int KV[16] = {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69
 # vector-loaded. lane = block (one lane owns 32 weights: one uint4 + one f16 a block; 32 lanes read 512 contiguous
 # bytes). Register-only, batch-invariant. cols = NB*32, walked 32 blocks (BW = 1024 weights) a step.
 _MATVEC_IQ4NL = blocks(
-    "",
-    "        uint b = c * 32 + lane;\n        bool ok = b < NB;\n        float dd[RP];\n        uint4 qq[RP];\n",
-    r"""
+    Frags(
+        "",
+        "        uint b = c * 32 + lane;\n        bool ok = b < NB;\n        float dd[RP];\n        uint4 qq[RP];\n",
+        r"""
             dd[r] = ok ? (float)Dd[(size_t)row * NB + b] : 0.0f;
             qq[r] = ok ? ((const device uint4*)Qq)[(size_t)row * NB + b] : uint4(0);
 """,
-    r"""
+        r"""
             if (ok) {
                 const device T* xb = xc + lane * 32;  // read in place a row: 32 held in registers spill
                 #pragma unroll
@@ -94,6 +95,7 @@ _MATVEC_IQ4NL = blocks(
                 }
             }
 """,
+    )
 )
 _DEQUANT_IQ4NL = r"""
     uint b = thread_position_in_grid.x;
@@ -116,9 +118,10 @@ _DEQUANT_IQ4NL = r"""
 # q the nibble of qs[16*ib + (col&15)] (low half of the block's cols the low nibble, high half the high). lane =
 # col within a 32-block (0..31). Register-only, batch-invariant. cols = NSB*256.
 _MATVEC_IQ4XS = blocks(
-    "    uint hi = lane >> 4, bx = lane & 15;\n",
-    "        float w[RP][8];\n",
-    r"""
+    Frags(
+        "    uint hi = lane >> 4, bx = lane & 15;\n",
+        "        float w[RP][8];\n",
+        r"""
             const device uchar* blk = W + ((size_t)row * NSB + c) * 136;
             float d = (float)(*(const device half*)blk);
             uint sh = (uint)blk[2] | ((uint)blk[3] << 8);
@@ -133,7 +136,7 @@ _MATVEC_IQ4XS = blocks(
                 w[r][ib] = dl * (float)KV[q];
             }
 """,
-    r"""
+        r"""
             float xv[8];
             #pragma unroll
             for (int k = 0; k < 8; k++) xv[k] = (float)xc[32 * k + lane];
@@ -142,6 +145,7 @@ _MATVEC_IQ4XS = blocks(
                 #pragma unroll
                 for (int k = 0; k < 8; k++) acc[r][tr] += w[r][k] * xv[k];
 """,
+    )
 )
 _DEQUANT_IQ4XS = r"""
     uint gid = thread_position_in_grid.x;
@@ -192,7 +196,7 @@ def _dequant(kind: str, w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
     with _lock:
         k = _deq.get(kind)
         if k is None:
-            k = _deq[kind] = m.fast.metal_kernel(
+            k = _deq[kind] = metal_kernel(
                 name=f"btb_{kind}_dequant", input_names=["W"], output_names=["out"], header=_KV, source=src
             )
     grid = ((nblk * 32 + 255) // 256) * 256
@@ -241,7 +245,7 @@ def dequant_iq4nl(d: mx_.array, q: mx_.array, rows: int, cols: int) -> mx_.array
     nblk = int(rows * cols // 32)
     with _lock:
         if _iq4nl_deq is None:
-            _iq4nl_deq = m.fast.metal_kernel(
+            _iq4nl_deq = metal_kernel(
                 name="btb_iq4nl_dequant",
                 input_names=["Dd", "Qq"],
                 output_names=["out"],
@@ -290,9 +294,10 @@ _APPLY_G8 = r"""
             }
 """
 _MATVEC_IQ3XXS = blocks(
-    "    uint ib = lane >> 2, l = lane & 3, cb = 8 * lane;   // two 4-value grid entries a lane\n",
-    _DECL_G8,
-    r"""
+    Frags(
+        "    uint ib = lane >> 2, l = lane & 3, cb = 8 * lane;   // two 4-value grid entries a lane\n",
+        _DECL_G8,
+        r"""
             const device uchar* blk = W + ((size_t)row * NSB + c) * 98;
             float d = (float)(*(const device half*)blk);
             const device uchar* qs = blk + 2;
@@ -306,7 +311,8 @@ _MATVEC_IQ3XXS = blocks(
             #pragma unroll
             for (int j = 0; j < 4; j++) { float v = (float)GRID[i2 * 4 + j]; g[r][4 + j] = (signs & (1 << (j + 4))) ? -v : v; }
 """,
-    _APPLY_G8,
+        _APPLY_G8,
+    )
 )
 _DEQUANT_IQ3XXS = r"""
     uint gid = thread_position_in_grid.x;
@@ -333,9 +339,10 @@ _DEQUANT_IQ3XXS = r"""
 # sub-groups of 8 a block; the (256,8) grid gives 8 values a sub-group, signed by the group's sign byte, scaled by
 # db = d*(0.5 + scale)*0.25. lane = col within a 32-block, l = lane>>3 the sub-group, j = lane&7 the value.
 _MATVEC_IQ2XXS = blocks(
-    "    uint ig = lane >> 2, sub = lane & 3, cb = 8 * lane;   // one grid entry a lane\n",
-    _DECL_G8,
-    r"""
+    Frags(
+        "    uint ig = lane >> 2, sub = lane & 3, cb = 8 * lane;   // one grid entry a lane\n",
+        _DECL_G8,
+        r"""
             const device uchar* blk = W + ((size_t)row * NSB + c) * 66;
             float d = (float)(*(const device half*)blk);
             const device uchar* grp = blk + 2 + 8 * ig;
@@ -346,7 +353,8 @@ _MATVEC_IQ2XXS = blocks(
             #pragma unroll
             for (int k = 0; k < 8; k++) { float v = (float)GRID[gi * 8 + k]; g[r][k] = (signs & (1 << k)) ? -v : v; }
 """,
-    _APPLY_G8,
+        _APPLY_G8,
+    )
 )
 _DEQUANT_IQ2XXS = r"""
     uint gid = thread_position_in_grid.x;
@@ -369,9 +377,10 @@ _DEQUANT_IQ2XXS = r"""
 # IQ2_XS: 74 B a superblock. d f16, 32 uint16 qs (a group of 8: low 9 bits a (512,8) grid index, top 7 bits a
 # sign-table index), 8 scale bytes (16 4-bit sub-scales, one a 16-weight half-block). db = d*(0.5 + sc4)*0.25.
 _MATVEC_IQ2XS = blocks(
-    "    uint s = lane >> 1, cb = 8 * lane;   // one uint16 grid entry a lane\n",
-    _DECL_G8,
-    r"""
+    Frags(
+        "    uint s = lane >> 1, cb = 8 * lane;   // one uint16 grid entry a lane\n",
+        _DECL_G8,
+        r"""
             const device uchar* blk = W + ((size_t)row * NSB + c) * 74;
             float d = (float)(*(const device half*)blk);
             const device uchar* p = blk + 2 + 2 * lane;
@@ -384,7 +393,8 @@ _MATVEC_IQ2XS = blocks(
             #pragma unroll
             for (int k = 0; k < 8; k++) { float v = (float)GRID[gi * 8 + k]; g[r][k] = (signs & (1 << k)) ? -v : v; }
 """,
-    _APPLY_G8,
+        _APPLY_G8,
+    )
 )
 _DEQUANT_IQ2XS = r"""
     uint gid = thread_position_in_grid.x;
@@ -409,9 +419,10 @@ _DEQUANT_IQ2XS = r"""
 # IQ2_S: 82 B a superblock. d f16, 32 qs bytes (low 8 index bits), 32 explicit sign bytes (a bit a weight), 8 qh
 # bytes (2 high index bits a group, into the (1024,8) grid), 8 scale bytes (16 4-bit sub-scales). db = d*(0.5+sc4)*0.25.
 _MATVEC_IQ2S = blocks(
-    "    uint b = lane >> 1, cb = 8 * lane;\n",
-    _DECL_G8,
-    r"""
+    Frags(
+        "    uint b = lane >> 1, cb = 8 * lane;\n",
+        _DECL_G8,
+        r"""
             const device uchar* blk = W + ((size_t)row * NSB + c) * 82;
             float d = (float)(*(const device half*)blk);
             const device uchar* qs = blk + 2;
@@ -425,7 +436,8 @@ _MATVEC_IQ2S = blocks(
             #pragma unroll
             for (int k = 0; k < 8; k++) { float v = (float)GRID[idx * 8 + k]; g[r][k] = (signs & (1 << k)) ? -v : v; }
 """,
-    _APPLY_G8,
+        _APPLY_G8,
+    )
 )
 _DEQUANT_IQ2S = r"""
     uint gid = thread_position_in_grid.x;
@@ -450,9 +462,10 @@ _DEQUANT_IQ2S = r"""
 # sub-block of 8, a 3-bit scale in bits 12-14, a delta sign in bit 15). The (2048,8) grid is ternary; a weight is
 # dl*(grid + delta), dl = d*(2*scale+1), delta = +-0.125. No sign table.
 _MATVEC_IQ1S = blocks(
-    "    uint ib = lane >> 2, l = lane & 3, cb = 8 * lane;   // one ternary grid entry a lane\n",
-    _DECL_G8,
-    r"""
+    Frags(
+        "    uint ib = lane >> 2, l = lane & 3, cb = 8 * lane;   // one ternary grid entry a lane\n",
+        _DECL_G8,
+        r"""
             const device uchar* blk = W + ((size_t)row * NSB + c) * 50;
             float d = (float)(*(const device half*)blk);
             const device uchar* qs = blk + 2;
@@ -464,7 +477,8 @@ _MATVEC_IQ1S = blocks(
             #pragma unroll
             for (int k = 0; k < 8; k++) g[r][k] = (float)GRID[idx * 8 + k] + delta;
 """,
-    _APPLY_G8,
+        _APPLY_G8,
+    )
 )
 _DEQUANT_IQ1S = r"""
     uint gid = thread_position_in_grid.x;
@@ -489,9 +503,10 @@ _DEQUANT_IQ1S = r"""
 # index bit as a plane), 32 explicit sign bytes (a bit a weight), 4 scale bytes (8 4-bit scales a 32-block). The
 # (512,4) grid gives 4 values a group; db = d*(1 + 2*sc4). lane = col within a 32-block, qb = lane>>2 the group.
 _MATVEC_IQ3S = blocks(
-    "    uint ib = lane >> 2, cb = 8 * lane, qb1 = 2 * lane, qb2 = 2 * lane + 1;   // two 4-value entries a lane\n",
-    _DECL_G8,
-    r"""
+    Frags(
+        "    uint ib = lane >> 2, cb = 8 * lane, qb1 = 2 * lane, qb2 = 2 * lane + 1;   // two 4-value entries a lane\n",
+        _DECL_G8,
+        r"""
             const device uchar* blk = W + ((size_t)row * NSB + c) * 110;
             float d = (float)(*(const device half*)blk);
             const device uchar* qs = blk + 2;
@@ -508,7 +523,8 @@ _MATVEC_IQ3S = blocks(
             #pragma unroll
             for (int j = 0; j < 4; j++) { float v = (float)GRID[i2 * 4 + j]; g[r][4 + j] = (signs & (1 << (j + 4))) ? -v : v; }
 """,
-    _APPLY_G8,
+        _APPLY_G8,
+    )
 )
 _DEQUANT_IQ3S = r"""
     uint gid = thread_position_in_grid.x;
@@ -537,9 +553,10 @@ _DEQUANT_IQ3S = r"""
 # (`_side_iq1m`: the f16 d precomputed, the sub-scales as nibble pairs) instead of reassembling d and selecting a
 # sub-scale through four uint16 every superblock; +10 bytes a superblock, 1.3x faster. lane = group of 8.
 _MATVEC_IQ1M = blocks(
-    "    uint si = lane >> 1, cb = 8 * lane;   // one ternary grid entry a lane\n",
-    _DECL_G8,
-    r"""
+    Frags(
+        "    uint si = lane >> 1, cb = 8 * lane;   // one ternary grid entry a lane\n",
+        _DECL_G8,
+        r"""
             const device uchar* blk = W + ((size_t)row * NSB + c) * 56;
             const device uchar* qs = blk;
             const device uchar* qh = blk + 32;
@@ -552,7 +569,8 @@ _MATVEC_IQ1M = blocks(
             #pragma unroll
             for (int k = 0; k < 8; k++) g[r][k] = (float)GRID[idx * 8 + k] + delta;
 """,
-    _APPLY_G8,
+        _APPLY_G8,
+    )
 )
 _DEQUANT_IQ1M = r"""
     uint gid = thread_position_in_grid.x;
@@ -664,7 +682,7 @@ def dequant_lattice(kind: str, w_bytes: mx_.array, rows: int, cols: int) -> mx_.
     with _lock:
         k = _latt_deq.get(kind)
         if k is None:
-            k = _latt_deq[kind] = m.fast.metal_kernel(
+            k = _latt_deq[kind] = metal_kernel(
                 name=f"btb_{kind}_dequant", input_names=inames, output_names=["out"], header="", source=spec["deq"]
             )
     g = ((nblk * 32 + 255) // 256) * 256

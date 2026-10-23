@@ -727,6 +727,32 @@ class GrowLayer(_DynamicLayer):
         self._n = n
         self._tk = self._tv = None
 
+    def in_arena(self, need: int, B: int = 1) -> bool:
+        """whether a pass of B rows reaching `need` cache rows writes them into the megakernel's arena (`arena_rows`):
+        not a batch, int8 rows, a session's row map, or past the arena's capacity (`mx_update` then leaves it)"""
+        if self.arena is None or self.bits or self._flat or self._row is not None or self._rmap is not None:
+            return False
+        return B == 1 and need <= self.arena[3]
+
+    def arena_rows(self, k: mx_.array, v: mx_.array) -> tuple[mx_.array, mx_.array, int] | None:
+        """A pass's rows `k`/`v` [1, Hk, T, d] given their place in the megakernel's arena, unwritten: the arena's K and
+        V views [1, Hk, cap, d] and the rows before them, the T counted; the caller writes them with the pass. None
+        where the pass does not write into the arena (`in_arena`)"""
+        B, Hk, T, d = (int(x) for x in k.shape)
+        n = self.get_seq_length()
+        if not self.in_arena(n + T, B):
+            return None
+        dt = mlxdev.torch_dtype(k.dtype)
+        if not self.is_initialized:
+            empty = torch.empty(0, dtype=dt)
+            self.lazy_initialization(empty, empty)
+            n = self.get_seq_length()
+        self._ensure(B, Hk, n + T, d, dt)
+        assert self.arena is not None, "[cache] `in_arena` admitted a pass `_ensure` took out of the arena"
+        self._apply_overrides()
+        self._n = n + T
+        return self._mx[0], self._mx[1], n
+
     def mx_update(self, k: mx_.array, v: mx_.array) -> tuple[mx_.array, mx_.array]:
         """The MLX device's append: `k`/`v` MLX arrays [B, Hk, T, d]; returns the used prefixes as lazy views,
         the append itself in place at the next eval."""

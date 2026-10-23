@@ -248,10 +248,6 @@ OPS: tuple[Op, ...] = (
     Op("read_at", (Stored.BYTES,), ("btb_read_at", "btb_open_cached"), "handle.rs", "guard_direct.rs", "direct.rs"),
 )
 
-# crate exports that are not kernels, so no Op claims them: the tier probe the bench records its numbers under,
-# and the CPU features the hardware report lists beside it
-META_EXPORTS: tuple[str, ...] = ("btb_isa", "btb_cpu_features")
-
 
 def op_families() -> list[str]:
     """the native op families, from the bench files on disk (native/benches/<family>.rs) - the same files
@@ -323,6 +319,16 @@ def crate_exports() -> set[str]:
     for macro in _EXPORT_MACRO_RE.findall(src):
         out |= set(re.findall(rf"\b{macro}!\(\s*(?:///[^\n]*\n\s*)*(btb_\w+)", src))
     return out
+
+
+# crate exports that are not kernels, so no Op claims them: the tier probe the bench records its numbers under, the
+# CPU features the hardware report lists beside it, and the Metal entries (btb.metal) the MLX megakernel replays its
+# passes through, certified by those passes matching the step (tests/kernels/test_mega.py)
+META_EXPORTS: tuple[str, ...] = (
+    "btb_isa",
+    "btb_cpu_features",
+    *sorted(e for e in crate_exports() if e.startswith("btb_metal_")),
+)
 
 
 def _exists(base: str, name: str | None) -> bool:

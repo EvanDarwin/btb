@@ -115,12 +115,18 @@ def test_a_cell_flips_to_covered_on_its_receipt(tmp_path: Path, monkeypatch: Mon
     assert _cell(manifest.compute_cells(), spec.Storage.SAFE_BF16, "cpu").verdict is manifest.Verdict.COVERED
 
 
+def _layout_refused() -> FamilyKind:
+    """a family whose layout the megakernel refuses, by the engine's own gate"""
+    return next(k for k in FamilyKind if spec.mega_refusal(k, spec.Storage.SAFE_BF16) is spec.MegaRefusal.LAYOUT)
+
+
 def test_a_receipt_cannot_buy_a_gap(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    """a banked id for a cell the engine cannot engage (phi3's megakernel, which the kernel's layout refuses)
-    leaves the cell a GAP. Coverage is a verdict about the path, so a stale or fallback-earned id buys nothing."""
-    stale = [manifest.safetensors_id(FamilyKind.PHI3, "mlx-mega", d) for d in spec.Decode]
+    """a banked id for a cell the engine cannot engage (the megakernel for a family whose layout it refuses) leaves
+    the cell a GAP. Coverage is a verdict about the path, so a stale or fallback-earned id buys nothing."""
+    kind = _layout_refused()
+    stale = [manifest.safetensors_id(kind, "mlx-mega", d) for d in spec.Decode]
     _receipts(tmp_path, monkeypatch, stale)
-    cell = _cell(manifest.compute_cells(), spec.Storage.SAFE_BF16, "mlx-mega", FamilyKind.PHI3)
+    cell = _cell(manifest.compute_cells(), spec.Storage.SAFE_BF16, "mlx-mega", kind)
     assert cell.verdict is manifest.Verdict.GAP and cell.reason == manifest.Missing.MEGAKERNEL.value, cell
 
 
@@ -169,7 +175,7 @@ def test_runnable_ids_exclude_gaps() -> None:
     """the union gate asks only for runs a machine could make: a gap cell's would-be id is not demanded, and a
     plain cpu cell's is."""
     ids = manifest.runnable_ids()
-    assert manifest.safetensors_id(FamilyKind.PHI3, "mlx-mega", spec.Decode.GREEDY) not in ids
+    assert manifest.safetensors_id(_layout_refused(), "mlx-mega", spec.Decode.GREEDY) not in ids
     assert manifest.safetensors_id(FamilyKind.QWEN3, "cpu", spec.Decode.GREEDY) in ids
 
 

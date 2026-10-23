@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from ..kinds import Parents
-from .core import mx
+from .core import compiled, metal_kernel, mx
 from .gemv import _gemv_lock
 
 if TYPE_CHECKING:
@@ -61,7 +61,7 @@ def delta_step_fn(hk: int, hv: int, dk: int, dv: int, key_dim: int, eps: float, 
         core = core * (zz * m.sigmoid(zz))
         return core.reshape(hv * dv), conv_new, S
 
-    return m.compile(step)
+    return compiled("the gated delta rule's step", step)
 
 
 _chunk_body_fn = None
@@ -83,7 +83,7 @@ def _chunk_body() -> Callable[..., Any]:
             )
             return out_i, state
 
-        _chunk_body_fn = m.compile(body)
+        _chunk_body_fn = compiled("the gated delta rule's chunk", body)
     return _chunk_body_fn
 
 
@@ -186,7 +186,7 @@ def delta_recurrent(
     with _gemv_lock:
         kern = _delta_kernels.get(key)
         if kern is None:
-            kern = _delta_kernels[key] = m.fast.metal_kernel(
+            kern = _delta_kernels[key] = metal_kernel(
                 name=f"btb_delta_recurrent{'_inplace' if inplace else ''}",
                 input_names=["q", "k", "v", "g", "beta", "state", "order"],
                 output_names=["out"] if inplace else ["out", "state_out"],
@@ -310,7 +310,7 @@ def delta_tree(
     m = mx()
     with _gemv_lock:
         if _delta_tree_kernel is None:
-            _delta_tree_kernel = m.fast.metal_kernel(
+            _delta_tree_kernel = metal_kernel(
                 name="btb_delta_tree",
                 input_names=["q", "k", "v", "g", "beta", "state", "order", "depth"],
                 output_names=["out"],

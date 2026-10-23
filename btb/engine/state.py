@@ -252,6 +252,7 @@ class _State:
     mlx_attn_rows: int
     mlx_state: MlxState
     _mega: MegaPass | None
+    _mega_wanted: bool  # the megakernel asked for at load (`mlx_mega` on MLX), built whenever the engine can take it
     _mlx_attn_slope: list[tuple[int, float]] | None
     _mlx_cost: dict[int, float]
     _mlx_pool: ThreadPoolExecutor
@@ -595,6 +596,9 @@ class _State:
         raise NotImplementedError
 
     def _forward_mega(self, ids: Any, cache: Any, T: int, pick: Any = None) -> torch.Tensor:
+        raise NotImplementedError
+
+    def _build_mega(self) -> None:
         raise NotImplementedError
 
     def _forward_mlx(

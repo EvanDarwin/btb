@@ -1,41 +1,30 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
-"""The megakernel's Metal: a grid of threadgroups running a pass's instructions in order, each cut into tickets, ticket
-k threadgroup k's own, run once the instructions it reads are done. A threadgroup kept waiting takes the lowest ticket
-nobody has claimed below its own, so the pass completes at any residency, a single threadgroup's included. The ops
-are device functions; a program compiles in the ones it uses."""
+"""The pass's Metal: its ops as device functions, each wrapped as a kernel of its own that reads its instruction's row
+of the table, so a program's instructions are dispatches the GPU schedules itself (`replay`), compiled behind MLX's own
+preamble with MLX's math, the bits the step's. A program compiles in the ops it uses."""
 
 from __future__ import annotations
 
-import threading
-import zlib
+import os
 from collections.abc import Iterable, Mapping
 from enum import StrEnum
-from typing import TypeAlias
+from typing import NamedTuple
 
-from .. import attn, fused
-from ..core import MetalKernel, mx
+from ...kinds import MEGA_STORED, Quant, quant_key
+from .. import attn, fused, kquant, legacyq, matvec, q6k
+from ..core import mx
+from ..matvec import StoredKernel
 
-# a table row: op, tickets, units (the op's own work items, a ticket's share of them run in turn), REFS (buffer,
-# offset) references from column REF0, n0, n1, n2, f0's bits, and from column DEP0 the instructions it waits on
-# (index + 1, 0 for none)
+# a table row: op, units (the op's work items, a threadgroup each), REFS (buffer, offset) references from column
+# REF0, n0, n1, n2, f0's bits, and from column DEP0 the instructions it reads the output of (index + 1, 0 for none)
 REFS = 6
-REF0 = 3
+REF0 = 2
 NUM = REF0 + 2 * REFS  # n0's column
 DEP0 = NUM + 4
 DEPS = 3
 W = DEP0 + DEPS
-# dims: rows of the pass, the path's row stride, the arena's rows a head, past, the probe's spins (0 for a pass),
-# instructions. Every per-pass input holds at least 8 elements: MLX binds a smaller one as `constant`, which the ops'
-# device pointers cannot take
+# dims: rows of the pass, the path's row stride, the arena's rows a head, past, then unused to 8
 DIMS = 8
-# polls of a threadgroup's wait on its own ticket's inputs before it looks for an unclaimed ticket below it to run:
-# long enough that a resident threadgroup merely behind keeps its own (at 2^12 a Qwen3-0.6B T=1 pass took ~60 tickets
-# that way, a thief's own ticket then waiting on the stolen one, 4-9% slower; past residency 2^16 recovers as fast)
-PATIENCE = 1 << 16
-# polls before the pass gives up on an instruction's inputs and flags it: a scheduling bug, never a load
-STUCK = 1 << 24
-CS = 32  # the scheduler's counters this many words apart, a 128-byte line each
-TICKETS_MAX = 32 * (CS - 1)  # the claim bits a counter line holds after its count: an instruction's most tickets
 
 TYPES = r"""
 #include <metal_simdgroup_matrix>
@@ -135,8 +124,8 @@ inline bfloat mlx_gelu_tanh(bfloat a) {
 
 
 class OpName(StrEnum):
-    """the megakernel's ops, each a device function `op_<name>(I, item, c)`; its code in the table is its place
-    here, from 1"""
+    """the pass's ops, each a device function `op_<name>(I, item, c)` (a `GRID3` op's `item` a uint3: its grid's
+    position); its code in the table is its place here, from 1"""
 
     RMSNORM = "rmsnorm"
     MATVEC = "matvec"
@@ -145,16 +134,37 @@ class OpName(StrEnum):
     EMBED = "embed"
     QKROPE = "qkrope"
     ATTN = "attn"
+    ATTN_FOLD = "attn_fold"
     FOLD = "fold"
     ARGMAX = "argmax"
     FNORM = "fnorm"
     HEAD = "head"
     ARGMAX_PART = "argmax_part"
     SANDWICH_ADD = "sandwich_add"
+    # a stored type's matvec and embedding row (`STORED`), named by its `kinds.quant_key`
+    MV_Q4K = "mv_q4k"
+    MV_Q5K = "mv_q5k"
+    MV_Q6K = "mv_q6k"
+    MV_Q80 = "mv_q80"
+    EMBED_Q4K = "embed_q4k"
+    EMBED_Q5K = "embed_q5k"
+    EMBED_Q6K = "embed_q6k"
+    EMBED_Q80 = "embed_q80"
 
 
 CODE: dict[OpName, int] = {o: i + 1 for i, o in enumerate(OpName)}
 SOURCE: dict[OpName, str] = {}
+# the ops dispatched on (kv head, block, node), the node attention's own grid: its threadgroups reading one head's
+# block sit together, measured 10% faster at 16 rows over 2000 than the same items on a line
+GRID3: frozenset[OpName] = frozenset({OpName.ATTN, OpName.ATTN_FOLD})
+
+# the stored types the kernel multiplies as stored, each through its launch's own chain (`matvec.StoredKernel`)
+STORED: dict[Quant, StoredKernel] = {**kquant.KERNELS, **q6k.KERNELS, **legacyq.KERNELS}
+assert set(STORED) == MEGA_STORED, f"kinds.MEGA_STORED and the kernel's stored types differ: {set(STORED)}"
+MV_OP: dict[Quant, OpName] = {q: OpName(f"mv_{quant_key(q)}") for q in STORED}
+EMBED_OP: dict[Quant, OpName] = {q: OpName(f"embed_{quant_key(q)}") for q in STORED}
+# what an op needs ahead of it in the kernel's header, once however many ops need it: a stored type's namespace
+_PRELUDE: dict[OpName, tuple[str, str]] = {}
 
 
 def _op(name: OpName, fn: str) -> None:
@@ -180,11 +190,12 @@ _op(
     OpName.MATVEC,
     r"""
 inline void op_matvec(thread const Ins& I, uint item, thread const Ctx& c) {
-    // y [T, rows] (C) = x [T, cols] (B) . W [rows, cols]^T (A); rows = n0, cols = n1, n2 & 1 a float32 y; the
-    // item's share of the 8-row tiles, a simdgroup's each (the gemv tile kernel's body, NB a runtime value)
+    // y [T, rows] (C) = x [T, cols] (B) . W [rows, cols]^T (A); rows = n0, cols = n1, n2 & 1 a float32 y, n2 >> 1
+    // y's row stride where y is a piece of a wider row (0: rows); the item's share of the 8-row tiles, a simdgroup's
+    // each (the gemv tile kernel's body, NB a runtime value)
     const uint KT = MV_KT;
     const uint NB = c.dims[0];
-    uint Nr = I.n0, K = I.n1;
+    uint Nr = I.n0, K = I.n1, LD = (I.n2 >> 1) ? (I.n2 >> 1) : I.n0;
     uint ntile = (Nr + 7) / 8;
     uint t0 = (uint)(((ulong)item * ntile) / I.items), t1 = (uint)(((ulong)(item + 1) * ntile) / I.items);
     for (uint tile = t0 + c.sg; tile < t1; tile += 8) {
@@ -247,11 +258,11 @@ inline void op_matvec(thread const Ins& I, uint item, thread const Ctx& c) {
             uint b = o / 8, n = o % 8;
             if (nb0 + n < Nr) {
                 if (I.n2 & 1u) {
-                    ((device float*)I.C)[(size_t)b * Nr + nb0 + n] = out[o];
+                    ((device float*)I.C)[(size_t)b * LD + nb0 + n] = out[o];
                 } else {
                     uint u = as_type<uint>(out[o]);
                     u += 0x7FFFu + ((u >> 16) & 1u);
-                    y[(size_t)b * Nr + nb0 + n] = (uint16_t)(u >> 16);
+                    y[(size_t)b * LD + nb0 + n] = (uint16_t)(u >> 16);
                 }
             }
         }
@@ -396,38 +407,48 @@ inline void op_qkrope(thread const Ins& I, uint item, thread const Ctx& c) {
 """,
 )
 
+# the node attention (attn.py `btb_attn_nodes`, a node a threadgroup) at grid position (kv head, block, node): q (A,
+# [T, Hq, D] bf16), this layer's K (B) and V (E) in the arena [Hk, cap, D]; the partials m (C), l (D) and acc
+# (C + PACC_OFF); Hk = n0, blocks = n1, T = n2's low half with the layer type's row of `meta` above it, scale = f0
+_ATTN_CORE = r"""
+inline void attn_core(thread const Ins& I, uint3 at, thread const Ctx& c) {
+    uint Hk = I.n0, Tn = I.n2 & 0xffffu;
+    BtbAttnIn<bfloat, const device uint*, const device uint*, const device float*, const device float*,
+              const device uint*> a = {
+        (const device bfloat*)I.A, (const device uint16_t*)I.B, (const device uint16_t*)I.E,
+        c.meta + (I.n2 >> 16) * Tn * 8, c.path, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, I.f0, Hk,
+        c.dims[2], Hk * ATT_G, Tn, I.n1, c.dims[1], 0u};
+    btb_attn_nodes<ATT_G, ATT_D, 1, ATT_P>(a, at.x, at.y, at.z, c.sg, c.lane, (threadgroup float4*)c.tgm,
+                                           (device float*)I.C, (device float*)I.D, (device float*)(I.C + PACC_OFF));
+}
+"""
+_PRELUDE[OpName.ATTN] = _PRELUDE[OpName.ATTN_FOLD] = ("attn_core", _ATTN_CORE)
+
 _op(
     OpName.ATTN,
     r"""
-inline void op_attn(thread const Ins& I, uint item, thread const Ctx& c) {
-    // the node attention (attn.py `btb_attn_nodes`, a node a threadgroup): item -> (kv head, block, node); q (A,
-    // [T, Hq, D] bf16), this layer's K (B) and V (E) in the arena [Hk, cap, D]; the partials m (C), l (D) and acc
-    // (C + PACC_OFF); Hk = n0, splits = n1's low bits, T = n2's low half with the layer type's row of `meta` above it,
-    // scale = f0. With n1's top bit (one block a node) the threadgroup folds its own partials (`btb_attn_fold`, a
-    // query head a simdgroup) into out at C + A_OFF
-    uint Hk = I.n0, ns = I.n1 & 0x7fffffffu, Tn = I.n2 & 0xffffu;
-    const device uint* meta = c.meta + (I.n2 >> 16) * Tn * 8;
-    uint h = item % Hk, node = item / (Hk * ns);
-    BtbAttnIn<bfloat, const device uint*, const device uint*, const device float*, const device float*,
-              const device uint*> a = {
-        (const device bfloat*)I.A, (const device uint16_t*)I.B, (const device uint16_t*)I.E, meta, c.path,
-        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, I.f0, Hk, c.dims[2], Hk * ATT_G, Tn, ns,
-        c.dims[1], 0u};
-    device float* pm = (device float*)I.C;
-    device float* pl = (device float*)I.D;
-    device float* pacc = (device float*)(I.C + PACC_OFF);
-    btb_attn_nodes<ATT_G, ATT_D, 1, ATT_P>(a, h, (item / Hk) % ns, node, c.sg, c.lane, (threadgroup float4*)c.tgm,
-                                           pm, pl, pacc);
-    if (I.n1 >> 31) {
-        // the partials this threadgroup wrote, read back by it after the barrier orders its device writes
-        threadgroup_barrier(mem_flags::mem_device);
-        if (c.sg < ATT_G) {
-            btb_attn_fold<false>((const device float*)pm, (const device float*)pl, (const device float*)pacc, meta,
-                                 (const device float*)nullptr, (node * Hk + h) * ATT_G + c.sg, c.lane, Tn, Hk, 8,
-                                 ATT_G, ATT_D, (device bfloat*)(I.C + A_OFF));
-        }
+inline void op_attn(thread const Ins& I, uint3 at, thread const Ctx& c) {
+    // the node attention, its partials left to the fold
+    attn_core(I, at, c);
+}
+""",
+)
+
+_op(
+    OpName.ATTN_FOLD,
+    r"""
+inline void op_attn_fold(thread const Ins& I, uint3 at, thread const Ctx& c) {
+    // the node attention over one block (n1 = 1), the threadgroup folding its own partials (`btb_attn_fold`, a query
+    // head a simdgroup) into out at C + A_OFF once a barrier orders its device writes
+    attn_core(I, at, c);
+    threadgroup_barrier(mem_flags::mem_device);
+    uint Hk = I.n0, Tn = I.n2 & 0xffffu;
+    if (c.sg < ATT_G) {
+        btb_attn_fold<false>((const device float*)I.C, (const device float*)I.D, (const device float*)(I.C + PACC_OFF),
+                             c.meta + (I.n2 >> 16) * Tn * 8, (const device float*)nullptr,
+                             (at.z * Hk + at.x) * ATT_G + c.sg, c.lane, Tn, Hk, 8, ATT_G, ATT_D,
+                             (device bfloat*)(I.C + A_OFF));
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 """,
 )
@@ -596,174 +617,197 @@ inline void op_argmax_part(thread const Ins& I, uint item, thread const Ctx& c) 
 """,
 )
 
-
-_SCHED = r"""
-    BUFFER_TABLE
-    uint tid = thread_position_in_threadgroup.x;
-    device atomic_uint* cnt = (device atomic_uint*)counters;
-    threadgroup uint8_t tgm[TGM_BYTES];
-    threadgroup uint sel[2];  // the ticket thread 0 picked: its instruction (N: none left) and its index
-    if (dims[4]) {
-        // the residency probe: how many of these threadgroups run at once (cnt: live, the most live, arrivals, done).
-        // Each stays until all have arrived or its spins run out; the first to run out ends the wait for the rest,
-        // so the threadgroups that could not start until others left pass straight through
-        if (tid == 0 && !atomic_load_explicit(cnt + 3, memory_order_relaxed)) {
-            uint live = atomic_fetch_add_explicit(cnt, 1u, memory_order_relaxed) + 1;
-            atomic_fetch_max_explicit(cnt + 1, live, memory_order_relaxed);
-            atomic_fetch_add_explicit(cnt + 2, 1u, memory_order_relaxed);
-            uint G = threadgroups_per_grid.x;
-            uint s = 0;
-            while (atomic_load_explicit(cnt + 2, memory_order_relaxed) < G && !atomic_load_explicit(cnt + 3, memory_order_relaxed)) {
-                if (++s >= dims[4]) atomic_store_explicit(cnt + 3, 1u, memory_order_relaxed);
-            }
-            atomic_fetch_sub_explicit(cnt, 1u, memory_order_relaxed);
-        }
-        return;
-    }
-    Ctx c = {tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup, tgm, dims, freqs, ids, pos, meta, path, out};
-    const uint N = dims[5];
-    const uint g = threadgroup_position_in_grid.x;
-    const uint gbit = 1u << (g & 31);
-    // the counters a line each (CS words apart): instruction n's done count, then its claim bits from word 1 (ticket
-    // k a bit); after them the lowest instruction that may still hold an unclaimed ticket, and the stuck flag last
-    device atomic_uint* lo = cnt + N * CS;
-    device atomic_uint* stuck = cnt + (N + 2) * CS - 1;
-    // thread 0's: the next instruction to look in for this threadgroup's own ticket, the one it holds while it waits
-    // on that ticket's inputs (N for none), and the claim bits as they stood before it set its own
-    uint n = 0, home = N, claim = 0;
-    for (;;) {
-        if (tid == 0) {
-            uint wn = N, wk = 0, waited = 0;
-            for (;;) {
-                if (home == N) {
-                    while (n < N && g >= tab[n * ROW + 1]) ++n;
-                    if (n == N) break;
-                    home = n++;
-                    // the claim's round trip runs under the reads of its inputs' counts below
-                    claim = atomic_fetch_or_explicit(cnt + home * CS + 1 + g / 32, gbit, memory_order_relaxed);
-                }
-                const device uint* f = tab + home * ROW;
-                bool ready = true;
-                uint spins = 0;
-                for (uint q = DEP0; q < ROW && ready; ++q) {
-                    uint d = f[q];
-                    if (d == 0) continue;
-                    uint need = tab[(d - 1) * ROW + 1];
-                    while (atomic_load_explicit(cnt + (d - 1) * CS, memory_order_relaxed) < need) {
-                        if (++spins >= PATIENCE) { ready = false; break; }
-                    }
-                }
-                waited += spins;
-                if (waited > STUCK) { atomic_store_explicit(stuck, home + 1, memory_order_relaxed); ready = true; }
-                if (ready) {
-                    uint h = home;
-                    home = N;
-                    if (!(claim & gbit)) { wn = h; wk = g; break; }
-                    continue;  // another threadgroup took it
-                }
-                // a long wait: the lowest ticket nobody has claimed below its own. Every instruction under that one is
-                // wholly claimed, by threadgroups that are running, so its inputs finish; a ticket at or above its own
-                // could wait on the one it holds
-                bool got = false;
-                for (uint s = atomic_load_explicit(lo, memory_order_relaxed); s < home && !got; ++s) {
-                    uint tk = tab[s * ROW + 1];
-                    for (uint w = 0; w * 32 < tk && !got; ++w) {
-                        uint want = tk - w * 32 >= 32 ? 0xffffffffu : (1u << (tk - w * 32)) - 1u;
-                        device atomic_uint* mw = cnt + s * CS + 1 + w;
-                        uint cur = atomic_load_explicit(mw, memory_order_relaxed);
-                        while ((cur & want) != want) {
-                            uint b = ctz(~cur & want);
-                            uint prev = atomic_fetch_or_explicit(mw, 1u << b, memory_order_relaxed);
-                            if (!(prev & (1u << b))) { wn = s; wk = w * 32 + b; got = true; break; }
-                            cur = prev | (1u << b);
-                        }
-                    }
-                    if (!got) atomic_fetch_max_explicit(lo, s + 1, memory_order_relaxed);
-                }
-                if (got) {
-                    const device uint* fs = tab + wn * ROW;
-                    for (uint q = DEP0; q < ROW; ++q) {
-                        uint d = fs[q];
-                        if (d == 0) continue;
-                        uint need = tab[(d - 1) * ROW + 1];
-                        uint sp = 0;
-                        while (atomic_load_explicit(cnt + (d - 1) * CS, memory_order_relaxed) < need) {
-                            if (++sp > STUCK) { atomic_store_explicit(stuck, wn + 1, memory_order_relaxed); break; }
-                        }
-                    }
-                    break;
-                }
-            }
-            sel[0] = wn;
-            sel[1] = wk;
-        }
-        threadgroup_barrier(mem_flags::mem_device);
-        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-        uint m = sel[0], k = sel[1];
-        if (m >= N) break;
-        const device uint* f = tab + m * ROW;
-        Ins I = {REF(0), REF(1), (device uint8_t*)REF(2), (device uint8_t*)REF(3), REF(4), REF(5), f[2], f[NUM],
-                 f[NUM + 1], f[NUM + 2], as_type<float>(f[NUM + 3])};
-        // this ticket's share of the instruction's units, run in turn (32-bit bounds: units x tickets stays far
-        // below 2^32, and a 64-bit division is emulated)
-        uint tickets = f[1];
-        uint u0 = k, u1 = k + 1;
-        if (tickets != I.items) {
-            u0 = (k * I.items) / tickets;
-            u1 = ((k + 1) * I.items) / tickets;
-        }
-        for (uint item = u0; item < u1; ++item) {
-            if (item != u0) threadgroup_barrier(mem_flags::mem_threadgroup);
-            switch (f[0]) {
-DISPATCH
-            }
-        }
-        // the ticket's writes made visible before it counts as done
-        threadgroup_barrier(mem_flags::mem_device);
-        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-        if (tid == 0) atomic_fetch_add_explicit(cnt + m * CS, 1u, memory_order_relaxed);
-    }
+# a stored type's `embed` in its namespace: a row decoded to bf16
+_STORED_FNS = r"""
+inline void embed(const device uchar* W, uint row, uint COLS, device bfloat* dst, uint tid) {
+    const uint NSB = COLS / BW;
+DECODE
+}
 """
 
-assert set(SOURCE) == set(OpName), "an op without its device function"
+_EMBED = r"""
+inline void op_embed_KEY(thread const Ins& I, uint item, thread const Ctx& c) {
+    // row `item` of h (C) = the table's row ids[item] (A: TYPE's blocks) as the step's gather decodes it; H = n0;
+    // n1 & 1: then times f0 as the step scales it (`rows * embed_scale`: the Python float rounded to bf16 first)
+    device bfloat* dst = (device bfloat*)I.C + (size_t)item * I.n0;
+    btb_KEY::embed(I.A, c.ids[item], I.n0, dst, c.tid);
+    if (I.n1 & 1u) {
+        threadgroup_barrier(mem_flags::mem_device);
+        bfloat s = (bfloat)I.f0;
+        for (uint i = c.tid; i < I.n0; i += 256) dst[i] = dst[i] * s;
+    }
+}
+"""
 
-# a kernel by its weight buffers, its ops and its compile-time constants
-KernelKey: TypeAlias = tuple[int, tuple[OpName, ...], tuple[tuple[str, int], ...]]
 
-_lock = threading.Lock()
-_kernels: dict[KernelKey, MetalKernel] = {}
-
-# the per-pass inputs after the weight buffers, the scratch, the constants and the arena
-INPUTS = ("freqs", "ids", "pos", "meta", "path", "tab", "dims")
+def _undo(defs: str) -> str:
+    """`#undef`s of what `defs` defines"""
+    names = (ln.split()[1].split("(")[0] for ln in defs.splitlines() if ln.startswith("#define "))
+    return "".join(f"#undef {n}\n" for n in names)
 
 
-def kernel(nbufs: int, ops: Iterable[OpName], defs: Mapping[str, int]) -> MetalKernel:
-    """the megakernel over `nbufs` weight buffers with `ops` compiled in and `defs` its compile-time constants
-    (XROWS, MV_KT, TGM_BYTES and the attention's shape), compiled once a process"""
-    used = tuple(sorted(set(ops), key=CODE.__getitem__))
-    key: KernelKey = (nbufs, used, tuple(sorted(defs.items())))
-    with _lock:
-        k = _kernels.get(key)
-        if k is None:
-            names = [f"w{i}" for i in range(nbufs)]
-            table = f"const device uint8_t* B[{nbufs + 3}] = {{{', '.join([*names, 'scr', 'consts', 'kv'])}}};"
-            consts = "".join(f"#define {n} {v}\n" for n, v in sorted(defs.items()))
-            dispatch = "\n".join(f"                case {CODE[o]}: op_{o.value}(I, item, c); break;" for o in used)
-            src = _SCHED.replace("BUFFER_TABLE", table).replace("DISPATCH", dispatch)
-            k = _kernels[key] = mx().fast.metal_kernel(
-                name=f"btb_mega_{nbufs}_{zlib.crc32(repr(key).encode()):08x}",
-                input_names=[*names, "scr", "consts", "kv", *INPUTS],
-                output_names=["out", "counters"],
-                header=consts
-                + f"#define ROW {W}\n#define NUM {NUM}\n#define DEP0 {DEP0}\n#define CS {CS}\n"
-                + f"#define PATIENCE {PATIENCE}u\n#define STUCK {STUCK}u\n"
-                + f"#define REF(k) (B[f[{REF0} + 2 * (k)]] + f[{REF0} + 2 * (k) + 1])\n"
-                + TYPES
-                + MLX_OPS
-                + fused.FUNCS
-                + "#define KQ 0\n#define SEG 0\n#define MAP 0\n"
-                + attn.ATTN_FUNCS
-                + "".join(SOURCE[o] for o in used),
-                source=src,
+def _stored_prelude(q: Quant, k: StoredKernel) -> str:
+    """type `q`'s namespace for the header: its defines, its device functions and `embed`, the defines undone"""
+    defs = f"#define BW {k.bw}\n{k.defs}"
+    fns = _STORED_FNS.replace("DECODE", k.decode)
+    return f"{defs}namespace btb_{quant_key(q)} {{\n{k.header}{fns}}}\n{_undo(defs)}"
+
+
+for _q, _k in STORED.items():
+    _PRELUDE[EMBED_OP[_q]] = (quant_key(_q), _stored_prelude(_q, _k))
+    _op(EMBED_OP[_q], _EMBED.replace("KEY", quant_key(_q)).replace("TYPE", _q.value))
+
+# a stored type's matvec, a kernel of its own a matrix and pass width (`stored_source`)
+MV_Q: dict[OpName, Quant] = {o: q for q, o in MV_OP.items()}
+assert set(SOURCE) == set(OpName) - set(MV_Q), "an op without its device function"
+
+# a command's buffers after the weights: the scratch, the constants, the arena, these, then the instruction's index
+INPUTS = ("freqs", "ids", "pos", "meta", "path", "tab", "dims", "out")
+# a buffer's type in a kernel's signature where it is not a uint array read
+_DECL = {
+    "scr": "device uint8_t*",
+    "consts": "device uint8_t*",
+    "kv": "device uint8_t*",
+    "freqs": "const device float*",
+    "out": "device uint*",
+}
+
+
+def _mlx_header(rel: str, seen: set[str]) -> str:
+    """MLX's kernel header `rel` from the installed package with its own includes inlined once each (a library built
+    from source has no include path): the preamble MLX compiles its custom kernels behind"""
+    if rel in seen:
+        return ""
+    seen.add(rel)
+    pkg = mx().__file__
+    if pkg is None:
+        raise RuntimeError("[mega] MLX is installed without a path to its headers")
+    root = os.path.join(os.path.dirname(pkg), "include")
+    out = []
+    with open(os.path.join(root, rel), encoding="utf-8") as fh:
+        for line in fh.read().splitlines():
+            s = line.strip()
+            if s.startswith('#include "') and s.endswith('"'):
+                out.append(_mlx_header(s[len('#include "') : -1], seen))
+            elif s != "#pragma once":
+                out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def kernel_name(op: OpName) -> str:
+    return f"btb_mega_{op.value}"
+
+
+class StoredMv(NamedTuple):
+    """a stored matvec instruction's kernel: its type, its matrix's rows and columns, the pass's rows, y's row stride
+    and whether x and y are float32 (the head) rather than bf16"""
+
+    q: Quant
+    rows: int
+    cols: int
+    T: int
+    ld: int
+    f32: bool
+
+
+def stored_name(s: StoredMv) -> str:
+    return f"btb_mega_mv_{quant_key(s.q)}_{s.rows}_{s.cols}_{s.T}_{s.ld}_{int(s.f32)}"
+
+
+def stored_groups(q: Quant, rows: int, T: int) -> int:
+    """the threadgroups of 256 a stored matvec of `rows` at `T` pass rows takes, its launch's grid"""
+    return -(-matvec.threads(rows, T, STORED[q].shapes) // 256)
+
+
+def _signature(name: str, nbufs: int, attrs: str) -> str:
+    """kernel `name` over a command's buffers (the weights', then the pass's), its row of the table `f` and `B` the
+    buffers its references index, `attrs` its position arguments"""
+    ws = ", ".join(f"device uint8_t* w{i} [[buffer({i})]]" for i in range(nbufs))
+    ins = ", ".join(
+        f"{_DECL.get(n, 'const device uint*')} {n} [[buffer({nbufs + j})]]"
+        for j, n in enumerate(("scr", "consts", "kv", *INPUTS, "mi"))
+    )
+    table = ", ".join([*(f"w{i}" for i in range(nbufs)), "scr", "consts", "kv"])
+    return f"""
+kernel void {name}({ws}, {ins}, {attrs}) {{
+    const device uint8_t* B[{nbufs + 3}] = {{{table}}};
+    const device uint* f = tab + mi[0] * ROW;
+"""
+
+
+def _wrap(op: OpName, nbufs: int, tgm: int) -> str:
+    """op `op`'s kernel: the instruction's row (its index bound at the command's own offset) read into the op's view,
+    the threadgroup's memory `tgm` bytes, a `GRID3` op given its grid position"""
+    pos = "uint3" if op in GRID3 else "uint"
+    tid = "tid3.x" if op in GRID3 else "tid3"
+    attrs = (
+        f"{pos} tid3 [[thread_position_in_threadgroup]], {pos} g [[threadgroup_position_in_grid]],\n"
+        "    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]"
+    )
+    return (
+        _signature(kernel_name(op), nbufs, attrs)
+        + f"""    threadgroup uint8_t tgm[{max(16, tgm)}];
+    Ins I = {{REF(0), REF(1), (device uint8_t*)REF(2), (device uint8_t*)REF(3), REF(4), REF(5), f[1], f[NUM],
+             f[NUM + 1], f[NUM + 2], as_type<float>(f[NUM + 3])}};
+    Ctx c = {{{tid}, sg, lane, tgm, dims, freqs, ids, pos, meta, path, out}};
+    op_{op.value}(I, g, c);
+}}
+"""
+    )
+
+
+def _preamble() -> str:
+    """MLX's preamble, then what every kernel reads its instruction through"""
+    return (
+        _mlx_header("mlx/backend/metal/kernels/utils.h", set())
+        + "#include <metal_stdlib>\nusing namespace metal;\n"
+        + f"#define ROW {W}\n#define NUM {NUM}\n"
+        + f"#define REF(k) (B[f[{REF0} + 2 * (k)]] + f[{REF0} + 2 * (k) + 1])\n"
+    )
+
+
+def stored_source(nbufs: int, mvs: Iterable[StoredMv]) -> str:
+    """the library of stored matvec kernels `mvs` over `nbufs` weight buffers: each its type's launch (`matvec.blocks`,
+    the step's kernel) with its matrix, pass rows and y's row stride as constants, y [T, rows] (C) = x [T, cols] (B) .
+    W^T, W (A) the type's blocks; a thread of the launch's grid a thread of the command's"""
+    by_q: dict[Quant, list[StoredMv]] = {}
+    for s in mvs:
+        by_q.setdefault(s.q, []).append(s)
+    out = [_preamble()]
+    for q, ss in by_q.items():
+        k, key = STORED[q], quant_key(q)
+        out.append(f"{k.defs}namespace btb_{key} {{\n{k.header}")
+        for s in ss:
+            d = matvec.defines(s.rows, s.cols, k.bw, s.T, k.shapes, s.ld)
+            out.append(
+                f"{d}template <typename T>\ninline void {stored_name(s)}(const device uint8_t* W, const device T* x, "
+                f"device T* out, uint3 thread_position_in_grid) {{\n{matvec.blocks(k.frags)}}}\n{_undo(d)}"
             )
-    return k
+        out.append("}\n")
+        for s in ss:
+            t = "float" if s.f32 else "bfloat"
+            out.append(
+                _signature(stored_name(s), nbufs, "uint3 gp [[thread_position_in_grid]]")
+                + f"    btb_{key}::{stored_name(s)}<{t}>(REF(0), (const device {t}*)REF(1), (device {t}*)REF(2), gp);\n}}\n"
+            )
+        out.append(_undo(k.defs))
+    return "".join(out)
+
+
+def source(nbufs: int, ops: Iterable[OpName], defs: Mapping[str, int], tgm: Mapping[OpName, int]) -> str:
+    """the library of a program's `ops` over `nbufs` weight buffers: MLX's preamble, the ops' device functions under
+    `defs`, their compile-time constants (XROWS, MV_KT and the attention's shape), and a kernel `btb_mega_<op>` each, its
+    threadgroup memory `tgm[op]` bytes"""
+    used = sorted(set(ops), key=CODE.__getitem__)
+    return (
+        _preamble()
+        + "".join(f"#define {n} {v}\n" for n, v in sorted(defs.items()))
+        + TYPES
+        + MLX_OPS
+        + fused.FUNCS
+        + "#define KQ 0\n#define SEG 0\n#define MAP 0\n"
+        + attn.ATTN_FUNCS
+        + "".join(dict(_PRELUDE[o] for o in used if o in _PRELUDE).values())
+        + "".join(SOURCE[o] for o in used)
+        + "".join(_wrap(o, nbufs, tgm[o]) for o in used)
+    )
