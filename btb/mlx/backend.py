@@ -199,6 +199,21 @@ class Weight:
             self.a = None
 
 
+def act(name: str) -> Callable[[mx_.array], mx_.array] | None:
+    """an MLP activation by its config name as MLX ops (the step's, and what the megakernel's copies are held to), None
+    for one btb has none for"""
+    m = mx()
+    if name in ("silu", "swish"):
+        return lambda a: a * m.sigmoid(a)
+    if name == "gelu":
+        return lambda a: 0.5 * a * (1.0 + m.erf(a / 1.4142135623730951))
+    if name in ("gelu_pytorch_tanh", "gelu_new"):
+        return lambda a: 0.5 * a * (1.0 + m.tanh(0.7978845608028654 * (a + 0.044715 * a * a * a)))
+    if name == "relu":
+        return lambda a: m.maximum(a, 0)
+    return None
+
+
 class Backend:
     gemm_rows: Any
     info: Any
@@ -359,16 +374,7 @@ class Backend:
         return out
 
     def act(self, name: str) -> Callable[[mx_.array], mx_.array] | None:
-        m = mx()
-        if name in ("silu", "swish"):
-            return lambda a: a * m.sigmoid(a)
-        if name == "gelu":
-            return lambda a: 0.5 * a * (1.0 + m.erf(a / 1.4142135623730951))
-        if name in ("gelu_pytorch_tanh", "gelu_new"):
-            return lambda a: 0.5 * a * (1.0 + m.tanh(0.7978845608028654 * (a + 0.044715 * a * a * a)))
-        if name == "relu":
-            return lambda a: m.maximum(a, 0)
-        return None
+        return act(name)
 
     def experts(self, x: torch.Tensor, hits: Any, act: Any) -> Any:
         """The mixture-of-experts step for one call: `hits` a list of (token_idx, top_k_weights, (gu, dn)) per active

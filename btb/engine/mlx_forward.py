@@ -1362,7 +1362,7 @@ class _MlxMixin(_State):
         parents = getattr(self, "ap", None) if spec_chain else None
         if parents is None:
             parents = list(range(-1, T - 1))
-        meta, path, splits = mlxdev.tree_meta(past, parents)
+        meta, path, splits = mg.metas(past, parents)
         depth = [0] * T
         for j in range(T):
             depth[j] = 0 if parents[j] < 0 else depth[parents[j]] + 1
@@ -1373,19 +1373,16 @@ class _MlxMixin(_State):
         def kv_off(i: int, which: int) -> int:
             return int(cache.layers[i].arena[1 + which])
 
-        ids_a = m.array(np.asarray(ids, dtype=np.uint32))
-        pos = m.array(np.asarray([past + d for d in depth], dtype=np.uint32))
         sampled = pick is not None and not pick.greedy
-        out, cnt = mg.run(buf, cap, kv_off, ids_a, pos, meta, path, splits, past, argmax=not sampled)
+        pos = [past + d for d in depth]
+        out, cnt = mg.run(buf, cap, kv_off, ids, pos, meta, path, splits, past, argmax=not sampled)
         if sampled:
             # the sample over the logits the kernel's head op left in its scratch, ordered after the pass by
             # taking its output as an input, evaluated with it: one sync a pass
-            V = mg.V
-            raw = mg.scr[mg.toff["logits"] : mg.toff["logits"] + T * V * 4].view(m.float32).reshape(T, V)
-            out = pick.pick_mx(raw, [pick.key_for(past + d) for d in depth], after=out)
+            out = pick.pick_mx(mg.logits(T), [pick.key_for(p) for p in pos], after=out)
         m.eval(out, cnt)
         if int(cnt[-1]):
-            raise RuntimeError("[mega] the pass's grid barrier timed out")
+            raise RuntimeError(f"[mega] instruction {int(cnt[-1]) - 1} never saw its inputs: a scheduling bug")
         for cl in cache.layers:
             cl.mx_advance(T, Hk, hd, torch.bfloat16)
         be = self.mlx

@@ -84,9 +84,7 @@ class ModelProposer:
 
         from .drafter import mlx_topk_ids
 
-        V = mg.V
-        raw = mg.scr[mg.toff["logits"] : mg.toff["logits"] + T * V * 4].view(mx.float32).reshape(T, V)
-        ids = mlx_topk_ids(raw, k)
+        ids = mlx_topk_ids(mg.logits(T), k)
         mx.eval(ids)
         return np.array(ids).tolist()
 

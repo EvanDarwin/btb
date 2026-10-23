@@ -206,7 +206,7 @@ OPS: tuple[Op, ...] = (
         funcs=("repack_lattice", "matvec_lattice", "dequant_lattice"),
     ),
     Op("kv", "kv", ("btb_kv_store", "btb_kv_scatter"), "kernels/test_kv.py"),
-    Op("mega", "mega", ("btb_mega_*_*_*_*",), "kernels/test_mega.py"),
+    Op("mega", "mega.kernel", ("btb_mega_*_*",), "kernels/test_mega.py"),
     Op("sample", "sample", ("btb_sample_pick", "btb_sample_verify"), "kernels/test_sampling.py"),
     Op(
         "binder",
@@ -227,13 +227,16 @@ _WILDCARD_RE = re.compile(r"^btb_\*")  # a template that names no kind: it would
 
 
 def _mlx_modules() -> list[tuple[str, str]]:
-    """(module stem, source text) for each btb/mlx/*.py, so a new module is parsed with no list to edit."""
+    """(module, source text) for each module under btb/mlx, a subpackage's dotted (`mega.kernel`), so a new module
+    is parsed with no list to edit."""
     out = []
-    for fn in sorted(os.listdir(MLX_DIR)):
-        if fn.endswith(".py") and fn != "__init__.py":
-            with open(os.path.join(MLX_DIR, fn), encoding="utf-8") as f:
-                out.append((fn[:-3], f.read()))
-    return out
+    for root, _dirs, files in os.walk(MLX_DIR):
+        for fn in files:
+            if fn.endswith(".py") and fn != "__init__.py":
+                rel = os.path.relpath(os.path.join(root, fn), MLX_DIR)[:-3]
+                with open(os.path.join(root, fn), encoding="utf-8") as f:
+                    out.append((rel.replace(os.sep, "."), f.read()))
+    return sorted(out)
 
 
 def source_funcs() -> set[tuple[str, str]]:

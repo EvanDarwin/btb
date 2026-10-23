@@ -868,7 +868,7 @@ class StreamedTextModel(
         # other compute dtype); an fp32 pass would store float32 into these bf16-sized slots, so it keeps its own
         # per-layer buffers instead
         bf16_compute = self.compute_dtype in (None, torch.bfloat16)
-        if mg is not None and bf16_compute and self.mlx is not None and not self.kv_bits and not flat:
+        if mg is not None and bf16_compute and self.mlx is not None and not self.kv_bits:
             from .. import mlx as mlxdev
             from ..mlx.attn import ATTN_BLOCK
 

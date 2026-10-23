@@ -108,15 +108,16 @@ MISSING: dict[Missing, tuple[str, str]] = {
     ),
     Missing.MEGA_STORAGE: (
         "the megakernel refuses this storage: it reads weights out of slot buffers, so as-stored quant blocks "
-        "(mlx_forward.py:1320, `self.mlx_state.affine`) and the 12-bit store's packed weights (mega.py:609, "
-        "'a weight outside a slot buffer') both fall to the step path",
+        "(mlx_forward.py `_mega_serves`, `self.mlx_state.affine`) and the 12-bit store's packed weights "
+        "(mlx/mega/model.py `MegaPass._ref`, 'a weight outside a slot buffer') both fall to the step path",
         "teach the megakernel to read packed weights, or record the refusal as a DNR once it is provably "
         "permanent - until then the cell is a real path the cert cannot certify",
     ),
     Missing.MEGA_SHAPE: (
-        "the megakernel takes a head of 64k dims (mega.py:599, `self.hd % 64`); this family's tiny fixture has "
-        "another head width, so it never builds here and any cell asserting it would be certified by the step path",
-        "widen the fixture's head to a multiple of 64 in tests/make_fixtures.py and rebank it",
+        "the megakernel takes a head of 32k dims, 256 at most (mlx/mega/model.py `MegaPass`); this family's tiny "
+        "fixture has another head width, so it never builds here and any cell asserting it would be certified by the "
+        "step path",
+        "make the fixture's head a multiple of 32 up to 256 in tests/make_fixtures.py and rebank it",
     ),
     Missing.CARD_GRAPH_FAMILY: (
         "the captured card step graph is not written for this family (cuda.py:284 takes the kernel layout or "
@@ -249,7 +250,7 @@ TITLE: dict[Missing, tuple[str, str]] = {
     Missing.MEGA_STORAGE: ("MLX megakernel refuses this storage", "Teach it packed weights, or mark it did-not-run"),
     Missing.MEGA_SHAPE: (
         "Fixture's head width doesn't fit the megakernel",
-        "Widen the fixture's head to a multiple of 64",
+        "Make the fixture's head a multiple of 32, up to 256",
     ),
     Missing.CARD_GRAPH_FAMILY: ("Card step graph not written for this family", "Write its card kernels"),
     Missing.CARD_GRAPH_SHAPE: (

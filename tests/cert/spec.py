@@ -443,8 +443,10 @@ def storage_tag(storage: Storage, hw: Hardware) -> PassTag | None:
 
 # the head widths the card's paged attention kernels are built for (btb/engine/prefix.py CARD_HEAD_DIMS)
 CARD_HEAD_DIMS = (64, 128, 256)
-# the megakernel's head multiple (btb/mlx/mega.py: `self.hd % 64`), which test_manifest holds against its source
-MEGA_HEAD_MULTIPLE = 64
+# the megakernel's head gate (btb/mlx/mega/model.py `MegaPass`: a multiple of 32 dims, 256 at most), which
+# test_manifest holds against its source
+MEGA_HEAD_MULTIPLE = 32
+MEGA_HEAD_MAX = 256
 
 
 class MegaRefusal(StrEnum):
@@ -457,17 +459,17 @@ class MegaRefusal(StrEnum):
 
 def mega_refusal(kind: FamilyKind, storage: Storage, packed: bool = True) -> MegaRefusal | None:
     """why the megakernel cannot take this family's fixture in this storage, by the engine's own gates, in their
-    order: the family's block (`Family.mega`: the kernel layout, not the sandwich's), the weights it reads out of slot
-    buffers (a GGUF's quant blocks bound as stored under `packed`, `mlx_state.affine`, and the 12-bit store's packed
-    weights fall to the step; blocks dequantized on load are bf16 slots it reads), then the head width"""
+    order: the family's block (`Family.mega`: the plain dense block or the sandwich one), the weights it reads out of
+    slot buffers (a GGUF's quant blocks bound as stored under `packed`, `mlx_state.affine`, and the 12-bit store's
+    packed weights fall to the step; blocks dequantized on load are bf16 slots it reads), then the head width"""
     fl = core.flags(kind)
-    if Cap.KERNEL_LAYOUT not in fl or Cap.SANDWICH in fl:
+    if Cap.DENSE not in fl and Cap.SANDWICH not in fl:
         return MegaRefusal.LAYOUT
     qc = quant_class(storage)
     if STORAGE[storage].container is Container.PACK12 or (packed and qc not in (None, QuantClass.FLOAT)):
         return MegaRefusal.STORAGE
     hd = head_dim(kind)
-    if hd is None or hd % MEGA_HEAD_MULTIPLE:
+    if hd is None or hd % MEGA_HEAD_MULTIPLE or hd > MEGA_HEAD_MAX:
         return MegaRefusal.SHAPE
     return None
 

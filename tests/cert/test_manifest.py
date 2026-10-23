@@ -382,8 +382,9 @@ def test_own_layer_speculation_gate_matches_its_source() -> None:
 
 
 def test_mega_head_multiple_matches_its_source() -> None:
-    """the megakernel's head gate, quoted from mega.py so MEGA_SHAPE cannot outlive the constraint."""
-    assert f"self.hd % {spec.MEGA_HEAD_MULTIPLE}" in _source("mlx", "mega.py")
+    """the megakernel's head gate, quoted from mega/model.py so MEGA_SHAPE cannot outlive the constraint."""
+    gate = f"self.hd % {spec.MEGA_HEAD_MULTIPLE} or self.hd > {spec.MEGA_HEAD_MAX}"
+    assert gate in _source("mlx", "mega", "model.py")
 
 
 def test_mlx_attn_heads_match_their_source() -> None:

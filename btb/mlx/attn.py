@@ -32,7 +32,32 @@ ATTN_NODES = 1
 ATTN_BLOCK = 1024
 
 
-_ATTN_SRC = """
+# The node attention and its fold as device functions: the launches below call them from their grid positions, and
+# the megakernel's attention ops call the same ones (btb/mlx/mega), one source for both. The includer defines KQ, SEG
+# and MAP; a launch's inputs reach the body through `BtbAttnIn`, the pointers MLX may bind in the constant address
+# space (a small array) typed by template parameters. Each launch's header is its own function alone.
+ATTN_NODES_FN = r"""
+template <typename QT, typename MT, typename PT, typename ST, typename ST2, typename RT>
+struct BtbAttnIn {
+    const device QT* q;
+    const device uint16_t* k;
+    const device uint16_t* v;
+    MT meta;
+    PT path;
+    ST ks;
+    ST vs;
+    ST2 ks2;
+    ST2 vs2;
+    const device uint16_t* k2;
+    const device uint16_t* v2;
+    RT rmap;
+    float sc;
+    uint Hk, cap, Hq, T, ns_max, PD, cap2;
+};
+
+template <uint G, uint D, uint NT, uint P, typename QT, typename MT, typename PT, typename ST, typename ST2, typename RT>
+inline void btb_attn_nodes(thread const BtbAttnIn<QT, MT, PT, ST, ST2, RT>& a, uint h, uint s, uint grp, uint sg,
+                           uint lane, threadgroup float4* qsb, device float* pm, device float* pl, device float* pacc) {
     // one threadgroup per (kv head, block of P rows, group of NT query nodes). The cache's rows are blocks of P
     // from row 0: row j belongs to block j / P, simdgroup (j / 32) % 8 of it, lane j % 32 - a function of j
     // alone, so a node folds its rows in one order whatever its length, its window or its company, and a tree
@@ -47,24 +72,26 @@ _ATTN_SRC = """
     // row past + path[t][d] (the d-th node on its root-to-self path, the tree's rows sitting after the prefix).
     // `start` is the sliding window's first row, max(0, rows - W) (0 for a full-attention layer); the node's
     // blocks are start / P .. (rows - 1) / P, `blocks` of them, block s of the grid the s-th.
-    const uint G = G_VALUE;
-    const uint D = D_VALUE;
-    const uint NT = NT_VALUE;
-    const uint P = P_VALUE;
     const uint DL = D / 32;
     const uint KC = D / 8;
-    uint h = threadgroup_position_in_grid.x;
-    uint s = threadgroup_position_in_grid.y;
-    uint grp = threadgroup_position_in_grid.z;
-    uint sg = simdgroup_index_in_threadgroup;
-    uint lane = thread_index_in_simdgroup;
-    // k, v: the cache's own buffers [1, Hk, cap, D] bf16, read as uint16 bit patterns
-    uint Hk = k_shape[1];
-    uint cap = k_shape[2];
-    uint Hq = q_shape[1];
-    uint T = q_shape[0];
-    uint ns_max = threadgroups_per_grid.y;
-    uint PD = path_shape[1];
+    // the launch's inputs under the names the body reads; k, v: the cache's own buffers [1, Hk, cap, D] bf16, read
+    // as uint16 bit patterns
+    const device QT* q = a.q;
+    const device uint16_t* k = a.k;
+    const device uint16_t* v = a.v;
+    const device uint16_t* k2 = a.k2;
+    const device uint16_t* v2 = a.v2;
+    MT meta = a.meta;
+    PT path = a.path;
+    ST ks = a.ks;
+    ST vs = a.vs;
+    ST2 ks2 = a.ks2;
+    ST2 vs2 = a.vs2;
+    RT rmap = a.rmap;
+    (void)k2; (void)v2; (void)ks; (void)vs; (void)ks2; (void)vs2; (void)rmap;
+    const float sc[1] = {a.sc};
+    uint Hk = a.Hk, cap = a.cap, Hq = a.Hq, T = a.T, ns_max = a.ns_max, PD = a.PD;
+    threadgroup float4 (*qs)[G][D / 4] = (threadgroup float4 (*)[G][D / 4])qsb;
     const device uint16_t* kb16 = (const device uint16_t*)k;
     const device uint16_t* vb16 = (const device uint16_t*)v;
     // the group's nodes: each its rows in this block, [lo, hi), and its K/V rows' bases. `kbidx` and `pbase`
@@ -88,7 +115,7 @@ _ATTN_SRC = """
     // batch appends with one in-place write; the logical order, so the lanes and the fold, is the single
     // decode's, and so are the bits
     uint seg[NT];
-    uint cap2 = k2_shape[2];
+    uint cap2 = a.cap2;
     const device uint16_t* kb2[NT];
     const device uint16_t* vb2[NT];
 #if KQ
@@ -123,7 +150,7 @@ _ATTN_SRC = """
 #endif
 #endif
         if (node[t] < T) {
-            const device uint* mt = meta + node[t] * 8;
+            auto mt = meta + node[t] * 8;
             uint nrows = mt[0];
             uint nb = mt[1];
             past_[t] = mt[2];
@@ -164,7 +191,6 @@ _ATTN_SRC = """
         }
     }
     if (!any) return;
-    threadgroup float4 qs[NT][G][D / 4];
     uint tid = sg * 32 + lane;
     for (uint e = tid; e < NT * G * (D / 4); e += 256) {
         uint t = e / (G * (D / 4));
@@ -386,24 +412,19 @@ _ATTN_SRC = """
             for (uint w = 0; w < DL; ++w) po[w] = acc[t][i][w];
         }
     }
+}
 """
 
-
-_ATTN_FOLD_SRC = """
-    // one simdgroup per (node, query head): fold that node's splits x 8 simdgroup partials (m, l, acc) in
+ATTN_FOLD_FN = r"""
+template <bool SINKS, typename OT, typename MT, typename SKT>
+inline void btb_attn_fold(const device float* pm, const device float* pl, const device float* pacc, MT meta,
+                          SKT sinks, uint j, uint lane, uint T, uint Hk, uint NP, uint G, uint D, device OT* out) {
+    // one simdgroup per (node, query head), j of them: fold that node's splits x 8 simdgroup partials (m, l, acc) in
     // one fixed order; each lane keeps D / 32 dims. With SINKS, the query head's sink logit (gpt-oss: one
     // learned scalar per query head, an extra column of the softmax with no value, taken as it is -- the
     // scores are scaled, the sink is not, as transformers' eager_attention_forward concatenates it) joins
     // the maximum and opens the denominator. It is per query head, so it is the same term whatever the node
     // count or the row count is, and it drops out of the arithmetic entirely when SINKS is 0.
-    uint sg = simdgroup_index_in_threadgroup;
-    uint lane = thread_index_in_simdgroup;
-    uint j = threadgroup_position_in_grid.x * 8 + sg;
-    uint T = pm_shape[0];
-    uint Hk = pm_shape[1];
-    uint NP = pm_shape[2];
-    uint G = pm_shape[3];
-    uint D = pacc_shape[4];
     uint DL = D / 32;
     if (j >= T * Hk * G) return;
     uint node = j / (Hk * G);
@@ -432,6 +453,53 @@ _ATTN_FOLD_SRC = """
     float inv = 1.0f / L;
     size_t ob = (size_t)j * D + lane * DL;
     for (uint t = 0; t < DL; ++t) out[ob + t] = (OT)(o[t] * inv);
+}
+"""
+
+ATTN_FUNCS = ATTN_NODES_FN + ATTN_FOLD_FN
+
+
+_ATTN_FOLD_SRC = """
+    uint j = threadgroup_position_in_grid.x * 8 + simdgroup_index_in_threadgroup;
+    btb_attn_fold<SINKS != 0>(pm, pl, pacc, meta, sinks, j, thread_index_in_simdgroup, (uint)pm_shape[0],
+                              (uint)pm_shape[1], (uint)pm_shape[2], (uint)pm_shape[3], (uint)pacc_shape[4], out);
+"""
+
+
+def _attn_source(D: int, g: int, nt: int, kq: bool, seg: bool, mapped: bool) -> str:
+    """the node kernel's body: its inputs bound into `BtbAttnIn` (an input the variant has not, a null pointer of the
+    type the struct takes) and `btb_attn_nodes` called at its grid position. An input's pointer type is taken from
+    `&x[0]`: `decltype(x)` keeps the parameter's own `thread` qualifier, which no struct field may carry"""
+    st = "decltype(&ks[0])" if kq else "const device float*"
+    st2 = "decltype(&ks2[0])" if kq and seg else "const device float*"
+    rt = "decltype(&rmap[0])" if mapped else "const device uint*"
+    fields = [
+        "q",
+        "(const device uint16_t*)k",
+        "(const device uint16_t*)v",
+        "meta",
+        "path",
+        "ks" if kq else "nullptr",
+        "vs" if kq else "nullptr",
+        "ks2" if kq and seg else "nullptr",
+        "vs2" if kq and seg else "nullptr",
+        "(const device uint16_t*)k2" if seg else "nullptr",
+        "(const device uint16_t*)v2" if seg else "nullptr",
+        "rmap" if mapped else "nullptr",
+        "sc[0]",
+        "(uint)k_shape[1]",
+        "(uint)k_shape[2]",
+        "(uint)q_shape[1]",
+        "(uint)q_shape[0]",
+        "threadgroups_per_grid.y",
+        "(uint)path_shape[1]",
+        "(uint)k2_shape[2]" if seg else "0u",
+    ]
+    return f"""
+    threadgroup float4 qs[{nt * g * (D // 4)}];
+    BtbAttnIn<QT, decltype(&meta[0]), decltype(&path[0]), {st}, {st2}, {rt}> a = {{{", ".join(fields)}}};
+    btb_attn_nodes<{g}, {D}, {nt}, {ATTN_BLOCK}>(a, threadgroup_position_in_grid.x, threadgroup_position_in_grid.y,
+        threadgroup_position_in_grid.z, simdgroup_index_in_threadgroup, thread_index_in_simdgroup, qs, pm, pl, pacc);
 """
 
 
@@ -711,11 +779,8 @@ def _attn_kernel(
                 name=f"btb_attn_nodes_{rows}{'_seg' if seg else ''}{'_map' if mapped else ''}_d{D}_g{g}_n{nt}",
                 input_names=names,
                 output_names=["pm", "pl", "pacc"],
-                header=f"#define KQ {int(kq)}\n#define SEG {int(seg)}\n#define MAP {int(mapped)}\n",
-                source=_ATTN_SRC.replace("G_VALUE", str(g))
-                .replace("D_VALUE", str(D))
-                .replace("NT_VALUE", str(nt))
-                .replace("P_VALUE", str(ATTN_BLOCK)),
+                header=f"#define KQ {int(kq)}\n#define SEG {int(seg)}\n#define MAP {int(mapped)}\n" + ATTN_NODES_FN,
+                source=_attn_source(D, g, nt, kq, seg, mapped),
             )
             _attn_kernels[(D, g, kq, seg, nt, mapped)] = k
         if _attn_fold is None:
@@ -723,6 +788,7 @@ def _attn_kernel(
                 name="btb_attn_fold",
                 input_names=["pm", "pl", "pacc", "meta", "sinks"],
                 output_names=["out"],
+                header=ATTN_FOLD_FN,
                 source=_ATTN_FOLD_SRC,
             )
     return k, _attn_fold
