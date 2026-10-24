@@ -3499,6 +3499,7 @@ class _RamEngine(_MemoryMixin):
         self.lines: list[str] = []
         self.cold_ring = None
         self.rebound: list[int] = []
+        self.mega_builds = 0  # the megakernel rebuilt over the weights where a regrow put them
 
     def log(self, *a: object, **k: object) -> None:
         self.lines.append(" ".join(str(x) for x in a))
@@ -3511,6 +3512,9 @@ class _RamEngine(_MemoryMixin):
 
     def _rebind_warm(self, i: int) -> None:
         self.rebound.append(i)
+
+    def _build_mega(self) -> None:
+        self.mega_builds += 1
 
     def _layer_bytes_stored(self, i: int, packed: bool = False) -> int:
         return self.stored_bytes
@@ -3603,6 +3607,7 @@ def test_the_ram_policy_regrows_after_clean_readings_with_room(monkeypatch: Monk
     e.ram_policy()  # fifth clean reading
     assert e.cold == set() and e.rebound == [2] and e.device.did[-1] == "ram-regrow" and e.ram_state.shed == []
     assert "[ram] REGROW layer 2" in e.lines[-1]
+    assert e.mega_builds == 1, "every layer back in RAM: the megakernel rebuilt over them"
 
 
 # --- the serve registry frees the card ---------------------------------------------------------------------
