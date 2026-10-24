@@ -15,6 +15,7 @@ import torch
 from ...kinds import CAPS, FAMILY_NAMES, Cap, FamilyKind, LayerKind, PassTag
 
 if TYPE_CHECKING:
+    from ...mlx.mega import Block
     from ..drafter import MTPDrafter
     from ..state import _State
 
@@ -134,9 +135,29 @@ class Family:
 
     @property
     def mega(self) -> bool:
-        """the MLX megakernel is written for the family's block: the kernel layout, not the sandwich's norm order
-        (mlx/mega.py; `_mega_ok` checks the cache, the storage and the pass after)"""
-        return self.kernel_layout and not self.sandwich
+        """the family's layers are composed for the MLX megakernel (`mega_layer`): the plain pre-norm block and the
+        sandwich block here, a family whose block differs composing its own (`_mega_ok` checks the cache, the storage
+        and the pass after)"""
+        return self.dense or self.sandwich
+
+    def mega_layer(self, b: Block, i: int) -> None:
+        """layer `i` of a megakernel pass, composed from the kernel's parts (btb/mlx/mega): the plain pre-norm block,
+        or the sandwich block (each sub-block's output normed before its add, the MLP's input normed on its own); q/k/v
+        one matvec and gate/up another (adjacent slots, or the module's fused projections)"""
+        if self.sandwich:
+            sw = b.sandwich(i)
+            at, mlp = sw.self_attn, sw.mlp
+            x = b.norm(sw.input_layernorm)
+            b.add_normed(b.linear(b.attention(i, b.linear(x, b.qkv(at)), at), at.o_proj), sw.post_attention_layernorm)
+            x2 = b.norm(sw.pre_feedforward_layernorm)
+            b.add_normed(b.linear(b.gated(b.linear(x2, b.gate_up(mlp))), mlp.down_proj), sw.post_feedforward_layernorm)
+            return
+        layer = b.dense(i)
+        at, mlp = layer.self_attn, layer.mlp
+        x = b.norm(layer.input_layernorm)
+        b.add(b.linear(b.attention(i, b.linear(x, b.qkv(at)), at), at.o_proj))
+        x2 = b.norm(layer.post_attention_layernorm)
+        b.add(b.linear(b.gated(b.linear(x2, b.gate_up(mlp))), mlp.down_proj))
 
     @property
     def mlx_path(self) -> PassTag:

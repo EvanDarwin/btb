@@ -48,14 +48,16 @@ GRAPHED = [s for s in DENSE if (k := kind_of_stem(s)) is not None and card_rows(
 OTHERS = ["tiny_gpt_oss", "tiny_q4"]
 HYBRID = "tiny_q35"  # served on the host: its recurrent states resume from the snapshots its prefill keeps
 VOCAB = 200  # inside every fixture's vocabulary
-# where a conversation's rows lie: the host's region on the CPU, in buffers MLX shares on MLX (the per-token graph: the
-# megakernel reads arenas of its own, `mlx-mega`); on the card, the card's region under the card graph (`card`), beside
-# a layer the host runs (`split`), or every row in RAM (`kvhost`), each placement pinned (`adapt` off); and the card as
-# `btb serve` loads it (`served`: the options' defaults, its memory policies reading every pass's cache)
+# where a conversation's rows lie: the host's region on the CPU, in buffers MLX shares on MLX (its per-token graph, and
+# its megakernel, `mlx-mega`; int8 rows keep a cache of their own, `mlx-kvbits`); on the card, the card's region under
+# the card graph (`card`), beside a layer the host runs (`split`), or every row in RAM (`kvhost`), each placement pinned
+# (`adapt` off); and the card as `btb serve` loads it (`served`: the options' defaults, its memory policies reading
+# every pass's cache)
 PLACES: dict[str, dict[str, Any]] = {
     "cpu": {"device": "cpu"},
     "mlx": {"device": "mlx", "mlx_mega": 0},
     "mlx-mega": {"device": "mlx"},
+    "mlx-kvbits": {"device": "mlx", "mlx_mega": 0, "kv_bits": 8},
     "card": {"device": "cuda", "adapt": 0},
     "split": {"device": "cuda", "adapt": 0, "cpu_layers": 1},
     "kvhost": {"device": "cuda", "adapt": 0, "kv_host": 1},
@@ -145,7 +147,12 @@ def walk(sm: StreamedTextModel, seed: int) -> list[torch.Tensor | list[int]]:
     return seen
 
 
-PLACED = ["cpu", pytest.param("mlx", marks=MLX), *(pytest.param(p, marks=CARD) for p in ON_CARD)]
+PLACED = [
+    "cpu",
+    pytest.param("mlx", marks=MLX),
+    pytest.param("mlx-mega", marks=MLX),
+    *(pytest.param(p, marks=CARD) for p in ON_CARD),
+]
 
 
 def same(paged: list[torch.Tensor | list[int]], flat: list[torch.Tensor | list[int]], what: str) -> None:
@@ -814,11 +821,11 @@ def test_a_hybrids_states_follow_a_linear_layer_the_card_gives_up_and_back(stem:
 
 
 @pytest.mark.parametrize(
-    "stem,place", [*((s, "cpu") for s in OTHERS), pytest.param("tiny_qwen3", "mlx-mega", marks=MLX)]
+    "stem,place", [*((s, "cpu") for s in OTHERS), pytest.param("tiny_qwen3", "mlx-kvbits", marks=MLX)]
 )
 def test_an_engine_the_prefix_cache_does_not_serve_says_why(stem: str, place: str) -> None:
-    """a family with its own layer, a family whose attention is its own module's, MLX's megakernel where it serves
-    the engine's passes: the reason, and its sessions' caches contiguous ones of their own"""
+    """a family with its own layer, a family whose attention is its own module's, MLX's int8 rows: the reason, and its
+    sessions' caches contiguous ones of their own"""
     sm = model(stem, place)
     assert PrefixCache.why_not(sm) and sm._prefix_cache() is None
     s = sm.session([5, 6, 7, 8])

@@ -9,13 +9,16 @@ bf16 copy. Native 144 B/256 as stored, vs MLX's 160 B repack."""
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from .core import mx
-from .matvec import blocks, launch
+from ..kinds import Quant
+from .core import metal_kernel, mx
+from .matvec import Frags, StoredKernel, blocks, launch
 
 if TYPE_CHECKING:
     import mlx.core as mx_
+
+    from .core import MetalKernel
 
 # 144 bytes a superblock of 256 weights: d f16, dmin f16, 12 bytes packing a 6-bit scale and a 6-bit min for
 # each of 8 sub-blocks of 32, then 128 bytes of nibbles (byte b = qs[32k + i] holds the low nibble for
@@ -78,7 +81,7 @@ inline void q5k_decode_block(const device uchar* blk, device U* o) {
 # to them in the column order the row's chain has always taken, and simd_sum. cols = NSB*256.
 # Q4_K and Q5_K share a source (BLKB block bytes, QSOFF the nibble offset, Q5 adds the 5th bit from the qh plane at
 # blk+16); a lane's weights pair as (sub-block 2k, 2k+1) at inner index lane.
-_MATVEC = blocks(
+MV_Q45 = Frags(
     "",
     "        float w[RP][8];\n",
     r"""
@@ -116,6 +119,7 @@ _MATVEC = blocks(
                 for (int k = 0; k < 4; k++) acc[r][tr] += w[r][2 * k] * xv[2 * k] + w[r][2 * k + 1] * xv[2 * k + 1];
 """,
 )
+_MATVEC = blocks(MV_Q45)
 # Q2_K and Q3_K: a lane's eight weights at col h*128 + j*32 + lane (h 0..1, j 0..3), one a term
 _APPLY_HJ = r"""
             float xv[8];
@@ -140,7 +144,7 @@ _DEQUANT = r"""
 
 # Q4_K: 144 B/superblock, nibbles at offset 16, no qh. Q5_K: 176 B, nibbles at 48, the 5th bit in qh at 16.
 _KQ = {"q4k": (144, 16, 0), "q5k": (176, 48, 1)}
-_deq_kernels: dict[str, Any] = {}
+_deq_kernels: dict[str, MetalKernel] = {}
 _lock = threading.Lock()
 
 
@@ -149,18 +153,30 @@ def _defs(kind: str) -> str:
     return f"#define BLKB {blkb}\n#define QSOFF {qsoff}\n#define Q5 {q5}\n"
 
 
+# a row of the matrix in bf16, a superblock a thread as `_DEQUANT` decodes it (the step's tied embedding)
+_DECODE_ROW = r"""
+    for (uint c = tid; c < NSB; c += 256) {
+#if Q5
+        q5k_decode_block<bfloat>(W + ((size_t)row * NSB + c) * BLKB, dst + (size_t)c * 256);
+#else
+        q4k_decode_block<bfloat>(W + ((size_t)row * NSB + c) * BLKB, dst + (size_t)c * 256);
+#endif
+    }
+"""
+
+
 def _matvec(kind: str, w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:
     nsb = cols // 256
     return launch(f"btb_{kind}_mv_{rows}_{nsb}", _MATVEC, f"{_SM}{_defs(kind)}", [("W", w_bytes)], x, rows, cols, 256)
 
 
 def _dequant(kind: str, w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
-    m = mx()
+    m = mx
     nblk = rows * cols // 256
     with _lock:
         k = _deq_kernels.get(kind)
         if k is None:
-            k = _deq_kernels[kind] = m.fast.metal_kernel(
+            k = _deq_kernels[kind] = metal_kernel(
                 name=f"btb_{kind}_dequant",
                 input_names=["W"],
                 output_names=["out"],
@@ -204,7 +220,7 @@ def dequant_q5k(w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
 # a group (l on q[l], q[l+16]). value = d*(scales[si]&0xF)*q - dmin*(scales[si]>>4), col = h*128 + j*32 + m.
 # lane = m (0..31): reads qs[h*32+m], the four j groups share the byte at shifts 0/2/4/6. Register-only,
 # batch-invariant.
-_MATVEC_Q2K = blocks(
+MV_Q2K = Frags(
     "    uint sub = lane >> 4;\n",
     "        float w[RP][8];\n",
     r"""
@@ -225,24 +241,30 @@ _MATVEC_Q2K = blocks(
 """,
     _APPLY_HJ,
 )
-_DEQUANT_Q2K = r"""
-    uint gid = thread_position_in_grid.x;
-    uint blk_i = gid / 32, lane = gid % 32;
-    if (blk_i >= NBLK) return;
+_MATVEC_Q2K = blocks(MV_Q2K)
+# a superblock's eight weights of lane `lane` (cols h*128 + j*32 + lane) into o: the dequant's, and the embedding's
+_Q2K_LANE = r"""
+template <typename U>
+inline void q2k_decode_lane(const device uchar* blk, uint lane, device U* o) {
     uint sub = lane >> 4;
-    const device uchar* blk = W + (size_t)blk_i * 84;
     const device uchar* scales = blk;
     const device uchar* qs = blk + 16;
     float d  = (float)(*(const device half*)(blk + 80));
     float dm = (float)(*(const device half*)(blk + 82));
-    device T* o = out + (size_t)blk_i * 256;
     for (int h = 0; h < 2; h++) {
         uchar byte = qs[h * 32 + lane];
         for (int j = 0; j < 4; j++) {
             uchar s = scales[h * 8 + 2 * j + sub];
-            o[h * 128 + j * 32 + lane] = (T)(d * (s & 0xF) * ((byte >> (2 * j)) & 3) - dm * (s >> 4));
+            o[h * 128 + j * 32 + lane] = (U)(d * (s & 0xF) * ((byte >> (2 * j)) & 3) - dm * (s >> 4));
         }
     }
+}
+"""
+_DEQUANT_Q2K = r"""
+    uint gid = thread_position_in_grid.x;
+    uint blk_i = gid / 32, lane = gid % 32;
+    if (blk_i >= NBLK) return;
+    q2k_decode_lane<T>(W + (size_t)blk_i * 84, lane, out + (size_t)blk_i * 256);
 """
 _q2k_deq = None
 
@@ -256,12 +278,12 @@ def matvec_q2k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.ar
 def dequant_q2k(w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
     """the full [rows, cols] bf16 weight for a Q2_K tensor."""
     global _q2k_deq
-    m = mx()
+    m = mx
     nblk = rows * cols // 256
     with _lock:
         if _q2k_deq is None:
-            _q2k_deq = m.fast.metal_kernel(
-                name="btb_q2k_dequant", input_names=["W"], output_names=["out"], header="", source=_DEQUANT_Q2K
+            _q2k_deq = metal_kernel(
+                name="btb_q2k_dequant", input_names=["W"], output_names=["out"], header=_Q2K_LANE, source=_DEQUANT_Q2K
             )
     grid = ((nblk * 32 + 255) // 256) * 256
     return _q2k_deq(
@@ -290,8 +312,27 @@ inline void q3k_aux(const device uchar* sc, thread uint aux[4]) {
     aux[0] = (a0 & k2) | (((a2 >> 0) & k1) << 4);
     aux[1] = (a1 & k2) | (((a2 >> 2) & k1) << 4);
 }
+// a superblock's eight weights of lane `lane` (cols h*128 + j*32 + lane) into o: the dequant's, and the embedding's
+template <typename U>
+inline void q3k_decode_lane(const device uchar* blk, uint lane, device U* o) {
+    uint sub = lane >> 4;
+    const device uchar* qs = blk + 32;
+    thread uint aux[4];
+    q3k_aux(blk + 96, aux);
+    const thread char* scl = (const thread char*)aux;
+    float d = (float)(*(const device half*)(blk + 108));
+    uchar hm = blk[lane];
+    for (int h = 0; h < 2; h++) {
+        uchar byte = qs[h * 32 + lane];
+        for (int j = 0; j < 4; j++) {
+            int q = (byte >> (2 * j)) & 3;
+            if (!(hm & (1 << (h * 4 + j)))) q -= 4;
+            o[h * 128 + j * 32 + lane] = (U)(d * (float)((int)scl[h * 8 + 2 * j + sub] - 32) * (float)q);
+        }
+    }
+}
 """
-_MATVEC_Q3K = blocks(
+MV_Q3K = Frags(
     "    uint sub = lane >> 4;\n",
     "        float w[RP][8];\n",
     r"""
@@ -315,27 +356,12 @@ _MATVEC_Q3K = blocks(
 """,
     _APPLY_HJ,
 )
+_MATVEC_Q3K = blocks(MV_Q3K)
 _DEQUANT_Q3K = r"""
     uint gid = thread_position_in_grid.x;
     uint blk_i = gid / 32, lane = gid % 32;
     if (blk_i >= NBLK) return;
-    uint sub = lane >> 4;
-    const device uchar* blk = W + (size_t)blk_i * 110;
-    const device uchar* qs = blk + 32;
-    thread uint aux[4];
-    q3k_aux(blk + 96, aux);
-    const thread char* scl = (const thread char*)aux;
-    float d = (float)(*(const device half*)(blk + 108));
-    uchar hm = blk[lane];
-    device T* o = out + (size_t)blk_i * 256;
-    for (int h = 0; h < 2; h++) {
-        uchar byte = qs[h * 32 + lane];
-        for (int j = 0; j < 4; j++) {
-            int q = (byte >> (2 * j)) & 3;
-            if (!(hm & (1 << (h * 4 + j)))) q -= 4;
-            o[h * 128 + j * 32 + lane] = (T)(d * (float)((int)scl[h * 8 + 2 * j + sub] - 32) * (float)q);
-        }
-    }
+    q3k_decode_lane<T>(W + (size_t)blk_i * 110, lane, out + (size_t)blk_i * 256);
 """
 _q3k_deq = None
 
@@ -349,11 +375,11 @@ def matvec_q3k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.ar
 def dequant_q3k(w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
     """the full [rows, cols] bf16 weight for a Q3_K tensor."""
     global _q3k_deq
-    m = mx()
+    m = mx
     nblk = int(rows * cols // 256)
     with _lock:
         if _q3k_deq is None:
-            _q3k_deq = m.fast.metal_kernel(
+            _q3k_deq = metal_kernel(
                 name="btb_q3k_dequant", input_names=["W"], output_names=["out"], header=_Q3K_AUX, source=_DEQUANT_Q3K
             )
     grid = ((nblk * 32 + 255) // 256) * 256
@@ -365,3 +391,20 @@ def dequant_q3k(w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
         output_dtypes=[m.bfloat16],
         template=[("T", m.bfloat16), ("NBLK", nblk)],
     )[0]
+
+
+def _decode_lanes(fn: str, blkb: int) -> str:
+    """a row of the matrix in bf16, a (superblock, lane) a thread as the dequant decodes it through `fn` (the step's
+    tied embedding)"""
+    return (
+        "    for (uint i = tid; i < NSB * 32; i += 256)\n"
+        f"        {fn}<bfloat>(W + ((size_t)row * NSB + i / 32) * {blkb}, i % 32, dst + (size_t)(i / 32) * 256);\n"
+    )
+
+
+KERNELS: dict[Quant, StoredKernel] = {
+    Quant.Q2_K: StoredKernel(MV_Q2K, _Q2K_LANE, "", 256, _decode_lanes("q2k_decode_lane", 84)),
+    Quant.Q3_K: StoredKernel(MV_Q3K, _Q3K_AUX, "", 256, _decode_lanes("q3k_decode_lane", 110)),
+    Quant.Q4_K: StoredKernel(MV_Q45, _SM, _defs("q4k"), 256, _DECODE_ROW),
+    Quant.Q5_K: StoredKernel(MV_Q45, _SM, _defs("q5k"), 256, _DECODE_ROW),
+}

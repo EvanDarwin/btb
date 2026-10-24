@@ -7,11 +7,11 @@ from __future__ import annotations
 import contextlib
 import time
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, TypeAlias, TypedDict
 
 import numpy as np
 
-from ..kinds import QUANT_KIND, Log, Quant, QuantClass, quant_key
+from ..kinds import QUANT_KIND, Json, Log, Quant, QuantClass, quant_key, stored_in_place
 from .core import bf16_weight, from_mx, info, mx, to_mx
 from .gemv import gemv, matmul_mxfp4, matmul_mxfp4_pair, unpack_bf16
 from .iquant import (
@@ -34,10 +34,48 @@ if TYPE_CHECKING:
 
     from .core import Shared
 
+# a stored type's arrays its kernels read (`stored_streams`): its blocks' bytes, then any split or side streams
+Streams: TypeAlias = "tuple[mx_.array, ...]"
+# the file's bytes of a stored weight: an MLX view of a slot or a pool block, else host bytes copied in
+RawBytes: TypeAlias = "mx_.array | np.ndarray"
+# a 12-bit record's arrays (`unpack_bf16`): low bytes, high nibbles, the table, the escapes' indices and values, n
+Packed: TypeAlias = "tuple[mx_.array, mx_.array, mx_.array, mx_.array | None, mx_.array | None, int]"
+# an expert's weights as the MLX step multiplies them: gate and up as one weight or a GGUF's pair, then down
+ExpertWeights: TypeAlias = "tuple[Weight | tuple[Weight, Weight], Weight]"
+# an MXFP4 expert's bytes in its slot: gate_up (ggml's layout: the gate and up views), then down
+Mxfp4Pair: TypeAlias = "tuple[mx_.array | tuple[mx_.array, mx_.array], mx_.array]"
+# an expert's rows of the input, their router weights, and its weights (`Backend.experts`)
+ExpertHit: TypeAlias = "tuple[Sequence[int], Sequence[float], ExpertWeights]"
+# an expert's output (`Backend.expert_mx`): its rows' indices (None: the whole input) and its weighted rows
+ExpertOut: TypeAlias = "tuple[mx_.array | None, mx_.array]"
 
-# the k-quant and IQ4 types' own matvec and dequant, by `kinds.quant_key`; the affine and lattice classes each
-# share one family keyed by the type (`stored_matvec`). Held to `kinds.stored_quants()` by test_runtime_guards
-_MATVEC: dict[str, Callable[..., Any]] = {
+
+class PackedEntry(TypedDict):
+    """a 12-bit record's layout in its slot (the cold tier's manifest entry): the low bytes', high nibbles', padding's
+    and escapes' sizes, the value table and the element count"""
+
+    lo: int
+    hi4: int
+    pad: int
+    esc: int
+    table: Sequence[int]
+    n: int
+
+
+class Stat(TypedDict):
+    """what the backend has run: linears, evaluations and their seconds, layers stepped and their seconds"""
+
+    linears: int
+    evals: int
+    s: float
+    layers: int
+    layer_s: float
+
+
+# the k-quant and IQ4 types' own matvec and dequant, by `kinds.quant_key` (each its own streams first, so `...`); the
+# affine and lattice classes each share one family keyed by the type (`stored_matvec`). Held to
+# `kinds.stored_quants()` by test_runtime_guards
+_MATVEC: dict[str, Callable[..., mx_.array]] = {
     "q2k": matvec_q2k,
     "q3k": matvec_q3k,
     "q4k": matvec_q4k,
@@ -46,7 +84,7 @@ _MATVEC: dict[str, Callable[..., Any]] = {
     "iq4nl": matvec_iq4nl,
     "iq4xs": matvec_iq4xs,
 }
-_DEQUANT: dict[str, Callable[..., Any]] = {
+_DEQUANT: dict[str, Callable[..., mx_.array]] = {
     "q2k": dequant_q2k,
     "q3k": dequant_q3k,
     "q4k": dequant_q4k,
@@ -57,25 +95,21 @@ _DEQUANT: dict[str, Callable[..., Any]] = {
 }
 
 
-def stored_streams(q: Quant, raw: Any) -> tuple[Any, ...]:
+def stored_streams(q: Quant, raw: RawBytes) -> Streams:
     """the arrays type `q`'s kernels read for the file's bytes `raw`: the bytes, IQ4_NL's split streams, a lattice
     type's bytes and side streams. Host bytes are copied in and repacked once, here; a slot's MLX view is read in
     place, repacked after each fill (`Weight.invalidate`)"""
-    m = mx()
+    m = mx
     a = raw if isinstance(raw, m.array) else m.array(np.asarray(raw, dtype=np.uint8).reshape(-1))
     out = (
-        repack_iq4nl(a)
-        if q is Quant.IQ4_NL
-        else (a, *repack_lattice(quant_key(q), a))
-        if QUANT_KIND[q] is QuantClass.LATTICE
-        else (a,)
+        (a,) if stored_in_place(q) else repack_iq4nl(a) if q is Quant.IQ4_NL else (a, *repack_lattice(quant_key(q), a))
     )
     if a is not raw:
         m.eval(*out)
     return out
 
 
-def stored_matvec(q: Quant, streams: tuple[Any, ...], x: mx_.array, rows: int, cols: int) -> mx_.array:
+def stored_matvec(q: Quant, streams: Streams, x: mx_.array, rows: int, cols: int) -> mx_.array:
     """y[T, rows] = x[T, cols] . W^T on type `q`'s own kernel over its `stored_streams`: f32 accumulation, y in x's
     dtype, batch-invariant (16 rows a launch)"""
     c, key = QUANT_KIND[q], quant_key(q)
@@ -90,15 +124,15 @@ def stored_matvec(q: Quant, streams: tuple[Any, ...], x: mx_.array, rows: int, c
 
 def _floats(q: Quant, raw: mx_.array, rows: int, cols: int) -> mx_.array:
     """a float type's bytes (`EXPERT_FLOATS`: a GGUF's expert held as the file's) as its [rows, cols] matrix"""
-    m = mx()
+    m = mx
     return raw.view(m.float16 if q is Quant.F16 else m.bfloat16).reshape(rows, cols)
 
 
-def stored_dequant(q: Quant, streams: tuple[Any, ...], rows: int, cols: int) -> mx_.array:
+def stored_dequant(q: Quant, streams: Streams, rows: int, cols: int) -> mx_.array:
     """the whole [rows, cols] weight of type `q` in bf16 from its `stored_streams`, gguf's numbers"""
     c, key = QUANT_KIND[q], quant_key(q)
     if c is QuantClass.FLOAT:
-        return _floats(q, streams[0], rows, cols).astype(mx().bfloat16)
+        return _floats(q, streams[0], rows, cols).astype(mx.bfloat16)
     if c is QuantClass.AFFINE:
         return dequant_legacy(q.value.lower(), streams[0], rows, cols)
     if c is QuantClass.LATTICE:
@@ -113,7 +147,7 @@ def _join_stored(ws: Sequence[Weight]) -> Weight | None:
     w0 = ws[0]
     if any(w.slot or w.q is not w0.q or w.shape[1] != w0.shape[1] or len(w.streams) != len(w0.streams) for w in ws):
         return None
-    m = mx()
+    m = mx
     parts = [[s.reshape(-1) for s in w.streams] for w in ws]
     joined = tuple(m.concatenate([p[i] for p in parts]) for i in range(len(w0.streams)))
     m.eval(*joined)
@@ -128,37 +162,56 @@ def _join_stored(ws: Sequence[Weight]) -> Weight | None:
     return Weight(q=w0.q, streams=joined, shape=(sum(int(w.shape[0]) for w in ws), int(w0.shape[1])))
 
 
+def _join_pooled(ws: Sequence[Weight]) -> Weight | None:
+    """pool-resident stored weights (`Backend.weight_stored_pool`) of one type and width, end to end in one block,
+    as one launch's: a view over their bytes. None where they are not: a copy would hold the bytes twice"""
+    w0 = ws[0]
+    sh = w0.sh
+    if sh is None or any(w.sh is not sh for w in ws):
+        return None
+    off = w0.off
+    for w in ws:
+        if w.q is not w0.q or w.shape[1] != w0.shape[1] or w.off != off:
+            return None
+        off += w.nb
+    nb = off - w0.off
+    shape = (sum(int(w.shape[0]) for w in ws), int(w0.shape[1]))
+    f = Weight(q=w0.q, streams=(sh.view_mx(w0.off, nb, mx.uint8, (nb,)),), shape=shape)
+    f.sh, f.off, f.nb = sh, w0.off, nb
+    return f
+
+
 class Weight:
     """A linear's weight for the GPU: `get()` is the bf16 [rows, cols] array. Four kinds: a resident copy, a
     view of a shared byte slot, a packed record over a slot that unpacks on the GPU once per pass, or a GGUF
     type's blocks (`q`, `streams`) multiplied by the type's own kernel."""
 
-    packed: Any
-    shape: Any
+    packed: Packed | None
+    shape: tuple[int, ...]
 
-    # a slot weight's place in its shared buffer (set by `weight_slot`; `weight_fused` reads them)
-    sh: Any
+    # a slot weight's place in its shared buffer (set by `weight_slot`, none elsewhere; `weight_fused` reads them)
+    sh: Shared | None
     off: int
     nb: int
-    a: Any
+    a: mx_.array | None
 
     q: Quant | None  # a GGUF type multiplied as stored, its kernels' arrays in `streams` (`stored_streams`)
-    streams: tuple[Any, ...]
+    streams: Streams
     slot: bool  # `streams` read a slot rewritten in place (`weight_stored_slot`), never copied out of it
     raw: mx_.array | None  # a slot weight's bytes as the slot holds them, which `invalidate` repacks
 
     def __init__(
         self,
-        a: Any = None,
-        packed: tuple[Any, ...] | None = None,
+        a: mx_.array | None = None,
+        packed: Packed | None = None,
         shape: Sequence[int] | None = None,
         q: Quant | None = None,
-        streams: tuple[Any, ...] = (),
+        streams: Streams = (),
         slot: bool = False,
     ) -> None:
         # every array made here is evaluated at once: a lazy node made on one thread cannot be evaluated by
         # another (MLX's default stream is per thread), and the server runs each request on its own thread
-        m = mx()
+        m = mx
         if a is not None:
             m.eval(a)
         if packed is not None:
@@ -171,17 +224,24 @@ class Weight:
         self.streams = streams
         self.slot = slot
         self.raw = None
-        self.shape = tuple(shape) if shape is not None else tuple(int(s) for s in a.shape)
+        self.sh, self.off, self.nb = None, 0, 0
+        if shape is None:
+            if a is None:
+                raise ValueError("[mlx] a weight without its array takes its shape")
+            shape = a.shape
+        self.shape = tuple(int(s) for s in shape)
 
     def get(self) -> mx_.array:
         if self.a is None:
             if self.q is not None:
                 rows, cols = (int(s) for s in self.shape)
                 self.a = stored_dequant(self.q, self.streams, rows, cols)
-            else:
+            elif self.packed is not None:
                 lo, hi4, tbl, esc_idx, esc_val, n = self.packed
                 self.a = unpack_bf16(lo, hi4, tbl, n, self.shape, esc_idx, esc_val)
-            mx().eval(self.a)  # made on whichever thread asked first; a lazy node cannot cross threads
+            else:
+                raise ValueError("[mlx] a weight with neither its array, a stored type's streams nor a 12-bit record")
+            mx.eval(self.a)  # made on whichever thread asked first; a lazy node cannot cross threads
         return self.a
 
     def invalidate(self) -> None:
@@ -190,8 +250,9 @@ class Weight:
         if self.packed is not None or self.q is not None:
             self.a = None
         if self.slot and self.q is not None:
+            assert self.raw is not None  # a slot's weight keeps the slot's bytes (`weight_stored_slot`)
             self.streams = stored_streams(self.q, self.raw)
-            mx().eval(*self.streams)
+            mx.eval(*self.streams)
 
     def drop(self) -> None:
         """The slot goes back to be refilled: drop the unpacked copy (the streams repack once the fill lands)."""
@@ -199,26 +260,46 @@ class Weight:
             self.a = None
 
 
+def _expert_rows(xm: mx_.array, token_idx: Sequence[int]) -> ExpertOut:
+    """an expert's rows of xm [T, H]: (their indices, None where it takes the one row whole; the rows)"""
+    if int(xm.shape[0]) == 1 and len(token_idx) == 1:
+        return None, xm
+    idx = mx.array(np.asarray(token_idx, dtype=np.int32))
+    return idx, mx.take(xm, idx, axis=0)
+
+
+def act(name: str) -> Callable[[mx_.array], mx_.array] | None:
+    """an MLP activation by its config name as MLX ops (the step's, and what the megakernel's copies are held to), None
+    for one btb has none for"""
+    m = mx
+    if name in ("silu", "swish"):
+        return lambda a: a * m.sigmoid(a)
+    if name == "gelu":
+        return lambda a: 0.5 * a * (1.0 + m.erf(a / 1.4142135623730951))
+    if name in ("gelu_pytorch_tanh", "gelu_new"):
+        return lambda a: 0.5 * a * (1.0 + m.tanh(0.7978845608028654 * (a + 0.044715 * a * a * a)))
+    if name == "relu":
+        return lambda a: m.maximum(a, 0)
+    return None
+
+
 class Backend:
-    gemm_rows: Any
-    info: Any
+    gemm_rows: int
+    info: Json
     mxfp4: bool
-    sm: Any
-    stat: Any
+    stat: Stat
 
     def __init__(
         self,
-        sm: Any,
         gemm_rows: int = 64,
         cache_limit_gb: float = 2.0,
         wire: bool = True,
         log: Log | None = None,
     ) -> None:
-        m = mx()
-        self.sm = sm
+        m = mx
         self.gemm_rows = int(gemm_rows)
         self.info = info()
-        self.stat = {"linears": 0, "evals": 0, "s": 0.0, "layers": 0, "layer_s": 0.0}
+        self.stat = Stat(linears=0, evals=0, s=0.0, layers=0, layer_s=0.0)
         # the MXFP4 expert path (`experts_mx`) is on: the engine's expert bank sends gpt-oss's experts here
         # from the store's shared slots
         self.mxfp4 = True
@@ -237,40 +318,40 @@ class Backend:
     # -- memory --
     @staticmethod
     def active_bytes() -> int:
-        return int(mx().get_active_memory())
+        return int(mx.get_active_memory())
 
     @staticmethod
     def held_bytes() -> int:
         """everything MLX holds: the arrays alive and the freed buffers it keeps cached - an exact count,
         whether or not the pages behind them have been touched yet"""
-        m = mx()
+        m = mx
         return int(m.get_active_memory()) + int(m.get_cache_memory())
 
     @staticmethod
     def peak_bytes() -> int:
-        return int(mx().get_peak_memory())
+        return int(mx.get_peak_memory())
 
     @staticmethod
     def clear_cache() -> None:
-        mx().clear_cache()
+        mx.clear_cache()
 
     # -- weights --
     def weight(self, t: torch.Tensor) -> Weight:
         return Weight(bf16_weight(t))
 
     def weight_slot(self, shared: Shared, off: int, nb: int, shape: Sequence[int]) -> Weight:
-        w = Weight(shared.view_mx(off, nb, mx().bfloat16, shape))
+        w = Weight(shared.view_mx(off, nb, mx.bfloat16, shape))
         w.sh, w.off, w.nb = shared, int(off), int(nb)
         return w
 
-    def weight_fused(self, ws: Sequence[Any]) -> Weight | None:
+    def weight_fused(self, ws: Sequence[Weight]) -> Weight | None:
         """One weight over several with the same columns (one matmul instead of several), None where they cannot be
         one: adjacent slot weights as a view, no copy; resident stored weights of one type joined (`_join_stored`)."""
-        if ws and all(getattr(w, "q", None) is not None for w in ws):
-            return _join_stored(ws)
-        if not ws or any(getattr(w, "sh", None) is None for w in ws):
+        if ws and all(w.q is not None for w in ws):
+            return _join_pooled(ws) if any(w.sh is not None for w in ws) else _join_stored(ws)
+        sh = ws[0].sh if ws else None
+        if sh is None or any(w.sh is None for w in ws):
             return None
-        sh = ws[0].sh
         cols = ws[0].shape[1]
         off = ws[0].off
         for w in ws:
@@ -278,12 +359,14 @@ class Backend:
                 return None
             off += w.nb
         nb = off - ws[0].off
-        f = Weight(sh.view_mx(ws[0].off, nb, mx().bfloat16, (sum(w.shape[0] for w in ws), cols)))
+        f = Weight(sh.view_mx(ws[0].off, nb, mx.bfloat16, (sum(w.shape[0] for w in ws), cols)))
         f.sh, f.off, f.nb = sh, ws[0].off, nb
         return f
 
-    def weight_slot_packed(self, shared: Shared, off: int, e: dict[str, Any], shape: Sequence[int]) -> Weight:
-        m = mx()
+    @staticmethod
+    def weight_slot_packed(shared: Shared, off: int, e: PackedEntry, shape: Sequence[int]) -> Weight:
+        """a 12-bit record (`e`'s layout) at `off` of a shared slot as a weight that unpacks on the GPU"""
+        m = mx
         a1 = e["lo"]
         a2 = a1 + e["hi4"] + e["pad"]
         a3 = a2 + 4 * e["esc"]
@@ -295,15 +378,22 @@ class Backend:
         return Weight(packed=(lo, hi4, table, esc_idx, esc_val, int(e["n"])), shape=shape)
 
     # -- the linear --
-    def weight_stored(self, q: Quant, raw: Any, shape: Sequence[int]) -> Weight:
+    def weight_stored(self, q: Quant, raw: RawBytes, shape: Sequence[int]) -> Weight:
         """a GGUF weight of a stored type `q` kept as its own blocks (`stored_streams`), never a bf16 copy: its
         type's kernel reads them as stored, batch-invariant. `raw` the file's uint8 bytes for `shape`."""
         return Weight(q=q, streams=stored_streams(q, raw), shape=shape)
 
+    def weight_stored_pool(self, shared: Shared, off: int, nb: int, q: Quant, shape: Sequence[int]) -> Weight:
+        """a resident GGUF weight of a type read in place (`kinds.stored_in_place`) as the `nb` bytes of a pool block
+        at `off`, never rewritten: neighbours join as a view (`weight_fused`), the megakernel reads it where it is"""
+        w = Weight(q=q, streams=(shared.view_mx(off, nb, mx.uint8, (nb,)),), shape=shape)
+        w.sh, w.off, w.nb = shared, int(off), int(nb)
+        return w
+
     def weight_stored_slot(self, shared: Shared, off: int, nb: int, q: Quant, shape: Sequence[int]) -> Weight:
         """a stored type's blocks as the `nb` bytes of a shared slot at `off` (a cold layer's or an expert's,
         rewritten as the slot is): read in place, a type that repacks them repacking after each fill (`invalidate`)"""
-        raw = shared.view_mx(off, nb, mx().uint8, (nb,))
+        raw = shared.view_mx(off, nb, mx.uint8, (nb,))
         w = Weight(q=q, streams=stored_streams(q, raw), shape=shape, slot=True)
         w.raw = raw
         return w
@@ -314,7 +404,7 @@ class Backend:
         head's table read without a bf16 copy of the vocabulary: Q6_K's gather kernel, else each row's blocks taken
         and dequantized"""
         assert w.q is not None  # the gather reads a stored weight's blocks
-        m, (rows, cols) = mx(), (int(s) for s in w.shape)
+        m, (rows, cols) = mx, (int(s) for s in w.shape)
         if w.q is Quant.Q6_K:
             return gather_q6k(w.streams[0], tok, cols)
         # the dequant reads the bytes alone, but IQ4_NL's split scale and nibble streams; a row's are contiguous
@@ -324,7 +414,7 @@ class Backend:
 
     def matmul(self, x: mx_.array, w: Weight) -> mx_.array:
         """x [b, cols] MLX (bf16 or float32), w a `Weight`: y [b, rows] in x's dtype, lazily."""
-        m = mx()
+        m = mx
         if w.q is not None:
             rows, cols = (int(s) for s in w.shape)
             # the type's kernel reads the weight once a 16 rows, so a prefill of `gemm_rows` rows or more widens it
@@ -344,7 +434,7 @@ class Backend:
 
     def linear(self, x: torch.Tensor, w: Weight) -> torch.Tensor:
         """torch in, torch out: the module boundary of `_HostLinear`."""
-        m = mx()
+        m = mx
         t0 = time.perf_counter()
         shp = x.shape
         cols = int(shp[-1])
@@ -359,38 +449,29 @@ class Backend:
         return out
 
     def act(self, name: str) -> Callable[[mx_.array], mx_.array] | None:
-        m = mx()
-        if name in ("silu", "swish"):
-            return lambda a: a * m.sigmoid(a)
-        if name == "gelu":
-            return lambda a: 0.5 * a * (1.0 + m.erf(a / 1.4142135623730951))
-        if name in ("gelu_pytorch_tanh", "gelu_new"):
-            return lambda a: 0.5 * a * (1.0 + m.tanh(0.7978845608028654 * (a + 0.044715 * a * a * a)))
-        if name == "relu":
-            return lambda a: m.maximum(a, 0)
-        return None
+        return act(name)
 
-    def experts(self, x: torch.Tensor, hits: Any, act: Any) -> Any:
+    def experts(
+        self, x: torch.Tensor, hits: Sequence[ExpertHit], act: Callable[[mx_.array], mx_.array]
+    ) -> torch.Tensor:
         """The mixture-of-experts step for one call: `hits` a list of (token_idx, top_k_weights, (gu, dn)) per active
         expert in expert order, `gu` one weight or a GGUF's (gate, up) pair; returns the summed [T, H] as a torch
         tensor. One graph, one eval."""
-        m = mx()
+        m = mx
         t0 = time.perf_counter()
         xm = to_mx(x)
         T = int(xm.shape[0])
         H = int(xm.shape[1])
         final = m.zeros((T, H), dtype=xm.dtype)
         for token_idx, wts, (gu, dn) in hits:
-            whole = T == 1 and len(token_idx) == 1
-            idx = None if whole else m.array(np.asarray(token_idx, dtype=np.int32))
-            cur = xm if whole else m.take(xm, idx, axis=0)
+            idx, cur = _expert_rows(xm, token_idx)
             if isinstance(gu, tuple):
                 gate, up = self.matmul(cur, gu[0]), self.matmul(cur, gu[1])
             else:
                 gate, up = m.split(self.matmul(cur, gu), 2, axis=-1)
             h = act(gate) * up
             y = self.matmul(h, dn) * m.array(np.asarray(wts, dtype=np.float32)).astype(xm.dtype)[:, None]
-            final = final + y if whole else final.at[idx].add(y)
+            final = final + y if idx is None else final.at[idx].add(y)
         m.eval(final)
         st = self.stat
         st["evals"] += 1
@@ -400,35 +481,34 @@ class Backend:
     def expert_mx(
         self,
         xm: mx_.array,
-        token_idx: Any,
-        wts: Any,
-        pair: Any,
+        token_idx: Sequence[int],
+        wts: Sequence[float],
+        pair: Mxfp4Pair,
         e: int,
         gu_shape: Sequence[int],
         dn_shape: Sequence[int],
-        gu_bias: Any,
-        dn_bias: Any,
+        gu_bias: mx_.array | None,
+        dn_bias: mx_.array | None,
         alpha: float,
         limit: float,
         ggml: bool = False,
         act: Callable[[mx_.array], mx_.array] | None = None,
-    ) -> Any:
+    ) -> ExpertOut:
         """One MXFP4 expert over its rows as its own graph (`async_eval`): `xm` [T, H], `token_idx`/`wts` its rows and
         router weights, `pair` = (gu, dn) uint8 slot views with `gu_shape`/`dn_shape` (`ggml`: a GGUF's, gu the
         (gate, up) views in ggml's layout), the bias tables (None for a family without them), and the gate:
         gpt-oss's clamped GLU with `alpha`/`limit`, or `act(gate) * up` where `act` is given. Under `gemm_rows` rows
         through the batch-invariant matvec, from there a gemm. Returns (idx, y): the rows' indices (None for the whole
         input) and the weighted output in x's dtype."""
-        m = mx()
+        m = mx
         gu, dn = pair
-        T = int(xm.shape[0])
-        whole = T == 1 and len(token_idx) == 1
-        idx = None if whole else m.array(np.asarray(token_idx, dtype=np.int32))
-        cur = xm if whole else m.take(xm, idx, axis=0)
+        idx, cur = _expert_rows(xm, token_idx)
         g = self.gemm_rows
         if ggml:
+            assert isinstance(gu, tuple)  # ggml's layout: the gate's and up's views
             y = matmul_mxfp4_pair(gu[0], gu[1], gu_shape[0] // 2, gu_shape[1], cur, gemm_rows=g)
         else:
+            assert not isinstance(gu, tuple)
             y = matmul_mxfp4(gu, gu_shape[0], gu_shape[1], cur, gemm_rows=g)
         if gu_bias is not None:
             y = y + gu_bias[e].astype(xm.dtype)
@@ -445,10 +525,10 @@ class Backend:
         m.async_eval(y)
         return idx, y
 
-    def experts_mx_sum(self, xm: mx_.array, parts: Any) -> Any:
+    def experts_mx_sum(self, xm: mx_.array, parts: Sequence[ExpertOut]) -> torch.Tensor:
         """The experts' outputs (in expert order) summed into [T, H] one add at a time, the same order alone or in a
         tile. Returns a torch tensor; one eval."""
-        m = mx()
+        m = mx
         t0 = time.perf_counter()
         final = m.zeros(xm.shape, dtype=xm.dtype)
         for idx, y in parts:
@@ -463,7 +543,7 @@ class Backend:
     def rope_fast(x: mx_.array, rd: int, freqs: mx_.array, scaling: float, offset: int) -> mx_.array:
         """transformers' RoPE for positions offset, offset+1, ... as one kernel: x [..., heads, T, d] rotated on its
         first rd dims with the scaling on the rotated part; the table path to float32 rounding."""
-        m = mx()
+        m = mx
         y = m.fast.rope(x, rd, traditional=False, base=None, scale=1.0, offset=int(offset), freqs=freqs)
         if scaling != 1.0:
             if rd == int(x.shape[-1]):
@@ -475,7 +555,7 @@ class Backend:
     @staticmethod
     def rope(x: mx_.array, cos: mx_.array, sin: mx_.array) -> mx_.array:
         """transformers' rotate-half RoPE on x [T, heads, d] with cos/sin [T, rd] (rd <= d: the tail passes)."""
-        m = mx()
+        m = mx
         d = int(x.shape[-1])
         rd = int(cos.shape[-1])
         xr = x if rd == d else x[..., :rd]
@@ -487,6 +567,6 @@ class Backend:
     def close(self) -> None:
         # every queued kernel finishes before the buffers it reads are released
         with contextlib.suppress(Exception):
-            mx().synchronize()
+            mx.synchronize()
         with contextlib.suppress(Exception):
-            mx().clear_cache()
+            mx.clear_cache()

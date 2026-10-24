@@ -479,10 +479,6 @@ def load(
         # the experts seated on the card: 0 none, "auto" what the card has to spare, or a figure in GB
         ve = os.environ.get("BTB_VRAM_EXPERTS_GB", c.get("vram_experts_gb", 0))
         sm.vram_experts_gb = "auto" if str(ve).strip().lower() == "auto" else float(ve or 0)
-        if getattr(sm, "mlx", None) is not None and sm.v_max > 0:
-            # every decode row through the engine's attention kernel, so a verify pass and the one-row step
-            # compute alike (see `_mlx_attend`)
-            sm.mlx_attn_rows = 0
         sm.eos_ids = ()
         if sm.gguf is not None:
             sm.eos_ids = sm.gguf.eos_ids()  # a GGUF carries them in its tokenizer keys, not a generation config
@@ -493,16 +489,8 @@ def load(
                 sm.eos_ids = tuple(int(x) for x in (e if isinstance(e, (list, tuple)) else [e]))
         # ready is part of the load, not of one command: the card's graphs and the pass-cost curve (the card graph),
         # the MLX pass-cost curve (the fused tree), over a throwaway prompt - what every entry point is timed at
-        if dev.kind is Device.MLX and int(c.get("mlx_mega", 1)) and sm.fam.mega and not sm.cold:
-            from .mlx.mega import MegaPass
-
-            try:
-                sm._mega = MegaPass(sm)
-                sm.log(
-                    f"[mega] the pass as one dispatch: {sm._mega.nb} weight buffers, scratch {sm._mega.scr.size >> 20} MB"
-                )
-            except ValueError as e:
-                sm.log(f"[mega] off: {e}")
+        sm._mega_wanted = dev.kind is Device.MLX and bool(int(c.get("mlx_mega", 1)))
+        sm._build_mega()
         sm.draft_engine = None
         sm.draft_ks = (4, 3, 2)
         sm.warm()

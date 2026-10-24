@@ -265,6 +265,18 @@ def stored_quants() -> list[Quant]:
     return [q for q in Quant if QUANT_KIND[q] in STORED_CLASSES]
 
 
+# the stored types the MLX megakernel multiplies as stored, each through its launch's own chain: the affine and
+# k-quant classes whole; its registry (`mlx.mega.kernel.STORED`) is held to this at import, so the torch-free cert
+# reads the same set
+MEGA_STORED: frozenset[Quant] = frozenset(q for q in Quant if QUANT_KIND[q] in (QuantClass.AFFINE, QuantClass.KQUANT))
+
+
+def stored_in_place(q: Quant) -> bool:
+    """whether the MLX kernels read a stored type's blocks as the file lays them out, one stream and no repack:
+    IQ4_NL splits its blocks into two and the lattice types add side streams (`mlx.backend.stored_streams`)"""
+    return q is not Quant.IQ4_NL and QUANT_KIND[q] is not QuantClass.LATTICE
+
+
 # the float types a GGUF's expert store also holds as the file's and multiplies with its own kernel, so a quantizer's
 # float fallback beside a stored type keeps the experts stored (a Q2_K file's down at 400 columns, no whole block)
 EXPERT_FLOATS: tuple[Quant, ...] = (Quant.BF16, Quant.F16)
@@ -379,8 +391,8 @@ class PassTag(StrEnum):
     MLX_STEP_UNFUSED = "mlx_step_unfused"  # the same graph as separate ops: no kernel/sandwich layout, a partial
     # rotary, a non-bf16 state, or a batched pass
     MLX_HYBRID = "mlx_hybrid"  # the Qwen3.5 DeltaNet fused path (_forward_mlx_hybrid)
-    MLX_SDPA = "mlx_sdpa"  # MLX's own fused attention, where the node kernel does not apply
-    # the engine's attention kernels over the cache buffers (btb/mlx/attn.py: decode, tree, rows, forest, head-256
+    MLX_SDPA = "mlx_sdpa"  # MLX's own fused attention, where aluminum does not apply
+    # the engine's attention kernels over the cache buffers (btb/mlx/aluminum.py: decode, tree, rows, forest,
     # prefill), read from the buffer itself rather than the views an append hands back
     MLX_ATTN_KERNEL = "mlx_attn_kernel"
     CUDA_GRAPH = "cuda_graph"  # a captured card graph ran the pass (_forward_card_segment/_forward_fast/step graph)

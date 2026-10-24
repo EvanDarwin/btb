@@ -945,6 +945,8 @@ class _MemoryMixin(_State):
         self._cold_stop()
         self.cold.add(i)
         self.ram_state.shed.append(i)
+        # the megakernel (off while a layer is cold) lets go of the weights it was built over, the shed layer's with them
+        self._mega = None
         self._bind_cold()
         now = self._layer_storages(i, spans)
         gone = [(p, n, m) for p, (n, m) in held.items() if p not in now]
@@ -976,6 +978,7 @@ class _MemoryMixin(_State):
             self._bind_cold()
         else:
             self.cold_ring = ColdRing()
+            self._build_mega()  # over the weights where the regrow put them
         size = _size(self._layer_bytes_stored(i, bool(getattr(self, "_packed", None))))
         log(
             f"[ram] REGROW layer {i} -> RAM ({size}; still shed: {self.ram_state.shed}); {len(self.cold)} from the "

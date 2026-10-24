@@ -8,16 +8,19 @@ import functools
 import threading
 import time
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, TypeAlias
 
 import numpy as np
 
-from .core import mx
+from .core import metal_kernel, mx
 
 if TYPE_CHECKING:
     import mlx.core as mx_
 
     from .core import MetalKernel
+
+# an MXFP4 matrix as a slot holds it: one uint8 view (its blocks then its scales, or ggml's blocks), or the pair
+Mxfp4Slot: TypeAlias = "mx_.array | tuple[mx_.array, mx_.array]"
 _UNPACK_SRC = """
     // one thread per pair of weights (one byte of codes): out[2i] and out[2i + 1]
     uint i = thread_position_in_grid.x;
@@ -29,7 +32,7 @@ _UNPACK_SRC = """
     if (j + 1 < n) out[j + 1] = (uint16_t)(((uint16_t)table[c >> 4] << 8) | (uint16_t)lo[j + 1]);
 """
 
-_unpack_kernel = None
+_unpack_kernel: MetalKernel | None = None
 
 
 def unpack_bf16(
@@ -38,16 +41,16 @@ def unpack_bf16(
     table: mx_.array,
     n: int,
     shape: Sequence[int],
-    esc_idx: Any = None,
-    esc_val: Any = None,
+    esc_idx: mx_.array | None = None,
+    esc_val: mx_.array | None = None,
 ) -> mx_.array:
     """The 12-bit store's inverse on the GPU, bit-identical to `engine.unpack_bf16`: `lo` u8[n], `hi4` u8[(n+1)/2],
     `table` u8[16], `esc_idx` i32[k] / `esc_val` u8[k] (or None); the escapes scattered in after one pass."""
     global _unpack_kernel
-    m = mx()
+    m = mx
     with _gemv_lock:
         if _unpack_kernel is None:
-            _unpack_kernel = m.fast.metal_kernel(
+            _unpack_kernel = metal_kernel(
                 name="btb_unpack_p12", input_names=["lo", "hi4", "table"], output_names=["out"], source=_UNPACK_SRC
             )
     pairs = (n + 1) // 2
@@ -59,6 +62,7 @@ def unpack_bf16(
         output_dtypes=[m.uint16],
     )[0]
     if esc_idx is not None and esc_idx.size:
+        assert esc_val is not None  # the escapes' values come with their indices
         out[esc_idx] = (esc_val.astype(m.uint16) << 8) | m.take(lo, esc_idx).astype(m.uint16)
     return out.view(m.bfloat16).reshape(*shape)
 
@@ -220,11 +224,10 @@ def _sgn(nb: int, xb: bool) -> int:
 
 
 def _gemm_kernel(xb: int, sgn: int, wf16: int = 0) -> MetalKernel:
-    m = mx()
     with _gemv_lock:
         k = _gemm_kernels.get((xb, sgn, wf16))
         if k is None:
-            k = _gemm_kernels[(xb, sgn, wf16)] = m.fast.metal_kernel(
+            k = _gemm_kernels[(xb, sgn, wf16)] = metal_kernel(
                 name=f"btb_gemm_rows_x{xb}_s{sgn}" + ("_f16" if wf16 else ""),
                 input_names=["w", "x"],
                 output_names=["y"],
@@ -239,7 +242,7 @@ def gemv(w_bf16: mx_.array, x: mx_.array) -> mx_.array:
     bf16 weight as it is, y in x's dtype: launches of about equal rows, `TILE_ROWS` at most. Batch-invariant: row i
     of y is the same bits whatever rows travel with it. Needs cols % 8 == 0. An f16 weight (a GGUF's float expert)
     is widened exactly into the float32 tiles, a bf16 x with it and y rounded back to bf16."""
-    m = mx()
+    m = mx
     b = int(x.shape[0])
     if b < 1:
         raise ValueError(f"[mlx] the matvec takes at least one row, got {b}")
@@ -255,7 +258,7 @@ def gemv(w_bf16: mx_.array, x: mx_.array) -> mx_.array:
 
 
 def _gemv_tile(w_bf16: mx_.array, x: mx_.array, xb: bool, wf16: bool = False) -> mx_.array:
-    m = mx()
+    m = mx
     rows, nb = int(w_bf16.shape[0]), int(x.shape[0])
     sgn = _sgn(nb, xb)
     tg = (rows + 8 * sgn - 1) // (8 * sgn)
@@ -275,7 +278,7 @@ def read_bps() -> float:
     """The rate the GPU reads weights at, bytes a second: this matvec (what an MLX pass is made of, and bound by
     its reads) for one row over a 256 MiB bf16 weight, eight launches a reading, the best of five. Measured once
     for the process; a plan prices an MLX pass from it."""
-    m = mx()
+    m = mx
     rows, cols = 16384, 8192
     w = m.random.normal((rows, cols)).astype(m.bfloat16)
     x = m.ones((1, cols), dtype=m.bfloat16)
@@ -487,8 +490,8 @@ _MXFP4_DEQUANT_SRC = """
 MXFP4_TM = 4
 MXFP4_TM1 = 4
 
-_mxfp4_kernels: dict[Any, Any] = {}
-_mxfp4_dequant_kernel = None
+_mxfp4_kernels: dict[tuple[int, bool, bool], MetalKernel] = {}
+_mxfp4_dequant_kernel: MetalKernel | None = None
 
 
 def mxfp4_bytes(rows: int, k: int) -> int:
@@ -500,7 +503,7 @@ def mxfp4_bytes(rows: int, k: int) -> int:
     return rows * g * MXFP4_BLOCK_BYTES + rows * g
 
 
-def mxfp4_split(slot: mx_.array, rows: int, k: int, ggml: bool = False) -> tuple[mx_.array, mx_.array]:
+def mxfp4_split(slot: Mxfp4Slot, rows: int, k: int, ggml: bool = False) -> tuple[mx_.array, mx_.array]:
     """A matrix's (blocks, scales) uint8 views out of one slot view (MLX slices share the bytes); a pair passes
     through. In ggml's layout the blocks carry the scales: (raw, raw)."""
     if isinstance(slot, (tuple, list)):
@@ -524,15 +527,14 @@ def mxfp4_split(slot: mx_.array, rows: int, k: int, ggml: bool = False) -> tuple
 def _mxfp4_pad(a: mx_.array) -> mx_.array:
     """MLX passes an input of <= 4 elements in the constant address space, where a block pointer cannot live:
     pad a fixture-sized input into a real buffer."""
-    m = mx()
+    m = mx
     if int(a.size) > 4:
         return a
     return m.concatenate([a, m.zeros((8 - int(a.size),), dtype=a.dtype)])
 
 
-def _mxfp4_kernel(n: int, ggml: bool = False, pair: bool = False) -> Any:
+def _mxfp4_kernel(n: int, ggml: bool = False, pair: bool = False) -> MetalKernel:
     """the matvec over n matrices in one dispatch (n = 1 is the single call), compiled once per (n, layout)"""
-    m = mx()
     with _gemv_lock:
         k = _mxfp4_kernels.get((n, ggml, pair))
         if k is None:
@@ -542,7 +544,7 @@ def _mxfp4_kernel(n: int, ggml: bool = False, pair: bool = False) -> Any:
             sel = "const device uint8_t* wb_ = w0;\n    const device uint8_t* sb_ = s0;"
             for i in range(1, n):
                 sel += f"\n    if (mi == {i}) {{ wb_ = w{i}; sb_ = s{i}; }}"
-            k = m.fast.metal_kernel(
+            k = metal_kernel(
                 name=f"btb_gemv_mxfp4{'_ggml' if ggml else ''}{'_pair' if pair else ''}_x{n}",
                 input_names=[*names, "x"],
                 output_names=["y"],
@@ -554,7 +556,7 @@ def _mxfp4_kernel(n: int, ggml: bool = False, pair: bool = False) -> Any:
 
 
 def _mxfp4_call(
-    mats: Sequence[Any],
+    mats: Sequence[tuple[mx_.array, mx_.array]],
     rows: int,
     k: int,
     x: mx_.array,
@@ -563,7 +565,7 @@ def _mxfp4_call(
     pair: bool = False,
 ) -> mx_.array:
     """the dispatch behind `gemv_mxfp4` / `gemv_mxfp4_group`: `mats` the (blocks, scales) views, `x` [n, b, k]"""
-    m = mx()
+    m = mx
     n = len(mats)
     rows, k = int(rows), int(k)
     b = int(x.shape[1])
@@ -598,7 +600,7 @@ def _mxfp4_call(
 
 
 def gemv_mxfp4(
-    slot: mx_.array, rows: int, k: int, x: mx_.array, tm: int | None = None, ggml: bool = False
+    slot: Mxfp4Slot, rows: int, k: int, x: mx_.array, tm: int | None = None, ggml: bool = False
 ) -> mx_.array:
     """y[b, rows] = W x for one MXFP4 matrix: `slot` its bytes (blocks then scales; ggml's 17-byte blocks when
     `ggml`) as a uint8 view or a pair, `rows`/`k` its shape, `x` [b, k] with b in 1..16. float32 accumulation,
@@ -607,7 +609,7 @@ def gemv_mxfp4(
 
 
 def gemv_mxfp4_group(
-    slots: Sequence[mx_.array], rows: int, k: int, x: mx_.array, tm: int | None = None, ggml: bool = False
+    slots: Sequence[Mxfp4Slot], rows: int, k: int, x: mx_.array, tm: int | None = None, ggml: bool = False
 ) -> mx_.array:
     """N MXFP4 matvecs of one shape in one dispatch, each bit-identical to its own `gemv_mxfp4`: `slots` N views,
     `x` [N, b, k] (broadcast one tile when shared). Returns [N, b, rows] in x's dtype, lazily."""
@@ -628,7 +630,7 @@ def _tiles(f: Callable[[mx_.array], mx_.array], x: mx_.array) -> mx_.array:
     n = int(x.shape[0])
     if n <= GEMV_ROWS:
         return f(x)
-    return mx().concatenate([f(x[s : s + GEMV_ROWS]) for s in range(0, n, GEMV_ROWS)], axis=0)
+    return mx.concatenate([f(x[s : s + GEMV_ROWS]) for s in range(0, n, GEMV_ROWS)], axis=0)
 
 
 def matmul_mxfp4_pair(
@@ -636,7 +638,7 @@ def matmul_mxfp4_pair(
 ) -> mx_.array:
     """`matmul_mxfp4` for a GGUF's gate and up: the pair matvec under `gemm_rows` rows, a gemm over the interleaved
     dequantized rows from there"""
-    m = mx()
+    m = mx
     if int(x.shape[0]) < gemm_rows:
         return _tiles(lambda t: gemv_mxfp4_pair(gate, up, inter, k, t), x)
     dt = m.bfloat16 if x.dtype == m.bfloat16 else m.float32
@@ -644,16 +646,16 @@ def matmul_mxfp4_pair(
     return m.matmul(x, w.reshape(2 * int(inter), int(k)).T)
 
 
-def mxfp4_dequant(slot: mx_.array, rows: int, k: int, dtype: Any = None, ggml: bool = False) -> mx_.array:
+def mxfp4_dequant(slot: mx_.array, rows: int, k: int, dtype: mx_.Dtype | None = None, ggml: bool = False) -> mx_.array:
     """One MXFP4 matrix as a dense `[rows, k]` array (bf16 by default): what prefill-sized calls multiply
     through MLX's gemm, and the reference the matvec is checked against."""
     global _mxfp4_dequant_kernel
-    m = mx()
+    m = mx
     dtype = dtype or m.bfloat16
     rows, k = int(rows), int(k)
     with _gemv_lock:
         if _mxfp4_dequant_kernel is None:
-            _mxfp4_dequant_kernel = m.fast.metal_kernel(
+            _mxfp4_dequant_kernel = metal_kernel(
                 name="btb_mxfp4_dequant",
                 input_names=["w", "s"],
                 output_names=["out"],
@@ -676,7 +678,7 @@ def matmul_mxfp4(
 ) -> mx_.array:
     """y = W x for any number of rows: under `gemm_rows` the batch-invariant matvec 16 rows a launch (a step, a
     verify pass, a batch: each row the bits it has alone), from there MLX's gemm over a dequantized copy (prefill)."""
-    m = mx()
+    m = mx
     if int(x.shape[0]) < gemm_rows:
         return _tiles(lambda t: gemv_mxfp4(slot, rows, k, t, ggml=ggml), x)
     w = mxfp4_dequant(slot, rows, k, m.bfloat16 if x.dtype == m.bfloat16 else m.float32, ggml=ggml)
@@ -699,7 +701,7 @@ def experts_mxfp4_step(
     MXFP4 views in expert order, `weights` the router weights (k, or [k, b]), the optional bias lists. Returns
     [b, hidden] in x's dtype: down_e(glu(gate_up_e x + b_e)) + b_e with `GptOssExperts._apply_gate`'s gate,
     weighted and summed in the given order. Two grouped dispatches and elementwise glue: batch-invariant."""
-    m = mx()
+    m = mx
     k = len(gate_up)
     if len(down) != k:
         raise ValueError(f"[mlx] {k} gate_up matrices and {len(down)} down matrices")

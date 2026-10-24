@@ -20,7 +20,7 @@ def test_each_backend_reads_its_kernels() -> None:
 def test_a_template_reduces_to_its_stem() -> None:
     assert gpu_kernels._stem("btb_{kind}_mv_{rows}_{nb}_{tr}") == "btb_<kind>_mv"
     assert gpu_kernels._stem("btb_gemm_rows_x{xb}_s{sgn}") == "btb_gemm_rows"
-    assert gpu_kernels._stem("btb_attn_nodes_{'i8' if kq else 'bf16'}") == "btb_attn_nodes"
+    assert gpu_kernels._stem("btb_aluminum_decode_{rows}{'_seg' if seg else ''}") == "btb_aluminum_decode"
     assert gpu_kernels._stem("btb_kv_store") == "btb_kv_store"
 
 

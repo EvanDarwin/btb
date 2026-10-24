@@ -7,13 +7,16 @@ the plain step). `matvec_legacy` is the linear, `dequant_legacy` the whole matri
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from .core import mx
-from .matvec import EPILOGUE, PROLOGUE, Shapes, launch
+from ..kinds import Quant
+from .core import metal_kernel, mx
+from .matvec import Frags, Shapes, StoredKernel, blocks, launch
 
 if TYPE_CHECKING:
     import mlx.core as mx_
+
+    from .core import MetalKernel
 
 # (block bytes, kernel id) by kind. Q4_0: d f16, 16 nibble bytes, value d*(q-8). Q4_1: d f16, m f16, 16 nibble
 # bytes, value d*q + m. Byte i holds weight i in its low nibble and weight i+16 in its high. Q8_0: d f16, 32 int8,
@@ -40,20 +43,10 @@ inline float legacy_weight(const device uchar* blk, uint i) {
 # 8q..8q+7, and reads its eight activations of each pass row as two (Q8_0: one) aligned vector loads, applied to
 # its RP rows' weights; fp32 MAC, then simd_sum. A row's chain - its block's widening, the fixed eight-term sum,
 # the accumulate - is the same at any TR and whichever rows share its group, so RP is free to follow TR.
-_MATVEC = (
-    PROLOGUE
-    + r"""
-    uint q = lane & 3;
-    float acc[RP][TRS];
-    #pragma unroll
-    for (int r = 0; r < RP; r++)
-        #pragma unroll
-        for (int u = 0; u < TRS; u++) acc[r][u] = 0.0f;
-    for (uint c = lane >> 2; c < NSB; c += 8) {
-        float w[RP][8];
-        #pragma unroll
-        for (int r = 0; r < RP; r++) {
-            uint row = min(row0 + r, (uint)ROWS - 1);  // a tail group repeats its last row, never written
+MV = Frags(
+    "    uint q = lane & 3;\n",
+    "        float w[RP][8];\n",
+    r"""
             const device uchar* blk = W + ((size_t)row * NSB + c) * BLKB;
             float d = (float)(*(const device half*)(blk));
 #if KIND == 2
@@ -79,16 +72,14 @@ _MATVEC = (
 #endif
             }
 #endif
-        }
-        #pragma unroll
-        for (int tr = 0; tr < TRS; tr++) {
-            const device T* xb = XROW(tr0 + tr) + (size_t)c * 32;
+""",
+    r"""
 #if KIND == 2
-            vec<T, 4> a = *(const device vec<T, 4>*)(xb + 8 * q);
-            vec<T, 4> b = *(const device vec<T, 4>*)(xb + 8 * q + 4);
+            vec<T, 4> a = *(const device vec<T, 4>*)(xc + 8 * q);
+            vec<T, 4> b = *(const device vec<T, 4>*)(xc + 8 * q + 4);
 #else
-            vec<T, 4> a = *(const device vec<T, 4>*)(xb + 4 * q);
-            vec<T, 4> b = *(const device vec<T, 4>*)(xb + 4 * q + 16);
+            vec<T, 4> a = *(const device vec<T, 4>*)(xc + 4 * q);
+            vec<T, 4> b = *(const device vec<T, 4>*)(xc + 4 * q + 16);
 #endif
             float xv[8] = {(float)a[0], (float)a[1], (float)a[2], (float)a[3],
                            (float)b[0], (float)b[1], (float)b[2], (float)b[3]};
@@ -99,11 +90,11 @@ _MATVEC = (
                 for (int t = 0; t < 8; t++) s += w[r][t] * xv[t];
                 acc[r][tr] += s;
             }
-        }
-    }
-"""
-    + EPILOGUE
+""",
+    step=8,
+    lane_block="(lane >> 2)",
 )
+_MATVEC = blocks(MV)
 
 # one thread a block
 _DEQUANT = r"""
@@ -113,7 +104,7 @@ _DEQUANT = r"""
     for (uint i = 0; i < 32; i++) out[(size_t)t * 32 + i] = (T)legacy_weight(blk, i);
 """
 
-_deq_kernels: dict[str, Any] = {}
+_deq_kernels: dict[str, MetalKernel] = {}
 _lock = threading.Lock()
 # this kernel's own launch shapes (`matvec.Shapes`), its lanes splitting a row's blocks rather than one superblock:
 # measured as the default's, over Q4_0, Q4_1 and Q8_0
@@ -133,9 +124,24 @@ SHAPES: Shapes = {
 KIND_SHAPES: dict[str, Shapes] = {"q8_0": {**SHAPES, 16: (4, 8)}}
 
 
-def _defs(kind: str) -> str:
+def _kind(kind: str) -> str:
     blkb, kid = KINDS[kind]
-    return f"#define BLKB {blkb}\n#define KIND {kid}\n{_WEIGHT}"
+    return f"#define BLKB {blkb}\n#define KIND {kid}\n"
+
+
+def _defs(kind: str) -> str:
+    return _kind(kind) + _WEIGHT
+
+
+# a row in bf16, a weight a thread as `_DEQUANT` widens it (the step's tied embedding)
+_DECODE_ROW = r"""
+    for (uint i = tid; i < NSB * 32; i += 256)
+        dst[i] = (bfloat)legacy_weight(W + ((size_t)row * NSB + i / 32) * BLKB, i % 32);
+"""
+# every kind for kernels built on its chain (the megakernel)
+KERNELS: dict[Quant, StoredKernel] = {
+    Quant[k.upper()]: StoredKernel(MV, _WEIGHT, _kind(k), 32, _DECODE_ROW, KIND_SHAPES.get(k, SHAPES)) for k in KINDS
+}
 
 
 def matvec_legacy(kind: str, w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:
@@ -149,12 +155,12 @@ def matvec_legacy(kind: str, w_bytes: mx_.array, x: mx_.array, rows: int, cols: 
 
 def dequant_legacy(kind: str, w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
     """the full [rows, cols] bf16 weight, the numbers the gguf package dequantizes to"""
-    m = mx()
+    m = mx
     nblk = rows * cols // 32
     with _lock:
         k = _deq_kernels.get(kind)
         if k is None:
-            k = _deq_kernels[kind] = m.fast.metal_kernel(
+            k = _deq_kernels[kind] = metal_kernel(
                 name=f"btb_{kind}_dequant",
                 input_names=["W"],
                 output_names=["out"],

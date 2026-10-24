@@ -53,6 +53,10 @@ class _Norms(TypedDict):
 class Qwen35Drafter(MTPDrafter):
     """the drafting head of Qwen3.5 and the families sharing its `mtp.*` layout"""
 
+    # the MLX graph's own norm weights and head, made on first use (`_mx_norms`, `_mx_head`)
+    _mx_consts: _Norms | None = None
+    _mx_head_w: Weight | None = None
+
     def __init__(
         self, sm: Any, train: bool = False, weights: str | None = None, dev: str | torch.device | None = None
     ) -> None:
@@ -166,7 +170,7 @@ class Qwen35Drafter(MTPDrafter):
     def _mx_dtype(self) -> mx_.Dtype:
         """The drafter's activation dtype on MLX: bf16 where the tree runs through the node kernel (it reads bf16
         rows), float32 otherwise (faster end to end). The verified output does not depend on it."""
-        m = mlxdev.mx()
+        m = mlxdev.mx
         return m.bfloat16 if self._tree_kernel() else m.float32
 
     def _tree_kernel(self) -> bool:
@@ -178,7 +182,7 @@ class Qwen35Drafter(MTPDrafter):
         hd = int(self.layer.self_attn.head_dim)
         Hq = int(sm.cfg.num_attention_heads)
         Hk = int(getattr(sm.cfg, "num_key_value_heads", None) or Hq)
-        return hd in (64, 128, 256) and Hq // Hk <= mlxdev.ATTN_MAXG
+        return hd in mlxdev.ATTN_HEADS and Hq // Hk <= mlxdev.ATTN_MAXG
 
     def _mm(self, x: mx_.array, w: Weight) -> mx_.array:
         """x [b, cols] against the drafter's weight `w`: the engine's matmul, or, with `draft_bits` 4 or 8, MLX's
@@ -187,7 +191,7 @@ class Qwen35Drafter(MTPDrafter):
         bits = int(getattr(self.sm, "draft_bits", 16) or 16)
         if bits >= 16:
             return self.sm.mlx.matmul(x, w)
-        m = mlxdev.mx()
+        m = mlxdev.mx
         q = self._q
         key = (id(w), str(x.dtype))
         packed = q.get(key)
@@ -202,7 +206,7 @@ class Qwen35Drafter(MTPDrafter):
     def _mx_head(self) -> Weight:
         """The drafter's head: the model's, or its first `draft_vocab` rows (ids follow frequency rank). A proposal
         outside them is a missed draft; the verified output is unchanged."""
-        w = getattr(self, "_mx_head_w", None)
+        w = self._mx_head_w
         if w is None:
             sm = self.sm
             w = sm.head_host.mx
@@ -214,9 +218,9 @@ class Qwen35Drafter(MTPDrafter):
 
     def _mx_norms(self) -> _Norms:
         """the drafter's own norm weights (1 + w) in its activation dtype, made once"""
-        m = mlxdev.mx()
+        m = mlxdev.mx
         dt = self._mx_dtype()
-        wd: _Norms | None = getattr(self, "_mx_consts", None)
+        wd = self._mx_consts
         if wd is None or wd["dt"] != dt:
             e, h, n = (
                 mlxdev.to_mx((1.0 + mod.weight.data.detach().float()).contiguous()).astype(dt)
@@ -232,7 +236,7 @@ class Qwen35Drafter(MTPDrafter):
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """The drafter's step as one MLX graph (norms, fc, the attention layer over its shared cache, the head)
         over bf16 weights in the drafter's dtype."""
-        m = mlxdev.mx()
+        m = mlxdev.mx
         sm = self.sm
         c = sm.cfg
         t0 = time.time()
@@ -287,7 +291,7 @@ class Qwen35Drafter(MTPDrafter):
         lazily; `append(kh, vh)` gives the attention its K/V (the cache's append), or `attn(qh, kh, vh)` computes
         the attention itself (the tree's node kernel over the shared cache) and returns [B, Hq, T, D]; `layer` the
         shared cache layer `append` writes, for a chunk's attention through the fused prefill kernel."""
-        m = mlxdev.mx()
+        m = mlxdev.mx
         sm = self.sm
         be = sm.mlx
         c = sm.cfg
@@ -295,8 +299,9 @@ class Qwen35Drafter(MTPDrafter):
         B, T = int(em.shape[0]), int(em.shape[1])
         xin = m.concatenate([m.fast.rms_norm(em, wd["e"], wd["eps"]), m.fast.rms_norm(hm, wd["h"], wd["eps"])], axis=-1)
         H = int(c.hidden_size)
-        assert self.fc_host is not None  # the MLX body runs with the resident head bound
-        x = self._mm(xin.reshape(B * T, -1), self.fc_host.mx).reshape(B, T, H)
+        fc = self.fc_host.mx if self.fc_host is not None else None
+        assert fc is not None  # the MLX body runs with the fc bound to MLX (`_mlx_ready`)
+        x = self._mm(xin.reshape(B * T, -1), fc).reshape(B, T, H)
         freqs, rd, rscale = sm._mlx_rope()
         w = sm._mlx_consts(-2, self.layer, mlxdev.torch_dtype(wd["dt"]))
         at, mlp = self.layer.self_attn, self.layer.mlp
@@ -305,7 +310,7 @@ class Qwen35Drafter(MTPDrafter):
         hd = int(at.head_dim)
         act = sm._mlx_act()
         xn = m.fast.rms_norm(x, w["ln1"], w["eps1"]).reshape(B * T, H)
-        qkv_w = getattr(at, "_mx_qkv", None)
+        qkv_w: Weight | None = getattr(at, "_mx_qkv", None)  # `_mlx_fuse`'s joined q/k/v
         if qkv_w is not None:
             qkv = self._mm(xn, qkv_w)
             nq, nk = Hq * 2 * hd, Hk * hd
@@ -341,8 +346,9 @@ class Qwen35Drafter(MTPDrafter):
             assert append is not None  # the attention's K/V from the caller's cache when it computes none itself
             K, V = append(kh, vh)
             if B == 1 and layer is not None and sm._mlx_prefill_able(layer, T, hd, Hq, Hk):
+                bufs = layer.mx_bufs()
                 a = mlxdev.attn_prefill(
-                    qh[0].transpose(1, 0, 2), layer._mx[0], layer._mx[1], layer._n - T, float(at.scaling), odt=qh.dtype
+                    qh[0].transpose(1, 0, 2), bufs[0], bufs[1], layer._n - T, float(at.scaling), odt=qh.dtype
                 )
                 a = a.transpose(1, 0, 2)[None]
             else:
@@ -359,7 +365,7 @@ class Qwen35Drafter(MTPDrafter):
             m.eval(x2)
             y = mlp(mlxdev.from_mx(x2))
             return x + mlxdev.to_mx(y.float().contiguous()).astype(x.dtype)
-        gu_w = getattr(mlp, "_mx_gu", None)
+        gu_w: Weight | None = getattr(mlp, "_mx_gu", None)  # `_mlx_fuse`'s joined gate/up
         if fuse:
             x_flat, x2 = fk.add_rmsnorm(x.reshape(B * T, H), o, w["ln2"], w["eps2"])
             if gu_w is not None:
@@ -379,7 +385,7 @@ class Qwen35Drafter(MTPDrafter):
         """The drafter's head over `out` [B, 1, H] under `sampling`: `k` children a row drawn without replacement
         from the sampled distribution (in draw order), their log-probabilities, and the distribution itself
         [B, Vd]; lazily."""
-        m = mlxdev.mx()
+        m = mlxdev.mx
         sm = self.sm
         wd = self._mx_norms()
         H = int(sm.cfg.hidden_size)
@@ -393,7 +399,7 @@ class Qwen35Drafter(MTPDrafter):
     def _mlx_topk(self, out: mx_.array, k: int) -> tuple[mx_.array, mx_.array]:
         """The drafter's head over `out` [B, 1, H]: the top-k log-probs and ids [B, k], sorted, lazily - the
         whole reduction on the graph, so a tree depth reads k numbers a node instead of the logits."""
-        m = mlxdev.mx()
+        m = mlxdev.mx
         sm = self.sm
         wd = self._mx_norms()
         H = int(sm.cfg.hidden_size)

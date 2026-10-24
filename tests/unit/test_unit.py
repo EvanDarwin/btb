@@ -735,8 +735,8 @@ def test_the_family_table_and_the_plain_blocks_answers() -> None:
     assert Family(kind=FamilyKind.QWEN3, kernel_layout=True).fused_step
     assert Family(kind=FamilyKind.QWEN3, sandwich=True, own=True).fused_step
     assert not Family(kind=FamilyKind.QWEN3, sandwich=True, own=True).card_graph
-    assert Family(kind=FamilyKind.QWEN3, kernel_layout=True).mega
-    assert not Family(kind=FamilyKind.QWEN3, kernel_layout=True, sandwich=True).mega
+    assert Family(kind=FamilyKind.QWEN3, dense=True).mega and Family(kind=FamilyKind.QWEN3, sandwich=True).mega
+    assert not Family(kind=FamilyKind.QWEN3, kernel_layout=True).mega
     from btb.kinds import PassTag
 
     assert Family(kind=FamilyKind.QWEN3, dense=True).mlx_path is PassTag.MLX_STEP

@@ -43,7 +43,7 @@ def mx_rows(a: mx_.array) -> list[list[float]]:
 def mlx_topk_ids(logits: mx_.array, k: int) -> mx_.array:
     """the top-k ids [T, k] a row of an MLX logits array, sorted by value descending, the reduction (argpartition
     then sort) on the graph so a caller reads k ids a row instead of the whole vocab; lazy."""
-    m = mlxdev.mx()
+    m = mlxdev.mx
     k = min(int(k), int(logits.shape[-1]))
     part = m.argpartition(-logits, kth=k - 1, axis=-1)[:, :k]
     vals = m.take_along_axis(logits, part, axis=-1)
@@ -96,8 +96,6 @@ class MTPDrafter:
     _head_h: Any
     _head_t: Any
     fc8: Any
-    _mx_consts: Any
-    _mx_head_w: Any
     cache: Any
     cd: torch.dtype
     dev: torch.device
@@ -130,7 +128,8 @@ class MTPDrafter:
         self.steps = 0
         # the last tree's nodes' path probabilities, in its order: what the verify pass's pricing weighs each by
         self.last_p: list[float] = []
-        self._q: dict[Any, Any] = {}  # the weights packed for `draft_bits`, by (weight, dtype)
+        # the weights packed for `draft_bits` on MLX (codes, scales, biases), by (the weight's id, the dtype)
+        self._q: dict[tuple[int, str], tuple[mx_.array, mx_.array, mx_.array]] = {}
         self.fc: torch.Tensor | None = None
         self.fc_host: _HostLinear | None = None
         self.cache = None
@@ -428,7 +427,7 @@ class MTPDrafter:
         mlx_tree = self._mlx_ready() and isinstance(layer, GrowLayer) and layer.shared and not layer.bits
         root_hin: mx_.array | torch.Tensor  # the root's hidden row, on the tree's side
         if mlx_tree:
-            m = mlxdev.mx()
+            m = mlxdev.mx
             t0 = time.time()
             dt = self._mx_dtype()
             e = self.sm.embed(torch.tensor([[int(t) for t in toks]]))
@@ -556,22 +555,24 @@ class MTPDrafter:
                     scale_ = float(self.layer.self_attn.scaling)
 
                     def node_attn(
-                        qh: Any,
-                        kh: Any,
-                        vh: Any,
-                        kbuf: Any = kbuf,
-                        vbuf: Any = vbuf,
+                        qh: mx_.array,
+                        kh: mx_.array,
+                        vh: mx_.array,
+                        kbuf: mx_.array = kbuf,
+                        vbuf: mx_.array = vbuf,
                         n0: int = root_len + first_row,
-                        meta: Any = meta_g,
-                        path: Any = path_g,
+                        meta: mx_.array = meta_g,
+                        path: mx_.array = path_g,
                         splits: int = splits,
                         scale_: float = scale_,
-                    ) -> Any:
+                    ) -> mx_.array:
                         # the rows written in place, the flag evaluated before the kernel reads them
                         fk_ = mlxdev.kv_store(kbuf, kh[:, :, 0, :].transpose(1, 0, 2), n0)
                         fv_ = mlxdev.kv_store(vbuf, vh[:, :, 0, :].transpose(1, 0, 2), n0)
                         m.eval(fk_, fv_)
-                        a = mlxdev.attn_nodes(qh[:, :, 0, :], kbuf, vbuf, meta, path, scale_, splits, odt=qh.dtype)
+                        a = mlxdev.attn_nodes(
+                            qh[:, :, 0, :], kbuf, vbuf, meta, path, scale_, splits, odt=qh.dtype, shared=True
+                        )
                         return a[:, :, None, :]
 
                     ho = self._mlx_body(em, hs, root_len + depth - 1, None, attn=node_attn)
@@ -597,9 +598,15 @@ class MTPDrafter:
                     vp = m.concatenate([kv_root[1] if p < 0 else kv_after[p][1] for _, _, p, _, _ in group], axis=0)
                     hs = m.concatenate([hin for _, _, _, _, hin in group], axis=0)
                     em = mlxdev.to_mx(self.sm.embed(ts)).astype(hs.dtype)
-                    kn: list[Any] = []
+                    kn: list[mx_.array] = []
 
-                    def cat_kv(kh: Any, vh: Any, kp: Any = kp, vp: Any = vp, kn: list[Any] = kn) -> tuple[Any, Any]:
+                    def cat_kv(
+                        kh: mx_.array,
+                        vh: mx_.array,
+                        kp: mx_.array = kp,
+                        vp: mx_.array = vp,
+                        kn: list[mx_.array] = kn,
+                    ) -> tuple[mx_.array, mx_.array]:
                         K = m.concatenate([kp, kh], axis=2)
                         V = m.concatenate([vp, vh], axis=2)
                         kn.extend((K, V))

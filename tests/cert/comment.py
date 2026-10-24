@@ -24,8 +24,8 @@ from . import delta, manifest, receipt, spec
 MARKER = "<!-- btb-cert-gaps -->"
 RECEIPT_HOWTO = (
     "On a machine with that device, run `BTB_CERT_RECEIPT=receipt.json python -m pytest "
-    "tests/cert/test_cert_runner.py` and paste `receipt.json` into the PR description as a "
-    "```` ```json btb-receipt ```` block."
+    "tests/cert/test_cert_runner.py` and paste what `python -m tests.cert.receipt --pr-block receipt.json` "
+    "prints into a comment on the PR (yours, or a maintainer's)."
 )
 MODELS = "Models"  # the manifest's area: the model cells
 

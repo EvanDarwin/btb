@@ -24,8 +24,10 @@ from .pack import unpack_bf16
 from .scheduler import MemoryGrantError
 
 if TYPE_CHECKING:
-    from ..mlx.backend import Backend, Weight
-    from .experts import StoreCall
+    import mlx.core as mx_
+
+    from ..mlx.backend import Backend, ExpertOut, ExpertWeights, Mxfp4Pair, Weight
+    from .experts import StoreCall, _ExpertStore
     from .scratch import Scratch
 
 # one expert's gate_up as its form multiplies it - bf16 [2I, H], MXFP4's blocks, FP8's bytes and grid, a GGUF's
@@ -36,8 +38,6 @@ ExpertDown = torch.Tensor | MxWeight | F8Weight | QuantWeight
 # or a stored form's weights, one an expert
 GateUpTable = torch.Tensor | Sequence[ExpertGateUp]
 DownTable = torch.Tensor | Sequence[ExpertDown]
-# one expert as the MLX step multiplies it: gate_up one weight, or a GGUF's stored (gate, up); and down
-MxExpert = tuple["Weight | tuple[Weight, Weight]", "Weight"]
 
 
 def copy_bytes(dst: torch.Tensor, t: torch.Tensor) -> None:
@@ -61,7 +61,7 @@ class _HostLinear(torch.nn.Module):
     bias: torch.Tensor | None
     f8: F8Weight | None
     key: str | None
-    mx: Any
+    mx: Weight | None  # the weight on MLX's GPU, where the layer runs there
     packed: tuple[Any, ...] | None
     quant: QuantWeight | None
     scratch: Scratch | None
@@ -311,7 +311,7 @@ class _Experts(torch.nn.Module):
     # MXFP4 or FP8 experts widened on the card at a time in a grouped call: gpt-oss-120b's are 50 MB a piece widened
     WIDEN_BATCH = 16
     sm: Any
-    _mx_bias: Any
+    _mx_bias: tuple[mx_.array, mx_.array] | None = None  # the bias tables on MLX (`_mx_biases`)
     act_fn: Any
     alpha: float
     base: str
@@ -572,33 +572,35 @@ class _Experts(torch.nn.Module):
         self,
         x: torch.Tensor,
         w_top: torch.Tensor,
-        expert_mask: Any,
+        expert_mask: torch.Tensor,
         hit: Any,
         views: Any,
         pending: Any,
-        store: Any,
+        store: _ExpertStore | None,
         final: torch.Tensor,
     ) -> None:
         # every active expert's two matmuls in one MLX graph over the store's slots (or copies of the
         # checkpoint's tables when there is no store), summed in expert order; one eval per layer
-        be = self.sm.mlx
+        be: Backend | None = self.sm.mlx
+        assert be is not None  # the experts run on MLX only with the backend up (`use_mlx`)
         tables = self._tables() if store is None else None
 
-        def rows(e: int) -> Any:
+        def rows(e: int) -> tuple[list[int], list[float]]:
             top_k_pos, token_idx = torch.where(expert_mask[e])
             return token_idx.tolist(), w_top[token_idx, top_k_pos].float().tolist()
 
         if self.mx:
             # MXFP4 experts through the GPU's matvec, each expert its own graph queued as its bytes land, the outputs
             # summed in expert order at the end whichever were ready first
+            assert store is not None  # MXFP4 experts are read into the store, never held whole
             self.sm._tag(PassTag.EXPERT_MXFP4_ASSTORED)  # the store's blocks as stored, never widened
             bg, bd = self._mx_biases() if self.biased else (None, None)
             act = None if self.gate is not None else self.sm._mlx_act()  # gpt-oss's clamped GLU, else the family's
             shp = store.mx_shapes()
             xm = mlxdev.to_mx(x)
-            parts = {}
+            parts: dict[int, ExpertOut] = {}
 
-            def part(e: int, pair: Any) -> None:
+            def part(e: int, pair: Mxfp4Pair) -> None:
                 ti, wts = rows(e)
                 parts[e] = be.expert_mx(
                     xm, ti, wts, pair, e, shp[0], shp[1], bg, bd, self.alpha, self.limit, ggml=store.ggml, act=act
@@ -606,32 +608,34 @@ class _Experts(torch.nn.Module):
 
             for e in hit:
                 if e in views:
-                    part(e, store._views_mx(store.last_slots[e]))
+                    part(e, store._views_mxfp4(store.last_slots[e]))
             for batch in store.landed(pending):
                 for e, _f, s in batch:
-                    part(e, store._views_mx(s))
+                    part(e, store._views_mxfp4(s))
             out = be.experts_mx_sum(xm, [parts[e] for e in sorted(parts)])
             final += out.to(final.dtype)
             return
-        hits = []
+        hits: list[tuple[int, list[int], list[float], ExpertWeights]] = []
         for e in hit:
             if e in views:
-                hits.append(
-                    (
-                        e,
-                        *rows(e),
-                        store._views_mx(store.last_slots[e]) if tables is None else self._mlx_table(be, tables, e),
-                    )
-                )
-        for batch in store.landed(pending) if pending else ():
-            for e, _f, s in batch:
-                hits.append((e, *rows(e), store._views_mx(s)))
+                if store is not None:
+                    pair = store._views_mx(store.last_slots[e])
+                else:
+                    assert tables is not None  # held whole where there is no store
+                    pair = self._mlx_table(be, tables, e)
+                hits.append((e, *rows(e), pair))
+        if store is not None and pending:
+            for batch in store.landed(pending):
+                for e, _f, s in batch:
+                    hits.append((e, *rows(e), store._views_mx(s)))
         hits.sort(key=lambda t: t[0])
-        out = be.experts(x, [(ti, w, pair) for _, ti, w, pair in hits], self.sm._mlx_act())
+        act_fn = self.sm._mlx_act()
+        assert act_fn is not None  # `use_mlx` takes the experts to MLX only with the family's activation there
+        out = be.experts(x, [(ti, w, pair) for _, ti, w, pair in hits], act_fn)
         final += out.to(final.dtype)
 
     @staticmethod
-    def _mlx_table(be: Backend, tables: tuple[GateUpTable, DownTable], e: int) -> MxExpert:
+    def _mlx_table(be: Backend, tables: tuple[GateUpTable, DownTable], e: int) -> ExpertWeights:
         """expert `e` of the whole tables as the MLX step takes it: bf16 weights, or a GGUF's stored (gate, up), down"""
         gu, dn = tables[0][e], tables[1][e]
         if isinstance(dn, QuantWeight):
@@ -641,15 +645,15 @@ class _Experts(torch.nn.Module):
         assert isinstance(gu, torch.Tensor) and isinstance(dn, torch.Tensor)  # bf16, an expert's slice of the stack
         return be.weight(gu), be.weight(dn)
 
-    def _mx_biases(self) -> Any:
+    def _mx_biases(self) -> tuple[mx_.array, mx_.array]:
         """the two per-expert bias tables as float32 MLX arrays, made once per layer"""
-        b = getattr(self, "_mx_bias", None)
+        b = self._mx_bias
         if b is None:
             b = (
                 mlxdev.to_mx(self.gate_up_proj_bias.data.detach().float().contiguous()),
                 mlxdev.to_mx(self.down_proj_bias.data.detach().float().contiguous()),
             )
-            mlxdev.mx().eval(*b)
+            mlxdev.mx.eval(*b)
             self._mx_bias = b
         return b
 

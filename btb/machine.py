@@ -1846,7 +1846,7 @@ def _mlx_gemv(rep: Report) -> None:
     from .mlx.core import mx
     from .mlx.gemv import gemv
 
-    m = mx()
+    m = mx
 
     def point(op: str, shape: str, side: int) -> None:
         each = side * side * 2
@@ -1867,7 +1867,7 @@ def _mlx_attn(rep: Report) -> None:
     from .mlx.attn import attn_decode
     from .mlx.core import mx
 
-    m = mx()
+    m = mx
     Hq, Hk, D = HEADS
 
     def point(op: str, n: int) -> None:

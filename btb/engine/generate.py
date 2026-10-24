@@ -24,6 +24,8 @@ from .hooks import Hooks
 from .state import _State
 
 if TYPE_CHECKING:
+    import mlx.core as mx_
+
     from ..session import Anchor
     from .cache import CacheLayer
 
@@ -73,21 +75,24 @@ def _lin(cl: LinLayer) -> tuple[torch.Tensor, torch.Tensor]:
     return c, r
 
 
-def _verify_of(smp: Sampling, T: int, qrows: dict[int, Any], draws: dict[int, list[int]]) -> Any:
+def _verify_of(
+    smp: Sampling, T: int, qrows: dict[int, torch.Tensor | mx_.array], draws: dict[int, list[int]]
+) -> Sampling | Verify:
     """the verify pick of a sampled tree of `T` rows: row j's draws in draw order and its drafter distribution
     (the root's under -1, node j's under j - 1), rows without one flagged as point masses; the plain sampling
-    when no row has one"""
+    when no row has one. The rows are all torch's or all MLX's, as the drafter made them"""
     kids = [[int(t) for t in draws.get(j - 1, [])] for j in range(T)]
     rows = [qrows.get(j - 1) for j in range(T)]
     hasq = [r is not None for r in rows]
     some = next((r for r in rows if r is not None), None)
     if some is None:
         return smp
+    q: torch.Tensor | mx_.array
     if isinstance(some, torch.Tensor):
-        q: Any = torch.stack([r if r is not None else torch.zeros_like(some) for r in rows])
+        q = torch.stack([r if isinstance(r, torch.Tensor) else torch.zeros_like(some) for r in rows])
     else:
-        m = mlxdev.mx()
-        q = m.stack([r if r is not None else m.zeros_like(some) for r in rows])
+        m = mlxdev.mx
+        q = m.stack([r if isinstance(r, m.array) else m.zeros_like(some) for r in rows])
     return Verify(smp, q, kids, hasq)
 
 
@@ -448,15 +453,11 @@ class _GenerateMixin(_State):
             not use_mtp
             and bool(getattr(self, "ngram_tree", True))
             and (
-                (getattr(self, "mlx", None) is not None and self._mlx_tree_able(cache))
+                (self.mlx is not None and self._mlx_tree_able(cache))
                 or (self.dev.type == Device.CUDA and not self.host and int(getattr(self, "tree_budget", 0) or 0) > 0)
                 # the host tier verifies a tree through its causal-mask pass (the receipts run one); the budget
                 # weighs its rows against the host's own pass-cost curve
-                or (
-                    self.dev.type == Device.CPU
-                    and getattr(self, "mlx", None) is None
-                    and bool(getattr(self, "_host_cost", None))
-                )
+                or (self.dev.type == Device.CPU and self.mlx is None and bool(getattr(self, "_host_cost", None)))
             )
         )
         # spans: (tag, ids) pairs added to this proposer, or a SpanBank whose standing index it looks up
@@ -684,7 +685,7 @@ class _GenerateMixin(_State):
                     # the chains merged by shared prefix into one tree: on MLX at most 15 rows with the root (the
                     # matvec kernel's tile: up to 15 drafted rows verify at the cost of one); on the card the
                     # tree's budget
-                    cap = 14 if getattr(self, "mlx", None) is not None else int(getattr(self, "tree_budget", 0) or 14)
+                    cap = 14 if self.mlx is not None else int(getattr(self, "tree_budget", 0) or 14)
                     cap = max(1, min(cap, rows - 1))
                     guesses, parents, depth, children, node_tags = _chains_tree(chains, cap)
                     src, tree_now = "ngram_tree", True
@@ -717,7 +718,7 @@ class _GenerateMixin(_State):
                         node_tags = node_tags[: keep + 1] if node_tags else node_tags
                         children = _children(parents)
             self.aa(parents if tree_now else None)
-            pick: Any = smp
+            pick: Sampling | Verify = smp
             if tree_now and qrows is not None:
                 pick = _verify_of(smp, len(guesses) + 1, qrows, draws)
             tf = time.perf_counter()
