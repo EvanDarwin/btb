@@ -251,9 +251,10 @@ class Block:
             n = (tiles, Hk, self.splits | wrow | ((phased and pick.rows == 16) << 31))
             op = OpName.ATTN_PHASED if phased else OpName.ATTN_TREE
             p.emit(op, tiles * Hk * self.splits, refs, n, scale, reads=[q, K, V], writes=[part, pl, one])
+        # the fold's output placed whatever the segments, so every shape lays the scratch out alike (`final`)
+        a = p.scratch(Hq * hd)
         if self.splits == 1:
             return one
-        a = p.scratch(Hq * hd)
         n = (Hk, self.splits, tm)
         p.emit(OpName.FOLD, (T * Hq * hd + 255) // 256, (part, pl, a), n, reads=[part, pl, one], writes=[a])
         return a
@@ -284,6 +285,9 @@ class Block:
         n = (H, int(y is not None), 0)
         p.emit(OpName.FNORM, T, (self.h, w, hn, None, y), n, eps, reads=reads, writes=[hn])
         logits = p.scratch(mp.V, 4)
+        if mp._frozen and logits.ref[1] != mp.logits_off:
+            # a replayed shape's logits are read at the widest pass's offset (`logits`)
+            raise ValueError("[mega] a pass shape places its logits where the widest pass does not")
         mp.logits_off = logits.ref[1]
         if mp.head_q is None:
             p.emit(OpName.HEAD, mv_items(mp.V, 8), (mp.head, hn, logits), (mp.V, H, 0), reads=[hn], writes=[logits])

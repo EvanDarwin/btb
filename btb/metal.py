@@ -5,7 +5,7 @@ library, its pipelines and its indirect command buffers, each by index. Torch- a
 from __future__ import annotations
 
 import ctypes
-import resource
+import mmap
 import weakref
 from collections.abc import Sequence
 
@@ -13,7 +13,7 @@ import numpy as np
 
 from .native_files import native_path
 
-PAGE = resource.getpagesize()
+PAGE = mmap.PAGESIZE  # `pool` imports `paged` on every platform: `resource` is POSIX-only
 
 
 def paged(n: int) -> int:

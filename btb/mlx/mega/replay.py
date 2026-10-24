@@ -73,7 +73,9 @@ class Replay:
     matrix and pass width, as the step compiles it), and each pass shape's program encoded once"""
 
     def __init__(self, mp: MegaPass) -> None:
-        self.mp = mp
+        # weak: the pass holds its replay, and a pass let go (a shed) frees its buffers and context at once, not at the
+        # cycle collector's next round
+        self._mp = weakref.ref(mp)
         self.metal = m = Metal()
         # reentrant: a region's finalizer can run from a collection inside a pass (never on a region that pass binds)
         self.lock = threading.RLock()
@@ -96,6 +98,13 @@ class Replay:
         self.stored: dict[StoredMv, int] = {}
         self.shapes: dict[tuple[int, int, bool, bool], Shape] = {}
         self.kv: dict[int, tuple[int, int]] = {}  # an aliased K/V array's id -> (its buffer, its address)
+
+    @property
+    def mp(self) -> MegaPass:
+        mp = self._mp()
+        if mp is None:
+            raise RuntimeError("[mega] a replay used after its pass was let go")
+        return mp
 
     def _pipelines(self, xr: int, mapped: bool) -> dict[int, int]:
         """the ops' kernels for passes of up to xr rows over a cache's rows where they lie or through a row map, by op

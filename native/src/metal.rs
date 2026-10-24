@@ -10,7 +10,8 @@ use std::ptr::NonNull;
 use std::sync::Mutex;
 
 use objc2::rc::{autoreleasepool, Retained};
-use objc2::runtime::ProtocolObject;
+use objc2::runtime::{NSObjectProtocol, ProtocolObject};
+use objc2::sel;
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
@@ -221,6 +222,22 @@ pub unsafe fn gpu_address(h: i64, b: i64, out: *mut u64) -> i32 {
     .unwrap_or_else(|e| e)
 }
 
+/// `o`'s math, safe unless `fast`: through `mathMode` where the OS has it (`has_mode`, macOS 15 on), else through
+/// `fastMathEnabled`, the one switch before it. Sending `setMathMode:` to macOS 14's options raised an Objective-C
+/// exception, which Rust cannot catch: the process aborted at the first compile
+fn set_math(o: &MTLCompileOptions, fast: bool, has_mode: bool) {
+    if has_mode {
+        o.setMathMode(if fast {
+            MTLMathMode::Fast
+        } else {
+            MTLMathMode::Safe
+        });
+    } else {
+        #[allow(deprecated)]
+        o.setFastMathEnabled(fast);
+    }
+}
+
 /// `src` (NUL-terminated UTF-8) compiled as the context's library, the math safe unless `fast` (MLX compiles its
 /// kernels safe: the bits a pass gives depend on it). `ERR_PARSE` with the compiler's message in `err`.
 ///
@@ -241,11 +258,7 @@ pub unsafe fn compile(
     };
     with(h, |c| {
         let o = MTLCompileOptions::new();
-        o.setMathMode(if fast {
-            MTLMathMode::Fast
-        } else {
-            MTLMathMode::Safe
-        });
+        set_math(&o, fast, o.respondsToSelector(sel!(setMathMode:)));
         match c
             .dev
             .newLibraryWithSource_options_error(&NSString::from_str(text), Some(&o))
@@ -433,4 +446,32 @@ pub unsafe fn run(
         Ok(OK)
     })
     .unwrap_or_else(|e| e)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// a library compiles through `fastMathEnabled` (macOS 14's switch, kept on every OS since) and, where the OS
+    /// answers to it, through `mathMode`: neither raises
+    #[test]
+    fn compiles_through_either_math_switch() {
+        let src = "#include <metal_stdlib>\nkernel void k(device float* x [[buffer(0)]], uint i [[thread_position_in_grid]]) \
+                   { x[i] = metal::exp(x[i]); }";
+        let h = open();
+        assert!(h >= 0, "no Metal device: {h}");
+        let got = with(h, |c| {
+            let probe = MTLCompileOptions::new();
+            for has_mode in [false, probe.respondsToSelector(sel!(setMathMode:))] {
+                let o = MTLCompileOptions::new();
+                set_math(&o, false, has_mode);
+                c.dev
+                    .newLibraryWithSource_options_error(&NSString::from_str(src), Some(&o))
+                    .map_err(|_| ERR_PARSE)?;
+            }
+            Ok(OK)
+        });
+        assert_eq!(close(h), OK);
+        assert_eq!(got, Ok(OK));
+    }
 }

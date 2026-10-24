@@ -404,6 +404,38 @@ def test_split_projections_match_step(tiny: StreamedTextModel) -> None:
         sm._mega = mega
 
 
+def test_every_shape_places_the_logits_alike(tiny: StreamedTextModel) -> None:
+    """a sampled pass reads its logits at one offset (`MegaPass.logits`), so every pass shape lays its scratch out as
+    the widest does: a one-segment program once left out the fold's output, and a shape replayed after a program of
+    the other kind had been built read another region"""
+    mg = tiny._mega
+    assert mg is not None
+    want = mg.logits_off
+    for T in (1, 7, 16):
+        for splits in (1, 2, mg.SPL):
+            for argmax in (True, False):
+                mg.table(T, splits, argmax)
+                assert mg.logits_off == want, f"{T} rows over {splits} segments place the logits elsewhere"
+
+
+def test_a_pass_let_go_is_freed_at_once(tiny: StreamedTextModel) -> None:
+    """a pass dropped (a shed) is freed with its last reference, its replay's context and buffers with it, not at the
+    cycle collector's next round: the replay holds its pass weakly"""
+    import gc
+    import weakref
+
+    from btb.mlx.mega import MegaPass
+
+    gc.disable()
+    try:
+        mp = MegaPass(tiny)
+        alive = weakref.ref(mp), weakref.ref(mp.replay)
+        del mp
+        assert alive[0]() is None and alive[1]() is None, "the pass outlived its last reference"
+    finally:
+        gc.enable()
+
+
 def test_family_loops_match_step(tiny: StreamedTextModel) -> None:
     sm = tiny
     mega = sm._mega

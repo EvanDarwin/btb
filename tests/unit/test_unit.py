@@ -1377,6 +1377,16 @@ def test_the_package_root_and_the_cli_stay_torch_free() -> None:
     assert out.stdout.strip() == "False", out.stdout + out.stderr
 
 
+def test_the_engine_imports_without_posix_modules() -> None:
+    """the engine loads where `resource` does not exist (Windows): the memory pool reads the page size through the
+    Metal module, which reached for the POSIX-only module at import and failed every Windows load"""
+    import subprocess
+
+    code = "import sys; sys.modules['resource'] = None; import btb.pool, btb.metal, btb.engine.model"
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=ROOT)
+    assert out.returncode == 0, out.stderr
+
+
 def test_the_host_memory_a_call_frees_goes_back_to_the_machine() -> None:
     """`import btb` has torch's CPU allocator give freed memory back as it goes (`MIMALLOC_PURGE_DELAY`, set before
     torch loads): by default mimalloc kept it committed to the process for good, and a 40k prompt's 2.5 GB of host
