@@ -142,6 +142,14 @@ def pytest_configure(config: Config) -> None:
     _warn_missing_prereqs(config)
 
 
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """when BTB_CERT_RECEIPT names a path, note the commit this run certifies and its start for the receipt"""
+    if os.environ.get("BTB_CERT_RECEIPT"):
+        from tests.cert import receipt
+
+        receipt.begin()
+
+
 def _derived_fixtures() -> None:
     """the GGUF twins derived from the committed fixtures, written before collection (the cert runner's cells are the
     files on disk); the generator, and torch, imported only when one is missing"""

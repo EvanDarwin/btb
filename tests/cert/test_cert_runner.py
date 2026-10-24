@@ -739,10 +739,10 @@ def test_cross_machine_coverage() -> None:
     fails here. No one machine has every device - CI has no GPU, the Mac no CUDA - so this is the union of the
     dev's boxes and CI, read from `$BTB_CERT_RECEIPTS` (else tests/cert/receipts). Receipts are not committed:
     a machine emits one with `BTB_CERT_RECEIPT=<path> pytest tests/cert/test_cert_runner.py` and it travels in
-    the pull request body as a ```json btb-receipt block, which CI drops into that directory beside its own
-    artifacts before running this."""
+    the pull request (`python -m tests.cert.receipt --pr-block <path>`), which CI drops into that directory beside
+    its own artifacts before running this."""
     uncovered = sorted(manifest.runnable_ids() - receipt.merged())
     assert not uncovered, (
         f"{len(uncovered)} runnable cells no receipt covers (never run+passed on any machine). Run the cert on a "
-        f"machine with the needed device and put its receipt in the PR body:\n  " + "\n  ".join(uncovered)
+        f"machine with the needed device and put its receipt in the PR:\n  " + "\n  ".join(uncovered)
     )

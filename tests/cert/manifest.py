@@ -17,8 +17,8 @@ covered:
     python -m tests.cert.manifest --strict     # --check, and also nonzero if a real-model target is not cached
 
 Receipts are not committed: `$BTB_CERT_RECEIPTS` (else tests/cert/receipts) is the directory CI fills from the
-PR body's ```json btb-receipt block and its own artifacts, so the same command reads one machine's proof locally
-and the union of every machine's in CI.
+receipts pasted into the PR (tests/cert/receipt.py `collect`) and its own artifacts, so the same command reads one
+machine's proof locally and the union of every machine's in CI.
 
 The `--missing` output is a to-do an agent can act on (a future skill wraps it): each line names a gap kind, the
 count and families, what is absent, and how to close it. The taxonomy is `Missing` + `MISSING`, one place."""
@@ -965,13 +965,13 @@ def summary_line() -> str:
 
 
 def _claimed_note() -> str:
-    """the ids whose only evidence is a receipt pasted into the PR body - a claim CI cannot verify - named in the
-    PROOF line so a reviewer sees what a cert run verified and what is merely asserted."""
+    """the ids whose only evidence is a receipt pasted into the PR (its body or a comment) - a claim CI cannot
+    verify - named in the PROOF line so a reviewer sees what a cert run verified and what is merely asserted."""
     src = receipt.by_source()
-    claimed = src.get("pr-body", set()) - src.get("run", set())
+    claimed = set[str]().union(*(ids for s, ids in src.items() if s != "run")) - src.get("run", set())
     if not claimed:
         return ""
-    return f"; {len(claimed)} of them CLAIMED in the PR body only (pasted, unverified by CI - the reviewer judges)"
+    return f"; {len(claimed)} of them CLAIMED in the PR only (pasted, unverified by CI - the reviewer judges)"
 
 
 def report() -> int:
