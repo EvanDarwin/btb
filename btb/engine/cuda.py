@@ -3609,12 +3609,12 @@ class _CudaMixin(_State):
                 r.copy_(rec)
         if flags and not lazy:
             # the arena layers' gathers, one eval for every layer
-            mlxdev.mx().eval(*flags)
+            mlxdev.mx.eval(*flags)
         if lazy:
             # the DeltaNet states of the accepted path, recomputed into the cache's own buffers in one eval (a
             # synchronous one: the states are read through torch right after, by snapshots and the receipts); the
             # conv windows copied in, the arena layers' gathers with them
-            mlxdev.mx().eval(*[rec for _, _, rec in lazy], *flags)
+            mlxdev.mx.eval(*[rec for _, _, rec in lazy], *flags)
             for layer, conv, _rec in lazy:
                 c, _r = self._lin(layer)
                 c.copy_(conv)

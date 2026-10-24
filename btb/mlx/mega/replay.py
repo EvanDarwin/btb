@@ -214,7 +214,7 @@ class Replay:
         dims = np.zeros(DIMS, dtype=np.uint32)
         dims[:4] = (T, path_np.shape[1], cap, past)
         # the cache's rows and anything else MLX was writing, done before the replay reads them
-        mx().synchronize()
+        mx.synchronize()
         with self.lock:
             key = (T, splits, argmax, mapped)
             s = self.shapes.get(key)

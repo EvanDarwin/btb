@@ -9,11 +9,14 @@ import random
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 import torch
 
 from .kinds import TokenRows
+
+if TYPE_CHECKING:
+    import mlx.core as mx_
 
 PRECUT = 1024  # the torch sampler's top-p works over this many of the top logits before it needs the full sort
 FIELDS = ("temperature", "top_p", "top_k", "seed")
@@ -116,7 +119,7 @@ class Sampling:
             picks.append(torch.topk(lq[r] + _gumbel_torch(int(q.shape[-1]), gen, q.device), k).indices)
         return torch.stack(picks), q
 
-    def dist_mx(self, logits: Any) -> Any:
+    def dist_mx(self, logits: mx_.array) -> mx_.array:
         """`dist_torch` on the MLX graph"""
         import mlx.core as mx
 
@@ -134,7 +137,7 @@ class Sampling:
             x = mx.put_along_axis(mx.zeros_like(x), order, vals, axis=-1)
         return mx.softmax(x, axis=-1)
 
-    def draw_mx(self, logits: Any, keys: Sequence[int], k: int) -> tuple[Any, Any]:
+    def draw_mx(self, logits: mx_.array, keys: Sequence[int], k: int) -> tuple[mx_.array, mx_.array]:
         """`draw_torch` on the MLX graph: (ids [R, k] in draw order, probs [R, V]), lazily"""
         import mlx.core as mx
 
@@ -198,7 +201,7 @@ class Sampling:
 
     # -- MLX -------------------------------------------------------------------------------------------------------
 
-    def pick_mx(self, logits: Any, keys: Sequence[int], after: Any = None) -> Any:
+    def pick_mx(self, logits: mx_.array, keys: Sequence[int], after: mx_.array | None = None) -> mx_.array:
         """the same pick inside the MLX graph: `logits` [R, V] lazy, one key a row; [R] int32, lazy. Greedy is
         `mx.argmax`; a draw is the fused kernel (btb/mlx/sample.py), one dispatch over the rows, ordered after
         the array `after` when the logits are a buffer another kernel writes"""
@@ -211,7 +214,7 @@ class Sampling:
         ids = sample.pick(logits.astype(mx.float32), keys, self.temperature, self.top_k, self.top_p, after=after)
         return ids.astype(mx.int32)
 
-    def pick_mx_ops(self, logits: Any, keys: Sequence[int]) -> Any:
+    def pick_mx_ops(self, logits: mx_.array, keys: Sequence[int]) -> mx_.array:
         """the draw as plain MLX ops (argsort, cumsum, gumbel): the kernel's reference, not the engine's path"""
         import mlx.core as mx
 
@@ -279,7 +282,7 @@ class Verify:
 
     greedy = False
 
-    def __init__(self, sampling: Sampling, q: Any, kids: TokenRows, hasq: Sequence[bool]) -> None:
+    def __init__(self, sampling: Sampling, q: torch.Tensor | mx_.array, kids: TokenRows, hasq: Sequence[bool]) -> None:
         self.sampling = sampling
         self.q = q  # [T, Vd] the rows' distributions (torch or mx), zeros where hasq is False
         self.kids = [list(k) for k in kids]  # a row's children tokens in draw order
@@ -303,7 +306,7 @@ class Verify:
         w = max(1, self.width)  # a pass without drafts still carries one (empty) slot a row
         return [[*k, *([-1] * (w - len(k)))] for k in self.kids]
 
-    def pick_mx(self, logits: Any, keys: Sequence[int], after: Any = None) -> Any:
+    def pick_mx(self, logits: mx_.array, keys: Sequence[int], after: mx_.array | None = None) -> mx_.array:
         import mlx.core as mx
 
         from .mlx import sample
@@ -414,9 +417,12 @@ def _generator(device: Any) -> torch.Generator:
 
 GREEDY = Sampling()
 
+# what a pass picks in its graph: a Sampling's draw (greedy, its argmax), or a sampled tree's verify
+Pick: TypeAlias = "Sampling | Verify"
 
-def as_pick(pick: Any) -> Sampling | None:
-    """the `pick` argument of a forward: None or False for the logits, True for the greedy ids, a Sampling as is"""
+
+def as_pick(pick: bool | Pick | None) -> Pick | None:
+    """the `pick` argument of a forward: None or False for the logits, True for the greedy ids, a pick as is"""
     if pick is None or pick is False:
         return None
     return GREEDY if pick is True else pick

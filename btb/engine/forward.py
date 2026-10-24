@@ -287,7 +287,7 @@ class _ForwardMixin(_State):
             return self._forward_mega(ids[0].tolist(), cache, T, pick)
         if attention_mask is None and not own and self._mlx_ok(cache, B, T, None, positions, n_layers):
             # the fused path from the embedding gathered on the graph: no torch embed, rope tables or mask
-            m = mlxdev.mx()
+            m = mlxdev.mx
             hm = self._mlx_embed_rows(m.array(ids[0].tolist(), dtype=m.int32))
             if self.compute_dtype is not None and self.compute_dtype != torch.bfloat16:
                 hm = hm.astype(m.float32)
@@ -865,7 +865,7 @@ class _ForwardMixin(_State):
             return hf
         return self._apply_head(hf)
 
-    # the head sizes MLX's fused attention kernel takes for a many-row pass; any other (Qwen3.5's 256) has the
+    # the head sizes MLX's fused attention kernel takes for a many-row pass; any other aluminum lacks too has the
     # scores of every row against every key materialized, T x (past + T) x heads, which the chunk must be priced by
     MLX_FUSED_HEAD = (64, 80, 128)
 
@@ -882,11 +882,11 @@ class _ForwardMixin(_State):
         on_card = self.dev.type == Device.CUDA and (bool(self.resident) or bool(self.prefill_card))
         if on_card:
             return int(self.device.free(self.dev, unreserved=True) or 0)
-        mlx = getattr(self, "mlx", None)
+        mlx = self.mlx
         if mlx is not None:
             # the ledger (the machine's live RAM above the OS's floor included), within Metal's working-set limit
             room = int(self.device.free(unreserved=True) or 0)
-            limit = int((getattr(mlx, "info", None) or {}).get("max_recommended_working_set_size", 0) or 0)
+            limit = int(mlx.info.get("max_recommended_working_set_size", 0) or 0)
             if limit:
                 room = min(room, limit - int(mlx.held_bytes()))
             return max(0, room)
@@ -935,22 +935,22 @@ class _ForwardMixin(_State):
         fp32 = self.compute_dtype is not None and self.compute_dtype != torch.bfloat16
         nb = 4 if (fp32 or not on_card) else 2
         per_token = 2 * nb * (3 * I + 8 * H + 2 * (Hq + 2 * Hk) * d)
-        if getattr(self, "mlx", None) is not None and LayerKind.LINEAR in self.layer_types:
+        if self.mlx is not None and LayerKind.LINEAR in self.layer_types:
             # the hybrid's chunked DeltaNet rule keeps its per-chunk states and blocks beside the activations:
             # on Qwen3.5-4B a 4096-row chunk at position 0 costs 4.9-6.2 GB against the 2.4 the
             # activations alone price
             per_token *= 2
         scores = 0
-        if getattr(self, "mlx", None) is not None:
-            if d not in self.MLX_FUSED_HEAD:
+        if self.mlx is not None:
+            from ..mlx.attn import ATTN_BLOCK, ATTN_HEADS
+
+            if d not in self.MLX_FUSED_HEAD and d not in ATTN_HEADS:
                 scores = 4 * Hq  # bytes per (row, key) pair of materialized scores, float32 through the softmax
             else:
-                # the fused kernel's per-key-block partials, (T, Hk, splits*8, g, D) float32 and two without D,
-                # folded after: about half the materialized figure a (row, key), and still growing with every key
-                # the chunk sees
-                from ..mlx.attn import ATTN_BLOCK
-
-                scores = -(-32 * Hq * (d + 2) // ATTN_BLOCK)
+                # aluminum's (and, at a head size it lacks, MLX's fused attention's) prefill keeps nothing a (row,
+                # key); a chunk taken as nodes (a batched row's) keeps its partials, (D + 2) float32 a (row, query
+                # head, segment), folded after - priced so, growing with every key the chunk sees
+                scores = -(-4 * Hq * (d + 2) // ATTN_BLOCK)
         elif self.fam.eager:
             # gpt-oss's sinks (`attention_sinks`) hold each row's scores against every key twice at once in the dtype
             # the reference's join promotes them to - the sinks' own (float32 in the checkpoint), or the pass's where
@@ -958,7 +958,7 @@ class _ForwardMixin(_State):
             # and the mask once, in the pass's dtype
             scores = 2 * max(nb, self._sinks_bytes()) * Hq + nb
         per_key = 0
-        if getattr(self, "mlx", None) is None and not self.fam.eager and not (rule and on_card):
+        if self.mlx is None and not self.fam.eager and not (rule and on_card):
             # torch's sdpa over every key the chunk sees: the causal mask, a value a (row, key) pair at most, and the
             # keys and values widened to every query head (`btb_sdpa`'s expand, transformers' `repeat_kv`)
             scores += nb
@@ -1132,9 +1132,9 @@ class _ForwardMixin(_State):
         _per_token, scores, _per_key = self._chunk_cost()
         free = self.prefill_room()
         buf_cap = free  # the single attention buffer must fit the reserve-aware room (--ram/--vram-reserve, via
-        mlx = getattr(self, "mlx", None)  # prefill_room) and, on MLX, Metal's hard per-buffer ceiling
+        mlx = self.mlx  # prefill_room) and, on MLX, Metal's hard per-buffer ceiling
         if mlx is not None:
-            hard = int((getattr(mlx, "info", None) or {}).get("max_buffer_length", 0) or 0)
+            hard = int(mlx.info.get("max_buffer_length", 0) or 0)
             if hard:
                 buf_cap = min(buf_cap, hard)
         rows = 4096

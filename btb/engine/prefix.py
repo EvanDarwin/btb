@@ -84,6 +84,9 @@ class PrefixCache:
         else:
             kv = torch.bfloat16 if sm.host_kv_dtype() == torch.bfloat16 else None
         ceiling = int(sm._card_ceiling()) if on_card and hasattr(sm, "_card_ceiling") else 1
+        on_mlx = getattr(sm, "mlx", None) is not None
+        # an MLX engine's rows are its activations' (bf16, float32 under --fp32): its growth priced so before any land
+        price = (torch.bfloat16 if sm.compute_dtype in (None, torch.bfloat16) else torch.float32) if on_mlx else None
         self.pool = KvPool(
             [i for i in layers if i not in card],
             hk,
@@ -93,7 +96,8 @@ class PrefixCache:
             card_layers=card,
             dev=sm.dev if on_card else None,
             ceiling=ceiling,
-            shared=getattr(sm, "mlx", None) is not None,
+            shared=on_mlx,
+            price=price,
         )
         self.grant = sched.grant if sched is not None else None
         self.tree = RadixTree(self.pool.pages)

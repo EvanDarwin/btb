@@ -387,18 +387,20 @@ def test_own_layer_speculation_gate_matches_its_source() -> None:
     assert "cpu" in verifies and cuda <= verifies and "mlx-step" not in verifies, verifies
 
 
-def test_mega_head_multiple_matches_its_source() -> None:
-    """the megakernel's head gate, quoted from mega/model.py so MEGA_SHAPE cannot outlive the constraint."""
-    gate = f"self.hd % {spec.MEGA_HEAD_MULTIPLE} or self.hd > {spec.MEGA_HEAD_MAX}"
-    assert gate in _source("mlx", "mega", "model.py")
+def test_mega_heads_match_their_source() -> None:
+    """the megakernel's head gate, quoted from mega/model.py and aluminum.py so MEGA_SHAPE cannot outlive it."""
+    assert "self.hd not in aluminum.HEADS" in _source("mlx", "mega", "model.py")
+    assert f"HEADS = {spec.ALUMINUM_HEADS}" in _source("mlx", "aluminum.py")
 
 
 def test_mlx_attn_heads_match_their_source() -> None:
-    """the engine's MLX attention-kernel head gate, quoted from mlx_forward.py so MLX_ATTN_SHAPE cannot outlive it."""
+    """the engine's MLX attention-kernel head gate, quoted from mlx_forward.py and aluminum.py so MLX_ATTN_SHAPE cannot
+    outlive it."""
     src = _source("engine", "mlx_forward.py")
-    assert f"ATTN_KERNEL_HEADS = {manifest.MLX_ATTN_HEAD_DIMS}" in src
-    # the tree, the contiguous and paged attention, the rows, the forest
-    assert src.count("hd in ATTN_KERNEL_HEADS") == 5, "a kernel gate stopped reading ATTN_KERNEL_HEADS"
+    assert "ATTN_KERNEL_HEADS = aluminum.HEADS" in src
+    assert f"HEADS = {manifest.MLX_ATTN_HEAD_DIMS}" in _source("mlx", "aluminum.py")
+    # the tree, the prefill chunk, the contiguous and paged attention, the rows, the forest
+    assert src.count("hd in ATTN_KERNEL_HEADS") == 6, "a kernel gate stopped reading ATTN_KERNEL_HEADS"
 
 
 def test_mtp_head_is_read_from_the_fixture() -> None:

@@ -52,7 +52,7 @@ def kv_store(buf: mx_.array, rows: mx_.array, n0: int) -> mx_.array:
     """`rows` [Hk, T, D] bf16 into `buf` [1, Hk, cap, D] at row `n0`, through the buffer's own bytes. Returns
     the kernel's flag: evaluate it before anything reads the rows (the write has no graph dependency)."""
     global _store_kernel
-    m = mx()
+    m = mx
     with _lock:
         if _store_kernel is None:
             _store_kernel = metal_kernel(
@@ -74,7 +74,7 @@ def kv_scatter(kb: mx_.array, vb: mx_.array, k: mx_.array, v: mx_.array, at: mx_
     no read of the buffers in the same evaluation after it (`mx.depends` neither), so the rows are read by a later
     one"""
     global _scatter_kernel
-    m = mx()
+    m = mx
     with _lock:
         if _scatter_kernel is None:
             _scatter_kernel = metal_kernel(
@@ -99,7 +99,7 @@ def kv_scatter(kb: mx_.array, vb: mx_.array, k: mx_.array, v: mx_.array, at: mx_
 def kv_gather(buf: mx_.array, keep: Sequence[int], base: int) -> mx_.array:
     """rows `keep` of `buf` [1, Hk, cap, D] become rows base.. (a gathered copy written back in place); returns
     the flag to evaluate"""
-    m = mx()
+    m = mx
     idx = m.array(np.asarray(list(keep), dtype=np.int32))
     rows = m.take(buf[0], idx, axis=1)
     return kv_store(buf, rows, base)

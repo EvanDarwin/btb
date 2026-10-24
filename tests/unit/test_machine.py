@@ -762,7 +762,7 @@ def test_the_mlx_section_skips_what_the_free_ram_cannot_hold(monkeypatch: Monkey
         bfloat16="bf16", float32="f32", random=types.SimpleNamespace(normal=normal),
         ones=lambda shape, dtype=None: Array(), eval=lambda *a: None, clear_cache=lambda: None,
     )  # fmt: skip
-    monkeypatch.setattr(core, "mx", lambda: m)
+    monkeypatch.setattr(core, "mx", m)
     monkeypatch.setattr(gemv, "gemv", lambda w, x: None)
     monkeypatch.setattr(attn, "attn_decode", lambda q, k, v, n, scale: None)
     monkeypatch.setattr(machine, "host_free", lambda: 8 * 1024 * MB)

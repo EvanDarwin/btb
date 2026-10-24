@@ -10,7 +10,7 @@ is one aligned uint4. IQ4_XS: 136 B/256 (d, a 6-bit scale a 32-block from scales
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 import numpy as np
 
@@ -18,16 +18,20 @@ from .core import metal_kernel, mx
 from .matvec import SHAPES, Frags, Shapes, blocks, launch
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import mlx.core as mx_
+
+    from .core import MetalKernel
 
 # ggml's IQ lattice codebooks (the grid a quant maps its indices through, and the 128-entry sign table shared by
 # the *_XXS/XS/S quants) built from the gguf package's deterministic constants, cached as device buffers the
 # kernels read; passing them as inputs keeps the kernel source free of the thousands of literal grid values.
-_tables: dict[str, Any] = {}
+_tables: dict[str, mx_.array] = {}
 _tbl_lock = threading.Lock()
 
 
-def _grid(name: str) -> Any:
+def _grid(name: str) -> mx_.array:
     """the int8 grid buffer for a gguf IQ quant class name (e.g. 'IQ3_XXS'), flattened (entries * values)."""
     with _tbl_lock:
         g = _tables.get(name)
@@ -36,8 +40,8 @@ def _grid(name: str) -> Any:
 
             cls = getattr(quants, name)
             cls.init_grid()
-            g = _tables[name] = mx().array(np.ascontiguousarray(cls.grid).reshape(-1).astype(np.int8))
-            mx().eval(g)
+            g = _tables[name] = mx.array(np.ascontiguousarray(cls.grid).reshape(-1).astype(np.int8))
+            mx.eval(g)
     return g
 
 
@@ -45,18 +49,18 @@ def _device(a: mx_.array) -> mx_.array:
     """`a` as an input the sources read through a `device` pointer: MLX hands a kernel an array of fewer than 8
     elements in `constant` memory, so a tiny matrix's one-a-block stream is padded to 8"""
     n = int(a.size)
-    return a if n >= 8 else mx().concatenate([a.reshape(-1), mx().zeros((8 - n,), dtype=a.dtype)])
+    return a if n >= 8 else mx.concatenate([a.reshape(-1), mx.zeros((8 - n,), dtype=a.dtype)])
 
 
-def _ksigns() -> Any:
+def _ksigns() -> mx_.array:
     """the 128-entry sign table (ggml's ksigns_iq2xs): index -> the 8 sign bits of a group of 8 weights."""
     with _tbl_lock:
         k = _tables.get("ksigns")
         if k is None:
             from gguf import quants
 
-            k = _tables["ksigns"] = mx().array(np.frombuffer(quants.IQ2_XXS.ksigns, dtype=np.uint8).copy())
-            mx().eval(k)
+            k = _tables["ksigns"] = mx.array(np.frombuffer(quants.IQ2_XXS.ksigns, dtype=np.uint8).copy())
+            mx.eval(k)
     return k
 
 
@@ -167,7 +171,7 @@ _DEQUANT_IQ4XS = r"""
     }
 """
 _lock = threading.Lock()
-_deq: dict[str, Any] = {}
+_deq: dict[str, MetalKernel] = {}
 # IQ4_NL's launch shapes and the lattice kernels' (`matvec.Shapes`), measured as the default's over their own types
 IQ4NL_SHAPES: Shapes = {
     **{t: (4, t) for t in range(1, 17)},
@@ -190,7 +194,7 @@ def _matvec(kind: str, w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -
 
 
 def _dequant(kind: str, w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
-    m = mx()
+    m = mx
     _, blkw, _, src = _IQ[kind]
     nblk = int(rows * cols // blkw)
     with _lock:
@@ -218,7 +222,7 @@ def repack_iq4nl(raw: mx_.array) -> tuple[mx_.array, mx_.array]:
     block) and the nibble bytes (16 a block, so each block is one aligned uint4). In the graph: once at bind, or
     each pass over a slot's view"""
     b = raw.reshape(-1, 18)
-    return b[:, 0:2].reshape(-1).view(mx().float16), b[:, 2:18].reshape(-1)
+    return b[:, 0:2].reshape(-1).view(mx.float16), b[:, 2:18].reshape(-1)
 
 
 def matvec_iq4nl(d: mx_.array, q: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:
@@ -241,7 +245,7 @@ def matvec_iq4nl(d: mx_.array, q: mx_.array, x: mx_.array, rows: int, cols: int)
 def dequant_iq4nl(d: mx_.array, q: mx_.array, rows: int, cols: int) -> mx_.array:
     """the full [rows, cols] bf16 weight for an IQ4_NL tensor from its repacked streams."""
     global _iq4nl_deq
-    m = mx()
+    m = mx
     nblk = int(rows * cols // 32)
     with _lock:
         if _iq4nl_deq is None:
@@ -602,7 +606,7 @@ def _side_iq1m(raw: mx_.array) -> tuple[mx_.array, mx_.array]:
     """IQ1_M's matvec side stream from the raw 56-byte superblocks, in the graph (once at bind, or each pass over a
     slot's view): the block f16 d reassembled here rather than in the kernel, and the sixteen 3-bit sub-scales
     packed as nibble pairs (8 B)."""
-    m = mx()
+    m = mx
     scb = raw.reshape(-1, 56)[:, 48:56].reshape(-1).view(m.uint16).reshape(-1, 4).astype(m.uint32)
     dbits = (scb[:, 0] >> 12) | ((scb[:, 1] >> 12) << 4) | ((scb[:, 2] >> 12) << 8) | ((scb[:, 3] >> 12) << 12)
     sub = (scb.reshape(-1, 4, 1) >> m.array([0, 3, 6, 9], dtype=m.uint32).reshape(1, 1, 4)) & 7
@@ -616,7 +620,19 @@ def _side_iq1m(raw: mx_.array) -> tuple[mx_.array, mx_.array]:
 # repack (raw -> extra device streams named `side_names`) the matvec reads beside the raw blocks. A kernel always
 # takes W, x and GRID; KS (the sign table) only when the entry reads it. Adding a quant is one entry here plus a
 # GGUF-name -> kind row in the engine binder. All are register-only and batch-invariant (row i identical at any T).
-_LATT: dict[str, dict[str, Any]] = {
+class Lattice(TypedDict):
+    """an IQ lattice kind's entry of `_LATT`"""
+
+    bytes: int
+    grid: str
+    ksigns: bool
+    mv: str
+    deq: str
+    side: NotRequired[Callable[[mx_.array], tuple[mx_.array, ...]]]
+    side_names: NotRequired[list[str]]
+
+
+_LATT: dict[str, Lattice] = {
     "iq3xxs": {"bytes": 98, "grid": "IQ3_XXS", "ksigns": True, "mv": _MATVEC_IQ3XXS, "deq": _DEQUANT_IQ3XXS},
     "iq2xxs": {"bytes": 66, "grid": "IQ2_XXS", "ksigns": True, "mv": _MATVEC_IQ2XXS, "deq": _DEQUANT_IQ2XXS},
     "iq2xs": {"bytes": 74, "grid": "IQ2_XS", "ksigns": True, "mv": _MATVEC_IQ2XS, "deq": _DEQUANT_IQ2XS},
@@ -646,11 +662,11 @@ def lattice_side(kind: str) -> bool:
     return _LATT[kind].get("side") is not None
 
 
-_latt_deq: dict[str, Any] = {}
+_latt_deq: dict[str, MetalKernel] = {}
 
 
 def matvec_lattice(
-    kind: str, w_bytes: mx_.array, x: mx_.array, rows: int, cols: int, side: tuple[Any, ...] = ()
+    kind: str, w_bytes: mx_.array, x: mx_.array, rows: int, cols: int, side: tuple[mx_.array, ...] = ()
 ) -> mx_.array:
     """y[T, rows] = x[T, cols] . W^T for a raw IQ lattice weight; fp32 accumulation, y in x's dtype, 1..16 rows a
     launch. `kind` selects the layout from `_LATT`; the grid (and sign table, when used) ride along as buffers,
@@ -674,7 +690,7 @@ def matvec_lattice(
 
 def dequant_lattice(kind: str, w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
     """the full [rows, cols] bf16 weight for an IQ lattice tensor of the given `kind`."""
-    m = mx()
+    m = mx
     spec = _LATT[kind]
     inames = ["W", "GRID"] + (["KS"] if spec["ksigns"] else [])
     tbls = [_grid(spec["grid"])] + ([_ksigns()] if spec["ksigns"] else [])

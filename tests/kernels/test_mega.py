@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
 
 from btb.engine.cache import GrowLayer
 from btb.kinds import MEGA_STORED, Parents, Tokens
+from btb.sampling import GREEDY
 from tests.cert import spec
 from tests.helpers import FIXTURES, NO_LOG, need_cached, need_mlx
 
@@ -23,9 +24,7 @@ if TYPE_CHECKING:
 
     from btb.engine.model import StreamedTextModel
     from btb.engine.prefix import PrefixCache
-    from btb.mlx.core import MetalKernel
     from btb.mlx.mega import MegaPass
-    from btb.mlx.mega.model import DenseLayer
 
 MODEL = "Qwen/Qwen3-0.6B"
 # the release's Q4_K_M file: Q4_K blocks with Q6_K ones in the same layers (a v and a down of their own type)
@@ -71,7 +70,7 @@ def _pass(
         finally:
             sm.ab()
     if arena or mega:
-        assert all(cast(GrowLayer, cl).arena is not None for cl in cache.layers), "the pass left the arena"
+        assert all(isinstance(cl, GrowLayer) and cl.arena is not None for cl in cache.layers), "the pass left the arena"
     T = len(toks)
     rows = [cache.layers[i]._mx[0][0, :, : past + T].astype(mx.float32) for i in (0, len(cache.layers) - 1)]
     return ids, rows
@@ -98,6 +97,49 @@ def test_pass_matches_fused(engine: StreamedTextModel, past: int, parents: Paren
     assert m_ids == f_ids, f"the megakernel's ids {m_ids} are not the fused path's {f_ids}"
     for a, b in zip(m_rows, f_rows):
         assert mx.array_equal(a, b), "the megakernel's K rows differ from the fused path's"
+
+
+def _tree_kernels_match_step(
+    sm: StreamedTextModel, monkeypatch: pytest.MonkeyPatch, prompt: Tokens, toks: Tokens, parents: Parents
+) -> None:
+    """for each tree kernel the megakernel has at the model's head size (`aluminum.tree_kernels` on its threadgroups,
+    `aluminum.tree_pick` made to take it for every tree, in a pass built for it): each node of a pass is the step's
+    one-row step along its path, its id and its cache rows bit for bit"""
+    import mlx.core as mx
+
+    from btb.mlx import aluminum
+    from btb.mlx.mega import MegaPass
+    from btb.mlx.mega.replay import THREADS
+
+    mega = sm._mega
+    assert mega is not None
+    past = len(prompt)
+    try:
+        sm._mega = None
+        steps = [_along(sm, prompt, toks, parents, j) for j in range(len(parents))]
+        for pick in aluminum.tree_kernels(mega.hd, THREADS // 32):
+            monkeypatch.setattr(
+                aluminum, "tree_pick", lambda D, g, Hk, T, splits, nsg=0, p=pick: p if T > 1 else aluminum.NODE_BY_NODE
+            )
+            m_ids, m_rows = _pass(sm, MegaPass(sm), prompt, toks, parents)
+            sm._mega = None
+            for j, (f_id, f_rows) in enumerate(steps):
+                on = f"node {j} on the {pick.kind} at {pick.rows} rows"
+                assert m_ids[j] == f_id, f"{on}: the pass's id {m_ids[j]} is not the step's {f_id}"
+                for a, b in zip(m_rows, f_rows):
+                    row = a[:, past + j : past + j + 1]
+                    assert mx.array_equal(row, b.astype(mx.float32)), f"{on}: K rows differ from the step's"
+    finally:
+        sm._mega = mega
+
+
+def test_tree_kernels_match_step(engine: StreamedTextModel, monkeypatch: pytest.MonkeyPatch) -> None:
+    """the megakernel's tree kernels over a prefix of three segments: each node the step's one-row step along its
+    path, bit for bit (its segments' partials folded)"""
+    past = 1100
+    parents = [-1, 0, 1, 0, 3, 3, 1]
+    prompt = [151644, *range(1000, 1000 + past - 1)]
+    _tree_kernels_match_step(engine, monkeypatch, prompt, [2000 + 7 * t for t in range(len(parents))], parents)
 
 
 @pytest.mark.parametrize("past", [51, 300])
@@ -190,12 +232,12 @@ def test_tree_positions_take_the_kernel(engine: StreamedTextModel) -> None:
     past = cache.get_seq_length()
     sm.aa(parents)
     try:
-        assert sm._mega_ok(cache, 5, None, True, True, [[past, past + 1, past + 2, past + 1, past + 2]])
-        assert not sm._mega_ok(cache, 5, None, True, True, [[past, past + 1, past + 2, past + 3, past + 4]])
-        assert not sm._mega_ok(cache, 5, None, True, True, [[past + 1, past + 2, past + 3, past + 2, past + 3]])
+        assert sm._mega_ok(cache, 5, None, True, GREEDY, [[past, past + 1, past + 2, past + 1, past + 2]])
+        assert not sm._mega_ok(cache, 5, None, True, GREEDY, [[past, past + 1, past + 2, past + 3, past + 4]])
+        assert not sm._mega_ok(cache, 5, None, True, GREEDY, [[past + 1, past + 2, past + 3, past + 2, past + 3]])
     finally:
         sm.ab()
-    assert sm._mega_ok(cache, 3, None, True, True, [[past, past + 1, past + 2]]), "a chain's positions"
+    assert sm._mega_ok(cache, 3, None, True, GREEDY, [[past, past + 1, past + 2]]), "a chain's positions"
 
 
 def test_loops_match_fused(engine: StreamedTextModel) -> None:
@@ -313,16 +355,32 @@ def test_family_pass_matches_step(tiny: StreamedTextModel, past: int, parents: P
         sm._mega = mega
 
 
+@pytest.mark.parametrize("past", [70, 600])
+def test_family_tree_kernels_match_step(tiny: StreamedTextModel, past: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    """every family's megakernel tree kernels over a prefix of one segment and of two: each node its step path's
+    one-row step along the node's path, bit for bit"""
+    parents = [-1, 0, 1, 0, 3, 3, 1]
+    V = _vocab(tiny)
+    prompt = [1 + (7 * t) % (V - 1) for t in range(past)]
+    toks = [1 + (13 * t + 5) % (V - 1) for t in range(len(parents))]
+    _tree_kernels_match_step(tiny, monkeypatch, prompt, toks, parents)
+
+
 def test_split_projections_match_step(tiny: StreamedTextModel) -> None:
     """with q/k/v and gate/up not one weight (a GGUF's v of another type than q and k), each written as its own
     piece of one output row: every node of a tree pass is still the step's one-row step along its path"""
     import mlx.core as mx
 
     from btb.mlx.mega import MegaPass
+    from btb.mlx.mega.model import DenseLayer, dense_layer
 
     sm = tiny
     mega = sm._mega
-    layers = [cast("DenseLayer", sm.host[i]) for i in range(sm.L)]
+    layers: list[DenseLayer] = []
+    for i in range(sm.L):
+        ly = sm.host[i]
+        assert dense_layer(ly), f"layer {i} is not the plain block's"
+        layers.append(ly)
     held = [(ly.self_attn._mx_qkv, ly.mlp._mx_gu) for ly in layers]
     for ly in layers:
         ly.self_attn._mx_qkv = ly.mlp._mx_gu = None
@@ -374,24 +432,22 @@ def test_mlx_ops_emulated_bit_for_bit() -> None:
     import numpy as np
 
     from btb.mlx.backend import act
+    from btb.mlx.core import metal_kernel
     from btb.mlx.mega.kernel import MLX_OPS, TYPES
 
     need_mlx()
     ctx = "Ctx c = {tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup, tgm, nullptr, nullptr, nullptr, "
     ctx += "nullptr, nullptr, nullptr, nullptr};"
     head = "    threadgroup uint8_t tgm[256];\n    uint tid = thread_position_in_threadgroup.x;\n    " + ctx + "\n"
-    norm = cast(
-        "MetalKernel",
-        mx.fast.metal_kernel(
-            name="test_mega_mlx_rms",
-            input_names=["x", "w", "eps"],
-            output_names=["y"],
-            header=TYPES + MLX_OPS,
-            source=head
-            + "    uint r = threadgroup_position_in_grid.x, H = x_shape[1];\n"
-            + "    mlx_rms_norm_row((const device bfloat*)x + (size_t)r * H, (device bfloat*)y + (size_t)r * H, w, H, "
-            + "eps[0], c);\n",
-        ),
+    norm = metal_kernel(
+        name="test_mega_mlx_rms",
+        input_names=["x", "w", "eps"],
+        output_names=["y"],
+        header=TYPES + MLX_OPS,
+        source=head
+        + "    uint r = threadgroup_position_in_grid.x, H = x_shape[1];\n"
+        + "    mlx_rms_norm_row((const device bfloat*)x + (size_t)r * H, (device bfloat*)y + (size_t)r * H, w, H, "
+        + "eps[0], c);\n",
     )
     rng = np.random.default_rng(0)
     for wdt in (mx.bfloat16, mx.float32):
@@ -409,19 +465,16 @@ def test_mlx_ops_emulated_bit_for_bit() -> None:
             want = mx.fast.rms_norm(xs, w, 1e-6).astype(mx.bfloat16)
             assert mx.array_equal(got.view(mx.uint16), want.view(mx.uint16)), f"rms_norm {wdt} H {H}"
     # the gated MLP's activations times up, and the embedding scale, against the step's own MLX expressions
-    elem = cast(
-        "MetalKernel",
-        mx.fast.metal_kernel(
-            name="test_mega_mlx_elementwise",
-            input_names=["g", "u", "s"],
-            output_names=["silu", "gelu", "scaled"],
-            header=TYPES + MLX_OPS,
-            source="    uint i = thread_position_in_grid.x;\n"
-            + "    bfloat a = ((const device bfloat*)g)[i], b = ((const device bfloat*)u)[i];\n"
-            + "    ((device bfloat*)silu)[i] = (a * mlx_sigmoid(a)) * b;\n"
-            + "    ((device bfloat*)gelu)[i] = mlx_gelu_tanh(a) * b;\n"
-            + "    ((device bfloat*)scaled)[i] = a * (bfloat)s[0];\n",
-        ),
+    elem = metal_kernel(
+        name="test_mega_mlx_elementwise",
+        input_names=["g", "u", "s"],
+        output_names=["silu", "gelu", "scaled"],
+        header=TYPES + MLX_OPS,
+        source="    uint i = thread_position_in_grid.x;\n"
+        + "    bfloat a = ((const device bfloat*)g)[i], b = ((const device bfloat*)u)[i];\n"
+        + "    ((device bfloat*)silu)[i] = (a * mlx_sigmoid(a)) * b;\n"
+        + "    ((device bfloat*)gelu)[i] = mlx_gelu_tanh(a) * b;\n"
+        + "    ((device bfloat*)scaled)[i] = a * (bfloat)s[0];\n",
     )
     # every finite bf16 gate (the all-ones exponents, infinities and NaNs, read as zero)
     bits = np.arange(1 << 16, dtype=np.uint16)

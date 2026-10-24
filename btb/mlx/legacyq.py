@@ -7,7 +7,7 @@ the plain step). `matvec_legacy` is the linear, `dequant_legacy` the whole matri
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from ..kinds import Quant
 from .core import metal_kernel, mx
@@ -15,6 +15,8 @@ from .matvec import Frags, Shapes, StoredKernel, blocks, launch
 
 if TYPE_CHECKING:
     import mlx.core as mx_
+
+    from .core import MetalKernel
 
 # (block bytes, kernel id) by kind. Q4_0: d f16, 16 nibble bytes, value d*(q-8). Q4_1: d f16, m f16, 16 nibble
 # bytes, value d*q + m. Byte i holds weight i in its low nibble and weight i+16 in its high. Q8_0: d f16, 32 int8,
@@ -102,7 +104,7 @@ _DEQUANT = r"""
     for (uint i = 0; i < 32; i++) out[(size_t)t * 32 + i] = (T)legacy_weight(blk, i);
 """
 
-_deq_kernels: dict[str, Any] = {}
+_deq_kernels: dict[str, MetalKernel] = {}
 _lock = threading.Lock()
 # this kernel's own launch shapes (`matvec.Shapes`), its lanes splitting a row's blocks rather than one superblock:
 # measured as the default's, over Q4_0, Q4_1 and Q8_0
@@ -153,7 +155,7 @@ def matvec_legacy(kind: str, w_bytes: mx_.array, x: mx_.array, rows: int, cols: 
 
 def dequant_legacy(kind: str, w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
     """the full [rows, cols] bf16 weight, the numbers the gguf package dequantizes to"""
-    m = mx()
+    m = mx
     nblk = rows * cols // 32
     with _lock:
         k = _deq_kernels.get(kind)

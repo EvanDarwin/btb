@@ -479,10 +479,6 @@ def load(
         # the experts seated on the card: 0 none, "auto" what the card has to spare, or a figure in GB
         ve = os.environ.get("BTB_VRAM_EXPERTS_GB", c.get("vram_experts_gb", 0))
         sm.vram_experts_gb = "auto" if str(ve).strip().lower() == "auto" else float(ve or 0)
-        if getattr(sm, "mlx", None) is not None and sm.v_max > 0:
-            # every decode row through the engine's attention kernel, so a verify pass and the one-row step
-            # compute alike (see `_mlx_attend`)
-            sm.mlx_attn_rows = 0
         sm.eos_ids = ()
         if sm.gguf is not None:
             sm.eos_ids = sm.gguf.eos_ids()  # a GGUF carries them in its tokenizer keys, not a generation config

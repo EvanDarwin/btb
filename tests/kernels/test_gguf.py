@@ -21,8 +21,11 @@ from btb.kinds import PassTag, Quant, quant_tag, stored_in_place, stored_quants
 from tests.cert.manifest import QWEN3_06B_GGUF
 
 if TYPE_CHECKING:
+    import mlx.core as mx_
+
     from btb.engine.scratch import Scratch
     from btb.gguf import GGUFModel, QuantWeight
+    from btb.mlx.backend import Streams
 
 from tests.helpers import (
     F16_AT,
@@ -418,7 +421,7 @@ def test_a_long_gguf_prefill_takes_the_gemm_as_a_bf16_one_does(device: str, monk
         decoded.append(w.shape[0])
         deq(gq, w, out)
 
-    def mlx_dequant(q: Quant, streams: tuple[object, ...], rows: int, cols: int) -> object:
+    def mlx_dequant(q: Quant, streams: "Streams", rows: int, cols: int) -> "mx_.array":
         decoded.append(rows)
         return sdq(q, streams, rows, cols)
 

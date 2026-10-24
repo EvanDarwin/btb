@@ -152,7 +152,7 @@ _ADD_RMSNORM_SRC = """
 
 def add_rmsnorm(h: mx_.array, y: mx_.array, w: mx_.array, eps: float) -> tuple[mx_.array, mx_.array]:
     """(h + y, rmsnorm(h + y) * w) for h, y [T, H] in one launch; both in h's dtype, lazily."""
-    m = mx()
+    m = mx
     k = _kernel("btb_add_rmsnorm", ["h", "y", "w", "eps"], ["h2", "x"], ADD_RMSNORM_FN, _ADD_RMSNORM_SRC)
     T, H = int(h.shape[0]), int(h.shape[1])
     h2, x = k(
@@ -181,7 +181,7 @@ def sandwich_add(h: mx_.array, y: mx_.array, w: mx_.array, eps: float) -> mx_.ar
     """h + rmsnorm(y) * w for h, y [T, H] in one launch, in h's dtype — Gemma's sandwich residual, the delta
     normed before it is added rather than after. `w` is read as stored (float32 for a 1 + weight family, the
     product the module takes)."""
-    m = mx()
+    m = mx
     k = _kernel("btb_sandwich_add", ["h", "y", "w", "eps"], ["out"], SANDWICH_ADD_FN, _SANDWICH_ADD_SRC)
     T, H = int(h.shape[0]), int(h.shape[1])
     return k(
@@ -226,7 +226,7 @@ def qk_norm_rope(
     """RMSNorm over each head of q [T, Hq, D] and k [T, Hk, D] (weights qn, kn [D], read as stored) then rope on
     the first `rd` dims at pos[t], in one launch; the rotation is rope_rows' to the bit. Returns (q, k) in q's
     dtype, lazily."""
-    m = mx()
+    m = mx
     kern = _kernel(
         "btb_qk_norm_rope",
         ["q", "k", "qn", "kn", "eps", "freqs", "pos"],

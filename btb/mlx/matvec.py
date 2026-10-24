@@ -174,7 +174,7 @@ def launch(
     """y[T, rows] = x[T, cols] . W^T through `source`, a kernel reading `inputs` by name beside x over NSB blocks of
     `bw` weights (the last one partial where `bw` does not divide `cols`); fp32 accumulation, y in x's dtype. `name`
     is the caller's kernel name for the matrix, the launch shape appended; `shapes` a kernel's own, else `SHAPES`."""
-    m = mx()
+    m = mx
     n = int(x.shape[0])
     outs = []
     for s in range(0, n, ROWS_MAX):

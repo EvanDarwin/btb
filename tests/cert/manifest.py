@@ -43,10 +43,10 @@ FIXTURES = spec.FIXTURES
 GGUF_DIR = spec.GGUF_DIR
 
 # the shapes the card's step-graph kernels are written for (btb/engine/cuda.py:295: a lane holds D/32 dims of a
-# head) and the heads the engine sends to its MLX attention kernels (mlx_forward.ATTN_KERNEL_HEADS). Neither is
-# reachable from a torch-free module, so test_manifest holds each against the source it is quoted from.
+# head) and the heads the engine sends to its MLX attention kernels (mlx_forward.ATTN_KERNEL_HEADS, aluminum's).
+# Neither is reachable from a torch-free module, so test_manifest holds each against the source it is quoted from.
 CARD_HEAD_DIMS: tuple[int, ...] = (64, 128, 256)
-MLX_ATTN_HEAD_DIMS: tuple[int, ...] = (128, 256)
+MLX_ATTN_HEAD_DIMS: tuple[int, ...] = spec.ALUMINUM_HEADS
 # a family that brings its own layer (Qwen4) verifies a speculative pass exactly through btb's own kernels for the
 # layers that carry state - the host's node steps, the card's DeltaNet node kernel - and the rest row-invariant
 # wherever it runs: on a card the card program, or where it declines (a float32 compute, a fixture shaped below its

@@ -9,8 +9,9 @@ import math
 import os
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from typing import Any, Concatenate, ParamSpec, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, Protocol, TypeVar
 
 import torch
 
@@ -45,6 +46,13 @@ from .scheduler import BatchScheduler, _size
 from .scratch import Scratch
 from .text import _TextMixin
 from .tiers import ColdRing, _TiersMixin
+
+if TYPE_CHECKING:
+    from ..mlx import Backend, Shared
+    from .cache import KvCache
+
+# each arena cache's megakernel arena, held as long as the cache is (`new_cache`)
+_ARENAS: weakref.WeakKeyDictionary[KvCache, Shared] = weakref.WeakKeyDictionary()
 
 
 class _Closes(Protocol):
@@ -99,7 +107,7 @@ class StreamedTextModel(
     _NGramRows = _NGramRows
     _ExpertStore = _ExpertStore
     MTPDrafter = MTPDrafter
-    mlx: Any = None
+    mlx: Backend | None = None
     gemm_rows = Native.gemm_rows
 
     @classmethod
@@ -161,20 +169,15 @@ class StreamedTextModel(
         self.mem_start = _pool.MEM_START if _pool.MEM_START is not None else host_free_bytes() + _pool.POOL.free_bytes()
         self.mlx_layers = set()
         # the attention cache's rows as int8 with a scale each (the MLX device; `GrowLayer(bits=)`): half the
-        # bytes of bf16, so every attention row goes through the node kernel that reads them as they are
+        # bytes of bf16, every attention row read through aluminum as its bf16 dequantization
         self.kv_bits = int(kv_bits) if kv_bits else None
         if self.kv_bits not in (None, 8):
             raise ValueError(f"[stream] kv_bits must be 8 or unset, got {kv_bits}")
-        self.mlx_attn_rows = 0 if self.kv_bits else 8192
-        # a prefill chunk's attention at head size 256 through the engine's fused prefill kernel instead of MLX's
-        # fallback (its fused attention takes 64, 80 and 128): in situ at a 40k position the attention runs 1.2x
-        # faster and the chunk 1.08-1.16x, the same math
-        self.mlx_attn_prefill = True
         devname = DeviceName.parse(device) or DeviceName(DeviceKind.CPU)
         if devname.kind is DeviceKind.MLX:
             if not mlxdev.available():
                 raise RuntimeError("[mlx] MLX is not available in this Python (pip install mlx; Apple silicon only)")
-            self.mlx = Native.mlx = mlxdev.Backend(self, gemm_rows=Native.gemm_rows, log=log)
+            self.mlx = Native.mlx = mlxdev.Backend(gemm_rows=Native.gemm_rows, log=log)
             self.holdings.own(Stage.VIEWS, "the MLX tier", self._mlx_teardown)
             self.mlx_layers = (
                 {int(x) for x in mlx_layers}
@@ -578,8 +581,9 @@ class StreamedTextModel(
             if hh.quant is not None:
                 rows = hh.quant.rows(ids)
             else:
-                assert self.mlx is not None  # a stored head is the native kernels' or MLX's
-                tok = mlxdev.mx().array(ids.reshape(-1).to(torch.int32).cpu().numpy())
+                # a stored head is the native kernels' or MLX's
+                assert self.mlx is not None and hh.mx is not None
+                tok = mlxdev.mx.array(ids.reshape(-1).to(torch.int32).cpu().numpy())
                 rows = mlxdev.from_mx(self.mlx.gather_rows(hh.mx, tok))
             return rows.view(*ids.shape, rows.shape[-1]).to(self.dev)
         rows = self.embed_table[ids.reshape(-1).cpu()]
@@ -769,7 +773,7 @@ class StreamedTextModel(
         store = getattr(self, "expert_store", None)
         if store is not None:
             store.pool.shutdown(wait=True)
-        pool = getattr(self, "_mlx_pool", None)
+        pool = self._mlx_pool
         if pool is not None:
             pool.shutdown(wait=True)
 
@@ -791,7 +795,7 @@ class StreamedTextModel(
         self.cold_ring.slots, self.cold_ring.shared = [], None
         st = self.mlx_state
         st.weights = {}
-        st.embed_w = st.embed_lin = st.rope_cache = st.ahead = None
+        st.embed_w = st.embed_lin = st.rope_cache = st.rope_dual = st.ahead = None
         if self.mlx is not None:
             self.mlx.close()
 
@@ -864,7 +868,7 @@ class StreamedTextModel(
         # the megakernel's arena: every layer's K and V as views of one shared array, `cap` rows a head (a layer
         # a session grows past it takes a buffer of its own and the pass leaves the megakernel)
         arena = None
-        mg = getattr(self, "_mega", None)
+        mg = self._mega
         # the arena and its megakernel are bf16-only (`per` counts two bytes a row, and `_mega_ok` refuses any
         # other compute dtype); an fp32 pass would store float32 into these bf16-sized slots, so it keeps its own
         # per-layer buffers instead
@@ -875,8 +879,7 @@ class StreamedTextModel(
 
             cap = min(int(max_len) if max_len else (span or 4096), mg.SPL * ATTN_BLOCK)
             per = mg.Hk * cap * mg.hd * 2
-            sh = mlxdev.Shared(2 * self.L * per)
-            setattr(cache, "_mega_arena", sh)  # noqa: B010  not a DynamicCache slot: the arena pinned to the cache's lifetime
+            sh = _ARENAS[cache] = mlxdev.Shared(2 * self.L * per)
             arena = [(sh.whole, (2 * i) * per, (2 * i + 1) * per, cap) for i in range(self.L)]
         # a bf16 card engine keeps every layer's rows in bf16, a host layer's too (`host_kv_dtype`)
         kv_dtype = torch.bfloat16 if self.host_kv_dtype() == torch.bfloat16 else None

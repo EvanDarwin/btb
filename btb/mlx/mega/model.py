@@ -5,21 +5,22 @@ gathered once, and a program per pass shape built from the family's layers (`Fam
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, TypeAlias, cast
+from typing import TYPE_CHECKING, Protocol, TypeAlias, TypeGuard
 
 import numpy as np
 import torch
 
 from ...kinds import LayerKind, Quant
 from ...metal import paged
+from .. import aluminum
 from ..attn import tree_meta
 from ..backend import Weight
 from ..core import mx, to_mx
 from .kernel import EMBED_OP, MV_OP, STORED, OpName, stored_groups
 from .program import CONSTS, SCR, Program, Refs, Tensor, align, kv
-from .replay import KvSlot, Replay
+from .replay import THREADS, KvSlot, Replay
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -27,7 +28,7 @@ if TYPE_CHECKING:
     from ...engine.model import StreamedTextModel
 
 ROWS_MAX = 16  # a pass's rows: the matvec's tile holds 16
-SPL = 8  # the attention blocks a pass may read, 8 x ATTN_BLOCK cache rows
+SPL = 16  # the attention segments a pass may read, 16 x ATTN_BLOCK cache rows
 MV_KT = 64  # the matvec's columns a step
 AMP = 64  # the argmax's parts a row
 TG_MEMORY = 32768  # a threadgroup's memory on every Apple GPU family (MTLDevice.maxThreadgroupMemoryLength)
@@ -83,13 +84,20 @@ class SandwichLayer(DenseLayer, Protocol):
     post_feedforward_layernorm: NormModule
 
 
-@dataclass(frozen=True)
-class Fusions:
-    """the ops a pass makes inside a neighbour instead of as instructions of their own, bit-exact either way: each
-    saves a wait between instructions, and costs what the neighbour then does again in every threadgroup and the
-    registers its code adds to the whole kernel"""
+def _holds(layer: object, proto: type) -> bool:
+    """`layer` has every member `proto` and its protocol bases declare. hasattr, not a runtime protocol check: that
+    reads attributes statically, and a torch module's submodules sit in its `_modules` behind `__getattr__`"""
+    return all(hasattr(layer, n) for c in proto.__mro__ for n in inspect.get_annotations(c))
 
-    fold_in_attention: bool = True  # a one-block pass's partials folded by the attention's own threadgroup
+
+def dense_layer(layer: object) -> TypeGuard[DenseLayer]:
+    """`layer` is the plain block's"""
+    return _holds(layer, DenseLayer)
+
+
+def sandwich_layer(layer: object) -> TypeGuard[SandwichLayer]:
+    """`layer` is the sandwich block's"""
+    return _holds(layer, SandwichLayer)
 
 
 def mv_items(rows: int, per: int) -> int:
@@ -112,11 +120,17 @@ class Block:
 
     def dense(self, i: int) -> DenseLayer:
         """layer i's host modules, read as the plain block's"""
-        return cast("DenseLayer", self.mp.sm.host[i])
+        layer = self.mp.sm.host[i]
+        if not dense_layer(layer):
+            raise TypeError(f"[mega] layer {i} ({type(layer).__name__}) is not the plain block's")
+        return layer
 
     def sandwich(self, i: int) -> SandwichLayer:
         """layer i's host modules, read as the sandwich block's"""
-        return cast("SandwichLayer", self.mp.sm.host[i])
+        layer = self.mp.sm.host[i]
+        if not sandwich_layer(layer):
+            raise TypeError(f"[mega] layer {i} ({type(layer).__name__}) is not the sandwich block's")
+        return layer
 
     @staticmethod
     def qkv(at: AttentionModule) -> Linears:
@@ -217,20 +231,31 @@ class Block:
         f0 = qk[1] if qk is not None else mp.rscale
         refs = (qkv, qk[0] if qk is not None else None, q, K, V)
         p.emit(OpName.QKROPE, T * (Hq + 2 * Hk), refs, n, f0, reads=[qkv], writes=[q, K, V])
-        # the partials, the folded output right behind them (A_OFF): a pass of one block a node folds in the attention
+        # the partials, and right behind them (A_OFF) the rows of the nodes of one segment as the attention writes them:
+        # a pass of one segment's output, else the fold's to copy beside the others' folded partials
         part = p.scratch(mp.part_bytes, 1, rows=1)
         pl = Tensor((SCR, part.ref[1] + mp.pl_off), scratch=True)
-        a = p.scratch(Hq * hd)
+        one = p.scratch(Hq * hd)
         refs = (q, K, part, pl, V)
         scale = float(at.scaling)
-        tm = T | (mp.wins.index(mp.windows[i]) << 16)  # the rows and the layer's window's row of the metadata
-        if self.splits == 1 and mp.fusions.fold_in_attention:
-            n = (Hk, 1, tm)
-            p.emit(OpName.ATTN_FOLD, Hk * T, refs, n, scale, reads=[q, K, V], writes=[part, pl, a])
+        wrow = mp.wins.index(mp.windows[i]) << 16  # the layer's window's row of the metadata
+        tm = T | wrow
+        pick = aluminum.tree_pick(hd, mp.G, Hk, T, self.splits, THREADS // 32)
+        if pick.kind is aluminum.TreeKind.NODES:
+            nhg = mp.G // mp.gh
+            n = (Hk * nhg, self.splits, tm)
+            p.emit(OpName.ATTN, Hk * nhg * self.splits * T, refs, n, scale, reads=[q, K, V], writes=[part, pl, one])
         else:
-            n = (Hk, self.splits, tm)
-            p.emit(OpName.ATTN, Hk * self.splits * T, refs, n, scale, reads=[q, K, V], writes=[part, pl])
-            p.emit(OpName.FOLD, (T * Hq + 7) // 8, (part, pl, a), n, reads=[part, pl], writes=[a])
+            phased = pick.kind is aluminum.TreeKind.PHASED
+            tiles = -(-(T * mp.G) // pick.rows)
+            n = (tiles, Hk, self.splits | wrow | ((phased and pick.rows == 16) << 31))
+            op = OpName.ATTN_PHASED if phased else OpName.ATTN_TREE
+            p.emit(op, tiles * Hk * self.splits, refs, n, scale, reads=[q, K, V], writes=[part, pl, one])
+        if self.splits == 1:
+            return one
+        a = p.scratch(Hq * hd)
+        n = (Hk, self.splits, tm)
+        p.emit(OpName.FOLD, (T * Hq * hd + 255) // 256, (part, pl, a), n, reads=[part, pl, one], writes=[a])
         return a
 
     def gated(self, gu: Tensor) -> Tensor:
@@ -275,19 +300,19 @@ class Block:
 class MegaPass:
     """A model's pass of 1..ROWS_MAX rows over an arena or a paged cache replayed on the GPU, bit-exact with the fused
     path: its weights in slot buffers, its constants packed once, a write-once scratch for the widest pass, and a
-    program per pass shape (rows, attention blocks, argmax) built from the family's layers, encoded once and replayed
+    program per pass shape (rows, attention segments, argmax) built from the family's layers, encoded once and replayed
     over whichever cache a pass binds."""
 
-    def __init__(self, sm: StreamedTextModel, fusions: Fusions | None = None) -> None:
+    def __init__(self, sm: StreamedTextModel) -> None:
         from ...engine.families import act_name
 
-        self.fusions = fusions or Fusions()
         if not sm.fam.mega:
             raise ValueError(f"[mega] {sm.fam.name}'s layers are not composed for the megakernel")
         hh = sm.head_host
-        if hh is None:
+        hw = hh.mx if hh is not None else None
+        if hw is None:
             raise ValueError("[mega] the head is not on the host")
-        m = mx()
+        m = mx
         c = sm.cfg
         self.sm = sm
         self.L = int(sm.L)
@@ -295,10 +320,13 @@ class MegaPass:
         self.Hq = int(c.num_attention_heads)
         self.Hk = int(getattr(c, "num_key_value_heads", None) or self.Hq)
         self.hd = int(sm.host[0].self_attn.head_dim)
-        self.V = int(hh.mx.shape[0])
+        self.V = int(hw.shape[0])
         self.SPL, self.ROWS = SPL, ROWS_MAX
-        if self.hd % 32 or self.hd > 256 or self.H % 8:
-            raise ValueError("[mega] the kernel takes a head of 32k dims up to 256 and a width of 8k")
+        if self.hd not in aluminum.HEADS or self.Hq % self.Hk or self.Hq // self.Hk > aluminum.MAXG or self.H % 8:
+            raise ValueError(
+                f"[mega] the kernel takes heads of {aluminum.HEADS} dims, up to {aluminum.MAXG} query heads a kv head, "
+                "and a width of 8k"
+            )
         # the rope: a row of frequencies a layer type (one for most families), turning the first rd dims of a head
         freqs, rd, rscale = sm._mlx_rope()
         if rd > self.hd or rd % 2:
@@ -318,12 +346,15 @@ class MegaPass:
         sw = int(getattr(c, "sliding_window", 0) or 0) if sm.fam.sandwich else 0
         self.windows = [sw if sw and sm.layer_types[i] == LayerKind.SLIDING else None for i in range(self.L)]
         self.wins = sorted(set(self.windows), key=lambda w: -1 if w is None else w)
-        G = self.Hq // self.Hk
-        # the attention's partials a layer, for the widest pass: m and l, then acc behind them
-        pm = ROWS_MAX * self.Hk * SPL * 8 * G * 4
+        self.G = self.Hq // self.Hk
+        # aluminum's decode: the query heads a threadgroup and V's keys a stage, its threadgroup memory's layout
+        self.gh, self.ch = aluminum.decode_shape(self.hd, self.G)
+        self.vt, self.attn_tgm = aluminum.tgm_layout(self.hd, self.gh, self.ch)
+        # the attention's partials a layer, for the widest pass: m and l a (row, query head, segment), then o behind them
+        pm = ROWS_MAX * self.Hq * SPL * 4
         self.pl_off = align(pm)
         self.pacc_off = 2 * align(pm)
-        self.part_bytes = self.pacc_off + ROWS_MAX * self.Hk * SPL * 8 * G * self.hd * 4
+        self.part_bytes = self.pacc_off + ROWS_MAX * self.Hq * SPL * self.hd * 4
         self.bufs: list[mx_.array] = []
         self._bid: dict[int, int] = {}
         self._cparts: list[mx_.array] = []
@@ -331,7 +362,7 @@ class MegaPass:
         self._consts: dict[ConstKey, Tensor] = {}
         self._frozen = False
         self.logits_off = 0
-        self.head, self.head_q = self._ref(hh.mx), hh.mx.q
+        self.head, self.head_q = self._ref(hw), hw.q
         if sm.head_key == sm.prefix + "embed_tokens.weight":
             self.embed, self.embed_q = self.head, self.head_q
         else:
@@ -352,8 +383,10 @@ class MegaPass:
         self.consts = m.concatenate([*consts, m.zeros((paged(self._csize) - self._csize,), dtype=m.uint8)])
         self.scr = m.zeros((paged(prog.size),), dtype=m.uint8)
         m.eval(self.consts, self.scr, self.freqs)
-        # every op a pass shape compiles to: the widest's and a one-block pass's (its attention folding its own)
-        self.ops = frozenset(prog.ops) | self._program(ROWS_MAX, 1, True).ops
+        # every op a pass shape compiles to: the widest's, a one-block pass's (its attention folding its own), and every
+        # attention (a shape's the one `aluminum.tree_pick` picks; the phased one at head 256 alone)
+        attns = {OpName.ATTN, OpName.ATTN_TREE} | ({OpName.ATTN_PHASED} if self.hd == 256 else set())
+        self.ops = frozenset(prog.ops) | self._program(ROWS_MAX, 1, True).ops | attns
         self.instructions = len(prog.rows)  # the most a pass has: the widest one's
         self.replay = Replay(self)
 
@@ -388,12 +421,12 @@ class MegaPass:
             if self._frozen:
                 raise ValueError("[mega] a pass reads a constant the widest pass did not")
             a = make()
-            mx().eval(a)
+            mx.eval(a)
             t = self._consts[key] = Tensor((CONSTS, self._csize))
             self._cparts.append(a)
             self._csize += a.nbytes
             if self._csize % 4:
-                pad = mx().zeros((4 - self._csize % 4,), dtype=mx().uint8)
+                pad = mx.zeros((4 - self._csize % 4,), dtype=mx.uint8)
                 self._cparts.append(pad)
                 self._csize += pad.nbytes
         return t
@@ -413,42 +446,43 @@ class MegaPass:
         if not self.fused:
             raise ValueError("[mega] q/k norms outside the fused kernels: the step norms them with MLX's own op")
         f32 = self.sm.fam.norm_centered
-        t = self._const(
-            ("qk", id(at)), lambda: mx().concatenate([_norm_array(qn, f32, f32), _norm_array(kn, f32, f32)])
-        )
+        t = self._const(("qk", id(at)), lambda: mx.concatenate([_norm_array(qn, f32, f32), _norm_array(kn, f32, f32)]))
         return t, _eps(qn), f32
 
     def metas(self, past: int, parents: Sequence[int]) -> tuple[mx_.array, mx_.array, int]:
         """a pass's node metadata, a row of it a distinct window (`wins`) end to end, the nodes' paths, and the
         attention blocks the widest row reads"""
         rows = [tree_meta(past, parents, window=w) for w in self.wins]
-        meta = rows[0][0] if len(rows) == 1 else mx().concatenate([r[0] for r in rows])
+        meta = rows[0][0] if len(rows) == 1 else mx.concatenate([r[0] for r in rows])
         return meta, rows[0][1], max(r[2] for r in rows)
 
     # -- the kernel --
 
     def defs(self, xr: int) -> dict[str, int]:
         """the ops' compile-time constants for passes of up to xr rows"""
-        from ..attn import ATTN_BLOCK
-
         return {
             "XROWS": xr,
             "MV_KT": MV_KT,
-            "ATT_G": self.Hq // self.Hk,
+            "ATT_G": self.G,
             "ATT_D": self.hd,
-            "ATT_P": ATTN_BLOCK,
+            "ATT_GH": self.gh,
+            "ATT_NHG": self.G // self.gh,
+            "ATT_CH": self.ch,
+            "ATT_VT": self.vt,
             "PACC_OFF": self.pacc_off,
             "A_OFF": align(self.part_bytes),
         }
 
     def tgm(self, xr: int) -> dict[OpName, int]:
         """each op's threadgroup memory at xr rows: the bf16 matvec's and the head's tiles staged a simdgroup each, the
-        rest their reductions' and the attention's queries"""
-        G = self.Hq // self.Hk
-        small = max(G * self.hd * 4, (8 + self.hd) * 4, 2 * 256 * 4)
+        attention's (`aluminum.tgm_layout`, `aluminum.tree_tgm`, `aluminum.phased_tgm`), the rest their reductions'"""
+        small = max((8 + self.hd) * 4, 2 * 256 * 4)
         need = dict.fromkeys(OpName, small)
         need[OpName.MATVEC] = max(small, 8 * (8 + xr) * MV_KT * 2)
         need[OpName.HEAD] = max(small, 8 * (8 * 32 + xr * 32) * 4)
+        need[OpName.ATTN] = max(small, self.attn_tgm)
+        need[OpName.ATTN_TREE] = max(small, aluminum.tree_tgm(self.hd, THREADS // 32))
+        need[OpName.ATTN_PHASED] = max(small, aluminum.phased_tgm(16))
         if max(need.values()) > TG_MEMORY:
             raise ValueError(
                 f"[mega] an op takes {max(need.values())} bytes of threadgroup memory, a threadgroup has {TG_MEMORY}"
@@ -473,7 +507,7 @@ class MegaPass:
     def logits(self, T: int) -> mx_.array:
         """the logits [T, V] float32 the last pass left in the scratch (a pass without its argmax)"""
         o = self.logits_off
-        return self.scr[o : o + T * self.V * 4].view(mx().float32).reshape(T, self.V)
+        return self.scr[o : o + T * self.V * 4].view(mx.float32).reshape(T, self.V)
 
     def run(
         self,
@@ -498,7 +532,7 @@ class MegaPass:
         return self.replay.run(kvs, cap, rmap, ids, pos, meta, path, splits, past, argmax)
 
 
-def _one_or_parts(mod: object, fused: str, names: tuple[str, ...]) -> Linears:
+def _one_or_parts(mod: AttentionModule | MlpModule, fused: str, names: tuple[str, ...]) -> Linears:
     """`mod`'s fused projection `fused` where it has one, else its projections `names`, into one output"""
     one: LinearModule | None = getattr(mod, fused, None)
     if one is not None:

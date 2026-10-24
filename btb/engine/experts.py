@@ -36,6 +36,8 @@ if TYPE_CHECKING:
     from concurrent.futures import ThreadPoolExecutor
     from types import ModuleType
 
+    from ..mlx import Shared
+    from ..mlx.backend import ExpertWeights, Mxfp4Pair
     from .scheduler import Route
 
 
@@ -912,7 +914,7 @@ class _ExpertStore:
     reserve: int
     scratch_n: int
     shapes: Any
-    shared: Any
+    shared: dict[int, Shared]  # each block's MLX buffer, by block, where the store's slots live in MLX's memory
     sizes: Any
     slots: dict[int, Slot]  # every live slot's record: its state changes only through the transitions below
     sm: Any
@@ -1764,11 +1766,17 @@ class _ExpertStore:
             bf16_in_place(self._part(slot, region, p), self.dt)
         sl.bf16 = True
 
-    def _views_mx(self, slot: Any) -> Any:
+    def _slot_shared(self, slot: int) -> tuple[Shared, int]:
+        """the MLX block holding `slot` and the slot's byte offset in it"""
         assert self.per is not None  # the store is sized before this runs
         sl = self.slots[slot]
-        sh = self.shared[sl.block]
-        off = sl.row * int(self.stride or self.per)
+        return self.shared[sl.block], sl.row * int(self.stride or self.per)
+
+    def _views_mx(self, slot: int) -> ExpertWeights:
+        """the slot's expert as the MLX step multiplies it: a stored type's (gate, up) and down read by the type's
+        kernel, or bf16 weights over the slot (an MXFP4 store's are `_views_mxfp4`)"""
+        assert self.per is not None  # the store is sized before this runs
+        sh, off = self._slot_shared(slot)
         be = self.sm.mlx
         if self.types:
             # a stored type's (gate, up, down) read by the type's kernel straight from the shared block
@@ -1781,17 +1789,7 @@ class _ExpertStore:
                 for p, ((_path, _off, n_e, shape), q) in enumerate(zip(self.recipes[layer], self.types[layer]))
             ]
             return (ws[0], ws[1]), ws[2]
-        if self.mx:
-            # the slot as the GPU's MXFP4 matvec reads it: gate_up's blocks then scales, then down's (a GGUF's:
-            # gate, up, down in ggml's blocks), as uint8 views of the shared block (the store's readers write,
-            # the kernel reads, the same bytes)
-            region = sh.view_mx(off, self.per, mlxdev.mx().uint8, (self.per,))
-            if self.ggml:
-                at = [self.part_at[p] if self.part_at else sum(self.sizes[:p]) for p in range(3)]
-                parts = [region[at[p] : at[p] + self.sizes[p]] for p in range(3)]
-                return (parts[0], parts[1]), parts[2]
-            n0 = self.sizes[0] + self.sizes[1]
-            return region[:n0], region[n0:]
+        assert not self.mx  # an MXFP4 store's slot is `_views_mxfp4`'s
         gu_n, gu_shape, dn_shape = self.shapes
         if self.dt == torch.bfloat16:
             return be.weight_slot(sh, off, gu_n, gu_shape), be.weight_slot(sh, off + gu_n, self.per - gu_n, dn_shape)
@@ -1799,6 +1797,20 @@ class _ExpertStore:
             be.weight_slot(sh, off, self._held(gu_n), gu_shape),
             be.weight_slot(sh, off + gu_n, self._held(self.per - gu_n), dn_shape),
         )
+
+    def _views_mxfp4(self, slot: int) -> Mxfp4Pair:
+        """the slot as the GPU's MXFP4 matvec reads it: gate_up's blocks then scales, then down's (a GGUF's: gate, up,
+        down in ggml's blocks), as uint8 views of the shared block (the store's readers write, the kernel reads, the
+        same bytes)"""
+        assert self.per is not None  # the store is sized before this runs
+        sh, off = self._slot_shared(slot)
+        region = sh.view_mx(off, self.per, mlxdev.mx.uint8, (self.per,))
+        if self.ggml:
+            at = [self.part_at[p] if self.part_at else sum(self.sizes[:p]) for p in range(3)]
+            parts = [region[at[p] : at[p] + self.sizes[p]] for p in range(3)]
+            return (parts[0], parts[1]), parts[2]
+        n0 = self.sizes[0] + self.sizes[1]
+        return region[:n0], region[n0:]
 
     def _note_read(
         self, prof: Any, layer: int, e: int, part: int, path: str, off: int, n_e: int, slot: Any, dur_ns: int

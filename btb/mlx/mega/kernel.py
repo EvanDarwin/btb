@@ -11,7 +11,7 @@ from enum import StrEnum
 from typing import NamedTuple
 
 from ...kinds import MEGA_STORED, Quant, quant_key
-from .. import attn, fused, kquant, legacyq, matvec, q6k
+from .. import aluminum, fused, kquant, legacyq, matvec, q6k
 from ..core import mx
 from ..matvec import StoredKernel
 
@@ -135,7 +135,8 @@ class OpName(StrEnum):
     EMBED = "embed"
     QKROPE = "qkrope"
     ATTN = "attn"
-    ATTN_FOLD = "attn_fold"
+    ATTN_TREE = "attn_tree"
+    ATTN_PHASED = "attn_phased"
     FOLD = "fold"
     ARGMAX = "argmax"
     FNORM = "fnorm"
@@ -163,9 +164,10 @@ class OpName(StrEnum):
 
 CODE: dict[OpName, int] = {o: i + 1 for i, o in enumerate(OpName)}
 SOURCE: dict[OpName, str] = {}
-# the ops dispatched on (kv head, block, node), the node attention's own grid: its threadgroups reading one head's
-# block sit together, measured 10% faster at 16 rows over 2000 than the same items on a line
-GRID3: frozenset[OpName] = frozenset({OpName.ATTN, OpName.ATTN_FOLD})
+# the ops dispatched on the attention's own grids, (kv head and head group, segment, node) and the tree kernels' (the
+# rows, kv head, segment): the threadgroups reading one head's segment sit together, measured 10% faster at 16 rows
+# over 2000 than the same items on a line
+GRID3: frozenset[OpName] = frozenset({OpName.ATTN, OpName.ATTN_TREE, OpName.ATTN_PHASED})
 
 # the stored types the kernel multiplies as stored, each through its launch's own chain (`matvec.StoredKernel`)
 STORED: dict[Quant, StoredKernel] = {**kquant.KERNELS, **q6k.KERNELS, **legacyq.KERNELS}
@@ -421,49 +423,71 @@ inline void op_qkrope(thread const Ins& I, uint item, thread const Ctx& c) {
 """,
 )
 
-# the node attention (attn.py `btb_attn_nodes`, a node a threadgroup) at grid position (kv head, block, node): q (A,
-# [T, Hq, D] bf16), this layer's K (B) and V (E) [Hk, cap, D] (under MAP every row through the row map, the pass's
-# own written to their pages already); the partials m (C), l (D) and acc
-# (C + PACC_OFF); Hk = n0, blocks = n1, T = n2's low half with the layer type's row of `meta` above it, scale = f0
-_ATTN_CORE = r"""
-inline void attn_core(thread const Ins& I, uint3 at, thread const Ctx& c) {
-    uint Hk = I.n0, Tn = I.n2 & 0xffffu;
-    BtbAttnIn<bfloat, const device uint*, const device uint*, const device float*, const device float*,
-              const device uint*> a = {
-        (const device bfloat*)I.A, (const device uint16_t*)I.B, (const device uint16_t*)I.E,
-        c.meta + (I.n2 >> 16) * Tn * 8, c.path, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, c.rmap, I.f0, Hk,
-        c.dims[2], Hk * ATT_G, Tn, I.n1, c.dims[1], 0u};
-    btb_attn_nodes<ATT_G, ATT_D, 1, ATT_P>(a, at.x, at.y, at.z, c.sg, c.lane, (threadgroup float4*)c.tgm,
-                                           (device float*)I.C, (device float*)I.D, (device float*)(I.C + PACC_OFF));
-}
-"""
-_PRELUDE[OpName.ATTN] = _PRELUDE[OpName.ATTN_FOLD] = ("attn_core", _ATTN_CORE)
-
 _op(
     OpName.ATTN,
     r"""
 inline void op_attn(thread const Ins& I, uint3 at, thread const Ctx& c) {
-    // the node attention, its partials left to the fold
-    attn_core(I, at, c);
+    // aluminum's decode (`btb_alu_segment`) at grid position (kv head and head group, segment, node): q (A, [T, Hq, D]
+    // bf16), this layer's K (B) and V (E) [Hk, cap, D] (under MAP every row through the row map, the pass's own written
+    // to their pages already); a node of one segment's row out at C + A_OFF, the others' partials m (C), l (D) and o
+    // (C + PACC_OFF). n0 = Hk * ATT_NHG, segments = n1, T = n2's low half with the layer type's row of `meta` above
+    // it, scale = f0
+    uint Hk = I.n0 / ATT_NHG, Tn = I.n2 & 0xffffu;
+    BtbAluIn<const device bfloat*, const device bfloat*, const device uint*, const device uint*, const device float*,
+             const device float*, const device uint*, const device float*> a = {
+        (const device bfloat*)I.A, (const device bfloat*)I.B, (const device bfloat*)I.E, nullptr, nullptr,
+        c.meta + (I.n2 >> 16) * Tn * 8, c.path, nullptr, nullptr, nullptr, nullptr, c.rmap, nullptr, I.f0,
+        (int)(Hk * ATT_G), (int)Hk, (int)c.dims[2], (int)c.dims[1], 0, (int)I.n1};
+    btb_alu_segment<ATT_D, ATT_G, ATT_GH, 256, ATT_CH, ATT_VT>(a, at.x, at.y, at.z, c.tid, c.tgm,
+        (device bfloat*)(I.C + A_OFF), (device float*)I.C, (device float*)I.D, (device float*)(I.C + PACC_OFF));
 }
 """,
 )
 
 _op(
-    OpName.ATTN_FOLD,
+    OpName.ATTN_TREE,
     r"""
-inline void op_attn_fold(thread const Ins& I, uint3 at, thread const Ctx& c) {
-    // the node attention over one block (n1 = 1), the threadgroup folding its own partials (`btb_attn_fold`, a query
-    // head a simdgroup) into out at C + A_OFF once a barrier orders its device writes
-    attn_core(I, at, c);
-    threadgroup_barrier(mem_flags::mem_device);
-    uint Hk = I.n0, Tn = I.n2 & 0xffffu;
-    if (c.sg < ATT_G) {
-        btb_attn_fold<false>((const device float*)I.C, (const device float*)I.D, (const device float*)(I.C + PACC_OFF),
-                             c.meta + (I.n2 >> 16) * Tn * 8, (const device float*)nullptr,
-                             (at.z * Hk + at.x) * ATT_G + c.sg, c.lane, Tn, Hk, 8, ATT_G, ATT_D,
-                             (device bfloat*)(I.C + A_OFF));
-    }
+inline void op_attn_tree(thread const Ins& I, uint3 at, thread const Ctx& c) {
+    // aluminum's tree tile (`btb_alu_tree`, 8 simdgroups) at grid position (the tile's rows, kv head, segment of those
+    // the nodes span): op_attn's buffers and outputs; Hk = n1, segments = n2's low half with the layer type's row of
+    // `meta` above it, the pass's rows dims[0], scale = f0
+    uint Hk = I.n1, ns = I.n2 & 0xffffu, Tn = c.dims[0];
+    BtbAluIn<const device bfloat*, const device bfloat*, const device uint*, const device uint*, const device float*,
+             const device float*, const device uint*, const device float*> a = {
+        (const device bfloat*)I.A, (const device bfloat*)I.B, (const device bfloat*)I.E, nullptr, nullptr,
+        c.meta + (I.n2 >> 16) * Tn * 8, c.path, nullptr, nullptr, nullptr, nullptr, c.rmap, nullptr, I.f0,
+        (int)(Hk * ATT_G), (int)Hk, (int)c.dims[2], (int)c.dims[1], 0, (int)ns};
+#if ATT_D == 256
+    btb_alu_tree256<ATT_D, ATT_G, 8>(a, (int)Tn, at.x, at.y, at.z, c.tid, c.tgm,
+#else
+    btb_alu_tree<ATT_D, ATT_G, 8>(a, (int)Tn, at.x, at.y, at.z, c.tid, c.tgm,
+#endif
+        (device bfloat*)(I.C + A_OFF), (device float*)I.C, (device float*)I.D, (device float*)(I.C + PACC_OFF));
+}
+""",
+)
+
+_op(
+    OpName.ATTN_PHASED,
+    r"""
+inline void op_attn_phased(thread const Ins& I, uint3 at, thread const Ctx& c) {
+    // aluminum's phased tree attention (`btb_alu_phased256`, head 256, 8 simdgroups) at grid position (the rows, kv
+    // head, segment of those the nodes span): op_attn_tree's buffers, outputs and n, 16 rows a threadgroup where n2's
+    // top bit is set, else 8
+    uint Hk = I.n1, ns = I.n2 & 0xffffu, Tn = c.dims[0];
+    BtbAluIn<const device bfloat*, const device bfloat*, const device uint*, const device uint*, const device float*,
+             const device float*, const device uint*, const device float*> a = {
+        (const device bfloat*)I.A, (const device bfloat*)I.B, (const device bfloat*)I.E, nullptr, nullptr,
+        c.meta + ((I.n2 >> 16) & 0x7fffu) * Tn * 8, c.path, nullptr, nullptr, nullptr, nullptr, c.rmap, nullptr, I.f0,
+        (int)(Hk * ATT_G), (int)Hk, (int)c.dims[2], (int)c.dims[1], 0, (int)ns};
+    device bfloat* one = (device bfloat*)(I.C + A_OFF);
+    device float* pacc = (device float*)(I.C + PACC_OFF);
+    if (I.n2 >> 31)
+        btb_alu_phased256<ATT_D, ATT_G, 8, 16>(a, (int)Tn, at.x, at.y, at.z, c.tid, c.tgm, one, (device float*)I.C,
+                                               (device float*)I.D, pacc);
+    else
+        btb_alu_phased256<ATT_D, ATT_G, 8, 8>(a, (int)Tn, at.x, at.y, at.z, c.tid, c.tgm, one, (device float*)I.C,
+                                              (device float*)I.D, pacc);
 }
 """,
 )
@@ -472,13 +496,15 @@ _op(
     OpName.FOLD,
     r"""
 inline void op_fold(thread const Ins& I, uint item, thread const Ctx& c) {
-    // the fold (attn.py `btb_attn_fold`), a simdgroup per (node, query head), item * 8 + sg: the partials m (A),
-    // l (B), acc (A + PACC_OFF) folded in one fixed order -> out (C, [T, Hq * D] bf16); Hk = n0, splits = n1, T and
-    // the layer type's `meta` row as the attention's (n2)
+    // aluminum's fold (`btb_alu_fold`), an output (node, query head, column) a thread, item * 256 + tid: the partials
+    // m (A), l (B), o (A + PACC_OFF) of the nodes of more than one segment folded in order, a node of one segment's
+    // row the attention wrote (A + A_OFF) copied -> out (C, [T, Hq * D] bf16); Hk = n0, segments = n1, T and the
+    // layer type's `meta` row as the attention's (n2)
     uint Tn = I.n2 & 0xffffu;
-    btb_attn_fold<false>((const device float*)I.A, (const device float*)I.B, (const device float*)(I.A + PACC_OFF),
-                         c.meta + (I.n2 >> 16) * Tn * 8, (const device float*)nullptr, item * 8 + c.sg, c.lane, Tn,
-                         I.n0, I.n1 * 8, ATT_G, ATT_D, (device bfloat*)I.C);
+    btb_alu_fold<ATT_D>(c.meta + (I.n2 >> 16) * Tn * 8, (const device float*)nullptr, (const device float*)I.A,
+                        (const device float*)I.B, (const device float*)(I.A + PACC_OFF),
+                        (const device bfloat*)(I.A + A_OFF), (int)Tn, (int)(I.n0 * ATT_G), (int)I.n1,
+                        item * 256 + c.tid, (device bfloat*)I.C);
 }
 """,
 )
@@ -692,7 +718,7 @@ def _mlx_header(rel: str, seen: set[str]) -> str:
     if rel in seen:
         return ""
     seen.add(rel)
-    pkg = mx().__file__
+    pkg = mx.__file__
     if pkg is None:
         raise RuntimeError("[mega] MLX is installed without a path to its headers")
     root = os.path.join(os.path.dirname(pkg), "include")
@@ -815,8 +841,7 @@ def source(ops: Iterable[OpName], defs: Mapping[str, int], tgm: Mapping[OpName, 
         + TYPES
         + MLX_OPS
         + fused.FUNCS
-        + f"#define KQ 0\n#define SEG 0\n#define MAP {int(mapped)}\n"
-        + attn.ATTN_FUNCS
+        + aluminum.device_header(defs["ATT_D"], mapped=mapped)
         + "".join(dict(_PRELUDE[o] for o in used if o in _PRELUDE).values())
         + "".join(SOURCE[o] for o in used)
         + "".join(_wrap(o, tgm[o]) for o in used)

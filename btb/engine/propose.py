@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from ..kinds import LayerKind
+from ..sampling import GREEDY
 
 if TYPE_CHECKING:
     from .generate import LinSnap
@@ -64,7 +65,7 @@ class ModelProposer:
         sm = self.sm
         T = len(toks)
         mg = getattr(sm, "_mega", None)
-        fast = mg is not None and sm._mega_ok(self.cache, T, None, True, True, None)
+        fast = mg is not None and sm._mega_ok(self.cache, T, None, True, GREEDY, None)
         with torch.inference_mode(), self._held():
             sm.aa(parents)
             try:

@@ -8,7 +8,7 @@ the whole matrix, for the rare path that wants a bf16 copy."""
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from ..kinds import Quant
 from .core import metal_kernel, mx
@@ -16,6 +16,8 @@ from .matvec import Frags, StoredKernel, blocks, launch
 
 if TYPE_CHECKING:
     import mlx.core as mx_
+
+    from .core import MetalKernel
 
 # 210 bytes a superblock of 256 weights: ql[128] (low nibbles), qh[64] (high 2 bits), scales[16] int8, d f16;
 # value = d * scales[is] * (q - 32), is = h*8 + l/16 over the sub-block indices {is, is+2, is+4, is+6}.
@@ -123,8 +125,8 @@ KERNELS: dict[Quant, StoredKernel] = {
     )
 }
 
-_deq_kernel = None
-_gather_kernels: dict[int, Any] = {}
+_deq_kernel: MetalKernel | None = None
+_gather_kernels: dict[int, MetalKernel] = {}
 _lock = threading.Lock()
 
 
@@ -138,7 +140,7 @@ def matvec_q6k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.ar
 def gather_q6k(w_bytes: mx_.array, tok: mx_.array, cols: int) -> mx_.array:
     """the embedding rows for token ids `tok` [T] (int32): [T, cols] bf16, each row's superblocks dequantized
     straight from the packed bytes - no bf16 copy of the whole table."""
-    m = mx()
+    m = mx
     nsb = cols // 256
     with _lock:
         k = _gather_kernels.get(nsb)
@@ -165,7 +167,7 @@ def gather_q6k(w_bytes: mx_.array, tok: mx_.array, cols: int) -> mx_.array:
 def dequant_q6k(w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
     """the full [rows, cols] bf16 weight, the numbers llama.cpp dequantizes (for a path that wants a bf16 copy)."""
     global _deq_kernel
-    m = mx()
+    m = mx
     nblk = rows * cols // 256
     with _lock:
         if _deq_kernel is None:

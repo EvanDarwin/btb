@@ -1,15 +1,18 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 """The MLX device (Apple silicon, one memory for the CPU and the GPU): the host tier's weights as MLX arrays in
 unified memory, zero-copy views between torch and MLX, whole layers as one graph per token. `core` (dtypes,
-conversions, shared buffers), `gemv` (the matvec and MXFP4 kernels), `attn` (the node kernel, rope for rows,
-the int8 cache), `delta` (the DeltaNet), `backend` (what an engine holds)."""
+conversions, shared buffers), `gemv` (the matvec and MXFP4 kernels), `aluminum` (the attention), `attn` (its
+node metadata and entry points, rope for rows, the int8 cache), `delta` (the DeltaNet), `backend` (what an engine
+holds)."""
 
 from .attn import (
+    ATTN_HEADS,
     ATTN_MAXG,
     attn_decode,
     attn_nodes,
     attn_params,
     attn_prefill,
+    attn_prefill_rows,
     attn_rows,
     attn_splits,
     attn_tree,
@@ -54,6 +57,7 @@ from .gemv import (
 from .kv import kv_gather, kv_scatter, kv_store
 
 __all__ = [
+    "ATTN_HEADS",
     "ATTN_MAXG",
     "GEMV_ROWS",
     "MXFP4_BLOCK",
@@ -66,6 +70,7 @@ __all__ = [
     "attn_nodes",
     "attn_params",
     "attn_prefill",
+    "attn_prefill_rows",
     "attn_rows",
     "attn_splits",
     "attn_tree",

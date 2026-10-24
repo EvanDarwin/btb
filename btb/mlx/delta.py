@@ -5,7 +5,7 @@ the tree variant (every node's conv reads its own ancestry), and the prefill ove
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Protocol, TypeAlias
 
 import numpy as np
 
@@ -16,29 +16,59 @@ from .gemv import _gemv_lock
 if TYPE_CHECKING:
     import mlx.core as mx_
 
+    from .core import MetalKernel
 
-def delta_step_fn(hk: int, hv: int, dk: int, dv: int, key_dim: int, eps: float, has_bias: bool) -> Callable[..., Any]:
+# the rule's heads from the conv's output: q, k, v, the log decay g and beta
+Heads: TypeAlias = "tuple[mx_.array, mx_.array, mx_.array, mx_.array, mx_.array]"
+# the chunked rule's step (`_chunk_body`): (q, k, v, g, decay, k . cumulative decay, state) -> (out, state)
+ChunkBody: TypeAlias = (
+    "Callable[[mx_.array, mx_.array, mx_.array, mx_.array, mx_.array, mx_.array, mx_.array], "
+    "tuple[mx_.array, mx_.array]]"
+)
+
+
+class DeltaStep(Protocol):
+    """the one-position step `delta_step_fn` compiles: (core [Hv*dv], conv_new [C, K], state_new)"""
+
+    def __call__(
+        self,
+        mixed: mx_.array,
+        z: mx_.array,
+        a: mx_.array,
+        b: mx_.array,
+        conv: mx_.array,
+        state: mx_.array,
+        conv_w: mx_.array,
+        conv_b: mx_.array | None,
+        a_log: mx_.array,
+        dt_bias: mx_.array,
+        norm_w: mx_.array,
+    ) -> tuple[mx_.array, mx_.array, mx_.array]: ...
+
+
+def delta_step_fn(hk: int, hv: int, dk: int, dv: int, key_dim: int, eps: float, has_bias: bool) -> DeltaStep:
     """A compiled function for one DeltaNet position (conv update, l2-normed q/k, the gated delta rule on the
     [Hv, dk, dv] state, the gated RMSNorm; float32). Returns (core [Hv*dv], conv_new [C, K], state_new)."""
-    m = mx()
+    m = mx
     scale = float(dk) ** -0.5
 
     def step(
-        mixed: Any,
-        z: Any,
-        a: Any,
-        b: Any,
-        conv: Any,
-        state: Any,
-        conv_w: Any,
-        conv_b: Any,
-        a_log: Any,
-        dt_bias: Any,
-        norm_w: Any,
-    ) -> Any:
+        mixed: mx_.array,
+        z: mx_.array,
+        a: mx_.array,
+        b: mx_.array,
+        conv: mx_.array,
+        state: mx_.array,
+        conv_w: mx_.array,
+        conv_b: mx_.array | None,
+        a_log: mx_.array,
+        dt_bias: mx_.array,
+        norm_w: mx_.array,
+    ) -> tuple[mx_.array, mx_.array, mx_.array]:
         conv_new = m.concatenate([conv[:, 1:], mixed[:, None]], axis=1)
         xc = (conv_new * conv_w).sum(axis=-1)
         if has_bias:
+            assert conv_b is not None  # a step compiled with the bias takes it
             xc = xc + conv_b
         xc = xc * m.sigmoid(xc)
         q = xc[:key_dim].reshape(hk, dk)
@@ -64,16 +94,24 @@ def delta_step_fn(hk: int, hv: int, dk: int, dv: int, key_dim: int, eps: float, 
     return compiled("the gated delta rule's step", step)
 
 
-_chunk_body_fn = None
+_chunk_body_fn: ChunkBody | None = None
 
 
-def _chunk_body() -> Callable[..., Any]:
+def _chunk_body() -> ChunkBody:
     """The per-chunk step of the chunked rule, compiled once (its shapes repeat across chunks and layers)."""
     global _chunk_body_fn
     if _chunk_body_fn is None:
-        m = mx()
+        m = mx
 
-        def body(q_i: Any, k_i: Any, v_i: Any, g_i: Any, decay_i: Any, kcd_i: Any, state: Any) -> Any:
+        def body(
+            q_i: mx_.array,
+            k_i: mx_.array,
+            v_i: mx_.array,
+            g_i: mx_.array,
+            decay_i: mx_.array,
+            kcd_i: mx_.array,
+            state: mx_.array,
+        ) -> tuple[mx_.array, mx_.array]:
             attn_i = (q_i @ k_i.transpose(0, 2, 1)) * decay_i
             v_new = v_i - kcd_i @ state
             out_i = (q_i * m.exp(g_i)[..., None]) @ state + attn_i @ v_new
@@ -159,7 +197,7 @@ _DELTA_SRC = """
 """
 
 
-_delta_kernels: dict[int, Any] = {}
+_delta_kernels: dict[int, MetalKernel] = {}
 
 
 def _delta_cols(dv: int) -> int:
@@ -181,7 +219,7 @@ def delta_recurrent(
     g [T, H] log decay, beta [T, H], state [H, dk, dv] (a leading 1 allowed); `order` the positions to run, in
     order (all when None). Returns (out [len(order), H, dv], state_new), lazily; `inplace` writes the new state
     into `state`'s own buffer and returns None for it. dk % 32 == 0."""
-    m = mx()
+    m = mx
     key = 1 if inplace else 0
     with _gemv_lock:
         kern = _delta_kernels.get(key)
@@ -307,7 +345,7 @@ def delta_tree(
     """`delta_recurrent` over a tree of T nodes (`parents`: -1 for the cache's state, parent[t] < t): every node
     from its parent's state, no checkpoint written. Returns out [T, H, dv], lazily."""
     global _delta_tree_kernel
-    m = mx()
+    m = mx
     with _gemv_lock:
         if _delta_tree_kernel is None:
             _delta_tree_kernel = metal_kernel(
@@ -342,7 +380,7 @@ def delta_tree(
 
 def _pad8(a: mx_.array, fill: int = 0) -> mx_.array:
     """an input of <= 4 elements would arrive in the constant address space; pad it into a real buffer"""
-    m = mx()
+    m = mx
     if int(a.size) > 4:
         return a
     return m.concatenate([a, m.full((8 - int(a.size),), fill, dtype=a.dtype)])
@@ -360,7 +398,7 @@ def delta_chain_state(
     return out if inplace else new
 
 
-def _tree_conv_index(parents: Parents, T: int, K: int) -> Any:
+def _tree_conv_index(parents: Parents, T: int, K: int) -> np.ndarray:
     """for every node, the rows of concat(stored inputs [K-1], nodes [T]) its conv window reads, oldest
     first: its K-1 ancestors (the cache's newest inputs past the root) and itself"""
     idx = np.empty((T, K), dtype=np.int32)
@@ -382,8 +420,8 @@ def delta_tree_step(
     a: mx_.array,
     b: mx_.array,
     conv_prev: mx_.array,
-    state0: mx_.array,
-    parents: Parents,
+    state0: mx_.array | None,
+    parents: Parents | None,
     conv_w: mx_.array,
     conv_b: mx_.array | None,
     a_log: mx_.array,
@@ -395,11 +433,11 @@ def delta_tree_step(
     dk: int,
     dv: int,
     key_dim: int,
-) -> Any:
+) -> tuple[mx_.array, mx_.array, Heads]:
     """A DeltaNet layer over T tree nodes from `conv_prev` [C, K-1] and `state0`: each node's conv reads its
     ancestry, the rule runs from its parent's state. Returns (core [T, Hv*dv], conv checkpoints [T, C, K], the
     heads (q, k, v, g, beta) for `delta_chain_state`), lazily; the cache is not touched."""
-    m = mx()
+    m = mx
     T = int(mixed.shape[0])
     K = int(conv_w.shape[1])
     par = [int(p) for p in parents] if parents is not None else list(range(-1, T - 1))
@@ -429,10 +467,10 @@ def _delta_heads(
     dv: int,
     key_dim: int,
     raw: bool = False,
-) -> Any:
+) -> Heads:
     """The conv's activated output xc [T, C] split into q, k, v with g and beta [T, Hv]; `raw` leaves q and k
     un-normed [T, Hk, dk] for the recurrence kernels, else normed, scaled and repeated to [T, Hv, dk]."""
-    m = mx()
+    m = mx
     T = int(xc.shape[0])
     q = xc[:, :key_dim].reshape(T, hk, dk)
     k = xc[:, key_dim : 2 * key_dim].reshape(T, hk, dk)
@@ -463,10 +501,10 @@ def _delta_prep(
     dv: int,
     key_dim: int,
     raw: bool = False,
-) -> Any:
+) -> tuple[mx_.array, mx_.array, mx_.array, mx_.array, mx_.array, mx_.array]:
     """The DeltaNet's front: the causal conv over the stored and new inputs, the split into q, k, v, g, beta, and
     the new conv state."""
-    m = mx()
+    m = mx
     T = int(mixed.shape[0])
     K = int(conv_w.shape[1])
     full = m.concatenate([conv_prev, mixed.T], axis=1)
@@ -488,7 +526,7 @@ def _delta_post(
 ) -> mx_.array:
     """The gated RMSNorm: core [T, Hv, dv] normed per head (the fused rms_norm: one kernel, the same per row
     at any row count), scaled, gated by silu(z) - or sigmoid(z), Qwen4's gate."""
-    m = mx()
+    m = mx
     T = int(core.shape[0])
     core = m.fast.rms_norm(core.reshape(T * hv, dv), norm_w, float(eps)).reshape(T, hv, dv)
     zz = z.reshape(T, hv, dv)
@@ -518,12 +556,12 @@ def delta_prefill(
     window: int = 512,
     inplace: bool = False,
     sigmoid_gate: bool = False,
-) -> Any:
+) -> tuple[mx_.array, mx_.array, mx_.array | None]:
     """A DeltaNet layer over T positions in MLX (float32) from `conv_prev` [C, K] and `state0`: `recurrent`
     the exact rule as one dispatch, `chunk` the module's chunked rule. Returns (core [T, Hv*dv], conv_new,
     state_new), lazily; `inplace` (recurrent, T <= window) writes the state into `state0` and returns None.
     `sigmoid_gate`: the norm gated by sigmoid(z) (Qwen4), not silu(z)"""
-    m = mx()
+    m = mx
     recurrent = mode == "recurrent" and dk % 32 == 0
     q, k, v, g, beta, conv_new = _delta_prep(
         mixed, a, b, conv_prev, conv_w, conv_b, a_log, dt_bias, hk, hv, dk, dv, key_dim, raw=recurrent
@@ -568,7 +606,7 @@ def delta_prefill(
     g = m.cumsum(g.reshape(hv, n, chunk), axis=-1)
     v_beta = v * beta[..., None]
     k_beta = k * beta[..., None]
-    tril = m.tril(m.ones((chunk, chunk), dtype=m.bool_))
+    tril = m.tril(m.ones((chunk, chunk), dtype=m.bool_), k=0)
     strict = m.tril(m.ones((chunk, chunk), dtype=m.bool_), k=-1)
     diff = g[..., :, None] - g[..., None, :]
     decay = m.where(tril, m.exp(m.where(tril, diff, 0.0)), 0.0)

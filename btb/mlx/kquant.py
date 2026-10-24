@@ -9,7 +9,7 @@ bf16 copy. Native 144 B/256 as stored, vs MLX's 160 B repack."""
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from ..kinds import Quant
 from .core import metal_kernel, mx
@@ -17,6 +17,8 @@ from .matvec import Frags, StoredKernel, blocks, launch
 
 if TYPE_CHECKING:
     import mlx.core as mx_
+
+    from .core import MetalKernel
 
 # 144 bytes a superblock of 256 weights: d f16, dmin f16, 12 bytes packing a 6-bit scale and a 6-bit min for
 # each of 8 sub-blocks of 32, then 128 bytes of nibbles (byte b = qs[32k + i] holds the low nibble for
@@ -142,7 +144,7 @@ _DEQUANT = r"""
 
 # Q4_K: 144 B/superblock, nibbles at offset 16, no qh. Q5_K: 176 B, nibbles at 48, the 5th bit in qh at 16.
 _KQ = {"q4k": (144, 16, 0), "q5k": (176, 48, 1)}
-_deq_kernels: dict[str, Any] = {}
+_deq_kernels: dict[str, MetalKernel] = {}
 _lock = threading.Lock()
 
 
@@ -169,7 +171,7 @@ def _matvec(kind: str, w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -
 
 
 def _dequant(kind: str, w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
-    m = mx()
+    m = mx
     nblk = rows * cols // 256
     with _lock:
         k = _deq_kernels.get(kind)
@@ -276,7 +278,7 @@ def matvec_q2k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.ar
 def dequant_q2k(w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
     """the full [rows, cols] bf16 weight for a Q2_K tensor."""
     global _q2k_deq
-    m = mx()
+    m = mx
     nblk = rows * cols // 256
     with _lock:
         if _q2k_deq is None:
@@ -373,7 +375,7 @@ def matvec_q3k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.ar
 def dequant_q3k(w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
     """the full [rows, cols] bf16 weight for a Q3_K tensor."""
     global _q3k_deq
-    m = mx()
+    m = mx
     nblk = int(rows * cols // 256)
     with _lock:
         if _q3k_deq is None:

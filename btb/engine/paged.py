@@ -102,6 +102,7 @@ class HostRegion:
         grant: Callable[..., None] | None = None,
         dtype: torch.dtype | None = None,
         shared: bool = False,
+        price: torch.dtype | None = None,
     ) -> None:
         self.layers = [int(i) for i in layers]
         self.hk, self.d = int(hk), int(d)
@@ -109,6 +110,8 @@ class HostRegion:
         self.cap = 0  # the pages the regions hold rows for
         self.kv_dtype = dtype  # the rows' dtype where it is not their own (a bf16 host's)
         self.dtype: torch.dtype | None = None  # the regions' dtype, from the first rows written
+        # the dtype a growth is priced in before the first rows set it (an MLX engine's rows'), else float32's
+        self.price = price
         self.k: dict[int, torch.Tensor] = {}
         self.v: dict[int, torch.Tensor] = {}
         self.shared = shared
@@ -122,7 +125,7 @@ class HostRegion:
         self._short = False
 
     def _el(self) -> int:
-        return torch.empty(0, dtype=self.dtype or self.kv_dtype or torch.float32).element_size()
+        return torch.empty(0, dtype=self.dtype or self.kv_dtype or self.price or torch.float32).element_size()
 
     def _target(self, pages: int) -> int:
         """the pages a growth to hold `pages` makes room for: GROW past what the regions hold"""
@@ -182,7 +185,7 @@ class HostRegion:
     def _settle(self) -> None:
         """MLX's writes in flight landed (a pipelined step's rows) before the host touches a shared region"""
         if self.shared:
-            mlxdev.mx().synchronize()
+            mlxdev.mx.synchronize()
 
     def _new(self, i: int, views: dict[int, mx_.array], wholes: dict[int, mx_.array], rows: int) -> torch.Tensor:
         """a fresh K or V region of layer i, `rows` rows: MLX's buffer under `shared`, its view kept in `views` (`mk` or
@@ -192,7 +195,7 @@ class HostRegion:
             return torch.empty(self.hk, rows, self.d, dtype=self.dtype)
         sh = mlxdev.Shared(self.hk * rows * self.d * self._el())
         a = sh.mx.view(mlxdev._dtypes()[self.dtype]).reshape(1, self.hk, rows, self.d)
-        mlxdev.mx().eval(a, sh.whole)
+        mlxdev.mx.eval(a, sh.whole)
         views[i], wholes[i] = a, sh.whole
         return sh.torch.view(self.dtype).view(self.hk, rows, self.d)
 
@@ -975,11 +978,12 @@ class KvPool:
         dev: torch.device | None = None,
         ceiling: int = 1,
         shared: bool = False,
+        price: torch.dtype | None = None,
     ) -> None:
         self.hk, self.d = int(hk), int(d)
         self.grant = grant  # the scheduler's, which a fork of a paged layer asks as its own rows grow
         self.pages = PagePool(grow=self._grow, freed=self._freed)
-        self.host = HostRegion(host_layers, hk, d, grant, dtype, shared)
+        self.host = HostRegion(host_layers, hk, d, grant, dtype, shared, price)
         # a card's region whether or not it runs a layer now: the layers coming onto it later find their pages placed
         self.card: CardRegion | None = None
         if dev is not None and torch.device(dev).type == "cuda":

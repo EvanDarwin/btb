@@ -115,8 +115,14 @@ class Op:
 # new launcher or a new `btb_*` kernel that no family covers is a reported gap - the table cannot fall behind.
 OPS: tuple[Op, ...] = (
     Op("rope", "attn", ("btb_rope_rows", "btb_rope_rows2"), "kernels/test_mlx.py"),
-    Op("attn_decode", "attn", ("btb_attn_nodes_***_d*_g*_n*", "btb_attn_fold"), "kernels/test_mlx.py"),
-    Op("attn_prefill", "attn", ("btb_attn_prefill_d256_g**",), "kernels/test_mlx.py"),
+    Op("attn_decode", "aluminum", ("btb_aluminum_decode_**_d*_g*", "btb_aluminum_fold_d**"), "kernels/test_mlx.py"),
+    Op(
+        "attn_tree",
+        "aluminum",
+        ("btb_aluminum_tree_*_r*_d*_g*", "btb_aluminum_phased_*_r*_n*_d256_g*"),
+        "kernels/test_mlx.py",
+    ),
+    Op("attn_prefill", "aluminum", ("btb_aluminum_prefill_*_d****",), "kernels/test_mlx.py"),
     Op("delta", "delta", ("btb_delta_recurrent*", "btb_delta_tree"), "kernels/test_mlx.py"),
     Op(
         "fused_dense",

@@ -37,6 +37,7 @@ from .stored import CardStored, held_bytes
 
 if TYPE_CHECKING:
     from ..mlx import Shared
+    from ..mlx.backend import PackedEntry
     from .cache import KvCache
 
 _DTYPE_NAME = {torch.bfloat16: "bf16", torch.float32: "fp32", torch.float16: "fp16"}
@@ -76,7 +77,7 @@ class ColdItem:
     nb: int
     path: str | None = None
     off: int = 0
-    p12: Json | None = None
+    p12: PackedEntry | None = None
     cast: tuple[int, torch.dtype] | None = None
     src: str | None = None
 
@@ -819,8 +820,17 @@ class _TiersMixin(_State):
             return ColdItem(m, SlotKind.QUANT, at, nb, span[0], span[1])
         pk = getattr(self, "_packed", {}).get(m.key)
         if pk is not None and not pk["raw"]:
-            nb = pk["lo"] + pk["hi4"] + pk["pad"] + 5 * pk["esc"]
-            return ColdItem(m, SlotKind.P12, at, nb, os.path.join(self.dir, pk["shard"]), int(pk["off"]), p12=pk)
+            # the manifest's record as the slot's kernels read it
+            p12: PackedEntry = {
+                "lo": int(pk["lo"]),
+                "hi4": int(pk["hi4"]),
+                "pad": int(pk["pad"]),
+                "esc": int(pk["esc"]),
+                "table": [int(b) for b in pk["table"]],
+                "n": int(pk["n"]),
+            }
+            nb = p12["lo"] + p12["hi4"] + p12["pad"] + 5 * p12["esc"]
+            return ColdItem(m, SlotKind.P12, at, nb, os.path.join(self.dir, pk["shard"]), int(pk["off"]), p12=p12)
         path, off, nb = self._span(m.key)
         stored = self._stored_span(m.key)
         if stored is not None:

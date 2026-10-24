@@ -444,10 +444,9 @@ def storage_tag(storage: Storage, hw: Hardware) -> PassTag | None:
 
 # the head widths the card's paged attention kernels are built for (btb/engine/prefix.py CARD_HEAD_DIMS)
 CARD_HEAD_DIMS = (64, 128, 256)
-# the megakernel's head gate (btb/mlx/mega/model.py `MegaPass`: a multiple of 32 dims, 256 at most), which
-# test_manifest holds against its source
-MEGA_HEAD_MULTIPLE = 32
-MEGA_HEAD_MAX = 256
+# aluminum's head sizes (btb/mlx/aluminum.py HEADS): the megakernel's head gate (mega/model.py `MegaPass`) and the
+# engine's MLX attention kernels' (mlx_forward.ATTN_KERNEL_HEADS), which test_manifest holds against their source
+ALUMINUM_HEADS = (64, 96, 128, 256)
 
 
 class MegaRefusal(StrEnum):
@@ -472,7 +471,7 @@ def mega_refusal(kind: FamilyKind, storage: Storage, packed: bool = True) -> Meg
     if STORAGE[storage].container is Container.PACK12 or (stored and not MEGA_STORED >= set(STORAGE[storage].quants)):
         return MegaRefusal.STORAGE
     hd = head_dim(kind)
-    if hd is None or hd % MEGA_HEAD_MULTIPLE or hd > MEGA_HEAD_MAX:
+    if hd is None or hd not in ALUMINUM_HEADS:
         return MegaRefusal.SHAPE
     return None
 
