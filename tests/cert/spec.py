@@ -477,42 +477,29 @@ def mega_refusal(kind: FamilyKind, storage: Storage, packed: bool = True) -> Meg
     return None
 
 
-def mega_serves(kind: FamilyKind, storage: Storage, knobs: dict[str, object] | None = None) -> bool:
-    """whether MLX's megakernel takes a load's passes (`_mega_serves`): its knob on (`mlx_mega`, on by default), a
-    bf16 state, and a family, storage and fixture it takes (`gguf_packed`, on by default, keeping a GGUF's blocks)"""
-    k = knobs or {}
-    packed = bool(k.get("gguf_packed", 1))
-    return bool(k.get("mlx_mega", 1)) and not k.get("fp32") and mega_refusal(kind, storage, packed) is None
-
-
-def paged(
-    kind: FamilyKind, hw: Hardware, knobs: dict[str, object] | None = None, storage: Storage = Storage.SAFE_BF16
-) -> bool:
+def paged(kind: FamilyKind, hw: Hardware, knobs: dict[str, object] | None = None) -> bool:
     """whether the prefix cache serves the family on this hardware, with these load options and this storage - its
     attention reading every one-sequence cache through the pages - by the engine's own rule (`PrefixCache.why_not`):
-    the host's tier, MLX's (not where its megakernel serves, which reads arenas of its own, nor int8 rows) and the
-    card's (heads its kernels take, bf16 compute: `fp32` keeps the card's layers wider than its kernels read), a
-    hybrid's recurrent layers resumed from its snapshots on each; not a family's own layer (Qwen4) or its own attention
-    module (gpt-oss)"""
+    the host's tier, MLX's (its step and its megakernel alike, not int8 rows) and the card's (heads its kernels take,
+    bf16 compute: `fp32` keeps the card's layers wider than its kernels read), a hybrid's recurrent layers resumed from
+    its snapshots on each; not a family's own layer (Qwen4) or its own attention module (gpt-oss)"""
     fl = core.flags(kind)
     k = knobs or {}
     if hw is Hardware.CUDA:
         hd = head_dim(kind)
         tier = not k.get("fp32") and (hd is None or hd in CARD_HEAD_DIMS)
     elif hw is Hardware.MLX:
-        tier = not k.get("kv_bits") and not mega_serves(kind, storage, k)
+        tier = not k.get("kv_bits")
     else:
         tier = hw is Hardware.CPU
     return tier and Cap.OWN not in fl and Cap.FAST in fl
 
 
-def kv_tag(
-    kind: FamilyKind, hw: Hardware, knobs: dict[str, object] | None = None, storage: Storage = Storage.SAFE_BF16
-) -> PassTag:
+def kv_tag(kind: FamilyKind, hw: Hardware, knobs: dict[str, object] | None = None) -> PassTag:
     """the reader a cell's attention must take its cache rows through: the engine's pool of pages where the prefix
     cache serves the family there (`paged`), else each conversation's own contiguous buffers - the line that flips
     per tier as each lands, so a receipt banked on the old reader stops proving the cell"""
-    return PassTag.KV_PAGED if paged(kind, hw, knobs, storage) else PassTag.KV_CONTIGUOUS
+    return PassTag.KV_PAGED if paged(kind, hw, knobs) else PassTag.KV_CONTIGUOUS
 
 
 def expert_tag(kind: FamilyKind, storage: Storage, hw: Hardware, packed: bool) -> PassTag | None:
@@ -584,7 +571,7 @@ class DeviceSubpath:
         return frozenset(
             {
                 self.expect(kind, storage, quant),
-                kv_tag(kind, self.hardware, self.knobs, storage),
+                kv_tag(kind, self.hardware, self.knobs),
                 *(t for t in extra if t is not None),
             }
         )

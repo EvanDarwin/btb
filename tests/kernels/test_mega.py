@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     import mlx.core as mx
 
     from btb.engine.model import StreamedTextModel
+    from btb.engine.prefix import PrefixCache
     from btb.mlx.core import MetalKernel
     from btb.mlx.mega import MegaPass
     from btb.mlx.mega.model import DenseLayer
@@ -118,6 +119,64 @@ def test_step_over_the_arena_matches_a_plain_cache(engine: StreamedTextModel, pa
     assert a_ids == p_ids, f"the step's ids over the arena {a_ids} are not a plain cache's {p_ids}"
     for a, b in zip(a_rows, p_rows):
         assert mx.array_equal(a, b), "the step's K rows in the arena differ from a plain cache's"
+
+
+def _paged_pass(
+    sm: StreamedTextModel, pc: PrefixCache, mega: MegaPass | None, prompt: Tokens, toks: Tokens, parents: Parents
+) -> tuple[list[int], list[mx.array]]:
+    """`_pass` over a fresh paged cache of `pc`: the prompt prefilled by the step, the pass by `mega` (None: the
+    step); the ids, and layer 0's and the last layer's K rows read back through the conversation's row map"""
+    import mlx.core as mx
+
+    sm._mega = None
+    cache = pc.new()
+    past = len(prompt)
+    with torch.inference_mode():
+        sm._prefill(torch.tensor([prompt]), cache)
+        sm._mega = mega
+        sm.aa(parents)
+        try:
+            out = sm.forward([toks], cache=cache, last_only=False, pick=True)
+            assert out is not None
+            ids = [int(v) for v in out[0].tolist()]
+        finally:
+            sm.ab()
+    rows = mx.array(cache.table.rows()[: past + len(toks)].numpy().astype("uint32"))
+    host = pc.pool.host
+    got = [mx.take(host.mx_view(i)[0][0], rows, axis=1).astype(mx.float32) for i in (0, len(cache.layers) - 1)]
+    cache.crop_to(0)
+    return ids, got
+
+
+@pytest.mark.parametrize("past", [51, 300])
+@pytest.mark.parametrize(
+    "parents",
+    [[-1], list(range(-1, 4)), [-1, 0, 1, 2, 3, 0, 5, 6, 1, 8, 0, 10, 11, 12, 13]],
+    ids=["one", "chain5", "tree15"],
+)
+def test_pass_over_pages_matches_the_step(engine: StreamedTextModel, past: int, parents: Parents) -> None:
+    """a pass over a paged cache (the prefix cache's pool): the megakernel writes its rows where the table puts them
+    and reads every row through the row map, and gives the step's ids and rows over the same kind of cache"""
+    import mlx.core as mx
+
+    from btb.engine.prefix import PrefixCache
+
+    sm = engine
+    mega = sm._mega
+    assert mega is not None
+    pc = PrefixCache(sm)
+    prompt = [151644, *range(1000, 1000 + past - 1)]
+    toks = [2000 + 7 * t for t in range(len(parents))]
+    try:
+        s_ids, s_rows = _paged_pass(sm, pc, None, prompt, toks, parents)
+        assert sm._mega_paged_ok(pc.new()), "the megakernel refuses the prefix cache's pages"
+        m_ids, m_rows = _paged_pass(sm, pc, mega, prompt, toks, parents)
+    finally:
+        sm._mega = mega
+        pc.close()
+    assert m_ids == s_ids, f"the megakernel's ids over pages {m_ids} are not the step's {s_ids}"
+    for a, b in zip(m_rows, s_rows):
+        assert mx.array_equal(a, b), "the megakernel's K rows in the pages differ from the step's"
 
 
 def test_tree_positions_take_the_kernel(engine: StreamedTextModel) -> None:

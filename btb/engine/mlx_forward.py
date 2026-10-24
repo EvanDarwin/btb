@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
     from ..mlx import Shared
     from ..mlx.attn import NodeMeta
+    from ..mlx.mega.replay import KvSlot
     from .cache import KvCache
     from .model import StreamedTextModel
 
@@ -1371,8 +1372,8 @@ class _MlxMixin(_State):
         return self._mlx_finish(hm, last_only, head, n_layers, t0, lazy=lazy, pick=pick, keys=keys)
 
     def _mega_ok(self, cache: Any, T: int, on_layer: Any, head: bool, pick: Any, positions: Any) -> bool:
-        """the megakernel takes a pass of 1..16 rows over an arena cache of the dense family, the head and the
-        pick in the graph (the argmax in the kernel; a sample over the logits it leaves), every layer resident"""
+        """the megakernel takes a pass of 1..16 rows over an arena cache or a paged one of the dense family, the head
+        and the pick in the graph (the argmax in the kernel; a sample over the logits it leaves), every layer resident"""
         if not self._mega_serves() or cache is None or not (1 <= T <= 16) or on_layer is not None:
             return False
         if not head or pick is None:
@@ -1382,13 +1383,43 @@ class _MlxMixin(_State):
         if positions is not None and not self._mega_positions_ok(cache, T, positions):
             return False
         layers = getattr(cache, "layers", None)
-        if not layers or any(not isinstance(cl, GrowLayer) or cl.arena is None for cl in layers):
+        if not layers:
             return False
         past = cache.get_seq_length()
-        cap = layers[0].arena[3]
         from ..mlx.attn import ATTN_BLOCK
 
-        return past + T <= cap and past + T <= mg.SPL * ATTN_BLOCK
+        if past + T > mg.SPL * ATTN_BLOCK:
+            return False
+        if isinstance(cache, PagedCache):
+            return self._mega_paged_ok(cache)
+        if any(not isinstance(cl, GrowLayer) or cl.arena is None for cl in layers):
+            return False
+        return past + T <= layers[0].arena[3]
+
+    def _mega_paged_ok(self, cache: PagedCache) -> bool:
+        """a paged cache the megakernel binds: every layer's rows in the host's shared regions, bf16 (or not yet
+        written: the pass shapes them so), no int8 rows"""
+        host = cache.prefix.pool.host
+        if getattr(self, "kv_bits", 0) or not host.shared or host.dtype not in (None, torch.bfloat16):
+            return False
+        return all(isinstance(cl, PagedLayer) and not cl.on_card for cl in cache.layers)
+
+    def _mega_paged(self, cache: PagedCache, past: int, T: int) -> tuple[list[KvSlot], int, np.ndarray]:
+        """a paged cache bound for a pass of T rows: each layer's K and V regions, their rows a head, and the row map
+        through the pass's own rows. The regions are shaped and the table grown first, as the step's maps are made
+        (`_mlx_page_maps`): a region regrown after would leave the pass's rows in the old buffer"""
+        from ..mlx.mega.replay import KvSlot
+
+        mg = self._mega
+        assert mg is not None
+        layers = cast("list[PagedLayer]", cache.layers)
+        pool = cache.prefix.pool
+        pool.shape(layers[0].i, torch.empty(1, mg.Hk, 0, mg.hd, dtype=torch.bfloat16))
+        cache.table.extend(past + T)
+        rows = cache.table.rows()[: past + T].numpy().astype(np.uint32)
+        kvs = [KvSlot(a, 0) for cl in layers for a in pool.host.mx_whole(cl.i)]
+        cap = int(pool.host.mk[layers[0].i].shape[2])
+        return kvs, cap, rows
 
     def _build_mega(self) -> None:
         """the megakernel over the weights where they lie now, where the engine takes it (asked for at load, the
@@ -1447,23 +1478,28 @@ class _MlxMixin(_State):
         depth = [0] * T
         for j in range(T):
             depth[j] = 0 if parents[j] < 0 else depth[parents[j]] + 1
-        cl0 = cache.layers[0]
-        buf, _ok, _ov, cap = cl0.arena
-        Hk, hd = mg.Hk, mg.hd
+        from ..mlx.mega.replay import KvSlot
 
-        def kv_off(i: int, which: int) -> int:
-            return int(cache.layers[i].arena[1 + which])
-
+        paged = isinstance(cache, PagedCache)
+        rmap: np.ndarray | None = None
+        if paged:
+            kvs, cap, rmap = self._mega_paged(cache, past, T)
+        else:
+            buf, cap = cache.layers[0].arena[0], int(cache.layers[0].arena[3])
+            kvs = [KvSlot(buf, int(cl.arena[1 + w])) for cl in cache.layers for w in (0, 1)]
         sampled = pick is not None and not pick.greedy
         pos = [past + d for d in depth]
-        got = mg.run(buf, cap, kv_off, ids, pos, meta, path, splits, past, argmax=not sampled)
+        got = mg.run(kvs, cap, rmap, ids, pos, meta, path, splits, past, argmax=not sampled)
         if sampled:
             # the sample over the logits the pass's head op left in its scratch, the pass done when `run` returns
             picked = pick.pick_mx(mg.logits(T), [pick.key_for(p) for p in pos])
             m.eval(picked)
             got = np.asarray(picked)
         for cl in cache.layers:
-            cl.mx_advance(T, Hk, hd, torch.bfloat16)
+            if paged:
+                cl.n += T  # the rows written where the table puts them, as `_mlx_page_append` counts them
+            else:
+                cl.mx_advance(T, mg.Hk, mg.hd, torch.bfloat16)
         be = self.mlx
         assert be is not None
         be.stat["layers"] += self.L

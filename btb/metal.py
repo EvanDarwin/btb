@@ -53,6 +53,7 @@ class Metal:
             "free_buffer": ([i64, i64], i32),
             "free_icb": ([i64, i64], i32),
             "contents": ([i64, i64, ctypes.POINTER(ptr), ctypes.POINTER(u64)], i32),
+            "gpu_address": ([i64, i64, ctypes.POINTER(u64)], i32),
             "compile": ([i64, txt, i32, txt, size], i32),
             "pipeline": ([i64, txt, txt, size], i64),
             "icb": ([i64, u32, u32], i64),
@@ -87,6 +88,12 @@ class Metal:
         p, n = ctypes.c_void_p(), ctypes.c_uint64()
         self._ok(self.lib.btb_metal_contents(self.h, b, ctypes.byref(p), ctypes.byref(n)), "contents")
         return int(p.value or 0), int(n.value)
+
+    def gpu_address(self, b: int) -> int:
+        """buffer `b`'s GPU address, for a table of addresses a kernel reads it through"""
+        a = ctypes.c_uint64()
+        self._ok(self.lib.btb_metal_gpu_address(self.h, b, ctypes.byref(a)), "gpu address")
+        return int(a.value)
 
     def write(self, b: int, data: np.ndarray) -> None:
         raw = np.ascontiguousarray(data).view(np.uint8).reshape(-1)

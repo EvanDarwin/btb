@@ -230,7 +230,10 @@ inline void btb_attn_nodes(thread const BtbAttnIn<QT, MT, PT, ST, ST2, RT>& a, u
 #if MAP
         // the row this lane's K read took per node (in the region, or in k2 where `own`), handed to the lane that
         // reads it as a V row below: the map read once a row
-        uint mrow[NT], own[NT];
+        uint mrow[NT];
+#if SEG
+        uint own[NT];
+#endif
 #endif
         for (uint t = 0; t < NT; ++t) {
             live[t] = has[t] && j >= lo[t] && j < hi[t];
@@ -243,7 +246,9 @@ inline void btb_attn_nodes(thread const BtbAttnIn<QT, MT, PT, ST, ST2, RT>& a, u
 #endif
 #if MAP
             mrow[t] = 0;
+#if SEG
             own[t] = 0;
+#endif
 #endif
             if (live[t]) {
                 uint pj = j < past_[t] ? j : past_[t] + path[(size_t)node[t] * PD + (j - past_[t])];
@@ -270,6 +275,10 @@ inline void btb_attn_nodes(thread const BtbAttnIn<QT, MT, PT, ST, ST2, RT>& a, u
                 mrow[t] = pj;
                 own[t] = kh_ != kh[t];
 #endif
+#elif MAP
+                // every row through the row map, the pass's own written to their pages before (the megakernel's)
+                pj = rmap[pj];
+                mrow[t] = pj;
 #endif
                 kr[t] = kh_ + (size_t)pj * KC;
 #endif
@@ -370,7 +379,9 @@ inline void btb_attn_nodes(thread const BtbAttnIn<QT, MT, PT, ST, ST2, RT>& a, u
 #if MAP
                 // lane r read this row's K: the row it took, where it lies (rr is uniform, so every lane is here)
                 pr = simd_shuffle(mrow[t], r);
+#if SEG
                 if (simd_shuffle(own[t], r)) vhb_ = vb2[t];
+#endif
 #elif SEG
                 if (pr >= seg[t]) { vhb_ = vb2[t]; pr -= seg[t]; }
 #endif
@@ -818,7 +829,8 @@ def attn_nodes(
     as they are, `meta` uint32 [T, 8] per node, `path` uint32 [T, PD] the node's rows as offsets after `past`,
     `sinks` [Hq] float32 an extra softmax column with no value (gpt-oss), `ks`/`vs` an int8 cache's scales,
     `rmap` uint32 a paged cache's row map: its rows before a node's `seg` through it (row j at buffer row rmap[j]),
-    the pass's own from `k2`/`v2` as the step buffer's are (bf16 rows). float32 throughout; returns [T, Hq, D],
+    the pass's own from `k2`/`v2` as the step buffer's are (bf16 rows), or without k2 every row through it (the pass's
+    own written to their pages already). float32 throughout; returns [T, Hq, D],
     lazily. Needs head_dim 64/128/256 and Hq / Hk <= ATTN_MAXG."""
     global _NO_SINKS
     m = mx()
@@ -830,8 +842,8 @@ def attn_nodes(
     kq = ks is not None
     seg = k2 is not None
     mapped = rmap is not None
-    if mapped and (kq or not seg):
-        raise ValueError("[mlx] a paged cache's rows are bf16, the pass's own beside them in k2/v2")
+    if mapped and kq:
+        raise ValueError("[mlx] a paged cache's rows are bf16")
     nt = max(1, min(T, ATTN_NODES if g <= 4 else max(1, ATTN_NODES // 2)))
     kern, fold = _attn_kernel(D, g, kq, seg, nt, mapped)
     if sinks is None:

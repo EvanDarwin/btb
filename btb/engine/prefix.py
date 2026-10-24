@@ -113,8 +113,6 @@ class PrefixCache:
         them: the tiers and families whose attention reads the pages land phase by phase"""
         mlx = getattr(sm, "mlx", None) is not None
         if mlx:
-            if sm._mega_serves():
-                return "MLX's megakernel reads each conversation's own arena, and it serves this engine's passes"
             if getattr(sm, "kv_bits", None):
                 return "int8 rows (`kv_bits`): the pool's pages hold the rows as they are made"
         elif sm.dev.type not in (Device.CPU, Device.CUDA):

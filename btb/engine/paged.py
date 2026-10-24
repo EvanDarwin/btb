@@ -114,6 +114,9 @@ class HostRegion:
         self.shared = shared
         self.mk: dict[int, mx_.array] = {}
         self.mv: dict[int, mx_.array] = {}
+        # each shared region's allocation whole (`Shared.whole`, its view from byte 0), what the megakernel aliases
+        self.wk: dict[int, mx_.array] = {}
+        self.wv: dict[int, mx_.array] = {}
         # a layer's regions short of `cap` pages: a fill the ledger refused part way (`_fill`), finished at the next
         # ask - a write's `shape`, a growth - before any row lands in them
         self._short = False
@@ -181,22 +184,22 @@ class HostRegion:
         if self.shared:
             mlxdev.mx().synchronize()
 
-    def _new(self, i: int, views: dict[int, mx_.array], rows: int) -> torch.Tensor:
-        """a fresh K or V region of layer i, `rows` rows: MLX's buffer under `shared`, its view kept in `views`
-        (`mk` or `mv`)"""
+    def _new(self, i: int, views: dict[int, mx_.array], wholes: dict[int, mx_.array], rows: int) -> torch.Tensor:
+        """a fresh K or V region of layer i, `rows` rows: MLX's buffer under `shared`, its view kept in `views` (`mk` or
+        `mv`) and its allocation in `wholes` (`wk` or `wv`)"""
         assert self.dtype is not None
         if not self.shared:
             return torch.empty(self.hk, rows, self.d, dtype=self.dtype)
         sh = mlxdev.Shared(self.hk * rows * self.d * self._el())
         a = sh.mx.view(mlxdev._dtypes()[self.dtype]).reshape(1, self.hk, rows, self.d)
-        mlxdev.mx().eval(a)
-        views[i] = a
+        mlxdev.mx().eval(a, sh.whole)
+        views[i], wholes[i] = a, sh.whole
         return sh.torch.view(self.dtype).view(self.hk, rows, self.d)
 
     @_kept
     def _regrow(self, i: int, new: int) -> None:
         rows, el = new * PAGE, self._el()
-        for store, views in ((self.k, self.mk), (self.v, self.mv)):
+        for store, views, wholes in ((self.k, self.mk, self.wk), (self.v, self.mv, self.wv)):
             old = store.get(i)
             if old is not None and old.shape[1] >= rows:
                 continue  # grown by an attempt the ledger refused part way
@@ -210,7 +213,7 @@ class HostRegion:
                     device="cpu",
                     held=old.numel() * el if old is not None else 0,
                 )
-            buf = self._new(i, views, rows)
+            buf = self._new(i, views, wholes, rows)
             if old is not None:
                 self._settle()
                 buf[:, : old.shape[1]] = old
@@ -231,7 +234,7 @@ class HostRegion:
         """layer i's rows held elsewhere from now on (it came onto the card): its regions let go"""
         if i in self.layers:
             self.layers.remove(i)
-        for store in (self.k, self.v, self.mk, self.mv):
+        for store in (self.k, self.v, self.mk, self.mv, self.wk, self.wv):
             store.pop(i, None)
 
     @_kept
@@ -247,7 +250,7 @@ class HostRegion:
         rows, el = pages * PAGE, self._el()
         self._settle()
         try:
-            for store, views in ((self.k, self.mk), (self.v, self.mv)):
+            for store, views, wholes in ((self.k, self.mk, self.wk), (self.v, self.mv, self.wv)):
                 for i in list(store):
                     old = store[i]
                     if old.shape[1] <= rows:
@@ -262,12 +265,13 @@ class HostRegion:
                                 device="cpu",
                                 draws="",
                             )
-                        buf = self._new(i, views, rows)
+                        buf = self._new(i, views, wholes, rows)
                         buf.copy_(old[:, :rows])
                         store[i] = buf
                     else:
                         del store[i]
                         views.pop(i, None)
+                        wholes.pop(i, None)
                     del old
         except MemoryGrantError:
             pass
@@ -289,6 +293,11 @@ class HostRegion:
         """a shared region's MLX arrays [1, Hk, rows, D] of layer i, which `mlx.kv_scatter` writes in place"""
         return self.mk[i], self.mv[i]
 
+    def mx_whole(self, i: int) -> tuple[mx_.array, mx_.array]:
+        """the allocations layer i's shared K and V regions lie in from byte 0 (whole pages), as the megakernel binds
+        them"""
+        return self.wk[i], self.wv[i]
+
     def gather(self, i: int, rows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """layer i's `rows` in order as [1, Hk, n, D] tensors of their own: a copy"""
         self._settle()
@@ -304,7 +313,7 @@ class HostRegion:
     def close(self) -> None:
         """the regions let go with the engine: nothing reads them after"""
         self._settle()
-        for store in (self.k, self.v, self.mk, self.mv):
+        for store in (self.k, self.v, self.mk, self.mv, self.wk, self.wv):
             store.clear()
         self.cap = 0
 

@@ -14,10 +14,16 @@ import numpy as np
 
 from .kernel import CODE, DEPS, NUM, REF0, REFS, OpName, W
 
-# the buffers past the weights, placed after them once the weights are counted: the scratch, the constants, the arena
-SCR, CONSTS, KV = -1, -2, -3
+# the buffers past the weights, numbered after them once the weights are counted: the scratch, the constants, then
+# each layer's K and V (`kv`)
+SCR, CONSTS = -1, -2
 
 Ref: TypeAlias = tuple[int, int]  # (buffer, byte offset), as the table carries a reference
+
+
+def kv(i: int, which: int) -> int:
+    """layer i's K (0) or V (1) rows [Hk, cap, D], a buffer of their own a pass binds to the cache it runs over"""
+    return -3 - (2 * i + which)
 
 
 @dataclass
@@ -110,7 +116,8 @@ class Program:
         return idx
 
     def table(self, nbufs: int) -> np.ndarray:
-        """the table, uint32 [N, W], the buffers past the weights numbered from `nbufs`"""
+        """the table, uint32 [N, W], the buffers past the weights numbered from `nbufs` (the scratch, the constants,
+        layer i's K at nbufs + 2 + 2i and its V beside it)"""
         tab = np.asarray(self.rows, dtype=np.int64)
         for col in range(REF0, NUM, 2):
             tab[:, col] = np.where(tab[:, col] < 0, nbufs - 1 - tab[:, col], tab[:, col])

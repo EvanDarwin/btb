@@ -23,7 +23,7 @@ NUM = REF0 + 2 * REFS  # n0's column
 DEP0 = NUM + 4
 DEPS = 3
 W = DEP0 + DEPS
-# dims: rows of the pass, the path's row stride, the arena's rows a head, past, then unused to 8
+# dims: rows of the pass, the path's row stride, the K/V regions' rows a head, past, then unused to 8
 DIMS = 8
 
 TYPES = r"""
@@ -47,6 +47,7 @@ struct Ctx {
     const device uint* pos;
     const device uint* meta;
     const device uint* path;
+    const device uint* rmap;
     device uint* out;
 };
 """
@@ -373,7 +374,8 @@ _op(
 inline void op_qkrope(thread const Ins& I, uint item, thread const Ctx& c) {
     // the q/k norms (where n0's top bit is set), the rope on the first 2 * hd2 dims (hd2 = n0's low bits) and the
     // append: item -> (row t, head hh) over Hq q, Hk k and Hk v heads of qkv (A, [T, (Hq + 2Hk) * D]); q -> C
-    // [T, Hq, D]; k, v -> the arena at row past + t (D: this layer's K, E: its V, each [Hk, cap, D]); the norm
+    // [T, Hq, D]; k, v -> row past + t (D: this layer's K, E: its V, each [Hk, cap, D]; under MAP the row the
+    // conversation's row past + t lies at); the norm
     // weights qn, kn [D] end to end at B (bf16, or float32 where n2's top bit is set: a centered norm's 1 + w); Hq =
     // n1 & 0xffff with the rope's row of `freqs` above it, Hk = n2 & 0xffff, D = n2's bits 16..30; f0 the norms' eps, or
     // without them the scale on the rotated dims (rope_fast's `y * scaling`: MLX rounds the Python float to the
@@ -382,19 +384,23 @@ inline void op_qkrope(thread const Ins& I, uint item, thread const Ctx& c) {
     uint hd2 = I.n0 & 0x7fffffffu;
     uint Hq = I.n1 & 0xffffu, Hk = I.n2 & 0xffffu, D = (I.n2 >> 16) & 0x7fffu;
     const device float* freqs = c.freqs + (I.n1 >> 16) * hd2;
-    uint row0 = c.dims[3];
     uint CAPR = c.dims[2];
     uint per = Hq + 2 * Hk;
     uint t = item / per, hh = item - t * per;
+#if MAP
+    uint row = c.rmap[c.dims[3] + t];  // a paged cache: the region row the conversation's row past + t lies at
+#else
+    uint row = c.dims[3] + t;
+#endif
     const device bfloat* src = (const device bfloat*)I.A + ((size_t)t * per + hh) * D;
     if (hh >= Hq + Hk) {
-        device bfloat* dst = (device bfloat*)I.E + ((size_t)(hh - Hq - Hk) * CAPR + row0 + t) * D;
+        device bfloat* dst = (device bfloat*)I.E + ((size_t)(hh - Hq - Hk) * CAPR + row) * D;
         for (uint i = c.tid; i < D; i += 256) dst[i] = src[i];
         return;
     }
     bool isq = hh < Hq;
     device bfloat* dst = isq ? ((device bfloat*)I.C + ((size_t)t * Hq + hh) * D)
-                             : ((device bfloat*)I.D + ((size_t)(hh - Hq) * CAPR + row0 + t) * D);
+                             : ((device bfloat*)I.D + ((size_t)(hh - Hq) * CAPR + row) * D);
     const device bfloat* wn = (const device bfloat*)I.B + (isq ? 0 : D);
     threadgroup float* part = (threadgroup float*)c.tgm;
     if (norm && wf32) {
@@ -416,7 +422,8 @@ inline void op_qkrope(thread const Ins& I, uint item, thread const Ctx& c) {
 )
 
 # the node attention (attn.py `btb_attn_nodes`, a node a threadgroup) at grid position (kv head, block, node): q (A,
-# [T, Hq, D] bf16), this layer's K (B) and V (E) in the arena [Hk, cap, D]; the partials m (C), l (D) and acc
+# [T, Hq, D] bf16), this layer's K (B) and V (E) [Hk, cap, D] (under MAP every row through the row map, the pass's
+# own written to their pages already); the partials m (C), l (D) and acc
 # (C + PACC_OFF); Hk = n0, blocks = n1, T = n2's low half with the layer type's row of `meta` above it, scale = f0
 _ATTN_CORE = r"""
 inline void attn_core(thread const Ins& I, uint3 at, thread const Ctx& c) {
@@ -424,7 +431,7 @@ inline void attn_core(thread const Ins& I, uint3 at, thread const Ctx& c) {
     BtbAttnIn<bfloat, const device uint*, const device uint*, const device float*, const device float*,
               const device uint*> a = {
         (const device bfloat*)I.A, (const device uint16_t*)I.B, (const device uint16_t*)I.E,
-        c.meta + (I.n2 >> 16) * Tn * 8, c.path, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, I.f0, Hk,
+        c.meta + (I.n2 >> 16) * Tn * 8, c.path, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, c.rmap, I.f0, Hk,
         c.dims[2], Hk * ATT_G, Tn, I.n1, c.dims[1], 0u};
     btb_attn_nodes<ATT_G, ATT_D, 1, ATT_P>(a, at.x, at.y, at.z, c.sg, c.lane, (threadgroup float4*)c.tgm,
                                            (device float*)I.C, (device float*)I.D, (device float*)(I.C + PACC_OFF));
@@ -669,16 +676,14 @@ for _q, _k in STORED.items():
 MV_Q: dict[OpName, Quant] = {o: q for q, o in MV_OP.items()}
 assert set(SOURCE) == set(OpName) - set(MV_Q), "an op without its device function"
 
-# a command's buffers after the weights: the scratch, the constants, the arena, these, then the instruction's index
-INPUTS = ("freqs", "ids", "pos", "meta", "path", "tab", "dims", "out")
+# a command's buffers after the table of addresses its references go through (`Buf`): these, then the instruction's
+# index
+INPUTS = ("freqs", "ids", "pos", "meta", "path", "rmap", "tab", "dims", "out")
 # a buffer's type in a kernel's signature where it is not a uint array read
-_DECL = {
-    "scr": "device uint8_t*",
-    "consts": "device uint8_t*",
-    "kv": "device uint8_t*",
-    "freqs": "const device float*",
-    "out": "device uint*",
-}
+_DECL = {"freqs": "const device float*", "out": "device uint*"}
+# an entry of the table of addresses: a buffer's GPU address (the weights', the scratch, the constants, each layer's K
+# and V, numbered as `Program.table` numbers them); a kernel argument cannot be a pointer to pointers itself
+_BUF = "struct Buf { device uint8_t* p; };\n"
 
 
 def _mlx_header(rel: str, seen: set[str]) -> str:
@@ -727,23 +732,19 @@ def stored_groups(q: Quant, rows: int, T: int) -> int:
     return -(-matvec.threads(rows, T, STORED[q].shapes) // 256)
 
 
-def _signature(name: str, nbufs: int, attrs: str) -> str:
-    """kernel `name` over a command's buffers (the weights', then the pass's), its row of the table `f` and `B` the
-    buffers its references index, `attrs` its position arguments"""
-    ws = ", ".join(f"device uint8_t* w{i} [[buffer({i})]]" for i in range(nbufs))
+def _signature(name: str, attrs: str) -> str:
+    """kernel `name` over a command's buffers (the table of addresses `B` its references index, then the pass's), its
+    row of the table `f`, `attrs` its position arguments"""
     ins = ", ".join(
-        f"{_DECL.get(n, 'const device uint*')} {n} [[buffer({nbufs + j})]]"
-        for j, n in enumerate(("scr", "consts", "kv", *INPUTS, "mi"))
+        f"{_DECL.get(n, 'const device uint*')} {n} [[buffer({j + 1})]]" for j, n in enumerate((*INPUTS, "mi"))
     )
-    table = ", ".join([*(f"w{i}" for i in range(nbufs)), "scr", "consts", "kv"])
     return f"""
-kernel void {name}({ws}, {ins}, {attrs}) {{
-    const device uint8_t* B[{nbufs + 3}] = {{{table}}};
+kernel void {name}(const device Buf* B [[buffer(0)]], {ins}, {attrs}) {{
     const device uint* f = tab + mi[0] * ROW;
 """
 
 
-def _wrap(op: OpName, nbufs: int, tgm: int) -> str:
+def _wrap(op: OpName, tgm: int) -> str:
     """op `op`'s kernel: the instruction's row (its index bound at the command's own offset) read into the op's view,
     the threadgroup's memory `tgm` bytes, a `GRID3` op given its grid position"""
     pos = "uint3" if op in GRID3 else "uint"
@@ -753,11 +754,11 @@ def _wrap(op: OpName, nbufs: int, tgm: int) -> str:
         "    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]"
     )
     return (
-        _signature(kernel_name(op), nbufs, attrs)
+        _signature(kernel_name(op), attrs)
         + f"""    threadgroup uint8_t tgm[{max(16, tgm)}];
-    Ins I = {{REF(0), REF(1), (device uint8_t*)REF(2), (device uint8_t*)REF(3), REF(4), REF(5), f[1], f[NUM],
-             f[NUM + 1], f[NUM + 2], as_type<float>(f[NUM + 3])}};
-    Ctx c = {{{tid}, sg, lane, tgm, dims, freqs, ids, pos, meta, path, out}};
+    Ins I = {{REF(0), REF(1), REF(2), REF(3), REF(4), REF(5), f[1], f[NUM], f[NUM + 1], f[NUM + 2],
+             as_type<float>(f[NUM + 3])}};
+    Ctx c = {{{tid}, sg, lane, tgm, dims, freqs, ids, pos, meta, path, rmap, out}};
     op_{op.value}(I, g, c);
 }}
 """
@@ -769,15 +770,16 @@ def _preamble() -> str:
     return (
         _mlx_header("mlx/backend/metal/kernels/utils.h", set())
         + "#include <metal_stdlib>\nusing namespace metal;\n"
+        + _BUF
         + f"#define ROW {W}\n#define NUM {NUM}\n"
-        + f"#define REF(k) (B[f[{REF0} + 2 * (k)]] + f[{REF0} + 2 * (k) + 1])\n"
+        + f"#define REF(k) (B[f[{REF0} + 2 * (k)]].p + f[{REF0} + 2 * (k) + 1])\n"
     )
 
 
-def stored_source(nbufs: int, mvs: Iterable[StoredMv]) -> str:
-    """the library of stored matvec kernels `mvs` over `nbufs` weight buffers: each its type's launch (`matvec.blocks`,
-    the step's kernel) with its matrix, pass rows and y's row stride as constants, y [T, rows] (C) = x [T, cols] (B) .
-    W^T, W (A) the type's blocks; a thread of the launch's grid a thread of the command's"""
+def stored_source(mvs: Iterable[StoredMv]) -> str:
+    """the library of stored matvec kernels `mvs`: each its type's launch (`matvec.blocks`, the step's kernel) with its
+    matrix, pass rows and y's row stride as constants, y [T, rows] (C) = x [T, cols] (B) . W^T, W (A) the type's
+    blocks; a thread of the launch's grid a thread of the command's"""
     by_q: dict[Quant, list[StoredMv]] = {}
     for s in mvs:
         by_q.setdefault(s.q, []).append(s)
@@ -795,17 +797,17 @@ def stored_source(nbufs: int, mvs: Iterable[StoredMv]) -> str:
         for s in ss:
             t = "float" if s.f32 else "bfloat"
             out.append(
-                _signature(stored_name(s), nbufs, "uint3 gp [[thread_position_in_grid]]")
+                _signature(stored_name(s), "uint3 gp [[thread_position_in_grid]]")
                 + f"    btb_{key}::{stored_name(s)}<{t}>(REF(0), (const device {t}*)REF(1), (device {t}*)REF(2), gp);\n}}\n"
             )
         out.append(_undo(k.defs))
     return "".join(out)
 
 
-def source(nbufs: int, ops: Iterable[OpName], defs: Mapping[str, int], tgm: Mapping[OpName, int]) -> str:
-    """the library of a program's `ops` over `nbufs` weight buffers: MLX's preamble, the ops' device functions under
-    `defs`, their compile-time constants (XROWS, MV_KT and the attention's shape), and a kernel `btb_mega_<op>` each, its
-    threadgroup memory `tgm[op]` bytes"""
+def source(ops: Iterable[OpName], defs: Mapping[str, int], tgm: Mapping[OpName, int], mapped: bool) -> str:
+    """the library of a program's `ops`: MLX's preamble, the ops' device functions under `defs`, their compile-time
+    constants (XROWS, MV_KT and the attention's shape), and a kernel `btb_mega_<op>` each, its threadgroup memory
+    `tgm[op]` bytes; `mapped` a paged cache's, its rows read and written through the conversation's row map"""
     used = sorted(set(ops), key=CODE.__getitem__)
     return (
         _preamble()
@@ -813,9 +815,9 @@ def source(nbufs: int, ops: Iterable[OpName], defs: Mapping[str, int], tgm: Mapp
         + TYPES
         + MLX_OPS
         + fused.FUNCS
-        + "#define KQ 0\n#define SEG 0\n#define MAP 0\n"
+        + f"#define KQ 0\n#define SEG 0\n#define MAP {int(mapped)}\n"
         + attn.ATTN_FUNCS
         + "".join(dict(_PRELUDE[o] for o in used if o in _PRELUDE).values())
         + "".join(SOURCE[o] for o in used)
-        + "".join(_wrap(o, nbufs, tgm[o]) for o in used)
+        + "".join(_wrap(o, tgm[o]) for o in used)
     )

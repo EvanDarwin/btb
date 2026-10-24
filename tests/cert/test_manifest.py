@@ -445,22 +445,12 @@ def test_every_cell_asserts_the_reader_its_cache_rows_take() -> None:
             assert spec.kv_tag(kind, dev.hardware, dev.knobs) in dev.expects(kind, bf16), (dev.key, kind)
     assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.CPU) is PassTag.KV_PAGED
     assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.CUDA) is PassTag.KV_PAGED
-    # MLX's per-token graph reads the pages; its megakernel, where it serves, the conversation's own arena
+    # MLX's per-token graph and its megakernel alike read the pages, however a GGUF's blocks are held; int8 rows keep
+    # each conversation's own buffers
     assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.MLX, spec.SUBPATH["mlx-step"].knobs) is PassTag.KV_PAGED
-    assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.MLX) is PassTag.KV_CONTIGUOUS
-    # a GGUF's blocks as stored keep the megakernel off where it does not multiply their type; dequantized on load,
-    # or of a type it multiplies, they are slots it reads
-    off = next(
-        s
-        for s in spec.Storage
-        if spec.STORAGE[s].container is spec.Container.GGUF
-        and spec.mega_refusal(FamilyKind.QWEN3, s) is spec.MegaRefusal.STORAGE
-    )
-    packed, dequant = spec.SUBPATH["mlx-packed"].knobs, spec.SUBPATH["mlx-dequant"].knobs
-    assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.MLX, packed, off) is PassTag.KV_PAGED
-    assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.MLX, dequant, off) is PassTag.KV_CONTIGUOUS
-    kq = spec.Storage.GGUF_KQUANT
-    assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.MLX, packed, kq) is PassTag.KV_CONTIGUOUS
+    assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.MLX) is PassTag.KV_PAGED
+    for sub in ("mlx-packed", "mlx-dequant"):
+        assert spec.kv_tag(FamilyKind.QWEN3, spec.Hardware.MLX, spec.SUBPATH[sub].knobs) is PassTag.KV_PAGED
     assert PassTag.KV_CONTIGUOUS in spec.SUBPATH["mlx-kvbits"].expects(FamilyKind.QWEN3, bf16)
     # a hybrid on the pages too, its states resumed from its snapshots
     assert spec.kv_tag(FamilyKind.QWEN3_5, spec.Hardware.CPU) is PassTag.KV_PAGED
@@ -498,12 +488,10 @@ def test_the_cert_reads_the_engines_own_rule_for_the_paged_reader(monkeypatch: M
         spec.Hardware.CUDA: torch.device("cuda"),
         spec.Hardware.MLX: torch.device("cpu"),
     }
-    # an MLX engine's megakernel is built at load (`_mega_serves`): these the knobs under which it never serves - off,
-    # or a float32 state; where it serves the runner's mega cells hold the rule
     options: dict[spec.Hardware, tuple[dict[str, object], ...]] = {
         spec.Hardware.CPU: ({}, {"fp32": 1}),
         spec.Hardware.CUDA: ({}, {"fp32": 1}),
-        spec.Hardware.MLX: ({"mlx_mega": 0}, {"mlx_mega": 0, "kv_bits": 8}, {"fp32": 1}),
+        spec.Hardware.MLX: ({}, {"mlx_mega": 0}, {"mlx_mega": 0, "kv_bits": 8}, {"fp32": 1}),
     }
     for kind in core.served_kinds():
         if kind not in spec.FIXTURE_STEM:
@@ -516,7 +504,6 @@ def test_the_cert_reads_the_engines_own_rule_for_the_paged_reader(monkeypatch: M
                 sm = types.SimpleNamespace(
                     dev=dev,
                     mlx=object() if hw is spec.Hardware.MLX else None,
-                    _mega_serves=lambda: False,
                     kv_bits=knobs.get("kv_bits"),
                     layer_types=types_,
                     fam=types.SimpleNamespace(**_flags(kind)),
@@ -564,17 +551,16 @@ def test_the_prefix_axis_runs_where_the_prefix_cache_serves_and_is_a_gap_elsewhe
         )
     assert spec.card_rows(FamilyKind.QWEN3) and spec.card_rows(FamilyKind.GEMMA3)
     assert by[(FamilyKind.QWEN3, "cuda-torch")] is manifest.Missing.PREFIX_WIDE
-    # MLX's per-token graph reads the pages for every family the host serves; its megakernel, where it serves, stands
-    # in the prefix cache's way
+    # MLX's per-token graph and its megakernel read the pages for every family the host serves, where they engage
     assert "mlx-step" not in {key for (kind, key) in by if kind in served - set(cpu)}, by
-    assert by[(FamilyKind.QWEN3, "mlx-mega")] is manifest.Missing.PREFIX_CACHE
+    assert (FamilyKind.QWEN3, "mlx-mega") not in by, by
     for (kind, key), why in by.items():
         dev = spec.SUBPATH[key]
         own = manifest.subpath_gap(kind, spec.Storage.SAFE_BF16, dev)
         if own is not None:
             assert why is own, (kind, key, why)
         elif dev.hardware is spec.Hardware.MLX:
-            assert why is (cpu.get(kind) or manifest.Missing.PREFIX_CACHE), (kind, key, why)
+            assert why is cpu.get(kind), (kind, key, why)
     ran = {i for i in manifest.runnable_ids() if i.startswith(f"{spec.Surface.PREFIX.value}/")}
     want = {
         manifest.stem_id(spec.Surface.PREFIX, spec.FIXTURE_STEM[k], key)
@@ -586,7 +572,6 @@ def test_the_prefix_axis_runs_where_the_prefix_cache_serves_and_is_a_gap_elsewhe
     assert manifest.stem_id(spec.Surface.PREFIX, spec.FIXTURE_STEM[FamilyKind.QWEN3], "cpu") in ran
     missing = {kind for kind, _n, _f in manifest.missing_items()}
     assert {
-        manifest.Missing.PREFIX_CACHE,
         manifest.Missing.PREFIX_FAMILY,
         manifest.Missing.PREFIX_WIDE,
         manifest.Missing.PREFIX_INVARIANCE,

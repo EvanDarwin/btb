@@ -1050,6 +1050,16 @@ pub unsafe extern "C" fn btb_metal_contents(
     guard(|| unsafe { metal::contents(h, b, out, len) })
 }
 
+/// Buffer `b`'s GPU address into `out`, for a table of addresses a kernel reads its buffers through.
+///
+/// # Safety
+/// `out` writable.
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub unsafe extern "C" fn btb_metal_gpu_address(h: i64, b: i64, out: *mut u64) -> i32 {
+    guard(|| unsafe { metal::gpu_address(h, b, out) })
+}
+
 /// `src` (NUL-terminated UTF-8) compiled as the context's library, the math safe unless `fast` is nonzero;
 /// `ERR_PARSE` with the compiler's message in `err` (NUL-terminated, `errlen` bytes at most).
 ///

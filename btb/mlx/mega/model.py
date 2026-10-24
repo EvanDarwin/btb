@@ -18,8 +18,8 @@ from ..attn import tree_meta
 from ..backend import Weight
 from ..core import mx, to_mx
 from .kernel import EMBED_OP, MV_OP, STORED, OpName, stored_groups
-from .program import CONSTS, KV, SCR, Program, Refs, Tensor, align
-from .replay import Replay
+from .program import CONSTS, SCR, Program, Refs, Tensor, align, kv
+from .replay import KvSlot, Replay
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -31,10 +31,7 @@ SPL = 8  # the attention blocks a pass may read, 8 x ATTN_BLOCK cache rows
 MV_KT = 64  # the matvec's columns a step
 AMP = 64  # the argmax's parts a row
 TG_MEMORY = 32768  # a threadgroup's memory on every Apple GPU family (MTLDevice.maxThreadgroupMemoryLength)
-# Metal binds 31 buffers a kernel: the weights' beside the scratch, constants, arena, 8 inputs and the instruction's
-BUFS_MAX = 19
 
-KvOff: TypeAlias = Callable[[int, int], int]  # the arena offset of layer i's K (0) or V (1)
 ConstKey: TypeAlias = tuple[str, int]  # a packed constant: what it is, and the module it is read from
 
 
@@ -106,10 +103,10 @@ class Block:
     """What a family's layer is made of in the megakernel (`Family.mega_layer`): the residual stream, read through a
     norm and added to by `add`, and the ops over it. An add waits for the next norm, which makes both in one op."""
 
-    def __init__(self, mp: MegaPass, prog: Program, kv_off: KvOff, splits: int) -> None:
+    def __init__(self, mp: MegaPass, prog: Program, splits: int) -> None:
         self.mp, self.p = mp, prog
         self.T = prog.T
-        self.kv_off, self.splits = kv_off, splits
+        self.splits = splits
         self.h: Tensor | None = None  # the residual
         self.y: Tensor | None = None  # an add to it not yet made
 
@@ -213,7 +210,7 @@ class Block:
         if qk is not None and mp.rscale != 1.0:
             raise ValueError("[mega] q/k norms with a scaled rope: the fused step scales after the kernel")
         q = p.scratch(Hq * hd)
-        K, V = Tensor((KV, self.kv_off(i, 0))), Tensor((KV, self.kv_off(i, 1)))
+        K, V = Tensor((kv(i, 0), 0)), Tensor((kv(i, 1), 0))
         row = mp.rope_row.get(mp.sm.layer_types[i], 0)
         f32 = qk is not None and qk[2]
         n = ((mp.rd // 2) | ((qk is not None) << 31), Hq | (row << 16), Hk | (hd << 16) | (f32 << 31))
@@ -276,9 +273,10 @@ class Block:
 
 
 class MegaPass:
-    """A model's pass of 1..ROWS_MAX rows over an arena cache replayed on the GPU, bit-exact with the fused path: its
-    weights in slot buffers, its constants packed once, a write-once scratch for the widest pass, and a program per
-    pass shape (rows, attention blocks, arena, argmax) built from the family's layers, encoded once and replayed."""
+    """A model's pass of 1..ROWS_MAX rows over an arena or a paged cache replayed on the GPU, bit-exact with the fused
+    path: its weights in slot buffers, its constants packed once, a write-once scratch for the widest pass, and a
+    program per pass shape (rows, attention blocks, argmax) built from the family's layers, encoded once and replayed
+    over whichever cache a pass binds."""
 
     def __init__(self, sm: StreamedTextModel, fusions: Fusions | None = None) -> None:
         from ...engine.families import act_name
@@ -346,18 +344,16 @@ class MegaPass:
         centered = sm.fam.norm_centered
         self.final_norm = (self._const(("final", 0), lambda: _norm_array(fn, True, centered)), _eps(fn))
         # the widest pass, built once: what it reads gathers the weights and the constants, its scratch the size
-        prog = self._program(ROWS_MAX, SPL, lambda i, w: 0, True)
+        prog = self._program(ROWS_MAX, SPL, True)
         self._frozen = True
         self.nb = len(self.bufs)
-        if self.nb > BUFS_MAX:
-            raise ValueError(f"[mega] {self.nb} weight buffers, the kernel binds {BUFS_MAX}")
         # the constants and the scratch whole pages, as the replay aliases them
         consts = [p.reshape(-1).view(m.uint8) for p in self._cparts]
         self.consts = m.concatenate([*consts, m.zeros((paged(self._csize) - self._csize,), dtype=m.uint8)])
         self.scr = m.zeros((paged(prog.size),), dtype=m.uint8)
         m.eval(self.consts, self.scr, self.freqs)
         # every op a pass shape compiles to: the widest's and a one-block pass's (its attention folding its own)
-        self.ops = frozenset(prog.ops) | self._program(ROWS_MAX, 1, lambda i, w: 0, True).ops
+        self.ops = frozenset(prog.ops) | self._program(ROWS_MAX, 1, True).ops
         self.instructions = len(prog.rows)  # the most a pass has: the widest one's
         self.replay = Replay(self)
 
@@ -459,20 +455,20 @@ class MegaPass:
             )
         return need
 
-    def _program(self, T: int, splits: int, kv_off: KvOff, argmax: bool) -> Program:
+    def _program(self, T: int, splits: int, argmax: bool) -> Program:
         """a pass's program: every layer and the head"""
         p = Program(T, ROWS_MAX)
-        b = Block(self, p, kv_off, splits)
+        b = Block(self, p, splits)
         b.embed()
         for i in range(self.L):
             self.sm.fam.mega_layer(b, i)
         b.final(argmax)
         return p
 
-    def table(self, T: int, splits: int, kv_off: KvOff, argmax: bool = True) -> np.ndarray:
-        """the program of a pass of T rows (`splits` attention blocks, the arena's layers at `kv_off`) as the table the
-        replay encodes, uint32 [instructions, W]"""
-        return self._program(T, splits, kv_off, argmax).table(self.nb)
+    def table(self, T: int, splits: int, argmax: bool = True) -> np.ndarray:
+        """the program of a pass of T rows (`splits` attention blocks) as the table the replay encodes, uint32
+        [instructions, W]"""
+        return self._program(T, splits, argmax).table(self.nb)
 
     def logits(self, T: int) -> mx_.array:
         """the logits [T, V] float32 the last pass left in the scratch (a pass without its argmax)"""
@@ -481,9 +477,9 @@ class MegaPass:
 
     def run(
         self,
-        kv: mx_.array,
+        kvs: Sequence[KvSlot],
         cap: int,
-        kv_off: KvOff,
+        rmap: np.ndarray | None,
         ids: Sequence[int],
         pos: Sequence[int],
         meta: mx_.array,
@@ -492,10 +488,14 @@ class MegaPass:
         past: int,
         argmax: bool = True,
     ) -> np.ndarray:
-        """the pass, run and waited for: `kv` the arena (uint8), `cap` its rows a head, `ids` and `pos` the rows' tokens
-        and positions, `meta`/`path` the node metadata; the argmax ids uint32 [T] (zeros with `argmax` off, the logits
-        then in the scratch)"""
-        return self.replay.run(kv, cap, kv_off, ids, pos, meta, path, splits, past, argmax)
+        """the pass, run and waited for: `kvs` each layer's K then V rows (2L of them) [Hk, cap, D] bf16, `rmap` a paged
+        cache's row map (uint32, the conversation's rows to the regions' through the pass's own: rows are read and
+        written through it) or None for rows where they lie (an arena), `ids` and `pos` the rows' tokens and positions,
+        `meta`/`path` the node metadata; the argmax ids uint32 [T] (zeros with `argmax` off, the logits then in the
+        scratch)"""
+        if len(kvs) != 2 * self.L:
+            raise ValueError(f"[mega] {len(kvs)} K and V regions for {self.L} layers")
+        return self.replay.run(kvs, cap, rmap, ids, pos, meta, path, splits, past, argmax)
 
 
 def _one_or_parts(mod: object, fused: str, names: tuple[str, ...]) -> Linears:

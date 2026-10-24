@@ -204,6 +204,23 @@ pub unsafe fn contents(h: i64, b: i64, out: *mut *mut u8, len: *mut u64) -> i32 
     .unwrap_or_else(|e| e)
 }
 
+/// Buffer `b`'s GPU address into `out`: what a kernel dereferences where a table of addresses names the buffer (the
+/// command buffers that read it make every buffer of the context resident).
+///
+/// # Safety
+/// `out` writable.
+pub unsafe fn gpu_address(h: i64, b: i64, out: *mut u64) -> i32 {
+    if out.is_null() {
+        return ERR_NULL;
+    }
+    with(h, |c| {
+        let buf = slot(&c.bufs, b)?;
+        unsafe { *out = buf.gpuAddress() };
+        Ok(OK)
+    })
+    .unwrap_or_else(|e| e)
+}
+
 /// `src` (NUL-terminated UTF-8) compiled as the context's library, the math safe unless `fast` (MLX compiles its
 /// kernels safe: the bits a pass gives depend on it). `ERR_PARSE` with the compiler's message in `err`.
 ///
