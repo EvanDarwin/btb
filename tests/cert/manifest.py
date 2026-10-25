@@ -98,10 +98,9 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "tiny GGUF fixture (tests/make_fixtures.py) so the storage cells can bind",
     ),
     Missing.MEGAKERNEL: (
-        "the fused MLX megakernel is not written for this family: it takes the dense kernel layout alone "
-        "(mlx_forward.py:1320 refuses a sandwich family), so a MoE family runs the per-op host path "
-        "(MLX_PEROP), a hybrid family the DeltaNet forward (MLX_HYBRID), and the rest the step path "
-        "(MLX_STEP_FUSED for a sandwich layout, MLX_STEP_UNFUSED without one)",
+        "the fused MLX megakernel is not written for this family: it composes the plain pre-norm block, the sandwich "
+        "block and a hybrid's DeltaNet and gated attention layers (`Family.mega`, `mega_layer`), so a mixture's "
+        "layers run the per-op host path (MLX_PEROP) and a family that brings its own layer its own",
         "implement the megakernel for this family's layout, or record it as a DNR if the architecture genuinely "
         "precludes a dense fused kernel",
     ),

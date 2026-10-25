@@ -14,9 +14,9 @@ import pytest
 import torch
 
 from btb.engine.cache import GrowLayer
-from btb.kinds import MEGA_STORED, Parents, Tokens
+from btb.kinds import MEGA_STORED, Cap, LayerKind, Parents, Tokens
 from btb.sampling import GREEDY
-from tests.cert import spec
+from tests.cert import core, spec
 from tests.helpers import FIXTURES, NO_LOG, need_cached, need_mlx
 
 if TYPE_CHECKING:
@@ -44,6 +44,12 @@ def engine(request: pytest.FixtureRequest) -> Iterator[StreamedTextModel]:
     sm.close()
 
 
+def _kv_layers(sm: StreamedTextModel) -> tuple[int, int]:
+    """the first and the last layer that keep K rows (a hybrid's attention layers, not its DeltaNet ones)"""
+    att = [i for i in range(sm.L) if sm.layer_types[i] != LayerKind.LINEAR]
+    return att[0], att[-1]
+
+
 def _pass(
     sm: StreamedTextModel,
     mega: MegaPass | None,
@@ -53,7 +59,8 @@ def _pass(
     arena: MegaPass | None = None,
 ) -> tuple[list[int], list[mx.array]]:
     """one pass by `mega` (None: the step) over a fresh cache, the arena of `arena` (else of `mega`; a plain cache
-    without either): (argmax ids, layer 0's and the last layer's K rows after it, the prompt's and the pass's)"""
+    without either): (argmax ids, the first and the last attention layer's K rows after it, the prompt's and the
+    pass's)"""
     import mlx.core as mx
 
     sm._mega = arena or mega
@@ -69,10 +76,11 @@ def _pass(
             ids = [int(v) for v in out[0].tolist()]
         finally:
             sm.ab()
+    att = [cl for i, cl in enumerate(cache.layers) if sm.layer_types[i] != LayerKind.LINEAR]
     if arena or mega:
-        assert all(isinstance(cl, GrowLayer) and cl.arena is not None for cl in cache.layers), "the pass left the arena"
+        assert all(isinstance(cl, GrowLayer) and cl.arena is not None for cl in att), "the pass left the arena"
     T = len(toks)
-    rows = [cache.layers[i]._mx[0][0, :, : past + T].astype(mx.float32) for i in (0, len(cache.layers) - 1)]
+    rows = [cache.layers[i]._mx[0][0, :, : past + T].astype(mx.float32) for i in _kv_layers(sm)]
     return ids, rows
 
 
@@ -326,7 +334,7 @@ def _along(sm: StreamedTextModel, prompt: Tokens, toks: Tokens, parents: Parents
             out = sm.forward([[toks[n]]], cache=cache, last_only=False, pick=True)
     assert out is not None
     row = len(prompt) + len(path) - 1
-    return int(out[0, 0]), [cache.layers[i]._mx[0][0, :, row : row + 1] for i in (0, len(cache.layers) - 1)]
+    return int(out[0, 0]), [cache.layers[i]._mx[0][0, :, row : row + 1] for i in _kv_layers(sm)]
 
 
 @pytest.mark.parametrize("past", [9, 70])
@@ -367,23 +375,22 @@ def test_family_tree_kernels_match_step(tiny: StreamedTextModel, past: int, monk
 
 
 def test_split_projections_match_step(tiny: StreamedTextModel) -> None:
-    """with q/k/v and gate/up not one weight (a GGUF's v of another type than q and k), each written as its own
-    piece of one output row: every node of a tree pass is still the step's one-row step along its path"""
+    """with q/k/v, gate/up and a DeltaNet's four inputs not one weight (a GGUF's v of another type than q and k),
+    each written as its own piece of one output row: every node of a tree pass is still the step's one-row step
+    along its path"""
     import mlx.core as mx
 
     from btb.mlx.mega import MegaPass
-    from btb.mlx.mega.model import DenseLayer, dense_layer
 
     sm = tiny
     mega = sm._mega
-    layers: list[DenseLayer] = []
+    held: list[tuple[object, str, object]] = []
     for i in range(sm.L):
-        ly = sm.host[i]
-        assert dense_layer(ly), f"layer {i} is not the plain block's"
-        layers.append(ly)
-    held = [(ly.self_attn._mx_qkv, ly.mlp._mx_gu) for ly in layers]
-    for ly in layers:
-        ly.self_attn._mx_qkv = ly.mlp._mx_gu = None
+        for part, name in (("self_attn", "_mx_qkv"), ("mlp", "_mx_gu"), ("linear_attn", "_mx_in")):
+            mod = getattr(sm.host[i], part, None)
+            if mod is not None and getattr(mod, name, None) is not None:
+                held.append((mod, name, getattr(mod, name)))
+                setattr(mod, name, None)
     parents = [-1, 0, 1, 0, 3, 3, 1]
     V = _vocab(sm)
     prompt = [1 + (7 * t) % (V - 1) for t in range(70)]
@@ -399,9 +406,54 @@ def test_split_projections_match_step(tiny: StreamedTextModel) -> None:
                 row = a[:, len(prompt) + j : len(prompt) + j + 1]
                 assert mx.array_equal(row, b.astype(mx.float32)), f"node {j}: K rows differ from the step's"
     finally:
-        for ly, (qkv, gu) in zip(layers, held, strict=True):
-            ly.self_attn._mx_qkv, ly.mlp._mx_gu = qkv, gu
+        for mod, name, w in held:
+            setattr(mod, name, w)
         sm._mega = mega
+
+
+# the fixtures of every hybrid family the megakernel composes: their DeltaNet layers' states
+HYBRID_STEMS = [s for s in STEMS if Cap.HYBRID in core.flags(next(k for k, v in spec.FIXTURE_STEM.items() if v == s))]
+
+
+@pytest.fixture(scope="module", params=HYBRID_STEMS)
+def hybrid(request: pytest.FixtureRequest) -> Iterator[StreamedTextModel]:
+    import btb
+
+    need_mlx()
+    sm = btb.load(os.path.join(FIXTURES, str(request.param)), device="mlx", log=NO_LOG, mlx_mega=1)
+    assert sm._mega is not None, f"the megakernel did not build on {request.param}"
+    yield sm
+    sm.close()
+
+
+def test_delta_states_match_step(hybrid: StreamedTextModel) -> None:
+    """the DeltaNet states a pass writes back - after a row, another, and a chain of four - are the step's bit for
+    bit, each layer's conv window and recurrent state, and the passes ran on the megakernel"""
+    from btb.kinds import PassTag
+
+    sm = hybrid
+    mega = sm._mega
+    V = _vocab(sm)
+    prompt = [1 + (7 * t) % (V - 1) for t in range(40)]
+    passes = [[5], [9], [11, 13, 17, 19]]
+    linear = [i for i in range(sm.L) if sm.layer_types[i] == LayerKind.LINEAR]
+    states: dict[bool, list[tuple[torch.Tensor, ...]]] = {}
+    try:
+        for use in (False, True):
+            sm._mega = mega if use else None
+            cache = sm.new_cache(max_len=4096)
+            with torch.inference_mode():
+                sm._prefill(torch.tensor([prompt]), cache)
+                sm._pass_reset()
+                for toks in passes:
+                    sm.forward([toks], cache=cache, last_only=False, pick=True)
+            assert (PassTag.MLX_MEGA in sm.last_pass_report()) is use, "the passes did not take the path asked"
+            states[use] = [tuple(t.clone() for t in sm._lin(cache.layers[i])) for i in linear]
+    finally:
+        sm._mega = mega
+    for i, step, ours in zip(linear, states[False], states[True], strict=True):
+        assert torch.equal(step[0], ours[0]), f"layer {i}'s conv window differs from the step's"
+        assert torch.equal(step[1], ours[1]), f"layer {i}'s recurrent state differs from the step's"
 
 
 def test_every_shape_places_the_logits_alike(tiny: StreamedTextModel) -> None:
@@ -437,6 +489,10 @@ def test_a_pass_let_go_is_freed_at_once(tiny: StreamedTextModel) -> None:
 
 
 def test_family_loops_match_step(tiny: StreamedTextModel) -> None:
+    """the greedy and speculative loops on the megakernel give the step's tokens, and the speculative one's passes
+    take it: an MTP drafter's verify passes hook the last layer's output, which the megakernel hands over"""
+    from btb.kinds import PassTag
+
     sm = tiny
     mega = sm._mega
     V = _vocab(sm)
@@ -447,12 +503,69 @@ def test_family_loops_match_step(tiny: StreamedTextModel) -> None:
             for use in (False, True):
                 sm._mega = mega if use else None
                 out[("greedy", use)] = list(sm.generate_greedy(ids, 24))
+                sm._pass_reset()
                 out[("spec", use)] = list(sm.generate_speculative(ids, 24)[0])
+                assert (PassTag.MLX_MEGA in sm.last_pass_report()) is use, "the speculative loop's passes"
     finally:
         sm._mega = mega
     g = out[("greedy", False)]
     for k, v in out.items():
         assert v == g, f"{k} gave {v[:12]}... against the step's greedy loop's {g[:12]}..."
+
+
+def test_mlx_float_ops_emulated_bit_for_bit() -> None:
+    """the megakernel's copies of the float32 MLX ops a DeltaNet's front and norm take (kernel.py `MLX_OPS`): sigmoid
+    and logaddexp against zero (the decay's softplus) over values across the range and its edges, and rms_norm over a
+    row of up to 128 by one simdgroup (`mlx_rms_inv_simd`), against MLX's own"""
+    import mlx.core as mx
+    import numpy as np
+
+    from btb.mlx.core import metal_kernel
+    from btb.mlx.mega.kernel import MLX_OPS, TYPES
+
+    need_mlx()
+    elem = metal_kernel(
+        name="test_mega_mlx_float",
+        input_names=["x"],
+        output_names=["sig", "lae"],
+        header=TYPES + MLX_OPS,
+        source="    uint i = thread_position_in_grid.x;\n    sig[i] = mlx_sigmoid(x[i]);\n"
+        + "    lae[i] = mlx_logaddexp(x[i], 0.0f);\n",
+    )
+    rng = np.random.default_rng(0)
+    edges = [0.0, -0.0, 1e-30, -1e-30, 1e-7, -1e-7, 88.7, -88.7, 104.0, -104.0, 1e30, -1e30, np.inf, -np.inf]
+    vals = np.concatenate([*(rng.standard_normal(1 << 18) * s for s in (0.01, 1, 10, 100)), np.array(edges)])
+    x = mx.array(vals.astype(np.float32))
+    sig, lae = elem(
+        inputs=[x],
+        grid=(int(x.size), 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[x.shape, x.shape],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    assert mx.array_equal(sig.view(mx.uint32), mx.sigmoid(x).view(mx.uint32)), "sigmoid"
+    assert mx.array_equal(lae.view(mx.uint32), mx.logaddexp(x, 0.0).view(mx.uint32)), "logaddexp"
+    rms = metal_kernel(
+        name="test_mega_mlx_rms_simd",
+        input_names=["x", "w", "eps"],
+        output_names=["y"],
+        header=TYPES + MLX_OPS,
+        source="    uint r = threadgroup_position_in_grid.x, lane = thread_position_in_threadgroup.x, H = x_shape[1];\n"
+        + "    float inv = mlx_rms_inv_simd(x + (size_t)r * H, H, eps[0], lane);\n"
+        + "    for (uint i = lane; i < H; i += 32) y[(size_t)r * H + i] = w[i] * (x[(size_t)r * H + i] * inv);\n",
+    )
+    for H in (32, 64, 128):
+        x = mx.array((rng.standard_normal((256, H)) * 3).astype(np.float32))
+        w = mx.array((1 + 0.1 * rng.standard_normal(H)).astype(np.float32))
+        got = rms(
+            inputs=[x, w, mx.array([1e-6], dtype=mx.float32)],
+            grid=(256 * 32, 1, 1),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(256, H)],
+            output_dtypes=[mx.float32],
+        )[0]
+        want = mx.fast.rms_norm(x, w, 1e-6)
+        assert mx.array_equal(got.view(mx.uint32), want.view(mx.uint32)), f"rms_norm float32 H {H}"
 
 
 def test_mlx_ops_emulated_bit_for_bit() -> None:

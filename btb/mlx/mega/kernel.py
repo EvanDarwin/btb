@@ -13,6 +13,7 @@ from typing import NamedTuple
 from ...kinds import MEGA_STORED, Quant, quant_key
 from .. import aluminum, fused, kquant, legacyq, matvec, q6k
 from ..core import mx
+from ..gemv import GEMM_SRC, gemm_sgn
 from ..matvec import StoredKernel
 
 # a table row: op, units (the op's work items, a threadgroup each), REFS (buffer, offset) references from column
@@ -21,7 +22,7 @@ REFS = 6
 REF0 = 2
 NUM = REF0 + 2 * REFS  # n0's column
 DEP0 = NUM + 4
-DEPS = 3
+DEPS = 4  # a DeltaNet's conv reads its four input projections' pieces where they are not one weight
 W = DEP0 + DEPS
 # dims: rows of the pass, the path's row stride, the K/V regions' rows a head, past, then unused to 8
 DIMS = 8
@@ -59,7 +60,8 @@ MLX_OPS = r"""
 // striding the row by 4096), a thread's squares summed in its order, simd_sum within each of its simdgroups, simd_sum
 // across them, precise rsqrt. Ours walk its simdgroups in turn, each lane standing for the thread at its own lane, so
 // every simd_sum takes MLX's values in MLX's lanes
-inline float mlx_rms_inv(const device bfloat* xr, uint H, float eps, thread const Ctx& c) {
+template <typename X>
+inline float mlx_rms_inv(const device X* xr, uint H, float eps, thread const Ctx& c) {
     threadgroup float* part = (threadgroup float*)c.tgm;
     if (c.tid < 32) part[c.tid] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -121,6 +123,32 @@ inline bfloat mlx_gelu_tanh(bfloat a) {
     bfloat t = (bfloat)metal::precise::tanh((float)((bfloat)0.7978845608028654f * (a + cube)));
     return ((bfloat)0.5f * a) * ((bfloat)1.0f + t);
 }
+
+// MLX's log1p (utils.h) and logaddexp (binary_ops.h `LogAddExp`) on float32, their log and exp the precise ones
+inline float mlx_log1p(float x) {
+    float xp1 = 1.0f + x;
+    if (xp1 == metal::numeric_limits<float>::max()) return metal::numeric_limits<float>::max();
+    if (xp1 == 1.0f) return x;
+    return x * (metal::precise::log(xp1) / (xp1 - 1.0f));
+}
+
+inline float mlx_logaddexp(float x, float y) {
+    if (metal::isnan(x) || metal::isnan(y)) return metal::numeric_limits<float>::quiet_NaN();
+    constexpr float inf = metal::numeric_limits<float>::infinity();
+    float maxval = metal::max(x, y), minval = metal::min(x, y);
+    return (minval == -inf || maxval == inf) ? maxval : (maxval + mlx_log1p(metal::precise::exp(minval - maxval)));
+}
+
+// a float32 row of H <= 128 elements' inverse RMS as MLX's rms_norm takes it, by one simdgroup: MLX's threadgroup of
+// 32 threads of 4 elements each, its second simd_sum over a single partial and zeros (`mlx_rms_inv`'s, one simdgroup)
+inline float mlx_rms_inv_simd(const device float* xr, uint H, float eps, uint lane) {
+    float acc = 0.0f;
+    float xv[4];
+    for (uint i = 0; i < 4; ++i) xv[i] = lane * 4 + i < H ? xr[lane * 4 + i] : 0.0f;
+    for (uint i = 0; i < 4; ++i) acc += xv[i] * xv[i];
+    acc = simd_sum(acc);
+    return metal::precise::rsqrt(acc / H + eps);
+}
 """
 
 
@@ -143,6 +171,10 @@ class OpName(StrEnum):
     HEAD = "head"
     ARGMAX_PART = "argmax_part"
     SANDWICH_ADD = "sandwich_add"
+    GATE = "gate"
+    DELTA_CONV = "delta_conv"
+    DELTA_RULE = "delta_rule"
+    DELTA_NORM = "delta_norm"
     # a stored type's matvec and embedding row (`STORED`), named by its `kinds.quant_key`
     MV_Q2K = "mv_q2k"
     MV_Q3K = "mv_q3k"
@@ -375,17 +407,18 @@ _op(
     r"""
 inline void op_qkrope(thread const Ins& I, uint item, thread const Ctx& c) {
     // the q/k norms (where n0's top bit is set), the rope on the first 2 * hd2 dims (hd2 = n0's low bits) and the
-    // append: item -> (row t, head hh) over Hq q, Hk k and Hk v heads of qkv (A, [T, (Hq + 2Hk) * D]); q -> C
-    // [T, Hq, D]; k, v -> row past + t (D: this layer's K, E: its V, each [Hk, cap, D]; under MAP the row the
-    // conversation's row past + t lies at); the norm
-    // weights qn, kn [D] end to end at B (bf16, or float32 where n2's top bit is set: a centered norm's 1 + w); Hq =
-    // n1 & 0xffff with the rope's row of `freqs` above it, Hk = n2 & 0xffff, D = n2's bits 16..30; f0 the norms' eps, or
-    // without them the scale on the rotated dims (rope_fast's `y * scaling`: MLX rounds the Python float to the
-    // array's bf16 and rounds the product)
-    bool norm = I.n0 >> 31, wf32 = I.n2 >> 31;
+    // append: item -> (row t, head hh) over Hq q, Hk k and Hk v heads of qkv (A, [T, (Hq + 2Hk) * D]; where n1's bit 30
+    // is set [T, (2Hq + 2Hk) * D], each q head followed by its gate's, Qwen3.5's); q -> C [T, Hq, D]; k, v -> row
+    // past + t (D: this layer's K, E: its V, each [Hk, cap, D]; under MAP the row the conversation's row past + t lies
+    // at); the norm weights qn, kn [D] end to end at B (bf16, or float32 where n2's top bit is set: a centered norm's
+    // 1 + w), the norms the fused kernel's or, where n1's top bit is set, MLX's rms_norm rounded to bf16 before the
+    // rope as the step's own ops make it; Hq = n1 & 0xffff with the rope's row of `freqs` above it, Hk = n2 & 0xffff,
+    // D = n2's bits 16..30; f0 the norms' eps, or without them the scale on the rotated dims (rope_fast's
+    // `y * scaling`: MLX rounds the Python float to the array's bf16 and rounds the product)
+    bool norm = I.n0 >> 31, wf32 = I.n2 >> 31, mlxnorm = I.n1 >> 31, gated = (I.n1 >> 30) & 1u;
     uint hd2 = I.n0 & 0x7fffffffu;
     uint Hq = I.n1 & 0xffffu, Hk = I.n2 & 0xffffu, D = (I.n2 >> 16) & 0x7fffu;
-    const device float* freqs = c.freqs + (I.n1 >> 16) * hd2;
+    const device float* freqs = c.freqs + ((I.n1 >> 16) & 0x3fffu) * hd2;
     uint CAPR = c.dims[2];
     uint per = Hq + 2 * Hk;
     uint t = item / per, hh = item - t * per;
@@ -394,7 +427,8 @@ inline void op_qkrope(thread const Ins& I, uint item, thread const Ctx& c) {
 #else
     uint row = c.dims[3] + t;
 #endif
-    const device bfloat* src = (const device bfloat*)I.A + ((size_t)t * per + hh) * D;
+    uint at = gated ? (hh < Hq ? 2 * hh : hh + Hq) : hh;
+    const device bfloat* src = (const device bfloat*)I.A + ((size_t)t * (gated ? per + Hq : per) + at) * D;
     if (hh >= Hq + Hk) {
         device bfloat* dst = (device bfloat*)I.E + ((size_t)(hh - Hq - Hk) * CAPR + row) * D;
         for (uint i = c.tid; i < D; i += 256) dst[i] = src[i];
@@ -405,7 +439,14 @@ inline void op_qkrope(thread const Ins& I, uint item, thread const Ctx& c) {
                              : ((device bfloat*)I.D + ((size_t)(hh - Hq) * CAPR + row) * D);
     const device bfloat* wn = (const device bfloat*)I.B + (isq ? 0 : D);
     threadgroup float* part = (threadgroup float*)c.tgm;
-    if (norm && wf32) {
+    if (mlxnorm) {
+        // the head normed into its destination, then turned there (every element read back by the thread that wrote
+        // it); the norm's weights and eps as the fused norm's, read by MLX's arithmetic
+        if (wf32) mlx_rms_norm_row(src, dst, (const device float*)I.B + (isq ? 0 : D), D, I.f0, c);
+        else mlx_rms_norm_row(src, dst, wn, D, I.f0, c);
+        threadgroup_barrier(mem_flags::mem_device);
+        btb_qk_norm_rope_head<false>(dst, dst, wn, D, hd2, 0.0f, freqs, c.pos[t], c.tid, c.lane, c.sg, part, part + 8);
+    } else if (norm && wf32) {
         const device float* wf = (const device float*)I.B + (isq ? 0 : D);
         btb_qk_norm_rope_head<true>(src, dst, wf, D, hd2, I.f0, freqs, c.pos[t], c.tid, c.lane, c.sg, part, part + 8);
     } else if (norm) {
@@ -532,7 +573,8 @@ _op(
     r"""
 inline void op_fnorm(thread const Ins& I, uint item, thread const Ctx& c) {
     // the final norm in float32: x (C, [T, H] float32) = rmsnorm(h (A, bf16)) * w (B, float32); where n1 & 1, h is
-    // the residual add h + y (E) rounded to bf16, as the block's own add would store it; H = n0, eps = f0
+    // the residual add h + y (E) rounded to bf16, as the block's own add would store it, and that residual (the last
+    // layer's output, a layer hook's) into D [T, H] bf16; H = n0, eps = f0
     uint H = I.n0;
     const device bfloat* hr = (const device bfloat*)I.A + (size_t)item * H;
     const device bfloat* yr = (const device bfloat*)I.E + (size_t)item * H;
@@ -551,82 +593,13 @@ inline void op_fnorm(thread const Ins& I, uint item, thread const Ctx& c) {
     float tot = 0.0f;
     for (uint q = 0; q < 8; ++q) tot += part[q];
     float scale = metal::rsqrt(tot / (float)H + I.f0);
+    device bfloat* res = (device bfloat*)I.D + (size_t)item * H;
     for (uint i = c.tid; i < H; i += 256) {
         float v = add ? (float)(bfloat)((float)hr[i] + (float)yr[i]) : (float)hr[i];
         xr[i] = v * scale * w[i];
+        res[i] = (bfloat)v;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-}
-""",
-)
-
-_op(
-    OpName.HEAD,
-    r"""
-inline void op_head(thread const Ins& I, uint item, thread const Ctx& c) {
-    // y [T, rows] float32 (C) = x [T, cols] float32 (B) . W [rows, cols]^T (A) as float 8x8 tiles (the weight widened
-    // at the stage, K steps of 32: the tile kernel's float path, the same chain); rows = n0, cols = n1
-    const uint KT = 32;
-    const uint NB = c.dims[0];
-    uint Nr = I.n0, K = I.n1;
-    uint ntile = (Nr + 7) / 8;
-    uint t0 = (uint)(((ulong)item * ntile) / I.items), t1 = (uint)(((ulong)(item + 1) * ntile) / I.items);
-    uint lane = c.lane;
-    for (uint tile = t0 + c.sg; tile < t1; tile += 8) {
-        uint nb0 = tile * 8;
-        const device uint16_t* w = (const device uint16_t*)I.A;
-        const device float* x = (const device float*)I.B;
-        threadgroup float* ws = (threadgroup float*)c.tgm + c.sg * (8 * KT);
-        threadgroup float* xs = (threadgroup float*)c.tgm + 8 * (8 * KT) + c.sg * (XROWS * KT);
-        uint wr = lane / 4, wc = (lane % 4) * 8;
-        const device uint4* wp = (const device uint4*)(w + (size_t)min(nb0 + wr, Nr - 1) * K + wc);
-        bool okw = nb0 + wr < Nr;
-        const uint XR = XROWS / 4;
-        uint xr[4]; bool xok[4]; const device uint4* xp[4];
-        for (uint i = 0; i < XR; ++i) {
-            uint piece = lane + 32 * i;
-            xr[i] = piece / 8;
-            uint xc = (piece % 8) * 4;
-            xok[i] = xr[i] < NB;
-            xp[i] = (const device uint4*)(x + (size_t)min(xr[i], NB - 1) * K + xc);
-        }
-        simdgroup_float8x8 acc0(0.0f), acc1(0.0f);
-        uint nstep = (K + KT - 1) / KT;
-        for (uint st = 0; st < nstep; ++st) {
-            uint k0 = st * KT;
-            uint4 pk = (okw && k0 + wc < K) ? wp[st * (KT / 8)] : uint4(0u);
-            threadgroup float4* d0 = (threadgroup float4*)(ws + wr * KT + wc);
-            d0[0] = float4(as_type<float>(pk.x << 16), as_type<float>(pk.x & 0xffff0000u), as_type<float>(pk.y << 16), as_type<float>(pk.y & 0xffff0000u));
-            d0[1] = float4(as_type<float>(pk.z << 16), as_type<float>(pk.z & 0xffff0000u), as_type<float>(pk.w << 16), as_type<float>(pk.w & 0xffff0000u));
-            for (uint i = 0; i < XR; ++i) {
-                uint piece = lane + 32 * i;
-                uint xc = (piece % 8) * 4;
-                uint4 xv = (xok[i] && k0 + xc < K) ? xp[i][st * (KT / 4)] : uint4(0u);
-                *((threadgroup uint4*)(xs + xr[i] * KT + xc)) = xv;
-            }
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint ks = 0; ks < KT / 8; ++ks) {
-                simdgroup_float8x8 A0, A1, Bt;
-                simdgroup_load(Bt, ws + ks * 8, KT, ulong2(0, 0), true);
-                simdgroup_load(A0, xs + ks * 8, KT);
-                simdgroup_multiply_accumulate(acc0, A0, Bt, acc0);
-                if (XROWS > 8) {
-                    simdgroup_load(A1, xs + 8 * KT + ks * 8, KT);
-                    simdgroup_multiply_accumulate(acc1, A1, Bt, acc1);
-                }
-            }
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        threadgroup float* outp = xs;
-        simdgroup_store(acc0, outp, 8);
-        if (XROWS > 8) simdgroup_store(acc1, outp + 64, 8);
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint o = lane; o < NB * 8; o += 32) {
-            uint b = o / 8, n = o % 8;
-            if (nb0 + n < Nr) ((device float*)I.C)[(size_t)b * Nr + nb0 + n] = outp[o];
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-    }
 }
 """,
 )
@@ -654,6 +627,169 @@ inline void op_argmax_part(thread const Ins& I, uint item, thread const Ctx& c) 
         ((device uint*)I.C)[I.n2 + item] = bi0;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+""",
+)
+
+_op(
+    OpName.GATE,
+    r"""
+inline void op_gate(thread const Ins& I, uint item, thread const Ctx& c) {
+    // y (C, [T, n0] bf16) = a (A) * sigmoid(gate), Qwen3.5's output gate as the step's MLX ops make it on bf16; the
+    // gate the second half of each q head's 2 * n1 columns in qkv (B, rows of n2); item -> 256 elements
+    uint e = item * 256 + c.tid, W = I.n0, D = I.n1;
+    if (e >= c.dims[0] * W) return;
+    uint t = e / W, j = e - t * W;
+    bfloat g = ((const device bfloat*)I.B)[(size_t)t * I.n2 + (j / D) * 2 * D + D + j % D];
+    ((device bfloat*)I.C)[e] = ((const device bfloat*)I.A)[e] * mlx_sigmoid(g);
+}
+""",
+)
+
+_op(
+    OpName.DELTA_CONV,
+    r"""
+inline void op_delta_conv(thread const Ins& I, uint item, thread const Ctx& c) {
+    // the DeltaNet's front, as the step's float32 MLX ops make it (delta.py `delta_tree_step`): a thread a channel of
+    // the C = n0 the conv reads (`mixed`, the first C columns of each row of the projections p, A: [T, n1] bf16), each
+    // node's window its K = DELTA_K newest inputs along its path, the stored inputs (the conv state E, [C, K] float32,
+    // its last K - 1) past the root; xc (C, [T, C]) = silu(sum_j window_j * w_j + bias), w and the bias the layer's
+    // constants (B: conv_w [C, K], conv_b [C], a_log, dt_bias [Hv]). Thread e < T * Hv besides: g = -exp(a_log) *
+    // logaddexp(a + dt_bias, 0) and beta = sigmoid(b) (D, [T, 2Hv]: g then beta), b and a p's last 2Hv columns. n2: Hv
+    // (low 16 bits), a bias (bit 16), the windows kept for a verify's commit (bit 17: F, [T, C, K]) else the last
+    // node's written back over the state (a chain's: one row, or a continuation's)
+    uint C = I.n0, P = I.n1, Hv = I.n2 & 0xffffu, T = c.dims[0];
+    bool bias = (I.n2 >> 16) & 1u, keep = (I.n2 >> 17) & 1u;
+    uint e = item * 256 + c.tid;
+    const device bfloat* p = (const device bfloat*)I.A;
+    const device float* w = (const device float*)I.B;
+    if (e < T * Hv) {
+        uint t = e / Hv, h = e - t * Hv;
+        const device float* a_log = w + C * DELTA_K + (bias ? C : 0);
+        const device float* dt_bias = a_log + Hv;
+        float b = (float)p[(size_t)t * P + P - 2 * Hv + h], a = (float)p[(size_t)t * P + P - Hv + h];
+        float lae = mlx_logaddexp(a + dt_bias[h], 0.0f);
+        ((device float*)I.D)[(size_t)t * 2 * Hv + h] = -metal::precise::exp(a_log[h]) * lae;
+        ((device float*)I.D)[(size_t)t * 2 * Hv + Hv + h] = mlx_sigmoid(b);
+    }
+    if (e >= C) return;
+    device float* st = (device float*)I.E + (size_t)e * DELTA_K;
+    float prev[DELTA_K - 1];
+    for (uint j = 0; j + 1 < DELTA_K; ++j) prev[j] = st[j + 1];
+    float in[XROWS];
+    for (uint t = 0; t < T; ++t) in[t] = (float)p[(size_t)t * P + e];
+    const device float* we = w + (size_t)e * DELTA_K;
+    float win[DELTA_K];
+    for (uint t = 0; t < T; ++t) {
+        uint d = c.pos[t] - c.dims[3];
+        const device uint* path = c.path + (size_t)t * c.dims[1];
+        for (uint j = 0; j < DELTA_K; ++j) {
+            // j steps back from the node: its path's nodes, then the stored inputs newest first
+            win[DELTA_K - 1 - j] = j <= d ? in[path[d - j]] : prev[DELTA_K - 1 - (j - d)];
+        }
+        float xc = win[0] * we[0];
+        for (uint j = 1; j < DELTA_K; ++j) {
+            float pr = win[j] * we[j];
+            xc = xc + pr;
+        }
+        if (bias) xc = xc + w[C * DELTA_K + e];
+        ((device float*)I.C)[(size_t)t * C + e] = xc * mlx_sigmoid(xc);
+        if (keep) {
+            device float* ck = (device float*)I.F + ((size_t)t * C + e) * DELTA_K;
+            for (uint j = 0; j < DELTA_K; ++j) ck[j] = win[j];
+        }
+    }
+    if (!keep)
+        for (uint j = 0; j < DELTA_K; ++j) st[j] = win[j];
+}
+""",
+)
+
+_op(
+    OpName.DELTA_RULE,
+    r"""
+inline void op_delta_rule(thread const Ins& I, uint item, thread const Ctx& c) {
+    // the gated delta rule over the pass's nodes, delta.py's tree kernel node by node (each from its parent's state,
+    // the root from the layer's, E: [Hv, DK, DV] float32): lane = c.lane over DELTA_NPT key elements each, column j of
+    // head h a simdgroup, 8 a threadgroup. q, k raw (the first 2 * key_dim columns of xc, A: [T, C]), v behind them;
+    // g and beta (B, [T, 2Hv]); out (C, [T, Hv, DV]). Hv = n0, Hk = n1; n2 set: a verify's, the states left for its
+    // commit, else the last node's state written back over the layer's (a chain's)
+    const uint DK = DELTA_DK, DV = DELTA_DV, NPT = DELTA_NPT;
+    uint Hv = I.n0, Hk = I.n1, T = c.dims[0];
+    uint h = item / (DV / 8), j = (item % (DV / 8)) * 8 + c.sg, lane = c.lane;
+    uint hk = h / (Hv / Hk), key_dim = Hk * DK, C = 2 * key_dim + Hv * DV;
+    const device float* xc = (const device float*)I.A;
+    const device float* gb = (const device float*)I.B;
+    device float* state = (device float*)I.E;
+    const float qscale = 1.0f / metal::precise::sqrt((float)DK);
+    float S[XROWS][NPT];
+    for (uint t = 0; t < T; ++t) {
+        uint d = c.pos[t] - c.dims[3];
+        int par = d ? (int)c.path[(size_t)t * c.dims[1] + d - 1] : -1;
+        float cur[NPT];
+        if (par < 0) {
+            for (uint i = 0; i < NPT; ++i) cur[i] = state[((size_t)h * DK + lane * NPT + i) * DV + j];
+        } else {
+            for (uint i = 0; i < NPT; ++i) cur[i] = S[par][i];
+        }
+        float gt = exp(gb[(size_t)t * 2 * Hv + h]);
+        float bt = gb[(size_t)t * 2 * Hv + Hv + h];
+        float vt = xc[(size_t)t * C + 2 * key_dim + h * DV + j];
+        const device float* qt = xc + (size_t)t * C + hk * DK + lane * NPT;
+        const device float* kt = qt + key_dim;
+        float kk[NPT];
+        float qq[NPT];
+        for (uint i = 0; i < NPT; ++i) { kk[i] = kt[i]; qq[i] = qt[i]; }
+        float ksq = 0.0f, qsq = 0.0f;
+        for (uint i = 0; i < NPT; ++i) { ksq = fma(kk[i], kk[i], ksq); qsq = fma(qq[i], qq[i], qsq); }
+        float kn = metal::precise::rsqrt(simd_sum(ksq) + 1e-6f);
+        float qn = metal::precise::rsqrt(simd_sum(qsq) + 1e-6f) * qscale;
+        for (uint i = 0; i < NPT; ++i) { kk[i] *= kn; qq[i] *= qn; }
+        float kv = 0.0f;
+        for (uint i = 0; i < NPT; ++i) {
+            cur[i] *= gt;
+            kv = fma(cur[i], kk[i], kv);
+        }
+        kv = simd_sum(kv);
+        float delta = (vt - kv) * bt;
+        float o = 0.0f;
+        for (uint i = 0; i < NPT; ++i) {
+            cur[i] = fma(kk[i], delta, cur[i]);
+            o = fma(cur[i], qq[i], o);
+        }
+        o = simd_sum(o);
+        if (lane == 0) ((device float*)I.C)[((size_t)t * Hv + h) * DV + j] = o;
+        for (uint i = 0; i < NPT; ++i) S[t][i] = cur[i];
+    }
+    if (!I.n2)
+        for (uint i = 0; i < NPT; ++i) state[((size_t)h * DK + lane * NPT + i) * DV + j] = S[T - 1][i];
+}
+""",
+)
+
+_op(
+    OpName.DELTA_NORM,
+    r"""
+inline void op_delta_norm(thread const Ins& I, uint item, thread const Ctx& c) {
+    // the DeltaNet's gated norm as the step's float32 MLX ops make it (delta.py `_delta_post`): a simdgroup a row of
+    // the rule's out (A, [T * Hv, DV]) through MLX's rms_norm with the layer's weight (E, [DV] float32), times
+    // z * sigmoid(z) (z: Hv * DV columns of each row of the projections, B: rows of n1 bf16, from column n2), rounded
+    // to bf16 (C, [T, Hv * DV]) for the out projection. Hv = n0, eps = f0
+    const uint DV = DELTA_DV;
+    uint r = item * 8 + c.sg, Hv = I.n0;
+    if (r >= c.dims[0] * Hv) return;
+    uint t = r / Hv, h = r - t * Hv;
+    const device float* x = (const device float*)I.A + (size_t)r * DV;
+    float inv = mlx_rms_inv_simd(x, DV, I.f0, c.lane);
+    const device float* w = (const device float*)I.E;
+    const device bfloat* z = (const device bfloat*)I.B + (size_t)t * I.n1 + I.n2 + h * DV;
+    device bfloat* y = (device bfloat*)I.C + (size_t)r * DV;
+    for (uint i = c.lane; i < DV; i += 32) {
+        float n = w[i] * (x[i] * inv);
+        float zf = (float)z[i];
+        float s = zf * mlx_sigmoid(zf);
+        y[i] = (bfloat)(n * s);
+    }
 }
 """,
 )
@@ -698,9 +834,11 @@ for _q, _k in STORED.items():
     _PRELUDE[EMBED_OP[_q]] = (quant_key(_q), _stored_prelude(_q, _k))
     _op(EMBED_OP[_q], _EMBED.replace("KEY", quant_key(_q)).replace("TYPE", _q.value))
 
-# a stored type's matvec, a kernel of its own a matrix and pass width (`stored_source`)
+# a stored type's matvec, a kernel of its own a matrix and pass width (`stored_source`); the bf16 head's, the step's
+# float32 matvec a kernel of its own a matrix and width (`head_source`)
 MV_Q: dict[OpName, Quant] = {o: q for q, o in MV_OP.items()}
-assert set(SOURCE) == set(OpName) - set(MV_Q), "an op without its device function"
+PER_SHAPE: frozenset[OpName] = frozenset({*MV_Q, OpName.HEAD})
+assert set(SOURCE) == set(OpName) - PER_SHAPE, "an op without its device function"
 
 # a command's buffers after the table of addresses its references go through (`Buf`): these, then the instruction's
 # index
@@ -827,6 +965,53 @@ def stored_source(mvs: Iterable[StoredMv]) -> str:
                 + f"    btb_{key}::{stored_name(s)}<{t}>(REF(0), (const device {t}*)REF(1), (device {t}*)REF(2), gp);\n}}\n"
             )
         out.append(_undo(k.defs))
+    return "".join(out)
+
+
+class HeadMv(NamedTuple):
+    """the bf16 head's matvec instruction's kernel: its matrix's rows and columns and the pass's rows"""
+
+    rows: int
+    cols: int
+    T: int
+
+
+def head_name(h: HeadMv) -> str:
+    return f"btb_mega_head_{h.rows}_{h.cols}_{h.T}"
+
+
+def head_threads(T: int) -> int:
+    """the threads a head kernel's threadgroup takes at T pass rows: the step's float32 matvec's simdgroups"""
+    return 32 * gemm_sgn(T, False)
+
+
+def head_groups(rows: int, T: int) -> int:
+    """the threadgroups a head of `rows` takes at T pass rows: a simdgroup each 8 of its rows, as the step's launch"""
+    return -(-rows // (8 * gemm_sgn(T, False)))
+
+
+def head_source(heads: Iterable[HeadMv]) -> str:
+    """the library of head kernels `heads`: each the step's float32 matvec (gemv.py `GEMM_SRC`, the launch
+    `Backend.matmul` makes for the step's head) with its matrix and pass rows as constants, y [T, rows] float32 (C) = x
+    [T, cols] float32 (B) . W^T, W (A) bf16; a threadgroup of the launch's a threadgroup of the command's"""
+    # the command's buffers it reads, at their places in every command's binding (the source names its own `out`)
+    tab, mi = INPUTS.index("tab") + 1, len(INPUTS) + 1
+    out = [_preamble(), "#include <metal_simdgroup_matrix>\n"]
+    for h in heads:
+        d = f"#define NB {h.T}\n#define SGN {gemm_sgn(h.T, False)}\n#define XB 0\n#define WF16 0\n"
+        sig = (
+            f"kernel void {head_name(h)}(const device Buf* B [[buffer(0)]], const device uint* tab [[buffer({tab})]], "
+            f"const device uint* mi [[buffer({mi})]], "
+            "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], "
+            "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]], "
+            "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {\n"
+            "    const device uint* f = tab + mi[0] * ROW;\n"
+            "    const device uint16_t* w = (const device uint16_t*)REF(0);\n"
+            "    const device float* x = (const device float*)REF(1);\n"
+            "    device float* y = (device float*)REF(2);\n"
+            f"    const int w_shape[2] = {{{h.rows}, {h.cols}}};\n"
+        )
+        out.append(d + sig + GEMM_SRC + "}\n" + _undo(d))
     return "".join(out)
 
 

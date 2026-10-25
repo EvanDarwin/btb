@@ -20,7 +20,7 @@ from ..session import TAIL_MAX, Session
 from .cache import linear_layer
 from .drafter import MTPDrafter
 from .fused import DELTA_BLOCK
-from .hooks import Hooks
+from .hooks import Hooks, LayerTap
 from .state import _State
 
 if TYPE_CHECKING:
@@ -416,11 +416,13 @@ class _GenerateMixin(_State):
         tap_ids = set(hk.taps) if hk is not None else set()
         tapped = bool(tap_ids)
 
-        def aw(i: int, h: torch.Tensor) -> None:
+        def hold(i: int, h: torch.Tensor) -> None:
             if i == self.L - 1:
                 last["h"] = h
             if i in tap_ids:
                 taps[i] = h
+
+        aw = LayerTap(hold, frozenset({self.L - 1, *tap_ids}))
 
         # a decode needing the last token's layers (the drafting head, taps) re-runs it; else a fed session goes on
         # from the logits it holds

@@ -29,8 +29,13 @@ from .kernel import (
     GRID3,
     MV_Q,
     NUM,
+    PER_SHAPE,
+    HeadMv,
     OpName,
     StoredMv,
+    head_name,
+    head_source,
+    head_threads,
     kernel_name,
     source,
     stored_name,
@@ -96,7 +101,8 @@ class Replay:
         m.write(self.mi, np.arange(mp.instructions, dtype=np.uint32))
         self.psos: dict[tuple[int, bool], dict[int, int]] = {}
         self.stored: dict[StoredMv, int] = {}
-        self.shapes: dict[tuple[int, int, bool, bool], Shape] = {}
+        self.heads: dict[HeadMv, int] = {}
+        self.shapes: dict[tuple[int, int, bool, bool, bool], Shape] = {}
         self.kv: dict[int, tuple[int, int]] = {}  # an aliased K/V array's id -> (its buffer, its address)
 
     @property
@@ -112,7 +118,7 @@ class Replay:
         got = self.psos.get((xr, mapped))
         if got is None:
             mp, m = self.mp, self.metal
-            ops = mp.ops - set(MV_Q)
+            ops = mp.ops - PER_SHAPE
             t0 = time.perf_counter()
             m.compile(source(ops, mp.defs(xr), mp.tgm(xr), mapped))
             got = self.psos[(xr, mapped)] = {CODE[o]: m.pipeline(kernel_name(o)) for o in ops}
@@ -132,6 +138,23 @@ class Replay:
             ms = 1e3 * (time.perf_counter() - t0)
             widths = ", ".join(str(t) for t in sorted({s.T for s in new}))
             trace.event("megakernel: %d stored matvecs compiled for %s-row passes in %.0f ms", len(new), widths, ms)
+
+    def _heads(self, hs: Sequence[HeadMv]) -> None:
+        """the head kernels `hs` not yet compiled, in one library (a pass width's, on its first pass)"""
+        new = list(dict.fromkeys(h for h in hs if h not in self.heads))
+        if new:
+            t0 = time.perf_counter()
+            self.metal.compile(head_source(new))
+            self.heads.update({h: self.metal.pipeline(head_name(h)) for h in new})
+            ms = 1e3 * (time.perf_counter() - t0)
+            trace.event("megakernel: %d head matvecs compiled in %.0f ms", len(new), ms)
+
+    @staticmethod
+    def _head(f: np.ndarray, T: int) -> HeadMv | None:
+        """instruction row `f`'s head matvec, or None where it is another op"""
+        if OP_OF[int(f[0])] is not OpName.HEAD:
+            return None
+        return HeadMv(int(f[NUM]), int(f[NUM + 1]), T)
 
     @staticmethod
     def _mv(f: np.ndarray, T: int) -> StoredMv | None:
@@ -164,17 +187,19 @@ class Replay:
             if got is not None:
                 self.metal.free_buffer(got[0])
 
-    def _encode(self, T: int, splits: int, argmax: bool, mapped: bool) -> Shape:
+    def _encode(self, T: int, splits: int, argmax: bool, mapped: bool, keep: bool) -> Shape:
         """the program of a pass shape as commands: a dispatch an instruction, its threadgroups its units (a GRID3 op's
         (kv heads, blocks, rows)), after a barrier where it reads an instruction encoded since the last one"""
         mp, m = self.mp, self.metal
-        tab = mp.table(T, splits, argmax)
+        tab = mp.table(T, splits, argmax, keep)
         n = int(tab.shape[0])
         tb = m.buffer(int(tab.nbytes))
         m.write(tb, tab)
         psos = self._pipelines(8 if T <= 8 else 16, mapped)
         mvs = [self._mv(f, T) for f in tab]
         self._stored([s for s in mvs if s is not None])
+        heads = [self._head(f, T) for f in tab]
+        self._heads([h for h in heads if h is not None])
         t0 = time.perf_counter()
         order = [self.ptrs, self.freqs, self.ids, self.pos, self.meta, self.path, self.rmap, tb, self.dims, self.out]
         order.append(self.mi)
@@ -182,15 +207,18 @@ class Replay:
         icb = m.icb(n, len(order))
         last, barriers = 0, 0  # the commands from `last` on may run beside each other
         for k in range(n):
-            f, mv = tab[k], mvs[k]
+            f, mv, hd = tab[k], mvs[k], heads[k]
             op = OP_OF[int(f[0])]
             deps = [int(d) - 1 for d in f[DEP0 : DEP0 + DEPS] if int(d)]
             barrier = any(d >= last for d in deps)
             if barrier:
                 last, barriers = k, barriers + 1
             grid = (int(f[NUM]), int(f[NUM + 1]), int(f[NUM + 2]) & 0xFFFF) if op in GRID3 else (int(f[1]), 1, 1)
-            pso = psos[int(f[0])] if mv is None else self.stored[mv]
-            m.cmd(icb, k, pso, binds, [0] * (len(order) - 1) + [4 * k], grid, THREADS, barrier)
+            if hd is not None:
+                pso, threads = self.heads[hd], head_threads(T)
+            else:
+                pso, threads = (psos[int(f[0])] if mv is None else self.stored[mv]), THREADS
+            m.cmd(icb, k, pso, binds, [0] * (len(order) - 1) + [4 * k], grid, threads, barrier)
         ms = 1e3 * (time.perf_counter() - t0)
         trace.event("megakernel: a %d-row pass encoded, %d commands after %d barriers, in %.1f ms", T, n, barriers, ms)
         return Shape(icb, n, tb)
@@ -207,9 +235,11 @@ class Replay:
         splits: int,
         past: int,
         argmax: bool,
+        keep: bool = False,
     ) -> np.ndarray:
-        """the pass over the K and V rows `kvs` (each layer's K then V, `cap` rows a head), read and written through
-        `rmap` where it is given, run and waited for: the argmax ids uint32 [T] (zeros without `argmax`)"""
+        """the pass over the K and V rows `kvs` (each layer's K then V, `cap` rows a head; a DeltaNet layer's states),
+        read and written through `rmap` where it is given, run and waited for: the argmax ids uint32 [T] (zeros
+        without `argmax`); `keep` a verify's pass"""
         mp, m = self.mp, self.metal
         T = len(ids)
         mapped = rmap is not None
@@ -225,10 +255,10 @@ class Replay:
         # the cache's rows and anything else MLX was writing, done before the replay reads them
         mx.synchronize()
         with self.lock:
-            key = (T, splits, argmax, mapped)
+            key = (T, splits, argmax, mapped, keep)
             s = self.shapes.get(key)
             if s is None:
-                s = self.shapes[key] = self._encode(T, splits, argmax, mapped)
+                s = self.shapes[key] = self._encode(T, splits, argmax, mapped, keep)
             base = mp.nb + 2
             for j, slot in enumerate(kvs):
                 self.addr[base + j] = self._kv_address(slot.arr) + int(slot.off)

@@ -49,7 +49,7 @@ from .tiers import ColdRing, _TiersMixin
 
 if TYPE_CHECKING:
     from ..mlx import Backend, Shared
-    from .cache import KvCache
+    from .cache import Arena, KvCache
 
 # each arena cache's megakernel arena, held as long as the cache is (`new_cache`)
 _ARENAS: weakref.WeakKeyDictionary[KvCache, Shared] = weakref.WeakKeyDictionary()
@@ -865,9 +865,10 @@ class StreamedTextModel(
         # allocated; 0 where neither is known, and the size check stands alone
         bound = int(max_len) if max_len else span
         sched = getattr(self, "scheduler", None)
-        # the megakernel's arena: every layer's K and V as views of one shared array, `cap` rows a head (a layer
-        # a session grows past it takes a buffer of its own and the pass leaves the megakernel)
-        arena = None
+        # the megakernel's arena: every attention layer's K and V as views of one shared array, `cap` rows a head (a
+        # layer a session grows past it takes a buffer of its own and the pass leaves the megakernel); a hybrid's
+        # DeltaNet layers keep their states where the step keeps them
+        arena: dict[int, Arena] | None = None
         mg = self._mega
         # the arena and its megakernel are bf16-only (`per` counts two bytes a row, and `_mega_ok` refuses any
         # other compute dtype); an fp32 pass would store float32 into these bf16-sized slots, so it keeps its own
@@ -879,8 +880,9 @@ class StreamedTextModel(
 
             cap = min(int(max_len) if max_len else (span or 4096), mg.SPL * ATTN_BLOCK)
             per = mg.Hk * cap * mg.hd * 2
-            sh = _ARENAS[cache] = mlxdev.Shared(2 * self.L * per)
-            arena = [(sh.whole, (2 * i) * per, (2 * i + 1) * per, cap) for i in range(self.L)]
+            att = [i for i in range(self.L) if not mg.linear[i]]
+            sh = _ARENAS[cache] = mlxdev.Shared(2 * len(att) * per)
+            arena = {i: (sh.whole, (2 * j) * per, (2 * j + 1) * per, cap) for j, i in enumerate(att)}
         # a bf16 card engine keeps every layer's rows in bf16, a host layer's too (`host_kv_dtype`)
         kv_dtype = torch.bfloat16 if self.host_kv_dtype() == torch.bfloat16 else None
         for i, layer in enumerate(cache.layers):
@@ -891,7 +893,7 @@ class StreamedTextModel(
                     cap_hint=int(max_len or 0),
                     grant=None if sched is None else sched.grant,
                     bound=bound,
-                    arena=arena[i] if arena is not None else None,
+                    arena=arena.get(i) if arena is not None else None,
                     kv_dtype=kv_dtype,
                 )
             elif type(layer) is DynamicIndexedLayer and sched is not None:

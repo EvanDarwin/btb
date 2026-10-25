@@ -22,6 +22,7 @@ from ..sampling import GREEDY
 from ..session import Session
 from .cache import GrowLayer, adopt_states, delta_layer, forked, has_graph_states
 from .families import act_name
+from .hooks import LayerTap
 from .host import _HostLinear, copy_bytes
 from .native import Native
 from .paged import PagedCache, PagedLayer
@@ -1577,8 +1578,9 @@ class _MlxMixin(_State):
         positions: Positions | None,
     ) -> bool:
         """the megakernel takes a pass of 1..16 rows over an arena cache or a paged one of the dense family, the head
-        and the pick in the graph (the argmax in the kernel; a sample over the logits it leaves), every layer resident"""
-        if not self._mega_serves() or cache is None or not (1 <= T <= 16) or on_layer is not None:
+        and the pick in the graph (the argmax in the kernel; a sample over the logits it leaves), every layer resident,
+        hooked at most for the last layer's output (`_mega_hook_ok`)"""
+        if not self._mega_serves() or cache is None or not (1 <= T <= 16) or not self._mega_hook_ok(on_layer):
             return False
         if not head or pick is None:
             return False
@@ -1594,12 +1596,21 @@ class _MlxMixin(_State):
 
         if past + T > mg.SPL * ATTN_BLOCK:
             return False
+        # a hybrid's DeltaNet layers step from the states a prefill left (the step's own nodes start past one)
+        if any(mg.linear) and past == 0:
+            return False
         if isinstance(cache, PagedCache):
             return self._mega_paged_ok(cache)
-        arenas = [cl.arena for cl in layers if isinstance(cl, GrowLayer) and cl.arena is not None]
-        if len(arenas) != len(layers):
+        attn = [cl for i, cl in enumerate(layers) if not mg.linear[i]]
+        arenas = [cl.arena for cl in attn if isinstance(cl, GrowLayer) and cl.arena is not None]
+        if len(arenas) != len(attn):
             return False
         return past + T <= arenas[0][3]
+
+    def _mega_hook_ok(self, on_layer: OnLayer | None) -> bool:
+        """a layer hook the megakernel serves: none, or one that keeps the last layer's output alone (a `LayerTap`: an
+        MTP drafter's), the residual its final norm leaves"""
+        return on_layer is None or (isinstance(on_layer, LayerTap) and on_layer.layers <= {self.L - 1})
 
     def _mega_paged_ok(self, cache: PagedCache) -> bool:
         """a paged cache the megakernel binds: every layer's rows in the host's shared regions, bf16 (or not yet
@@ -1607,24 +1618,70 @@ class _MlxMixin(_State):
         host = cache.prefix.pool.host
         if getattr(self, "kv_bits", 0) or not host.shared or host.dtype not in (None, torch.bfloat16):
             return False
-        return all(isinstance(cl, PagedLayer) and not cl.on_card for cl in cache.layers)
+        attn = [cl for i, cl in enumerate(cache.layers) if self.layer_types[i] != LayerKind.LINEAR]
+        return all(isinstance(cl, PagedLayer) and not cl.on_card for cl in attn)
 
-    def _mega_paged(self, cache: PagedCache, past: int, T: int) -> tuple[list[KvSlot], int, np.ndarray]:
-        """a paged cache bound for a pass of T rows: each layer's K and V regions, their rows a head, and the row map
-        through the pass's own rows. The regions are shaped and the table grown first, as the step's maps are made
-        (`_mlx_page_maps`): a region regrown after would leave the pass's rows in the old buffer"""
+    def _mega_paged(
+        self, cache: PagedCache, past: int, T: int
+    ) -> tuple[list[KvSlot], int, np.ndarray, dict[int, mx_.array]]:
+        """a paged cache bound for a pass of T rows: each attention layer's K and V regions, their rows a head, the row
+        map through the pass's own rows, and a hybrid's DeltaNet states as an arena's (`_mega_states`). The regions are
+        shaped and the table grown first, as the step's maps are made (`_mlx_page_maps`): a region regrown after would
+        leave the pass's rows in the old buffer"""
         from ..mlx.mega.replay import KvSlot
 
         mg = self._mega
         assert mg is not None
-        layers = _layers_of(cache, PagedLayer)
+        layers = [cl for i, cl in enumerate(cache.layers) if not mg.linear[i] and isinstance(cl, PagedLayer)]
         pool = cache.prefix.pool
         pool.shape(layers[0].i, torch.empty(1, mg.Hk, 0, mg.hd, dtype=torch.bfloat16))
         cache.table.extend(past + T)
         rows = cache.table.rows()[: past + T].numpy().astype(np.uint32)
-        kvs = [KvSlot(a, 0) for cl in layers for a in pool.host.mx_whole(cl.i)]
+        kvs: list[KvSlot] = []
+        recs: dict[int, mx_.array] = {}
+        for i, cl in enumerate(cache.layers):
+            if mg.linear[i]:
+                kvs += self._mega_states(cache, i, recs)
+            elif isinstance(cl, PagedLayer):
+                kvs += [KvSlot(a, 0) for a in pool.host.mx_whole(cl.i)]
+            else:
+                raise RuntimeError(f"[mega] a paged pass over a cache whose layer {i} is a {type(cl).__name__}")
         cap = int(pool.host.mk[layers[0].i].shape[2])
-        return kvs, cap, rows
+        return kvs, cap, rows, recs
+
+    def _mega_states(self, cache: KvCache, i: int, recs: dict[int, mx_.array]) -> list[KvSlot]:
+        """DeltaNet layer i's conv and recurrent states bound for a pass, where the step keeps them: moved into shared
+        memory as the step moves them (`_mlx_lin_adopt`); its recurrent state as an MLX array into `recs`, a verify's
+        checkpoints' start"""
+        from ..mlx.mega.replay import KvSlot
+
+        lin = delta_layer(cache, i)
+        _, recs[i] = self._mlx_lin_adopt(lin)
+        held = lin._mx_states if has_graph_states(lin) else None
+        if held is None or held[0].shared is None or held[1].shared is None:
+            raise RuntimeError(f"[mega] layer {i}'s DeltaNet states are not in shared memory")
+        return [KvSlot(held[0].shared.whole, 0), KvSlot(held[1].shared.whole, 0)]
+
+    def _mega_arena(self, cache: KvCache) -> tuple[list[KvSlot], int, dict[int, mx_.array]]:
+        """an arena cache bound for a pass: each attention layer's K and V in the arena, `cap` rows a head, a hybrid's
+        DeltaNet states in their place (`_mega_states`), and those layers' recurrent states by layer"""
+        from ..mlx.mega.replay import KvSlot
+
+        mg = self._mega
+        assert mg is not None
+        kvs: list[KvSlot] = []
+        recs: dict[int, mx_.array] = {}
+        cap = 0
+        for i, cl in enumerate(cache.layers):
+            if mg.linear[i]:
+                kvs += self._mega_states(cache, i, recs)
+                continue
+            ar = cl.arena if isinstance(cl, GrowLayer) else None
+            if ar is None:
+                raise RuntimeError("[mega] a pass over a cache with a layer outside the arena (`_mega_ok` admits none)")
+            cap = int(ar[3])
+            kvs += [KvSlot(ar[0], int(ar[1])), KvSlot(ar[0], int(ar[2]))]
+        return kvs, cap, recs
 
     def _build_mega(self) -> None:
         """the megakernel over the weights where they lie now, where the engine takes it (asked for at load, the
@@ -1648,7 +1705,18 @@ class _MlxMixin(_State):
         resident, the family's block, its weights in slot buffers, a bf16 state"""
         if self._mega is None or self.cold or not self.fam.mega or self.mlx_state.affine:
             return False
+        if self.fam.hybrid and not self._mlx_delta_kernels():
+            return False
         return self.compute_dtype is None or self.compute_dtype == torch.bfloat16
+
+    def _mlx_delta_kernels(self) -> bool:
+        """the hybrid's MLX step runs its DeltaNet through the recurrent kernels (`_forward_mlx_hybrid`'s node and
+        one-position branches), the arithmetic the megakernel's DeltaNet is bit-exact with"""
+        return (
+            Native.delta_step is not None
+            and self.mlx_state.delta_mode == "recurrent"
+            and bool(getattr(self, "mlx_delta", True))
+        )
 
     def _mega_positions_ok(self, cache: KvCache, T: int, positions: Positions) -> bool:
         """the tree's natural positions (past + a node's depth), the only ones the kernel computes"""
@@ -1667,9 +1735,12 @@ class _MlxMixin(_State):
             depth[j] = 0 if parents[j] < 0 else depth[parents[j]] + 1
         return pos == [past + d for d in depth]
 
-    def _forward_mega(self, ids: Tokens, cache: KvCache, T: int, pick: Pick | None = None) -> torch.Tensor:
+    def _forward_mega(
+        self, ids: Tokens, cache: KvCache, T: int, pick: Pick | None = None, on_layer: OnLayer | None = None
+    ) -> torch.Tensor:
         """The pass as one dispatch: the picked ids [1, T] int32 (the kernel's argmax, or a sample over the logits
-        it leaves in its scratch); the cache's rows appended in the kernel."""
+        it leaves in its scratch); the cache's rows appended in the kernel; `on_layer` handed the last layer's output
+        (`_mega_hook_ok`)."""
         self._tag(PassTag.MLX_MEGA)
         self._tag_tiers(self.L)
         self._tag_quant(self.L)
@@ -1686,31 +1757,38 @@ class _MlxMixin(_State):
         depth = [0] * T
         for j in range(T):
             depth[j] = 0 if parents[j] < 0 else depth[parents[j]] + 1
-        from ..mlx.mega.replay import KvSlot
-
         rmap: np.ndarray | None = None
+        recs: dict[int, mx_.array] = {}
         if isinstance(cache, PagedCache):
-            kvs, cap, rmap = self._mega_paged(cache, past, T)
+            kvs, cap, rmap, recs = self._mega_paged(cache, past, T)
         else:
-            arenas = [gl.arena for gl in _layers_of(cache, GrowLayer) if gl.arena is not None]
-            if len(arenas) != len(cache.layers):
-                raise RuntimeError("[mega] a pass over a cache with a layer outside the arena (`_mega_ok` admits none)")
-            buf, cap = arenas[0][0], int(arenas[0][3])
-            kvs = [KvSlot(buf, int(ar[1 + w])) for ar in arenas for w in (0, 1)]
+            kvs, cap, recs = self._mega_arena(cache)
+        # a verify pass leaves a hybrid's DeltaNet states for its commit, as the step's verify does
+        keep = bool(getattr(self, "aq", False)) and any(mg.linear)
         sampled = pick is not None and not pick.greedy
         pos = [past + d for d in depth]
-        got = mg.run(kvs, cap, rmap, ids, pos, meta, path, splits, past, argmax=not sampled)
+        got = mg.run(kvs, cap, rmap, ids, pos, meta, path, splits, past, argmax=not sampled, keep=keep)
+        if keep:
+            for i, rec in recs.items():
+                conv, heads = mg.checkpoints(i, T)
+                self.al[i] = _MxCheckpoints(conv, heads, rec)
+                self.am[i] = self._lin(delta_layer(cache, i))
         if pick is not None and sampled:
             # the sample over the logits the pass's head op left in its scratch, the pass done when `run` returns
             picked = pick.pick_mx(mg.logits(T), [pick.key_for(p) for p in pos])
             m.eval(picked)
             got = np.asarray(picked)
+        if on_layer is not None:
+            # a copy: the scratch is the next pass's
+            on_layer(self.L - 1, mlxdev.from_mx(mg.hidden(T))[None].clone())
         if isinstance(cache, PagedCache):
-            for pl in _layers_of(cache, PagedLayer):
-                pl.n += T  # the rows written where the table puts them, as `_mlx_page_append` counts them
+            for cl in cache.layers:
+                if isinstance(cl, PagedLayer):
+                    cl.n += T  # the rows written where the table puts them, as `_mlx_page_append` counts them
         else:
-            for gl in _layers_of(cache, GrowLayer):
-                gl.mx_advance(T, mg.Hk, mg.hd, torch.bfloat16)
+            for i, cl in enumerate(cache.layers):
+                if isinstance(cl, GrowLayer) and not mg.linear[i]:
+                    cl.mx_advance(T, mg.Hk, mg.hd, torch.bfloat16)
         be = self.mlx
         assert be is not None
         be.stat["layers"] += self.L

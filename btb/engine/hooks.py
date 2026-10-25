@@ -13,6 +13,18 @@ from typing import Protocol, TypedDict
 import torch
 
 
+class LayerTap:
+    """a pass's layer hook (`on_layer(i, h)`, h layer i's output [B, T, H]) that names the layers it keeps: a path
+    that holds only some layers' outputs (the MLX megakernel: the residual after the last) takes a hooked pass where
+    those are all it keeps"""
+
+    def __init__(self, fn: Callable[[int, torch.Tensor], object], layers: frozenset[int]) -> None:
+        self.fn, self.layers = fn, layers
+
+    def __call__(self, i: int, h: torch.Tensor) -> object:
+        return self.fn(i, h)
+
+
 class LogitsProcessor(Protocol):
     """`(ids, logits) -> logits`: the ids the row holds so far (prompt and answer) and the next token's logits
     [V]. Called on every candidate row, a speculative pass's drafts included, so it must be a function of `ids`:

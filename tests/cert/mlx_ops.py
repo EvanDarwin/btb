@@ -212,7 +212,12 @@ OPS: tuple[Op, ...] = (
         funcs=("repack_lattice", "matvec_lattice", "dequant_lattice"),
     ),
     Op("kv", "kv", ("btb_kv_store", "btb_kv_scatter"), "kernels/test_kv.py"),
-    Op("mega", "mega.kernel", ("btb_mega_*", "btb_mega_mv_*_*_*_*_*_*"), "kernels/test_mega.py"),
+    Op(
+        "mega",
+        "mega.kernel",
+        ("btb_mega_*", "btb_mega_mv_*_*_*_*_*_*", "btb_mega_head_*_*_*"),
+        "kernels/test_mega.py",
+    ),
     Op("sample", "sample", ("btb_sample_pick", "btb_sample_verify"), "kernels/test_sampling.py"),
     Op(
         "binder",

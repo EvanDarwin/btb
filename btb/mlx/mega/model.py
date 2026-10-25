@@ -6,8 +6,9 @@ gathered once, and a program per pass shape built from the family's layers (`Fam
 from __future__ import annotations
 
 import inspect
+import math
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Protocol, TypeAlias, TypeGuard
+from typing import TYPE_CHECKING, NamedTuple, Protocol, TypeAlias, TypeGuard
 
 import numpy as np
 import torch
@@ -18,7 +19,7 @@ from .. import aluminum
 from ..attn import tree_meta
 from ..backend import Weight
 from ..core import mx, to_mx
-from .kernel import EMBED_OP, MV_OP, STORED, OpName, stored_groups
+from .kernel import EMBED_OP, MV_OP, STORED, OpName, head_groups, stored_groups
 from .program import CONSTS, SCR, Program, Refs, Tensor, align, kv
 from .replay import THREADS, KvSlot, Replay
 
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
     import mlx.core as mx_
 
     from ...engine.model import StreamedTextModel
+    from ..delta import Heads
 
 ROWS_MAX = 16  # a pass's rows: the matvec's tile holds 16
 SPL = 16  # the attention segments a pass may read, 16 x ATTN_BLOCK cache rows
@@ -84,6 +86,65 @@ class SandwichLayer(DenseLayer, Protocol):
     post_feedforward_layernorm: NormModule
 
 
+class ConvModule(Protocol):
+    """the DeltaNet's depthwise conv: its weight [C, 1, K], its bias where it has one"""
+
+    weight: torch.Tensor
+    bias: torch.Tensor | None
+
+
+class DeltaNetModule(Protocol):
+    """a gated DeltaNet's mixer as the megakernel reads it (Qwen3.5's `linear_attn`): its four input projections (one
+    weight where their slots are adjacent, `_mx_in`), its conv, decay and gated norm, its out projection"""
+
+    in_proj_qkv: LinearModule
+    in_proj_z: LinearModule
+    in_proj_b: LinearModule
+    in_proj_a: LinearModule
+    out_proj: LinearModule
+    conv1d: ConvModule
+    A_log: torch.Tensor
+    dt_bias: torch.Tensor
+    norm: NormModule
+    num_k_heads: int
+    num_v_heads: int
+    head_k_dim: int
+    head_v_dim: int
+    key_dim: int
+    _mx_in: Weight | None
+
+
+class DeltaLayer(Protocol):
+    """a hybrid's DeltaNet layer: the pre-norm block with the DeltaNet in the attention's place"""
+
+    input_layernorm: NormModule
+    post_attention_layernorm: NormModule
+    linear_attn: DeltaNetModule
+    mlp: MlpModule
+
+
+class DeltaShape(NamedTuple):
+    """a hybrid's DeltaNet layers' sizes, every layer's alike: the conv's channels and width, the value and key heads
+    and their dims, the keys' width"""
+
+    C: int
+    K: int
+    Hv: int
+    Hk: int
+    dk: int
+    dv: int
+    key_dim: int
+
+
+class DeltaRefs(NamedTuple):
+    """where a DeltaNet layer's pass leaves what a verify's commit reads (scratch offsets): the conv's output xc [T, C]
+    (q, k and v), g and beta [T, 2Hv], each node's conv window [T, C, K]"""
+
+    xc: int
+    gb: int
+    win: int
+
+
 def _holds(layer: object, proto: type) -> bool:
     """`layer` has every member `proto` and its protocol bases declare. hasattr, not a runtime protocol check: that
     reads attributes statically, and a torch module's submodules sit in its `_modules` behind `__getattr__`"""
@@ -100,6 +161,14 @@ def sandwich_layer(layer: object) -> TypeGuard[SandwichLayer]:
     return _holds(layer, SandwichLayer)
 
 
+def delta_layer(layer: object) -> TypeGuard[DeltaLayer]:
+    """`layer` is a hybrid's DeltaNet layer"""
+    if not _holds(layer, DeltaLayer):
+        return False
+    la: object = getattr(layer, "linear_attn", None)
+    return _holds(la, DeltaNetModule)
+
+
 def mv_items(rows: int, per: int) -> int:
     """the threadgroups a matvec of `rows` takes, its simdgroups `per` rows each (the bf16 tile's 8): every simdgroup
     its own rows, once"""
@@ -111,10 +180,11 @@ class Block:
     """What a family's layer is made of in the megakernel (`Family.mega_layer`): the residual stream, read through a
     norm and added to by `add`, and the ops over it. An add waits for the next norm, which makes both in one op."""
 
-    def __init__(self, mp: MegaPass, prog: Program, splits: int) -> None:
+    def __init__(self, mp: MegaPass, prog: Program, splits: int, keep: bool) -> None:
         self.mp, self.p = mp, prog
         self.T = prog.T
         self.splits = splits
+        self.keep = keep  # a verify pass: the DeltaNet's states left for its commit (`delta`)
         self.h: Tensor | None = None  # the residual
         self.y: Tensor | None = None  # an add to it not yet made
 
@@ -123,6 +193,13 @@ class Block:
         layer = self.mp.sm.host[i]
         if not dense_layer(layer):
             raise TypeError(f"[mega] layer {i} ({type(layer).__name__}) is not the plain block's")
+        return layer
+
+    def deltanet(self, i: int) -> DeltaLayer:
+        """layer i's host modules, read as a hybrid's DeltaNet layer"""
+        layer = self.mp.sm.host[i]
+        if not delta_layer(layer):
+            raise TypeError(f"[mega] layer {i} ({type(layer).__name__}) is not a DeltaNet layer")
         return layer
 
     def sandwich(self, i: int) -> SandwichLayer:
@@ -139,6 +216,14 @@ class Block:
         if at._mx_qkv is not None:
             return at._mx_qkv
         return _one_or_parts(at, "qkv_proj", ("q_proj", "k_proj", "v_proj"))
+
+    @staticmethod
+    def delta_in(la: DeltaNetModule) -> Linears:
+        """the DeltaNet's four input projections (the conv's input, z, b and a) as one weight where their slots are
+        adjacent, else the four into one output"""
+        if la._mx_in is not None:
+            return la._mx_in
+        return la.in_proj_qkv, la.in_proj_z, la.in_proj_b, la.in_proj_a
 
     @staticmethod
     def gate_up(mlp: MlpModule) -> Linears:
@@ -223,11 +308,19 @@ class Block:
         qk = mp.qk_weights(at)
         if qk is not None and mp.rscale != 1.0:
             raise ValueError("[mega] q/k norms with a scaled rope: the fused step scales after the kernel")
+        if qkv.cols != (Hq * (1 + mp.gated) + 2 * Hk) * hd:
+            raise ValueError(f"[mega] a q/k/v projection of {qkv.cols} columns")
         q = p.scratch(Hq * hd)
         K, V = Tensor((kv(i, 0), 0)), Tensor((kv(i, 1), 0))
         row = mp.rope_row.get(mp.sm.layer_types[i], 0)
         f32 = qk is not None and qk[2]
-        n = ((mp.rd // 2) | ((qk is not None) << 31), Hq | (row << 16), Hk | (hd << 16) | (f32 << 31))
+        # the norms the fused kernel's where the step takes its kernels, else MLX's own, as the step's unfused ops
+        fk, mlx = qk is not None and mp.fused, qk is not None and not mp.fused
+        n = (
+            (mp.rd // 2) | (fk << 31),
+            Hq | (row << 16) | (mp.gated << 30) | (mlx << 31),
+            Hk | (hd << 16) | (f32 << 31),
+        )
         f0 = qk[1] if qk is not None else mp.rscale
         refs = (qkv, qk[0] if qk is not None else None, q, K, V)
         p.emit(OpName.QKROPE, T * (Hq + 2 * Hk), refs, n, f0, reads=[qkv], writes=[q, K, V])
@@ -259,11 +352,51 @@ class Block:
         p.emit(OpName.FOLD, (T * Hq * hd + 255) // 256, (part, pl, a), n, reads=[part, pl, one], writes=[a])
         return a
 
+    def gate(self, a: Tensor, qkv: Tensor) -> Tensor:
+        """the attention's output `a` times the sigmoid of its heads' gates (Qwen3.5's output gate), each q head's
+        gate the second half of its columns in `qkv`"""
+        mp = self.mp
+        W = mp.Hq * mp.hd
+        y = self.p.scratch(W)
+        n = (W, mp.hd, qkv.cols)
+        self.p.emit(OpName.GATE, (self.T * W + 255) // 256, (a, qkv, y), n, reads=[a, qkv], writes=[y])
+        return y
+
+    def delta(self, i: int, p: Tensor, la: DeltaNetModule) -> Tensor:
+        """layer i's DeltaNet over its projections `p` (the conv's input, z, b and a end to end): the conv along each
+        node's path, the gated delta rule from each node's parent's state, the gated norm; [T, Hv * dv] bf16 for the out
+        projection. A pass that is not a verify writes its last node's states back over the layer's (the cache's, bound
+        at kv(i, 0) and kv(i, 1)); a verify leaves them, its windows and the rule's inputs in the scratch
+        (`DeltaRefs`) for its commit"""
+        mp, prog, T = self.mp, self.p, self.T
+        d = mp.delta
+        if d is None:
+            raise ValueError("[mega] a DeltaNet layer in a model without them")
+        if p.cols != d.C + d.Hv * d.dv + 2 * d.Hv:
+            raise ValueError(f"[mega] DeltaNet projections of {p.cols} columns")
+        consts, bias = mp.delta_consts(la)
+        conv, rec = Tensor((kv(i, 0), 0)), Tensor((kv(i, 1), 0))
+        # placed whatever the pass, so every shape lays the scratch out alike
+        xc, gb, win = prog.scratch(d.C, 4), prog.scratch(2 * d.Hv, 4), prog.scratch(d.C * d.K, 4)
+        mp.delta_refs(i, DeltaRefs(xc.ref[1], gb.ref[1], win.ref[1]))
+        n = (d.C, p.cols, d.Hv | (bias << 16) | (self.keep << 17))
+        items = (max(d.C, T * d.Hv) + 255) // 256
+        prog.emit(OpName.DELTA_CONV, items, (p, consts, xc, gb, conv, win), n, reads=[p], writes=[xc, gb])
+        core = prog.scratch(d.Hv * d.dv, 4)
+        n = (d.Hv, d.Hk, int(self.keep))
+        prog.emit(OpName.DELTA_RULE, d.Hv * d.dv // 8, (xc, gb, core, None, rec), n, reads=[xc, gb], writes=[core])
+        y = prog.scratch(d.Hv * d.dv)
+        w, eps = mp.delta_norm(la)
+        n = (d.Hv, p.cols, d.C)
+        items = (T * d.Hv + 7) // 8
+        prog.emit(OpName.DELTA_NORM, items, (core, p, y, None, w), n, eps, reads=[core, p], writes=[y])
+        return y
+
     def gated(self, gu: Tensor) -> Tensor:
         """act(gate) * up over gate and up end to end in `gu`, as the step makes it: silu in the fused kernel (gate and
         up one weight) or in MLX's own ops (the step's split gate and up, an unfused family), gelu-tanh in MLX's"""
         if self.mp.act in ("silu", "swish"):
-            how = 0 if self.mp.fused and not gu.parts else 1
+            how = 0 if self.mp.fused_mlp and not gu.parts else 1
         elif self.mp.act in ("gelu_pytorch_tanh", "gelu_new"):
             how = 2
         else:
@@ -280,17 +413,22 @@ class Block:
         mp, p, T, H = self.mp, self.p, self.T, self.mp.H
         w, eps = mp.final_norm
         hn = p.scratch(H, 4)
+        res = p.scratch(H)  # the last layer's output, a layer hook's (`MegaPass.hidden`)
+        if mp._frozen and res.ref[1] != mp.hidden_off:
+            raise ValueError("[mega] a pass shape places the last layer's output where the widest pass does not")
+        mp.hidden_off = res.ref[1]
         y = self.y
         reads = [self.h] if y is None else [self.h, y]
         n = (H, int(y is not None), 0)
-        p.emit(OpName.FNORM, T, (self.h, w, hn, None, y), n, eps, reads=reads, writes=[hn])
+        p.emit(OpName.FNORM, T, (self.h, w, hn, res, y), n, eps, reads=reads, writes=[hn, res])
         logits = p.scratch(mp.V, 4)
         if mp._frozen and logits.ref[1] != mp.logits_off:
             # a replayed shape's logits are read at the widest pass's offset (`logits`)
             raise ValueError("[mega] a pass shape places its logits where the widest pass does not")
         mp.logits_off = logits.ref[1]
-        if mp.head_q is None:
-            p.emit(OpName.HEAD, mv_items(mp.V, 8), (mp.head, hn, logits), (mp.V, H, 0), reads=[hn], writes=[logits])
+        if mp.head_q is None:  # the step's own float32 matvec over the bf16 head (`kernel.head_source`)
+            items = head_groups(mp.V, T)
+            p.emit(OpName.HEAD, items, (mp.head, hn, logits), (mp.V, H, 0), reads=[hn], writes=[logits])
         else:  # the type's own chain over float32 rows, as the step multiplies a stored head
             items = stored_groups(mp.head_q, mp.V, T)
             p.emit(MV_OP[mp.head_q], items, (mp.head, hn, logits), (mp.V, H, 1), reads=[hn], writes=[logits])
@@ -323,7 +461,15 @@ class MegaPass:
         self.H = int(c.hidden_size)
         self.Hq = int(c.num_attention_heads)
         self.Hk = int(getattr(c, "num_key_value_heads", None) or self.Hq)
-        self.hd = int(sm.host[0].self_attn.head_dim)
+        # a hybrid's DeltaNet layers beside its attention ones, the attention's sizes read off the first of those
+        self.linear = [sm.layer_types[i] == LayerKind.LINEAR for i in range(self.L)]
+        att = next((i for i in range(self.L) if not self.linear[i]), None)
+        if att is None:
+            raise ValueError("[mega] no attention layer to read the heads off")
+        self.hd = int(sm.host[att].self_attn.head_dim)
+        self.gated = bool(sm.fam.attn_gate)  # each q head's output gate beside it in the q projection (Qwen3.5's)
+        self.delta = self._delta_shape() if any(self.linear) else None
+        self._delta_refs: dict[int, DeltaRefs] = {}
         self.V = int(hw.shape[0])
         self.SPL, self.ROWS = SPL, ROWS_MAX
         if self.hd not in aluminum.HEADS or self.Hq % self.Hk or self.Hq // self.Hk > aluminum.MAXG or self.H % 8:
@@ -342,8 +488,10 @@ class MegaPass:
         self.freqs = table.astype(m.float32).reshape(-1)
         if self.freqs.size < 8:
             self.freqs = m.pad(self.freqs, (0, 8 - int(self.freqs.size)))
-        # the step this pass is bit-exact with: the fused kernels (`_forward_mlx`'s `fuse`), or MLX's own ops
+        # the step this pass is bit-exact with: the fused kernels (`_forward_mlx`'s `fuse`), or MLX's own ops; the
+        # hybrid's step (`_forward_mlx_hybrid`) takes MLX's ops but the fused silu * up wherever gate and up are one
         self.fused = bool(getattr(sm, "mlx_fused_kernels", True)) and sm.fam.fused_step and self.rd == self.hd
+        self.fused_mlp = self.fused or sm.fam.hybrid
         self.act = act_name(c)
         # each layer's attention window, as the step reads it (a sandwich family's sliding layers), and the distinct
         # ones: a row of the node metadata each (`metas`)
@@ -366,6 +514,7 @@ class MegaPass:
         self._consts: dict[ConstKey, Tensor] = {}
         self._frozen = False
         self.logits_off = 0
+        self.hidden_off = 0
         self.head, self.head_q = self._ref(hw), hw.q
         if sm.head_key == sm.prefix + "embed_tokens.weight":
             self.embed, self.embed_q = self.head, self.head_q
@@ -435,6 +584,73 @@ class MegaPass:
                 self._csize += pad.nbytes
         return t
 
+    def _delta_shape(self) -> DeltaShape:
+        """the DeltaNet layers' sizes, read off the first (every layer's alike), held to what the ops take: the rule's
+        key dim a multiple of 32 (its lanes), the value dim a multiple of 8 (its simdgroups) up to 128 (a simdgroup's
+        norm), the conv's channels the keys twice and the values"""
+        layer = next(self.sm.host[i] for i in range(self.L) if self.linear[i])
+        if not delta_layer(layer):
+            raise ValueError(f"[mega] a linear-attention layer ({type(layer).__name__}) that is not a DeltaNet's")
+        la = layer.linear_attn
+        w = la.conv1d.weight
+        d = DeltaShape(
+            C=int(w.shape[0]),
+            K=int(w.shape[-1]),
+            Hv=int(la.num_v_heads),
+            Hk=int(la.num_k_heads),
+            dk=int(la.head_k_dim),
+            dv=int(la.head_v_dim),
+            key_dim=int(la.key_dim),
+        )
+        if d.dk % 32 or d.dv % 8 or d.dv > 128 or d.Hv % d.Hk or d.K < 2:
+            raise ValueError(f"[mega] a DeltaNet of {d} is not in the kernel's ops")
+        if d.key_dim != d.Hk * d.dk or d.C != 2 * d.key_dim + d.Hv * d.dv:
+            raise ValueError(f"[mega] a DeltaNet conv of {d.C} channels over keys of {d.key_dim}")
+        return d
+
+    def delta_consts(self, la: DeltaNetModule) -> tuple[Tensor, bool]:
+        """a DeltaNet layer's constants end to end as `op_delta_conv` reads them, float32 as the step keeps them: the
+        conv's weight [C, K] and bias [C] (where it has one), a_log and dt_bias [Hv]; and whether it has the bias"""
+        bias = la.conv1d.bias is not None
+
+        def make() -> mx_.array:
+            parts = [la.conv1d.weight.squeeze(1), *([la.conv1d.bias] if la.conv1d.bias is not None else [])]
+            parts += [la.A_log, la.dt_bias]
+            return to_mx(torch.cat([t.data.detach().float().reshape(-1) for t in parts]).contiguous())
+
+        return self._const(("delta", id(la)), make), bias
+
+    def delta_norm(self, la: DeltaNetModule) -> tuple[Tensor, float]:
+        """a DeltaNet layer's gated norm's weight, float32 as the step keeps it (not centered), and its epsilon"""
+        return self._const(("delta_norm", id(la)), lambda: _norm_array(la.norm, True, False)), _eps(la.norm)
+
+    def delta_refs(self, i: int, refs: DeltaRefs) -> None:
+        """where layer i's pass leaves its verify's state (`checkpoints`): recorded by the widest pass, every other
+        shape held to it"""
+        got = self._delta_refs.setdefault(i, refs)
+        if got != refs:
+            raise ValueError(f"[mega] a pass shape places layer {i}'s DeltaNet state where the widest pass does not")
+
+    def checkpoints(self, i: int, T: int) -> tuple[mx_.array, Heads]:
+        """what the last pass (a verify of T nodes) left for DeltaNet layer i's commit, views of the scratch the next
+        pass overwrites: each node's conv window [T, C, K] and the rule's heads (q, k [T, Hk, dk] raw, v [T, Hv, dv], g
+        and beta [T, Hv]), as delta.py `delta_tree_step` hands them to `delta_chain_state`"""
+        d, r = self.delta, self._delta_refs[i]
+        assert d is not None  # a layer with refs is a DeltaNet layer
+        f32 = mx.float32
+
+        def view(off: int, *shape: int) -> mx_.array:
+            n = math.prod(shape) * 4
+            return self.scr[off : off + n].view(f32).reshape(*shape)
+
+        xc = view(r.xc, T, d.C)
+        gb = view(r.gb, T, 2 * d.Hv)
+        kd = d.key_dim
+        q = xc[:, :kd].reshape(T, d.Hk, d.dk)
+        k = xc[:, kd : 2 * kd].reshape(T, d.Hk, d.dk)
+        v = xc[:, 2 * kd :].reshape(T, d.Hv, d.dv)
+        return view(r.win, T, d.C, d.K), (q, k, v, gb[:, : d.Hv], gb[:, d.Hv :])
+
     def norm_weight(self, mod: NormModule) -> tuple[Tensor, float, bool]:
         """a block norm's weight as the step keeps it (bf16, or a centered norm's 1 + w in float32), its epsilon, and
         whether it is the float32 one"""
@@ -447,8 +663,6 @@ class MegaPass:
         qn, kn = getattr(at, "q_norm", None), getattr(at, "k_norm", None)
         if qn is None or kn is None:
             return None
-        if not self.fused:
-            raise ValueError("[mega] q/k norms outside the fused kernels: the step norms them with MLX's own op")
         f32 = self.sm.fam.norm_centered
         t = self._const(("qk", id(at)), lambda: mx.concatenate([_norm_array(qn, f32, f32), _norm_array(kn, f32, f32)]))
         return t, _eps(qn), f32
@@ -475,15 +689,25 @@ class MegaPass:
             "ATT_VT": self.vt,
             "PACC_OFF": self.pacc_off,
             "A_OFF": align(self.part_bytes),
+            **(
+                {}
+                if self.delta is None
+                else {
+                    "DELTA_K": self.delta.K,
+                    "DELTA_DK": self.delta.dk,
+                    "DELTA_DV": self.delta.dv,
+                    "DELTA_NPT": self.delta.dk // 32,
+                }
+            ),
         }
 
     def tgm(self, xr: int) -> dict[OpName, int]:
-        """each op's threadgroup memory at xr rows: the bf16 matvec's and the head's tiles staged a simdgroup each, the
-        attention's (`aluminum.tgm_layout`, `aluminum.tree_tgm`, `aluminum.phased_tgm`), the rest their reductions'"""
+        """each op's threadgroup memory at xr rows: the bf16 matvec's tiles staged a simdgroup each, the attention's
+        (`aluminum.tgm_layout`, `aluminum.tree_tgm`, `aluminum.phased_tgm`), the rest their reductions' (a head kernel
+        declares its own, the step's)"""
         small = max((8 + self.hd) * 4, 2 * 256 * 4)
         need = dict.fromkeys(OpName, small)
         need[OpName.MATVEC] = max(small, 8 * (8 + xr) * MV_KT * 2)
-        need[OpName.HEAD] = max(small, 8 * (8 * 32 + xr * 32) * 4)
         need[OpName.ATTN] = max(small, self.attn_tgm)
         need[OpName.ATTN_TREE] = max(small, aluminum.tree_tgm(self.hd, THREADS // 32))
         need[OpName.ATTN_PHASED] = max(small, aluminum.phased_tgm(16))
@@ -493,25 +717,30 @@ class MegaPass:
             )
         return need
 
-    def _program(self, T: int, splits: int, argmax: bool) -> Program:
-        """a pass's program: every layer and the head"""
+    def _program(self, T: int, splits: int, argmax: bool, keep: bool = False) -> Program:
+        """a pass's program: every layer and the head; `keep` a verify's, its DeltaNet states left for its commit"""
         p = Program(T, ROWS_MAX)
-        b = Block(self, p, splits)
+        b = Block(self, p, splits, keep)
         b.embed()
         for i in range(self.L):
             self.sm.fam.mega_layer(b, i)
         b.final(argmax)
         return p
 
-    def table(self, T: int, splits: int, argmax: bool = True) -> np.ndarray:
-        """the program of a pass of T rows (`splits` attention blocks) as the table the replay encodes, uint32
-        [instructions, W]"""
-        return self._program(T, splits, argmax).table(self.nb)
+    def table(self, T: int, splits: int, argmax: bool = True, keep: bool = False) -> np.ndarray:
+        """the program of a pass of T rows (`splits` attention blocks; `keep` a verify's) as the table the replay
+        encodes, uint32 [instructions, W]"""
+        return self._program(T, splits, argmax, keep).table(self.nb)
 
     def logits(self, T: int) -> mx_.array:
         """the logits [T, V] float32 the last pass left in the scratch (a pass without its argmax)"""
         o = self.logits_off
         return self.scr[o : o + T * self.V * 4].view(mx.float32).reshape(T, self.V)
+
+    def hidden(self, T: int) -> mx_.array:
+        """the last layer's output [T, H] bf16 the last pass left in the scratch, as the step hands a layer hook"""
+        o = self.hidden_off
+        return self.scr[o : o + T * self.H * 2].view(mx.bfloat16).reshape(T, self.H)
 
     def run(
         self,
@@ -525,15 +754,17 @@ class MegaPass:
         splits: int,
         past: int,
         argmax: bool = True,
+        keep: bool = False,
     ) -> np.ndarray:
-        """the pass, run and waited for: `kvs` each layer's K then V rows (2L of them) [Hk, cap, D] bf16, `rmap` a paged
-        cache's row map (uint32, the conversation's rows to the regions' through the pass's own: rows are read and
-        written through it) or None for rows where they lie (an arena), `ids` and `pos` the rows' tokens and positions,
-        `meta`/`path` the node metadata; the argmax ids uint32 [T] (zeros with `argmax` off, the logits then in the
-        scratch)"""
+        """the pass, run and waited for: `kvs` each layer's K then V rows (2L of them) [Hk, cap, D] bf16 - a DeltaNet
+        layer's conv and recurrent states in their place, float32 - `rmap` a paged cache's row map (uint32, the
+        conversation's rows to the regions' through the pass's own: rows are read and written through it) or None for
+        rows where they lie (an arena), `ids` and `pos` the rows' tokens and positions, `meta`/`path` the node
+        metadata; the argmax ids uint32 [T] (zeros with `argmax` off, the logits then in the scratch). `keep`: a
+        verify, its DeltaNet states left for its commit (`checkpoints`)"""
         if len(kvs) != 2 * self.L:
             raise ValueError(f"[mega] {len(kvs)} K and V regions for {self.L} layers")
-        return self.replay.run(kvs, cap, rmap, ids, pos, meta, path, splits, past, argmax)
+        return self.replay.run(kvs, cap, rmap, ids, pos, meta, path, splits, past, argmax, keep)
 
 
 def _one_or_parts(mod: AttentionModule | MlpModule, fused: str, names: tuple[str, ...]) -> Linears:

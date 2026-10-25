@@ -459,12 +459,13 @@ class MegaRefusal(StrEnum):
 
 def mega_refusal(kind: FamilyKind, storage: Storage, packed: bool = True) -> MegaRefusal | None:
     """why the megakernel cannot take this family's fixture in this storage, by the engine's own gates, in their
-    order: the family's block (`Family.mega`: the plain dense block or the sandwich one), the weights it reads out of
-    slot buffers (a GGUF's quant blocks bound as stored under `packed` read as stored where every type of the storage
-    is one the kernel multiplies, `kinds.MEGA_STORED`; the 12-bit store's packed weights fall to the step; blocks
-    dequantized on load are bf16 slots it reads), then the head width"""
+    order: the family's block (`Family.mega`: the plain dense block, the sandwich one, or the hybrid's DeltaNet and
+    gated attention layers without a mixture), the weights it reads out of slot buffers (a GGUF's quant blocks bound as
+    stored under `packed` read as stored where every type of the storage is one the kernel multiplies,
+    `kinds.MEGA_STORED`; the 12-bit store's packed weights fall to the step; blocks dequantized on load are bf16 slots
+    it reads), then the head width"""
     fl = core.flags(kind)
-    if Cap.DENSE not in fl and Cap.SANDWICH not in fl:
+    if not (Cap.DENSE in fl or Cap.SANDWICH in fl or (Cap.HYBRID in fl and Cap.MOE not in fl)):
         return MegaRefusal.LAYOUT
     qc = quant_class(storage)
     stored = packed and qc not in (None, QuantClass.FLOAT)

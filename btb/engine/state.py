@@ -596,7 +596,9 @@ class _State:
     def _bind_mlx_resident(self, layer: torch.nn.Module, checkpoint: bool = True) -> int:
         raise NotImplementedError
 
-    def _forward_mega(self, ids: Tokens, cache: KvCache, T: int, pick: Pick | None = None) -> torch.Tensor:
+    def _forward_mega(
+        self, ids: Tokens, cache: KvCache, T: int, pick: Pick | None = None, on_layer: OnLayer | None = None
+    ) -> torch.Tensor:
         raise NotImplementedError
 
     def _build_mega(self) -> None:

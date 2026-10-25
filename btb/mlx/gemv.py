@@ -76,7 +76,7 @@ TILE_ROWS = {True: 32, False: 16}
 
 _GEMM_HEADER = "#include <metal_simdgroup_matrix>\n"
 
-_GEMM_SRC = """
+GEMM_SRC = """
     // y[b, n] = sum_k x[b, k] w[n, k] for NB rows of x. A simdgroup owns 8 rows of w and streams K in steps of 64:
     // its lanes stage the 8 x 64 weight tile and the NB x 64 activation tile (rows past NB zero, to a whole 8) in the
     // simdgroup's own threadgroup memory, then 8x8 matrix multiply-accumulates, one float accumulator an 8-row
@@ -216,7 +216,7 @@ _gemm_kernels: dict[tuple[int, int, int], MetalKernel] = {}
 _gemv_lock = threading.Lock()
 
 
-def _sgn(nb: int, xb: bool) -> int:
+def gemm_sgn(nb: int, xb: bool) -> int:
     """the simdgroups a threadgroup takes for an `nb`-row tile: each stages its 8 weight rows and its own x tile,
     within the 32 KB of threadgroup memory"""
     tile = (8 + 8 * ((nb + 7) // 8)) * 64 * (2 if xb else 4)
@@ -232,7 +232,7 @@ def _gemm_kernel(xb: int, sgn: int, wf16: int = 0) -> MetalKernel:
                 input_names=["w", "x"],
                 output_names=["y"],
                 header=_GEMM_HEADER + f"#define XB {xb}\n#define SGN {sgn}\n#define WF16 {wf16}\n",
-                source=_GEMM_SRC,
+                source=GEMM_SRC,
             )
     return k
 
@@ -260,7 +260,7 @@ def gemv(w_bf16: mx_.array, x: mx_.array) -> mx_.array:
 def _gemv_tile(w_bf16: mx_.array, x: mx_.array, xb: bool, wf16: bool = False) -> mx_.array:
     m = mx
     rows, nb = int(w_bf16.shape[0]), int(x.shape[0])
-    sgn = _sgn(nb, xb)
+    sgn = gemm_sgn(nb, xb)
     tg = (rows + 8 * sgn - 1) // (8 * sgn)
     y = _gemm_kernel(int(xb), sgn, int(wf16))(
         inputs=[w_bf16.view(m.uint16), x.view(m.uint16) if xb else x],

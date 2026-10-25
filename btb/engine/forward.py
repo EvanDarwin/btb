@@ -284,7 +284,7 @@ class _ForwardMixin(_State):
             and n_layers == self.L
             and self._mega_ok(cache, T, on_layer, head, pick, positions)
         ):
-            return self._forward_mega(ids[0].tolist(), cache, T, pick)
+            return self._forward_mega(ids[0].tolist(), cache, T, pick, on_layer)
         if attention_mask is None and not own and self._mlx_ok(cache, B, T, None, positions, n_layers):
             # the fused path from the embedding gathered on the graph: no torch embed, rope tables or mask
             m = mlxdev.mx
