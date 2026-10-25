@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from .hf import is_gguf
-from .kinds import Log, stored_in_place, stored_quants
+from .kinds import Log, Quant, pooled_layout, stored_quants
 from .metal import paged
 
 if TYPE_CHECKING:
@@ -121,32 +121,30 @@ def _headers(model_dir: str) -> dict[str, tuple[str, list[int], int]]:
 
 def _gguf_sizes(path: str, packed: bool) -> list[int]:
     """`sizes_for` of a GGUF file off its tensor list (llama.cpp's names: `token_embd`, `output`, `blk.N.*`): the
-    head, then a layer's stored blocks of the types read in place end to end (`packed`: kinds.stored_quants, a matrix
-    of whole blocks, as the MLX binding's `_bind_gguf_pooled` lays them) and its other 2-D tensors as bf16. The
-    other stored types get arrays of their own"""
+    head, then a layer's stored weights' streams (`packed`: kinds.stored_quants, a matrix of whole blocks, laid out as
+    the MLX binding's `_bind_gguf_pooled` lays them, `kinds.pooled_layout`) and its other 2-D tensors as bf16"""
     import gguf
 
     stored = {q.value: q for q in stored_quants()}
     al = lambda nb: (nb + ALIGN - 1) // ALIGN * ALIGN
-    per: dict[int, list[int]] = {}  # a layer's stored bytes, then its bf16 buffer's
+    per: dict[int, tuple[list[tuple[Quant, int]], list[int]]] = {}  # a layer's stored weights, its bf16 bytes
     head = 0
     for t in gguf.GGUFReader(path).tensors:
         if len(t.shape) != 2:
             continue
         whole = int(t.shape[0]) % gguf.GGML_QUANT_SIZES[t.tensor_type][0] == 0
         q = stored.get(t.tensor_type.name) if packed and whole else None
-        if q is not None and not stored_in_place(q):
-            continue
-        nb = int(t.n_bytes) if q is not None else 2 * int(t.n_elements)
+        nb = pooled_layout([(q, int(t.n_bytes))])[1] if q is not None else 2 * int(t.n_elements)
         if t.name == "output.weight" or (t.name == "token_embd.weight" and not head):
             head = al(nb)
         elif t.name.startswith("blk."):
-            got = per.setdefault(int(t.name.split(".")[1]), [0, 0])
+            got = per.setdefault(int(t.name.split(".")[1]), ([], [0]))
             if q is not None:
-                got[0] += nb
+                got[0].append((q, int(t.n_bytes)))
             else:
-                got[1] += al(nb)
-    return [head] + [al(n) for i in sorted(per) for n in per[i] if n] if per else []
+                got[1][0] += al(nb)
+    sizes = [n for i in sorted(per) for n in (pooled_layout(per[i][0])[1], per[i][1][0]) if n]
+    return [head] + [al(n) for n in sizes] if per else []
 
 
 def sizes_for(model_dir: str, gguf_packed: bool = True) -> list[int]:

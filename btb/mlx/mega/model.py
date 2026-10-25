@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, NamedTuple, Protocol, TypeAlias, TypeGuard
 import numpy as np
 import torch
 
-from ...kinds import LayerKind, Quant
+from ...kinds import LayerKind, Quant, quant_key
 from ...metal import paged
 from .. import aluminum
 from ..attn import tree_meta
@@ -36,6 +36,13 @@ AMP = 64  # the argmax's parts a row
 TG_MEMORY = 32768  # a threadgroup's memory on every Apple GPU family (MTLDevice.maxThreadgroupMemoryLength)
 
 ConstKey: TypeAlias = tuple[str, int]  # a packed constant: what it is, and the module it is read from
+# a weight's references: its first stream (the instruction's A), then the rest of what its kernels read (D, E, F)
+WeightRefs: TypeAlias = tuple[Tensor, ...]
+
+
+def refs_of(w: WeightRefs, x: Tensor | None, out: Tensor) -> Refs:
+    """an instruction's references over weight `w` beside `x` (B) and `out` (C)"""
+    return (w[0], x, out, *w[1:])
 
 
 class NormModule(Protocol):
@@ -240,7 +247,7 @@ class Block:
         scale = mp.sm.embed_scale
         n = (H, int(scale is not None), 0)
         op = OpName.EMBED if mp.embed_q is None else EMBED_OP[mp.embed_q]
-        self.p.emit(op, self.T, (mp.embed, None, h), n, scale or 0.0, writes=[h])
+        self.p.emit(op, self.T, refs_of(mp.embed, None, h), n, scale or 0.0, writes=[h])
         self.h = h
 
     def norm(self, mod: NormModule) -> Tensor:
@@ -292,7 +299,7 @@ class Block:
             out = y if len(got) == 1 else y.piece(at, rows)
             ld = 0 if len(got) == 1 else width
             op, items = (OpName.MATVEC, mv_items(rows, 8)) if q is None else (MV_OP[q], stored_groups(q, rows, self.T))
-            self.p.emit(op, items, (wt, x, out), (rows, cols, ld << 1), reads=[x], writes=[out])
+            self.p.emit(op, items, refs_of(wt, x, out), (rows, cols, ld << 1), reads=[x], writes=[out])
             pieces.append(out)
             at += rows
         if len(pieces) > 1:
@@ -428,10 +435,11 @@ class Block:
         mp.logits_off = logits.ref[1]
         if mp.head_q is None:  # the step's own float32 matvec over the bf16 head (`kernel.head_source`)
             items = head_groups(mp.V, T)
-            p.emit(OpName.HEAD, items, (mp.head, hn, logits), (mp.V, H, 0), reads=[hn], writes=[logits])
+            p.emit(OpName.HEAD, items, refs_of(mp.head, hn, logits), (mp.V, H, 0), reads=[hn], writes=[logits])
         else:  # the type's own chain over float32 rows, as the step multiplies a stored head
             items = stored_groups(mp.head_q, mp.V, T)
-            p.emit(MV_OP[mp.head_q], items, (mp.head, hn, logits), (mp.V, H, 1), reads=[hn], writes=[logits])
+            refs = refs_of(mp.head, hn, logits)
+            p.emit(MV_OP[mp.head_q], items, refs, (mp.V, H, 1), reads=[hn], writes=[logits])
         amax = p.scratch(2 * AMP, 4)
         if argmax:
             n = (mp.V, AMP, p.R * AMP)
@@ -545,23 +553,32 @@ class MegaPass:
 
     # -- what the program reads, gathered by the widest pass's build --
 
-    def _ref(self, w: Weight) -> Tensor:
-        """a weight in a slot or pool buffer, bf16 or of a stored type the kernel reads (`STORED`): its reference"""
+    def _ref(self, w: Weight) -> WeightRefs:
+        """a weight in a slot or pool buffer, bf16 or of a stored type the kernel reads (`STORED`): a reference each
+        of what its kernels read (`kernel.stored_inputs`), its streams in its buffer and its tables in the constants"""
         sh = getattr(w, "sh", None)
         if sh is None or w.packed is not None:
             raise ValueError("[mega] a weight outside a slot buffer")
         if w.q is not None and w.q not in STORED:
             raise ValueError(f"[mega] {w.q} weights are not in the kernel's ops")
+        k = None if w.q is None else STORED[w.q]
+        offs = w.offs or (w.off,)
+        if k is not None and len(offs) != len(k.streams):
+            raise ValueError(f"[mega] {w.q} weights outside a pool block: their streams are repacked in the graph")
         i = self._bid.get(id(sh.mx))
         if i is None:
             if self._frozen:
                 raise ValueError("[mega] a pass reads a weight buffer the widest pass did not")
             i = self._bid[id(sh.mx)] = len(self.bufs)
             self.bufs.append(sh.whole)
-        return Tensor((i, int(w.off)), int(w.shape[1]))
+        cols = int(w.shape[1])
+        streams = tuple(Tensor((i, int(o)), cols) for o in offs)
+        if w.q is None or k is None:
+            return streams
+        return streams + tuple(self._const((f"{quant_key(w.q)}_{t.name}", 0), t.make) for t in k.tables)
 
-    def weight(self, w: Linear | None) -> tuple[Tensor, int, int, Quant | None]:
-        """a slot weight (or a host linear holding one): its reference, rows, columns and stored type (None: bf16)"""
+    def weight(self, w: Linear | None) -> tuple[WeightRefs, int, int, Quant | None]:
+        """a slot weight (or a host linear holding one): its references, rows, columns and stored type (None: bf16)"""
         wt = w if w is None or isinstance(w, Weight) else w.mx
         if wt is None:
             raise ValueError("[mega] a linear with no weight on the GPU")

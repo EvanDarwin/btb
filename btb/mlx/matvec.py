@@ -7,7 +7,7 @@ bit-identical for a 1-row and a 16-row call."""
 from __future__ import annotations
 
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -85,11 +85,22 @@ class Frags:
 
 
 @dataclass(frozen=True)
+class Table:
+    """a codebook a stored type's kernels read beside its streams: the name its source reads it by, its element
+    type, and its array"""
+
+    name: str
+    ctype: str
+    make: Callable[[], mx_.array]
+
+
+@dataclass(frozen=True)
 class StoredKernel:
     """a stored type as the megakernel builds its launch and embedding on it: its matvec `frags`, the device
     functions they and `decode` call (`header`), the defines both read (`defs`), BW weights a block step, `decode`:
-    statements writing row `row` of the matrix to `dst` (bf16) from thread `tid` of 256, its dequant's numbers, and
-    its launch's `shapes` (None: `SHAPES`)"""
+    statements writing row `row` of the matrix to `dst` (bf16) from thread `tid` of 256, its dequant's numbers, its
+    launch's `shapes` (None: `SHAPES`), the `streams` its pieces read (`kinds.stored_stream_bytes`' order: the name
+    each is read by and its element type) and the `tables` beside them"""
 
     frags: Frags
     header: str
@@ -97,6 +108,8 @@ class StoredKernel:
     bw: int
     decode: str
     shapes: Shapes | None = None
+    streams: tuple[tuple[str, str], ...] = (("W", "uint8_t"),)
+    tables: tuple[Table, ...] = ()
 
 
 def blocks(f: Frags) -> str:

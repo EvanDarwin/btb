@@ -11,7 +11,7 @@ from enum import StrEnum
 from typing import NamedTuple
 
 from ...kinds import MEGA_STORED, Quant, quant_key
-from .. import aluminum, fused, kquant, legacyq, matvec, q6k
+from .. import aluminum, fused, iquant, kquant, legacyq, matvec, q6k
 from ..core import mx
 from ..gemv import GEMM_SRC, gemm_sgn
 from ..matvec import StoredKernel
@@ -184,6 +184,15 @@ class OpName(StrEnum):
     MV_Q40 = "mv_q40"
     MV_Q41 = "mv_q41"
     MV_Q80 = "mv_q80"
+    MV_IQ4NL = "mv_iq4nl"
+    MV_IQ4XS = "mv_iq4xs"
+    MV_IQ3XXS = "mv_iq3xxs"
+    MV_IQ3S = "mv_iq3s"
+    MV_IQ2XXS = "mv_iq2xxs"
+    MV_IQ2XS = "mv_iq2xs"
+    MV_IQ2S = "mv_iq2s"
+    MV_IQ1S = "mv_iq1s"
+    MV_IQ1M = "mv_iq1m"
     EMBED_Q2K = "embed_q2k"
     EMBED_Q3K = "embed_q3k"
     EMBED_Q4K = "embed_q4k"
@@ -192,6 +201,15 @@ class OpName(StrEnum):
     EMBED_Q40 = "embed_q40"
     EMBED_Q41 = "embed_q41"
     EMBED_Q80 = "embed_q80"
+    EMBED_IQ4NL = "embed_iq4nl"
+    EMBED_IQ4XS = "embed_iq4xs"
+    EMBED_IQ3XXS = "embed_iq3xxs"
+    EMBED_IQ3S = "embed_iq3s"
+    EMBED_IQ2XXS = "embed_iq2xxs"
+    EMBED_IQ2XS = "embed_iq2xs"
+    EMBED_IQ2S = "embed_iq2s"
+    EMBED_IQ1S = "embed_iq1s"
+    EMBED_IQ1M = "embed_iq1m"
 
 
 CODE: dict[OpName, int] = {o: i + 1 for i, o in enumerate(OpName)}
@@ -202,7 +220,7 @@ SOURCE: dict[OpName, str] = {}
 GRID3: frozenset[OpName] = frozenset({OpName.ATTN, OpName.ATTN_TREE, OpName.ATTN_PHASED})
 
 # the stored types the kernel multiplies as stored, each through its launch's own chain (`matvec.StoredKernel`)
-STORED: dict[Quant, StoredKernel] = {**kquant.KERNELS, **q6k.KERNELS, **legacyq.KERNELS}
+STORED: dict[Quant, StoredKernel] = {**kquant.KERNELS, **q6k.KERNELS, **legacyq.KERNELS, **iquant.KERNELS}
 assert set(STORED) == MEGA_STORED, f"kinds.MEGA_STORED and the kernel's stored types differ: {set(STORED)}"
 MV_OP: dict[Quant, OpName] = {q: OpName(f"mv_{quant_key(q)}") for q in STORED}
 EMBED_OP: dict[Quant, OpName] = {q: OpName(f"embed_{quant_key(q)}") for q in STORED}
@@ -796,18 +814,32 @@ inline void op_delta_norm(thread const Ins& I, uint item, thread const Ctx& c) {
 
 # a stored type's `embed` in its namespace: a row decoded to bf16
 _STORED_FNS = r"""
-inline void embed(const device uchar* W, uint row, uint COLS, device bfloat* dst, uint tid) {
+inline void embed(PARAMS, uint row, uint COLS, device bfloat* dst, uint tid) {
     const uint NSB = COLS / BW;
 DECODE
 }
 """
 
+# the instruction fields a stored type's inputs (`stored_inputs`) arrive in beside x (B) and y (C), in order, and
+# each field's reference (`Ins`' order)
+STORED_FIELDS = ("A", "D", "E", "F")
+REF_OF = {f: i for i, f in enumerate("ABCDEF")}
+
+
+def stored_inputs(k: StoredKernel) -> list[tuple[str, str]]:
+    """what a stored type's kernels read, each by its name and element type: its streams, then its tables"""
+    ins = [*k.streams, *((t.name, t.ctype) for t in k.tables)]
+    assert len(ins) <= len(STORED_FIELDS), f"a stored type reads {len(ins)} inputs, past the instruction's"
+    return ins
+
+
 _EMBED = r"""
 inline void op_embed_KEY(thread const Ins& I, uint item, thread const Ctx& c) {
-    // row `item` of h (C) = the table's row ids[item] (A: TYPE's blocks) as the step's gather decodes it; H = n0;
-    // n1 & 1: then times f0 as the step scales it (`rows * embed_scale`: the Python float rounded to bf16 first)
+    // row `item` of h (C) = the table's row ids[item] (A, D, E, F: TYPE's streams and tables) as the step's gather
+    // decodes it; H = n0; n1 & 1: then times f0 as the step scales it (`rows * embed_scale`: the Python float rounded
+    // to bf16 first)
     device bfloat* dst = (device bfloat*)I.C + (size_t)item * I.n0;
-    btb_KEY::embed(I.A, c.ids[item], I.n0, dst, c.tid);
+    btb_KEY::embed(ARGS, c.ids[item], I.n0, dst, c.tid);
     if (I.n1 & 1u) {
         threadgroup_barrier(mem_flags::mem_device);
         bfloat s = (bfloat)I.f0;
@@ -826,13 +858,15 @@ def _undo(defs: str) -> str:
 def _stored_prelude(q: Quant, k: StoredKernel) -> str:
     """type `q`'s namespace for the header: its defines, its device functions and `embed`, the defines undone"""
     defs = f"#define BW {k.bw}\n{k.defs}"
-    fns = _STORED_FNS.replace("DECODE", k.decode)
+    params = ", ".join(f"const device {t}* {n}" for n, t in stored_inputs(k))
+    fns = _STORED_FNS.replace("PARAMS", params).replace("DECODE", k.decode)
     return f"{defs}namespace btb_{quant_key(q)} {{\n{k.header}{fns}}}\n{_undo(defs)}"
 
 
 for _q, _k in STORED.items():
     _PRELUDE[EMBED_OP[_q]] = (quant_key(_q), _stored_prelude(_q, _k))
-    _op(EMBED_OP[_q], _EMBED.replace("KEY", quant_key(_q)).replace("TYPE", _q.value))
+    _args = ", ".join(f"(const device {t}*)I.{a}" for (_, t), a in zip(stored_inputs(_k), STORED_FIELDS, strict=False))
+    _op(EMBED_OP[_q], _EMBED.replace("KEY", quant_key(_q)).replace("TYPE", _q.value).replace("ARGS", _args))
 
 # a stored type's matvec, a kernel of its own a matrix and pass width (`stored_source`); the bf16 head's, the step's
 # float32 matvec a kernel of its own a matrix and width (`head_source`)
@@ -942,19 +976,23 @@ def _preamble() -> str:
 
 def stored_source(mvs: Iterable[StoredMv]) -> str:
     """the library of stored matvec kernels `mvs`: each its type's launch (`matvec.blocks`, the step's kernel) with its
-    matrix, pass rows and y's row stride as constants, y [T, rows] (C) = x [T, cols] (B) . W^T, W (A) the type's
-    blocks; a thread of the launch's grid a thread of the command's"""
+    matrix, pass rows and y's row stride as constants, y [T, rows] (C) = x [T, cols] (B) . W^T, W the type's streams
+    and tables (`stored_inputs`, in A, D, E, F); a thread of the launch's grid a thread of the command's"""
     by_q: dict[Quant, list[StoredMv]] = {}
     for s in mvs:
         by_q.setdefault(s.q, []).append(s)
     out = [_preamble()]
+    refs = {f: REF_OF[f] for f in STORED_FIELDS}
     for q, ss in by_q.items():
         k, key = STORED[q], quant_key(q)
+        ins = stored_inputs(k)
+        params = "".join(f"const device {t}* {n}, " for n, t in ins)
+        args = "".join(f"(const device {t}*)REF({refs[f]}), " for (_, t), f in zip(ins, STORED_FIELDS, strict=False))
         out.append(f"{k.defs}namespace btb_{key} {{\n{k.header}")
         for s in ss:
             d = matvec.defines(s.rows, s.cols, k.bw, s.T, k.shapes, s.ld)
             out.append(
-                f"{d}template <typename T>\ninline void {stored_name(s)}(const device uint8_t* W, const device T* x, "
+                f"{d}template <typename T>\ninline void {stored_name(s)}({params}const device T* x, "
                 f"device T* out, uint3 thread_position_in_grid) {{\n{matvec.blocks(k.frags)}}}\n{_undo(d)}"
             )
         out.append("}\n")
@@ -962,7 +1000,7 @@ def stored_source(mvs: Iterable[StoredMv]) -> str:
             t = "float" if s.f32 else "bfloat"
             out.append(
                 _signature(stored_name(s), "uint3 gp [[thread_position_in_grid]]")
-                + f"    btb_{key}::{stored_name(s)}<{t}>(REF(0), (const device {t}*)REF(1), (device {t}*)REF(2), gp);\n}}\n"
+                + f"    btb_{key}::{stored_name(s)}<{t}>({args}(const device {t}*)REF(1), (device {t}*)REF(2), gp);\n}}\n"
             )
         out.append(_undo(k.defs))
     return "".join(out)

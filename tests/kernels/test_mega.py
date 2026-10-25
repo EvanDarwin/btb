@@ -1,8 +1,8 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
-"""The megakernel on Qwen3-0.6B from the local cache (two weight buffers, an untied embedding): a pass of any
-width and shape gives the fused path's argmax ids and cache rows bit for bit, and the greedy and speculative
-loops give the fused loops' tokens. Skipped without MLX or the cached model (never downloads). Then every family the
-megakernel composes, on its tiny fixture, against its own step path."""
+"""The megakernel on Qwen3-0.6B from the local cache (two weight buffers, an untied embedding), its Q4_K_M file and a
+Qwen3.5 2-bit file of lattice types: a pass of any width and shape gives the step's argmax ids and cache rows bit for
+bit, and the greedy and speculative loops give the step's tokens. Skipped without MLX or the cached model (never
+downloads). Then every family the megakernel composes, on its tiny fixture, against its own step path."""
 
 from __future__ import annotations
 
@@ -29,9 +29,11 @@ if TYPE_CHECKING:
 MODEL = "Qwen/Qwen3-0.6B"
 # the release's Q4_K_M file: Q4_K blocks with Q6_K ones in the same layers (a v and a down of their own type)
 MODEL_Q4KM = "unsloth/Qwen3-0.6B-GGUF:Qwen3-0.6B-Q4_K_M.gguf"
+# a hybrid's dynamic 2-bit file: IQ3_XXS, IQ3_S, IQ2_S, IQ2_XS and IQ4_XS blocks beside k-quant and Q8_0 ones
+MODEL_UDQ2 = "unsloth/Qwen3.5-2B-GGUF:Qwen3.5-2B-UD-Q2_K_XL.gguf"
 
 
-@pytest.fixture(scope="module", params=[MODEL, MODEL_Q4KM])
+@pytest.fixture(scope="module", params=[MODEL, MODEL_Q4KM, MODEL_UDQ2])
 def engine(request: pytest.FixtureRequest) -> Iterator[StreamedTextModel]:
     import btb
 
@@ -73,7 +75,8 @@ def _pass(
         try:
             out = sm.forward([toks], cache=cache, last_only=False, pick=True)
             assert out is not None
-            ids = [int(v) for v in out[0].tolist()]
+            # a path that picks hands back ids, one that does not (the sandwich's step under speculation) logits
+            ids = [int(v) for v in (out[0].argmax(-1) if out.dim() == 3 else out[0]).tolist()]
         finally:
             sm.ab()
     att = [cl for i, cl in enumerate(cache.layers) if sm.layer_types[i] != LayerKind.LINEAR]
@@ -155,12 +158,15 @@ def test_tree_kernels_match_step(engine: StreamedTextModel, monkeypatch: pytest.
 def test_step_over_the_arena_matches_a_plain_cache(engine: StreamedTextModel, past: int, parents: Parents) -> None:
     """a pass the step takes over the megakernel's arena (the prompt's rows and its own written with the pass, read as
     a paged layer's are) gives a plain cache's ids and rows"""
+    prompt = [151644, *range(1000, 1000 + past - 1)]
+    _arena_matches_a_plain_cache(engine, prompt, [2000 + 7 * t for t in range(len(parents))], parents)
+
+
+def _arena_matches_a_plain_cache(sm: StreamedTextModel, prompt: Tokens, toks: Tokens, parents: Parents) -> None:
+    """the step's pass over the megakernel's arena gives its pass over a plain cache's ids and rows"""
     import mlx.core as mx
 
-    sm = engine
     mega = sm._mega
-    prompt = [151644, *range(1000, 1000 + past - 1)]
-    toks = [2000 + 7 * t for t in range(len(parents))]
     try:
         p_ids, p_rows = _pass(sm, None, prompt, toks, parents)
         a_ids, a_rows = _pass(sm, None, prompt, toks, parents, arena=mega)
@@ -175,7 +181,7 @@ def _paged_pass(
     sm: StreamedTextModel, pc: PrefixCache, mega: MegaPass | None, prompt: Tokens, toks: Tokens, parents: Parents
 ) -> tuple[list[int], list[mx.array]]:
     """`_pass` over a fresh paged cache of `pc`: the prompt prefilled by the step, the pass by `mega` (None: the
-    step); the ids, and layer 0's and the last layer's K rows read back through the conversation's row map"""
+    step); the ids, and the first and the last attention layer's K rows read back through the conversation's row map"""
     import mlx.core as mx
 
     sm._mega = None
@@ -193,7 +199,7 @@ def _paged_pass(
             sm.ab()
     rows = mx.array(cache.table.rows()[: past + len(toks)].numpy().astype("uint32"))
     host = pc.pool.host
-    got = [mx.take(host.mx_view(i)[0][0], rows, axis=1).astype(mx.float32) for i in (0, len(cache.layers) - 1)]
+    got = [mx.take(host.mx_view(i)[0][0], rows, axis=1).astype(mx.float32) for i in _kv_layers(sm)]
     cache.crop_to(0)
     return ids, got
 
@@ -294,9 +300,10 @@ def test_loops_match_sampled(engine: StreamedTextModel) -> None:
 
 
 def test_arena_layers(engine: StreamedTextModel) -> None:
-    """every layer of a cache built with the megakernel lives in the arena"""
+    """every attention layer of a cache built with the megakernel lives in the arena"""
     cache = engine.new_cache(max_len=1024)
-    assert all(isinstance(cl, GrowLayer) and cl.arena is not None for cl in cache.layers)
+    att = [cl for i, cl in enumerate(cache.layers) if engine.layer_types[i] != LayerKind.LINEAR]
+    assert att and all(isinstance(cl, GrowLayer) and cl.arena is not None for cl in att)
 
 
 # the fixtures of every family whose layers the megakernel composes, by the cert's own gate, then each as a GGUF of
@@ -361,6 +368,15 @@ def test_family_pass_matches_step(tiny: StreamedTextModel, past: int, parents: P
                 assert mx.array_equal(row, b.astype(mx.float32)), f"node {j}: K rows differ from the step's"
     finally:
         sm._mega = mega
+
+
+@pytest.mark.parametrize("parents", [[-1], [-1, 0, 1, 0, 3, 3, 1]], ids=["one", "tree7"])
+def test_family_step_over_the_arena_matches_a_plain_cache(tiny: StreamedTextModel, parents: Parents) -> None:
+    """every family's step over the megakernel's arena, a tree's metadata read off its first attention layer (a
+    hybrid's first layer keeps no rows), gives its pass over a plain cache's ids and rows"""
+    V = _vocab(tiny)
+    prompt = [1 + (7 * t) % (V - 1) for t in range(70)]
+    _arena_matches_a_plain_cache(tiny, prompt, [1 + (13 * t + 5) % (V - 1) for t in range(len(parents))], parents)
 
 
 @pytest.mark.parametrize("past", [70, 600])

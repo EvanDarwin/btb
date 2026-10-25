@@ -15,7 +15,7 @@ import torch
 
 from .. import mlx as mlxdev
 from .. import pool
-from ..kinds import LayerKind, NodePath, Parents, PassTag, TokenRows, Tokens, stored_in_place
+from ..kinds import LayerKind, NodePath, Parents, PassTag, TokenRows, Tokens, pooled_layout, stored_in_place
 from ..mlx import aluminum
 from ..mlx import fused as fk
 from ..sampling import GREEDY
@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     import mlx.core as mx_
     from transformers.cache_utils import LinearAttentionCacheLayerMixin, LinearAttentionLayer
 
+    from ..gguf import QuantWeight
     from ..kinds import Json
     from ..mlx import Shared
     from ..mlx.attn import NodeMeta
@@ -366,32 +367,37 @@ class _MlxMixin(_State):
         return placed + cur
 
     def _bind_gguf_pooled(self, lins: Sequence[_HostLinear]) -> int:
-        """the GGUF tensors among `lins` of a stored type read in place (`kinds.stored_in_place`), end to end in one
-        pool buffer (each type's blocks are an even number of bytes, all its kernels' f16 reads need), bound there
-        (`Backend.weight_stored_pool`): neighbours join as a view and the megakernel reads them where they are. The
-        torch weight becomes a shape, as `_bind_gguf_stored` leaves it. Returns the bytes placed."""
+        """the GGUF tensors among `lins` of a stored type as the streams its kernels read, in one pool buffer
+        (`kinds.pooled_layout`: the blocks in place, IQ4_NL's and IQ1_M's split out once) and bound there
+        (`Backend.weight_stored_pool`): neighbours join as a view a stream and the megakernel reads them where they
+        are. The torch weight becomes a shape, as `_bind_gguf_stored` leaves it. Returns the bytes placed."""
+        from ..mlx.backend import stored_streams
+
         gg = self.gguf
         if gg is None or not self.gguf_packed:
             return 0
-        items, cur = [], 0
+        items: list[tuple[_HostLinear, QuantWeight]] = []
         for m in lins:
             name = self._gguf_names.get(m.key) if m.key is not None else None
-            if name is None or not gg.storable(name):
-                continue
-            w = gg.stored(name)
-            if not stored_in_place(w.q):
-                continue
-            items.append((m, w, cur))
-            cur += int(w.raw.numel())
+            if name is not None and gg.storable(name):
+                items.append((m, gg.stored(name)))
         if not items:
             return 0
         be = self.mlx
         assert be is not None
+        offs, cur = pooled_layout([(w.q, int(w.raw.numel())) for _, w in items])
         sh, base = self._shared_ahead(cur)
-        for m, w, so in items:
-            nb = int(w.raw.numel())
-            sh.torch[base + so : base + so + nb].copy_(w.raw.reshape(-1))
-            m.mx = be.weight_stored_pool(sh, base + so, nb, w.q, w.shape)
+        for (m, w), at in zip(items, offs, strict=True):
+            raw = w.raw.reshape(-1)
+            if stored_in_place(w.q):
+                parts = [raw]
+            else:  # the type's split streams, made once from the file's blocks
+                made = stored_streams(w.q, raw.numpy())
+                parts = [torch.from_numpy(np.asarray(s).reshape(-1).view(np.uint8).copy()) for s in made]
+            for o, p in zip(at, parts, strict=True):
+                sh.torch[base + o : base + o + int(p.numel())].copy_(p)
+            nbs = [int(p.numel()) for p in parts]
+            m.mx = be.weight_stored_pool(sh, [base + o for o in at], nbs, w.q, w.shape)
             m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*w.shape), requires_grad=False)
         self.mlx_state.bytes += cur
         return cur
@@ -470,7 +476,8 @@ class _MlxMixin(_State):
         depth = [0] * T
         for j in range(T):
             depth[j] = 0 if parents[j] < 0 else depth[parents[j]] + 1
-        cl0 = cache.layers[0] if cache is not None and cache.layers else None
+        # the first attention layer's (a hybrid's first layer is a DeltaNet one, which keeps no rows)
+        cl0 = next((cl for cl in cache.layers if isinstance(cl, GrowLayer)), None) if cache is not None else None
         rows = isinstance(cache, PagedCache) or (isinstance(cl0, GrowLayer) and cl0.in_arena(int(past) + T))
         seg = int(past) if rows else None
         selected = isinstance(cl0, GrowLayer) and cl0._row is not None

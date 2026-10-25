@@ -265,16 +265,45 @@ def stored_quants() -> list[Quant]:
     return [q for q in Quant if QUANT_KIND[q] in STORED_CLASSES]
 
 
-# the stored types the MLX megakernel multiplies as stored, each through its launch's own chain: the affine and
-# k-quant classes whole; its registry (`mlx.mega.kernel.STORED`) is held to this at import, so the torch-free cert
-# reads the same set
-MEGA_STORED: frozenset[Quant] = frozenset(q for q in Quant if QUANT_KIND[q] in (QuantClass.AFFINE, QuantClass.KQUANT))
+# the stored types the MLX megakernel multiplies as stored, each through its launch's own chain: every stored class;
+# its registry (`mlx.mega.kernel.STORED`) is held to this at import, so the torch-free cert reads the same set
+MEGA_STORED: frozenset[Quant] = frozenset(stored_quants())
 
 
 def stored_in_place(q: Quant) -> bool:
     """whether the MLX kernels read a stored type's blocks as the file lays them out, one stream and no repack:
     IQ4_NL splits its blocks into two and the lattice types add side streams (`mlx.backend.stored_streams`)"""
     return q is not Quant.IQ4_NL and QUANT_KIND[q] is not QuantClass.LATTICE
+
+
+def stored_stream_bytes(q: Quant, nbytes: int) -> tuple[int, ...]:
+    """the bytes of each stream the MLX kernels read for `nbytes` of a stored type's file blocks, in the order
+    `mlx.backend.stored_streams` makes them: the blocks themselves, IQ4_NL's f16 scale and 16 nibble bytes a 32-block
+    (the file's 18 bytes), IQ1_M's blocks with its f16 scale and 8 sub-scale bytes a 56-byte superblock beside them"""
+    if q is Quant.IQ4_NL:
+        return 2 * (nbytes // 18), 16 * (nbytes // 18)
+    if q is Quant.IQ1_M:
+        return nbytes, 2 * (nbytes // 56), 8 * (nbytes // 56)
+    return (nbytes,)
+
+
+def pooled_layout(items: Sequence[tuple[Quant, int]]) -> tuple[list[tuple[int, ...]], int]:
+    """where a layer's stored weights' streams lie in its pool block, each item a weight's type and file bytes: stream
+    by stream, and within a stream type by type in first appearance, each such group from 16 bytes (its kernels'
+    vector reads) with its weights end to end in order (a type's blocks are an even number of bytes, all its f16 reads
+    need), so neighbours of one type join as one view a stream. Each item's stream offsets, and the block's bytes"""
+    sizes = [stored_stream_bytes(q, nb) for q, nb in items]
+    offs: list[list[int]] = [[] for _ in items]
+    types = list(dict.fromkeys(q for q, _ in items))
+    at = 0
+    for i in range(max((len(s) for s in sizes), default=0)):
+        for t in types:
+            at = (at + 15) // 16 * 16
+            for k, (q, _) in enumerate(items):
+                if q is t and i < len(sizes[k]):
+                    offs[k].append(at)
+                    at += sizes[k][i]
+    return [tuple(o) for o in offs], at
 
 
 # the float types a GGUF's expert store also holds as the file's and multiplies with its own kernel, so a quantizer's

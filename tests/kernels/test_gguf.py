@@ -10,6 +10,7 @@ converter refuses; it is checked on a real release."""
 import json
 import os
 import shutil
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -17,7 +18,7 @@ import numpy as np
 import pytest
 import torch
 
-from btb.kinds import PassTag, Quant, quant_tag, stored_in_place, stored_quants
+from btb.kinds import PassTag, Quant, quant_tag, stored_quants
 from tests.cert.manifest import QWEN3_06B_GGUF
 
 if TYPE_CHECKING:
@@ -224,37 +225,48 @@ def test_joined_stored_weights_are_their_members_in_one_launch(q: Quant) -> None
         assert np.array_equal(np.array(stored_matvec(q, w.streams, x, *w.shape)), b), q.value
 
 
-@pytest.mark.parametrize("q", [q for q in stored_quants() if stored_in_place(q)], ids=lambda q: q.value)
+@pytest.mark.parametrize("q", stored_quants(), ids=lambda q: q.value)
 def test_pooled_stored_weights_join_as_a_view_of_their_block(q: Quant) -> None:
-    """stored weights of a type read in place, end to end in one pool block (`weight_stored_pool`, as a GGUF binds
-    them): their join (q/k/v, gate/up) is a view over the same bytes, each of its rows bit-for-bit its member's at
-    every pass width; members out of order, of another type or another block are not joined at all (a copy would hold
+    """stored weights of each type laid out in one pool block as a GGUF binds them (`kinds.pooled_layout`, then
+    `weight_stored_pool`: the blocks in place, a split type's streams made once): each matvec is the type's over its
+    own streams, and their join (q/k/v, gate/up) a view a stream over the same bytes, each of its rows bit-for-bit its
+    member's at every pass width; members out of order or of another block are not joined at all (a copy would hold
     the block's bytes twice)"""
     need_mlx()
     import mlx.core as mx
 
     from btb import mlx as mlxdev
-    from btb.mlx.backend import stored_matvec
+    from btb.kinds import pooled_layout
+    from btb.mlx import Shared
+    from btb.mlx.backend import Weight, stored_matvec, stored_streams
 
     be = mlxdev.Backend.__new__(mlxdev.Backend)
-    cols, base = 512, 64
-    raws = [stored_blocks(q, r, cols, i) for i, r in enumerate((40, 24, 16))]
-    sh = mlxdev.Shared(base + sum(r.size for r in raws))
-    ws, at = [], base
-    for raw, rows in zip(raws, (40, 24, 16), strict=True):
-        sh.torch[at : at + raw.size] = torch.from_numpy(raw.reshape(-1).copy())
-        ws.append(be.weight_stored_pool(sh, at, raw.size, q, (rows, cols)))
-        at += raw.size
+    cols, base, heights = 512, 64, (40, 24, 16)
+
+    def pool(raws: list[np.ndarray], heights: Sequence[int]) -> tuple[Shared, list[Weight]]:
+        offs, size = pooled_layout([(q, r.size) for r in raws])
+        sh = mlxdev.Shared(base + size)
+        ws = []
+        for raw, rows, at in zip(raws, heights, offs, strict=True):
+            parts = [np.asarray(s).reshape(-1).view(np.uint8) for s in stored_streams(q, raw)]
+            for o, p in zip(at, parts, strict=True):
+                sh.torch[base + o : base + o + p.size] = torch.from_numpy(p.copy())
+            ws.append(be.weight_stored_pool(sh, [base + o for o in at], [p.size for p in parts], q, (rows, cols)))
+        return sh, ws
+
+    raws = [stored_blocks(q, r, cols, i) for i, r in enumerate(heights)]
+    sh, ws = pool(raws, heights)
     x = mx.array(np.random.default_rng(3).standard_normal((16, cols)).astype(np.float32))
     before = [np.array(stored_matvec(q, w.streams, x, *w.shape)) for w in ws]
+    for raw, w, b in zip(raws, ws, before, strict=True):
+        assert np.array_equal(np.array(stored_matvec(q, stored_streams(q, raw), x, *w.shape)), b), q.value
     j = be.weight_fused(ws)
-    assert j is not None and j.shape == (80, cols) and j.sh is sh and (j.off, j.nb) == (base, at - base)
+    assert j is not None and j.shape == (80, cols) and j.sh is sh and j.offs == ws[0].offs
+    assert j.nbs == tuple(sum(w.nbs[i] for w in ws) for i in range(len(j.nbs))), q.value
     for t in range(1, 17):
         want = np.concatenate([b[:t] for b in before], axis=1)
         assert np.array_equal(np.array(stored_matvec(q, j.streams, x[:t], *j.shape)), want), (q.value, t)
-    other = mlxdev.Shared(raws[1].size)
-    other.torch[:] = torch.from_numpy(raws[1].reshape(-1).copy())
-    apart = be.weight_stored_pool(other, 0, raws[1].size, q, (24, cols))
+    _, (apart,) = pool([raws[1]], heights[1:2])
     for bad in ([ws[1], ws[0]], [ws[0], apart]):
         assert be.weight_fused(bad) is None, q.value
 

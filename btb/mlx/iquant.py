@@ -14,8 +14,9 @@ from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 import numpy as np
 
+from ..kinds import Quant, QuantClass, quant_key, quants_of
 from .core import metal_kernel, mx
-from .matvec import SHAPES, Frags, Shapes, blocks, launch
+from .matvec import SHAPES, Frags, Shapes, StoredKernel, Table, blocks, launch
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -72,15 +73,14 @@ _KV = "constant int KV[16] = {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69
 # a block, so a block's nibbles are one aligned uint4): ggml's 18-byte stride straddles cache lines and cannot be
 # vector-loaded. lane = block (one lane owns 32 weights: one uint4 + one f16 a block; 32 lanes read 512 contiguous
 # bytes). Register-only, batch-invariant. cols = NB*32, walked 32 blocks (BW = 1024 weights) a step.
-_MATVEC_IQ4NL = blocks(
-    Frags(
-        "",
-        "        uint b = c * 32 + lane;\n        bool ok = b < NB;\n        float dd[RP];\n        uint4 qq[RP];\n",
-        r"""
+IQ4NL_FRAGS = Frags(
+    "",
+    "        uint b = c * 32 + lane;\n        bool ok = b < NB;\n        float dd[RP];\n        uint4 qq[RP];\n",
+    r"""
             dd[r] = ok ? (float)Dd[(size_t)row * NB + b] : 0.0f;
             qq[r] = ok ? ((const device uint4*)Qq)[(size_t)row * NB + b] : uint4(0);
 """,
-        r"""
+    r"""
             if (ok) {
                 const device T* xb = xc + lane * 32;  // read in place a row: 32 held in registers spill
                 #pragma unroll
@@ -99,14 +99,12 @@ _MATVEC_IQ4NL = blocks(
                 }
             }
 """,
-    )
 )
-_DEQUANT_IQ4NL = r"""
-    uint b = thread_position_in_grid.x;
-    if (b >= NBLK) return;
-    float d = (float)Dd[b];
-    uint4 q = ((const device uint4*)Qq)[b];
-    device T* o = out + (size_t)b * 32;
+_MATVEC_IQ4NL = blocks(IQ4NL_FRAGS)
+# a 32-block of IQ4_NL as bf16 (or T): the dequant's and a megakernel's embedding row's
+_IQ4NL_BLOCK = r"""
+template <typename T>
+inline void iq4nl_block(float d, uint4 q, device T* o) {
     #pragma unroll
     for (int k = 0; k < 4; k++) { uint by = (q.x >> (8*k)) & 0xFF; o[k]      = (T)(d * (float)KV[by & 0xF]); o[16 + k] = (T)(d * (float)KV[by >> 4]); }
     #pragma unroll
@@ -115,17 +113,22 @@ _DEQUANT_IQ4NL = r"""
     for (int k = 0; k < 4; k++) { uint by = (q.z >> (8*k)) & 0xFF; o[8 + k]  = (T)(d * (float)KV[by & 0xF]); o[24 + k] = (T)(d * (float)KV[by >> 4]); }
     #pragma unroll
     for (int k = 0; k < 4; k++) { uint by = (q.w >> (8*k)) & 0xFF; o[12 + k] = (T)(d * (float)KV[by & 0xF]); o[28 + k] = (T)(d * (float)KV[by >> 4]); }
+}
+"""
+_DEQUANT_IQ4NL = r"""
+    uint b = thread_position_in_grid.x;
+    if (b >= NBLK) return;
+    iq4nl_block((float)Dd[b], ((const device uint4*)Qq)[b], out + (size_t)b * 32);
 """
 
 # IQ4_XS: 136 B a superblock of 256. d f16, scales_h u16, scales_l[4], then 128 nibble bytes. Eight 32-blocks a
 # superblock; block ib has a 6-bit scale ls = (scales_l nibble) | (scales_h 2 bits << 4), value = d*(ls-32)*KV[q],
 # q the nibble of qs[16*ib + (col&15)] (low half of the block's cols the low nibble, high half the high). lane =
 # col within a 32-block (0..31). Register-only, batch-invariant. cols = NSB*256.
-_MATVEC_IQ4XS = blocks(
-    Frags(
-        "    uint hi = lane >> 4, bx = lane & 15;\n",
-        "        float w[RP][8];\n",
-        r"""
+IQ4XS_FRAGS = Frags(
+    "    uint hi = lane >> 4, bx = lane & 15;\n",
+    "        float w[RP][8];\n",
+    r"""
             const device uchar* blk = W + ((size_t)row * NSB + c) * 136;
             float d = (float)(*(const device half*)blk);
             uint sh = (uint)blk[2] | ((uint)blk[3] << 8);
@@ -140,7 +143,7 @@ _MATVEC_IQ4XS = blocks(
                 w[r][ib] = dl * (float)KV[q];
             }
 """,
-        r"""
+    r"""
             float xv[8];
             #pragma unroll
             for (int k = 0; k < 8; k++) xv[k] = (float)xc[32 * k + lane];
@@ -149,19 +152,18 @@ _MATVEC_IQ4XS = blocks(
                 #pragma unroll
                 for (int k = 0; k < 8; k++) acc[r][tr] += w[r][k] * xv[k];
 """,
-    )
 )
-_DEQUANT_IQ4XS = r"""
-    uint gid = thread_position_in_grid.x;
-    uint blk_i = gid / 32, lane = gid % 32;
-    if (blk_i >= NBLK) return;
+_MATVEC_IQ4XS = blocks(IQ4XS_FRAGS)
+# a lane (one column of each of the eight 32-blocks) of an IQ4_XS superblock `blk` as T: the dequant's and a
+# megakernel's embedding row's
+_IQ4XS_LANE = r"""
+template <typename T>
+inline void iq4xs_lane(const device uchar* blk, uint lane, device T* o) {
     uint hi = lane >> 4, bx = lane & 15;
-    const device uchar* blk = W + (size_t)blk_i * 136;
     float d = (float)(*(const device half*)blk);
     uint sh = (uint)blk[2] | ((uint)blk[3] << 8);
     const device uchar* sl = blk + 4;
     const device uchar* qs = blk + 8;
-    device T* o = out + (size_t)blk_i * 256;
     for (int ib = 0; ib < 8; ib++) {
         int ls = ((sl[ib >> 1] >> (4 * (ib & 1))) & 0xF) | (((sh >> (2 * ib)) & 3) << 4);
         float dl = d * (float)(ls - 32);
@@ -169,6 +171,13 @@ _DEQUANT_IQ4XS = r"""
         int q = hi ? (byte >> 4) : (byte & 0xF);
         o[32 * ib + lane] = (T)(dl * (float)KV[q]);
     }
+}
+"""
+_DEQUANT_IQ4XS = r"""
+    uint gid = thread_position_in_grid.x;
+    uint blk_i = gid / 32, lane = gid % 32;
+    if (blk_i >= NBLK) return;
+    iq4xs_lane(W + (size_t)blk_i * 136, lane, out + (size_t)blk_i * 256);
 """
 _lock = threading.Lock()
 _deq: dict[str, MetalKernel] = {}
@@ -181,27 +190,27 @@ IQ4NL_SHAPES: Shapes = {
     16: (4, 4),
 }
 LATTICE_SHAPES: Shapes = {**SHAPES, 1: (2, 1)}
-# (block bytes, block weights, matvec source, dequant source) a kind
+# (block bytes, block weights, matvec source, dequant source, the device functions it calls) a kind
 _IQ = {
-    "iq4xs": (136, 256, _MATVEC_IQ4XS, _DEQUANT_IQ4XS),
+    "iq4xs": (136, 256, _MATVEC_IQ4XS, _DEQUANT_IQ4XS, _IQ4XS_LANE),
 }
 
 
 def _matvec(kind: str, w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:
-    _, blkw, src, _ = _IQ[kind]
+    _, blkw, src, _, _ = _IQ[kind]
     nb = cols // blkw
     return launch(f"btb_{kind}_mv_{rows}_{nb}", src, _KV, [("W", w_bytes)], x, rows, cols, blkw)
 
 
 def _dequant(kind: str, w_bytes: mx_.array, rows: int, cols: int) -> mx_.array:
     m = mx
-    _, blkw, _, src = _IQ[kind]
+    _, blkw, _, src, fns = _IQ[kind]
     nblk = int(rows * cols // blkw)
     with _lock:
         k = _deq.get(kind)
         if k is None:
             k = _deq[kind] = metal_kernel(
-                name=f"btb_{kind}_dequant", input_names=["W"], output_names=["out"], header=_KV, source=src
+                name=f"btb_{kind}_dequant", input_names=["W"], output_names=["out"], header=_KV + fns, source=src
             )
     grid = ((nblk * 32 + 255) // 256) * 256
     return k(
@@ -253,7 +262,7 @@ def dequant_iq4nl(d: mx_.array, q: mx_.array, rows: int, cols: int) -> mx_.array
                 name="btb_iq4nl_dequant",
                 input_names=["Dd", "Qq"],
                 output_names=["out"],
-                header=_KV,
+                header=_KV + _IQ4NL_BLOCK,
                 source=_DEQUANT_IQ4NL,
             )
     grid = ((nblk + 255) // 256) * 256
@@ -297,11 +306,10 @@ _APPLY_G8 = r"""
                 acc[r][tr] += db[r] * p;
             }
 """
-_MATVEC_IQ3XXS = blocks(
-    Frags(
-        "    uint ib = lane >> 2, l = lane & 3, cb = 8 * lane;   // two 4-value grid entries a lane\n",
-        _DECL_G8,
-        r"""
+IQ3XXS_FRAGS = Frags(
+    "    uint ib = lane >> 2, l = lane & 3, cb = 8 * lane;   // two 4-value grid entries a lane\n",
+    _DECL_G8,
+    r"""
             const device uchar* blk = W + ((size_t)row * NSB + c) * 98;
             float d = (float)(*(const device half*)blk);
             const device uchar* qs = blk + 2;
@@ -315,20 +323,19 @@ _MATVEC_IQ3XXS = blocks(
             #pragma unroll
             for (int j = 0; j < 4; j++) { float v = (float)GRID[i2 * 4 + j]; g[r][4 + j] = (signs & (1 << (j + 4))) ? -v : v; }
 """,
-        _APPLY_G8,
-    )
+    _APPLY_G8,
 )
-_DEQUANT_IQ3XXS = r"""
-    uint gid = thread_position_in_grid.x;
-    uint blk_i = gid / 32, lane = gid % 32;
-    if (blk_i >= NBLK) return;
+# each lattice kind's lane of a superblock `blk` as T (one column of each of its eight 32-blocks): the dequant's and a
+# megakernel's embedding row's, over the kind's grid (and the sign table where it reads one)
+_IQ3XXS_LANE = r"""
+template <typename T>
+inline void iq3xxs_lane(const device uchar* blk, uint lane, const device int8_t* GRID, const device uint8_t* KS,
+                        device T* o) {
     uint l = lane >> 3, m = lane & 7, qsoff = 2 * l + (m >= 4 ? 1 : 0), gj = m & 3;
     uchar smask = 1 << m;
-    const device uchar* blk = W + (size_t)blk_i * 98;
     float d = (float)(*(const device half*)blk);
     const device uchar* qs = blk + 2;
     const device uchar* sca = blk + 66;
-    device T* o = out + (size_t)blk_i * 256;
     for (int ib = 0; ib < 8; ib++) {
         uint aux = (uint)sca[4*ib] | ((uint)sca[4*ib+1]<<8) | ((uint)sca[4*ib+2]<<16) | ((uint)sca[4*ib+3]<<24);
         float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
@@ -337,16 +344,16 @@ _DEQUANT_IQ3XXS = r"""
         uchar signs = KS[(aux >> (7 * l)) & 127];
         o[32 * ib + lane] = (T)(db * gval * ((signs & smask) ? -1.0f : 1.0f));
     }
+}
 """
 # IQ2_XXS: 66 B a superblock of 256. d f16, then 8 interleaved groups of 8 bytes (word0 = 4 grid-index bytes,
 # word1 = a 4-bit scale in the top nibble and four 7-bit sign-table indices below). A group is a 32-block, four
 # sub-groups of 8 a block; the (256,8) grid gives 8 values a sub-group, signed by the group's sign byte, scaled by
 # db = d*(0.5 + scale)*0.25. lane = col within a 32-block, l = lane>>3 the sub-group, j = lane&7 the value.
-_MATVEC_IQ2XXS = blocks(
-    Frags(
-        "    uint ig = lane >> 2, sub = lane & 3, cb = 8 * lane;   // one grid entry a lane\n",
-        _DECL_G8,
-        r"""
+IQ2XXS_FRAGS = Frags(
+    "    uint ig = lane >> 2, sub = lane & 3, cb = 8 * lane;   // one grid entry a lane\n",
+    _DECL_G8,
+    r"""
             const device uchar* blk = W + ((size_t)row * NSB + c) * 66;
             float d = (float)(*(const device half*)blk);
             const device uchar* grp = blk + 2 + 8 * ig;
@@ -357,18 +364,15 @@ _MATVEC_IQ2XXS = blocks(
             #pragma unroll
             for (int k = 0; k < 8; k++) { float v = (float)GRID[gi * 8 + k]; g[r][k] = (signs & (1 << k)) ? -v : v; }
 """,
-        _APPLY_G8,
-    )
+    _APPLY_G8,
 )
-_DEQUANT_IQ2XXS = r"""
-    uint gid = thread_position_in_grid.x;
-    uint blk_i = gid / 32, lane = gid % 32;
-    if (blk_i >= NBLK) return;
+_IQ2XXS_LANE = r"""
+template <typename T>
+inline void iq2xxs_lane(const device uchar* blk, uint lane, const device int8_t* GRID, const device uint8_t* KS,
+                        device T* o) {
     uint l = lane >> 3, j = lane & 7; uchar jmask = 1 << j;
-    const device uchar* blk = W + (size_t)blk_i * 66;
     float d = (float)(*(const device half*)blk);
     const device uchar* qs = blk + 2;
-    device T* o = out + (size_t)blk_i * 256;
     for (int ib = 0; ib < 8; ib++) {
         const device uchar* grp = qs + 8 * ib;
         uint w1 = (uint)grp[4] | ((uint)grp[5]<<8) | ((uint)grp[6]<<16) | ((uint)grp[7]<<24);
@@ -377,14 +381,14 @@ _DEQUANT_IQ2XXS = r"""
         uchar signs = KS[(w1 >> (7 * l)) & 127];
         o[32 * ib + lane] = (T)(db * gval * ((signs & jmask) ? -1.0f : 1.0f));
     }
+}
 """
 # IQ2_XS: 74 B a superblock. d f16, 32 uint16 qs (a group of 8: low 9 bits a (512,8) grid index, top 7 bits a
 # sign-table index), 8 scale bytes (16 4-bit sub-scales, one a 16-weight half-block). db = d*(0.5 + sc4)*0.25.
-_MATVEC_IQ2XS = blocks(
-    Frags(
-        "    uint s = lane >> 1, cb = 8 * lane;   // one uint16 grid entry a lane\n",
-        _DECL_G8,
-        r"""
+IQ2XS_FRAGS = Frags(
+    "    uint s = lane >> 1, cb = 8 * lane;   // one uint16 grid entry a lane\n",
+    _DECL_G8,
+    r"""
             const device uchar* blk = W + ((size_t)row * NSB + c) * 74;
             float d = (float)(*(const device half*)blk);
             const device uchar* p = blk + 2 + 2 * lane;
@@ -397,18 +401,15 @@ _MATVEC_IQ2XS = blocks(
             #pragma unroll
             for (int k = 0; k < 8; k++) { float v = (float)GRID[gi * 8 + k]; g[r][k] = (signs & (1 << k)) ? -v : v; }
 """,
-        _APPLY_G8,
-    )
+    _APPLY_G8,
 )
-_DEQUANT_IQ2XS = r"""
-    uint gid = thread_position_in_grid.x;
-    uint blk_i = gid / 32, lane = gid % 32;
-    if (blk_i >= NBLK) return;
+_IQ2XS_LANE = r"""
+template <typename T>
+inline void iq2xs_lane(const device uchar* blk, uint lane, const device int8_t* GRID, const device uint8_t* KS,
+                       device T* o) {
     uint l = lane >> 3, j = lane & 7; uchar jmask = 1 << j;
-    const device uchar* blk = W + (size_t)blk_i * 74;
     float d = (float)(*(const device half*)blk);
     const device uchar* qs = blk + 2; const device uchar* sc = blk + 66;
-    device T* o = out + (size_t)blk_i * 256;
     for (int ib = 0; ib < 8; ib++) {
         uint grp = 4 * ib + l;
         const device uchar* p = qs + 2 * grp;
@@ -419,14 +420,14 @@ _DEQUANT_IQ2XS = r"""
         uchar signs = KS[q16 >> 9];
         o[32 * ib + lane] = (T)(db * gval * ((signs & jmask) ? -1.0f : 1.0f));
     }
+}
 """
 # IQ2_S: 82 B a superblock. d f16, 32 qs bytes (low 8 index bits), 32 explicit sign bytes (a bit a weight), 8 qh
 # bytes (2 high index bits a group, into the (1024,8) grid), 8 scale bytes (16 4-bit sub-scales). db = d*(0.5+sc4)*0.25.
-_MATVEC_IQ2S = blocks(
-    Frags(
-        "    uint b = lane >> 1, cb = 8 * lane;\n",
-        _DECL_G8,
-        r"""
+IQ2S_FRAGS = Frags(
+    "    uint b = lane >> 1, cb = 8 * lane;\n",
+    _DECL_G8,
+    r"""
             const device uchar* blk = W + ((size_t)row * NSB + c) * 82;
             float d = (float)(*(const device half*)blk);
             const device uchar* qs = blk + 2;
@@ -440,19 +441,15 @@ _MATVEC_IQ2S = blocks(
             #pragma unroll
             for (int k = 0; k < 8; k++) { float v = (float)GRID[idx * 8 + k]; g[r][k] = (signs & (1 << k)) ? -v : v; }
 """,
-        _APPLY_G8,
-    )
+    _APPLY_G8,
 )
-_DEQUANT_IQ2S = r"""
-    uint gid = thread_position_in_grid.x;
-    uint blk_i = gid / 32, lane = gid % 32;
-    if (blk_i >= NBLK) return;
+_IQ2S_LANE = r"""
+template <typename T>
+inline void iq2s_lane(const device uchar* blk, uint lane, const device int8_t* GRID, device T* o) {
     uint l = lane >> 3, j = lane & 7; uchar jmask = 1 << j;
-    const device uchar* blk = W + (size_t)blk_i * 82;
     float d = (float)(*(const device half*)blk);
     const device uchar* qs = blk + 2; const device uchar* sgn = blk + 34;
     const device uchar* qh = blk + 66; const device uchar* sc = blk + 74;
-    device T* o = out + (size_t)blk_i * 256;
     for (int ib = 0; ib < 8; ib++) {
         uint grp = 4 * ib + l;
         uint idx = (uint)qs[grp] | ((((uint)qh[grp >> 2] >> (2 * (grp & 3))) & 3) << 8);
@@ -461,15 +458,15 @@ _DEQUANT_IQ2S = r"""
         float gval = (float)GRID[idx * 8 + j];
         o[32 * ib + lane] = (T)(db * gval * ((sgn[grp] & jmask) ? -1.0f : 1.0f));
     }
+}
 """
 # IQ1_S: 50 B a superblock. d f16, 32 qs bytes (low 8 index bits), 8 uint16 qh (a 32-block: 3 high index bits a
 # sub-block of 8, a 3-bit scale in bits 12-14, a delta sign in bit 15). The (2048,8) grid is ternary; a weight is
 # dl*(grid + delta), dl = d*(2*scale+1), delta = +-0.125. No sign table.
-_MATVEC_IQ1S = blocks(
-    Frags(
-        "    uint ib = lane >> 2, l = lane & 3, cb = 8 * lane;   // one ternary grid entry a lane\n",
-        _DECL_G8,
-        r"""
+IQ1S_FRAGS = Frags(
+    "    uint ib = lane >> 2, l = lane & 3, cb = 8 * lane;   // one ternary grid entry a lane\n",
+    _DECL_G8,
+    r"""
             const device uchar* blk = W + ((size_t)row * NSB + c) * 50;
             float d = (float)(*(const device half*)blk);
             const device uchar* qs = blk + 2;
@@ -481,18 +478,14 @@ _MATVEC_IQ1S = blocks(
             #pragma unroll
             for (int k = 0; k < 8; k++) g[r][k] = (float)GRID[idx * 8 + k] + delta;
 """,
-        _APPLY_G8,
-    )
+    _APPLY_G8,
 )
-_DEQUANT_IQ1S = r"""
-    uint gid = thread_position_in_grid.x;
-    uint blk_i = gid / 32, lane = gid % 32;
-    if (blk_i >= NBLK) return;
+_IQ1S_LANE = r"""
+template <typename T>
+inline void iq1s_lane(const device uchar* blk, uint lane, const device int8_t* GRID, device T* o) {
     uint l = lane >> 3, j = lane & 7;
-    const device uchar* blk = W + (size_t)blk_i * 50;
     float d = (float)(*(const device half*)blk);
     const device uchar* qs = blk + 2; const device uchar* qhb = blk + 34;
-    device T* o = out + (size_t)blk_i * 256;
     for (int ib = 0; ib < 8; ib++) {
         const device uchar* p = qhb + 2 * ib;
         uint qhv = (uint)p[0] | ((uint)p[1] << 8);
@@ -501,16 +494,16 @@ _DEQUANT_IQ1S = r"""
         float delta = (qhv & 0x8000) ? -0.125f : 0.125f;
         o[32 * ib + lane] = (T)(dl * ((float)GRID[idx * 8 + j] + delta));
     }
+}
 """
 
 # IQ3_S: 110 B a superblock. d f16, 64 qs bytes (low 8 index bits, one a group of 4 weights), 8 qh bytes (the 9th
 # index bit as a plane), 32 explicit sign bytes (a bit a weight), 4 scale bytes (8 4-bit scales a 32-block). The
 # (512,4) grid gives 4 values a group; db = d*(1 + 2*sc4). lane = col within a 32-block, qb = lane>>2 the group.
-_MATVEC_IQ3S = blocks(
-    Frags(
-        "    uint ib = lane >> 2, cb = 8 * lane, qb1 = 2 * lane, qb2 = 2 * lane + 1;   // two 4-value entries a lane\n",
-        _DECL_G8,
-        r"""
+IQ3S_FRAGS = Frags(
+    "    uint ib = lane >> 2, cb = 8 * lane, qb1 = 2 * lane, qb2 = 2 * lane + 1;   // two 4-value entries a lane\n",
+    _DECL_G8,
+    r"""
             const device uchar* blk = W + ((size_t)row * NSB + c) * 110;
             float d = (float)(*(const device half*)blk);
             const device uchar* qs = blk + 2;
@@ -527,19 +520,15 @@ _MATVEC_IQ3S = blocks(
             #pragma unroll
             for (int j = 0; j < 4; j++) { float v = (float)GRID[i2 * 4 + j]; g[r][4 + j] = (signs & (1 << (j + 4))) ? -v : v; }
 """,
-        _APPLY_G8,
-    )
+    _APPLY_G8,
 )
-_DEQUANT_IQ3S = r"""
-    uint gid = thread_position_in_grid.x;
-    uint blk_i = gid / 32, lane = gid % 32;
-    if (blk_i >= NBLK) return;
+_IQ3S_LANE = r"""
+template <typename T>
+inline void iq3s_lane(const device uchar* blk, uint lane, const device int8_t* GRID, device T* o) {
     uint ql = lane >> 2, j = lane & 3, sl = lane >> 3; uchar sbit = 1 << (lane & 7);
-    const device uchar* blk = W + (size_t)blk_i * 110;
     float d = (float)(*(const device half*)blk);
     const device uchar* qs = blk + 2; const device uchar* qh = blk + 66;
     const device uchar* sgn = blk + 74; const device uchar* sc = blk + 106;
-    device T* o = out + (size_t)blk_i * 256;
     for (int ib = 0; ib < 8; ib++) {
         uint qb = 8 * ib + ql;
         uint idx = (uint)qs[qb] | ((((uint)qh[qb >> 3] >> (qb & 7)) & 1) << 8);
@@ -548,6 +537,7 @@ _DEQUANT_IQ3S = r"""
         float gval = (float)GRID[idx * 4 + j];
         o[32 * ib + lane] = (T)(db * gval * ((sgn[4 * ib + sl] & sbit) ? -1.0f : 1.0f));
     }
+}
 """
 
 # IQ1_M: 56 B a superblock, no leading f16. 32 qs bytes (low 8 index bits, a group of 8), 16 qh bytes (a nibble a
@@ -556,11 +546,10 @@ _DEQUANT_IQ3S = r"""
 # dl = d*(2*sub+1), delta = +-0.125, weight = dl*(grid + delta). The matvec reads a side stream built once at bind
 # (`_side_iq1m`: the f16 d precomputed, the sub-scales as nibble pairs) instead of reassembling d and selecting a
 # sub-scale through four uint16 every superblock; +10 bytes a superblock, 1.3x faster. lane = group of 8.
-_MATVEC_IQ1M = blocks(
-    Frags(
-        "    uint si = lane >> 1, cb = 8 * lane;   // one ternary grid entry a lane\n",
-        _DECL_G8,
-        r"""
+IQ1M_FRAGS = Frags(
+    "    uint si = lane >> 1, cb = 8 * lane;   // one ternary grid entry a lane\n",
+    _DECL_G8,
+    r"""
             const device uchar* blk = W + ((size_t)row * NSB + c) * 56;
             const device uchar* qs = blk;
             const device uchar* qh = blk + 32;
@@ -573,21 +562,17 @@ _MATVEC_IQ1M = blocks(
             #pragma unroll
             for (int k = 0; k < 8; k++) g[r][k] = (float)GRID[idx * 8 + k] + delta;
 """,
-        _APPLY_G8,
-    )
+    _APPLY_G8,
 )
-_DEQUANT_IQ1M = r"""
-    uint gid = thread_position_in_grid.x;
-    uint blk_i = gid / 32, lane = gid % 32;
-    if (blk_i >= NBLK) return;
+_IQ1M_LANE = r"""
+template <typename T>
+inline void iq1m_lane(const device uchar* blk, uint lane, const device int8_t* GRID, device T* o) {
     uint j8 = lane >> 3, e = lane & 7, sl = lane >> 4;
-    const device uchar* blk = W + (size_t)blk_i * 56;
     const device uchar* qs = blk; const device uchar* qh = blk + 32; const device uchar* scb = blk + 48;
     uint s0 = (uint)scb[0]|((uint)scb[1]<<8), s1 = (uint)scb[2]|((uint)scb[3]<<8);
     uint s2 = (uint)scb[4]|((uint)scb[5]<<8), s3 = (uint)scb[6]|((uint)scb[7]<<8);
     ushort dbits = (ushort)((s0>>12) | ((s1>>12)<<4) | ((s2>>12)<<8) | ((s3>>12)<<12));
     float d = (float)as_type<half>(dbits);
-    device T* o = out + (size_t)blk_i * 256;
     for (int ib = 0; ib < 8; ib++) {
         uint j = 4 * ib + j8;
         uchar nib = (qh[j >> 1] >> (4 * (j & 1))) & 0xF;
@@ -599,6 +584,7 @@ _DEQUANT_IQ1M = r"""
         float dl = d * (float)(2 * sub + 1);
         o[32 * ib + lane] = (T)(dl * ((float)GRID[idx * 8 + e] + delta));
     }
+}
 """
 
 
@@ -616,39 +602,68 @@ def _side_iq1m(raw: mx_.array) -> tuple[mx_.array, mx_.array]:
 
 
 # the IQ lattice family (grid-codebook quants) on one launcher: each entry is the superblock byte size, the grid
-# class name, whether the shared sign table is read, the matvec/dequant Metal sources, and optionally a `side`
-# repack (raw -> extra device streams named `side_names`) the matvec reads beside the raw blocks. A kernel always
-# takes W, x and GRID; KS (the sign table) only when the entry reads it. Adding a quant is one entry here plus a
-# GGUF-name -> kind row in the engine binder. All are register-only and batch-invariant (row i identical at any T).
+# class name, whether the shared sign table is read, the matvec's pieces, its lane's dequant (`<kind>_lane`), and
+# optionally a `side` repack (raw -> extra device streams named `side_names`) the matvec reads beside the raw blocks.
+# A kernel always takes W, x and GRID; KS (the sign table) only when the entry reads it. Adding a quant is one entry
+# here plus a GGUF-name -> kind row in the engine binder. All are register-only and batch-invariant (row i identical
+# at any T).
 class Lattice(TypedDict):
     """an IQ lattice kind's entry of `_LATT`"""
 
     bytes: int
     grid: str
     ksigns: bool
-    mv: str
-    deq: str
+    frags: Frags
+    lane: str
     side: NotRequired[Callable[[mx_.array], tuple[mx_.array, ...]]]
     side_names: NotRequired[list[str]]
 
 
 _LATT: dict[str, Lattice] = {
-    "iq3xxs": {"bytes": 98, "grid": "IQ3_XXS", "ksigns": True, "mv": _MATVEC_IQ3XXS, "deq": _DEQUANT_IQ3XXS},
-    "iq2xxs": {"bytes": 66, "grid": "IQ2_XXS", "ksigns": True, "mv": _MATVEC_IQ2XXS, "deq": _DEQUANT_IQ2XXS},
-    "iq2xs": {"bytes": 74, "grid": "IQ2_XS", "ksigns": True, "mv": _MATVEC_IQ2XS, "deq": _DEQUANT_IQ2XS},
-    "iq2s": {"bytes": 82, "grid": "IQ2_S", "ksigns": False, "mv": _MATVEC_IQ2S, "deq": _DEQUANT_IQ2S},
-    "iq1s": {"bytes": 50, "grid": "IQ1_S", "ksigns": False, "mv": _MATVEC_IQ1S, "deq": _DEQUANT_IQ1S},
-    "iq3s": {"bytes": 110, "grid": "IQ3_S", "ksigns": False, "mv": _MATVEC_IQ3S, "deq": _DEQUANT_IQ3S},
+    "iq3xxs": {"bytes": 98, "grid": "IQ3_XXS", "ksigns": True, "frags": IQ3XXS_FRAGS, "lane": _IQ3XXS_LANE},
+    "iq2xxs": {"bytes": 66, "grid": "IQ2_XXS", "ksigns": True, "frags": IQ2XXS_FRAGS, "lane": _IQ2XXS_LANE},
+    "iq2xs": {"bytes": 74, "grid": "IQ2_XS", "ksigns": True, "frags": IQ2XS_FRAGS, "lane": _IQ2XS_LANE},
+    "iq2s": {"bytes": 82, "grid": "IQ2_S", "ksigns": False, "frags": IQ2S_FRAGS, "lane": _IQ2S_LANE},
+    "iq1s": {"bytes": 50, "grid": "IQ1_S", "ksigns": False, "frags": IQ1S_FRAGS, "lane": _IQ1S_LANE},
+    "iq3s": {"bytes": 110, "grid": "IQ3_S", "ksigns": False, "frags": IQ3S_FRAGS, "lane": _IQ3S_LANE},
     "iq1m": {
         "bytes": 56,
         "grid": "IQ1_M",
         "ksigns": False,
-        "mv": _MATVEC_IQ1M,
-        "deq": _DEQUANT_IQ1M,
+        "frags": IQ1M_FRAGS,
+        "lane": _IQ1M_LANE,
         "side": _side_iq1m,
         "side_names": ["Dd", "SB"],
     },
 }
+
+
+def _lane_call(kind: str, blk: str, lane: str, out: str) -> str:
+    """the call of `kind`'s lane dequant on block pointer `blk`, lane `lane`, into `out`"""
+    tables = "GRID, KS" if _LATT[kind]["ksigns"] else "GRID"
+    return f"{kind}_lane({blk}, {lane}, {tables}, {out})"
+
+
+def _lattice_dequant(kind: str) -> str:
+    """`kind`'s dequant kernel: a (superblock, lane) a thread through its lane function"""
+    b = _LATT[kind]["bytes"]
+    return (
+        "    uint gid = thread_position_in_grid.x;\n    uint blk_i = gid / 32, lane = gid % 32;\n"
+        "    if (blk_i >= NBLK) return;\n"
+        f"    {_lane_call(kind, f'W + (size_t)blk_i * {b}', 'lane', 'out + (size_t)blk_i * 256')};\n"
+    )
+
+
+def _lattice_decode(kind: str) -> str:
+    """a row of a `kind` matrix in bf16 for a megakernel's embedding, a (superblock, lane) a thread as the dequant
+    decodes it"""
+    b = _LATT[kind]["bytes"]
+    blk = f"W + ((size_t)row * NSB + i / 32) * {b}"
+    return f"    for (uint i = tid; i < NSB * 32; i += 256)\n        {_lane_call(kind, blk, 'i % 32', 'dst + (size_t)(i / 32) * 256')};\n"
+
+
+# each lattice kind's matvec source, built once from its pieces
+_LATT_MV: dict[str, str] = {k: blocks(v["frags"]) for k, v in _LATT.items()}
 
 
 def repack_lattice(kind: str, raw: mx_.array) -> tuple[mx_.array, ...]:
@@ -677,7 +692,7 @@ def matvec_lattice(
     nsb = cols // 256
     return launch(
         f"btb_{kind}_mv_{rows}_{nsb}",
-        spec["mv"],
+        _LATT_MV[kind],
         "",
         [("W", w_bytes), *tables, *sides],
         x,
@@ -699,7 +714,11 @@ def dequant_lattice(kind: str, w_bytes: mx_.array, rows: int, cols: int) -> mx_.
         k = _latt_deq.get(kind)
         if k is None:
             k = _latt_deq[kind] = metal_kernel(
-                name=f"btb_{kind}_dequant", input_names=inames, output_names=["out"], header="", source=spec["deq"]
+                name=f"btb_{kind}_dequant",
+                input_names=inames,
+                output_names=["out"],
+                header=spec["lane"],
+                source=_lattice_dequant(kind),
             )
     g = ((nblk * 32 + 255) // 256) * 256
     return k(
@@ -710,3 +729,44 @@ def dequant_lattice(kind: str, w_bytes: mx_.array, rows: int, cols: int) -> mx_.
         output_dtypes=[m.bfloat16],
         template=[("T", m.bfloat16), ("NBLK", nblk)],
     )[0]
+
+
+def _codebooks(kind: str) -> tuple[Table, ...]:
+    """the codebooks `kind`'s kernels read: its grid, and the sign table where it reads one"""
+    spec = _LATT[kind]
+    grid = Table("GRID", "int8_t", lambda: _grid(spec["grid"]))
+    return (grid, Table("KS", "uint8_t", _ksigns)) if spec["ksigns"] else (grid,)
+
+
+def _lattice_kernel(kind: str) -> StoredKernel:
+    spec = _LATT[kind]
+    streams = (("W", "uint8_t"), *((n, "half" if n == "Dd" else "uint8_t") for n in spec.get("side_names", [])))
+    decode = _lattice_decode(kind)
+    return StoredKernel(spec["frags"], spec["lane"], "", 256, decode, LATTICE_SHAPES, streams, _codebooks(kind))
+
+
+_IQ4NL_DECODE = (
+    "    for (uint b = tid; b < COLS / 32; b += 256)\n"
+    "        iq4nl_block((float)Dd[(size_t)row * (COLS / 32) + b], ((const device uint4*)Qq)[(size_t)row * (COLS / 32) + b],"
+    " dst + (size_t)b * 32);\n"
+)
+_IQ4XS_DECODE = (
+    "    for (uint i = tid; i < NSB * 32; i += 256)\n"
+    "        iq4xs_lane(W + ((size_t)row * NSB + i / 32) * 136, i % 32, dst + (size_t)(i / 32) * 256);\n"
+)
+# every IQ4 and lattice type as the megakernel builds on it (`mlx.mega.kernel.STORED`): its matvec's pieces over its
+# streams (IQ4_NL's split scales and nibbles, IQ1_M's side streams beside its blocks) and tables, its dequant a row of
+# an embedding
+KERNELS: dict[Quant, StoredKernel] = {
+    Quant.IQ4_NL: StoredKernel(
+        IQ4NL_FRAGS,
+        _KV + _IQ4NL_BLOCK,
+        "#define NB (COLS / 32)\n",
+        1024,
+        _IQ4NL_DECODE,
+        IQ4NL_SHAPES,
+        (("Dd", "half"), ("Qq", "uint8_t")),
+    ),
+    Quant.IQ4_XS: StoredKernel(IQ4XS_FRAGS, _KV + _IQ4XS_LANE, "", 256, _IQ4XS_DECODE),
+    **{q: _lattice_kernel(quant_key(q)) for q in quants_of(QuantClass.LATTICE)},
+}
