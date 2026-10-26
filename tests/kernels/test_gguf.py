@@ -290,7 +290,7 @@ def test_pooled_stored_weights_join_as_a_view_of_their_block(q: Quant) -> None:
 
 
 @pytest.mark.parametrize("q", [*stored_quants(), Quant.F16, Quant.BF16], ids=lambda q: q.value)
-def test_a_stored_prefills_rows_are_its_steps_on_mlx(q: Quant) -> None:
+def test_a_stored_prefills_rows_are_its_steps_on_mlx(q: Quant, monkeypatch: pytest.MonkeyPatch) -> None:
     """every stored type (and a GGUF's float experts) through `Backend.matmul`, x bf16 and float32: a pass of each
     width - the one-row kernel, the multiply-accumulate one, past `gemm_rows` the dequant and the gemm - is its rows'
     one-row steps bit for bit (a prefix hit's tail and a cold prefill, a verify pass and its steps, agree); the chain
@@ -302,19 +302,22 @@ def test_a_stored_prefills_rows_are_its_steps_on_mlx(q: Quant) -> None:
 
     import mlx.core as mx
 
+    from btb.mlx import steel
     from btb.mlx.backend import Backend, Stat, Weight, stored_dequant, stored_matvec, stored_streams
-    from btb.mlx.steel import CHAIN_TILES, pick
     from btb.mlx.stored import STORED
 
     gemv = importlib.import_module("btb.mlx.gemv").gemv
     be = Backend.__new__(Backend)
     be.gemm_rows = 64
     be.stat = Stat(linears=0, evals=0, s=0.0, layers=0, layer_s=0.0)
+    # the wide tile at any x, so the tall matrix's 128 rows take it
+    monkeypatch.setattr(steel, "CHAIN_WIDE", 0)
     floats = q in (Quant.F16, Quant.BF16)
-    shapes = [(72, (2, 3, 4, 5, 6, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100))] + ([] if floats else [(2560, (64,))])
-    gemms = {pick(t, rows, CHAIN_TILES) for rows, widths in shapes for t in widths if t >= be.gemm_rows}
-    assert floats or gemms == set(CHAIN_TILES), "a tile unchecked"
+    shapes: list[tuple[int, tuple[int, ...]]] = [(72, (2, 3, 4, 5, 6, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100))]
+    shapes += [] if floats else [(2560, (64, 128))]
     cols = 544 if not floats and STORED[q].bw == 32 else 512
+    gemms = {steel.chain_tile(t, rows, cols) for rows, widths in shapes for t in widths if t >= be.gemm_rows}
+    assert floats or gemms == set(steel.CHAIN_TILES), "a tile unchecked"
     for rows, widths in shapes:
         if floats:
             f = np.random.default_rng(9).standard_normal((rows, cols)).astype(np.float32) * 0.05

@@ -26,9 +26,12 @@ Tile = tuple[int, int, int, int, int]
 # largest first; every tile gives the same bits, so a launch takes the fastest (`pick`). On an 18-core M3 Pro, against
 # MLX's gemm over eight shapes at 8 to 4096 rows: within noise of it or up to 50% faster where MLX splits K
 TILES: tuple[Tile, ...] = ((64, 64, 16, 2, 2), (64, 32, 32, 2, 2), (32, 32, 32, 1, 2))
-# a stored chain's (`gemm_chain`: K steps of a 32-column block, the segments' running total beside the accumulators):
-# 64 x 32 ran 1-7 points faster than 64 x 64 at every shape measured but 1024 rows over a 9728-column K (4 slower)
-CHAIN_TILES: tuple[Tile, ...] = ((64, 32, 32, 2, 2), (32, 32, 32, 1, 2))
+# a stored chain's (`gemm_chain`: K steps of a 32-column block, the segments' running total beside the accumulators).
+# 64 x 64 reads x half as often as 64 x 32 and takes from `CHAIN_WIDE` elements of x (b * cols): a tie to 24% faster
+# from there over thirteen model shapes at 512-2048 rows, a tie at 2.5M. Its 2 x 4 simdgroups hold half the
+# accumulators and total a thread that 2 x 2 do (2 x 2 ran 3-8% slower)
+CHAIN_TILES: tuple[Tile, ...] = ((64, 64, 32, 2, 4), (64, 32, 32, 2, 2), (32, 32, 32, 1, 2))
+CHAIN_WIDE = 3 << 20
 # the threadgroups a launch needs to keep that GPU busy: 64 x 32 tiles at 80 beat 64 x 64 at 40 by 6 points
 # ([2560, 9728] at 64 rows), 64 x 64 at 80 tie 64 x 32 at 160
 FILL = 80
@@ -278,13 +281,19 @@ def _launch(w: mx_.array, x: mx_.array) -> mx_.array:
     )[0]
 
 
+def chain_tile(b: int, rows: int, cols: int) -> Tile:
+    """`gemm_chain`'s tile for b rows of x over a [rows, cols] w: `pick` of `CHAIN_TILES`, the 64 x 64 one only from
+    `CHAIN_WIDE` elements of x"""
+    return pick(b, rows, CHAIN_TILES if b * cols >= CHAIN_WIDE else CHAIN_TILES[1:])
+
+
 def gemm_chain(w: mx_.array, x: mx_.array) -> mx_.array:
     """y[b, rows] = x[b, cols] w[rows, cols]^T on a stored type's chain (matvec.py), w its dequant, both bf16 or both
     float32, y in that dtype: a row the bits its matvec gives it"""
     rows, cols, b = int(w.shape[0]), int(w.shape[1]), int(x.shape[0])
     if cols % 32:
         raise ValueError(f"[mlx] a stored chain runs whole 32-column blocks, not {cols} columns")
-    bm, bn, _, wm, wn = tile = pick(b, rows, CHAIN_TILES)
+    bm, bn, _, wm, wn = tile = chain_tile(b, rows, cols)
     return _kernel(tile, chain=True)(
         inputs=[w, x],
         template=[("T", x.dtype), ("MA", b % bm == 0), ("NA", rows % bn == 0)],
