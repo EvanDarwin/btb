@@ -112,9 +112,9 @@ def _matvec(kind: str, w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -
     return launch(f"btb_{kind}_mv_{rows}_{cols // 256}", KERNELS[_BY_KIND[kind]], [w_bytes], x, rows, cols)
 
 
-def _dequant(kind: str, w_bytes: mx_.array, rows: int, cols: int, dtype: mx_.Dtype | None, chain: bool) -> mx_.array:
+def _dequant(kind: str, w_bytes: mx_.array, rows: int, cols: int, dtype: mx_.Dtype | None) -> mx_.array:
     k = KERNELS[_BY_KIND[kind]]
-    return dequant(f"btb_{kind}_dequant", k, [w_bytes], rows, cols, dtype or mx.bfloat16, chain)
+    return dequant(f"btb_{kind}_dequant", k, [w_bytes], rows, cols, dtype or mx.bfloat16)
 
 
 def matvec_q4k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:
@@ -123,12 +123,9 @@ def matvec_q4k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.ar
     return _matvec("q4k", w_bytes, x, rows, cols)
 
 
-def dequant_q4k(
-    w_bytes: mx_.array, rows: int, cols: int, dtype: mx_.Dtype | None = None, chain: bool = False
-) -> mx_.array:
-    """the full weight in `dtype` (bf16 by default): the matvec's weights, `chain` in its chain's column order for a
-    prefill's gemm (`matvec.dequant`)."""
-    return _dequant("q4k", w_bytes, rows, cols, dtype, chain)
+def dequant_q4k(w_bytes: mx_.array, rows: int, cols: int, dtype: mx_.Dtype | None = None) -> mx_.array:
+    """the full weight in `dtype` (bf16 by default): the matvec's weights, a prefill's gemm's (`matvec.dequant`)."""
+    return _dequant("q4k", w_bytes, rows, cols, dtype)
 
 
 def matvec_q5k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:
@@ -136,11 +133,9 @@ def matvec_q5k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.ar
     return _matvec("q5k", w_bytes, x, rows, cols)
 
 
-def dequant_q5k(
-    w_bytes: mx_.array, rows: int, cols: int, dtype: mx_.Dtype | None = None, chain: bool = False
-) -> mx_.array:
+def dequant_q5k(w_bytes: mx_.array, rows: int, cols: int, dtype: mx_.Dtype | None = None) -> mx_.array:
     """`dequant_q4k` for Q5_K."""
-    return _dequant("q5k", w_bytes, rows, cols, dtype, chain)
+    return _dequant("q5k", w_bytes, rows, cols, dtype)
 
 
 def matvec_q2k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:
@@ -148,11 +143,9 @@ def matvec_q2k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.ar
     return _matvec("q2k", w_bytes, x, rows, cols)
 
 
-def dequant_q2k(
-    w_bytes: mx_.array, rows: int, cols: int, dtype: mx_.Dtype | None = None, chain: bool = False
-) -> mx_.array:
+def dequant_q2k(w_bytes: mx_.array, rows: int, cols: int, dtype: mx_.Dtype | None = None) -> mx_.array:
     """`dequant_q4k` for Q2_K."""
-    return _dequant("q2k", w_bytes, rows, cols, dtype, chain)
+    return _dequant("q2k", w_bytes, rows, cols, dtype)
 
 
 def matvec_q3k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:
@@ -160,8 +153,6 @@ def matvec_q3k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.ar
     return _matvec("q3k", w_bytes, x, rows, cols)
 
 
-def dequant_q3k(
-    w_bytes: mx_.array, rows: int, cols: int, dtype: mx_.Dtype | None = None, chain: bool = False
-) -> mx_.array:
+def dequant_q3k(w_bytes: mx_.array, rows: int, cols: int, dtype: mx_.Dtype | None = None) -> mx_.array:
     """`dequant_q4k` for Q3_K."""
-    return _dequant("q3k", w_bytes, rows, cols, dtype, chain)
+    return _dequant("q3k", w_bytes, rows, cols, dtype)

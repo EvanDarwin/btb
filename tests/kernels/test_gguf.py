@@ -292,17 +292,18 @@ def test_pooled_stored_weights_join_as_a_view_of_their_block(q: Quant) -> None:
 @pytest.mark.parametrize("q", [*stored_quants(), Quant.F16, Quant.BF16], ids=lambda q: q.value)
 def test_a_stored_prefills_rows_are_its_steps_on_mlx(q: Quant) -> None:
     """every stored type (and a GGUF's float experts) through `Backend.matmul`, x bf16 and float32: a pass of each
-    width - the type's matvec, past `gemm_rows` its dequant and the gemm - is its rows' one-row steps bit for bit (a
-    prefix hit's tail and a cold prefill, a verify pass and its steps, agree), the matvec is gemv over the dequant's
-    weights and x in the chain's column order (a 32-wide type's row a half group past whole 64-groups), and the
-    embedding gather is the dequant's rows"""
+    width - the one-row kernel, the multiply-accumulate one, past `gemm_rows` the dequant and the gemm - is its rows'
+    one-row steps bit for bit (a prefix hit's tail and a cold prefill, a verify pass and its steps, agree); the chain
+    is each segment's gemv over the dequant's and x's columns in the chain's order, folded in order (a row of 17 blocks
+    leaves the segments uneven); a tall matrix too, so the gemm takes each of its tiles; the embedding gather is the
+    dequant's rows"""
     need_mlx()
     import importlib
 
     import mlx.core as mx
 
     from btb.mlx.backend import Backend, Stat, Weight, stored_dequant, stored_matvec, stored_streams
-    from btb.mlx.matvec import chain_x
+    from btb.mlx.steel import CHAIN_TILES, pick
     from btb.mlx.stored import STORED
 
     gemv = importlib.import_module("btb.mlx.gemv").gemv
@@ -310,28 +311,36 @@ def test_a_stored_prefills_rows_are_its_steps_on_mlx(q: Quant) -> None:
     be.gemm_rows = 64
     be.stat = Stat(linears=0, evals=0, s=0.0, layers=0, layer_s=0.0)
     floats = q in (Quant.F16, Quant.BF16)
-    rows, widths = 72, (2, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100)
+    shapes = [(72, (2, 3, 4, 5, 6, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100))] + ([] if floats else [(2560, (64,))])
+    gemms = {pick(t, rows, CHAIN_TILES) for rows, widths in shapes for t in widths if t >= be.gemm_rows}
+    assert floats or gemms == set(CHAIN_TILES), "a tile unchecked"
     cols = 544 if not floats and STORED[q].bw == 32 else 512
-    if floats:
-        f = np.random.default_rng(9).standard_normal((rows, cols)).astype(np.float32) * 0.05
-        bits = f.astype(np.float16) if q is Quant.F16 else (f.view(np.uint32) >> 16).astype(np.uint16)
-        raw = bits.view(np.uint8).reshape(-1)
-    else:
-        raw = stored_blocks(q, rows, cols, 9)
-    streams = stored_streams(q, raw)
-    w = Weight(q=q, streams=streams, shape=(rows, cols))
-    for dt in (mx.bfloat16, mx.float32):
-        x = mx.array(np.random.default_rng(10).standard_normal((max(widths), cols)).astype(np.float32)).astype(dt)
-        one = mx.concatenate([stored_matvec(q, streams, x[i : i + 1], rows, cols) for i in range(max(widths))])
-        for t in widths:
-            assert mx.array_equal(be.matmul(x[:t], w), one[:t]), (q.value, str(dt), t)
+    for rows, widths in shapes:
+        if floats:
+            f = np.random.default_rng(9).standard_normal((rows, cols)).astype(np.float32) * 0.05
+            bits = f.astype(np.float16) if q is Quant.F16 else (f.view(np.uint32) >> 16).astype(np.uint16)
+            raw = bits.view(np.uint8).reshape(-1)
+        else:
+            raw = stored_blocks(q, rows, cols, 9)
+        streams = stored_streams(q, raw)
+        w = Weight(q=q, streams=streams, shape=(rows, cols))
+        for dt in (mx.bfloat16, mx.float32):
+            x = mx.array(np.random.default_rng(10).standard_normal((max(widths), cols)).astype(np.float32)).astype(dt)
+            one = mx.concatenate([stored_matvec(q, streams, x[i : i + 1], rows, cols) for i in range(max(widths))])
+            for t in widths:
+                assert mx.array_equal(be.matmul(x[:t], w), one[:t]), (q.value, str(dt), rows, t)
+            if not floats:
+                deq, xf = stored_dequant(q, streams, rows, cols, dt), x[:16].astype(mx.float32)
+                # segment s: blocks s, s + 8, ..., a block's column 8 * ks + j its physical 8 * (j / 2) + 2 * ks + j % 2
+                ks, j = np.arange(32) // 8, np.arange(32) % 8
+                fold = mx.zeros((16, rows), dtype=mx.float32)
+                for s in range(8):
+                    at = mx.array((np.arange(s, cols // 32, 8)[:, None] * 32 + j // 2 * 8 + 2 * ks + j % 2).reshape(-1))
+                    fold = fold + gemv(mx.take(deq, at, axis=1), mx.take(xf, at, axis=1))
+                assert mx.array_equal(fold.astype(dt), one[:16]), (q.value, str(dt), rows, "against the segments' fold")
         if not floats:
-            deq = stored_dequant(q, streams, rows, cols, dt, chain=True)
-            got = gemv(deq, chain_x(x[:16], cols))
-            assert mx.array_equal(got, one[:16]), (q.value, str(dt), "matvec against gemv(dequant)")
-    if not floats:
-        tok = mx.array([3, 0, rows - 1, 5], dtype=mx.int32)
-        assert mx.array_equal(Backend.gather_rows(w, tok), stored_dequant(q, streams, rows, cols)[tok]), q.value
+            tok = mx.array([3, 0, rows - 1, 5], dtype=mx.int32)
+            assert mx.array_equal(Backend.gather_rows(w, tok), stored_dequant(q, streams, rows, cols)[tok]), q.value
 
 
 @pytest.mark.parametrize("q", stored_quants(), ids=lambda q: q.value)
@@ -497,10 +506,10 @@ def test_a_long_gguf_prefill_takes_the_gemm_as_a_bf16_one_does(device: str, monk
         deq(gq, w, out)
 
     def mlx_dequant(
-        q: Quant, streams: "Streams", rows: int, cols: int, dtype: "mx_.Dtype | None" = None, chain: bool = False
+        q: Quant, streams: "Streams", rows: int, cols: int, dtype: "mx_.Dtype | None" = None
     ) -> "mx_.array":
         decoded.append(rows)
-        return sdq(q, streams, rows, cols, dtype, chain)
+        return sdq(q, streams, rows, cols, dtype)
 
     monkeypatch.setattr(QuantGemv, "dequant", native_dequant)
     monkeypatch.setattr(backend, "stored_dequant", mlx_dequant)

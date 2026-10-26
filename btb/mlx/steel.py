@@ -26,6 +26,9 @@ Tile = tuple[int, int, int, int, int]
 # largest first; every tile gives the same bits, so a launch takes the fastest (`pick`). On an 18-core M3 Pro, against
 # MLX's gemm over eight shapes at 8 to 4096 rows: within noise of it or up to 50% faster where MLX splits K
 TILES: tuple[Tile, ...] = ((64, 64, 16, 2, 2), (64, 32, 32, 2, 2), (32, 32, 32, 1, 2))
+# a stored chain's (`gemm_chain`: K steps of a 32-column block, the segments' running total beside the accumulators):
+# 64 x 32 ran 1-7 points faster than 64 x 64 at every shape measured but 1024 rows over a 9728-column K (4 slower)
+CHAIN_TILES: tuple[Tile, ...] = ((64, 32, 32, 2, 2), (32, 32, 32, 1, 2))
 # the threadgroups a launch needs to keep that GPU busy: 64 x 32 tiles at 80 beat 64 x 64 at 40 by 6 points
 # ([2560, 9728] at 64 rows), 64 x 64 at 80 tie 64 x 32 at 160
 FILL = 80
@@ -64,6 +67,44 @@ struct BtbFetch {
         for (short i = 0; i < n_rows; i++) *((threadgroup ReadVector*)(&dst[i * TROWS * dst_ld])) = r[i];
     }
     METAL_FUNC void next() thread { src += BCOLS; }
+};
+
+// a stored chain's K step, one 32-column block (`fetch(col)` its first column): stashed with physical column
+// 8 * g + 2 * ks + e at 8 * ks + 2 * g + e, so steel's multiplies run the block in the chain's order. Rows past `lim`
+// read the last one's (their products land in outputs never stored)
+template <typename T, short BROWS, short dst_ld, short tgp_size>
+struct BtbChainFetch {
+    STEEL_CONST short n_reads = (32 * BROWS) / tgp_size;
+    STEEL_CONST short TCOLS = 32 / n_reads;
+    STEEL_CONST short TROWS = tgp_size / TCOLS;
+    STEEL_CONST short n_rows = BROWS / TROWS;
+    static_assert(n_reads % 8 == 0 && n_rows > 0 && BROWS % TROWS == 0, "a thread whole 8-column groups of a row");
+    struct alignas(16) ReadVector { vec<T, 2> p[n_reads / 2]; };
+    threadgroup T* dst;
+    const device T* src[n_rows];
+    short g0;
+    ReadVector r[n_rows];
+    METAL_FUNC BtbChainFetch(const device T* src_, int src_ld, threadgroup T* dst_, short lim, ushort sg, ushort lane)
+        thread {
+        const short tid = sg * 32 + lane, row = tid / TCOLS, c0 = n_reads * (tid % TCOLS);
+        g0 = c0 / 8;
+        dst = dst_ + row * dst_ld;
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < n_rows; i++) src[i] = src_ + (size_t)min(row + i * TROWS, lim - 1) * src_ld + c0;
+    }
+    METAL_FUNC void fetch(int col) thread {
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < n_rows; i++) r[i] = *((const device ReadVector*)(src[i] + col));
+    }
+    METAL_FUNC void stash() const thread {
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < n_rows; i++)
+            STEEL_PRAGMA_UNROLL
+            for (short gg = 0; gg < n_reads / 8; gg++)
+                STEEL_PRAGMA_UNROLL
+                for (short ks = 0; ks < 4; ks++)
+                    *((threadgroup vec<T, 2>*)(dst + i * TROWS * dst_ld + 8 * ks + 2 * (g0 + gg))) = r[i].p[4 * gg + ks];
+    }
 };
 """
 
@@ -120,7 +161,58 @@ _SRC = """
     }
 """
 
-_kernels: dict[Tile, MetalKernel] = {}
+# a stored type's chain (matvec.py) over its dequant and x as they lie: a K step a 32-column block (`BtbChainFetch`),
+# the blocks walked a segment at a time (segment s: s, s + 8, ...), the segment's accumulator folded into a running
+# total at its end (fma by 1, in order) and cleared
+_CHAIN_SRC = """
+    using namespace mlx::steel;
+    using gemm_t = GEMMKernel<T, T, BM_, BN_, 32, WM_, WN_, false, true, false, true>;
+    threadgroup T As[gemm_t::tgp_mem_size_a];
+    threadgroup T Bs[gemm_t::tgp_mem_size_b];
+    const int M = x_shape[0], N = w_shape[0], K = w_shape[1];
+    const int c_row = threadgroup_position_in_grid.y * BM_, c_col = threadgroup_position_in_grid.x * BN_;
+    ushort sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    thread typename gemm_t::mma_t mma_op(sg, lane);
+    device T* D = (device T*)y + (size_t)c_row * N + c_col;
+    const short tgp_bm = MA ? BM_ : min(BM_, M - c_row), tgp_bn = NA ? BN_ : min(BN_, N - c_col);
+    BtbChainFetch<T, BM_, 32 + gemm_t::tgp_padding_a, WM_ * WN_ * 32> fa(
+        (const device T*)x + (size_t)c_row * K, K, As, tgp_bm, sg, lane);
+    BtbChainFetch<T, BN_, 32 + gemm_t::tgp_padding_b, WM_ * WN_ * 32> fb(
+        (const device T*)w + (size_t)c_col * K, K, Bs, tgp_bn, sg, lane);
+    const int nblk = K / 32;
+    constexpr short NE = decltype(mma_op.Ctile)::kElemsPerTile;
+    float total[NE];
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < NE; i++) total[i] = 0.0f;
+    fa.fetch(0);
+    fb.fetch(0);
+    for (int s = 0; s < 8; s++) {
+        for (int b = s; b < nblk; b += 8) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            fa.stash();
+            fb.stash();
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // the next block's loads in flight under this one's multiplies
+            const int nb = b + 8 < nblk ? b + 8 : (s < 7 ? s + 1 : nblk);
+            if (nb < nblk) { fa.fetch(32 * nb); fb.fetch(32 * nb); }
+            mma_op.mma(As, Bs);
+        }
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < NE; i++) {
+            total[i] = fma(mma_op.Ctile.elems()[i], 1.0f, total[i]);
+            mma_op.Ctile.elems()[i] = 0.0f;
+        }
+    }
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < NE; i++) mma_op.Ctile.elems()[i] = total[i];
+    if (tgp_bm == BM_ && tgp_bn == BN_) {
+        mma_op.store_result(D, N);
+    } else {
+        mma_op.store_result_safe(D, N, short2(tgp_bn, tgp_bm));
+    }
+"""
+
+_kernels: dict[tuple[Tile, bool], MetalKernel] = {}
 _lock = threading.Lock()
 
 
@@ -143,32 +235,32 @@ def _header() -> str:
     return "#include <metal_stdlib>\n#include <metal_simdgroup>\n#include <metal_simdgroup_matrix>\n" + body + _FETCH
 
 
-def _kernel(tile: Tile) -> MetalKernel:
+def _kernel(tile: Tile, chain: bool = False) -> MetalKernel:
     with _lock:
-        k = _kernels.get(tile)
+        k = _kernels.get((tile, chain))
         if k is None:
             bm, bn, bk, wm, wn = tile
             defines = "".join(f"#define {n}_ {v}\n" for n, v in zip(("BM", "BN", "BK", "WM", "WN"), tile, strict=True))
-            k = _kernels[tile] = metal_kernel(
-                name=f"btb_steel_{bm}_{bn}_{bk}_{wm}_{wn}",
+            k = _kernels[(tile, chain)] = metal_kernel(
+                name=f"btb_steel_chain_{bm}_{bn}_{bk}_{wm}_{wn}" if chain else f"btb_steel_{bm}_{bn}_{bk}_{wm}_{wn}",
                 input_names=["w", "x"],
                 output_names=["y"],
                 header=_header() + defines,
-                source=_SRC,
+                source=_CHAIN_SRC if chain else _SRC,
             )
     return k
 
 
-def pick(b: int, rows: int) -> Tile:
-    """the tile for b rows of x over `rows` outputs: the largest that pads b to within a quarter of the fewest rows
-    any tile pads it to (96 rows take 32-row tiles, not 64-row ones a third empty) and still launches `FILL`
-    threadgroups"""
-    padded = {t: -(-b // t[0]) * t[0] for t in TILES}
+def pick(b: int, rows: int, tiles: tuple[Tile, ...] = TILES) -> Tile:
+    """the tile of `tiles` for b rows of x over `rows` outputs: the largest that pads b to within a quarter of the
+    fewest rows any tile pads it to (96 rows take 32-row tiles, not 64-row ones a third empty) and still launches
+    `FILL` threadgroups"""
+    padded = {t: -(-b // t[0]) * t[0] for t in tiles}
     least = min(padded.values())
-    for t in TILES:
+    for t in tiles:
         if 4 * padded[t] <= 5 * least and padded[t] // t[0] * -(-rows // t[1]) >= FILL:
             return t
-    return TILES[-1]
+    return tiles[-1]
 
 
 def _launch(w: mx_.array, x: mx_.array) -> mx_.array:
@@ -179,6 +271,23 @@ def _launch(w: mx_.array, x: mx_.array) -> mx_.array:
     return _kernel(tile)(
         inputs=[w, x],
         template=[("T", x.dtype), ("MA", b % bm == 0), ("NA", rows % bn == 0), ("KA", cols % bk == 0)],
+        grid=(-(-rows // bn) * wm * wn * 32, -(-b // bm), 1),
+        threadgroup=(wm * wn * 32, 1, 1),
+        output_shapes=[(b, rows)],
+        output_dtypes=[x.dtype],
+    )[0]
+
+
+def gemm_chain(w: mx_.array, x: mx_.array) -> mx_.array:
+    """y[b, rows] = x[b, cols] w[rows, cols]^T on a stored type's chain (matvec.py), w its dequant, both bf16 or both
+    float32, y in that dtype: a row the bits its matvec gives it"""
+    rows, cols, b = int(w.shape[0]), int(w.shape[1]), int(x.shape[0])
+    if cols % 32:
+        raise ValueError(f"[mlx] a stored chain runs whole 32-column blocks, not {cols} columns")
+    bm, bn, _, wm, wn = tile = pick(b, rows, CHAIN_TILES)
+    return _kernel(tile, chain=True)(
+        inputs=[w, x],
+        template=[("T", x.dtype), ("MA", b % bm == 0), ("NA", rows % bn == 0)],
         grid=(-(-rows // bn) * wm * wn * 32, -(-b // bm), 1),
         threadgroup=(wm * wn * 32, 1, 1),
         output_shapes=[(b, rows)],

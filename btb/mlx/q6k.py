@@ -16,15 +16,21 @@ if TYPE_CHECKING:
 
 # 210 bytes a superblock of 256 weights: ql[128] (low nibbles), qh[64] (high 2 bits), scales[16] int8, d f16. Column
 # c: h = c / 128, quarter u = c % 128 / 32, l = c % 32; the nibble is ql[64h + l + 32 (u & 1)]'s low (u < 2) or high
-# one, the high bits (qh[32h + l] >> 2u) & 3, the scale scales[8h + l / 16 + 2u]; value = d*scale*(q - 32).
+# one, the high bits (qh[32h + l] >> 2u) & 3, the scale scales[8h + l / 16 + 2u]; value = d*scale*(q - 32). The bytes
+# read two at a time (a superblock is 2-byte aligned), q - 32 to float exactly as 0x1p23 + q - (0x1p23 + 32).
 _W8 = r"""
     const device uchar* blk = W + ((size_t)row * (cols / 256) + k / 256) * 210;
     uint c = k % 256, h = c / 128, u = c % 128 / 32, l = c % 32, sh = (u >> 1) * 4;
     float a = (float)(*(const device half*)(blk + 208)) * (float)((const device char*)(blk + 192))[h * 8 + l / 16 + 2 * u];
-    const device uchar* ql = blk + h * 64 + l + (u & 1) * 32;
-    const device uchar* qh = blk + 128 + h * 32 + l;
+    const device ushort* ql = (const device ushort*)(blk + h * 64 + l + (u & 1) * 32);
+    const device ushort* qh = (const device ushort*)(blk + 128 + h * 32 + l);
     #pragma unroll
-    for (uint t = 0; t < 8; ++t) w[t] = a * (float)((int)(((ql[t] >> sh) & 0xF) | (((qh[t] >> (2 * u)) & 3) << 4)) - 32);
+    for (uint t = 0; t < 4; ++t) {
+        uint lo = (uint)ql[t] >> sh, hi = (uint)qh[t] >> (2 * u);
+        uint q0 = (lo & 0xF) | ((hi & 3) << 4), q1 = ((lo >> 8) & 0xF) | (((hi >> 8) & 3) << 4);
+        w[2 * t] = a * (as_type<float>(0x4B000000u | q0) - 8388640.0f);
+        w[2 * t + 1] = a * (as_type<float>(0x4B000000u | q1) - 8388640.0f);
+    }
 """
 
 KERNELS: dict[Quant, StoredKernel] = {Quant.Q6_K: StoredKernel(_W8, 256)}
@@ -36,9 +42,6 @@ def matvec_q6k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.ar
     return launch(f"btb_q6k_mv_{rows}_{cols // 256}", KERNELS[Quant.Q6_K], [w_bytes], x, rows, cols)
 
 
-def dequant_q6k(
-    w_bytes: mx_.array, rows: int, cols: int, dtype: mx_.Dtype | None = None, chain: bool = False
-) -> mx_.array:
-    """the full weight in `dtype` (bf16 by default): the matvec's weights, `chain` in its chain's column order for a
-    prefill's gemm (`matvec.dequant`)."""
-    return dequant("btb_q6k_dequant", KERNELS[Quant.Q6_K], [w_bytes], rows, cols, dtype or mx.bfloat16, chain)
+def dequant_q6k(w_bytes: mx_.array, rows: int, cols: int, dtype: mx_.Dtype | None = None) -> mx_.array:
+    """the full weight in `dtype` (bf16 by default): the matvec's weights, a prefill's gemm's (`matvec.dequant`)."""
+    return dequant("btb_q6k_dequant", KERNELS[Quant.Q6_K], [w_bytes], rows, cols, dtype or mx.bfloat16)

@@ -858,7 +858,9 @@ def _stored_prelude(q: Quant, k: StoredKernel) -> str:
     defines undone"""
     params = ", ".join(f"const device {t}* {n}" for n, t in stored_inputs(k))
     fns = _STORED_FNS.replace("PARAMS", params).replace("DECODE", matvec.DECODE_ROW)
-    return f"{k.defs}namespace btb_{quant_key(q)} {{\n{matvec.device_fns(k)}{fns}}}\n#undef W8\n{_undo(k.defs)}"
+    return (
+        f"{k.defs}namespace btb_{quant_key(q)} {{\n{matvec.device_fns(k)}{fns}}}\n#undef W8\n#undef W2\n{_undo(k.defs)}"
+    )
 
 
 for _q, _k in STORED.items():
@@ -923,9 +925,9 @@ def stored_name(s: StoredMv) -> str:
     return f"btb_mega_mv_{quant_key(s.q)}_{s.rows}_{s.cols}_{s.T}_{s.ld}_{int(s.f32)}"
 
 
-def stored_groups(rows: int) -> int:
-    """the threadgroups a stored matvec of `rows` takes: the step's launch's (`matvec.tile_groups`)"""
-    return matvec.tile_groups(rows)
+def stored_groups(rows: int, T: int) -> int:
+    """the threadgroups a stored matvec of `rows` at `T` pass rows takes: the step's launch's (`matvec.groups`)"""
+    return matvec.groups(rows, T)
 
 
 # the threads a stored matvec's threadgroup takes: the step's launch's simdgroups
@@ -977,7 +979,7 @@ def _preamble() -> str:
 
 
 def stored_source(mvs: Iterable[StoredMv]) -> str:
-    """the library of stored matvec kernels `mvs`: each the step's launch (`matvec.TILE` over its type's `w8`) with its
+    """the library of stored matvec kernels `mvs`: each the step's launch (`matvec.body` over its type's `w8`) with its
     matrix, pass rows and y's row stride as constants, y [T, rows] (C) = x [T, cols] (B) . W^T, W the type's streams
     and tables (`stored_inputs`, in A, D, E, F); a threadgroup of the launch's a threadgroup of the command's"""
     by_q: dict[Quant, list[StoredMv]] = {}
@@ -1005,11 +1007,11 @@ def stored_source(mvs: Iterable[StoredMv]) -> str:
                 "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {\n"
                 f"    using namespace btb_{key};\n    const device uint* f = tab + mi[0] * ROW;\n{ins}"
                 f"    const device {t}* x = (const device {t}*)REF(1);\n    device {t}* out = (device {t}*)REF(2);\n"
-                + matvec.TILE.replace("BIND", "")
+                + matvec.body(s.T, k).replace("BIND", "")
                 + "}\n"
                 + _undo(d)
             )
-        out.append(f"#undef W8\n{_undo(k.defs)}")
+        out.append(f"#undef W8\n#undef W2\n{_undo(k.defs)}")
     return "".join(out)
 
 

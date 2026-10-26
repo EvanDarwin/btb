@@ -260,14 +260,14 @@ def _compiled(key: tuple[object, ...], name: str, inputs: Sequence[str], outputs
 def _gather_source(q: Quant, rows: int, cols: int, items: int, nb: int, part: int, kp: int, xb: bool) -> matvec.Source:
     k = STORED[q]
     assert len(k.streams) <= STREAMS_MAX, f"{q} reads {len(k.streams)} streams, past a table row's"
-    # an item a threadgroup row (grid y): its expert's streams bound, its x row and y row the tile's one pass row
+    # an item a threadgroup row (grid y): its expert's streams bound, its x row and y row the launch's one pass row
     bind = "    uint item = threadgroup_position_in_grid.y;\n" + _bind(nb, part, "item", k.streams)
     rowsof = f"#define XROW(t) (x + (size_t)(item / {kp}) * COLS)\n#define YROW(t) (out + (size_t)item * ROWS)\n"
     return matvec.Source(
         f"btb_moe_gather_{quant_key(q)}_x{int(xb)}_{rows}_{cols}_{items}_{nb}_{part}_{kp}",
         [*(f"B{b}" for b in range(nb)), "tab", "ids", *(t.name for t in k.tables), "x"],
         "#include <metal_simdgroup_matrix>\n" + k.defs + matvec.device_fns(k),
-        matvec.tile_defines(rows, cols, 1, xb) + rowsof + matvec.TILE.replace("BIND", bind),
+        matvec.tile_defines(rows, cols, 1, xb) + rowsof + matvec.body(1, k).replace("BIND", bind),
     )
 
 
@@ -290,7 +290,7 @@ def gather(
     )
     y = kern(
         inputs=[*g.blocks, g.tab, ids.reshape(-1), *(t.make() for t in STORED[q].tables), xin],
-        grid=(matvec.tile_groups(rows) * 32 * matvec.SGN, items, 1),
+        grid=(matvec.groups(rows, 1) * 32 * matvec.SGN, items, 1),
         threadgroup=(32 * matvec.SGN, 1, 1),
         output_shapes=[(items, rows)],
         output_dtypes=[xin.dtype],

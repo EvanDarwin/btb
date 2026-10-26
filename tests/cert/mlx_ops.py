@@ -133,6 +133,7 @@ OPS: tuple[Op, ...] = (
     Op("p12_unpack", "gemv", ("btb_unpack_p12",), "kernels/test_mlx.py"),
     Op("gemm_bf16", "gemv", ("btb_gemm_rows_x*_s*",), "kernels/test_mlx.py"),
     Op("gemm_steel", "steel", ("btb_steel_*_*_*_*_*",), "kernels/test_mlx.py"),
+    Op("gemm_steel_chain", "steel", ("btb_steel_chain_*_*_*_*_*",), "kernels/test_gguf.py"),
     Op("gemv_mxfp4", "gemv", ("btb_gemv_mxfp4**_x*", "btb_mxfp4_dequant"), "kernels/test_mxfp4.py"),
     Op(
         "kquant_q45",

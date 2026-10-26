@@ -1,10 +1,12 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 """The stored GGUF types' matmul on Metal, one chain at every width. A type's `w8` gives 8 consecutive weights of a
-row as float32 from its streams, and every kernel over the type is built on it. The chain runs K a 64-group at a time
-in an order of its own (`chain_order`): logical column 8*ks + f of a group is physical (f/2)*16 + 2*ks + f%2, so a
-lane's 16 consecutive weights land straight in its 8x8 matrix fragments, each rounded to bf16 for a bf16 x. The
-matvec multiplies them there in ascending logical K; a prefill's gemm (the same chain, steel.py) runs over the dequant
-written in that order and x taken in it (`chain_x`). So a row has the same bits in a step, a verify pass, a batch, a
+row as float32 from its streams (rounded to bf16 for a bf16 x), and every kernel over the type is built on it. The
+chain: a row's 32-column blocks in 8 segments (block b in segment b % 8), each block in fragment order (logical 8*ks +
+f is physical 8*(f/2) + 2*ks + f%2), each segment an fma chain from +0 over its blocks ascending, the segments' sums
+folded in order, ((0 + s0) + s1) + ... + s7, every add an fma by 1 so no compile reassociates it. One pass row runs
+it with a segment a lane (`LANE`), a few with a segment a lane over two rows (`LANE2`, or `PAIR2` for a type that
+decodes a pair of weights), more on the matrix multiply-accumulates with a segment an accumulator (`TILE`), a prefill
+on steel over the dequant (`steel.gemm_chain`). So a row has the same bits in a step, a verify pass, a batch, a
 prefill cut anywhere, the megakernel and a mixture's gather."""
 
 from __future__ import annotations
@@ -15,10 +17,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
 
-import numpy as np
-
 from .core import metal_kernel, mx
-from .gemv import TILE_ROWS
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -41,7 +40,9 @@ class StoredKernel:
     """a stored type as every kernel over it is built: `w8`, the body of a device function writing the float32
     weights of row `row`, columns k..k+7 (k a multiple of 8, under `cols`, the row's width) into `w` from the type's
     `streams` and `tables` (each read by its name); `header` the device functions it calls, `defs` the defines it
-    reads, `bw` the weights a block (a row is whole blocks). `streams` in `kinds.stored_stream_bytes`' order"""
+    reads, `bw` the weights a block (a row is whole blocks), `lane_rows` the pass rows to which a launch takes
+    `LANE2` (past them `TILE`), `w2` (where a type has one) the body writing weights k and k + 1 (k even) of row
+    `row` with `w8`'s bits, which takes `PAIR2` for `LANE2`. `streams` in `kinds.stored_stream_bytes`' order"""
 
     w8: str
     bw: int
@@ -49,6 +50,8 @@ class StoredKernel:
     defs: str = ""
     streams: tuple[tuple[str, str], ...] = (("W", "uint8_t"),)
     tables: tuple[Table, ...] = ()
+    lane_rows: int = 3
+    w2: str = ""
 
 
 def inputs(k: StoredKernel) -> list[tuple[str, str]]:
@@ -57,22 +60,220 @@ def inputs(k: StoredKernel) -> list[tuple[str, str]]:
 
 
 def device_fns(k: StoredKernel) -> str:
-    """the type's device functions and `w8` over its inputs; a kernel calls it as W8(row, k, w), its COLS the width"""
+    """the type's device functions and `w8` (and `w2`) over its inputs; a kernel calls it as W8(row, k, w) (W2), its
+    COLS the width"""
     params = "".join(f"const device {t}* {n}, " for n, t in inputs(k))
     args = "".join(f"{n}, " for n, _ in inputs(k))
-    return (
-        f"{k.header}inline void w8({params}uint cols, uint row, uint k, thread float* w) {{\n{k.w8}}}\n"
-        f"#define W8(row, k, w) w8({args}COLS, row, k, w)\n"
-    )
+    fns = f"{k.header}inline void w8({params}uint cols, uint row, uint k, thread float* w) {{\n{k.w8}}}\n"
+    fns += f"#define W8(row, k, w) w8({args}COLS, row, k, w)\n"
+    if k.w2:
+        fns += f"inline void w2({params}uint cols, uint row, uint k, thread float* w) {{\n{k.w2}}}\n"
+        fns += f"#define W2(row, k, w) w2({args}COLS, row, k, w)\n"
+    return fns
 
 
-# y[b, n] = sum_k x[b, k] w[n, k] for NB rows of x: a simdgroup owns 8 rows of W and runs K a 64-group at a time in
-# the chain's order, 8 matrix multiply-accumulates a group into one float accumulator an 8-row block of x. Lane (fm,
-# fn) holds A's [fm][fn, fn+1] (row fm's logical columns fn, fn+1 of each of the 8: its physical 16*(fn/2)..+15, two
-# w8s) and B's [fm][fn, fn+1] (x rows fn, fn+1 at logical column fm: physical 16*(fm/2) + 2*ks + fm%2, from two or four
-# 16-byte loads). XB: bf16 x and A (a weight rounded to bf16), y bf16 (round to nearest even); else float32. XROW(t)
-# and YROW(t) are row t of x and of y; BIND declares a gather's item's streams. A row past ROWS is decoded from the
-# last real one and never written; a column past COLS (a 32-wide type's half group) is zero.
+# y[b, n] = sum_k x[b, k] w[n, k] for NB rows of x, a row of W a group of 8 lanes (4 rows a simdgroup): lane p runs
+# segment p (blocks p, p + 8, ..., each in the chain's order: logical 8 * ks + f is physical 8 * (f / 2) + 2 * ks +
+# f % 2), its block's 32 x values loaded before the decode; then the 8 lanes' sums folded in order through shuffles.
+# The one-row launches' and a gather's (an item one row)
+LANE = r"""
+    uint sg = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint r0 = (threadgroup_position_in_grid.x * SGN + sg) * 4;
+    if (r0 >= ROWS) return;
+BIND
+#if XB
+    typedef bfloat ST;
+#else
+    typedef float ST;
+#endif
+    uint p = lane % 8, rl = lane / 8;
+    uint row = min(r0 + rl, (uint)ROWS - 1);
+    float acc[NB];
+    #pragma unroll
+    for (uint t = 0; t < NB; ++t) acc[t] = 0.0f;
+    for (uint b = p; b < COLS / 32; b += 8) {
+        // the block's x widened ahead of the decode (packed and widened at each use measured 1.6-2.6x)
+        float xf[NB][32];
+        #pragma unroll
+        for (uint t = 0; t < NB; ++t) {
+#if XB
+            const device uint4* xr = (const device uint4*)(XROW(t) + b * 32);
+            #pragma unroll
+            for (uint q = 0; q < 4; ++q) {
+                uint4 v = xr[q];
+                uint u[4] = {v.x, v.y, v.z, v.w};
+                #pragma unroll
+                for (uint i = 0; i < 8; ++i) xf[t][8 * q + i] = as_type<float>(i % 2 ? u[i / 2] & 0xFFFF0000u : u[i / 2] << 16);
+            }
+#else
+            const device float4* xr = (const device float4*)(XROW(t) + b * 32);
+            #pragma unroll
+            for (uint q = 0; q < 8; ++q) {
+                float4 v = xr[q];
+                xf[t][4 * q] = v.x;
+                xf[t][4 * q + 1] = v.y;
+                xf[t][4 * q + 2] = v.z;
+                xf[t][4 * q + 3] = v.w;
+            }
+#endif
+        }
+        float w[32];
+        #pragma unroll
+        for (uint q = 0; q < 4; ++q) {
+            W8(row, b * 32 + 8 * q, w + 8 * q);
+            #pragma unroll
+            for (uint i = 0; i < 8; ++i) w[8 * q + i] = (float)(ST)w[8 * q + i];
+        }
+        #pragma unroll
+        for (uint ks = 0; ks < 4; ++ks)
+            #pragma unroll
+            for (uint f = 0; f < 8; ++f) {
+                uint c = 8 * (f / 2) + 2 * ks + f % 2;
+                #pragma unroll
+                for (uint t = 0; t < NB; ++t) acc[t] = fma(w[c], xf[t][c], acc[t]);
+            }
+    }
+    #pragma unroll
+    for (uint t = 0; t < NB; ++t) {
+        float v = 0.0f;
+        for (uint i = 0; i < 8; ++i) v = fma(simd_shuffle(acc[t], (lane & ~7u) + i), 1.0f, v);
+        if (p == 0 && r0 + rl < ROWS) ((device ST*)YROW(t))[r0 + rl] = (ST)v;
+    }
+"""
+
+# LANE for a few pass rows: a lane two rows of W (8 a simdgroup), both rows' blocks decoded, then each pass row's x
+# pairs loaded once for both rows. The x a lane reads is what a pass row costs (LANE's whole block of x a pass row
+# measured +20-40% at 4 rows); two rows a lane halve it
+LANE2 = r"""
+    uint sg = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint r0 = (threadgroup_position_in_grid.x * SGN + sg) * 8;
+    if (r0 >= ROWS) return;
+BIND
+#if XB
+    typedef bfloat ST;
+#else
+    typedef float ST;
+#endif
+    uint p = lane % 8, rl = lane / 8;
+    uint ra = min(r0 + 2 * rl, (uint)ROWS - 1), rb = min(r0 + 2 * rl + 1, (uint)ROWS - 1);
+    float acc[2][NB];
+    #pragma unroll
+    for (uint t = 0; t < NB; ++t) acc[0][t] = acc[1][t] = 0.0f;
+    for (uint b = p; b < COLS / 32; b += 8) {
+        float w[2][32];
+        #pragma unroll
+        for (uint q = 0; q < 4; ++q) {
+            W8(ra, b * 32 + 8 * q, w[0] + 8 * q);
+            W8(rb, b * 32 + 8 * q, w[1] + 8 * q);
+            #pragma unroll
+            for (uint i = 0; i < 8; ++i) {
+                w[0][8 * q + i] = (float)(ST)w[0][8 * q + i];
+                w[1][8 * q + i] = (float)(ST)w[1][8 * q + i];
+            }
+        }
+        #pragma unroll
+        for (uint t = 0; t < NB; ++t) {
+#if XB
+            const device uint* xr = (const device uint*)(XROW(t) + b * 32);
+#else
+            const device float2* xr = (const device float2*)(XROW(t) + b * 32);
+#endif
+            #pragma unroll
+            for (uint ks = 0; ks < 4; ++ks)
+                #pragma unroll
+                for (uint g = 0; g < 4; ++g) {
+                    // the pair at physical 8 * g + 2 * ks: logical 8 * ks + 2 * g and its successor
+#if XB
+                    uint u = xr[4 * g + ks];
+                    float x0 = as_type<float>(u << 16), x1 = as_type<float>(u & 0xFFFF0000u);
+#else
+                    float2 v = xr[4 * g + ks];
+                    float x0 = v.x, x1 = v.y;
+#endif
+                    #pragma unroll
+                    for (uint r = 0; r < 2; ++r) {
+                        acc[r][t] = fma(w[r][8 * g + 2 * ks], x0, acc[r][t]);
+                        acc[r][t] = fma(w[r][8 * g + 2 * ks + 1], x1, acc[r][t]);
+                    }
+                }
+        }
+    }
+    #pragma unroll
+    for (uint r = 0; r < 2; ++r)
+        #pragma unroll
+        for (uint t = 0; t < NB; ++t) {
+            float v = 0.0f;
+            for (uint i = 0; i < 8; ++i) v = fma(simd_shuffle(acc[r][t], (lane & ~7u) + i), 1.0f, v);
+            if (p == 0 && r0 + 2 * rl + r < ROWS) ((device ST*)YROW(t))[r0 + 2 * rl + r] = (ST)v;
+        }
+"""
+
+# LANE2 for a type that decodes a pair (`StoredKernel.w2`): each pair of both rows decoded where it is multiplied,
+# the pass rows innermost. Holding no block of decoded weights, a lane keeps few registers (a Q8_0 head's float32 x at
+# 2-5 pass rows within 2% of the lane-strided kernel, against +4-29% on LANE2 or TILE)
+PAIR2 = r"""
+    uint sg = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint r0 = (threadgroup_position_in_grid.x * SGN + sg) * 8;
+    if (r0 >= ROWS) return;
+BIND
+#if XB
+    typedef bfloat ST;
+#else
+    typedef float ST;
+#endif
+    uint p = lane % 8, rl = lane / 8;
+    uint ra = min(r0 + 2 * rl, (uint)ROWS - 1), rb = min(r0 + 2 * rl + 1, (uint)ROWS - 1);
+    float acc[2][NB];
+    #pragma unroll
+    for (uint t = 0; t < NB; ++t) acc[0][t] = acc[1][t] = 0.0f;
+    for (uint b = p; b < COLS / 32; b += 8) {
+        #pragma unroll
+        for (uint ks = 0; ks < 4; ++ks)
+            #pragma unroll
+            for (uint g = 0; g < 4; ++g) {
+                // the pair at physical 8 * g + 2 * ks: logical 8 * ks + 2 * g and its successor
+                float w[2][2];
+                W2(ra, b * 32 + 8 * g + 2 * ks, w[0]);
+                W2(rb, b * 32 + 8 * g + 2 * ks, w[1]);
+                #pragma unroll
+                for (uint r = 0; r < 2; ++r) {
+                    w[r][0] = (float)(ST)w[r][0];
+                    w[r][1] = (float)(ST)w[r][1];
+                }
+                #pragma unroll
+                for (uint t = 0; t < NB; ++t) {
+#if XB
+                    uint u = ((const device uint*)(XROW(t) + b * 32))[4 * g + ks];
+                    float x0 = as_type<float>(u << 16), x1 = as_type<float>(u & 0xFFFF0000u);
+#else
+                    float2 v = ((const device float2*)(XROW(t) + b * 32))[4 * g + ks];
+                    float x0 = v.x, x1 = v.y;
+#endif
+                    #pragma unroll
+                    for (uint r = 0; r < 2; ++r) {
+                        acc[r][t] = fma(w[r][0], x0, acc[r][t]);
+                        acc[r][t] = fma(w[r][1], x1, acc[r][t]);
+                    }
+                }
+            }
+    }
+    #pragma unroll
+    for (uint r = 0; r < 2; ++r)
+        #pragma unroll
+        for (uint t = 0; t < NB; ++t) {
+            float v = 0.0f;
+            for (uint i = 0; i < 8; ++i) v = fma(simd_shuffle(acc[r][t], (lane & ~7u) + i), 1.0f, v);
+            if (p == 0 && r0 + 2 * rl + r < ROWS) ((device ST*)YROW(t))[r0 + 2 * rl + r] = (ST)v;
+        }
+"""
+
+# the same for more pass rows on the matrix multiply-accumulates: a simdgroup owns 8 rows of W and walks the
+# blocks in order, block b's 4 multiplies into segment b % 8's accumulator, an 8-row block of x each; lane (fm, fn)
+# holds A's [fm][fn, fn+1] (row fm's physical 8 * (fn / 2)..+7 of the block, one w8) and B's [fm][fn, fn+1] (x rows fn,
+# fn + 1 at physical 8 * (fm / 2) + 2 * ks + fm % 2, one or two 16-byte loads). The segments fold in order at the end
 TILE = r"""
     constexpr uint NA = (NB + 7) / 8;
     uint sg = simdgroup_index_in_threadgroup;
@@ -83,57 +284,77 @@ BIND
 #if XB
     typedef bfloat ST;
     typedef simdgroup_bfloat8x8 SM;
-    constexpr uint XV = 2;
+    constexpr uint XV = 1;
 #else
     typedef float ST;
     typedef simdgroup_float8x8 SM;
-    constexpr uint XV = 4;
+    constexpr uint XV = 2;
 #endif
     uint qid = lane / 4;
     uint fm = (qid & 4) + (lane / 2) % 4, fn = (qid & 2) * 2 + (lane % 2) * 2;
-    uint row = min(n0 + fm, (uint)ROWS - 1), wq = 16 * (fn / 2), xq = 16 * (fm / 2), xe = fm % 2;
-    simdgroup_float8x8 acc[NA];
+    uint row = min(n0 + fm, (uint)ROWS - 1), wq = 8 * (fn / 2), xe = fm % 2;
+    // x rows fn, fn + 1 of each 8-row block at physical 8 * (fm / 2) of a block, XS 16-byte loads a block apart; a row
+    // past NB reads the last one's (its products land in columns never stored). A float32 x skips those loads
+    // (measured faster at 3-6 rows); bf16 keeps them (skipping measured +10-20%)
+    constexpr uint XS = 32 / (16 / sizeof(ST));
+    bool ok0[NA], ok1[NA];
+    const device uint4* x0[NA];
+    const device uint4* x1[NA];
     #pragma unroll
-    for (uint j = 0; j < NA; ++j) acc[j] = simdgroup_float8x8(0.0f);
-    for (uint g = 0; g < COLS; g += 64) {
-        float w[16];
-        if (g + wq < COLS) {
-            W8(row, g + wq, w);
-            W8(row, g + wq + 8, w + 8);
-        } else {
-            for (uint i = 0; i < 16; ++i) w[i] = 0.0f;
-        }
-        ST a[16];
+    for (uint j = 0; j < NA; ++j) {
+        uint t0 = 8 * j + fn;
+        ok0[j] = XB || t0 < NB;
+        ok1[j] = XB || t0 + 1 < NB;
+        x0[j] = (const device uint4*)(XROW(min(t0, (uint)NB - 1)) + 8 * (fm / 2));
+        x1[j] = (const device uint4*)(XROW(min(t0 + 1, (uint)NB - 1)) + 8 * (fm / 2));
+    }
+    simdgroup_float8x8 acc[8 * NA];
+    #pragma unroll
+    for (uint i = 0; i < 8 * NA; ++i) acc[i] = simdgroup_float8x8(0.0f);
+    for (uint b0 = 0; b0 < COLS / 32; b0 += 8) {
         #pragma unroll
-        for (uint i = 0; i < 16; ++i) a[i] = (ST)w[i];
-        bool xin = g + xq < COLS;
-        #pragma unroll
-        for (uint j = 0; j < NA; ++j) {
-            uint t0 = 8 * j + fn, t1 = t0 + 1;
-            const device uint4* p0 = (const device uint4*)(XROW(min(t0, (uint)NB - 1)) + g + xq);
-            const device uint4* p1 = (const device uint4*)(XROW(min(t1, (uint)NB - 1)) + g + xq);
-            uint4 v0[XV], v1[XV];
-            #pragma unroll
-            for (uint v = 0; v < XV; ++v) {
-                v0[v] = xin && t0 < NB ? p0[v] : uint4(0u);
-                v1[v] = xin && t1 < NB ? p1[v] : uint4(0u);
-            }
-            #pragma unroll
-            for (uint ks = 0; ks < 8; ++ks) {
-                SM A, B;
-                A.thread_elements()[0] = a[2 * ks];
-                A.thread_elements()[1] = a[2 * ks + 1];
+        for (uint s = 0; s < 8; ++s) {
+            uint b = b0 + s;
+            if (b < COLS / 32) {
+                float w[8];
+                W8(row, b * 32 + wq, w);
+                #pragma unroll
+                for (uint j = 0; j < NA; ++j) {
+                    uint4 v0[XV], v1[XV];
+                    #pragma unroll
+                    for (uint v = 0; v < XV; ++v) {
+                        v0[v] = ok0[j] ? x0[j][b * XS + v] : uint4(0u);
+                        v1[v] = ok1[j] ? x1[j][b * XS + v] : uint4(0u);
+                    }
+                    #pragma unroll
+                    for (uint ks = 0; ks < 4; ++ks) {
+                        SM A, B;
+                        A.thread_elements()[0] = (ST)w[2 * ks];
+                        A.thread_elements()[1] = (ST)w[2 * ks + 1];
 #if XB
-                uint u0 = v0[ks / 4][ks % 4], u1 = v1[ks / 4][ks % 4];
-                B.thread_elements()[0] = as_type<bfloat>((ushort)(xe ? u0 >> 16 : u0 & 0xFFFF));
-                B.thread_elements()[1] = as_type<bfloat>((ushort)(xe ? u1 >> 16 : u1 & 0xFFFF));
+                        uint u0 = v0[0][ks], u1 = v1[0][ks];
+                        B.thread_elements()[0] = as_type<bfloat>((ushort)(xe ? u0 >> 16 : u0 & 0xFFFF));
+                        B.thread_elements()[1] = as_type<bfloat>((ushort)(xe ? u1 >> 16 : u1 & 0xFFFF));
 #else
-                uint4 q0 = v0[ks / 2], q1 = v1[ks / 2];
-                B.thread_elements()[0] = as_type<float>(ks % 2 ? (xe ? q0.w : q0.z) : (xe ? q0.y : q0.x));
-                B.thread_elements()[1] = as_type<float>(ks % 2 ? (xe ? q1.w : q1.z) : (xe ? q1.y : q1.x));
+                        uint4 q0 = v0[ks / 2], q1 = v1[ks / 2];
+                        B.thread_elements()[0] = as_type<float>(ks % 2 ? (xe ? q0.w : q0.z) : (xe ? q0.y : q0.x));
+                        B.thread_elements()[1] = as_type<float>(ks % 2 ? (xe ? q1.w : q1.z) : (xe ? q1.y : q1.x));
 #endif
-                simdgroup_multiply_accumulate(acc[j], A, B, acc[j]);
+                        simdgroup_multiply_accumulate(acc[s * NA + j], A, B, acc[s * NA + j]);
+                    }
+                }
             }
+        }
+    }
+    // every element folded before any branch: read under a row's guard, the accumulators go to the stack (2-3x)
+    float2 v[NA];
+    #pragma unroll
+    for (uint j = 0; j < NA; ++j) {
+        v[j] = float2(0.0f);
+        #pragma unroll
+        for (uint s = 0; s < 8; ++s) {
+            v[j].x = fma(acc[s * NA + j].thread_elements()[0], 1.0f, v[j].x);
+            v[j].y = fma(acc[s * NA + j].thread_elements()[1], 1.0f, v[j].y);
         }
     }
     if (n0 + fm < ROWS) {
@@ -142,78 +363,46 @@ BIND
             #pragma unroll
             for (uint e = 0; e < 2; ++e) {
                 uint t = 8 * j + fn + e;
-                if (t < NB) {
-#if XB
-                    uint u = as_type<uint>(acc[j].thread_elements()[e]);
-                    u += 0x7FFFu + ((u >> 16) & 1u);
-                    ((device uint16_t*)YROW(t))[n0 + fm] = (uint16_t)(u >> 16);
-#else
-                    ((device float*)YROW(t))[n0 + fm] = acc[j].thread_elements()[e];
-#endif
-                }
+                if (t < NB) ((device ST*)YROW(t))[n0 + fm] = (ST)v[j][e];
             }
         }
     }
 """
-# a tile launch's simdgroups a threadgroup: it holds no threadgroup memory, and 2 and 4 tie, 8 and 16 run slower
+# a launch's simdgroups a threadgroup: no kernel holds threadgroup memory; 2 and 4 tie, 8 and 16 run slower
 SGN = 4
+# a launch's pass rows at most: TILE's 8 segment accumulators an 8-row block of x
+LAUNCH_ROWS = 16
+
+
+def body(nb: int, k: StoredKernel) -> str:
+    """the kernel body a launch of `nb` pass rows over type `k` takes"""
+    if nb == 1:
+        return LANE
+    if nb <= k.lane_rows:
+        return PAIR2 if k.w2 else LANE2
+    return TILE
 
 
 def tile_defines(rows: int, cols: int, nb: int, xb: bool) -> str:
-    """a tile launch's defines but its rows' addresses: the matrix, the pass rows, its simdgroups a threadgroup"""
+    """a launch's defines but its rows' addresses: the matrix, the pass rows, its simdgroups a threadgroup"""
     return f"#define ROWS {rows}\n#define COLS {cols}\n#define NB {nb}\n#define SGN {SGN}\n#define XB {int(xb)}\n"
 
 
-def tile_groups(rows: int) -> int:
-    """the threadgroups a tile launch over `rows` outputs takes: a simdgroup each 8 rows, `SGN` a threadgroup"""
-    return -(-rows // (8 * SGN))
+def groups(rows: int, nb: int) -> int:
+    """the threadgroups a launch of `nb` pass rows over `rows` outputs takes, `SGN` simdgroups each: 4 rows a
+    simdgroup on LANE, 8 on LANE2 and TILE"""
+    return -(-rows // ((4 if nb == 1 else 8) * SGN))
 
 
-def chain_cols(cols: int) -> int:
-    """the chain's columns over a row of `cols`: whole 64-groups, the last one's tail zero"""
-    return -(-cols // 64) * 64
-
-
-@functools.cache
-def chain_order(cols: int) -> mx_.array:
-    """int32 [chain_cols(cols)]: the physical column of each of the chain's logical ones"""
-    lg = np.arange(chain_cols(cols))
-    g, ks, f = lg - lg % 64, lg % 64 // 8, lg % 8
-    order = mx.array((g + f // 2 * 16 + 2 * ks + f % 2).astype(np.int32))
-    mx.eval(order)
-    return order
-
-
-def chain_x(x: mx_.array, cols: int) -> mx_.array:
-    """x [b, cols] in the chain's column order (`chain_order`), zero past `cols`: a prefill's gemm over the dequant
-    `chain` writes is the matvec's chain"""
-    m = mx
-    pc = chain_cols(cols)
-    xp = x if pc == cols else m.pad(x, [(0, 0), (0, pc - cols)])
-    return m.take(xp, chain_order(cols), axis=1)
-
-
-# one thread 8 consecutive weights of a row, as the tile rounds them: OT bf16 or float32, OC columns a row out. CHAIN:
-# into the chain's order (physical k + i is logical (k & ~63) + 8 * ((k % 16 + i) / 2) + 2 * (k % 64 / 16) + i % 2),
-# a 32-wide type's half group zero
+# the matrix's weights as the kernels round them, OT bf16 or float32, a thread 8 consecutive weights
 DEQUANT = r"""
     uint t = thread_position_in_grid.x;
-    if (t >= ROWS * (OC / 8)) return;
-    uint row = t / (OC / 8), k = (t % (OC / 8)) * 8;
+    if (t >= ROWS * (COLS / 8)) return;
+    uint row = t / (COLS / 8), k = (t % (COLS / 8)) * 8;
     float w[8];
-    if (k < COLS) {
-        W8(row, k, w);
-    } else {
-        for (uint i = 0; i < 8; ++i) w[i] = 0.0f;
-    }
-#if CHAIN
-    device OT* o = out + (size_t)row * OC + (k & ~63u) + 4 * (k % 16) + 2 * (k % 64 / 16);
+    W8(row, k, w);
     #pragma unroll
-    for (uint i = 0; i < 8; ++i) o[8 * (i / 2) + i % 2] = (OT)w[i];
-#else
-    #pragma unroll
-    for (uint i = 0; i < 8; ++i) out[(size_t)row * OC + k + i] = (OT)w[i];
-#endif
+    for (uint i = 0; i < 8; ++i) out[(size_t)row * COLS + k + i] = (OT)w[i];
 """
 
 # row `row` of the matrix in bf16 into dst, a thread 8 weights of each 2048 (a megakernel's embedding: the dequant's)
@@ -258,7 +447,7 @@ def compiled(key: tuple[object, ...], make: Callable[[], Source]) -> MetalKernel
     return k
 
 
-def _tile(name: str, k: StoredKernel, rows: int, cols: int, nb: int, xb: bool) -> Source:
+def _launched(name: str, k: StoredKernel, rows: int, cols: int, nb: int, xb: bool) -> Source:
     _whole(k, cols)
     return Source(
         f"{name}_{nb}_x{int(xb)}",
@@ -266,55 +455,50 @@ def _tile(name: str, k: StoredKernel, rows: int, cols: int, nb: int, xb: bool) -
         "#include <metal_simdgroup_matrix>\n" + k.defs + device_fns(k),
         tile_defines(rows, cols, nb, xb)
         + "#define XROW(t) (x + (size_t)(t) * COLS)\n#define YROW(t) (out + (size_t)(t) * ROWS)\n"
-        + TILE.replace("BIND", ""),
+        + body(nb, k).replace("BIND", ""),
     )
 
 
 def launch(name: str, k: StoredKernel, ins: Sequence[mx_.array], x: mx_.array, rows: int, cols: int) -> mx_.array:
     """y[T, rows] = x[T, cols] . W^T over a stored type's `ins` (its streams then its tables, `inputs`' order), x bf16
-    or float32, y in its dtype: launches of about equal rows, `gemv.TILE_ROWS` at most. `name` is the caller's kernel
-    name for the matrix (its rows and columns), the pass rows appended"""
+    or float32, y in its dtype: launches of about equal rows, `LAUNCH_ROWS` at most, each on the kernel its rows take
+    (`body`). `name` is the caller's kernel name for the matrix (its rows and columns), the pass rows appended"""
     m = mx
     xb = x.dtype == m.bfloat16
     xin = x if xb else x.astype(m.float32)
     b = int(xin.shape[0])
-    n = -(-b // TILE_ROWS[xb])
+    n = -(-b // LAUNCH_ROWS)
     size = -(-b // n)
-    grid, tg = (tile_groups(rows) * 32 * SGN, 1, 1), (32 * SGN, 1, 1)
     outs = []
     for s in range(0, b, size):
         xr = xin if n == 1 else xin[s : s + size]
         nb = int(xr.shape[0])
-        kern = compiled((name, nb, xb), functools.partial(_tile, name, k, rows, cols, nb, xb))
-        outs.append(
-            kern(inputs=[*ins, xr], grid=grid, threadgroup=tg, output_shapes=[(nb, rows)], output_dtypes=[xr.dtype])[0]
-        )
+        kern = compiled((name, nb, xb), functools.partial(_launched, name, k, rows, cols, nb, xb))
+        got = kern(inputs=[*ins, xr], grid=(groups(rows, nb) * 32 * SGN, 1, 1), threadgroup=(32 * SGN, 1, 1),
+                   output_shapes=[(nb, rows)], output_dtypes=[xr.dtype])  # fmt: skip
+        outs.append(got[0])
     y = outs[0] if len(outs) == 1 else m.concatenate(outs, axis=0)
     return y if y.dtype == x.dtype else y.astype(x.dtype)
 
 
-def _dequant(name: str, k: StoredKernel, rows: int, cols: int, ot: str, chain: bool) -> Source:
+def _dequant(name: str, k: StoredKernel, rows: int, cols: int, ot: str) -> Source:
     _whole(k, cols)
     return Source(
-        f"{name}_{rows}_{cols}_{ot}" + ("_chain" if chain else ""),
+        f"{name}_{rows}_{cols}_{ot}",
         [nm for nm, _ in inputs(k)],
         k.defs + device_fns(k),
-        f"#define ROWS {rows}\n#define COLS {cols}\n#define OC {chain_cols(cols) if chain else cols}\n"
-        f"#define OT {ot}\n#define CHAIN {int(chain)}\n" + DEQUANT,
+        f"#define ROWS {rows}\n#define COLS {cols}\n#define OT {ot}\n" + DEQUANT,
     )
 
 
-def dequant(
-    name: str, k: StoredKernel, ins: Sequence[mx_.array], rows: int, cols: int, dtype: mx_.Dtype, chain: bool = False
-) -> mx_.array:
-    """the whole weight in `dtype` (bf16, or float32 for a float32 x's gemm), the tile's weights: [rows, cols], or with
-    `chain` [rows, chain_cols(cols)] in the chain's column order (a prefill's gemm over `chain_x`)"""
+def dequant(name: str, k: StoredKernel, ins: Sequence[mx_.array], rows: int, cols: int, dtype: mx_.Dtype) -> mx_.array:
+    """the whole [rows, cols] weight in `dtype` (bf16, or float32 for a float32 x's gemm), as the kernels round it: a
+    prefill's (`steel.gemm_chain`)"""
     m = mx
     ot = "bfloat" if dtype == m.bfloat16 else "float"
-    oc = chain_cols(cols) if chain else cols
-    kern = compiled((name, rows, cols, ot, chain), lambda: _dequant(name, k, rows, cols, ot, chain))
-    n = rows * oc // 8
+    kern = compiled((name, rows, cols, ot), lambda: _dequant(name, k, rows, cols, ot))
+    n = rows * cols // 8
     return kern(
-        inputs=list(ins), grid=(-(-n // 256) * 256, 1, 1), threadgroup=(256, 1, 1), output_shapes=[(rows, oc)],
+        inputs=list(ins), grid=(-(-n // 256) * 256, 1, 1), threadgroup=(256, 1, 1), output_shapes=[(rows, cols)],
         output_dtypes=[dtype],
     )[0]  # fmt: skip

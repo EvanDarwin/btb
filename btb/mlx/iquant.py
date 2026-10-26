@@ -71,9 +71,9 @@ _W8_IQ4NL = r"""
     size_t b = (size_t)row * (cols / 32) + k / 32;
     uint i0 = k % 32, sh = i0 < 16 ? 0 : 4;
     float d = (float)Dd[b];
-    const device uchar* q = Qq + b * 16 + (i0 & 15);
+    uint2 q = *(const device uint2*)(Qq + b * 16 + (i0 & 15));
     #pragma unroll
-    for (uint t = 0; t < 8; ++t) w[t] = d * (float)KV[(q[t] >> sh) & 0xF];
+    for (uint t = 0; t < 8; ++t) w[t] = d * (float)KV[((t < 4 ? q.x : q.y) >> (8 * (t % 4) + sh)) & 0xF];
 """
 # IQ4_XS: 136 B a superblock of 256. d f16, scales_h u16, scales_l[4], then 128 nibble bytes. Eight 32-blocks a
 # superblock; block ib has a 6-bit scale ls = (scales_l nibble) | (scales_h 2 bits << 4), value = d*(ls-32)*KV[q],
@@ -84,74 +84,117 @@ _W8_IQ4XS = r"""
     uint shi = (uint)blk[2] | ((uint)blk[3] << 8);
     int ls = ((blk[4 + ib / 2] >> (4 * (ib & 1))) & 0xF) | (((shi >> (2 * ib)) & 3) << 4);
     float dl = (float)(*(const device half*)blk) * (float)(ls - 32);
-    const device uchar* qs = blk + 8 + 16 * ib + (bx & 15);
+    uint2 q = *(const device uint2*)(blk + 8 + 16 * ib + (bx & 15));
     #pragma unroll
-    for (uint t = 0; t < 8; ++t) w[t] = dl * (float)KV[(qs[t] >> sh) & 0xF];
+    for (uint t = 0; t < 8; ++t) w[t] = dl * (float)KV[((t < 4 ? q.x : q.y) >> (8 * (t % 4) + sh)) & 0xF];
 """
 
 # The lattice types: a 32-block of a superblock of 256 is four groups of 8 weights, 8 columns at k one group
-# (ib = c / 32, l = c % 32 / 8), each a grid entry of 8 (or two of 4) signed and scaled by the block's db.
+# (ib = c / 32, l = c % 32 / 8), each a grid entry of 8 (or two of 4) signed and scaled by the block's db. A grid
+# entry is read whole (one 8- or 4-byte load, the codebooks' rows aligned), a block's multi-byte fields 16 bits at a
+# time (a superblock is 2-byte aligned); IQ3_S's bytes one at a time (whole reads measured 3-5% slower at one row)
 _LATTICE_AT = r"""
     const device uchar* blk = W + ((size_t)row * (cols / 256) + k / 256) * BLKB;
     uint c = k % 256, ib = c / 32, l = c % 32 / 8;
     float d = (float)(*(const device half*)blk);
+    const device ushort* blk16 = (const device ushort*)blk;
+"""
+# grid entry `i` of 8 int8 values into float v[8], or entries i and j of 4 into v[0..3] and v[4..7]
+_GRID8 = r"""
+    uint2 ge = ((const device uint2*)GRID)[GI];
+    float4 v0 = float4(as_type<char4>(ge.x)), v1 = float4(as_type<char4>(ge.y));
+"""
+_GRID44 = r"""
+    float4 v0 = float4(as_type<char4>(((const device uint*)GRID)[GI])), v1 = float4(as_type<char4>(((const device uint*)GRID)[GJ]));
 """
 # IQ3_XXS: 98 B. d f16, 64 grid-index bytes (two 4-value entries a group), then 8 uint32 (one a 32-block: the top 4
 # bits a scale, the low 28 four 7-bit sign-table indices); db = d*(0.5 + scale)*0.5.
-_W8_IQ3XXS = r"""
-    const device uchar* sca = blk + 66 + 4 * ib;
-    uint aux = (uint)sca[0] | ((uint)sca[1] << 8) | ((uint)sca[2] << 16) | ((uint)sca[3] << 24);
+_W8_IQ3XXS = (
+    r"""
+    uint aux = (uint)blk16[33 + 2 * ib] | ((uint)blk16[34 + 2 * ib] << 16);
     float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
     uchar signs = KS[(aux >> (7 * l)) & 127];
-    uint i1 = blk[2 + 8 * ib + 2 * l], i2 = blk[3 + 8 * ib + 2 * l];
+    uint ii = blk16[1 + 4 * ib + l];
+"""
+    + _GRID44.replace("GI", "ii & 0xFF").replace("GJ", "ii >> 8")
+    + r"""
     #pragma unroll
     for (uint t = 0; t < 8; ++t) {
-        float v = (float)GRID[(t < 4 ? i1 : i2) * 4 + t % 4];
+        float v = t < 4 ? v0[t] : v1[t - 4];
         w[t] = db * (((signs >> t) & 1) ? -v : v);
     }
 """
+)
 # IQ2_XXS: 66 B. d f16, then a 32-block's 8 bytes: word0 4 grid-index bytes (a group each), word1 a 4-bit scale in
 # the top nibble and four 7-bit sign-table indices; the (256,8) grid, db = d*(0.5 + scale)*0.25.
-_W8_IQ2XXS = r"""
+_W8_IQ2XXS = (
+    r"""
     const device uchar* grp = blk + 2 + 8 * ib;
-    uint w1 = (uint)grp[4] | ((uint)grp[5] << 8) | ((uint)grp[6] << 16) | ((uint)grp[7] << 24);
+    uint w1 = (uint)blk16[3 + 4 * ib] | ((uint)blk16[4 + 4 * ib] << 16);
     float db = d * (0.5f + (float)(w1 >> 28)) * 0.25f;
     uchar signs = KS[(w1 >> (7 * l)) & 127];
-    uint gi = grp[l];
-    #pragma unroll
-    for (uint t = 0; t < 8; ++t) { float v = (float)GRID[gi * 8 + t]; w[t] = db * (((signs >> t) & 1) ? -v : v); }
 """
+    + _GRID8.replace("GI", "grp[l]")
+    + r"""
+    #pragma unroll
+    for (uint t = 0; t < 8; ++t) {
+        float v = t < 4 ? v0[t] : v1[t - 4];
+        w[t] = db * (((signs >> t) & 1) ? -v : v);
+    }
+"""
+)
 # IQ2_XS: 74 B. d f16, 32 uint16 qs (a group: low 9 bits a (512,8) grid index, top 7 a sign-table index), 8 scale
 # bytes (16 4-bit sub-scales, one a 16-weight half-block); db = d*(0.5 + sc4)*0.25.
-_W8_IQ2XS = r"""
+_W8_IQ2XS = (
+    r"""
     uint g = 4 * ib + l, s = g / 2;
-    uint q16 = (uint)blk[2 + 2 * g] | ((uint)blk[3 + 2 * g] << 8);
+    uint q16 = blk16[1 + g];
     float db = d * (0.5f + (float)((blk[66 + s / 2] >> (4 * (s & 1))) & 0xF)) * 0.25f;
     uchar signs = KS[q16 >> 9];
-    #pragma unroll
-    for (uint t = 0; t < 8; ++t) { float v = (float)GRID[(q16 & 511) * 8 + t]; w[t] = db * (((signs >> t) & 1) ? -v : v); }
 """
+    + _GRID8.replace("GI", "q16 & 511")
+    + r"""
+    #pragma unroll
+    for (uint t = 0; t < 8; ++t) {
+        float v = t < 4 ? v0[t] : v1[t - 4];
+        w[t] = db * (((signs >> t) & 1) ? -v : v);
+    }
+"""
+)
 # IQ2_S: 82 B. d f16, 32 qs bytes (low 8 index bits a group), 32 sign bytes (a bit a weight), 8 qh bytes (2 high
 # index bits a group, into the (1024,8) grid), 8 scale bytes (16 4-bit sub-scales); db = d*(0.5 + sc4)*0.25.
-_W8_IQ2S = r"""
+_W8_IQ2S = (
+    r"""
     uint g = 4 * ib + l, s = g / 2;
     uint idx = (uint)blk[2 + g] | ((((uint)blk[66 + g / 4] >> (2 * (g & 3))) & 3) << 8);
     float db = d * (0.5f + (float)((blk[74 + s / 2] >> (4 * (s & 1))) & 0xF)) * 0.25f;
     uchar signs = blk[34 + g];
-    #pragma unroll
-    for (uint t = 0; t < 8; ++t) { float v = (float)GRID[idx * 8 + t]; w[t] = db * (((signs >> t) & 1) ? -v : v); }
 """
+    + _GRID8.replace("GI", "idx")
+    + r"""
+    #pragma unroll
+    for (uint t = 0; t < 8; ++t) {
+        float v = t < 4 ? v0[t] : v1[t - 4];
+        w[t] = db * (((signs >> t) & 1) ? -v : v);
+    }
+"""
+)
 # IQ1_S: 50 B. d f16, 32 qs bytes (low 8 index bits), 8 uint16 qh (a 32-block: 3 high index bits a group, a 3-bit
 # scale in bits 12-14, a delta sign in bit 15). The (2048,8) ternary grid; a weight is dl*(grid + delta),
 # dl = d*(2*scale+1), delta = +-0.125.
-_W8_IQ1S = r"""
-    uint qhv = (uint)blk[34 + 2 * ib] | ((uint)blk[35 + 2 * ib] << 8);
+_W8_IQ1S = (
+    r"""
+    uint qhv = blk16[17 + ib];
     uint idx = (uint)blk[2 + 4 * ib + l] | (((qhv >> (3 * l)) & 7) << 8);
     float dl = d * (float)(2 * ((qhv >> 12) & 7) + 1);
     float delta = (qhv & 0x8000) ? -0.125f : 0.125f;
-    #pragma unroll
-    for (uint t = 0; t < 8; ++t) w[t] = dl * ((float)GRID[idx * 8 + t] + delta);
 """
+    + _GRID8.replace("GI", "idx")
+    + r"""
+    #pragma unroll
+    for (uint t = 0; t < 8; ++t) w[t] = dl * ((t < 4 ? v0[t] : v1[t - 4]) + delta);
+"""
+)
 # IQ3_S: 110 B. d f16, 64 qs bytes (low 8 index bits, one a group of 4), 8 qh bytes (the 9th index bit as a plane),
 # 32 sign bytes (a bit a weight), 4 scale bytes (8 4-bit scales a 32-block). The (512,4) grid; db = d*(1 + 2*sc4).
 _W8_IQ3S = r"""
@@ -170,7 +213,8 @@ _W8_IQ3S = r"""
 # bits and a delta-sign bit), 8 scale bytes whose top nibbles reassemble d and whose low 12 bits hold sixteen 3-bit
 # sub-scales. The kernels read the side streams `_side_iq1m` makes once at bind (Dd: d an f16 a superblock; SB: the
 # sub-scales as nibble pairs, 8 B a superblock). The (2048,8) ternary grid; dl = d*(2*sub+1), weight = dl*(grid + delta).
-_W8_IQ1M = r"""
+_W8_IQ1M = (
+    r"""
     size_t sb = (size_t)row * (cols / 256) + k / 256;
     const device uchar* blk = W + sb * 56;
     uint g = k % 256 / 8, si = g / 2;
@@ -179,9 +223,13 @@ _W8_IQ1M = r"""
     uint idx = (uint)blk[g] | ((uint)(nib & 7) << 8);
     float delta = (nib & 8) ? -0.125f : 0.125f;
     float dl = (float)Dd[sb] * (float)(2 * sub + 1);
-    #pragma unroll
-    for (uint t = 0; t < 8; ++t) w[t] = dl * ((float)GRID[idx * 8 + t] + delta);
 """
+    + _GRID8.replace("GI", "idx")
+    + r"""
+    #pragma unroll
+    for (uint t = 0; t < 8; ++t) w[t] = dl * ((t < 4 ? v0[t] : v1[t - 4]) + delta);
+"""
+)
 
 
 def _side_iq1m(raw: mx_.array) -> tuple[mx_.array, mx_.array]:
@@ -250,8 +298,9 @@ def _codebooks(kind: str) -> tuple[Table, ...]:
 def _lattice_kernel(kind: str) -> StoredKernel:
     spec = _LATT[kind]
     streams = (("W", "uint8_t"), *((n, "half" if n == "Dd" else "uint8_t") for n in spec.get("side_names", [])))
+    # LANE2 to 4 pass rows: a lattice decode costs TILE's lanes more (IQ2_XS at 4 rows: TILE +6-15%, LANE2 -2-4%)
     return StoredKernel(spec["w8"], 256, defs=f"#define BLKB {spec['bytes']}\n", streams=streams,
-                        tables=_codebooks(kind))  # fmt: skip
+                        tables=_codebooks(kind), lane_rows=4)  # fmt: skip
 
 
 def repack_iq4nl(raw: mx_.array) -> tuple[mx_.array, mx_.array]:
@@ -276,13 +325,11 @@ def matvec_iq4nl(d: mx_.array, q: mx_.array, x: mx_.array, rows: int, cols: int)
     return launch(f"btb_iq4nl_mv_{rows}_{cols // 32}", KERNELS[Quant.IQ4_NL], [_device(d), q], x, rows, cols)
 
 
-def dequant_iq4nl(
-    d: mx_.array, q: mx_.array, rows: int, cols: int, dtype: mx_.Dtype | None = None, chain: bool = False
-) -> mx_.array:
-    """the full weight in `dtype` (bf16 by default) for an IQ4_NL tensor from its repacked streams, `chain` in its
-    chain's column order (`matvec.dequant`)."""
+def dequant_iq4nl(d: mx_.array, q: mx_.array, rows: int, cols: int, dtype: mx_.Dtype | None = None) -> mx_.array:
+    """the full weight in `dtype` (bf16 by default) for an IQ4_NL tensor from its repacked streams
+    (`matvec.dequant`)."""
     k = KERNELS[Quant.IQ4_NL]
-    return dequant("btb_iq4nl_dequant", k, [_device(d), q], rows, cols, dtype or mx.bfloat16, chain)
+    return dequant("btb_iq4nl_dequant", k, [_device(d), q], rows, cols, dtype or mx.bfloat16)
 
 
 def matvec_iq4xs(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:
@@ -290,11 +337,9 @@ def matvec_iq4xs(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.
     return launch(f"btb_iq4xs_mv_{rows}_{cols // 256}", KERNELS[Quant.IQ4_XS], [w_bytes], x, rows, cols)
 
 
-def dequant_iq4xs(
-    w_bytes: mx_.array, rows: int, cols: int, dtype: mx_.Dtype | None = None, chain: bool = False
-) -> mx_.array:
+def dequant_iq4xs(w_bytes: mx_.array, rows: int, cols: int, dtype: mx_.Dtype | None = None) -> mx_.array:
     """`dequant_iq4nl` for an IQ4_XS tensor."""
-    return dequant("btb_iq4xs_dequant", KERNELS[Quant.IQ4_XS], [w_bytes], rows, cols, dtype or mx.bfloat16, chain)
+    return dequant("btb_iq4xs_dequant", KERNELS[Quant.IQ4_XS], [w_bytes], rows, cols, dtype or mx.bfloat16)
 
 
 def matvec_lattice(
@@ -309,10 +354,10 @@ def matvec_lattice(
 
 def dequant_lattice(
     kind: str, w_bytes: mx_.array, rows: int, cols: int, side: tuple[mx_.array, ...] = (),
-    dtype: mx_.Dtype | None = None, chain: bool = False,
+    dtype: mx_.Dtype | None = None,
 ) -> mx_.array:  # fmt: skip
     """the full weight in `dtype` (bf16 by default) for an IQ lattice tensor of `kind`, `side` its `repack_lattice`
-    streams, `chain` in its chain's column order (`matvec.dequant`)"""
+    streams (`matvec.dequant`)"""
     k = KERNELS[Quant[_LATT[kind]["grid"]]]
     ins = [w_bytes, *(_device(s) for s in side), *(t.make() for t in k.tables)]
-    return dequant(f"btb_{kind}_dequant", k, ins, rows, cols, dtype or mx.bfloat16, chain)
+    return dequant(f"btb_{kind}_dequant", k, ins, rows, cols, dtype or mx.bfloat16)

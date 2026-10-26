@@ -26,9 +26,8 @@ from .iquant import (
 )
 from .kquant import dequant_q2k, dequant_q3k, dequant_q4k, dequant_q5k, matvec_q2k, matvec_q3k, matvec_q4k, matvec_q5k
 from .legacyq import dequant_legacy, matvec_legacy
-from .matvec import chain_x
 from .q6k import dequant_q6k, matvec_q6k
-from .steel import FROM_ROWS, gemm
+from .steel import FROM_ROWS, gemm, gemm_chain
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -143,21 +142,17 @@ def _floats(q: Quant, raw: mx_.array, rows: int, cols: int) -> mx_.array:
     return raw.view(m.float16 if q is Quant.F16 else m.bfloat16).reshape(rows, cols)
 
 
-def stored_dequant(
-    q: Quant, streams: Streams, rows: int, cols: int, dtype: mx_.Dtype | None = None, chain: bool = False
-) -> mx_.array:
+def stored_dequant(q: Quant, streams: Streams, rows: int, cols: int, dtype: mx_.Dtype | None = None) -> mx_.array:
     """the whole [rows, cols] weight of type `q` from its `stored_streams` in `dtype` (bf16 by default; float32 for
-    a float32 x's gemm): the weights its matvec multiplies. With `chain` (not a float type) [rows, chain_cols(cols)]
-    in its chain's column order, so the gemm over them and `chain_x(x)` is its chain"""
+    a float32 x's gemm): the weights its matvec multiplies"""
     c, key = QUANT_KIND[q], quant_key(q)
     if c is QuantClass.FLOAT:
-        assert not chain  # a float type runs the dense route's chain over its weights as they are
         return _floats(q, streams[0], rows, cols).astype(dtype or mx.bfloat16)
     if c is QuantClass.AFFINE:
-        return dequant_legacy(q.value.lower(), streams[0], rows, cols, dtype, chain)
+        return dequant_legacy(q.value.lower(), streams[0], rows, cols, dtype)
     if c is QuantClass.LATTICE:
-        return dequant_lattice(key, streams[0], rows, cols, streams[1:], dtype, chain)
-    return _DEQUANT[key](*streams, rows, cols, dtype, chain)
+        return dequant_lattice(key, streams[0], rows, cols, streams[1:], dtype)
+    return _DEQUANT[key](*streams, rows, cols, dtype)
 
 
 def _join_stored(ws: Sequence[Weight]) -> Weight | None:
@@ -467,12 +462,11 @@ class Backend:
         floats = w.q is not None and QUANT_KIND[w.q] is QuantClass.FLOAT
         if w.q is not None and not floats and x.dtype in (m.float32, m.bfloat16):
             rows, cols = (int(s) for s in w.shape)
-            # the type's kernel decodes its weights into the gemm's fragments a launch; a prefill of `gemm_rows` rows or
-            # more decodes them once (bf16, or float32 for a float32 x: the fragments' numbers) in the chain's column
-            # order for the gemm over x taken in it, the same chain
+            # the type's kernels decode its weights a launch; a prefill of `gemm_rows` rows or more decodes them once
+            # (bf16, or float32 for a float32 x: the kernels' numbers) for steel's gemm on the same chain
             if int(x.shape[0]) < self.gemm_rows:
                 return stored_matvec(w.q, w.streams, x, rows, cols)
-            return gemm(stored_dequant(w.q, w.streams, rows, cols, x.dtype, chain=True), chain_x(x, cols))
+            return gemm_chain(stored_dequant(w.q, w.streams, rows, cols, x.dtype), x)
         # a GGUF's float experts as the file holds them, the dense route's chain over them as they are
         W = _floats(w.q, w.streams[0], *(int(s) for s in w.shape)) if floats and w.q is not None else w.get()
         # each row's bits its own whatever the width (a verify pass, a batch or any cut of a prefill computes each row
