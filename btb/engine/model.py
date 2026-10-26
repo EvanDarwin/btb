@@ -9,7 +9,6 @@ import math
 import os
 import threading
 import time
-import weakref
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, Protocol, TypeVar
 
@@ -48,11 +47,8 @@ from .text import _TextMixin
 from .tiers import ColdRing, _TiersMixin
 
 if TYPE_CHECKING:
-    from ..mlx import Backend, Shared
+    from ..mlx import Backend
     from .cache import Arena, KvCache
-
-# each arena cache's megakernel arena, held as long as the cache is (`new_cache`)
-_ARENAS: weakref.WeakKeyDictionary[KvCache, Shared] = weakref.WeakKeyDictionary()
 
 
 class _Closes(Protocol):
@@ -639,6 +635,8 @@ class StreamedTextModel(
         Returns the widths timed; 0 where the host does not hold every layer."""
         if self.dev.type != DeviceKind.CPU or self.cold or self.mlx is not None:
             return 0
+        from transformers.cache_utils import DynamicLayer
+
         t_max = int(t_max or self._spec_full())
         t_max = max(1, min(t_max, 16))
         ids_t = torch.as_tensor(list(ids), dtype=torch.long).view(1, -1)
@@ -661,7 +659,12 @@ class StreamedTextModel(
                 for cl in cache.layers:
                     if isinstance(cl, GrowLayer) and cl.get_seq_length() > base:
                         cl.crop(base)
-                    elif getattr(cl, "keys", None) is not None and cl.keys.shape[-2] > base:
+                    elif (
+                        isinstance(cl, DynamicLayer)
+                        and cl.keys is not None
+                        and cl.values is not None
+                        and cl.keys.shape[-2] > base
+                    ):
                         cl.keys = cl.keys[..., :base, :]
                         cl.values = cl.values[..., :base, :]
                         if hasattr(cl, "cumulative_length"):
@@ -851,7 +854,7 @@ class StreamedTextModel(
         span = self._reach()
         return bool(self.fam.flat_cache) or bool(win and span and int(win) >= span)
 
-    def new_cache(self, max_len: int | None = None) -> Any:
+    def new_cache(self, max_len: int | None = None) -> KvCache:
         from transformers.cache_utils import DynamicCache, DynamicIndexedLayer, DynamicLayer
 
         cache = DynamicCache(config=self.cfg)
@@ -881,8 +884,9 @@ class StreamedTextModel(
             cap = min(int(max_len) if max_len else (span or 4096), mg.SPL * ATTN_BLOCK)
             per = mg.Hk * cap * mg.hd * 2
             att = [i for i in range(self.L) if not mg.linear[i]]
-            sh = _ARENAS[cache] = mlxdev.Shared(2 * len(att) * per)
-            arena = {i: (sh.whole, (2 * j) * per, (2 * j + 1) * per, cap) for j, i in enumerate(att)}
+            # the arena's pages, held by the layers that view them (each one's `arena`) and let go with the last
+            whole = mlxdev.Shared(2 * len(att) * per).whole
+            arena = {i: (whole, (2 * j) * per, (2 * j + 1) * per, cap) for j, i in enumerate(att)}
         # a bf16 card engine keeps every layer's rows in bf16, a host layer's too (`host_kv_dtype`)
         kv_dtype = torch.bfloat16 if self.host_kv_dtype() == torch.bfloat16 else None
         for i, layer in enumerate(cache.layers):

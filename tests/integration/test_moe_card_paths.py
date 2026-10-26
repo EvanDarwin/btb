@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 import torch
 
-from btb.engine.experts import ExpertProfile, LayerDepot
+from btb.engine.experts import Expert, ExpertProfile, LayerDepot
 from btb.engine.scheduler import MemoryGrantError
 from tests.helpers import NO_LOG, fixture, forward_logits, host_model, layer_count, need_cuda, rel_err
 
@@ -82,9 +82,10 @@ def test_a_block_the_scheduler_or_the_card_refuses_seats_nothing(monkeypatch: py
         with monkeypatch.context() as mp:
             mp.setattr(torch, "empty", empty)
             assert depot._block(LayerDepot.BLOCK) is None
-            got = depot.get(0, 3, gu, dn)
+            got = depot.get(0, Expert(3), gu, dn)
         assert depot.n_seats == 0 and depot.stat["scratch"] == 1 and depot.stat["seated"] == 0
-        assert all(t.device.type == "cuda" for t in got) and _slot_is(depot, 0, (gu, dn))
+        assert all(isinstance(t, torch.Tensor) and t.device.type == "cuda" for t in got)
+        assert _slot_is(depot, 0, (gu, dn))
     finally:
         depot.close()
     n = len(asked)
@@ -101,8 +102,8 @@ def test_uploads_with_no_pinned_ring_go_from_the_stores_pages(monkeypatch: pytes
                 mp.setenv("BTB_PREFILL_STAGE", "0")
             depot = LayerDepot(dev, _ledger(pin=how != "no pin"))
             try:
-                experts = {e: _expert(e) for e in (1, 4)}
-                assert depot.takes(experts[1]) and depot.stage is None, how
+                experts = {Expert(e): _expert(e) for e in (1, 4)}
+                assert depot.takes(experts[Expert(1)]) and depot.stage is None, how
                 slots = depot.place(0, [(e, *p) for e, p in experts.items()])
                 assert depot.stat["seated"] == 2 and all(s is not None for s in slots), how
                 for s, p in zip(slots, experts.values(), strict=True):
@@ -120,10 +121,10 @@ def test_an_expert_the_depot_cannot_take_is_handed_back() -> None:
         gu, dn = _expert(0)
         assert depot.takes((gu, dn))
         other = _expert(1, inter=2 * INTER)
-        got = depot.get(0, 5, *other)
+        got = depot.get(0, Expert(5), *other)
         assert got[0] is other[0] and got[1] is other[1] and depot.stat["passed"] == 1
         on_card = (gu.to(dev), dn.to(dev))
-        slots = depot.place(1, [(2, gu, dn), (3, *on_card), (6, *other)])
+        slots = depot.place(1, [(Expert(2), gu, dn), (Expert(3), *on_card), (Expert(6), *other)])
         assert slots[0] is not None and slots[1:] == [None, None] and depot.stat["passed"] == 3
         assert _slot_is(depot, slots[0], (gu, dn))
     finally:
@@ -137,14 +138,14 @@ def test_a_loop_call_after_a_wave_waits_for_the_waves_scratch(monkeypatch: pytes
     monkeypatch.setattr(LayerDepot, "MAX_SEATS", 0)
     depot = LayerDepot(dev, _ledger())
     try:
-        wave = {e: _expert(e) for e in range(3)}
-        assert depot.takes(wave[0])
+        wave = {Expert(e): _expert(e) for e in range(3)}
+        assert depot.takes(wave[Expert(0)])
         slots = depot.place(0, [(e, *p) for e, p in wave.items()])
         assert slots == [0, 1, 2] and depot.fence_scratch and depot.stat["scratch"] == 3
         late = _expert(7)
-        depot.get(0, 7, *late)
+        depot.get(0, Expert(7), *late)
         assert not depot.fence_scratch, "the call did not wait for the wave"
-        assert _slot_is(depot, 0, late) and _slot_is(depot, 1, wave[1])
+        assert _slot_is(depot, 0, late) and _slot_is(depot, 1, wave[Expert(1)])
     finally:
         depot.close()
 
@@ -161,16 +162,18 @@ def test_a_seat_is_given_only_to_a_rider_that_earned_it() -> None:
     dev = torch.device(need_cuda())
     shapes = (2 * INTER * H * 2, (2 * INTER, H), (H, INTER))
     region = lambda seed: torch.cat([p.reshape(-1).view(torch.uint8) for p in _expert(seed)])
-    assert not VramSeats(0, PER, shapes, dev).offer("a", 9, region(0)), "no seats, yet one was given"
+    a, b, c = (0, Expert(0)), (0, Expert(1)), (0, Expert(2))
+    assert not VramSeats(0, PER, shapes, dev).offer(a, 9, region(0)), "no seats, yet one was given"
     v = VramSeats(2, PER, shapes, dev, min_rides=2, per_pass=2)
-    assert not v.offer("a", 1, region(0)) and "a" not in v, "seated short of its rides"
-    assert v.offer("a", 2, region(0)) and not v.offer("a", 5, region(0)), "seated twice"
-    assert v.offer("b", 3, region(1)) and not v.offer("c", 3, region(2)), "past the pass's promotions"
+    assert not v.offer(a, 1, region(0)) and a not in v, "seated short of its rides"
+    assert v.offer(a, 2, region(0)) and not v.offer(a, 5, region(0)), "seated twice"
+    assert v.offer(b, 3, region(1)) and not v.offer(c, 3, region(2)), "past the pass's promotions"
     v.new_pass()
-    v.views("a")  # "a" ridden since "b": "b" is the least recently ridden
-    assert v.offer("c", 3, region(2)) and "b" not in v and set(v.seat_of) == {"a", "c"} and v.copies == 3
-    for key, seed in (("a", 0), ("c", 2)):
+    v.views(a)  # a ridden since b: b is the least recently ridden
+    assert v.offer(c, 3, region(2)) and b not in v and set(v.seat_of) == {a, c} and v.copies == 3
+    for key, seed in ((a, 0), (c, 2)):
         gu, dn = v.views(key)
+        assert isinstance(gu, torch.Tensor) and isinstance(dn, torch.Tensor), "a bf16 seat's views"
         want = _expert(seed)
         assert torch.equal(gu.cpu(), want[0]) and torch.equal(dn.cpu(), want[1]), f"seat {key} holds other bytes"
 

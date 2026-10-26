@@ -356,6 +356,32 @@ def test_a_forks_rows_are_the_sessions_own_draws(stem: str, device: str) -> None
     close(s.feed([7]).logits[-1], by_hand.feed([7]).logits[-1], device)
 
 
+@pytest.mark.parametrize("device", ["mlx"])
+@families
+def test_a_forks_batched_rows_are_their_sessions_bit_for_bit(stem: str, device: str) -> None:
+    """on MLX a fork steps its rows as one batch wherever the batched step takes the family (`_mlx_rows_ok`), and then
+    each row's logits are, bit for bit, a session's fed the same tokens, every step, and a kept row goes on as that
+    session does: the batch computes each row as the one-row step does, so a mixture's near-tied router picks alike"""
+    sm = model(stem, device)
+    V = int(sm.cfg.vocab_size)
+    toks = [[(t * 37 + r * 11) % V for t in range(1, 7)] for r in range(3)]
+    br = sm.session(PROMPT).fork(3)
+    try:
+        assert (br.mode == "rows") is sm._mlx_rows_ok(3), f"the fork took {br.mode!r}"
+        if br.mode != "rows":
+            return
+        solos = [sm.session(PROMPT) for _ in toks]
+        for j in range(len(toks[0])):
+            lg = br.step([row[j] for row in toks]).logits
+            for r, s in enumerate(solos):
+                assert torch.equal(lg[r], s.feed([toks[r][j]]).logits[-1].float()), f"row {r} parted at step {j}"
+        kept = br.keep(1)
+        assert torch.equal(kept.feed([7]).logits[-1], solos[1].feed([7]).logits[-1]), "the kept row went on otherwise"
+    finally:
+        if br.cache is not None:
+            br.close()
+
+
 @cells
 @families
 def test_a_forks_step_is_each_rows_own_pass(stem: str, device: str) -> None:

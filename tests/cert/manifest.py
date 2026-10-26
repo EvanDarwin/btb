@@ -100,7 +100,8 @@ MISSING: dict[Missing, tuple[str, str]] = {
     Missing.MEGAKERNEL: (
         "the fused MLX megakernel is not written for this family: it composes the plain pre-norm block, the sandwich "
         "block and a hybrid's DeltaNet and gated attention layers (`Family.mega`, `mega_layer`), so a mixture's "
-        "layers run the per-op host path (MLX_PEROP) and a family that brings its own layer its own",
+        "layers take the step (a hybrid's MLX_HYBRID, a dense one's the per-op host path, MLX_PEROP) and a family "
+        "that brings its own layer its own",
         "implement the megakernel for this family's layout, or record it as a DNR if the architecture genuinely "
         "precludes a dense fused kernel",
     ),
@@ -130,8 +131,9 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "widen the fixture's head to one the kernels take in tests/make_fixtures.py and rebank it",
     ),
     Missing.MLX_ATTN_FAMILY: (
-        "the engine's MLX attention kernels are not on this family's path: a mixture of experts runs its layers "
-        "through the per-op host path (PassTag.MLX_PEROP), whose attention is transformers' own",
+        "the engine's MLX attention kernels are not on this family's path: a dense mixture of experts, or one whose "
+        "experts are FP8 or MXFP4, runs its layers through the per-op host path (PassTag.MLX_PEROP), whose attention "
+        "is transformers' own",
         "route the family's MLX attention through `_mlx_attend` (a fused MoE step), or leave it certified under "
         "the per-op path it really runs",
     ),
@@ -553,10 +555,10 @@ def _card_graph_gap(kind: FamilyKind) -> Missing | None:
     return None if spec.head_dim(kind) in CARD_HEAD_DIMS else Missing.CARD_GRAPH_SHAPE
 
 
-def _mlx_attn_gap(kind: FamilyKind) -> Missing | None:
-    """why the engine's MLX attention kernels cannot engage: a family whose MLX layers never reach
-    `_mlx_attend`, then the fixture's head width."""
-    if Cap.MOE in core.flags(kind):
+def _mlx_attn_gap(kind: FamilyKind, storage: spec.Storage) -> Missing | None:
+    """why the engine's MLX attention kernels cannot engage: a family whose MLX layers in this storage never reach
+    `_mlx_attend` (the per-op host path's, `spec.mlx_compute_tag`), then the fixture's head width."""
+    if spec.mlx_compute_tag(kind, storage, fused=True) is PassTag.MLX_PEROP:
         return Missing.MLX_ATTN_FAMILY
     return None if spec.head_dim(kind) in MLX_ATTN_HEAD_DIMS else Missing.MLX_ATTN_SHAPE
 
@@ -570,7 +572,7 @@ def subpath_gap(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath
     if dev.key == "mlx-mega":
         return _mega_gap(kind, storage)
     if dev.key == "mlx-attn-kernel":
-        return _mlx_attn_gap(kind)
+        return _mlx_attn_gap(kind, storage)
     if dev.key == "cuda-graph":
         return _card_graph_gap(kind)
     return None

@@ -14,10 +14,11 @@ import pytest
 import torch
 
 from btb.engine.cache import GrowLayer
+from btb.engine.generate import lin_layer
 from btb.kinds import MEGA_STORED, Cap, LayerKind, Parents, Tokens
 from btb.sampling import GREEDY
 from tests.cert import core, spec
-from tests.helpers import FIXTURES, NO_LOG, need_cached, need_mlx
+from tests.helpers import FIXTURES, NO_LOG, mlx_keys, need_cached, need_mlx
 
 if TYPE_CHECKING:
     import mlx.core as mx
@@ -83,7 +84,7 @@ def _pass(
     if arena or mega:
         assert all(isinstance(cl, GrowLayer) and cl.arena is not None for cl in att), "the pass left the arena"
     T = len(toks)
-    rows = [cache.layers[i]._mx[0][0, :, : past + T].astype(mx.float32) for i in _kv_layers(sm)]
+    rows = [mlx_keys(cache, i)[0, :, : past + T].astype(mx.float32) for i in _kv_layers(sm)]
     return ids, rows
 
 
@@ -341,7 +342,7 @@ def _along(sm: StreamedTextModel, prompt: Tokens, toks: Tokens, parents: Parents
             out = sm.forward([[toks[n]]], cache=cache, last_only=False, pick=True)
     assert out is not None
     row = len(prompt) + len(path) - 1
-    return int(out[0, 0]), [cache.layers[i]._mx[0][0, :, row : row + 1] for i in _kv_layers(sm)]
+    return int(out[0, 0]), [mlx_keys(cache, i)[0, :, row : row + 1] for i in _kv_layers(sm)]
 
 
 @pytest.mark.parametrize("past", [9, 70])
@@ -464,7 +465,7 @@ def test_delta_states_match_step(hybrid: StreamedTextModel) -> None:
                 for toks in passes:
                     sm.forward([toks], cache=cache, last_only=False, pick=True)
             assert (PassTag.MLX_MEGA in sm.last_pass_report()) is use, "the passes did not take the path asked"
-            states[use] = [tuple(t.clone() for t in sm._lin(cache.layers[i])) for i in linear]
+            states[use] = [tuple(t.clone() for t in sm._lin(lin_layer(cache.layers[i]))) for i in linear]
     finally:
         sm._mega = mega
     for i, step, ours in zip(linear, states[False], states[True], strict=True):

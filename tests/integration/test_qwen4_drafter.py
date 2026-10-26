@@ -58,7 +58,7 @@ def _held_rows(mp: pytest.MonkeyPatch, dr: Qwen4Drafter, n: int, on: list[int]) 
         def fed(toks: Any, h: torch.Tensor, pos0: int, *args: Any, **kw: Any) -> Any:
             # a draft of no width feeds nothing
             if name == "extend" or int(args[0]) > 0:
-                held = dr.cache.get_seq_length()
+                held = dr._kv().get_seq_length()
                 assert held == pos0, f"{name}: the drafter holds {held} rows, fed at {pos0}"
                 assert int(h.shape[1]) == len(toks), (name, int(h.shape[1]), len(toks))
                 T = n + max(0, len(on) - 1)
@@ -108,10 +108,10 @@ def test_the_drafter_reads_its_experts_through_the_store_and_its_speculation_is_
                     assert census["proposed"] > 0, f"{name}, {proposer}: nothing was drafted, so nothing verified"
                     assert census["mtp_steps"] > 0, f"{name}, {proposer}: the drafter never stepped"
                     # the tree's branches leave the drafter's cache as the root left it: the indexer's keys with K/V
-                    cl = dr.cache.layers[0]
-                    ik = indexer_keys(cl)
-                    assert ik is not None and ik.shape[0] == cl.keys.shape[0] == 1
-                    assert ik.shape[1] == cl.keys.shape[-2], f"{name}, {proposer}: indexer keys out of step"
+                    cl = dr._layer0()
+                    ik, keys = indexer_keys(cl), cl.keys
+                    assert ik is not None and keys is not None and ik.shape[0] == keys.shape[0] == 1
+                    assert ik.shape[1] == keys.shape[-2], f"{name}, {proposer}: indexer keys out of step"
                     # plain steps the pricer plans between drafting passes (its warm steps, a width that does not
                     # pay): the drafter still takes every committed row, at the next draft's root or, past
                     # PEND_ROWS of them, without drafting - its cache the one every pass drafting leaves

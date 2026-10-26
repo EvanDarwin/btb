@@ -75,8 +75,8 @@ if TYPE_CHECKING:
     from .drafter import MTPDrafter
     from .experts import ExpertProfile, _ExpertStore
     from .families import Family
-    from .forward import PassRope
-    from .generate import LinLayer, LinSnap
+    from .forward import PassIds, PassRope
+    from .generate import GreedyOut, LinLayer, LinSnap
     from .hooks import Hooks, OnToken
     from .host import _HostLinear
     from .memory import RamPolicyState, Room, VramPolicyState
@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     from .scratch import Scratch
     from .spec_cost import SpecCost
     from .stored import CardStored
+    from .text import GenerateStats
     from .tiers import ColdRing
 
 
@@ -664,7 +665,7 @@ class _State:
         t0: float,
         session: Session | None = None,
         sampling: Sampling | None = None,
-    ) -> tuple[list[int], Json]:
+    ) -> tuple[list[int], GenerateStats]:
         raise NotImplementedError
 
     def _generate_greedy_mlx_batch(
@@ -689,7 +690,13 @@ class _State:
     ) -> bool:
         raise NotImplementedError
 
+    def _mlx_act(self) -> Callable[[mx_.array], mx_.array] | None:
+        raise NotImplementedError
+
     def _mlx_batch_ok(self, B: int, on_layer: OnLayer | None, prefill_only: bool) -> bool:
+        raise NotImplementedError
+
+    def _mlx_rows_ok(self, B: int) -> bool:
         raise NotImplementedError
 
     def _mlx_embed(self) -> mx_.array:
@@ -739,26 +746,53 @@ class _State:
     def _prefill(
         self,
         ids: torch.Tensor,
-        cache: Any,
-        on_layer: Any = None,
+        cache: KvCache | None,
+        on_layer: OnLayer | None = None,
         attention_mask: torch.Tensor | None = None,
         last_only: bool = True,
-    ) -> Any:
+    ) -> torch.Tensor:
         raise NotImplementedError
 
-    @torch.inference_mode()
+    @overload
     def forward(
         self,
-        ids: Any,
-        cache: Any = None,
-        on_layer: Callable[[int, torch.Tensor], Any] | None = None,
+        ids: PassIds,
+        cache: KvCache | None = ...,
+        on_layer: OnLayer | None = ...,
+        last_only: bool = ...,
+        stop_after: None = ...,
+        attention_mask: torch.Tensor | None = ...,
+        positions: Positions | None = ...,
+        head: bool = ...,
+        pick: bool | Pick | None = ...,
+    ) -> torch.Tensor: ...
+
+    @overload
+    def forward(
+        self,
+        ids: PassIds,
+        cache: KvCache | None = ...,
+        on_layer: OnLayer | None = ...,
+        last_only: bool = ...,
+        stop_after: int | None = ...,
+        attention_mask: torch.Tensor | None = ...,
+        positions: Positions | None = ...,
+        head: bool = ...,
+        pick: bool | Pick | None = ...,
+    ) -> torch.Tensor | None: ...
+
+    def forward(
+        self,
+        ids: PassIds,
+        cache: KvCache | None = None,
+        on_layer: OnLayer | None = None,
         last_only: bool = True,
         stop_after: int | None = None,
         attention_mask: torch.Tensor | None = None,
-        positions: Any = None,
+        positions: Positions | None = None,
         head: bool = True,
-        pick: Any = None,
-    ) -> Any:
+        pick: bool | Pick | None = None,
+    ) -> torch.Tensor | None:
         raise NotImplementedError
 
     @staticmethod
@@ -767,7 +801,7 @@ class _State:
 
     # -- generate.py --
     @staticmethod
-    def _lin(cl: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    def _lin(cl: LinLayer) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
     @staticmethod
@@ -781,19 +815,80 @@ class _State:
     def _lin_restore(cl: LinLayer, snap: LinSnap, dev: torch.device | None = None) -> None:
         raise NotImplementedError
 
+    @overload
+    def generate_greedy(
+        self,
+        ids: torch.Tensor | Tokens | TokenRows,
+        max_new: int,
+        eos_ids: Tokens = ...,
+        on_token: OnToken | None = ...,
+        attention_mask: torch.Tensor | None = ...,
+        on_layer: OnLayer | None = ...,
+        prefill_only: bool = ...,
+        *,
+        session: Session,
+        sampling: Sampling | None = ...,
+        hooks: Hooks | None = ...,
+    ) -> tuple[list[int], GenerateStats]: ...
+
+    @overload
+    def generate_greedy(
+        self,
+        ids: Tokens,
+        max_new: int,
+        eos_ids: Tokens = ...,
+        on_token: OnToken | None = ...,
+        attention_mask: torch.Tensor | None = ...,
+        on_layer: OnLayer | None = ...,
+        prefill_only: bool = ...,
+        session: None = ...,
+        sampling: Sampling | None = ...,
+        hooks: Hooks | None = ...,
+    ) -> list[int]: ...
+
+    @overload
+    def generate_greedy(
+        self,
+        ids: torch.Tensor | TokenRows,
+        max_new: int,
+        eos_ids: Tokens = ...,
+        on_token: OnToken | None = ...,
+        attention_mask: torch.Tensor | None = ...,
+        on_layer: OnLayer | None = ...,
+        prefill_only: bool = ...,
+        session: None = ...,
+        sampling: Sampling | None = ...,
+        hooks: Hooks | None = ...,
+    ) -> list[int] | list[list[int]]: ...
+
+    @overload
+    def generate_greedy(
+        self,
+        ids: torch.Tensor | Tokens | TokenRows,
+        max_new: int,
+        eos_ids: Tokens = ...,
+        on_token: OnToken | None = ...,
+        attention_mask: torch.Tensor | None = ...,
+        on_layer: OnLayer | None = ...,
+        prefill_only: bool = ...,
+        session: Session | None = ...,
+        sampling: Sampling | None = ...,
+        hooks: Hooks | None = ...,
+    ) -> GreedyOut: ...
+
     def generate_greedy(
         self,
         ids: torch.Tensor | Tokens | TokenRows,
         max_new: int,
         eos_ids: Tokens = (),
-        on_token: Callable[[int], Any] | None = None,
+        on_token: OnToken | None = None,
         attention_mask: torch.Tensor | None = None,
-        on_layer: Any = None,
+        on_layer: OnLayer | None = None,
         prefill_only: bool = False,
-        session: Any = None,
-        sampling: Any = None,
+        session: Session | None = None,
+        sampling: Sampling | None = None,
         hooks: Hooks | None = None,
-    ) -> Any:
+    ) -> GreedyOut:
         raise NotImplementedError
 
     def generate_speculative(
@@ -804,13 +899,13 @@ class _State:
         v_max: int = 8,
         n_min: int = 2,
         n_max: int = 4,
-        on_token: Callable[[int], Any] | None = None,
+        on_token: OnToken | None = None,
         proposer: Proposer | str = Proposer.NGRAM,
         spans: Spans = (),
         session: Session | None = None,
-        sampling: Any = None,
+        sampling: Sampling | None = None,
         hooks: Hooks | None = None,
-    ) -> tuple[list[int], Json]:
+    ) -> tuple[list[int], GenerateStats]:
         raise NotImplementedError
 
     def serve(
@@ -819,33 +914,33 @@ class _State:
         max_new: int,
         eos_ids: Tokens = (),
         pad_id: int | None = None,
-        sampling: Any = None,
+        sampling: Sampling | None = None,
         hooks: Hooks | None = None,
     ) -> list[list[int]]:
         raise NotImplementedError
 
     @staticmethod
-    def _lin_set(cl: Any, conv: torch.Tensor, rec: torch.Tensor) -> None:
+    def _lin_set(cl: LinLayer, conv: torch.Tensor, rec: torch.Tensor) -> None:
         raise NotImplementedError
 
     def _session_prefill(
-        self, ids: torch.Tensor, cache: Any, reuse: int, session: Session | None, on_layer: Any = None
-    ) -> tuple[Any, Any]:
+        self, ids: torch.Tensor, cache: KvCache, reuse: int, session: Session | None, on_layer: OnLayer | None = None
+    ) -> tuple[torch.Tensor, list[Anchor] | None]:
         raise NotImplementedError
 
-    def _anchor(self, cache: Any, at: int, logits: Any, h_last: torch.Tensor | None) -> Anchor:
+    def _anchor(self, cache: KvCache, at: int, logits: torch.Tensor, h_last: torch.Tensor | None) -> Anchor:
         raise NotImplementedError
 
     def _prefill_at_blocks(
         self,
         ids: torch.Tensor,
-        cache: Any,
+        cache: PagedCache,
         reuse: int,
         tail: int,
-        hook: Any,
-        snap: Callable[[int, Any], Anchor],
+        hook: OnLayer | None,
+        snap: Callable[[int, torch.Tensor], Anchor],
         last_only: bool = True,
-    ) -> tuple[Any, list[Anchor]]:
+    ) -> tuple[torch.Tensor, list[Anchor]]:
         raise NotImplementedError
 
     # -- families/__init__.py --
@@ -863,11 +958,11 @@ class _State:
     def embed(self, ids: Any) -> torch.Tensor:
         raise NotImplementedError
 
-    def new_cache(self, max_len: int | None = None) -> Any:
+    def new_cache(self, max_len: int | None = None) -> KvCache:
         raise NotImplementedError
 
     # -- text.py --
-    def _decode_cache(self, max_len: int | None = None) -> Any:
+    def _decode_cache(self, max_len: int | None = None) -> KvCache:
         raise NotImplementedError
 
     # -- memory.py --

@@ -754,7 +754,7 @@ _IQ4XS_DECODE = (
     "    for (uint i = tid; i < NSB * 32; i += 256)\n"
     "        iq4xs_lane(W + ((size_t)row * NSB + i / 32) * 136, i % 32, dst + (size_t)(i / 32) * 256);\n"
 )
-# every IQ4 and lattice type as the megakernel builds on it (`mlx.mega.kernel.STORED`): its matvec's pieces over its
+# every IQ4 and lattice type as the megakernel builds on it (`mlx.stored.STORED`): its matvec's pieces over its
 # streams (IQ4_NL's split scales and nibbles, IQ1_M's side streams beside its blocks) and tables, its dequant a row of
 # an embedding
 KERNELS: dict[Quant, StoredKernel] = {

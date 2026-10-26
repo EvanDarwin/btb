@@ -283,7 +283,8 @@ class SchedulerHost(Protocol):
 
 class Route(Protocol):
     """What the expert store reads its experts through: the scheduler's drive queue (`BatchScheduler.disk_read`),
-    or a test's stand-in recording the reads"""
+    or a test's stand-in recording the reads. Past the priority every argument is a keyword: the queue's own take more
+    (`depth`), so no order of them is shared"""
 
     def disk_read(
         self,
@@ -292,11 +293,14 @@ class Route(Protocol):
         n: int,
         dst: torch.Tensor,
         priority: int = 0,
+        *,
         key: object = None,
         on_done: Callable[[int], None] | None = None,
         chunk: int = 0,
         cached: bool = False,
     ) -> Future[float]: ...
+
+    def disk_promote(self, key: object, priority: int) -> int: ...
 
 
 @dataclass
@@ -1120,6 +1124,7 @@ class BatchScheduler:
         n: int,
         dst: torch.Tensor,
         priority: int = 0,
+        *,
         key: Any = None,
         on_done: Any = None,
         chunk: int = 0,
@@ -1170,6 +1175,22 @@ class BatchScheduler:
             self._disk_start(st)
             st["cv"].notify()
         return r["future"]
+
+    def disk_promote(self, key: object, priority: int) -> int:
+        """Raise every queued read of `key` to `priority` where it is lower (a call now waits on reads queued behind
+        it: a fill's sweep, the lookahead's); a read in flight is left as it goes. Returns how many were raised"""
+        st = self._disk_state()
+        n = 0
+        with st["cv"]:
+            for r in st["reqs"].values():
+                if r["key"] == key and r["state"] == "queued" and int(priority) < r["priority"]:
+                    r["priority"] = int(priority)
+                    r["ver"] += 1
+                    heapq.heappush(st["queue"], (r["priority"], r["path"], r["off"], r["seq"], r["ver"]))
+                    n += 1
+            if n:
+                st["cv"].notify()
+        return n
 
     def disk_drop(self, key: Any, whole: bool = False) -> int:
         """Withdraw every queued read of `key` (a prediction that lapsed): their futures are cancelled; a read

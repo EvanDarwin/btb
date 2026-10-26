@@ -226,6 +226,24 @@ def test_joined_stored_weights_are_their_members_in_one_launch(q: Quant) -> None
 
 
 @pytest.mark.parametrize("q", stored_quants(), ids=lambda q: q.value)
+def test_a_stored_weights_first_rows_are_its_rows(q: Quant) -> None:
+    """a stored weight's first rows (`Weight.first_rows`, a drafter's vocabulary slice of the head) are a weight over
+    a prefix of each of its streams: its matvec the whole one's first outputs bit for bit, no bf16 copy made"""
+    need_mlx()
+    import mlx.core as mx
+
+    from btb.mlx.backend import Weight, stored_matvec, stored_streams
+
+    rows, cols, n = 40, 512, 24
+    w = Weight(q=q, streams=stored_streams(q, stored_blocks(q, rows, cols, 5)), shape=(rows, cols))
+    x = mx.array(np.random.default_rng(6).standard_normal((3, cols)).astype(np.float32)).astype(mx.bfloat16)
+    head = w.first_rows(n)
+    assert head.shape == (n, cols) and head.a is None and w.a is None
+    want = stored_matvec(q, w.streams, x, rows, cols)[:, :n]
+    assert mx.array_equal(stored_matvec(q, head.streams, x, n, cols), want), q.value
+
+
+@pytest.mark.parametrize("q", stored_quants(), ids=lambda q: q.value)
 def test_pooled_stored_weights_join_as_a_view_of_their_block(q: Quant) -> None:
     """stored weights of each type laid out in one pool block as a GGUF binds them (`kinds.pooled_layout`, then
     `weight_stored_pool`: the blocks in place, a split type's streams made once): each matvec is the type's over its

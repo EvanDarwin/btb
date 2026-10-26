@@ -398,15 +398,17 @@ def fused_step(kind: FamilyKind) -> bool:
     return (Cap.KERNEL_LAYOUT in fl or Cap.SANDWICH in fl) and rope_dim(kind) == head_dim(kind)
 
 
-def mlx_compute_tag(kind: FamilyKind, *, fused: bool) -> PassTag:
-    """the MLX compute tag a step-path pass must show, by the engine's own order (`Family.mlx_path`): a MoE family -
-    a hybrid one too - the per-op host path, a hybrid family the DeltaNet forward, and the rest the step - fused
-    where the layout and the bf16 state allow it."""
+def mlx_compute_tag(kind: FamilyKind, storage: Storage, *, fused: bool) -> PassTag:
+    """the MLX compute tag a step-path pass must show, by the engine's own order (`Family.mlx_path`,
+    `_mlx_mixtures_ok`): a hybrid family the DeltaNet forward - a mixture's too, its picks on the GPU, unless its
+    experts are FP8 or MXFP4 (no gather multiplies those yet) - a dense mixture the per-op host path, and the rest
+    the step, fused where the layout and the bf16 state allow it."""
     fl = core.flags(kind)
-    if Cap.MOE in fl:
-        return PassTag.MLX_PEROP  # its experts are picked on the host between layers: no fused step, no hybrid graph
     if Cap.HYBRID in fl:
-        return PassTag.MLX_HYBRID
+        perop = Cap.MOE in fl and (storage is Storage.SAFE_FP8 or quant_class(storage) is QuantClass.MXFP4)
+        return PassTag.MLX_PEROP if perop else PassTag.MLX_HYBRID
+    if Cap.MOE in fl:
+        return PassTag.MLX_PEROP  # its experts are picked on the host between layers: no fused step
     return PassTag.MLX_STEP_FUSED if fused and fused_step(kind) else PassTag.MLX_STEP_UNFUSED
 
 
@@ -623,7 +625,7 @@ DEVICE_SUBPATHS: tuple[DeviceSubpath, ...] = (
     DeviceSubpath(
         "mlx-step",
         Hardware.MLX,
-        lambda k, s, q: mlx_compute_tag(k, fused=True),
+        lambda k, s, q: mlx_compute_tag(k, s, fused=True),
         {"device": "mlx", "mlx_mega": 0},
         "the per-token graph, megakernel off",
     ),
@@ -654,14 +656,14 @@ DEVICE_SUBPATHS: tuple[DeviceSubpath, ...] = (
     DeviceSubpath(
         "mlx-kvbits",
         Hardware.MLX,
-        lambda k, s, q: mlx_compute_tag(k, fused=True),
+        lambda k, s, q: mlx_compute_tag(k, s, fused=True),
         {"device": "mlx", "mlx_mega": 0, "kv_bits": 8},
         "int8 KV rows",
     ),
     DeviceSubpath(
         "mlx-fp32",
         Hardware.MLX,
-        lambda k, s, q: mlx_compute_tag(k, fused=False),
+        lambda k, s, q: mlx_compute_tag(k, s, fused=False),
         {"device": "mlx", "fp32": 1},
         "fp32 compute: the fused kernels take a bf16 state, so the step runs unfused",
     ),
@@ -803,9 +805,11 @@ SURFACE_SUBPATHS: dict[Surface, tuple[str, ...]] = {
 
 def rows_tag(kind: FamilyKind, dev: DeviceSubpath) -> PassTag:
     """the path a fork's or a batch's rows must show, by the engine's own gates: the MLX batched step over a flat
-    buffer for a dense family on MLX (`_mlx_batch_ok`), the card graph's rows pass on a sub-path that runs the card
-    graph for a family the card's kernels take (`_card_rows_ok`), the torch pass over joined layers elsewhere"""
-    if dev.hardware is Hardware.MLX and Cap.DENSE in core.flags(kind):
+    buffer on MLX for a dense family or a hybrid whose step is the DeltaNet forward (`_mlx_rows_ok`), the card graph's
+    rows pass on a sub-path that runs the card graph for a family the card's kernels take (`_card_rows_ok`), the torch
+    pass over joined layers elsewhere"""
+    hybrid = mlx_compute_tag(kind, Storage.SAFE_BF16, fused=True) is PassTag.MLX_HYBRID
+    if dev.hardware is Hardware.MLX and (Cap.DENSE in core.flags(kind) or hybrid):
         return PassTag.ROWS_FLAT
     if dev.card_graph and card_rows(kind):
         return PassTag.ROWS_CARD

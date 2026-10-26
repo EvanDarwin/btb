@@ -112,12 +112,14 @@ class StoredKernel:
     tables: tuple[Table, ...] = ()
 
 
-def blocks(f: Frags) -> str:
+def blocks(f: Frags, bind: str = "") -> str:
     """the launch over a stored type: its (row group, pass-row group) from the grid, the rows' chains over their NSB
     blocks of BW weights into acc[RP][TRS] (each lane its blocks in turn: a block decoded for each of the RP rows, then
-    applied to each pass row), the sums"""
+    applied to each pass row), the sums. `bind`: statements declaring the streams from the group's position (a
+    mixture's gather, its pass row's expert's)"""
     return (
         PROLOGUE
+        + bind
         + f.lanes
         + r"""
     float acc[RP][TRS];

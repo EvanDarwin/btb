@@ -6,16 +6,41 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterable, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 
 from ..kinds import LayerKind
 from ..sampling import GREEDY
+from .generate import lin_layer
 
 if TYPE_CHECKING:
+    import threading
+
+    from ..draft import NGramProposer
+    from ..mlx.mega import MegaPass
+    from .cache import KvCache
     from .generate import LinSnap
     from .model import StreamedTextModel
+
+# drafts as chains, each with its source's tag (`ngram3`, `seq4`, `draft`)
+Chains = list[tuple[list[int], str]]
+# where `propose_with_source`'s chain came from: a banked span's (tag, id, position after the match), the n-gram
+# corpus position it continues from, or a draft model's tag; None with no chain
+ChainSource = tuple[str, int, int] | int | str | None
+
+
+class ChainProposer(Protocol):
+    """what the speculative loop drafts from without a drafting head: the n-gram proposer (btb/draft.py), or a draft
+    model's chains ahead of it (`UnionProposer`); fed every committed token (`extend`)"""
+
+    def add_sequence(self, ids: Iterable[int], tag: str) -> int: ...
+
+    def extend(self, tok_id: int) -> None: ...
+
+    def propose_chains(self, v: int) -> Chains: ...
+
+    def propose_with_source(self, v: int) -> tuple[list[int], ChainSource]: ...
 
 
 class ModelProposer:
@@ -37,7 +62,7 @@ class ModelProposer:
         self.sm = engine
         self.ks, self.nodes, self.tag = [int(k) for k in ks], int(nodes), tag
         ids = [int(t) for t in prompt]
-        self.cache = engine.new_cache()
+        self.cache: KvCache = engine.new_cache()
         with torch.inference_mode(), self._held():
             engine._prefill(torch.tensor([ids]), self.cache)
         self.n = len(ids)
@@ -45,13 +70,13 @@ class ModelProposer:
         self.passes = 0
         self.marks: dict[int, LinSnap] = {}  # a hybrid drafter's DeltaNet state at the committed rows, by layer
 
-    def _held(self) -> Any:
+    def _held(self) -> contextlib.AbstractContextManager[object]:
         """the drafting engine's decode lock, held for its passes as a decode holds it: its adapt watchers
         (`watch_vram_budget`, `watch_ram`) take a free lock for an idle engine, and moved its layers mid-pass"""
-        lock = getattr(self.sm, "_decode_lock", None)
+        lock: threading.RLock | None = getattr(self.sm, "_decode_lock", None)
         return lock if lock is not None else contextlib.nullcontext()
 
-    def add_sequence(self, ids: Iterable[int], tag: Any) -> int:
+    def add_sequence(self, ids: Iterable[int], tag: str) -> int:
         return 0
 
     def extend(self, tok_id: int) -> None:
@@ -64,15 +89,22 @@ class ModelProposer:
         pass's logits directly."""
         sm = self.sm
         T = len(toks)
-        mg = getattr(sm, "_mega", None)
+        mg: MegaPass | None = getattr(sm, "_mega", None)
         fast = mg is not None and sm._mega_ok(self.cache, T, None, True, GREEDY, None)
+        # a node at the cache's next position plus its depth, as the target's verify pass places its tree: the torch
+        # and card paths rotate a pass's rows at the positions it is handed (the card reads its depths off them), and
+        # without them at past + row - every node past a depth's first one off; MLX takes the depths from `parents`
+        depth: list[int] = []
+        for p in parents:
+            depth.append(0 if p < 0 else depth[p] + 1)
+        pos = [[self.n + d for d in depth]]
         with torch.inference_mode(), self._held():
             sm.aa(parents)
             try:
                 if fast:
-                    sm.forward([toks], cache=self.cache, last_only=False, pick=True)
+                    sm.forward([toks], cache=self.cache, last_only=False, positions=pos, pick=True)
                 else:
-                    lg = sm.forward([toks], cache=self.cache, last_only=False)
+                    lg = sm.forward([toks], cache=self.cache, last_only=False, positions=pos)
             finally:
                 sm.ab()
         self.passes += 1
@@ -94,17 +126,19 @@ class ModelProposer:
         the engine does not speculate, writes the state along the nodes it ran; `_crop` puts this back"""
         sm = self.sm
         linear = [i for i, kind in enumerate(sm.layer_types) if kind == LayerKind.LINEAR]
-        self.marks = {i: sm._lin_snap(self.cache.layers[i]) for i in linear}
+        self.marks = {i: sm._lin_snap(lin_layer(self.cache.layers[i])) for i in linear}
 
     def _crop(self) -> None:
+        from transformers.cache_utils import DynamicLayer
+
         for i, cl in enumerate(self.cache.layers):
             snap = self.marks.get(i)
             if snap is not None:
-                self.sm._lin_restore(cl, snap)
-            elif cl.get_seq_length() > self.n:
+                self.sm._lin_restore(lin_layer(cl), snap)
+            elif isinstance(cl, DynamicLayer) and cl.get_seq_length() > self.n:
                 cl.crop(self.n)
 
-    def propose_chains(self, v: int, tree: bool = True) -> list[tuple[list[int], str]]:
+    def propose_chains(self, v: int, tree: bool = True) -> Chains:
         """the drafts as chains: the tree of `ks` where the target verifies trees, one greedy chain else"""
         if v <= 0 or not self.pending:
             return []
@@ -140,7 +174,7 @@ class ModelProposer:
                     nodes_p.append(leaf)
                     new_leaves.append(len(nodes_t) - 1)
             leaves = new_leaves
-        chains = []
+        chains: Chains = []
         for leaf in leaves:
             path = []
             j = leaf
@@ -150,7 +184,7 @@ class ModelProposer:
             chains.append((path[::-1], self.tag))
         return chains
 
-    def propose_with_source(self, v: int) -> tuple[list[int], Any]:
+    def propose_with_source(self, v: int) -> tuple[list[int], ChainSource]:
         """one greedy chain, for a target that verifies chains (the host tier, a card without the tree)"""
         chains = self.propose_chains(v, tree=False)
         return (chains[0][0], self.tag) if chains else ([], None)
@@ -159,19 +193,19 @@ class ModelProposer:
 class UnionProposer:
     """The model's chains first, the n-gram proposer's after: both fed every committed token."""
 
-    def __init__(self, model: ModelProposer, ngram: Any) -> None:
+    def __init__(self, model: ModelProposer, ngram: NGramProposer) -> None:
         self.model, self.ngram = model, ngram
 
-    def add_sequence(self, ids: Iterable[int], tag: Any) -> int:
+    def add_sequence(self, ids: Iterable[int], tag: str) -> int:
         return self.ngram.add_sequence(ids, tag)
 
     def extend(self, tok_id: int) -> None:
         self.model.extend(tok_id)
         self.ngram.extend(tok_id)
 
-    def propose_chains(self, v: int) -> list[tuple[list[int], str]]:
+    def propose_chains(self, v: int) -> Chains:
         return self.model.propose_chains(v) + self.ngram.propose_chains(v)
 
-    def propose_with_source(self, v: int) -> tuple[list[int], Any]:
+    def propose_with_source(self, v: int) -> tuple[list[int], ChainSource]:
         out = self.model.propose_with_source(v)
         return out if out[0] else self.ngram.propose_with_source(v)

@@ -112,12 +112,12 @@ class _Rows:
         self.mode = "fork"
 
     def _rows_ok(self, sessions: Sequence[Session], B: int) -> bool:
-        """the MLX batched decode takes these rows: a dense family, every attention layer an MLX buffer or a paged
-        layer in the pool's MLX regions"""
+        """the MLX batched step takes these rows (`_mlx_rows_ok`): every attention layer an MLX buffer or a paged layer
+        in the pool's MLX regions"""
         eng = self.eng
         return bool(
             eng.mlx is not None
-            and eng._mlx_batch_ok(max(2, B), None, False)
+            and eng._mlx_rows_ok(max(2, B))
             and all(
                 (isinstance(cl, GrowLayer) and cl.shared and cl._mx is not None) or _mlx_paged(cl) is not None
                 for s in sessions

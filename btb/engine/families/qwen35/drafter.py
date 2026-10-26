@@ -10,7 +10,7 @@ from __future__ import annotations
 import copy
 import time
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, TypedDict
 
 import torch
 
@@ -19,16 +19,26 @@ from ....kinds import LayerKind
 from ....mlx import fused as fk
 from ....options import Device
 from ...cache import GrowLayer
-from ...drafter import MTPDrafter, mlx_topk_ids
+from ...drafter import MTPDrafter, drafter_weights, mlx_topk_ids
 from ...host import _HostLinear
 from ...native import Native
 
 if TYPE_CHECKING:
     import mlx.core as mx_
+    from transformers.models.qwen3_5.modeling_qwen3_5 import (
+        Qwen3_5DecoderLayer,
+        Qwen3_5RMSNorm,
+        Qwen3_5TextRotaryEmbedding,
+    )
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        Qwen3_5MoeDecoderLayer,
+        Qwen3_5MoeTextRotaryEmbedding,
+    )
 
-    from ....mlx.backend import Weight
+    from ....mlx.backend import Backend, Weight
     from ....sampling import Sampling
-    from ...drafter import MxAppend, MxAttend
+    from ...drafter import DraftLogits, HiddenRows, MxAppend, MxAttend
+    from ...model import StreamedTextModel
 
 # the drafting head's layer, and its own tensors around it: the fc over [embedding; hidden], their two norms, and
 # the norm before the head
@@ -50,15 +60,31 @@ class _Norms(TypedDict):
     n: mx_.array
 
 
+def _bound(lin: torch.nn.Module) -> Weight:
+    """a linear of the drafting layer as its MLX graph multiplies it: a host linear with its weight on MLX"""
+    if not isinstance(lin, _HostLinear) or lin.mx is None:
+        raise TypeError(f"[mtp] the drafter's MLX graph reached a {type(lin).__name__} with no weight on MLX")
+    return lin.mx
+
+
 class Qwen35Drafter(MTPDrafter):
     """the drafting head of Qwen3.5 and the families sharing its `mtp.*` layout"""
 
+    layer: Qwen3_5DecoderLayer | Qwen3_5MoeDecoderLayer
+    norm_e: Qwen3_5RMSNorm
+    norm_h: Qwen3_5RMSNorm
+    norm: Qwen3_5RMSNorm
+    rotary: Qwen3_5TextRotaryEmbedding | Qwen3_5MoeTextRotaryEmbedding
     # the MLX graph's own norm weights and head, made on first use (`_mx_norms`, `_mx_head`)
     _mx_consts: _Norms | None = None
     _mx_head_w: Weight | None = None
 
     def __init__(
-        self, sm: Any, train: bool = False, weights: str | None = None, dev: str | torch.device | None = None
+        self,
+        sm: StreamedTextModel,
+        train: bool = False,
+        weights: str | None = None,
+        dev: str | torch.device | None = None,
     ) -> None:
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm
 
@@ -69,8 +95,11 @@ class Qwen35Drafter(MTPDrafter):
         idx = sm.layer_types.index(LayerKind.FULL)
         L = int(sm.L)
         self.layer = sm._new_layer(idx, base=LAYER, at=L)
-        src = {} if weights is None else torch.load(weights, map_location="cpu", weights_only=True)
-        get = lambda k: src[k] if k in src else sm._get(k)
+        src, meta = drafter_weights(weights)
+
+        def get(k: str) -> torch.Tensor:
+            return src[k] if k in src else sm._get(k)
+
         for name, p in list(self.layer.named_parameters()):
             t = get(f"{LAYER}{name}")
             if t.shape != p.shape:
@@ -126,8 +155,8 @@ class Qwen35Drafter(MTPDrafter):
         self.rotary = sm.fam.rotary(config=cfg).to(self.dev)
         if weights is not None:
             sm.log(
-                f"[mtp] drafter weights <- {weights} ({sum(1 for k in src if k != '__meta__')} tensors"
-                + (f"; epochs {src['__meta__'].get('epochs_done')}" if "__meta__" in src else "")
+                f"[mtp] drafter weights <- {weights} ({len(src)} tensors"
+                + (f"; epochs {meta.get('epochs_done')}" if meta is not None else "")
                 + ")"
             )
         if train:
@@ -135,8 +164,8 @@ class Qwen35Drafter(MTPDrafter):
                 sm._set_param(self.layer, name, torch.nn.Parameter(p.detach().clone().float(), requires_grad=True))
             assert self.fc is not None  # set in __init__, nulled only later by int8 quant
             self.fc = torch.nn.Parameter(self.fc.detach().clone().float(), requires_grad=True)
-            for m in (self.norm_e, self.norm_h, self.norm):
-                m.weight = torch.nn.Parameter(m.weight.detach().clone().float(), requires_grad=True)
+            for norm in (self.norm_e, self.norm_h, self.norm):
+                norm.weight = torch.nn.Parameter(norm.weight.detach().clone().float(), requires_grad=True)
             self.layer.train(False)
         mcfg = copy.deepcopy(cfg)
         mcfg.num_hidden_layers = 1
@@ -145,11 +174,12 @@ class Qwen35Drafter(MTPDrafter):
         self.cache = None
 
     def named_tensors(self) -> dict[str, torch.Tensor]:
-        out = {f"{LAYER}{n}": p for n, p in self.layer.named_parameters()}
+        out: dict[str, torch.Tensor] = {f"{LAYER}{n}": p for n, p in self.layer.named_parameters()}
         if self.fc is not None:
             out[FC] = self.fc
         else:
             fc8 = self.fc8
+            assert fc8 is not None  # the fc leaves only for its int8 copy (`_pack_torch`)
             out[FC] = (fc8.w8.float() * fc8.scale[:, None]).to(self.cd)
         out[NORM_E] = self.norm_e.weight
         out[NORM_H] = self.norm_h.weight
@@ -166,6 +196,12 @@ class Qwen35Drafter(MTPDrafter):
             and getattr(self.layer.self_attn.q_proj, "mx", None) is not None
             and sm._mlx_act() is not None
         )
+
+    def _be(self) -> Backend:
+        """the engine's MLX backend, the graph's"""
+        be = self.sm.mlx
+        assert be is not None  # the graph runs only with MLX up (`_mlx_ready`)
+        return be
 
     def _mx_dtype(self) -> mx_.Dtype:
         """The drafter's activation dtype on MLX: bf16 where the tree runs through the node kernel (it reads bf16
@@ -190,7 +226,7 @@ class Qwen35Drafter(MTPDrafter):
         model's files untouched, the drafter's output only ever verified"""
         bits = int(getattr(self.sm, "draft_bits", 16) or 16)
         if bits >= 16:
-            return self.sm.mlx.matmul(x, w)
+            return self._be().matmul(x, w)
         m = mlxdev.mx
         q = self._q
         key = (id(w), str(x.dtype))
@@ -203,18 +239,31 @@ class Qwen35Drafter(MTPDrafter):
         wq, sc, bi = packed
         return m.quantized_matmul(x, wq, sc, bi, transpose=True, group_size=64, bits=bits)
 
-    def _mx_head(self) -> Weight:
-        """The drafter's head: the model's, or its first `draft_vocab` rows (ids follow frequency rank). A proposal
-        outside them is a missed draft; the verified output is unchanged."""
+    def _mx_head(self) -> Weight | None:
+        """The drafter's head on MLX: the model's, or its first `draft_vocab` rows (ids follow frequency rank); None
+        with the model's head off MLX. A proposal outside them is a missed draft; the verified output is unchanged."""
         w = self._mx_head_w
         if w is None:
             sm = self.sm
-            w = sm.head_host.mx
+            hh = sm.head_host
+            if hh is None or hh.mx is None:
+                return None
+            w = hh.mx
             n = int(getattr(sm, "draft_vocab", 0) or 0)
             if 0 < n < int(w.shape[0]) and w.packed is None:
-                w = mlxdev.Weight(w.get()[:n])
+                w = w.first_rows(n)  # a view of the head's own rows: a stored head is never decoded whole for it
             self._mx_head_w = w
         return w
+
+    def _mx_logits(self, hn: mx_.array) -> mx_.array:
+        """float32 logits [B, V] of the normed rows `hn` [B, H]: through the drafter's head on MLX (`_mx_head`), else
+        through the model's head on the host, as `_mlx_step` takes them there"""
+        m = mlxdev.mx
+        head = self._mx_head()
+        if head is not None:
+            return self._mm(hn, head).astype(m.float32)
+        m.eval(hn)
+        return mlxdev.to_mx(self.sm._head_host()(mlxdev.from_mx(hn)).float().contiguous())
 
     def _mx_norms(self) -> _Norms:
         """the drafter's own norm weights (1 + w) in its activation dtype, made once"""
@@ -232,8 +281,8 @@ class Qwen35Drafter(MTPDrafter):
         return wd
 
     def _mlx_step(
-        self, tok_ids: torch.Tensor, h: torch.Tensor, pos0: int, need_logits: bool
-    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        self, tok_ids: torch.Tensor, h: HiddenRows, pos0: int, need_logits: bool
+    ) -> tuple[DraftLogits | None, HiddenRows]:
         """The drafter's step as one MLX graph (norms, fc, the attention layer over its shared cache, the head)
         over bf16 weights in the drafter's dtype."""
         m = mlxdev.mx
@@ -246,7 +295,8 @@ class Qwen35Drafter(MTPDrafter):
         dt = self._mx_dtype()
         em = mlxdev.to_mx(e).astype(dt)
         hm = mlxdev.to_mx(h.detach().contiguous()).astype(dt)
-        cl = self.cache.layers[0]
+        kv = self._kv()
+        cl = kv.layers[0]
         append: MxAppend
         if isinstance(cl, GrowLayer) and cl.shared:
             append = cl.mx_update
@@ -254,7 +304,7 @@ class Qwen35Drafter(MTPDrafter):
 
             def _append(kh: mx_.array, vh: mx_.array) -> tuple[mx_.array, mx_.array]:
                 m.eval(kh, vh)
-                kf, vf = self.cache.update(mlxdev.from_mx(kh), mlxdev.from_mx(vh), 0)
+                kf, vf = kv.update(mlxdev.from_mx(kh), mlxdev.from_mx(vh), 0)
                 return mlxdev.to_mx(kf), mlxdev.to_mx(vf)
 
             append = _append
@@ -267,8 +317,10 @@ class Qwen35Drafter(MTPDrafter):
             return None, mlxdev.from_mx(out)
         hn = m.fast.rms_norm(out, wd["n"], wd["eps"])
         H = int(c.hidden_size)
-        if sm.head_host is not None and sm.head_host.mx is not None:
-            lm = self._mm(hn.reshape(B * T, H), self._mx_head()).reshape(B, T, -1).astype(m.float32)
+        hh = sm.head_host
+        head = self._mx_head() if hh is not None and hh.mx is not None else None
+        if head is not None:
+            lm = self._mm(hn.reshape(B * T, H), head).reshape(B, T, -1).astype(m.float32)
             m.eval(lm, out)
             logits = mlxdev.from_mx(lm)
         else:
@@ -293,7 +345,7 @@ class Qwen35Drafter(MTPDrafter):
         shared cache layer `append` writes, for a chunk's attention through the fused prefill kernel."""
         m = mlxdev.mx
         sm = self.sm
-        be = sm.mlx
+        be = self._be()
         c = sm.cfg
         wd = self._mx_norms()
         B, T = int(em.shape[0]), int(em.shape[1])
@@ -303,20 +355,26 @@ class Qwen35Drafter(MTPDrafter):
         assert fc is not None  # the MLX body runs with the fc bound to MLX (`_mlx_ready`)
         x = self._mm(xin.reshape(B * T, -1), fc).reshape(B, T, H)
         freqs, rd, rscale = sm._mlx_rope()
+        assert not isinstance(freqs, dict)  # Qwen3.5 carries a single rope, never Gemma's dual
         w = sm._mlx_consts(-2, self.layer, mlxdev.torch_dtype(wd["dt"]))
         at, mlp = self.layer.self_attn, self.layer.mlp
         Hq = int(c.num_attention_heads)
         Hk = int(getattr(c, "num_key_value_heads", None) or Hq)
         hd = int(at.head_dim)
         act = sm._mlx_act()
-        xn = m.fast.rms_norm(x, w["ln1"], w["eps1"]).reshape(B * T, H)
+        # the layer's centred norms are float32 (`_mlx_consts`): normed as the trunk norms them, back in the rows' dtype
+        xn = sm._mlx_norm(x, w["ln1"], w["eps1"]).reshape(B * T, H)
         qkv_w: Weight | None = getattr(at, "_mx_qkv", None)  # `_mlx_fuse`'s joined q/k/v
         if qkv_w is not None:
             qkv = self._mm(xn, qkv_w)
             nq, nk = Hq * 2 * hd, Hk * hd
             qg, kk, vv = qkv[:, :nq], qkv[:, nq : nq + nk], qkv[:, nq + nk :]
         else:
-            qg, kk, vv = self._mm(xn, at.q_proj.mx), self._mm(xn, at.k_proj.mx), self._mm(xn, at.v_proj.mx)
+            qg, kk, vv = (
+                self._mm(xn, _bound(at.q_proj)),
+                self._mm(xn, _bound(at.k_proj)),
+                self._mm(xn, _bound(at.v_proj)),
+            )
         q, gate = m.split(qg.reshape(B, T, Hq, 2 * hd), 2, axis=-1)
         gate = gate.reshape(B, T, Hq * hd)
         k = kk.reshape(B, T, Hk, hd)
@@ -331,14 +389,14 @@ class Qwen35Drafter(MTPDrafter):
             qh = qr.reshape(B, T, Hq, hd).transpose(0, 2, 1, 3)
             kh = kr.reshape(B, T, Hk, hd).transpose(0, 2, 1, 3)
         else:
-            q = m.fast.rms_norm(q, w["qn"], w["epsq"])
-            k = m.fast.rms_norm(k, w["kn"], w["epsq"])
+            q = sm._mlx_norm(q, w["qn"], w["epsq"])
+            k = sm._mlx_norm(k, w["kn"], w["epsq"])
             qh = be.rope_fast(q.transpose(0, 2, 1, 3), rd, freqs, rscale, pos0)
             kh = be.rope_fast(k.transpose(0, 2, 1, 3), rd, freqs, rscale, pos0)
         vh = v.transpose(0, 2, 1, 3)
         if self._tree_kernel():
             # the cache in the drafter's dtype from the prefill on: the node kernel reads bf16 rows, and a
-            # layer asked to grow in another dtype starts over empty
+            # layer holding rows refuses another dtype's (`GrowLayer._ensure`)
             kh, vh = kh.astype(em.dtype), vh.astype(em.dtype)
         if attn is not None:
             a = attn(qh, kh, vh)
@@ -356,28 +414,33 @@ class Qwen35Drafter(MTPDrafter):
                     qh, K, V, scale=float(at.scaling), mask="causal" if T > 1 else None
                 )
         a = a.transpose(0, 2, 1, 3).reshape(B, T, Hq * hd) * m.sigmoid(gate)
-        o = self._mm(a.reshape(B * T, -1), at.o_proj.mx)
+        o = self._mm(a.reshape(B * T, -1), _bound(at.o_proj))
         if sm.fam.moe:
             # a mixture's block through its modules, as the trunk's run on MLX: the router and the shared expert's
             # linears on MLX, the experts the store's (layer L), between the graph's halves
             x = x + o.reshape(B, T, H)
-            x2 = m.fast.rms_norm(x, w["ln2"], w["eps2"]).astype(m.float32)
+            x2 = sm._mlx_norm(x, w["ln2"], w["eps2"])
             m.eval(x2)
-            y = mlp(mlxdev.from_mx(x2))
-            return x + mlxdev.to_mx(y.float().contiguous()).astype(x.dtype)
+            y: torch.Tensor = mlp(mlxdev.from_mx(x2))
+            return x + mlxdev.to_mx(y.contiguous()).astype(x.dtype)
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5MLP
+
+        if not isinstance(mlp, Qwen3_5MLP):
+            raise TypeError(f"[mtp] Qwen3.5's dense drafting layer holds a {type(mlp).__name__} for its MLP")
+        assert act is not None  # the graph runs only with the family's activation on MLX (`_mlx_ready`)
         gu_w: Weight | None = getattr(mlp, "_mx_gu", None)  # `_mlx_fuse`'s joined gate/up
         if fuse:
             x_flat, x2 = fk.add_rmsnorm(x.reshape(B * T, H), o, w["ln2"], w["eps2"])
             if gu_w is not None:
-                down = self._mm(fk.silu_mul(self._mm(x2, gu_w)), mlp.down_proj.mx)
+                down = self._mm(fk.silu_mul(self._mm(x2, gu_w)), _bound(mlp.down_proj))
             else:
-                mid = act(self._mm(x2, mlp.gate_proj.mx)) * self._mm(x2, mlp.up_proj.mx)
-                down = self._mm(mid, mlp.down_proj.mx)
+                mid = act(self._mm(x2, _bound(mlp.gate_proj))) * self._mm(x2, _bound(mlp.up_proj))
+                down = self._mm(mid, _bound(mlp.down_proj))
             return (x_flat + down).reshape(B, T, H)
         x = x + o.reshape(B, T, H)
-        x2 = m.fast.rms_norm(x, w["ln2"], w["eps2"]).reshape(B * T, H)
-        mid = act(self._mm(x2, mlp.gate_proj.mx)) * self._mm(x2, mlp.up_proj.mx)
-        return x + self._mm(mid, mlp.down_proj.mx).reshape(B, T, H)
+        x2 = sm._mlx_norm(x, w["ln2"], w["eps2"]).reshape(B * T, H)
+        mid = act(self._mm(x2, _bound(mlp.gate_proj))) * self._mm(x2, _bound(mlp.up_proj))
+        return x + self._mm(mid, _bound(mlp.down_proj)).reshape(B, T, H)
 
     def _mlx_draw(
         self, out: mx_.array, k: int, sampling: Sampling, keys: Sequence[int]
@@ -391,7 +454,7 @@ class Qwen35Drafter(MTPDrafter):
         H = int(sm.cfg.hidden_size)
         B = int(out.shape[0])
         hn = m.fast.rms_norm(out, wd["n"], wd["eps"]).reshape(B, H)
-        lg = self._mm(hn, self._mx_head()).astype(m.float32)
+        lg = self._mx_logits(hn)
         ids, q = sampling.draw_mx(lg, keys, min(int(k), int(lg.shape[-1])))
         vals = m.log(m.take_along_axis(q, ids, axis=-1))
         return vals, ids, q
@@ -405,14 +468,14 @@ class Qwen35Drafter(MTPDrafter):
         H = int(sm.cfg.hidden_size)
         B = int(out.shape[0])
         hn = m.fast.rms_norm(out, wd["n"], wd["eps"]).reshape(B, H)
-        lp = self._mm(hn, self._mx_head()).astype(m.float32)
+        lp = self._mx_logits(hn)
         lp = lp - m.logsumexp(lp, axis=-1, keepdims=True)
         ids = mlx_topk_ids(lp, k)
         return m.take_along_axis(lp, ids, axis=-1), ids
 
     def _pass(
-        self, tok_ids: torch.Tensor, h: torch.Tensor, pos0: int, need_logits: bool
-    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        self, tok_ids: torch.Tensor, h: HiddenRows, pos0: int, need_logits: bool
+    ) -> tuple[DraftLogits | None, HiddenRows]:
         if self._mlx_ready():
             return self._mlx_step(tok_ids, h, pos0, need_logits)
         from transformers.masking_utils import create_causal_mask
@@ -420,9 +483,11 @@ class Qwen35Drafter(MTPDrafter):
         self._pack_torch()
         t0 = time.time()
         sm = self.sm
+        kv = self._kv()
         e = sm.embed(tok_ids).to(self.dev, self.cd)
         xin = torch.cat([self.norm_e(e), self.norm_h(h.to(self.dev, self.cd))], dim=-1)
-        fc8 = getattr(self, "fc8", None)
+        fc8 = self.fc8
+        x: torch.Tensor
         if self.fc_host is not None:
             x = self.fc_host(xin.float())
         elif fc8 is not None:
@@ -435,14 +500,14 @@ class Qwen35Drafter(MTPDrafter):
         text_pos, rope_pos = pos[0], pos[1:]
         pe = self.rotary(x, rope_pos)
         mask = create_causal_mask(
-            config=self.mcfg, inputs_embeds=x, attention_mask=None, past_key_values=self.cache, position_ids=text_pos
+            config=self.mcfg, inputs_embeds=x, attention_mask=None, past_key_values=kv, position_ids=text_pos
         )
-        out = self.layer(
+        out: torch.Tensor = self.layer(
             x,
             position_embeddings=pe,
             attention_mask=mask,
             position_ids=text_pos,
-            past_key_values=self.cache,
+            past_key_values=kv,
             use_cache=True,
         )
         if not need_logits:

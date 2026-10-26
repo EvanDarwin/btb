@@ -24,7 +24,8 @@ from btb.engine.cache import GrowLayer
 from btb.engine.device import where
 from btb.engine.generate import _chains_tree
 from btb.engine.host import _HostLinear
-from btb.kinds import Json, LayerKind, Quant, SlotKind, TokenRows, quant_tag
+from btb.engine.text import GenerateStats
+from btb.kinds import LayerKind, Quant, SlotKind, Tokens, quant_tag
 from tests.cert import spec
 from tests.helpers import (
     NO_LOG,
@@ -658,7 +659,9 @@ def test_load_gives_a_card_that_holds_every_layer_a_tree_without_a_drafting_head
 # --- exactness: a speculative decode is the greedy one -------------------------------------------------------
 
 
-def _exactly_greedy(sm: StreamedTextModel, prompt: TokenRows, n_new: int, spans: Spans = ()) -> tuple[list[int], Json]:
+def _exactly_greedy(
+    sm: StreamedTextModel, prompt: Tokens, n_new: int, spans: Spans = ()
+) -> tuple[list[int], GenerateStats]:
     """(the greedy answer, the speculative loop's census), failing where the two answers part"""
     speculation(sm, tree_min_prob=0.0, ngram_p=0.9, tree_read="step")
     greedy = sm.generate_greedy(prompt, n_new)
@@ -680,7 +683,7 @@ def test_speculative_is_the_greedy_answer_on_the_host() -> None:
         sm = host_model(fixture("tiny_q35"))
         try:
             sm.tree_budget = 16
-            greedy, census = _exactly_greedy(sm, VARIED, 48)
+            greedy, census = _exactly_greedy(sm, VARIED[0], 48)
             assert len(set(greedy)) > 10, "a constant answer would accept every draft: the check would be empty"
             assert census["accepted"] > 0, "nothing was drafted: the loop under test never ran"
             assert census["proposed"] > census["accepted"], "no draft was rejected: the crop was never taken"
@@ -694,7 +697,7 @@ def test_a_hybrid_draft_model_keeps_its_deltanet_state_at_the_committed_rows(dev
     and a speculative decode with it drafting answers as the plain loop. Its pass over the committed rows used
     to leave that state where it was (a host tree pass leaves it to the commit, which a drafter never made), and
     its tree passes crop by a length MLX's linear layers do not have; either way it drafted from a stale state"""
-    from btb.engine.generate import _lin
+    from btb.engine.generate import _lin, lin_layer
     from btb.engine.propose import ModelProposer
 
     if device == "mlx":
@@ -710,7 +713,7 @@ def test_a_hybrid_draft_model_keeps_its_deltanet_state_at_the_committed_rows(dev
         sm._prefill(torch.tensor([prompt + more]), ref)
         for i, kind in enumerate(sm.layer_types):
             if kind == LayerKind.LINEAR:
-                for got, want in zip(_lin(mp.cache.layers[i]), _lin(ref.layers[i]), strict=True):
+                for got, want in zip(_lin(lin_layer(mp.cache.layers[i])), _lin(lin_layer(ref.layers[i])), strict=True):
                     err = float((got.float() - want.float()).abs().max())
                     assert err <= 1e-2 * float(want.float().abs().max()), f"layer {i}: {err:.3e} off the prefill"
     with loaded_model(path, device=device, draft_model=path, v_max=4, tree_budget=0) as sm:
@@ -774,7 +777,7 @@ def test_the_sampled_drafting_tree_draws_the_sequential_distribution_on_the_host
             accepted = proposed = 0
             for seed in range(n):
                 s = Sampling(temperature=0.1, seed=seed)
-                seq[int(sm.generate_greedy(VARIED, 4, sampling=s)[0])] += 1
+                seq[sm.generate_greedy(VARIED[0], 4, sampling=s)[0]] += 1
                 out, census = sm.generate_speculative(VARIED, 4, proposer="mtp_dyn", v_max=4, sampling=s)
                 spec[int(out[0])] += 1
                 accepted += census["accepted"]
@@ -803,11 +806,11 @@ def test_speculative_is_the_greedy_answer_on_the_card_with_the_ngram_tree() -> N
             # keys alone (the last span banked under a key is the one proposed). Every pass then holds two chains -
             # the right one and a one-token wrong branch - merged into a tree whose wrong node is drafted, rejected
             # and cropped
-            answer = [int(t) for t in sm.generate_greedy(REPEATING, 48)]
+            answer = sm.generate_greedy(REPEATING[0], 48)
             seen = set(answer) | set(REPEATING[0])
             wrong = next(t for t in range(int(sm.cfg.vocab_size)) if t not in seen)
             spans = [("right", answer)] + [("misleading", [t, wrong]) for t in sorted(set(answer))]
-            greedy, census = _exactly_greedy(sm, REPEATING, 48, spans=spans)
+            greedy, census = _exactly_greedy(sm, REPEATING[0], 48, spans=spans)
             assert greedy == answer
             assert "ngram_tree" in census["by_source"]["drafted"], f"no tree was built: {census['by_source']}"
             assert census["proposed"] > census["accepted"], "every node was accepted: the crop never ran"
@@ -917,14 +920,15 @@ def test_the_drafter_answers_the_greedy_loop_over_a_head_slice_on_the_card_and_o
                     assert tdr.fc is None and tdr.fc8 is not None, "the bf16 fc is still held beside its int8 copy"
                     assert any(isinstance(m, _Int8Linear) for m in tdr.layer.modules()), "the layer was not packed"
                 continue
-            head = dr._head_t
-            assert head is not None, "the drafter never made its head"
+            th = dr._head_t
+            assert th is not None, "the drafter never made its head"
             if bits < 16:
-                assert isinstance(head, _Int8Linear) and tuple(head.w8.shape) == (256, H)
+                assert isinstance(th, _Int8Linear) and tuple(th.w8.shape) == (256, H)
                 assert dr.fc is None and dr.fc8 is not None, "the bf16 fc is still held beside its int8 copy"
                 assert any(isinstance(m, _Int8Linear) for m in dr.layer.modules()), "the layer was not packed"
             else:
-                assert not isinstance(head, _Int8Linear) and tuple(head.shape) == (256, H)
+                # a safetensors head: its rows sliced, in bf16
+                assert isinstance(th, torch.Tensor) and tuple(th.shape) == (256, H)
                 assert dr.fc is not None and getattr(dr, "fc8", None) is None
 
 

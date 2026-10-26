@@ -19,7 +19,8 @@ from .. import aluminum
 from ..attn import tree_meta
 from ..backend import Weight
 from ..core import mx, to_mx
-from .kernel import EMBED_OP, MV_OP, STORED, OpName, head_groups, stored_groups
+from ..stored import STORED
+from .kernel import EMBED_OP, MV_OP, OpName, head_groups, stored_groups
 from .program import CONSTS, SCR, Program, Refs, Tensor, align, kv
 from .replay import THREADS, KvSlot, Replay
 

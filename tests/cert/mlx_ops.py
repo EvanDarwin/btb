@@ -132,6 +132,7 @@ OPS: tuple[Op, ...] = (
     ),
     Op("p12_unpack", "gemv", ("btb_unpack_p12",), "kernels/test_mlx.py"),
     Op("gemm_bf16", "gemv", ("btb_gemm_rows_x*_s*",), "kernels/test_mlx.py"),
+    Op("gemm_steel", "steel", ("btb_steel_*_*_*_*_*",), "kernels/test_mlx.py"),
     Op("gemv_mxfp4", "gemv", ("btb_gemv_mxfp4**_x*", "btb_mxfp4_dequant"), "kernels/test_mxfp4.py"),
     Op(
         "kquant_q45",
@@ -212,6 +213,18 @@ OPS: tuple[Op, ...] = (
         funcs=("repack_lattice", "matvec_lattice", "dequant_lattice"),
     ),
     Op("kv", "kv", ("btb_kv_store", "btb_kv_scatter"), "kernels/test_kv.py"),
+    Op(
+        "moe",
+        "moe",
+        (
+            "btb_moe_route",
+            "btb_moe_combine",
+            "btb_moe_silu_apart",
+            "btb_moe_gather_*_*_*_*_*_*_*",
+            "btb_moe_gather_*_x*_*_*_*_*_*_*",
+        ),
+        "kernels/test_moe.py",
+    ),
     Op(
         "mega",
         "mega.kernel",

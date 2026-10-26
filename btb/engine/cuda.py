@@ -98,12 +98,13 @@ from ..options import Device
 from ..sampling import GREEDY
 from . import device as device_mod
 from .arena import KvArena
-from .cache import CardRowsLayer, GrowLayer, attention_rows, forked, indexer_keys, set_rows
+from .cache import ArenaIndexedLayer, CardRowsLayer, GrowLayer, attention_rows, forked, indexer_keys, set_rows
 from .families import act_name
 from .fixed_rows import KeyRows
 from .forward import chain_of, layer_window, node_mask, pe_for
 from .fused import _fused_rope
 from .native import Native, NativeDtypeError, _Cuda, kernels_path
+from .paged import PagedCache, PagedLayer
 from .scheduler import MemoryGrantError, _size
 from .spec_cost import SpecCost
 from .state import _State
@@ -111,7 +112,6 @@ from .stored import CardMat, CardStored, card_loose, mat_rows
 
 if TYPE_CHECKING:
     from .forward import PassRope, Rope
-    from .paged import PagedCache
     from .prefix import PassLists
 
 _KERNELS_WARNED = False
@@ -2444,8 +2444,11 @@ class _CudaMixin(_State):
         # output was kept (the one after an eos is not part of the answer)
         n = past + max(0, len(out) - 1)
         for i in layers:
-            cache.layers[i].set_front(n)
-        if paged:
+            cl = cache.layers[i]
+            if not isinstance(cl, (GrowLayer, ArenaIndexedLayer, PagedLayer)):
+                raise TypeError(f"[card] the step graph wrote layer {i}'s rows into a {type(cl).__name__}")
+            cl.set_front(n)
+        if isinstance(cache, PagedCache):
             cache.crop_to(n)  # the rows reserved past the answer's end let go
         self.log(
             f"[stream] generated {len(out)} tokens over 1 rows in {time.time() - t0:.1f}s "
@@ -2587,7 +2590,7 @@ class _CudaMixin(_State):
                     + ", ".join(f"{T}:{c / c1:.2f}x" for T, c in cost.items() if T in (1, 2, 4, 8, 16, t_max))
                     + f" (one row {c1 * 1e3:.2f} ms)"
                 )
-            if paged:
+            if isinstance(cache, PagedCache):
                 cache.release()  # the throwaway's pages back to the pool now, not when it is collected
         return n
 

@@ -12,15 +12,17 @@ from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypeAlias, TypedDic
 
 import numpy as np
 import torch
+from transformers.cache_utils import LinearAttentionCacheLayerMixin
 
 from .. import mlx as mlxdev
 from .. import pool
-from ..kinds import LayerKind, NodePath, Parents, PassTag, TokenRows, Tokens, pooled_layout, stored_in_place
-from ..mlx import aluminum
+from ..kinds import LayerKind, NodePath, Parents, PassTag, TokenRows, Tokens, pooled_layout, quant_tag
+from ..mlx import aluminum, moe
 from ..mlx import fused as fk
 from ..sampling import GREEDY
 from ..session import Session
 from .cache import GrowLayer, adopt_states, delta_layer, forked, has_graph_states
+from .experts import Expert, Settled
 from .families import act_name
 from .hooks import LayerTap
 from .host import _HostLinear, copy_bytes
@@ -30,21 +32,25 @@ from .state import _State
 
 if TYPE_CHECKING:
     import mlx.core as mx_
-    from transformers.cache_utils import LinearAttentionCacheLayerMixin, LinearAttentionLayer
+    from transformers.cache_utils import LinearAttentionLayer
 
     from ..gguf import QuantWeight
-    from ..kinds import Json
+    from ..kinds import Quant
     from ..mlx import Shared
     from ..mlx.attn import NodeMeta
-    from ..mlx.backend import Weight
+    from ..mlx.backend import ExpertWeights, Weight
     from ..mlx.core import SharedTensor
     from ..mlx.delta import DeltaStep, Heads
     from ..mlx.mega.model import NormModule
     from ..mlx.mega.replay import KvSlot
+    from ..mlx.moe import Gather
     from ..sampling import Pick, Sampling
     from .cache import KvCache, KvScales, RowBufs
+    from .families.base import GatedMlp, Mixture
     from .forward import PassRope
     from .hooks import OnToken
+    from .host import _Experts
+    from .text import GenerateStats
 
     # a pass's attention mask: causal, a boolean one over its rows (a tree's), or none (one row)
     AttnMask: TypeAlias = Literal["causal"] | mx_.array | None
@@ -90,7 +96,8 @@ class DeltaConsts(TypedDict):
 
 class LayerConsts(TypedDict, total=False):
     """a layer's norm weights as MLX arrays and their epsilons (`_mlx_consts`): the final norm's alone (`norm`), or
-    the block's two, a sandwich block's four, the q/k norms and a DeltaNet's tensors where the layer has them"""
+    the block's two, a sandwich block's four, the q/k norms, a DeltaNet's tensors and a mixture's router where the
+    layer has them"""
 
     norm: mx_.array
     eps: float
@@ -108,6 +115,7 @@ class LayerConsts(TypedDict, total=False):
     epsq: float
     kn: mx_.array
     delta: DeltaConsts
+    router: Weight
 
 
 class Forest(TypedDict):
@@ -281,6 +289,10 @@ class _MlxMixin(_State):
         mlp = getattr(layer, "mlp", None)
         if mlp is not None:
             mlp._mx_gu = fused(mlp, ("gate_proj", "up_proj"))
+            # a mixture's shared expert, the dense MLP beside its experts
+            shared = getattr(mlp, "shared_expert", None)
+            if shared is not None:
+                shared._mx_gu = fused(shared, ("gate_proj", "up_proj"))
 
     def _shared_ahead(self, nbytes: int) -> tuple[Shared, int]:
         """A `Shared` of `nbytes` for a layer's linears, filled on MLX's CPU stream with the next layer's buffer
@@ -371,7 +383,7 @@ class _MlxMixin(_State):
         (`kinds.pooled_layout`: the blocks in place, IQ4_NL's and IQ1_M's split out once) and bound there
         (`Backend.weight_stored_pool`): neighbours join as a view a stream and the megakernel reads them where they
         are. The torch weight becomes a shape, as `_bind_gguf_stored` leaves it. Returns the bytes placed."""
-        from ..mlx.backend import stored_streams
+        from ..mlx.backend import place_streams
 
         gg = self.gguf
         if gg is None or not self.gguf_packed:
@@ -388,15 +400,7 @@ class _MlxMixin(_State):
         offs, cur = pooled_layout([(w.q, int(w.raw.numel())) for _, w in items])
         sh, base = self._shared_ahead(cur)
         for (m, w), at in zip(items, offs, strict=True):
-            raw = w.raw.reshape(-1)
-            if stored_in_place(w.q):
-                parts = [raw]
-            else:  # the type's split streams, made once from the file's blocks
-                made = stored_streams(w.q, raw.numpy())
-                parts = [torch.from_numpy(np.asarray(s).reshape(-1).view(np.uint8).copy()) for s in made]
-            for o, p in zip(at, parts, strict=True):
-                sh.torch[base + o : base + o + int(p.numel())].copy_(p)
-            nbs = [int(p.numel()) for p in parts]
+            nbs = place_streams(w.q, w.raw.reshape(-1).numpy(), sh.np[base:], at)
             m.mx = be.weight_stored_pool(sh, [base + o for o in at], nbs, w.q, w.shape)
             m.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16).expand(*w.shape), requires_grad=False)
         self.mlx_state.bytes += cur
@@ -456,12 +460,14 @@ class _MlxMixin(_State):
                 )
             elif fam.mlx_path is PassTag.MLX_HYBRID:
                 # the DeltaNet step per position runs through the native kernel; without it the host path
-                ok = self._mlx_act() is not None and Native.delta_step is not None
+                ok = self._mlx_act() is not None and Native.delta_step is not None and self._mlx_mixtures_ok()
             else:
                 ok = False
             self.mlx_state.family_ok = ok
         if not ok:
             return False
+        if fam.moe and any(getattr(self, n, None) is not None for n in ("expert_probe", "expert_trace")):
+            return False  # the routing instruments read each layer's picks on the host, between its layers
         if not fam.hybrid and (tree or positions is not None) and (cache is None or not self._mlx_tree_able(cache)):
             # a tree on the dense path attends through aluminum's nodes (each node walks its own ancestry), so
             # every layer's cache must be one the kernels read; otherwise chains only
@@ -668,6 +674,17 @@ class _MlxMixin(_State):
                     "key_dim": int(la.key_dim),
                     "value_dim": int(la.value_dim),
                 }
+            mix = self.fam.mixture(tmpl.mlp) if getattr(tmpl, "mlp", None) is not None else None
+            if mix is not None:
+                # the router's matrix where its host linear bound it, else (a GGUF's, kept in float32 as stored) a
+                # float32 copy: its logits the float32 matvec's, row-invariant either way
+                lin = mix.router_lin
+                if lin is not None and lin.mx is not None:
+                    w["router"] = lin.mx
+                else:
+                    from ..mlx.backend import Weight
+
+                    w["router"] = Weight(mlxdev.to_mx(mix.router.detach().float().contiguous()))
         d[key] = w
         arrays = [x for x in w.values() if isinstance(x, mlxdev.mx.array)]
         delta = w.get("delta")
@@ -675,6 +692,142 @@ class _MlxMixin(_State):
             arrays += [x for x in delta.values() if isinstance(x, mlxdev.mx.array)]
         mlxdev.mx.eval(*arrays)
         return w
+
+    def _mlx_mixtures_ok(self) -> bool:
+        """every host layer's mixture is one the GPU routes (`_mlx_mixture`): a silu MLP, experts in bf16 or a GGUF's
+        stored types (an FP8 or an MXFP4 store's keep the per-op path), a shared expert behind a host linear's gate"""
+        if not self.fam.moe:
+            return True
+        if act_name(self.cfg) not in ("silu", "swish"):
+            return False
+        for layer in self.host.values():
+            mix = self.fam.mixture(layer.mlp)
+            if mix is None:
+                continue
+            if mix.experts.f8 or mix.experts.mx or (mix.shared is not None and mix.shared_gate is None):
+                return False
+        return True
+
+    def _mlx_mixture(self, i: int, mix: Mixture, router: Weight, x: mx_.array) -> mx_.array:
+        """layer i's mixture over the rows `x` [T, H] on the GPU (btb/mlx/moe.py): the router's picks and weights from
+        its float32 logits (`moe.route`), the picked experts' rows (`_mlx_experts`), and the weighted picks summed with
+        the shared expert behind its gate (`moe.combine`)"""
+        m = mlxdev.mx
+        be = self.mlx
+        assert be is not None
+        T, H = (int(s) for s in x.shape)
+        ids, wts = moe.route(be.matmul(x.astype(m.float32), router), mix.top_k, mix.mode, x.dtype)
+        y = self._mlx_experts(i, mix.experts, x, ids, mix.top_k)
+        g = sh = None
+        if mix.shared is not None:
+            assert mix.shared_gate is not None and mix.shared_gate.mx is not None  # `_mlx_mixtures_ok`'s
+            sh = self._mlx_silu_mlp(mix.shared, x)
+            g = be.matmul(x, mix.shared_gate.mx)
+        return moe.combine(y.reshape(T, mix.top_k, H), wts, g, sh)
+
+    def _mlx_silu_mlp(self, mlp: GatedMlp, x: mx_.array) -> mx_.array:
+        """a dense silu MLP over `x` as a mixture's experts compute: gate and up through `btb_silu_mul` (one weight's
+        halves, or two weights'), then down"""
+        be = self.mlx
+        assert be is not None
+        gate, up, down = mlp.gate_proj.mx, mlp.up_proj.mx, mlp.down_proj.mx
+        assert gate is not None and up is not None and down is not None  # bound with the layer
+        gu = self._mlx_fused(mlp, "_mx_gu")
+        mid = fk.silu_mul(be.matmul(x, gu)) if gu is not None else moe.silu_apart(be.matmul(x, gate), be.matmul(x, up))
+        return be.matmul(mid, down)
+
+    def _mlx_experts(self, i: int, ex: _Experts, x: mx_.array, ids: mx_.array, k: int) -> mx_.array:
+        """the picked experts' rows [T * k, H] over `x` [T, H] (row t's pick j at t * k + j), each (row, pick) its
+        expert's type's one-row chain: gathered from the store's slots (`moe.gather`) with no host where every expert
+        of the layer has landed (`resident_gather`), or after the host seats the picks (one sync); past `moe.ROWS_MAX`
+        rows (a prefill) and where the slots are past a gather's binding, each expert over its rows by its own matmuls"""
+        T = int(x.shape[0])
+        store = self.expert_store
+        parts = store.parts(i, ex.base) if store is not None else []
+        if store is not None:
+            self._tag(PassTag.EXPERT_STORE, store.res_tag)
+            if store.types:
+                self._tag(PassTag.EXPERT_QUANT_ASSTORED, *(quant_tag(q) for q, _r, _c in parts if q is not None))
+            elif store.widened:
+                self._tag(PassTag.EXPERT_QUANT_DEQUANT)
+            g = store.resident_gather(i, ex.base) if T <= moe.ROWS_MAX else None
+            if g is not None:
+                return self._mlx_gathered(parts, g, ids.reshape(-1), x, k)
+        else:
+            self._tag(PassTag.EXPERT_TABLES)
+        # the picks to the host, where the store seats them (and reads the next layers' ahead from the rows): every
+        # earlier layer's gathers feed x, so once it is evaluated no graph still to run reads a seat about to change
+        settled = self._settle(ids, x)
+        if store is not None:
+            store.fill(i, ex.base, settled=settled)
+        flat = np.asarray(ids).reshape(-1)
+        picks = sorted({Expert(int(e)) for e in flat})
+        st = self.expert_stat
+        st["experts"] += len(picks)
+        st["calls"] += 1
+        weights: dict[Expert, ExpertWeights]
+        if store is not None:
+            if T < Native.gemm_rows:
+                store.lookahead(i, mlxdev.from_mx(x))
+            call = store.call(i, ex.base, picks, keep=T < Native.gemm_rows, rows=T)
+            _ready, pending = call.whole(settled=settled)
+            store.wait(pending)
+            slots = {e: store.last_slots[e] for e in picks}
+            for s in slots.values():
+                store._form(s)
+            g = store.gather(i, slots) if T <= moe.ROWS_MAX else None
+            if g is not None:
+                return self._mlx_gathered(parts, g, ids.reshape(-1), x, k)
+            weights = {e: store._views_mx(s) for e, s in slots.items()}
+        else:
+            be = self.mlx
+            assert be is not None
+            tables = ex._tables()
+            weights = {e: ex._mlx_table(be, tables, e) for e in picks}
+        return self._mlx_each_expert(weights, flat, x, k)
+
+    @staticmethod
+    def _settle(*arrays: mx_.array) -> Settled:
+        """`arrays` evaluated, and everything a pass built under them: the MLX path's one proof for the expert store
+        that no graph still to run reads its slots (`Settled`)"""
+        mlxdev.mx.eval(*arrays)
+        return Settled()
+
+    @staticmethod
+    def _mlx_gathered(
+        parts: Sequence[tuple[Quant | None, int, int]], g: Gather, ids: mx_.array, x: mx_.array, k: int
+    ) -> mx_.array:
+        """`_mlx_experts`' rows through the gathers over the slots `g` binds, the layer's `parts` (`_ExpertStore.parts`):
+        gate and up (a GGUF's two parts, or a bf16 expert's one), `btb_silu_mul`, then down"""
+        if len(parts) == 3:
+            (gq, gr, gc), (uq, ur, uc), (dq, dr, dc) = parts
+            mid = moe.silu_apart(moe.gather(gq, g, ids, x, gr, gc, 0, k), moe.gather(uq, g, ids, x, ur, uc, 1, k))
+            return moe.gather(dq, g, ids, mid, dr, dc, 2, 1)
+        (guq, gur, guc), (dq, dr, dc) = parts
+        mid = fk.silu_mul(moe.gather(guq, g, ids, x, gur, guc, 0, k))
+        return moe.gather(dq, g, ids, mid, dr, dc, 1, 1)
+
+    def _mlx_each_expert(
+        self, weights: dict[Expert, ExpertWeights], flat: np.ndarray, x: mx_.array, k: int
+    ) -> mx_.array:
+        """`_mlx_experts`' rows, each picked expert over its rows by its own matmuls (the same chains as a gather's up
+        to `gemm_rows` rows), the experts' rows put back in the picks' order"""
+        m = mlxdev.mx
+        be = self.mlx
+        assert be is not None
+        outs, order = [], []
+        for e in sorted(weights):
+            items = np.nonzero(flat == e)[0]
+            xe = m.take(x, m.array((items // k).astype(np.int32)), axis=0)
+            gu, dn = weights[e]
+            if isinstance(gu, tuple):
+                mid = moe.silu_apart(be.matmul(xe, gu[0]), be.matmul(xe, gu[1]))
+            else:
+                mid = fk.silu_mul(be.matmul(xe, gu))
+            outs.append(be.matmul(mid, dn))
+            order.append(items)
+        back = np.argsort(np.concatenate(order)).astype(np.int32)
+        return m.take(m.concatenate(outs, axis=0), m.array(back), axis=0)
 
     def _mlx_lin_adopt(self, cl: LinearAttentionCacheLayerMixin) -> tuple[mx_.array, mx_.array]:
         """The DeltaNet layer's states moved once into shared memory, so the GPU step and every torch path write
@@ -696,7 +849,11 @@ class _MlxMixin(_State):
         """DeltaNet states the pipelined decode kept in the graph are written into the cache's tensors, so every
         torch path (trees, snapshots, the module) sees them."""
         m = mlxdev.mx
-        todo = [(cl, cl._mx_pending) for cl in cache.layers if has_graph_states(cl) and cl._mx_pending is not None]
+        todo = [
+            (cl, cl._mx_pending)
+            for cl in cache.layers
+            if isinstance(cl, LinearAttentionCacheLayerMixin) and has_graph_states(cl) and cl._mx_pending is not None
+        ]
         if not todo:
             return
         m.eval(*[a for _, pend in todo for a in pend])
@@ -746,6 +903,45 @@ class _MlxMixin(_State):
             mixed, z, a, b, conv_mx[0], rec_mx[0], d["conv_w"], conv_b, d["a_log"], d["dt_bias"], d["norm_w"]
         )
         return core, conv_new, S
+
+    def _mlx_delta_one(
+        self,
+        w: LayerConsts,
+        mixed: mx_.array,
+        z: mx_.array,
+        a: mx_.array,
+        b: mx_.array,
+        conv_mx: mx_.array,
+        rec_mx: mx_.array,
+        inplace: bool = False,
+    ) -> tuple[mx_.array, mx_.array, mx_.array | None]:
+        """One DeltaNet position of one row (float32 `mixed` [C], `z`, `a`, `b`; its states [1, C, K] and [1, Hv, dk,
+        dv]): the recurrent kernel's dispatch over one position, else the module's rule in MLX ops (`_mlx_delta_step`).
+        Returns (core [Hv*dv], conv_new [C, K], the new state, or None where `inplace` wrote it into `rec_mx`), lazily"""
+        d = w["delta"]
+        if self.mlx_state.delta_mode != "recurrent" or d["dk"] % 32 != 0:
+            return self._mlx_delta_step(w, mixed, z, a, b, conv_mx, rec_mx)
+        core, conv_new, rec_new = mlxdev.delta_prefill(
+            mixed[None],
+            z[None],
+            a[None],
+            b[None],
+            conv_mx[0][:, 1:],
+            rec_mx,
+            d["conv_w"],
+            d["conv_b"],
+            d["a_log"],
+            d["dt_bias"],
+            d["norm_w"],
+            d["eps"],
+            d["hk"],
+            d["hv"],
+            d["dk"],
+            d["dv"],
+            d["key_dim"],
+            inplace=inplace,
+        )
+        return core[0], conv_new, rec_new
 
     def _mlx_rope(self) -> tuple[mx_.array | dict[str, mx_.array], int, float]:
         """The rotary module's frequencies for `Backend.rope_fast`: (freqs, rotary dims, attention scaling),
@@ -1207,6 +1403,45 @@ class _MlxMixin(_State):
             outs.append(a[0, :, 0, :])
         return m.stack(outs, axis=0).reshape(B, Hq * hd)
 
+    def _mlx_rows_meta(self, cache: KvCache | None, rows: Sequence[int]) -> NodeMeta:
+        """a batched step's node metadata, built once a pass: every attention layer reads the rows' same lengths"""
+        first = next(i for i, lt in enumerate(self.layer_types) if lt != LayerKind.LINEAR)
+        cl0 = self._mlx_batched_layer(cache, first)
+        return mlxdev.rows_meta(
+            [int(r) + 1 for r in rows],
+            segs=cl0._seg if cl0._dec_cap else None,
+            pbases=cl0._offs if cl0._flat else None,
+        )
+
+    def _mlx_rows_attend(
+        self,
+        cache: KvCache | None,
+        i: int,
+        q: mx_.array,
+        k: mx_.array,
+        v: mx_.array,
+        rows: Sequence[int],
+        freqs: mx_.array,
+        rd: int,
+        rscale: float,
+        scale: float,
+        prepared: NodeMeta | None,
+        roped: bool = False,
+    ) -> mx_.array:
+        """layer i's attention for B rows of one token each (q [B, Hq, hd], k and v [B, Hk, hd]), row b at position
+        rows[b]: rotated with the one-row step's bits (`roped`: by the fused q/k norm kernel already), appended to its
+        own slice and attended over it; [B, Hq * hd]"""
+        gl = self._mlx_batched_layer(cache, i)
+        if roped:
+            qr, kr = q, k
+        elif self.mlx_state.rope_rows:
+            qr, kr = mlxdev.rope_rows2(q, k, rd, freqs, rscale, rows)  # both in one launch
+        else:
+            qr = self._mlx_rope_rows(q, rows, rd, freqs, rscale)
+            kr = self._mlx_rope_rows(k, rows, rd, freqs, rscale)
+        gl.mx_update_rows(kr[:, :, None, :], v[:, :, None, :])
+        return self._mlx_attend_rows(qr, gl, scale, prepared=prepared)
+
     def _mlx_attend_forest(
         self, qh: mx_.array, kh: mx_.array, vh: mx_.array, cl: GrowLayer, scale: float, forest: Forest
     ) -> mx_.array:
@@ -1329,8 +1564,12 @@ class _MlxMixin(_State):
         self._tag_tiers(n_layers)
         self._tag_quant(n_layers)
         if self.fam.hybrid:
+            if forest is not None:
+                raise RuntimeError(
+                    "[mlx] a hybrid prefills its rows one at a time: the forest prefill is the dense one"
+                )
             return self._forward_mlx_hybrid(
-                h, pe, cache, on_layer, last_only, head, n_layers, hm=hm, lazy=lazy, pick=pick
+                h, pe, cache, on_layer, last_only, head, n_layers, hm=hm, lazy=lazy, pick=pick, rows=rows
             )
         self._tag(PassTag.MLX_STEP)
         m = mlxdev.mx
@@ -1369,11 +1608,10 @@ class _MlxMixin(_State):
             parents = None
         tree_prep, tree_pos = self._mlx_tree_prep(cache, past, parents) if parents is not None else (None, [])
         keys = _pick_keys(pick, tree_pos if tree else (rows if rows is not None else range(past, past + T)), last_only)
-        # the fused kernels serve the one-row step, a chain and a tree (<= 16 rows, the matvec tile) of the dense
-        # families with a full rotary; the batched and forest passes keep their own launches
+        # the fused kernels serve the one-row step, a chain, a tree and a batched step (<= 16 rows, the matvec tile) of
+        # the dense families with a full rotary, so each row's bits are the one-row step's; the forest keeps its own
         fuse = (
             bool(getattr(self, "mlx_fused_kernels", True))
-            and rows is None
             and forest is None
             and T <= 16
             and self.fam.fused_step
@@ -1385,13 +1623,10 @@ class _MlxMixin(_State):
         rows_prep: NodeMeta | None = None
         batched = rows is not None or forest is not None
         if rows is not None:
-            # every layer's attention this step reads the same lengths: the node metadata once, not per layer
-            cl0 = self._mlx_batched_layer(cache, 0)
-            rows_prep = mlxdev.rows_meta(
-                [int(r) + 1 for r in rows],
-                segs=cl0._seg if cl0._dec_cap else None,
-                pbases=cl0._offs if cl0._flat else None,
-            )
+            rows_prep = self._mlx_rows_meta(cache, rows)
+        # where the fused q/k norms and rope put each row: a batched step's at its own position, a tree's node at its
+        # depth, a chain's row t at past + t
+        qk_pos = list(rows) if rows is not None else (tree_pos if tree else [past + t for t in range(T)])
         for i in range(n_layers):
             tmpl = self.host[i]
             if i in self.cold:
@@ -1411,9 +1646,8 @@ class _MlxMixin(_State):
                 v = qkv[:, nq + nk :].reshape(T, Hk, hd)
             elif (qkv_w := self._mlx_fused(at, "_mx_qkv")) is not None and (batched or T <= 16):
                 qkv = be.matmul(x, qkv_w).reshape(T, Hq + 2 * Hk, hd)
-                if fuse and not batched:
-                    # the q/k norms and the rope in one launch: row t at past + t (a chain), or at its depth (a tree)
-                    qk_pos = tree_pos if tree else [past + t for t in range(T)]
+                if fuse:
+                    # the q/k norms and the rope in one launch, each row at `qk_pos`
                     q, k = fk.qk_norm_rope(
                         qkv[:, :Hq], qkv[:, Hq : Hq + Hk], w["qn"], w["kn"], w["epsq"], rd, fq, rscale, qk_pos
                     )
@@ -1429,24 +1663,16 @@ class _MlxMixin(_State):
                 q = be.matmul(x, at.q_proj.mx).reshape(T, Hq, hd)
                 k = be.matmul(x, at.k_proj.mx).reshape(T, Hk, hd)
                 v = be.matmul(x, at.v_proj.mx).reshape(T, Hk, hd)
-                if fuse and not batched:
-                    qk_pos = tree_pos if tree else [past + t for t in range(T)]
+                if fuse:
                     q, k = fk.qk_norm_rope(q, k, w["qn"], w["kn"], w["epsq"], rd, fq, rscale, qk_pos)
                     roped = True
                 else:
                     q = self._mlx_norm(q, w["qn"], w["epsq"])
                     k = self._mlx_norm(k, w["kn"], w["epsq"])
             if rows is not None:
-                # B rows, one token each at its own position: the weights read once for all, each row rotated,
-                # appended and attended over its own slice as its single decode would be
-                gl = self._mlx_batched_layer(cache, i)
-                if self.mlx_state.rope_rows:
-                    qr, kr = mlxdev.rope_rows2(q, k, rd, fq, rscale, rows)  # both in one launch
-                else:
-                    qr = self._mlx_rope_rows(q, rows, rd, fq, rscale)
-                    kr = self._mlx_rope_rows(k, rows, rd, fq, rscale)
-                gl.mx_update_rows(kr[:, :, None, :], v[:, :, None, :])
-                a = self._mlx_attend_rows(qr, gl, float(at.scaling), prepared=rows_prep)
+                a = self._mlx_rows_attend(
+                    cache, i, q, k, v, rows, fq, rd, rscale, float(at.scaling), rows_prep, roped=roped
+                )
             elif forest is not None:
                 # a group of rows' prompts end to end: one gemm at the group's size, each token rotated at its
                 # position in its row, the rows one slab in the flat buffer, every token attending its row's prefix
@@ -1836,16 +2062,15 @@ class _MlxMixin(_State):
             rows = mlxdev.mx.take(self._mlx_embed(), tok, axis=0)
         return rows if self.embed_scale is None else rows * self.embed_scale
 
-    def _mlx_batch_ok(self, B: int, on_layer: OnLayer | None, prefill_only: bool) -> bool:
-        """B > 1 rows decode together on the MLX device: the dense families through the fused forward, each
-        row at its own length. A mask is fine (a left-padded batch is unpadded to its rows)."""
+    def _mlx_rows_ok(self, B: int) -> bool:
+        """B > 1 rows step together on the MLX device (a fork's, a batch of sessions), each row at its own length: a
+        dense family's per-token graph, or a hybrid's (each row's bits its own one-row step's, whatever its MLP). A
+        sliding window's family stays out: the rows' attention reads every row's whole prefix"""
         return (
             self.mlx is not None
             and B > 1
             and self.mlx_state.batch
-            and on_layer is None
-            and not prefill_only
-            and self.fam.dense
+            and (self.fam.dense or self.fam.mlx_path is PassTag.MLX_HYBRID)
             and not self.cold
             and self.norm is not None
             and self.head_host is not None
@@ -1853,6 +2078,12 @@ class _MlxMixin(_State):
             and self.head is None
             and self._mlx_ok(None, 1, 1, None, None, self.L)
         )
+
+    def _mlx_batch_ok(self, B: int, on_layer: OnLayer | None, prefill_only: bool) -> bool:
+        """B > 1 rows decode together on the MLX device: the dense families through the fused forward, the prompts
+        prefilled as a forest, each row at its own length. A mask is fine (a left-padded batch is unpadded to its
+        rows)."""
+        return on_layer is None and not prefill_only and self.fam.dense and self._mlx_rows_ok(B)
 
     def _generate_greedy_mlx_batch(
         self,
@@ -1933,8 +2164,8 @@ class _MlxMixin(_State):
         for bb in range(b, B):
             for cl in layers:
                 cl.select_row(bb)
-            lg = self._prefill(torch.tensor([rows[bb]], dtype=torch.long), cache)
-            t = int(smp.pick_torch(lg[0, -1:], [smp.key_for(lens[bb] - 1)])[0])
+            row_lg = self._prefill(torch.tensor([rows[bb]], dtype=torch.long), cache)
+            t = int(smp.pick_torch(row_lg[0, -1:], [smp.key_for(lens[bb] - 1)])[0])
             out[bb].append(t)
             cur[bb] = t
             done[bb] = t in eos
@@ -2015,7 +2246,7 @@ class _MlxMixin(_State):
         t0: float,
         session: Session | None = None,
         sampling: Sampling | None = None,
-    ) -> tuple[list[int], Json]:
+    ) -> tuple[list[int], GenerateStats]:
         """Plain decoding with one token of lookahead: step t+1's graph is built from step t's unread pick (the
         argmax, or the sample keyed by the row) and queued before t is read. A `session` reuses its cache when
         the prompt extends the tokens it holds."""
@@ -2030,9 +2261,9 @@ class _MlxMixin(_State):
         self.vram_trim("prefill")
         first = int(smp.pick_torch(logits[0, -1:], [smp.key_for(len(prompt) - 1)])[0])
         out = [first]
-        census: Json = {"forwards": 1, "reused": reuse, "prefill_s": round(time.time() - t0, 3)}
+        census: GenerateStats = {"forwards": 1, "reused": reuse, "prefill_s": round(time.time() - t0, 3)}
 
-        def keep() -> tuple[list[int], Json]:
+        def keep() -> tuple[list[int], GenerateStats]:
             if session is not None:
                 session._commit_decode(prompt, out, cache, anchors)
             census["seconds"] = time.time() - t0
@@ -2112,10 +2343,12 @@ class _MlxMixin(_State):
         hm: mx_.array | None = None,
         lazy: bool = False,
         pick: Pick | None = None,
+        rows: Sequence[int] | None = None,
     ) -> MlxOut:
         """The Qwen3.5 hybrid on the GPU: attention layers and MLPs as MLX graphs, the DeltaNet as one dispatch per
         layer (or per position on the CPU kernel with per-node checkpoints under speculation); a tree attends
-        through one mask. `lazy` keeps the new DeltaNet states in the graph."""
+        through one mask. `lazy` keeps the new DeltaNet states in the graph; `rows` a batched step (hm[b] at
+        position rows[b]), each row's bits its own one-row step's, its states written back with the pass"""
         self._tag(PassTag.MLX_HYBRID)
         m = mlxdev.mx
         be = self.mlx
@@ -2136,6 +2369,8 @@ class _MlxMixin(_State):
         Hq = int(c.num_attention_heads)
         Hk = int(getattr(c, "num_key_value_heads", None) or Hq)
         spec_on = bool(getattr(self, "aq", False))
+        if rows is not None and spec_on:
+            raise RuntimeError("[mlx] a batched step of rows verifies no drafts")
         parents: Parents | None = getattr(self, "ap", None) if spec_on else None
         # the pass's own map: the drafts' tree, else the chain the rows make
         nodes: Parents = parents if parents is not None else list(range(-1, T - 1))
@@ -2143,7 +2378,8 @@ class _MlxMixin(_State):
         freqs, rd, rscale = self._mlx_rope()
         assert not isinstance(freqs, dict)  # the hybrid families (Qwen3.5) carry a single rope, never Gemma's dual
         tree_prep, tree_pos = self._mlx_tree_prep(cache, past, nodes) if tree else (None, [])
-        keys = _pick_keys(pick, tree_pos if tree else range(past, past + T), last_only)
+        rows_prep = self._mlx_rows_meta(cache, rows) if rows is not None else None
+        keys = _pick_keys(pick, rows if rows is not None else (tree_pos if tree else range(past, past + T)), last_only)
         # as the host path: after a prefix, positions step one at a time through the kernel (a chain, a tree, a
         # short continuation) - up to the 16 rows the node kernels take; a prefill from scratch, a chunked one and
         # any longer continuation (a session's next turn) go through the module's chunked rule from the stored
@@ -2173,6 +2409,8 @@ class _MlxMixin(_State):
         # each step layer's states to write back after the eval: (layer, conv, recurrent; None where written in place)
         pending: list[tuple[LinearAttentionLayer, mx_.array, mx_.array | None]] = []
         pend_inplace: set[int] = set()
+        # a batched step's layers' states, every row's: (layer, conv [B, C, K], recurrent [B, Hv, dk, dv])
+        pend_rows: list[tuple[LinearAttentionLayer, mx_.array, mx_.array]] = []
         # each prefill layer's new states and its conv's width
         fresh: list[tuple[LinearAttentionLayer, mx_.array, mx_.array, int]] = []
         ckpts: list[mx_.array] = []
@@ -2186,6 +2424,10 @@ class _MlxMixin(_State):
                 # a state written in place has none to copy (or its kernel's output in its stead)
                 if id(cl_) not in pend_inplace and rn is not None:
                     r_[0].copy_(mlxdev.from_mx(rn))
+            for cl_, cn, rn in pend_rows:
+                c_, r_ = self._lin(cl_)
+                c_.copy_(mlxdev.from_mx(cn))
+                r_.copy_(mlxdev.from_mx(rn))
             for cl_, cn, rn, K_ in fresh:
                 # through the cache's own setters: they initialize a fresh layer and copy into a live one
                 cl_.update_conv_state(mlxdev.from_mx(cn)[None].clone(), 0, conv_kernel_size=K_)
@@ -2215,68 +2457,63 @@ class _MlxMixin(_State):
                 q = self._mlx_norm(q, w["qn"], w["epsq"])
                 k = self._mlx_norm(kk.reshape(T, Hk, hd), w["kn"], w["epsq"])
                 v = vv.reshape(T, Hk, hd)
-                if tree:
-                    # every node rotated at past + depth in one launch for q and k, the one-row step's bits (a table
-                    # rotation would round the K rows differently)
-                    qr, kr = mlxdev.rope_rows2(q, k, rd, freqs, rscale, tree_pos)
-                    qh, kh = qr.transpose(1, 0, 2)[None], kr.transpose(1, 0, 2)[None]
+                if rows is not None:
+                    a = self._mlx_rows_attend(cache, i, q, k, v, rows, freqs, rd, rscale, float(at.scaling), rows_prep)
                 else:
-                    qh = be.rope_fast(q.transpose(1, 0, 2), rd, freqs, rscale, past)[None]
-                    kh = be.rope_fast(k.transpose(1, 0, 2), rd, freqs, rscale, past)[None]
-                vh = v.transpose(1, 0, 2)[None]
-                cl, K, V = self._mlx_cache(cache, i, kh, vh, writes)
-                a, attn_pa = self._mlx_attend(
-                    qh,
-                    K,
-                    V,
-                    cl,
-                    T,
-                    hd,
-                    Hq,
-                    Hk,
-                    float(at.scaling),
-                    tree_mask if tree else ("causal" if T > 1 else None),
-                    attn_pa,
-                    prepared=tree_prep,
-                    nodes=(past, nodes) if (step_nodes and spec_on) else None,
-                )
+                    if tree:
+                        # every node rotated at past + depth in one launch for q and k, the one-row step's bits (a
+                        # table rotation would round the K rows differently)
+                        qr, kr = mlxdev.rope_rows2(q, k, rd, freqs, rscale, tree_pos)
+                        qh, kh = qr.transpose(1, 0, 2)[None], kr.transpose(1, 0, 2)[None]
+                    else:
+                        qh = be.rope_fast(q.transpose(1, 0, 2), rd, freqs, rscale, past)[None]
+                        kh = be.rope_fast(k.transpose(1, 0, 2), rd, freqs, rscale, past)[None]
+                    vh = v.transpose(1, 0, 2)[None]
+                    cl, K, V = self._mlx_cache(cache, i, kh, vh, writes)
+                    a, attn_pa = self._mlx_attend(
+                        qh,
+                        K,
+                        V,
+                        cl,
+                        T,
+                        hd,
+                        Hq,
+                        Hk,
+                        float(at.scaling),
+                        tree_mask if tree else ("causal" if T > 1 else None),
+                        attn_pa,
+                        prepared=tree_prep,
+                        nodes=(past, nodes) if (step_nodes and spec_on) else None,
+                    )
                 a = a * m.sigmoid(gate)
                 hm = hm + be.matmul(a, at.o_proj.mx)
             else:
                 la = tmpl.linear_attn
                 lin = delta_layer(cache, i) if cache is not None else None
-                if step_nodes and T == 1 and not spec_on and getattr(self, "mlx_delta", True):
+                if rows is not None:
+                    # B rows of one position each, every row's states its own: each row through the one-row step's
+                    # dispatch (`_mlx_delta_one`), the new states written back after the eval
+                    assert lin is not None  # a batched step runs over its rows' cache
+                    mixed, z, b, a_ = (t.astype(m.float32) for t in self._mlx_delta_proj(la, x))
+                    conv_mx, rec_mx = self._mlx_lin_adopt(lin)
+                    cores, convs, recs = [], [], []
+                    for r in range(T):
+                        c_, cn, rn = self._mlx_delta_one(
+                            w, mixed[r], z[r], a_[r], b[r], conv_mx[r : r + 1], rec_mx[r : r + 1]
+                        )
+                        assert rn is not None  # not in place: the row's state handed back
+                        cores.append(c_)
+                        convs.append(cn)
+                        recs.append(rn)
+                    pend_rows.append((lin, m.stack(convs), m.stack(recs)))
+                    hm = hm + be.matmul(m.stack(cores).astype(hm.dtype), la.out_proj.mx)
+                elif step_nodes and T == 1 and not spec_on and getattr(self, "mlx_delta", True):
                     # the plain decode position in MLX ops: the states stay in the graph, no round trip
                     assert lin is not None  # a step over nodes runs over its cache
                     mixed, z, b, a_ = (t[0].astype(m.float32) for t in self._mlx_delta_proj(la, x))
                     conv_mx, rec_mx = self._mlx_lin_adopt(lin)
-                    if self.mlx_state.delta_mode == "recurrent" and w["delta"]["dk"] % 32 == 0:
-                        # the same Metal dispatch as the prefill, over one position
-                        d = w["delta"]
-                        # the state written into the cache's buffer by the kernel unless the graph carries it
-                        core, conv_new, rec_new = mlxdev.delta_prefill(
-                            mixed[None],
-                            z[None],
-                            a_[None],
-                            b[None],
-                            conv_mx[0][:, 1:],
-                            rec_mx,
-                            d["conv_w"],
-                            d["conv_b"],
-                            d["a_log"],
-                            d["dt_bias"],
-                            d["norm_w"],
-                            d["eps"],
-                            d["hk"],
-                            d["hv"],
-                            d["dk"],
-                            d["dv"],
-                            d["key_dim"],
-                            inplace=not lazy,
-                        )
-                        core = core[0]
-                    else:
-                        core, conv_new, rec_new = self._mlx_delta_step(w, mixed, z, a_, b, conv_mx, rec_mx)
+                    # the state written into the cache's buffer by the kernel unless the graph carries it
+                    core, conv_new, rec_new = self._mlx_delta_one(w, mixed, z, a_, b, conv_mx, rec_mx, inplace=not lazy)
                     pending.append((lin, conv_new, rec_new))
                     if rec_new is None:
                         pend_inplace.add(id(lin))
@@ -2367,12 +2604,16 @@ class _MlxMixin(_State):
                     hm = hm + mlxdev.to_mx(mix[0].to(dt).contiguous())
             x2 = self._mlx_norm(hm, w["ln2"], w["eps2"])
             mlp = tmpl.mlp
-            gu_w = self._mlx_fused(mlp, "_mx_gu")
-            if gu_w is not None and silu:
-                mid = fk.silu_mul(be.matmul(x2, gu_w))
+            mix = self.fam.mixture(mlp) if "router" in w else None
+            if mix is not None:
+                hm = hm + self._mlx_mixture(i, mix, w["router"], x2)
             else:
-                mid = act(be.matmul(x2, mlp.gate_proj.mx)) * be.matmul(x2, mlp.up_proj.mx)
-            hm = hm + be.matmul(mid, mlp.down_proj.mx)
+                gu_w = self._mlx_fused(mlp, "_mx_gu")
+                if gu_w is not None and silu:
+                    mid = fk.silu_mul(be.matmul(x2, gu_w))
+                else:
+                    mid = act(be.matmul(x2, mlp.gate_proj.mx)) * be.matmul(x2, mlp.up_proj.mx)
+                hm = hm + be.matmul(mid, mlp.down_proj.mx)
             if i in self.cold:
                 m.eval(hm)
                 self._cold_release(i)
@@ -2382,7 +2623,9 @@ class _MlxMixin(_State):
         if writes:
             # a paged cache's rows into its pages with the pass, whatever evaluates it (a pipelined step its pick)
             hm = m.depends(hm, writes)
-        if lazy and not fresh:
+        # a batched step's states go back with the pass, never carried in the graph: the rows' undo and selection read
+        # the cache's tensors (branches.py `_point`, `_select`)
+        if lazy and not fresh and rows is None:
             for cl_, cn, rn in pending:
                 # adopted by its step (`_mlx_lin_adopt`), whose lazy state the graph carries
                 assert has_graph_states(cl_) and rn is not None
@@ -2391,6 +2634,7 @@ class _MlxMixin(_State):
                 cl_._mx_pending = (cn[None], rn[None])
             return self._mlx_finish(hm, last_only, head, n_layers, t0, lazy=True)
         extra = [a for _, cn, rn in pending for a in (cn, rn) if a is not None]
+        extra += [a for _, cn, rn in pend_rows for a in (cn, rn)]
         extra += [a for _, cn, rn, _ in fresh for a in (cn, rn)]
 
         def after() -> None:

@@ -266,7 +266,7 @@ def stored_quants() -> list[Quant]:
 
 
 # the stored types the MLX megakernel multiplies as stored, each through its launch's own chain: every stored class;
-# its registry (`mlx.mega.kernel.STORED`) is held to this at import, so the torch-free cert reads the same set
+# its registry (`mlx.stored.STORED`) is held to this at import, so the torch-free cert reads the same set
 MEGA_STORED: frozenset[Quant] = frozenset(stored_quants())
 
 
@@ -304,6 +304,16 @@ def pooled_layout(items: Sequence[tuple[Quant, int]]) -> tuple[list[tuple[int, .
                     offs[k].append(at)
                     at += sizes[k][i]
     return [tuple(o) for o in offs], at
+
+
+class RouteMode(StrEnum):
+    """how a mixture's router turns a row's logits into its picks' weights (`mlx.moe.route`): a softmax over every
+    expert, renormalized over the picks or not (Qwen3.5-MoE always, Qwen4 where its config says so), or a softmax over
+    the picks' logits alone (gpt-oss)"""
+
+    SOFTMAX_ALL = "softmax_all"
+    SOFTMAX_ALL_NORM = "softmax_all_norm"
+    SOFTMAX_PICKS = "softmax_picks"
 
 
 # the float types a GGUF's expert store also holds as the file's and multiplies with its own kernel, so a quantizer's

@@ -674,6 +674,39 @@ def check_gemv_rows() -> str:
     return "rows alone and in passes of 2-63 rows bit-exact (bf16, float32)"
 
 
+def check_steel_rows() -> str:
+    """a prefill's rows through the gemm are their one-row steps: the route's every width (the matvec's, steel's each
+    tile, partial tiles, a K of no whole BK steps, MLX's own gemm at short K) for each weight dtype, x in bf16 and
+    float32, bit for bit"""
+    import mlx.core as mx
+
+    from btb import mlx as mlxdev
+    from btb.mlx import steel
+    from btb.mlx.backend import Stat
+
+    be = mlxdev.Backend.__new__(mlxdev.Backend)
+    be.gemm_rows = 64
+    be.stat = Stat(linears=0, evals=0, s=0.0, layers=0, layer_s=0.0)
+    mx.random.seed(5)
+    widths = (2, 31, 32, 63, 64, 65, 127, 200, 256, 300)
+    # (1000, 2056) and (1536, 2560) take steel (K past max(M, N)), (4096, 1024) and (2048, 512) MLX's gemm
+    assert {steel.pick(t, r) for t in widths if t >= 32 for r in (1000, 1536)} == set(steel.TILES), "a tile unchecked"
+    bad = []
+    for rows, cols in ((1000, 2056), (1536, 2560), (4096, 1024), (2048, 512)):
+        for wdt in (mx.bfloat16, mx.float16, mx.float32):
+            w = mlxdev.Weight((mx.random.normal((rows, cols)) * 0.05).astype(wdt))
+            for dt in (mx.bfloat16, mx.float32):
+                X = mx.random.normal((max(widths), cols)).astype(dt)
+                one = mx.concatenate([be.matmul(X[i : i + 1], w) for i in range(max(widths))])
+                for t in widths:
+                    full = be.matmul(X[:t], w)
+                    mx.eval(full, one)
+                    if full.dtype != one.dtype or not mx.array_equal(full, one[:t]):
+                        bad.append((rows, cols, str(wdt), str(dt), t))
+    assert not bad, f"a prefill's row is not its one-row step: {bad}"
+    return f"rows of passes of {', '.join(map(str, widths))} rows are their one-row steps (bf16/f16/f32 weights)"
+
+
 _FP4 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
 
 
@@ -1210,6 +1243,7 @@ def check_batch_rows() -> str:
     kernel's tile), through a left-padded batch as
     serve() sends one"""
     from btb.engine import StreamedTextModel
+    from btb.engine.generate import as_rows
 
     fx = fixture("tiny_qwen3")
     native_library()
@@ -1223,11 +1257,11 @@ def check_batch_rows() -> str:
                 torch.randint(0, 256, (int(torch.randint(3, 13, (1,), generator=g)),), generator=g).tolist()
                 for _ in range(B)
             ]
-            single = [sm.generate_greedy(torch.tensor([r]), 10) for r in rows]
+            single = [sm.generate_greedy(r, 10) for r in rows]
             ids, mask = StreamedTextModel.pad_left(rows, 0)
-            batched = sm.generate_greedy(ids, 10, attention_mask=mask)
+            batched = as_rows(sm.generate_greedy(ids, 10, attention_mask=mask))
             assert len(batched) == B
-            bad = [b for b in range(B) if list(batched[b]) != list(single[b])]
+            bad = [b for b in range(B) if batched[b] != single[b]]
             assert not bad, (
                 f"B={B}: rows {bad} differ from their single decodes: {[(batched[b], single[b]) for b in bad[:2]]}"
             )
@@ -1244,6 +1278,7 @@ def check_sampled_rows() -> str:
     itself, then a reversed one), a batch of rows gives each row's own single sampled decode, and the sample
     is not the greedy answer"""
     from btb.engine import StreamedTextModel
+    from btb.engine.generate import as_rows
     from btb.sampling import Sampling
 
     fx = fixture("tiny_qwen3")
@@ -1254,9 +1289,9 @@ def check_sampled_rows() -> str:
         sm = host_model(fx, device="mlx", dtype=torch.bfloat16)
         speculation(sm, tree_budget=0, v_max=4, ngram_p=0.9, tree_min_prob=0.0)
         row = torch.randint(0, 256, (12,), generator=g).tolist()
-        plain = list(sm.generate_greedy(torch.tensor([row]), 24, sampling=s9))
-        assert plain != list(sm.generate_greedy(torch.tensor([row]), 24)), "the sample is the greedy answer"
-        assert plain == list(sm.generate_greedy(torch.tensor([row]), 24, sampling=s9)), "a seed repeats"
+        plain = sm.generate_greedy(row, 24, sampling=s9)
+        assert plain != sm.generate_greedy(row, 24), "the sample is the greedy answer"
+        assert plain == sm.generate_greedy(row, 24, sampling=s9), "a seed repeats"
         wrong = plain[:6] + [(t + 1) % 256 for t in plain[6:]]  # every draft past the prefix another token
         for tag, span in (("answer", plain), ("wrong", wrong)):
             spec, census = sm.generate_speculative(
@@ -1268,10 +1303,10 @@ def check_sampled_rows() -> str:
             torch.randint(0, 256, (int(torch.randint(3, 13, (1,), generator=g)),), generator=g).tolist()
             for _ in range(4)
         ]
-        single = [list(sm.generate_greedy(torch.tensor([r]), 10, sampling=s9)) for r in rows]
+        single = [sm.generate_greedy(r, 10, sampling=s9) for r in rows]
         ids, mask = StreamedTextModel.pad_left(rows, 0)
-        batched = sm.generate_greedy(ids, 10, attention_mask=mask, sampling=s9)
-        bad = [b for b in range(4) if list(batched[b]) != single[b]]
+        batched = as_rows(sm.generate_greedy(ids, 10, attention_mask=mask, sampling=s9))
+        bad = [b for b in range(4) if batched[b] != single[b]]
         assert not bad, f"rows {bad} differ from their single sampled decodes: {[(batched[b], single[b]) for b in bad]}"
         sm.close()
     return "sampled: pipelined == speculative under one seed, 4 batched rows == their single decodes"
@@ -1338,6 +1373,7 @@ def main() -> int:
         check_unpack,
         check_gemv,
         check_gemv_rows,
+        check_steel_rows,
         check_rope,
         check_rope_nodes,
         check_cache,

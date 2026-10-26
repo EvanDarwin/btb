@@ -55,7 +55,26 @@ from __future__ import annotations
 import math
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from typing import TypedDict
+
+
+class PricingReport(TypedDict):
+    """`SpecCost.report`: whether the call priced its passes, the passes by their rows, the model's seconds against
+    the measured, the fitted figures, and each source's calibration by depth"""
+
+    active: bool
+    rows: dict[int, int]
+    predicted_s: float
+    measured_s: float
+    priced_passes: int
+    step_s: float
+    step_wait_s: float
+    compute_exponent: float
+    draft_s: float
+    miss_ms: float
+    reads_step: float
+    reads_exponent: float
+    calibration: dict[str, list[float]]
 
 
 def _mix(old: float | None, new: float, keep: float) -> float:
@@ -449,7 +468,7 @@ class SpecCost:
         """`tag`'s calibration by depth, 1 .. DEPTHS"""
         return [round(self.cal(tag, d), 3) for d in range(1, self.DEPTHS + 1)]
 
-    def report(self) -> dict[str, Any]:
+    def report(self) -> PricingReport:
         """the call's pricing: whether it sized the passes, the rows its passes carried, the model's seconds
         against the measured, and the figures behind them"""
         tags = sorted({t for t, _d in self.cal_p})

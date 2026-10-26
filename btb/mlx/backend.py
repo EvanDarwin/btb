@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Evan Darwin - FSL-1.1-ALv2
 """The MLX backend an engine on the MLX device holds: its weights as views over shared buffers, the matmul
-route (the kernel up to 16 rows, the GEMM past), rope, the fused views, and the accounting of what MLX holds."""
+route (the matvec for few rows, steel's gemm past), rope, the fused views, and the accounting of what MLX holds."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from .iquant import (
 from .kquant import dequant_q2k, dequant_q3k, dequant_q4k, dequant_q5k, matvec_q2k, matvec_q3k, matvec_q4k, matvec_q5k
 from .legacyq import dequant_legacy, matvec_legacy
 from .q6k import dequant_q6k, gather_q6k, matvec_q6k
+from .steel import FROM_ROWS, gemm
 
 if TYPE_CHECKING:
     import mlx.core as mx_
@@ -107,6 +108,19 @@ def stored_streams(q: Quant, raw: RawBytes) -> Streams:
     if a is not raw:
         m.eval(*out)
     return out
+
+
+def place_streams(q: Quant, raw: np.ndarray, dst: np.ndarray, offs: Sequence[int]) -> list[int]:
+    """type `q`'s streams for the file's bytes `raw` written into `dst` (bytes) at `offs` (`kinds.pooled_layout`'s),
+    once: the blocks as they are, a split type's streams made from them first (`raw` may lie under `dst`). Returns
+    each stream's bytes"""
+    if stored_in_place(q):
+        parts = [raw.reshape(-1).view(np.uint8)]
+    else:
+        parts = [np.asarray(s).reshape(-1).view(np.uint8).copy() for s in stored_streams(q, raw)]
+    for o, p in zip(offs, parts, strict=True):
+        dst[o : o + p.size] = p
+    return [int(p.size) for p in parts]
 
 
 def stored_matvec(q: Quant, streams: Streams, x: mx_.array, rows: int, cols: int) -> mx_.array:
@@ -281,6 +295,16 @@ class Weight:
         if self.packed is not None or self.q is not None:
             self.a = None
 
+    def first_rows(self, n: int) -> Weight:
+        """the weight's first `n` rows as a weight of their own over the same bytes, nothing decoded: a stored type's
+        streams each hold its blocks row by row, so the rows are a prefix of each; a 12-bit record has no row prefix"""
+        rows, cols = (int(s) for s in self.shape)
+        if self.q is not None:
+            return Weight(q=self.q, streams=tuple(s[: int(s.size) * n // rows] for s in self.streams), shape=(n, cols))
+        if self.packed is not None:
+            raise ValueError("[mlx] a 12-bit record's rows are not a prefix of its streams")
+        return Weight(self.get()[:n])
+
 
 def _expert_rows(xm: mx_.array, token_idx: Sequence[int]) -> ExpertOut:
     """an expert's rows of xm [T, H]: (their indices, None where it takes the one row whole; the rows)"""
@@ -441,16 +465,20 @@ class Backend:
         if w.q is not None:
             rows, cols = (int(s) for s in w.shape)
             # the type's kernel reads the weight once a 16 rows, so a prefill of `gemm_rows` rows or more widens it
-            # once to bf16 for MLX's gemm (4x faster at 512 rows), as a bf16 weight's prefill takes the gemm
+            # once to bf16 for the gemm (4x faster at 512 rows), as a bf16 weight's prefill takes the gemm
             if int(x.shape[0]) < self.gemm_rows:
                 return stored_matvec(w.q, w.streams, x, rows, cols)
             W = stored_dequant(w.q, w.streams, rows, cols)
+            if cols % 8 == 0 and x.dtype in (m.float32, m.bfloat16):
+                return gemm(W, x)
             return m.matmul(x, (W.astype(m.float32) if x.dtype == m.float32 else W).T)
         W = w.get()
-        # under `gemm_rows`: the engine's kernel, each row's bits its own whatever the width (a verify pass or a batch
-        # computes each row as the one-row step does); from there (prefill) MLX's gemm
-        if int(x.shape[0]) < self.gemm_rows and int(W.shape[1]) % 8 == 0 and x.dtype in (m.float32, m.bfloat16):
-            return gemv(W, x)
+        # each row's bits its own whatever the width (a verify pass, a batch or any cut of a prefill computes each row
+        # as the one-row step does): the engine's matvec, then steel's gemm (the same chain) from `FROM_ROWS` rows of
+        # bf16, or `gemm_rows` of float32 (the gemm widens the weight a whole copy, the matvec as it stages it)
+        if int(W.shape[1]) % 8 == 0 and x.dtype in (m.float32, m.bfloat16):
+            narrow = FROM_ROWS if W.dtype == m.bfloat16 and x.dtype == m.bfloat16 else self.gemm_rows
+            return gemv(W, x) if int(x.shape[0]) < narrow else gemm(W, x)
         if x.dtype == m.float32:
             return m.matmul(x, W.astype(m.float32).T)
         return m.matmul(x, W.T)

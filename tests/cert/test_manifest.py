@@ -297,6 +297,9 @@ def test_the_mlx_step_fork_is_tagged_per_family() -> None:
     assert step.expect(FamilyKind.GEMMA3, bf16, None) is PassTag.MLX_STEP_FUSED
     assert step.expect(FamilyKind.PHI3, bf16, None) is PassTag.MLX_STEP_UNFUSED
     assert step.expect(FamilyKind.QWEN3_5, bf16, None) is PassTag.MLX_HYBRID
+    assert step.expect(FamilyKind.QWEN3_5_MOE, bf16, None) is PassTag.MLX_HYBRID, "a hybrid mixture's picks on the GPU"
+    for s in (spec.Storage.SAFE_FP8, spec.Storage.GGUF_MXFP4):
+        assert step.expect(FamilyKind.QWEN3_5_MOE, s, None) is PassTag.MLX_PEROP, f"no gather for {s.value} experts"
     assert step.expect(FamilyKind.GPT_OSS, bf16, None) is PassTag.MLX_PEROP
     assert fp32.expect(FamilyKind.QWEN3, bf16, None) is PassTag.MLX_STEP_UNFUSED
 

@@ -10,11 +10,12 @@ from collections.abc import Iterable, Mapping
 from enum import StrEnum
 from typing import NamedTuple
 
-from ...kinds import MEGA_STORED, Quant, quant_key
-from .. import aluminum, fused, iquant, kquant, legacyq, matvec, q6k
+from ...kinds import Quant, quant_key
+from .. import aluminum, fused, matvec
 from ..core import mx
 from ..gemv import GEMM_SRC, gemm_sgn
 from ..matvec import StoredKernel
+from ..stored import STORED
 
 # a table row: op, units (the op's work items, a threadgroup each), REFS (buffer, offset) references from column
 # REF0, n0, n1, n2, f0's bits, and from column DEP0 the instructions it reads the output of (index + 1, 0 for none)
@@ -219,9 +220,7 @@ SOURCE: dict[OpName, str] = {}
 # over 2000 than the same items on a line
 GRID3: frozenset[OpName] = frozenset({OpName.ATTN, OpName.ATTN_TREE, OpName.ATTN_PHASED})
 
-# the stored types the kernel multiplies as stored, each through its launch's own chain (`matvec.StoredKernel`)
-STORED: dict[Quant, StoredKernel] = {**kquant.KERNELS, **q6k.KERNELS, **legacyq.KERNELS, **iquant.KERNELS}
-assert set(STORED) == MEGA_STORED, f"kinds.MEGA_STORED and the kernel's stored types differ: {set(STORED)}"
+# each stored type's matvec and embedding row, through its launch's own chain (`stored.STORED`)
 MV_OP: dict[Quant, OpName] = {q: OpName(f"mv_{quant_key(q)}") for q in STORED}
 EMBED_OP: dict[Quant, OpName] = {q: OpName(f"embed_{quant_key(q)}") for q in STORED}
 # what an op needs ahead of it in the kernel's header, once however many ops need it: a stored type's namespace
@@ -1036,7 +1035,7 @@ def head_source(heads: Iterable[HeadMv]) -> str:
     tab, mi = INPUTS.index("tab") + 1, len(INPUTS) + 1
     out = [_preamble(), "#include <metal_simdgroup_matrix>\n"]
     for h in heads:
-        d = f"#define NB {h.T}\n#define SGN {gemm_sgn(h.T, False)}\n#define XB 0\n#define WF16 0\n"
+        d = f"#define NB {h.T}\n#define SGN {gemm_sgn(h.T, False)}\n#define XB 0\n#define WF16 0\n#define WF32 0\n"
         sig = (
             f"kernel void {head_name(h)}(const device Buf* B [[buffer(0)]], const device uint* tab [[buffer({tab})]], "
             f"const device uint* mi [[buffer({mi})]], "

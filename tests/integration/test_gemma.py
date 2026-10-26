@@ -199,11 +199,11 @@ def test_gemma3_270m_fused_matches_eager() -> None:
     is unambiguous where the tiny random model's cannot be."""
     import btb
 
-    prompt = [[2, 818, 5279, 529, 7001, 563]]  # "The capital of France is", the earlier 270m parity prompt
+    prompt = [2, 818, 5279, 529, 7001, 563]  # "The capital of France is", the earlier 270m parity prompt
     sm = btb.load(REPO_270M, device="mlx")
 
     def greedy() -> list[int]:
-        return list(sm.generate_greedy(prompt, 12))
+        return sm.generate_greedy(prompt, 12)
 
     try:
         speculation(sm, tree_budget=0, v_max=0, ngram_p=0.0, tree_read="step")

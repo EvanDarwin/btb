@@ -19,17 +19,20 @@ import torch
 
 from ..api import api, carried, in_hook
 from ..draft import Spans
-from ..kinds import Json, PassReport, Proposer, TokenRows, Tokens
+from ..kinds import PassReport, Proposer, TokenRows, Tokens
 from ..sampling import GREEDY, Sampling
 from ..session import Session
 from ..text import Channels, Messages, TextStream, ToolSpecs, answer, messages_of, prompt_ids
+from .generate import as_rows
 from .hooks import HookArgs, Hooks, LogitsProcessor, OnPass, OnToken, Taps, TokenLogprob
 from .state import P, R, _State
 
 if TYPE_CHECKING:
     from .branches import Batch
+    from .cache import KvCache
     from .model import StreamedTextModel
     from .prefix import PrefixCache
+    from .spec_cost import PricingReport
 
 
 class GenerateStats(TypedDict, total=False):
@@ -50,14 +53,14 @@ class GenerateStats(TypedDict, total=False):
     prefill_s: float
     tokens_per_pass: float
     phase_s: dict[str, float]
-    by_source: dict[str, Any]
+    by_source: dict[str, dict[str, int]]  # "drafted" and "accepted": each source's tokens
     drafted_by_pos: list[int]
     accepted_by_pos: list[int]
     anchored: bool
     mtp_build_s: float
     mtp_steps: int
     mtp_step_s: float
-    priced: dict[str, Any]  # the passes' pricing by their rows' cost (`SpecCost.report`)
+    priced: PricingReport  # the passes' pricing by their rows' cost
 
 
 # a generation's shape: a row's tokens, logprobs and taps, or a list of each per row
@@ -586,7 +589,7 @@ class _TextMixin(_State):
         max_new = int(max_new)
         stop = tuple(self.stop_ids if eos is None else (int(e) for e in eos))
         smp = (sampling if sampling is not None else getattr(self, "sampling", None) or GREEDY).seeded()
-        seed: dict[str, Any] = {} if smp.greedy else {"seed": smp.seed}
+        seed: GenerateStats = {} if smp.greedy or smp.seed is None else {"seed": smp.seed}
         if len(rows) > 1 and session is not None:
             raise ValueError("a session holds one sequence: batch sessions with model.batch(sessions)")
         # a decode over a session is one transaction: committed at its end, rolled back however else it is left (a
@@ -606,35 +609,38 @@ class _TextMixin(_State):
         spans: Spans,
         speculate: bool,
         smp: Sampling,
-        seed: dict[str, Any],
+        seed: GenerateStats,
         hooks: Hooks,
     ) -> RowGeneration | BatchGeneration:
         """`_generate`'s rows decoded by the loop that fits them"""
+        plain: GenerateStats = {**seed, "cap": max_new, "proposer": "greedy", "tokens_per_pass": 1.0}
         if len({len(r) for r in rows}) > 1:
             # rows of their own lengths: left-padded in epochs the scheduler sizes
             out = self.serve(rows, max_new, eos_ids=stop, sampling=smp, hooks=hooks)
-            return self._batch_result(out, dict(cap=max_new, proposer="greedy", tokens_per_pass=1.0, **seed), hooks)
+            return self._batch_result(out, plain, hooks)
         v = max(0, int(self.v_max)) if speculate else 0
-        if len(rows) > 1 or (v == 0 and session is None):
-            # several rows, or no drafts and no session to keep: the plain loop (the speculative loop is one row)
-            out = self.generate_greedy(rows, max_new, eos_ids=stop, on_token=on_token, sampling=smp, hooks=hooks)
-            stats = dict(cap=max_new, proposer="greedy", tokens_per_pass=1.0, **seed)
-            if len(rows) > 1:
-                return self._batch_result(out, stats, hooks)
-            return self._row_result(out, stats, hooks)
+        if len(rows) > 1:
+            # several rows: the plain loop (the speculative loop is one row)
+            got = self.generate_greedy(rows, max_new, eos_ids=stop, on_token=on_token, sampling=smp, hooks=hooks)
+            return self._batch_result(as_rows(got), plain, hooks)
+        if v == 0 and session is None:
+            # no drafts and no session to keep: the plain loop
+            one = self.generate_greedy(rows[0], max_new, eos_ids=stop, on_token=on_token, sampling=smp, hooks=hooks)
+            return self._row_result(one, plain, hooks)
         if (
             v == 0
+            and session is not None
             and not hooks.active
             and getattr(self, "mlx", None) is not None
             and self._mlx_greedy_ok(len(rows), None, None, False)
         ):
             # plain decoding with a session on the MLX device: the pipelined loop, reusing the session's cache
-            out, c = self.generate_greedy(
+            toks, c = self.generate_greedy(
                 rows, max_new, eos_ids=stop, on_token=on_token, session=session, sampling=smp, hooks=hooks
             )
-            return self._row_result(out, dict(c, cap=max_new, proposer="greedy", tokens_per_pass=1.0, **seed), hooks)
+            return self._row_result(toks, {**c, **plain}, hooks)
         prop = self.proposer if v > 0 else Proposer.NGRAM
-        one, c = self.generate_speculative(
+        drafted, c = self.generate_speculative(
             rows,
             max_new,
             eos_ids=stop,
@@ -646,22 +652,22 @@ class _TextMixin(_State):
             sampling=smp,
             hooks=hooks,
         )
-        return self._row_result(one, dict(c, cap=max_new), hooks)
+        return self._row_result(drafted, {**c, "cap": max_new}, hooks)
 
     @staticmethod
-    def _row_result(out: list[int], stats: Json, hooks: Hooks) -> RowGeneration:
+    def _row_result(out: list[int], stats: GenerateStats, hooks: Hooks) -> RowGeneration:
         """one row's tokens and counts, with what the hooks collected for it"""
         lp = (hooks.lp[0] if hooks.lp else []) if hooks.logprobs is not None else None
         taps = _stacked(hooks)
         hidden = (taps[0] if taps else {}) if hooks.taps else None
-        return Generation(out, cast(GenerateStats, stats), lp, hidden)
+        return Generation(out, stats, lp, hidden)
 
     @staticmethod
-    def _batch_result(out: list[list[int]], stats: Json, hooks: Hooks) -> BatchGeneration:
+    def _batch_result(out: list[list[int]], stats: GenerateStats, hooks: Hooks) -> BatchGeneration:
         """the rows' tokens and counts, with what the hooks collected, a list per row"""
         lp = hooks.lp if hooks.logprobs is not None else None
         hidden = _stacked(hooks) if hooks.taps else None
-        return Generation(out, cast(GenerateStats, stats), lp, hidden)
+        return Generation(out, stats, lp, hidden)
 
     def ask(
         self,
@@ -722,7 +728,7 @@ class _TextMixin(_State):
                 holdings.own(Stage.MEMORY, "the prefix cache's pages", kv.close)
         return cast("PrefixCache | None", self.__dict__["_kv"])
 
-    def _decode_cache(self, max_len: int | None = None) -> Any:
+    def _decode_cache(self, max_len: int | None = None) -> KvCache:
         """one sequence's cache for a decode no session lends one to: over the prefix cache's pool where the engine
         has one - its attention reads pages as a session's does, nothing goes into the tree, and the pages go back
         with the cache - else a contiguous one reaching `max_len` (the context's, None)"""

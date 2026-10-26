@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import weakref
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any, Protocol, TypedDict, TypeGuard, cast
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast
 
 import torch
 
@@ -14,6 +14,8 @@ from .. import mlx as mlxdev
 from .device import DeviceSpec, Where, where
 
 if TYPE_CHECKING:
+    from typing import TypeIs
+
     import mlx.core as mx_
     from transformers.cache_utils import (
         CacheLayerMixin,
@@ -103,7 +105,7 @@ class GraphStates(Protocol):
     _mx_prev: tuple[mx_.array, mx_.array] | None
 
 
-def has_graph_states(cl: object) -> TypeGuard[GraphStates]:
+def has_graph_states(cl: object) -> TypeIs[GraphStates]:
     """`cl` carries every `GraphStates` attribute: `adopt_states` sets them together"""
     return hasattr(cl, "_mx_states")
 

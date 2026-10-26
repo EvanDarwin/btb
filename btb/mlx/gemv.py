@@ -84,7 +84,8 @@ GEMM_SRC = """
     // the hardware's fixed order over K whatever else the tile holds, so row b is the same bits alone or in a tile
     // of any width, and the tile's rows cost no memory traffic beyond the one weight read.
     // XB: bf16 x and bf16 tiles, y bf16 (round to nearest even); else float32 x and float tiles (the weight
-    // widened at the stage), y float32. SGN simdgroups a threadgroup, as many as its memory holds the tiles of.
+    // widened at the stage, or a float32 one's as it is: WF32), y float32. SGN simdgroups a threadgroup, as many as
+    // its memory holds the tiles of.
     constexpr uint KT = 64;
     constexpr uint NA = (NB + 7) / 8;  // the 8-row blocks of x
     constexpr uint NX = 2 * NA;        // the 4-row groups a lane stages
@@ -124,11 +125,13 @@ GEMM_SRC = """
     #pragma unroll
     for (uint j = 0; j < NA; ++j) acc[j] = simdgroup_float8x8(0.0f);
     uint nstep = (K + KT - 1) / KT;
-    uint4 w0 = uint4(0u), w1 = uint4(0u), xv[NX], xv2[NX];
+    // a lane's 8 weights of a row a step: one uint4 of a 16-bit weight, two of a float32 one (w0b, w1b its second)
+    constexpr uint WSTEP = WF32 ? KT / 4 : KT / 8;
+    uint4 w0 = uint4(0u), w1 = uint4(0u), w0b = uint4(0u), w1b = uint4(0u), xv[NX], xv2[NX];
     #pragma unroll
     for (uint i = 0; i < NX; ++i) { xv[i] = uint4(0u); xv2[i] = uint4(0u); }
-    if (ok0 && wc < K) w0 = wp0[0];
-    if (ok1 && wc < K) w1 = wp1[0];
+    if (ok0 && wc < K) { w0 = wp0[0]; if (WF32) w0b = wp0[1]; }
+    if (ok1 && wc < K) { w1 = wp1[0]; if (WF32) w1b = wp1[1]; }
     #pragma unroll
     for (uint i = 0; i < NX; ++i) if (xok[i] && wc < K) { xv[i] = xp[i][0]; if (!XB) xv2[i] = xp[i][1]; }
     for (uint st = 0; st < nstep; ++st) {
@@ -141,7 +144,12 @@ GEMM_SRC = """
         {
             threadgroup float4* d0 = (threadgroup float4*)(ws + wr0 * KT + wc);
             threadgroup float4* d1 = (threadgroup float4*)(ws + wr1 * KT + wc);
-#if WF16
+#if WF32
+            d0[0] = as_type<float4>(w0);
+            d0[1] = as_type<float4>(w0b);
+            d1[0] = as_type<float4>(w1);
+            d1[1] = as_type<float4>(w1b);
+#elif WF16
             // an f16 weight (a GGUF's float expert): each half widened exactly, the low one of a word first
             d0[0] = float4(float2(as_type<half2>(w0.x)), float2(as_type<half2>(w0.y)));
             d0[1] = float4(float2(as_type<half2>(w0.z)), float2(as_type<half2>(w0.w)));
@@ -168,8 +176,12 @@ GEMM_SRC = """
         simdgroup_barrier(mem_flags::mem_threadgroup);
         uint kn = (st + 1) * KT;
         bool more = st + 1 < nstep;
-        w0 = (more && ok0 && kn + wc < K) ? wp0[(st + 1) * (KT / 8)] : uint4(0u);
-        w1 = (more && ok1 && kn + wc < K) ? wp1[(st + 1) * (KT / 8)] : uint4(0u);
+        w0 = (more && ok0 && kn + wc < K) ? wp0[(st + 1) * WSTEP] : uint4(0u);
+        w1 = (more && ok1 && kn + wc < K) ? wp1[(st + 1) * WSTEP] : uint4(0u);
+        if (WF32) {
+            w0b = (more && ok0 && kn + wc < K) ? wp0[(st + 1) * WSTEP + 1] : uint4(0u);
+            w1b = (more && ok1 && kn + wc < K) ? wp1[(st + 1) * WSTEP + 1] : uint4(0u);
+        }
         #pragma unroll
         for (uint i = 0; i < NX; ++i) {
             bool g = more && xok[i] && kn + wc < K;
@@ -212,7 +224,7 @@ GEMM_SRC = """
 """
 
 
-_gemm_kernels: dict[tuple[int, int, int], MetalKernel] = {}
+_gemm_kernels: dict[tuple[int, int, int, int], MetalKernel] = {}
 _gemv_lock = threading.Lock()
 
 
@@ -223,15 +235,15 @@ def gemm_sgn(nb: int, xb: bool) -> int:
     return max(1, min(8 if xb else 4, 32768 // tile))
 
 
-def _gemm_kernel(xb: int, sgn: int, wf16: int = 0) -> MetalKernel:
+def _gemm_kernel(xb: int, sgn: int, wf16: int = 0, wf32: int = 0) -> MetalKernel:
     with _gemv_lock:
-        k = _gemm_kernels.get((xb, sgn, wf16))
+        k = _gemm_kernels.get((xb, sgn, wf16, wf32))
         if k is None:
-            k = _gemm_kernels[(xb, sgn, wf16)] = metal_kernel(
-                name=f"btb_gemm_rows_x{xb}_s{sgn}" + ("_f16" if wf16 else ""),
+            k = _gemm_kernels[(xb, sgn, wf16, wf32)] = metal_kernel(
+                name=f"btb_gemm_rows_x{xb}_s{sgn}" + ("_f16" if wf16 else "") + ("_f32" if wf32 else ""),
                 input_names=["w", "x"],
                 output_names=["y"],
-                header=_GEMM_HEADER + f"#define XB {xb}\n#define SGN {sgn}\n#define WF16 {wf16}\n",
+                header=_GEMM_HEADER + f"#define XB {xb}\n#define SGN {sgn}\n#define WF16 {wf16}\n#define WF32 {wf32}\n",
                 source=GEMM_SRC,
             )
     return k
@@ -241,29 +253,33 @@ def gemv(w_bf16: mx_.array, x: mx_.array) -> mx_.array:
     """y[b, rows] = x[b, cols] w[rows, cols]^T for any rows of x (bf16 or float32), float32 accumulation over the
     bf16 weight as it is, y in x's dtype: launches of about equal rows, `TILE_ROWS` at most. Batch-invariant: row i
     of y is the same bits whatever rows travel with it. Needs cols % 8 == 0. An f16 weight (a GGUF's float expert)
-    is widened exactly into the float32 tiles, a bf16 x with it and y rounded back to bf16."""
+    is widened exactly into the float32 tiles, a bf16 x with it and y rounded back to bf16; a float32 weight (a
+    router kept as stored) takes float32 rows, a bf16 x widened and y float32"""
     m = mx
     b = int(x.shape[0])
     if b < 1:
         raise ValueError(f"[mlx] the matvec takes at least one row, got {b}")
     wf16 = w_bf16.dtype == m.float16
+    wf32 = w_bf16.dtype == m.float32
     if wf16 and x.dtype == m.bfloat16:
         return gemv(w_bf16, x.astype(m.float32)).astype(m.bfloat16)
+    if wf32 and x.dtype != m.float32:
+        x = x.astype(m.float32)
     xb = x.dtype == m.bfloat16
     n = -(-b // TILE_ROWS[xb])
     size = -(-b // n)
     if n == 1:
-        return _gemv_tile(w_bf16, x, xb, wf16)
-    return m.concatenate([_gemv_tile(w_bf16, x[s : s + size], xb, wf16) for s in range(0, b, size)], axis=0)
+        return _gemv_tile(w_bf16, x, xb, wf16, wf32)
+    return m.concatenate([_gemv_tile(w_bf16, x[s : s + size], xb, wf16, wf32) for s in range(0, b, size)], axis=0)
 
 
-def _gemv_tile(w_bf16: mx_.array, x: mx_.array, xb: bool, wf16: bool = False) -> mx_.array:
+def _gemv_tile(w_bf16: mx_.array, x: mx_.array, xb: bool, wf16: bool = False, wf32: bool = False) -> mx_.array:
     m = mx
     rows, nb = int(w_bf16.shape[0]), int(x.shape[0])
     sgn = gemm_sgn(nb, xb)
     tg = (rows + 8 * sgn - 1) // (8 * sgn)
-    y = _gemm_kernel(int(xb), sgn, int(wf16))(
-        inputs=[w_bf16.view(m.uint16), x.view(m.uint16) if xb else x],
+    y = _gemm_kernel(int(xb), sgn, int(wf16), int(wf32))(
+        inputs=[w_bf16 if wf32 else w_bf16.view(m.uint16), x.view(m.uint16) if xb else x],
         template=[("NB", nb)],
         grid=(tg * 32 * sgn, 1, 1),
         threadgroup=(32 * sgn, 1, 1),
