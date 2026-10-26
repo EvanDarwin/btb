@@ -814,7 +814,6 @@ inline void op_delta_norm(thread const Ins& I, uint item, thread const Ctx& c) {
 # a stored type's `embed` in its namespace: a row decoded to bf16
 _STORED_FNS = r"""
 inline void embed(PARAMS, uint row, uint COLS, device bfloat* dst, uint tid) {
-    const uint NSB = COLS / BW;
 DECODE
 }
 """
@@ -826,8 +825,8 @@ REF_OF = {f: i for i, f in enumerate("ABCDEF")}
 
 
 def stored_inputs(k: StoredKernel) -> list[tuple[str, str]]:
-    """what a stored type's kernels read, each by its name and element type: its streams, then its tables"""
-    ins = [*k.streams, *((t.name, t.ctype) for t in k.tables)]
+    """what a stored type's kernels read (`matvec.inputs`), within an instruction's fields"""
+    ins = matvec.inputs(k)
     assert len(ins) <= len(STORED_FIELDS), f"a stored type reads {len(ins)} inputs, past the instruction's"
     return ins
 
@@ -855,11 +854,11 @@ def _undo(defs: str) -> str:
 
 
 def _stored_prelude(q: Quant, k: StoredKernel) -> str:
-    """type `q`'s namespace for the header: its defines, its device functions and `embed`, the defines undone"""
-    defs = f"#define BW {k.bw}\n{k.defs}"
+    """type `q`'s namespace for the header: its defines, its `w8` and `embed` (a row as the dequant decodes it), the
+    defines undone"""
     params = ", ".join(f"const device {t}* {n}" for n, t in stored_inputs(k))
-    fns = _STORED_FNS.replace("PARAMS", params).replace("DECODE", k.decode)
-    return f"{defs}namespace btb_{quant_key(q)} {{\n{k.header}{fns}}}\n{_undo(defs)}"
+    fns = _STORED_FNS.replace("PARAMS", params).replace("DECODE", matvec.DECODE_ROW)
+    return f"{k.defs}namespace btb_{quant_key(q)} {{\n{matvec.device_fns(k)}{fns}}}\n#undef W8\n{_undo(k.defs)}"
 
 
 for _q, _k in STORED.items():
@@ -924,9 +923,13 @@ def stored_name(s: StoredMv) -> str:
     return f"btb_mega_mv_{quant_key(s.q)}_{s.rows}_{s.cols}_{s.T}_{s.ld}_{int(s.f32)}"
 
 
-def stored_groups(q: Quant, rows: int, T: int) -> int:
-    """the threadgroups of 256 a stored matvec of `rows` at `T` pass rows takes, its launch's grid"""
-    return -(-matvec.threads(rows, T, STORED[q].shapes) // 256)
+def stored_groups(rows: int) -> int:
+    """the threadgroups a stored matvec of `rows` takes: the step's launch's (`matvec.tile_groups`)"""
+    return matvec.tile_groups(rows)
+
+
+# the threads a stored matvec's threadgroup takes: the step's launch's simdgroups
+STORED_THREADS = 32 * matvec.SGN
 
 
 def _signature(name: str, attrs: str) -> str:
@@ -974,34 +977,39 @@ def _preamble() -> str:
 
 
 def stored_source(mvs: Iterable[StoredMv]) -> str:
-    """the library of stored matvec kernels `mvs`: each its type's launch (`matvec.blocks`, the step's kernel) with its
+    """the library of stored matvec kernels `mvs`: each the step's launch (`matvec.TILE` over its type's `w8`) with its
     matrix, pass rows and y's row stride as constants, y [T, rows] (C) = x [T, cols] (B) . W^T, W the type's streams
-    and tables (`stored_inputs`, in A, D, E, F); a thread of the launch's grid a thread of the command's"""
+    and tables (`stored_inputs`, in A, D, E, F); a threadgroup of the launch's a threadgroup of the command's"""
     by_q: dict[Quant, list[StoredMv]] = {}
     for s in mvs:
         by_q.setdefault(s.q, []).append(s)
-    out = [_preamble()]
-    refs = {f: REF_OF[f] for f in STORED_FIELDS}
+    tab, mi = INPUTS.index("tab") + 1, len(INPUTS) + 1
+    out = [_preamble(), "#include <metal_simdgroup_matrix>\n"]
     for q, ss in by_q.items():
         k, key = STORED[q], quant_key(q)
-        ins = stored_inputs(k)
-        params = "".join(f"const device {t}* {n}, " for n, t in ins)
-        args = "".join(f"(const device {t}*)REF({refs[f]}), " for (_, t), f in zip(ins, STORED_FIELDS, strict=False))
-        out.append(f"{k.defs}namespace btb_{key} {{\n{k.header}")
-        for s in ss:
-            d = matvec.defines(s.rows, s.cols, k.bw, s.T, k.shapes, s.ld)
-            out.append(
-                f"{d}template <typename T>\ninline void {stored_name(s)}({params}const device T* x, "
-                f"device T* out, uint3 thread_position_in_grid) {{\n{matvec.blocks(k.frags)}}}\n{_undo(d)}"
-            )
-        out.append("}\n")
+        ins = "".join(
+            f"    const device {t}* {n} = (const device {t}*)REF({REF_OF[f]});\n"
+            for (n, t), f in zip(stored_inputs(k), STORED_FIELDS, strict=False)
+        )
+        out.append(f"{k.defs}namespace btb_{key} {{\n{matvec.device_fns(k)}}}\n")
         for s in ss:
             t = "float" if s.f32 else "bfloat"
-            out.append(
-                _signature(stored_name(s), "uint3 gp [[thread_position_in_grid]]")
-                + f"    btb_{key}::{stored_name(s)}<{t}>({args}(const device {t}*)REF(1), (device {t}*)REF(2), gp);\n}}\n"
+            d = matvec.tile_defines(s.rows, s.cols, s.T, not s.f32) + (
+                f"#define XROW(t) (x + (size_t)(t) * COLS)\n#define YROW(t) (out + (size_t)(t) * {s.ld})\n"
             )
-        out.append(_undo(k.defs))
+            out.append(
+                d + f"kernel void {stored_name(s)}(const device Buf* B [[buffer(0)]], "
+                f"const device uint* tab [[buffer({tab})]], const device uint* mi [[buffer({mi})]], "
+                "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], "
+                "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]], "
+                "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {\n"
+                f"    using namespace btb_{key};\n    const device uint* f = tab + mi[0] * ROW;\n{ins}"
+                f"    const device {t}* x = (const device {t}*)REF(1);\n    device {t}* out = (device {t}*)REF(2);\n"
+                + matvec.TILE.replace("BIND", "")
+                + "}\n"
+                + _undo(d)
+            )
+        out.append(f"#undef W8\n{_undo(k.defs)}")
     return "".join(out)
 
 

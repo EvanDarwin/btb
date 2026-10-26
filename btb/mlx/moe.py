@@ -193,7 +193,7 @@ def silu_apart(g: mx_.array, u: mx_.array) -> mx_.array:
 
 
 # the pass rows a gather serves, a step's or a verify pass's; a prefill's experts each take their rows' own matmuls
-ROWS_MAX = matvec.ROWS_MAX
+ROWS_MAX = 16
 # the store's blocks one gather binds: a launch's buffer table holds 31, beside the table, the picks, x, the output and
 # a type's codebooks
 BLOCKS_MAX = 24
@@ -257,40 +257,45 @@ def _compiled(key: tuple[object, ...], name: str, inputs: Sequence[str], outputs
     return k
 
 
+def _gather_source(q: Quant, rows: int, cols: int, items: int, nb: int, part: int, kp: int, xb: bool) -> matvec.Source:
+    k = STORED[q]
+    assert len(k.streams) <= STREAMS_MAX, f"{q} reads {len(k.streams)} streams, past a table row's"
+    # an item a threadgroup row (grid y): its expert's streams bound, its x row and y row the tile's one pass row
+    bind = "    uint item = threadgroup_position_in_grid.y;\n" + _bind(nb, part, "item", k.streams)
+    rowsof = f"#define XROW(t) (x + (size_t)(item / {kp}) * COLS)\n#define YROW(t) (out + (size_t)item * ROWS)\n"
+    return matvec.Source(
+        f"btb_moe_gather_{quant_key(q)}_x{int(xb)}_{rows}_{cols}_{items}_{nb}_{part}_{kp}",
+        [*(f"B{b}" for b in range(nb)), "tab", "ids", *(t.name for t in k.tables), "x"],
+        "#include <metal_simdgroup_matrix>\n" + k.defs + matvec.device_fns(k),
+        matvec.tile_defines(rows, cols, 1, xb) + rowsof + matvec.TILE.replace("BIND", bind),
+    )
+
+
 def gather(
     q: Quant | None, g: Gather, ids: mx_.array, x: mx_.array, rows: int, cols: int, part: int, kp: int
 ) -> mx_.array:
     """y [items, rows] in x's dtype: item i the matvec of x's row i // kp (kp a row's picks; 1 where x holds each
     item's own row) through expert ids[i]'s part `part` [rows, cols] where its streams lie in `g`'s blocks, its type's
-    one-row chain (`stored.STORED`, or the step's float32 matvec for a float type), lazily"""
+    chain (`stored.STORED`'s tile, or the step's float32 matvec for a float type), lazily"""
+    m = mx
     items, nb = int(ids.size), len(g.blocks)
     if q in FLOATS:
         return _gather_float(q, g, ids, x, rows, cols, part, kp)
     assert q is not None
-    k = STORED[q]
-    assert len(k.streams) <= STREAMS_MAX, f"{q} reads {len(k.streams)} streams, past a table row's"
-    rp = (k.shapes or matvec.SHAPES).get(1, (4, 1))[0]
-    shapes = {items: (rp, 1)}  # an item a simdgroup's pass row: its own expert's weights
-    key = ("stored", q, rows, cols, items, nb, part, kp)
-    d = matvec.defines(rows, cols, k.bw, items, shapes)
-    if kp > 1:
-        d += f"#undef XROW\n#define XROW(t) (x + (size_t)((t) / {kp}) * COLS)\n"
-    kern = _compiled(
-        key,
-        f"btb_moe_gather_{quant_key(q)}_{rows}_{cols}_{items}_{nb}_{part}_{kp}",
-        [*(f"B{b}" for b in range(nb)), "tab", "ids", *(t.name for t in k.tables), "x"],
-        ["out"],
-        k.defs + k.header + d,
-        matvec.blocks(k.frags, _bind(nb, part, "tr0", k.streams)),
+    xb = x.dtype == m.bfloat16
+    xin = x if xb else x.astype(m.float32)
+    kern = matvec.compiled(
+        ("moe_gather", q, rows, cols, items, nb, part, kp, xb),
+        lambda: _gather_source(q, rows, cols, items, nb, part, kp, xb),
     )
-    return kern(
-        inputs=[*g.blocks, g.tab, ids.reshape(-1), *(t.make() for t in k.tables), x],
-        grid=(-(-matvec.threads(rows, items, shapes) // 256) * 256, 1, 1),
-        threadgroup=(256, 1, 1),
+    y = kern(
+        inputs=[*g.blocks, g.tab, ids.reshape(-1), *(t.make() for t in STORED[q].tables), xin],
+        grid=(matvec.tile_groups(rows) * 32 * matvec.SGN, items, 1),
+        threadgroup=(32 * matvec.SGN, 1, 1),
         output_shapes=[(items, rows)],
-        output_dtypes=[x.dtype],
-        template=[("T", x.dtype)],
+        output_dtypes=[xin.dtype],
     )[0]
+    return y if y.dtype == x.dtype else y.astype(x.dtype)
 
 
 def _gather_float(

@@ -172,7 +172,7 @@ OPS: tuple[Op, ...] = (
     Op(
         "q6k",
         "q6k",
-        ("btb_q6k_mv_*_*", "btb_q6k_gather_*", "btb_q6k_dequant"),
+        ("btb_q6k_mv_*_*", "btb_q6k_dequant"),
         "kernels/test_gguf.py",
         funcs=("matvec_q6k", "dequant_q6k"),
     ),
@@ -220,7 +220,6 @@ OPS: tuple[Op, ...] = (
             "btb_moe_route",
             "btb_moe_combine",
             "btb_moe_silu_apart",
-            "btb_moe_gather_*_*_*_*_*_*_*",
             "btb_moe_gather_*_x*_*_*_*_*_*_*",
         ),
         "kernels/test_moe.py",

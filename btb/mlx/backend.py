@@ -26,7 +26,8 @@ from .iquant import (
 )
 from .kquant import dequant_q2k, dequant_q3k, dequant_q4k, dequant_q5k, matvec_q2k, matvec_q3k, matvec_q4k, matvec_q5k
 from .legacyq import dequant_legacy, matvec_legacy
-from .q6k import dequant_q6k, gather_q6k, matvec_q6k
+from .matvec import chain_x
+from .q6k import dequant_q6k, matvec_q6k
 from .steel import FROM_ROWS, gemm
 
 if TYPE_CHECKING:
@@ -124,8 +125,8 @@ def place_streams(q: Quant, raw: np.ndarray, dst: np.ndarray, offs: Sequence[int
 
 
 def stored_matvec(q: Quant, streams: Streams, x: mx_.array, rows: int, cols: int) -> mx_.array:
-    """y[T, rows] = x[T, cols] . W^T on type `q`'s own kernel over its `stored_streams`: f32 accumulation, y in x's
-    dtype, batch-invariant (16 rows a launch)"""
+    """y[T, rows] = x[T, cols] . W^T on type `q`'s own kernel over its `stored_streams`: the gemm's chain over its
+    weights (`matvec`), y in x's dtype, each row's bits its own whatever the width"""
     c, key = QUANT_KIND[q], quant_key(q)
     if c is QuantClass.FLOAT:
         return gemv(_floats(q, streams[0], rows, cols), x)
@@ -142,16 +143,21 @@ def _floats(q: Quant, raw: mx_.array, rows: int, cols: int) -> mx_.array:
     return raw.view(m.float16 if q is Quant.F16 else m.bfloat16).reshape(rows, cols)
 
 
-def stored_dequant(q: Quant, streams: Streams, rows: int, cols: int) -> mx_.array:
-    """the whole [rows, cols] weight of type `q` in bf16 from its `stored_streams`, gguf's numbers"""
+def stored_dequant(
+    q: Quant, streams: Streams, rows: int, cols: int, dtype: mx_.Dtype | None = None, chain: bool = False
+) -> mx_.array:
+    """the whole [rows, cols] weight of type `q` from its `stored_streams` in `dtype` (bf16 by default; float32 for
+    a float32 x's gemm): the weights its matvec multiplies. With `chain` (not a float type) [rows, chain_cols(cols)]
+    in its chain's column order, so the gemm over them and `chain_x(x)` is its chain"""
     c, key = QUANT_KIND[q], quant_key(q)
     if c is QuantClass.FLOAT:
-        return _floats(q, streams[0], rows, cols).astype(mx.bfloat16)
+        assert not chain  # a float type runs the dense route's chain over its weights as they are
+        return _floats(q, streams[0], rows, cols).astype(dtype or mx.bfloat16)
     if c is QuantClass.AFFINE:
-        return dequant_legacy(q.value.lower(), streams[0], rows, cols)
+        return dequant_legacy(q.value.lower(), streams[0], rows, cols, dtype, chain)
     if c is QuantClass.LATTICE:
-        return dequant_lattice(key, streams[0], rows, cols)
-    return _DEQUANT[key](*streams, rows, cols)
+        return dequant_lattice(key, streams[0], rows, cols, streams[1:], dtype, chain)
+    return _DEQUANT[key](*streams, rows, cols, dtype, chain)
 
 
 def _join_stored(ws: Sequence[Weight]) -> Weight | None:
@@ -448,31 +454,27 @@ class Backend:
     @staticmethod
     def gather_rows(w: Weight, tok: mx_.array) -> mx_.array:
         """rows `tok` (int32 [T]) of a stored weight as bf16 [T, cols], decoded from their own blocks - a tied
-        head's table read without a bf16 copy of the vocabulary: Q6_K's gather kernel, else each row's blocks taken
-        and dequantized"""
+        head's table read without a bf16 copy of the vocabulary: each row's part of each stream taken (a stream holds
+        its rows in order), then dequantized as the megakernel's embedding decodes a row"""
         assert w.q is not None  # the gather reads a stored weight's blocks
         m, (rows, cols) = mx, (int(s) for s in w.shape)
-        if w.q is Quant.Q6_K:
-            return gather_q6k(w.streams[0], tok, cols)
-        # the dequant reads the bytes alone, but IQ4_NL's split scale and nibble streams; a row's are contiguous
-        streams = w.streams if w.q is Quant.IQ4_NL else w.streams[:1]
-        picked = tuple(m.take(s.reshape(rows, -1), tok, axis=0).reshape(-1) for s in streams)
+        picked = tuple(m.take(s.reshape(rows, -1), tok, axis=0).reshape(-1) for s in w.streams)
         return stored_dequant(w.q, picked, int(tok.shape[0]), cols)
 
     def matmul(self, x: mx_.array, w: Weight) -> mx_.array:
         """x [b, cols] MLX (bf16 or float32), w a `Weight`: y [b, rows] in x's dtype, lazily."""
         m = mx
-        if w.q is not None:
+        floats = w.q is not None and QUANT_KIND[w.q] is QuantClass.FLOAT
+        if w.q is not None and not floats and x.dtype in (m.float32, m.bfloat16):
             rows, cols = (int(s) for s in w.shape)
-            # the type's kernel reads the weight once a 16 rows, so a prefill of `gemm_rows` rows or more widens it
-            # once to bf16 for the gemm (4x faster at 512 rows), as a bf16 weight's prefill takes the gemm
+            # the type's kernel decodes its weights into the gemm's fragments a launch; a prefill of `gemm_rows` rows or
+            # more decodes them once (bf16, or float32 for a float32 x: the fragments' numbers) in the chain's column
+            # order for the gemm over x taken in it, the same chain
             if int(x.shape[0]) < self.gemm_rows:
                 return stored_matvec(w.q, w.streams, x, rows, cols)
-            W = stored_dequant(w.q, w.streams, rows, cols)
-            if cols % 8 == 0 and x.dtype in (m.float32, m.bfloat16):
-                return gemm(W, x)
-            return m.matmul(x, (W.astype(m.float32) if x.dtype == m.float32 else W).T)
-        W = w.get()
+            return gemm(stored_dequant(w.q, w.streams, rows, cols, x.dtype, chain=True), chain_x(x, cols))
+        # a GGUF's float experts as the file holds them, the dense route's chain over them as they are
+        W = _floats(w.q, w.streams[0], *(int(s) for s in w.shape)) if floats and w.q is not None else w.get()
         # each row's bits its own whatever the width (a verify pass, a batch or any cut of a prefill computes each row
         # as the one-row step does): the engine's matvec, then steel's gemm (the same chain) from `FROM_ROWS` rows of
         # bf16, or `gemm_rows` of float32 (the gemm widens the weight a whole copy, the matvec as it stages it)

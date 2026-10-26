@@ -30,6 +30,7 @@ from .kernel import (
     MV_Q,
     NUM,
     PER_SHAPE,
+    STORED_THREADS,
     HeadMv,
     OpName,
     StoredMv,
@@ -216,8 +217,10 @@ class Replay:
             grid = (int(f[NUM]), int(f[NUM + 1]), int(f[NUM + 2]) & 0xFFFF) if op in GRID3 else (int(f[1]), 1, 1)
             if hd is not None:
                 pso, threads = self.heads[hd], head_threads(T)
+            elif mv is not None:
+                pso, threads = self.stored[mv], STORED_THREADS
             else:
-                pso, threads = (psos[int(f[0])] if mv is None else self.stored[mv]), THREADS
+                pso, threads = psos[int(f[0])], THREADS
             m.cmd(icb, k, pso, binds, [0] * (len(order) - 1) + [4 * k], grid, threads, barrier)
         ms = 1e3 * (time.perf_counter() - t0)
         trace.event("megakernel: a %d-row pass encoded, %d commands after %d barriers, in %.1f ms", T, n, barriers, ms)
