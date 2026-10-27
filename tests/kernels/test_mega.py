@@ -534,13 +534,13 @@ def test_mlx_float_ops_emulated_bit_for_bit() -> None:
     """the megakernel's copies of the float32 MLX ops a DeltaNet's front and norm take (kernel.py `MLX_OPS`): sigmoid
     and logaddexp against zero (the decay's softplus) over values across the range and its edges, and rms_norm over a
     row of up to 128 by one simdgroup (`mlx_rms_inv_simd`), against MLX's own"""
+    need_mlx()
     import mlx.core as mx
     import numpy as np
 
     from btb.mlx.core import metal_kernel
     from btb.mlx.mega.kernel import MLX_OPS, TYPES
 
-    need_mlx()
     elem = metal_kernel(
         name="test_mega_mlx_float",
         input_names=["x"],
@@ -590,6 +590,7 @@ def test_mlx_ops_emulated_bit_for_bit() -> None:
     row), give MLX's bits: rms_norm with a bf16 weight and with a float32 one (the step's `_mlx_norm` on a centered
     norm), at widths each side of MLX's looped limit; and over every finite bf16, the gated activations (`act`) times
     up and the embedding's scale"""
+    need_mlx()
     import mlx.core as mx
     import numpy as np
 
@@ -597,7 +598,6 @@ def test_mlx_ops_emulated_bit_for_bit() -> None:
     from btb.mlx.core import metal_kernel
     from btb.mlx.mega.kernel import MLX_OPS, TYPES
 
-    need_mlx()
     ctx = "Ctx c = {tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup, tgm, nullptr, nullptr, nullptr, "
     ctx += "nullptr, nullptr, nullptr, nullptr};"
     head = "    threadgroup uint8_t tgm[256];\n    uint tid = thread_position_in_threadgroup.x;\n    " + ctx + "\n"
