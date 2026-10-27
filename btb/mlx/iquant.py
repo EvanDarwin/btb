@@ -300,7 +300,7 @@ def _lattice_kernel(kind: str) -> StoredKernel:
     streams = (("W", "uint8_t"), *((n, "half" if n == "Dd" else "uint8_t") for n in spec.get("side_names", [])))
     # LANE2 to 4 pass rows: a lattice decode costs TILE's lanes more (IQ2_XS at 4 rows: TILE +6-15%, LANE2 -2-4%)
     return StoredKernel(spec["w8"], 256, defs=f"#define BLKB {spec['bytes']}\n", streams=streams,
-                        tables=_codebooks(kind), lane_rows=4)  # fmt: skip
+                        tables=_codebooks(kind), lane_rows=4, bf16_rows=4)  # fmt: skip
 
 
 def repack_iq4nl(raw: mx_.array) -> tuple[mx_.array, mx_.array]:

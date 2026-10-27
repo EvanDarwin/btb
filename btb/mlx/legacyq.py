@@ -69,11 +69,12 @@ def _kind(kind: str) -> str:
 
 
 def _kernel(kind: str) -> StoredKernel:
-    # Q8_0 takes PAIR2 to 5 pass rows: its head's float32 x at 2-5 rows ran +4-29% on LANE2 or TILE, within 2% of the
-    # lane-strided kernel on PAIR2. Q4_0 and Q4_1 ran 8-20 points slower on PAIR2 than on LANE2 for a bf16 x
+    # Q8_0's float32 x takes PAIR2 to 5 pass rows: its head at 2-5 rows ran +4-29% on LANE2 or TILE, within 2% of the
+    # lane-strided kernel on PAIR2; its bf16 x ran 7-15 points slower on PAIR2 than on LANE2. All three take LANE2
+    # to 4 bf16 rows (Q4_0 and Q4_1 7-18 points faster there than on TILE)
     if kind == "q8_0":
-        return StoredKernel(_W8, 32, header=_PAIR, defs=_kind(kind), w2=_W2, lane_rows=5)
-    return StoredKernel(_W8, 32, header=_PAIR, defs=_kind(kind))
+        return StoredKernel(_W8, 32, header=_PAIR, defs=_kind(kind), w2=_W2, lane_rows=5, bf16_rows=4)
+    return StoredKernel(_W8, 32, header=_PAIR, defs=_kind(kind), bf16_rows=4)
 
 
 # every kind for kernels built on its chain (the megakernel)

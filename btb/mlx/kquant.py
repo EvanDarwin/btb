@@ -99,12 +99,13 @@ _W8_Q3K = r"""
     }
 """
 
+# a bf16 x takes TILE from 2 pass rows (Q2_K from 3): back to back it ran 2-28 points faster than LANE2 there.
+# Q3_K keeps TILE at 4 float32 rows: a head ran 8 points slower on TILE4
 KERNELS: dict[Quant, StoredKernel] = {
-    Quant.Q2_K: StoredKernel(_W8_Q2K, 256),
-    # TILE at 4 float32 rows: a head ran 8 points slower on TILE4
-    Quant.Q3_K: StoredKernel(_W8_Q3K, 256, _Q3K_AUX, tile4=False),
-    Quant.Q4_K: StoredKernel(_W8_Q45, 256, _SM, _defs("q4k")),
-    Quant.Q5_K: StoredKernel(_W8_Q45, 256, _SM, _defs("q5k")),
+    Quant.Q2_K: StoredKernel(_W8_Q2K, 256, bf16_rows=2),
+    Quant.Q3_K: StoredKernel(_W8_Q3K, 256, _Q3K_AUX, bf16_rows=1, tile4=False),
+    Quant.Q4_K: StoredKernel(_W8_Q45, 256, _SM, _defs("q4k"), bf16_rows=1),
+    Quant.Q5_K: StoredKernel(_W8_Q45, 256, _SM, _defs("q5k"), bf16_rows=1),
 }
 _BY_KIND = {"q2k": Quant.Q2_K, "q3k": Quant.Q3_K, "q4k": Quant.Q4_K, "q5k": Quant.Q5_K}
 

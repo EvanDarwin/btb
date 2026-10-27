@@ -33,7 +33,8 @@ _W8 = r"""
     }
 """
 
-KERNELS: dict[Quant, StoredKernel] = {Quant.Q6_K: StoredKernel(_W8, 256)}
+# a bf16 x takes TILE from 2 pass rows: back to back it ran 2-8 points faster than LANE2 there
+KERNELS: dict[Quant, StoredKernel] = {Quant.Q6_K: StoredKernel(_W8, 256, bf16_rows=1)}
 
 
 def matvec_q6k(w_bytes: mx_.array, x: mx_.array, rows: int, cols: int) -> mx_.array:

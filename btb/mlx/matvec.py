@@ -40,10 +40,10 @@ class StoredKernel:
     """a stored type as every kernel over it is built: `w8`, the body of a device function writing the float32
     weights of row `row`, columns k..k+7 (k a multiple of 8, under `cols`, the row's width) into `w` from the type's
     `streams` and `tables` (each read by its name); `header` the device functions it calls, `defs` the defines it
-    reads, `bw` the weights a block (a row is whole blocks), `lane_rows` the pass rows to which a launch takes
-    `LANE2` (past them `TILE`), `w2` (where a type has one) the body writing weights k and k + 1 (k even) of row
-    `row` with `w8`'s bits, which takes `PAIR2` for `LANE2`, `tile4` whether 4 float32 pass rows past `lane_rows`
-    take `TILE4`. `streams` in `kinds.stored_stream_bytes`' order"""
+    reads, `bw` the weights a block (a row is whole blocks), `lane_rows` the float32 x's pass rows to which a launch
+    takes `LANE2` (past them `TILE4` to 4 rows where `tile4`, then `TILE`) and `bf16_rows` a bf16 x's (past them
+    `TILE`), `w2` (where a type has one) the body writing weights k and k + 1 (k even) of row `row` with `w8`'s bits,
+    which takes `PAIR2` for a float32 x's `LANE2`. `streams` in `kinds.stored_stream_bytes`' order"""
 
     w8: str
     bw: int
@@ -52,6 +52,7 @@ class StoredKernel:
     streams: tuple[tuple[str, str], ...] = (("W", "uint8_t"),)
     tables: tuple[Table, ...] = ()
     lane_rows: int = 3
+    bf16_rows: int = 3
     w2: str = ""
     tile4: bool = True
 
@@ -473,10 +474,13 @@ def body(nb: int, k: StoredKernel, xb: bool) -> str:
     """the kernel body a launch of `nb` pass rows of x (bf16 if `xb`, else float32) over type `k` takes"""
     if nb == 1:
         return LANE
+    # a bf16 x is a layer's, a float32 x the head's (150k rows): their crossovers measured apart. TILE4 at 4 float32
+    # rows ran a tie to 25 points faster than TILE over the types reaching it, 5-40 slower for bf16 at 2-4 rows
+    if xb:
+        return LANE2 if nb <= k.bf16_rows else TILE
     if nb <= k.lane_rows:
         return PAIR2 if k.w2 else LANE2
-    # TILE4 at 4 float32 rows ran a tie to 25 points faster than TILE over the types reaching it, 5-24 slower for bf16
-    return TILE4 if nb <= 4 and not xb and k.tile4 else TILE
+    return TILE4 if nb <= 4 and k.tile4 else TILE
 
 
 def tile_defines(rows: int, cols: int, nb: int, xb: bool) -> str:
