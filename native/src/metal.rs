@@ -16,10 +16,10 @@ use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
     MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineDescriptor,
-    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLDispatchType,
-    MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType,
-    MTLIndirectComputeCommand, MTLLibrary, MTLMathMode, MTLPipelineOption, MTLResource,
-    MTLResourceOptions, MTLResourceUsage, MTLSize,
+    MTLComputePipelineState, MTLCopyAllDevices, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLDispatchType, MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor,
+    MTLIndirectCommandType, MTLIndirectComputeCommand, MTLLibrary, MTLMathMode, MTLPipelineOption,
+    MTLResource, MTLResourceOptions, MTLResourceUsage, MTLSize,
 };
 
 use crate::codes::*;
@@ -89,10 +89,16 @@ fn push<T>(v: &mut Vec<T>, x: T) -> i64 {
     v.len() as i64 - 1
 }
 
-/// A context on the system's GPU: its handle, or `ERR_IO` where there is no Metal device.
+// macOS gives a process the default Metal device only where it links CoreGraphics (Apple's MTLCreateSystemDefaultDevice
+// notes): a cargo test binary, or a Python that loaded no graphics framework yet, would otherwise get none
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {}
+
+/// A context on the system's GPU: its handle, or `ERR_IO` where there is no Metal device. A headless machine (a
+/// CI virtual machine) can list a device it gives no default for, so the first listed stands in.
 pub fn open() -> i64 {
     let made = autoreleasepool(|_| {
-        let dev = MTLCreateSystemDefaultDevice()?;
+        let dev = MTLCreateSystemDefaultDevice().or_else(|| MTLCopyAllDevices().firstObject())?;
         let queue = dev.newCommandQueue()?;
         Some(Ctx {
             dev,
