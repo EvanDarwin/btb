@@ -2657,6 +2657,33 @@ def test_a_decode_call_raises_the_fills_reads_it_waits_on(monkeypatch: MonkeyPat
         assert pris == {want}, f"{key}: {pris}"
 
 
+def test_a_shed_store_fills_no_layer_by_unseating_its_residents(monkeypatch: MonkeyPatch) -> None:
+    """a store with a seat for every expert, shed below a layer's (the machine took RAM back) and refused growth,
+    fills a layer only into seats it has free: decode calls over a resident expert read nothing, call after call,
+    where the fill once unseated the layer's residents to read the rest and each call waited on those reads"""
+    route = FakeRoute()
+    st, _sm = expert_store(monkeypatch, route, n_layers=2, n_experts=8, lookahead=())
+    st.holds_all, st.ring_n = True, 0
+    assert st.per is not None
+    st.block_max = 4 * st.per
+    st._grow(4)
+    st._grow(4)
+    assert st.fill(0, "b.", settled=NO_GRAPH) == 8
+    for e in range(8):
+        route.land((0, Expert(e)))
+    st._release_block(next(iter(st.blocks)))
+    # the host down to the store's margin: no growth (it keeps two slots above it), no further shedding
+    monkeypatch.setattr(st, "_host_free", lambda: int(st.margin))
+    kept = [Expert(e) for e in range(8) if st.res.peek((0, Expert(e))) is not None]
+    assert len(kept) == 4
+    n_reads = len(route.reads)
+    for _ in range(3):
+        assert st.fill(0, "b.", settled=NO_GRAPH) == 0
+        ready, pending = st.call(0, "b.", [kept[0]], keep=True).whole(settled=NO_GRAPH)
+        assert set(ready) == {kept[0]} and not pending, "a resident expert waited on the fill's reads"
+    assert len(route.reads) == n_reads, "the fill read the layer again into seats its residents held"
+
+
 def test_ring_wraps_over_landed_predictions_and_holds_at_in_flight_ones(monkeypatch: MonkeyPatch) -> None:
     st, route, _sm = _store_with_routers(monkeypatch, lookahead=(2, 0), ring_n=2)
     h = torch.ones(1, 4)

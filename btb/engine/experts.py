@@ -1338,11 +1338,8 @@ class _ExpertStore:
         withdrawn whole; and with `last`, one of `protect` after all (a wave's first expert: a wave must seat one
         to go on, and any later one gains nothing by unseating an expert the call still wants). None when none of
         these has one."""
-        if not self.free and self.live() < self.n_slots:
-            self._grow(1)
-        if self.free:
-            s = self.free.pop()
-            self.slots[s].state = SlotState.FREE
+        s = self._free_seat()
+        if s is not None:
             return s
         v = self.res.victim(_Either(skip, protect))
         if v is None and ring:
@@ -1359,6 +1356,17 @@ class _ExpertStore:
             assert self.per is not None  # a seat given up was read into: the store is sized
             prof.add(prof.EVICT, key[0], key[1], self.per, slot=s, aux=0)
         self._taken(s)
+        return s
+
+    def _free_seat(self) -> SlotId | None:
+        """a slot no expert holds: a free one, else one the store grows (the host's ledger allowing); None where only
+        a seat on the line is left"""
+        if not self.free and self.live() < self.n_slots:
+            self._grow(1)
+        if not self.free:
+            return None
+        s = self.free.pop()
+        self.slots[s].state = SlotState.FREE
         return s
 
     def _grow(self, need: int) -> int:
@@ -2391,8 +2399,10 @@ class _ExpertStore:
 
     def fill(self, layer: int, base: str, *, settled: Settled) -> int:
         """`layer`'s experts with no seat seated and their reads queued at a prefill sweep's priority, none waited
-        for: a store with a seat for every expert (`holds_all`) fills a layer whole the first time a pass reaches it.
-        `settled` the caller's proof that no graph still to run reads the slots it seats. Returns the reads queued"""
+        for: a store with a seat for every expert (`holds_all`) fills a layer whole the first time a pass reaches it,
+        into seats it has free or can grow - shed below that (the machine took RAM back), the rest waits for the
+        calls' own picks, no resident unseated for it. `settled` the caller's proof that no graph still to run reads
+        the slots it seats. Returns the reads queued"""
         if not self.holds_all:
             return 0
         parts = self._recipe(layer, base)
@@ -2403,7 +2413,7 @@ class _ExpertStore:
             key = (layer, e)
             if self.res.peek(key) is not None:
                 continue
-            s = self._seat_for(set())
+            s = self._free_seat()
             if s is None:
                 break
             self._resident(s, key)
