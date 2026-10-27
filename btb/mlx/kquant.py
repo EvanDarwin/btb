@@ -101,7 +101,8 @@ _W8_Q3K = r"""
 
 KERNELS: dict[Quant, StoredKernel] = {
     Quant.Q2_K: StoredKernel(_W8_Q2K, 256),
-    Quant.Q3_K: StoredKernel(_W8_Q3K, 256, _Q3K_AUX),
+    # TILE at 4 float32 rows: a head ran 8 points slower on TILE4
+    Quant.Q3_K: StoredKernel(_W8_Q3K, 256, _Q3K_AUX, tile4=False),
     Quant.Q4_K: StoredKernel(_W8_Q45, 256, _SM, _defs("q4k")),
     Quant.Q5_K: StoredKernel(_W8_Q45, 256, _SM, _defs("q5k")),
 }

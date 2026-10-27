@@ -313,7 +313,8 @@ def repack_iq4nl(raw: mx_.array) -> tuple[mx_.array, mx_.array]:
 # every IQ4 and lattice type as every kernel builds on it (`mlx.stored.STORED`): its w8 over its streams (IQ4_NL's
 # split scales and nibbles, IQ1_M's side streams beside its blocks) and tables
 KERNELS: dict[Quant, StoredKernel] = {
-    Quant.IQ4_NL: StoredKernel(_W8_IQ4NL, 32, _KV, streams=(("Dd", "half"), ("Qq", "uint8_t"))),
+    # TILE at 4 float32 rows: a head ran 3-5 points slower on TILE4
+    Quant.IQ4_NL: StoredKernel(_W8_IQ4NL, 32, _KV, streams=(("Dd", "half"), ("Qq", "uint8_t")), tile4=False),
     Quant.IQ4_XS: StoredKernel(_W8_IQ4XS, 256, _KV),
     **{q: _lattice_kernel(quant_key(q)) for q in quants_of(QuantClass.LATTICE)},
 }

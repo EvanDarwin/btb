@@ -267,7 +267,7 @@ def _gather_source(q: Quant, rows: int, cols: int, items: int, nb: int, part: in
         f"btb_moe_gather_{quant_key(q)}_x{int(xb)}_{rows}_{cols}_{items}_{nb}_{part}_{kp}",
         [*(f"B{b}" for b in range(nb)), "tab", "ids", *(t.name for t in k.tables), "x"],
         "#include <metal_simdgroup_matrix>\n" + k.defs + matvec.device_fns(k),
-        matvec.tile_defines(rows, cols, 1, xb) + rowsof + matvec.body(1, k).replace("BIND", bind),
+        matvec.tile_defines(rows, cols, 1, xb) + rowsof + matvec.body(1, k, xb).replace("BIND", bind),
     )
 
 
@@ -290,7 +290,7 @@ def gather(
     )
     y = kern(
         inputs=[*g.blocks, g.tab, ids.reshape(-1), *(t.make() for t in STORED[q].tables), xin],
-        grid=(matvec.groups(rows, 1) * 32 * matvec.SGN, items, 1),
+        grid=(matvec.groups(rows, 1, STORED[q], xb) * 32 * matvec.SGN, items, 1),
         threadgroup=(32 * matvec.SGN, 1, 1),
         output_shapes=[(items, rows)],
         output_dtypes=[xin.dtype],

@@ -299,7 +299,9 @@ class Block:
                 raise ValueError(f"[mega] a linear of {cols} columns over rows of {x.cols}")
             out = y if len(got) == 1 else y.piece(at, rows)
             ld = 0 if len(got) == 1 else width
-            op, items = (OpName.MATVEC, mv_items(rows, 8)) if q is None else (MV_OP[q], stored_groups(rows, self.T))
+            op, items = (
+                (OpName.MATVEC, mv_items(rows, 8)) if q is None else (MV_OP[q], stored_groups(q, rows, self.T, False))
+            )
             self.p.emit(op, items, refs_of(wt, x, out), (rows, cols, ld << 1), reads=[x], writes=[out])
             pieces.append(out)
             at += rows
@@ -438,7 +440,7 @@ class Block:
             items = head_groups(mp.V, T)
             p.emit(OpName.HEAD, items, refs_of(mp.head, hn, logits), (mp.V, H, 0), reads=[hn], writes=[logits])
         else:  # the type's own chain over float32 rows, as the step multiplies a stored head
-            items = stored_groups(mp.V, T)
+            items = stored_groups(mp.head_q, mp.V, T, True)
             refs = refs_of(mp.head, hn, logits)
             p.emit(MV_OP[mp.head_q], items, refs, (mp.V, H, 1), reads=[hn], writes=[logits])
         amax = p.scratch(2 * AMP, 4)

@@ -925,9 +925,10 @@ def stored_name(s: StoredMv) -> str:
     return f"btb_mega_mv_{quant_key(s.q)}_{s.rows}_{s.cols}_{s.T}_{s.ld}_{int(s.f32)}"
 
 
-def stored_groups(rows: int, T: int) -> int:
-    """the threadgroups a stored matvec of `rows` at `T` pass rows takes: the step's launch's (`matvec.groups`)"""
-    return matvec.groups(rows, T)
+def stored_groups(q: Quant, rows: int, T: int, f32: bool) -> int:
+    """the threadgroups a stored matvec of type `q` over `rows` at `T` pass rows (of float32 x if `f32`, else bf16)
+    takes: the step's launch's (`matvec.groups`)"""
+    return matvec.groups(rows, T, STORED[q], not f32)
 
 
 # the threads a stored matvec's threadgroup takes: the step's launch's simdgroups
@@ -1007,7 +1008,7 @@ def stored_source(mvs: Iterable[StoredMv]) -> str:
                 "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {\n"
                 f"    using namespace btb_{key};\n    const device uint* f = tab + mi[0] * ROW;\n{ins}"
                 f"    const device {t}* x = (const device {t}*)REF(1);\n    device {t}* out = (device {t}*)REF(2);\n"
-                + matvec.body(s.T, k).replace("BIND", "")
+                + matvec.body(s.T, k, not s.f32).replace("BIND", "")
                 + "}\n"
                 + _undo(d)
             )

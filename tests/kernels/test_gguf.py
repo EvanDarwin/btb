@@ -313,7 +313,8 @@ def test_a_stored_prefills_rows_are_its_steps_on_mlx(q: Quant, monkeypatch: pyte
     # the wide tile at any x, so the tall matrix's 128 rows take it
     monkeypatch.setattr(steel, "CHAIN_WIDE", 0)
     floats = q in (Quant.F16, Quant.BF16)
-    shapes: list[tuple[int, tuple[int, ...]]] = [(72, (2, 3, 4, 5, 6, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100))]
+    # 70 rows: a simdgroup's last rows past the matrix on every kernel (4 and 8 rows a simdgroup)
+    shapes: list[tuple[int, tuple[int, ...]]] = [(70, (2, 3, 4, 5, 6, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100))]
     shapes += [] if floats else [(2560, (64, 128))]
     cols = 544 if not floats and STORED[q].bw == 32 else 512
     gemms = {steel.chain_tile(t, rows, cols) for rows, widths in shapes for t in widths if t >= be.gemm_rows}
