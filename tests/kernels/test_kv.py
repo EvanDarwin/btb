@@ -65,7 +65,7 @@ def _store(buf: mx_.array, rows: mx_.array, n0: int) -> None:
     from btb import mlx as mlxdev
 
     flag = mlxdev.kv_store(buf, rows, n0)
-    mlxdev.mx().eval(flag)
+    mlxdev.mx.eval(flag)
     assert flag.tolist() == [1]
 
 
@@ -73,7 +73,7 @@ def _view_bits(buf: mx_.array) -> Bits:
     """the layer's MLX view read back as the attention reads it, [Hk, cap, d] bits"""
     from btb import mlx as mlxdev
 
-    m = mlxdev.mx()
+    m = mlxdev.mx
     return np.array(buf[0].view(m.uint16))
 
 
@@ -94,7 +94,7 @@ def test_store_writes_the_rows_in_place_and_nothing_else(Hk: int, d: int, cap: i
 
     for li in (0, LAYERS // 2, LAYERS - 1):
         for which in (0, 1):
-            buf = layers[li]._mx[which]
+            buf = layers[li].mx_bufs()[which]
             slot = 2 * li + which
 
             def check(n0: int, want: Bits, buf: mx_.array = buf, slot: int = slot) -> None:
@@ -143,14 +143,14 @@ def test_gather_moves_the_kept_rows_in_place(Hk: int, d: int) -> None:
     read before any is overwritten); the rows past the kept ones are left as they were"""
     from btb import mlx as mlxdev
 
-    m = mlxdev.mx()
+    m = mlxdev.mx
     cap = 1024
     _sh, layers, arena = _arena(Hk, d, cap)
     rng = random.Random(Hk * 31 + d)
     n = 300
     fill = (torch.randn(2 * LAYERS, Hk, n, d, generator=torch.Generator().manual_seed(d)) * 4).bfloat16()
     for slot in range(2 * LAYERS):
-        _store(layers[slot // 2]._mx[slot % 2], mlxdev.to_mx(fill[slot]), 0)
+        _store(layers[slot // 2].mx_bufs()[slot % 2], mlxdev.to_mx(fill[slot]), 0)
     ref = arena.copy()
     assert np.array_equal(ref[:, :, :n], _bits(fill))
     root = 200
@@ -159,7 +159,7 @@ def test_gather_moves_the_kept_rows_in_place(Hk: int, d: int) -> None:
     rng.shuffle(perm)
     for keep, base in ((list(range(root)) + path, root), (perm, 0)):
         for slot in range(2 * LAYERS):
-            buf = layers[slot // 2]._mx[slot % 2]
+            buf = layers[slot // 2].mx_bufs()[slot % 2]
             before = ref[slot].copy()
             flag = mlxdev.kv_gather(buf, keep[base:], base)
             m.eval(flag)
@@ -180,7 +180,7 @@ def test_scatter_writes_a_passes_rows_where_the_table_puts_them(Hk: int, d: int,
     from btb.engine.kvpool import PAGE
     from btb.engine.paged import HostRegion
 
-    m = mlxdev.mx()
+    m = mlxdev.mx
     pages = 6
     region = HostRegion([0], Hk, d, shared=True)
     region.shape(torch.empty(1, Hk, 0, d, dtype=dtype))
@@ -234,7 +234,7 @@ def test_arena_layer_appends_gathers_and_grows_out(Hk: int, d: int) -> None:
     the layer to a buffer of its own - its K/V after each step against a plain concatenation of the rows"""
     from btb import mlx as mlxdev
 
-    m = mlxdev.mx()
+    m = mlxdev.mx
     cap = 256
     _sh, layers, arena = _arena(Hk, d, cap)
     layer = layers[1]

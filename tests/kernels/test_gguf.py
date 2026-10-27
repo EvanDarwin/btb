@@ -10,6 +10,7 @@ converter refuses; it is checked on a real release."""
 import json
 import os
 import shutil
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -21,8 +22,11 @@ from btb.kinds import PassTag, Quant, quant_tag, stored_quants
 from tests.cert.manifest import QWEN3_06B_GGUF
 
 if TYPE_CHECKING:
+    import mlx.core as mx_
+
     from btb.engine.scratch import Scratch
     from btb.gguf import GGUFModel, QuantWeight
+    from btb.mlx.backend import Streams
 
 from tests.helpers import (
     F16_AT,
@@ -222,6 +226,128 @@ def test_joined_stored_weights_are_their_members_in_one_launch(q: Quant) -> None
 
 
 @pytest.mark.parametrize("q", stored_quants(), ids=lambda q: q.value)
+def test_a_stored_weights_first_rows_are_its_rows(q: Quant) -> None:
+    """a stored weight's first rows (`Weight.first_rows`, a drafter's vocabulary slice of the head) are a weight over
+    a prefix of each of its streams: its matvec the whole one's first outputs bit for bit, no bf16 copy made"""
+    need_mlx()
+    import mlx.core as mx
+
+    from btb.mlx.backend import Weight, stored_matvec, stored_streams
+
+    rows, cols, n = 40, 512, 24
+    w = Weight(q=q, streams=stored_streams(q, stored_blocks(q, rows, cols, 5)), shape=(rows, cols))
+    x = mx.array(np.random.default_rng(6).standard_normal((3, cols)).astype(np.float32)).astype(mx.bfloat16)
+    head = w.first_rows(n)
+    assert head.shape == (n, cols) and head.a is None and w.a is None
+    want = stored_matvec(q, w.streams, x, rows, cols)[:, :n]
+    assert mx.array_equal(stored_matvec(q, head.streams, x, n, cols), want), q.value
+
+
+@pytest.mark.parametrize("q", stored_quants(), ids=lambda q: q.value)
+def test_pooled_stored_weights_join_as_a_view_of_their_block(q: Quant) -> None:
+    """stored weights of each type laid out in one pool block as a GGUF binds them (`kinds.pooled_layout`, then
+    `weight_stored_pool`: the blocks in place, a split type's streams made once): each matvec is the type's over its
+    own streams, and their join (q/k/v, gate/up) a view a stream over the same bytes, each of its rows bit-for-bit its
+    member's at every pass width; members out of order or of another block are not joined at all (a copy would hold
+    the block's bytes twice)"""
+    need_mlx()
+    import mlx.core as mx
+
+    from btb import mlx as mlxdev
+    from btb.kinds import pooled_layout
+    from btb.mlx import Shared
+    from btb.mlx.backend import Weight, stored_matvec, stored_streams
+
+    be = mlxdev.Backend.__new__(mlxdev.Backend)
+    cols, base, heights = 512, 64, (40, 24, 16)
+
+    def pool(raws: list[np.ndarray], heights: Sequence[int]) -> tuple[Shared, list[Weight]]:
+        offs, size = pooled_layout([(q, r.size) for r in raws])
+        sh = mlxdev.Shared(base + size)
+        ws = []
+        for raw, rows, at in zip(raws, heights, offs, strict=True):
+            parts = [np.asarray(s).reshape(-1).view(np.uint8) for s in stored_streams(q, raw)]
+            for o, p in zip(at, parts, strict=True):
+                sh.torch[base + o : base + o + p.size] = torch.from_numpy(p.copy())
+            ws.append(be.weight_stored_pool(sh, [base + o for o in at], [p.size for p in parts], q, (rows, cols)))
+        return sh, ws
+
+    raws = [stored_blocks(q, r, cols, i) for i, r in enumerate(heights)]
+    sh, ws = pool(raws, heights)
+    x = mx.array(np.random.default_rng(3).standard_normal((16, cols)).astype(np.float32))
+    before = [np.array(stored_matvec(q, w.streams, x, *w.shape)) for w in ws]
+    for raw, w, b in zip(raws, ws, before, strict=True):
+        assert np.array_equal(np.array(stored_matvec(q, stored_streams(q, raw), x, *w.shape)), b), q.value
+    j = be.weight_fused(ws)
+    assert j is not None and j.shape == (80, cols) and j.sh is sh and j.offs == ws[0].offs
+    assert j.nbs == tuple(sum(w.nbs[i] for w in ws) for i in range(len(j.nbs))), q.value
+    for t in range(1, 17):
+        want = np.concatenate([b[:t] for b in before], axis=1)
+        assert np.array_equal(np.array(stored_matvec(q, j.streams, x[:t], *j.shape)), want), (q.value, t)
+    _, (apart,) = pool([raws[1]], heights[1:2])
+    for bad in ([ws[1], ws[0]], [ws[0], apart]):
+        assert be.weight_fused(bad) is None, q.value
+
+
+@pytest.mark.parametrize("q", [*stored_quants(), Quant.F16, Quant.BF16], ids=lambda q: q.value)
+def test_a_stored_prefills_rows_are_its_steps_on_mlx(q: Quant, monkeypatch: pytest.MonkeyPatch) -> None:
+    """every stored type (and a GGUF's float experts) through `Backend.matmul`, x bf16 and float32: a pass of each
+    width - the one-row kernel, the multiply-accumulate one, past `gemm_rows` the dequant and the gemm - is its rows'
+    one-row steps bit for bit (a prefix hit's tail and a cold prefill, a verify pass and its steps, agree); the chain
+    is each segment's gemv over the dequant's and x's columns in the chain's order, folded in order (a row of 17 blocks
+    leaves the segments uneven); a tall matrix too, so the gemm takes each of its tiles; the embedding gather is the
+    dequant's rows"""
+    need_mlx()
+    import importlib
+
+    import mlx.core as mx
+
+    from btb.mlx import steel
+    from btb.mlx.backend import Backend, Stat, Weight, stored_dequant, stored_matvec, stored_streams
+    from btb.mlx.stored import STORED
+
+    gemv = importlib.import_module("btb.mlx.gemv").gemv
+    be = Backend.__new__(Backend)
+    be.gemm_rows = 64
+    be.stat = Stat(linears=0, evals=0, s=0.0, layers=0, layer_s=0.0)
+    # the wide tile at any x, so the tall matrix's 128 rows take it
+    monkeypatch.setattr(steel, "CHAIN_WIDE", 0)
+    floats = q in (Quant.F16, Quant.BF16)
+    # 70 rows: a simdgroup's last rows past the matrix on every kernel (4 and 8 rows a simdgroup)
+    shapes: list[tuple[int, tuple[int, ...]]] = [(70, (2, 3, 4, 5, 6, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100))]
+    shapes += [] if floats else [(2560, (64, 128))]
+    cols = 544 if not floats and STORED[q].bw == 32 else 512
+    gemms = {steel.chain_tile(t, rows, cols) for rows, widths in shapes for t in widths if t >= be.gemm_rows}
+    assert floats or gemms == set(steel.CHAIN_TILES), "a tile unchecked"
+    for rows, widths in shapes:
+        if floats:
+            f = np.random.default_rng(9).standard_normal((rows, cols)).astype(np.float32) * 0.05
+            bits = f.astype(np.float16) if q is Quant.F16 else (f.view(np.uint32) >> 16).astype(np.uint16)
+            raw = bits.view(np.uint8).reshape(-1)
+        else:
+            raw = stored_blocks(q, rows, cols, 9)
+        streams = stored_streams(q, raw)
+        w = Weight(q=q, streams=streams, shape=(rows, cols))
+        for dt in (mx.bfloat16, mx.float32):
+            x = mx.array(np.random.default_rng(10).standard_normal((max(widths), cols)).astype(np.float32)).astype(dt)
+            one = mx.concatenate([stored_matvec(q, streams, x[i : i + 1], rows, cols) for i in range(max(widths))])
+            for t in widths:
+                assert mx.array_equal(be.matmul(x[:t], w), one[:t]), (q.value, str(dt), rows, t)
+            if not floats:
+                deq, xf = stored_dequant(q, streams, rows, cols, dt), x[:16].astype(mx.float32)
+                # segment s: blocks s, s + 8, ..., a block's column 8 * ks + j its physical 8 * (j / 2) + 2 * ks + j % 2
+                ks, j = np.arange(32) // 8, np.arange(32) % 8
+                fold = mx.zeros((16, rows), dtype=mx.float32)
+                for s in range(8):
+                    at = mx.array((np.arange(s, cols // 32, 8)[:, None] * 32 + j // 2 * 8 + 2 * ks + j % 2).reshape(-1))
+                    fold = fold + gemv(mx.take(deq, at, axis=1), mx.take(xf, at, axis=1))
+                assert mx.array_equal(fold.astype(dt), one[:16]), (q.value, str(dt), rows, "against the segments' fold")
+        if not floats:
+            tok = mx.array([3, 0, rows - 1, 5], dtype=mx.int32)
+            assert mx.array_equal(Backend.gather_rows(w, tok), stored_dequant(q, streams, rows, cols)[tok]), q.value
+
+
+@pytest.mark.parametrize("q", stored_quants(), ids=lambda q: q.value)
 def test_each_stored_types_dequant_feeds_the_prefills_gemm(q: Quant) -> None:
     """the native decode of a whole matrix a CPU prefill's GEMM takes, every stored type: the package's
     dequantization to f32 rounding; and `stored_matmul` over 64 rows (the GEMM over those weights)
@@ -383,9 +509,11 @@ def test_a_long_gguf_prefill_takes_the_gemm_as_a_bf16_one_does(device: str, monk
         decoded.append(w.shape[0])
         deq(gq, w, out)
 
-    def mlx_dequant(q: Quant, streams: tuple[object, ...], rows: int, cols: int) -> object:
+    def mlx_dequant(
+        q: Quant, streams: "Streams", rows: int, cols: int, dtype: "mx_.Dtype | None" = None
+    ) -> "mx_.array":
         decoded.append(rows)
-        return sdq(q, streams, rows, cols)
+        return sdq(q, streams, rows, cols, dtype)
 
     monkeypatch.setattr(QuantGemv, "dequant", native_dequant)
     monkeypatch.setattr(backend, "stored_dequant", mlx_dequant)

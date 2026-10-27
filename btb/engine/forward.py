@@ -7,10 +7,11 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, overload
 
 import torch
 import torch.nn.functional as F
+from transformers.cache_utils import DynamicLayer
 
 from .. import mlx as mlxdev
 from ..kinds import LayerKind, LayerTier, Parents, PassTag, TokenRows
@@ -22,6 +23,7 @@ from .families.attention import CARD_ATTENTION, ChunkCausal
 from .fixed_rows import fixed_rows
 from .fused import DELTA_BLOCK
 from .native import Native
+from .paged import PagedLayer
 from .scheduler import EPOCH, MemoryGrantError
 from .state import _State
 from .stored import CardStored
@@ -33,8 +35,14 @@ PREFILL = "prefill"
 if TYPE_CHECKING:
     from transformers.cache_utils import DynamicCache
 
+    from ..kinds import Tokens
+    from ..sampling import Pick
+    from .cache import KvCache
     from .device import Placement
-    from .paged import PagedLayer
+    from .mlx_forward import OnLayer, Positions
+
+    # a pass's token ids: a [B, T] tensor (a [T] one is one row), one row's ids, or rows of them
+    PassIds = torch.Tensor | Tokens | TokenRows
 
 
 # a rope table (cos, sin) over a pass's positions
@@ -240,18 +248,48 @@ class _ForwardMixin(_State):
             mask[b, T - len(r) :] = 1
         return ids, mask
 
+    # the whole pass: its logits (or its final rows without `head`)
+    @overload
+    def forward(
+        self,
+        ids: PassIds,
+        cache: KvCache | None = ...,
+        on_layer: OnLayer | None = ...,
+        last_only: bool = ...,
+        stop_after: None = ...,
+        attention_mask: torch.Tensor | None = ...,
+        positions: Positions | None = ...,
+        head: bool = ...,
+        pick: bool | Pick | None = ...,
+    ) -> torch.Tensor: ...
+
+    # a pass `stop_after` may end before the last layer: None there
+    @overload
+    def forward(
+        self,
+        ids: PassIds,
+        cache: KvCache | None = ...,
+        on_layer: OnLayer | None = ...,
+        last_only: bool = ...,
+        stop_after: int | None = ...,
+        attention_mask: torch.Tensor | None = ...,
+        positions: Positions | None = ...,
+        head: bool = ...,
+        pick: bool | Pick | None = ...,
+    ) -> torch.Tensor | None: ...
+
     @torch.inference_mode()
     def forward(
         self,
-        ids: Any,
-        cache: Any = None,
-        on_layer: Callable[[int, torch.Tensor], Any] | None = None,
+        ids: PassIds,
+        cache: KvCache | None = None,
+        on_layer: OnLayer | None = None,
         last_only: bool = True,
         stop_after: int | None = None,
         attention_mask: torch.Tensor | None = None,
-        positions: Any = None,
+        positions: Positions | None = None,
         head: bool = True,
-        pick: Any = None,
+        pick: bool | Pick | None = None,
     ) -> torch.Tensor | None:
         """`pick` (True: greedy; a Sampling: its draw, keyed by each row's cache position): the fused MLX path
         returns [B, T] int32 token ids picked in the graph instead of logits; the other paths ignore it and
@@ -282,12 +320,13 @@ class _ForwardMixin(_State):
             and not own
             and B == 1
             and n_layers == self.L
+            and cache is not None
             and self._mega_ok(cache, T, on_layer, head, pick, positions)
         ):
-            return self._forward_mega(ids[0].tolist(), cache, T, pick)
+            return self._forward_mega(ids[0].tolist(), cache, T, pick, on_layer)
         if attention_mask is None and not own and self._mlx_ok(cache, B, T, None, positions, n_layers):
             # the fused path from the embedding gathered on the graph: no torch embed, rope tables or mask
-            m = mlxdev.mx()
+            m = mlxdev.mx
             hm = self._mlx_embed_rows(m.array(ids[0].tolist(), dtype=m.int32))
             if self.compute_dtype is not None and self.compute_dtype != torch.bfloat16:
                 hm = hm.astype(m.float32)
@@ -748,7 +787,7 @@ class _ForwardMixin(_State):
             pas.on_layer(i, h)
         return h
 
-    def _ids(self, ids: Any) -> torch.Tensor:
+    def _ids(self, ids: PassIds) -> torch.Tensor:
         """token ids as a [B, T] long tensor on the engine's device, checked on the host first where they come from
         it: an id past the vocabulary is refused by name - on the card its embedding lookup fired a device-side
         assert, which leaves the process's CUDA context unusable (300 ids up to 484 over a 256-token fixture)"""
@@ -865,7 +904,7 @@ class _ForwardMixin(_State):
             return hf
         return self._apply_head(hf)
 
-    # the head sizes MLX's fused attention kernel takes for a many-row pass; any other (Qwen3.5's 256) has the
+    # the head sizes MLX's fused attention kernel takes for a many-row pass; any other aluminum lacks too has the
     # scores of every row against every key materialized, T x (past + T) x heads, which the chunk must be priced by
     MLX_FUSED_HEAD = (64, 80, 128)
 
@@ -882,11 +921,11 @@ class _ForwardMixin(_State):
         on_card = self.dev.type == Device.CUDA and (bool(self.resident) or bool(self.prefill_card))
         if on_card:
             return int(self.device.free(self.dev, unreserved=True) or 0)
-        mlx = getattr(self, "mlx", None)
+        mlx = self.mlx
         if mlx is not None:
             # the ledger (the machine's live RAM above the OS's floor included), within Metal's working-set limit
             room = int(self.device.free(unreserved=True) or 0)
-            limit = int((getattr(mlx, "info", None) or {}).get("max_recommended_working_set_size", 0) or 0)
+            limit = int(mlx.info.get("max_recommended_working_set_size", 0) or 0)
             if limit:
                 room = min(room, limit - int(mlx.held_bytes()))
             return max(0, room)
@@ -935,22 +974,22 @@ class _ForwardMixin(_State):
         fp32 = self.compute_dtype is not None and self.compute_dtype != torch.bfloat16
         nb = 4 if (fp32 or not on_card) else 2
         per_token = 2 * nb * (3 * I + 8 * H + 2 * (Hq + 2 * Hk) * d)
-        if getattr(self, "mlx", None) is not None and LayerKind.LINEAR in self.layer_types:
+        if self.mlx is not None and LayerKind.LINEAR in self.layer_types:
             # the hybrid's chunked DeltaNet rule keeps its per-chunk states and blocks beside the activations:
             # on Qwen3.5-4B a 4096-row chunk at position 0 costs 4.9-6.2 GB against the 2.4 the
             # activations alone price
             per_token *= 2
         scores = 0
-        if getattr(self, "mlx", None) is not None:
-            if d not in self.MLX_FUSED_HEAD:
+        if self.mlx is not None:
+            from ..mlx.attn import ATTN_BLOCK, ATTN_HEADS
+
+            if d not in self.MLX_FUSED_HEAD and d not in ATTN_HEADS:
                 scores = 4 * Hq  # bytes per (row, key) pair of materialized scores, float32 through the softmax
             else:
-                # the fused kernel's per-key-block partials, (T, Hk, splits*8, g, D) float32 and two without D,
-                # folded after: about half the materialized figure a (row, key), and still growing with every key
-                # the chunk sees
-                from ..mlx.attn import ATTN_BLOCK
-
-                scores = -(-32 * Hq * (d + 2) // ATTN_BLOCK)
+                # aluminum's (and, at a head size it lacks, MLX's fused attention's) prefill keeps nothing a (row,
+                # key); a chunk taken as nodes (a batched row's) keeps its partials, (D + 2) float32 a (row, query
+                # head, segment), folded after - priced so, growing with every key the chunk sees
+                scores = -(-4 * Hq * (d + 2) // ATTN_BLOCK)
         elif self.fam.eager:
             # gpt-oss's sinks (`attention_sinks`) hold each row's scores against every key twice at once in the dtype
             # the reference's join promotes them to - the sinks' own (float32 in the checkpoint), or the pass's where
@@ -958,7 +997,7 @@ class _ForwardMixin(_State):
             # and the mask once, in the pass's dtype
             scores = 2 * max(nb, self._sinks_bytes()) * Hq + nb
         per_key = 0
-        if getattr(self, "mlx", None) is None and not self.fam.eager and not (rule and on_card):
+        if self.mlx is None and not self.fam.eager and not (rule and on_card):
             # torch's sdpa over every key the chunk sees: the causal mask, a value a (row, key) pair at most, and the
             # keys and values widened to every query head (`btb_sdpa`'s expand, transformers' `repeat_kv`)
             scores += nb
@@ -1047,7 +1086,7 @@ class _ForwardMixin(_State):
         card = self.dev.type == Device.CUDA
         work = self._chunk_bytes(C, past + max(0, T - C), rule=card and self._chunk_rule(B))
         if card:
-            work += self._grouped_bytes(C, getattr(self, "expert_store", None))
+            work += self._grouped_bytes(C)
         row_b, park = self._sweep_rows(B, T)
         rows = 0 if (park or not card) else T * row_b
         growth = self.cache_growth(cache, B, T, peak=True).get(self.dev, 0)
@@ -1100,7 +1139,7 @@ class _ForwardMixin(_State):
             n += sum(1 << max(0, (min(T, a + C) - a) * (row_b // B) * B - 1).bit_length() for a in range(0, T, C))
         return n
 
-    def _grouped_bytes(self, rows: int, store: Any) -> int:
+    def _grouped_bytes(self, rows: int) -> int:
         """a mixture's grouped expert call on the card over a chunk of `rows` (`_card_grouped`), at its widest: each
         pick's place in the sum's buffer, and beside it the larger of its way in - the row gathered, gate_up's
         product, its bias gathered and their sum, and the gate's temporaries over the halves (gpt-oss's clamped GLU,
@@ -1109,13 +1148,14 @@ class _ForwardMixin(_State):
         multiplies (`widen_scratch`). 0 where the loop takes the calls"""
         if not self.fam.moe or not bool(getattr(self, "grouped_experts", False)):
             return 0
-        from .host import _Experts, widen_scratch
+        from .host import _Experts, expert_form, widen_scratch
 
         c = self.cfg
         H = int(c.hidden_size)
         I = int(getattr(c, "moe_intermediate_size", None) or c.intermediate_size)
         k = int(getattr(c, "num_experts_per_tok", 1) or 1)
-        return 2 * rows * k * (H + max(H + 8 * I, I + 5 * H)) + widen_scratch(store, _Experts.WIDEN_BATCH, I, H)
+        form = expert_form(self.fam.mxfp4, self.gguf, self.fp8_experts, self.stored_experts)
+        return 2 * rows * k * (H + max(H + 8 * I, I + 5 * H)) + widen_scratch(form, _Experts.WIDEN_BATCH, I, H)
 
     def _chunk_bytes(self, rows: int, past: int = 0, on_card: bool | None = None, rule: bool = False) -> int:
         """a prefill chunk of `rows` at position `past`: its activations, its scores and mask against every key it
@@ -1132,9 +1172,9 @@ class _ForwardMixin(_State):
         _per_token, scores, _per_key = self._chunk_cost()
         free = self.prefill_room()
         buf_cap = free  # the single attention buffer must fit the reserve-aware room (--ram/--vram-reserve, via
-        mlx = getattr(self, "mlx", None)  # prefill_room) and, on MLX, Metal's hard per-buffer ceiling
+        mlx = self.mlx  # prefill_room) and, on MLX, Metal's hard per-buffer ceiling
         if mlx is not None:
-            hard = int((getattr(mlx, "info", None) or {}).get("max_buffer_length", 0) or 0)
+            hard = int(mlx.info.get("max_buffer_length", 0) or 0)
             if hard:
                 buf_cap = min(buf_cap, hard)
         rows = 4096
@@ -1150,11 +1190,11 @@ class _ForwardMixin(_State):
     def _prefill(
         self,
         ids: torch.Tensor,
-        cache: Any,
-        on_layer: Any = None,
+        cache: KvCache | None,
+        on_layer: OnLayer | None = None,
         attention_mask: torch.Tensor | None = None,
         last_only: bool = True,
-    ) -> Any:
+    ) -> torch.Tensor:
         """`ids` into `cache` in chunks the free memory prices: the last row's logits, or every row's (the chunks'
         joined) without `last_only`. A prompt past a step's rows lets the card's scratch go after it (its chunks'
         buffers, a width no step takes): kept, they held the prompt's width for every step after - half a gigabyte
@@ -1169,11 +1209,11 @@ class _ForwardMixin(_State):
     def _prefill_chunks(
         self,
         ids: torch.Tensor,
-        cache: Any,
-        on_layer: Any,
+        cache: KvCache | None,
+        on_layer: OnLayer | None,
         attention_mask: torch.Tensor | None,
         last_only: bool,
-    ) -> Any:
+    ) -> torch.Tensor:
         T = ids.shape[1]
         if cache is None or attention_mask is not None or getattr(self, "aq", False):
             return self.forward(ids, cache=cache, on_layer=on_layer, attention_mask=attention_mask, last_only=last_only)
@@ -1214,7 +1254,7 @@ class _ForwardMixin(_State):
         def collect(i: int, h: torch.Tensor) -> None:
             if i == last:
                 taps.append(h)
-            else:
+            elif on_layer is not None:
                 on_layer(i, h)
 
         hook = collect if on_layer is not None else None
@@ -1245,16 +1285,17 @@ class _ForwardMixin(_State):
                         break
                     except Exception as e:
                         sched = getattr(self, "scheduler", None)
+                        croppable = [cl for cl in cache.layers if isinstance(cl, DynamicLayer)]
                         if not (
                             _is_gpu_recovery(e)
                             and attempt < _GPU_PREFILL_RETRIES
                             and sched is not None
                             and on_layer is None
                             and LayerKind.LINEAR not in self.layer_types
-                            and all(hasattr(cl, "crop") for cl in cache.layers)
+                            and len(croppable) == len(cache.layers)
                         ):
                             raise
-                        for cl in cache.layers:
+                        for cl in croppable:
                             cl.crop(ckpt)
                         attempt += 1
                         wait = sched.gpu_recovered()
@@ -1276,7 +1317,7 @@ class _ForwardMixin(_State):
         return out if last_only else torch.cat(rows, dim=1)
 
     @torch.inference_mode()
-    def _prefill_by_layer(self, ids: torch.Tensor, cache: Any, C: int) -> Any:
+    def _prefill_by_layer(self, ids: torch.Tensor, cache: KvCache, C: int) -> torch.Tensor:
         """The prompt through one layer at a time, every chunk of it before the next layer, so a layer the pass
         streams is read once for the whole prompt instead of once per chunk: a card pass's template, a drive layer's
         ring slot (held across the layer's chunks), a mixture's experts. Each chunk meets each layer as the
@@ -1572,7 +1613,8 @@ class _ForwardMixin(_State):
                         if ring and i in self.cold:
                             self._cold_wait(i)
                             self._cold_held = i
-                        hopped = False  # a host layer's rows on the card, in the sweep's one buffer for them
+                        # the host layer whose rows are on the card, in the sweep's one buffer for them
+                        hopped: GrowLayer | PagedLayer | None = None
                         last_on_card = graph_layer
                         for c in range(len(spans)):
                             h = hs[c]
@@ -1613,9 +1655,9 @@ class _ForwardMixin(_State):
                                     hs[c] = keep(c, hcard)
                                     continue
                             if host and not card[c]:
-                                if hopped:
-                                    cache.layers[i].land(where(Device.CPU), self.host_kv_dtype())
-                                    hopped = False
+                                if hopped is not None:
+                                    hopped.land(where(Device.CPU), self.host_kv_dtype())
+                                    hopped = None
                                     hop_at.clear()
                                 if h.device.type != "cpu" or h.dtype != torch.float32:
                                     # widened on the host, where the host chunk's share was asked for it
@@ -1632,9 +1674,9 @@ class _ForwardMixin(_State):
                             # a paged host layer's rows hop as a contiguous one's do: the conversation's rows of the
                             # layer gathered into the sweep's buffer, the chunks' own put back into its pages at land
                             if cl is not None and (
-                                (isinstance(cl, GrowLayer) and not cl.shared) or getattr(cl, "paged", False)
+                                (isinstance(cl, GrowLayer) and not cl.shared) or isinstance(cl, PagedLayer)
                             ):
-                                if not hopped:
+                                if hopped is None:
                                     # the layer's rows onto the card once for all its card chunks, into one buffer
                                     # the sweep keeps for every host layer in turn (`_hop_bytes`, in the prefill's
                                     # reservation): each chunk writes in place, nothing grown or granted, and back to
@@ -1643,14 +1685,14 @@ class _ForwardMixin(_State):
                                     # which WDDM paged a game out to keep, never failing an allocation to trim it
                                     kv = hop_rows(h.dtype, h.shape[0])
                                     cl.hop(kv[0], kv[1])
-                                    hopped = True
+                                    hopped = cl
                                     hop_at[:] = [i]
                             elif host and frames[c]["past"] > 0:
                                 self._cache_to(cache, i, self.dev)
                             pas = chunk_pass(c, i, lt, True, h)
                             pas.place = place
                             h = self._run_card_layer(i, tmpl, h, pas)
-                            if host and not hopped:
+                            if host and hopped is None:
                                 self._cache_to(cache, i, "cpu")
                             hs[c] = keep(c, h)
                             # a chunk's buffers grow with the keys it sees (the mask, the keys widened to every
@@ -1663,10 +1705,10 @@ class _ForwardMixin(_State):
                             ):
                                 torch.cuda.synchronize(self.dev)
                                 torch.cuda.empty_cache()
-                        if hopped:
+                        if hopped is not None:
                             # back on the host in its own dtype, as long as its growth is priced: the answer's
                             # first token appends in place (GrowLayer.land)
-                            cache.layers[i].land(where(Device.CPU), self.host_kv_dtype())
+                            hopped.land(where(Device.CPU), self.host_kv_dtype())
                             hop_at.clear()
                         if self._cold_held is not None:
                             self._cold_held = None
@@ -1737,8 +1779,8 @@ class _ForwardMixin(_State):
                 # the buffer let go with the sweep's - left, its every later pass appended into the dead buffer and
                 # was refused. A contiguous one's rows are the buffer's: its next append moves them (`GrowLayer`)
                 cl = cache.layers[j]
-                if getattr(cl, "paged", False):
-                    cast("PagedLayer", cl).unhop()
+                if isinstance(cl, PagedLayer):
+                    cl.unhop()
             hop_buf[0] = None
             self.scratch.draws = None
             self.device.release(PREFILL)

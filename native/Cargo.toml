@@ -26,6 +26,12 @@ criterion = "0.5"
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
 
+# Metal on macOS (`src/metal.rs`): the MLX pass replayed from an indirect command buffer.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = "0.3"
+
 # One `[[bench]]` per op family, all custom-harness. The benches build inputs with the parity
 # tests' generators (`tests/common/refs.rs`, `fixture.rs`) included by path, so core is untouched.
 [[bench]]

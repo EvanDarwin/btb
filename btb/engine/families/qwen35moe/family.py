@@ -15,10 +15,14 @@ from ...host import _Experts
 from ..base import _flags
 from ..qwen4.router import install as install_router
 from ..qwen4.router import install_card as install_card_router
+from ..qwen4.router import mixture
 from ..qwen35.family import Qwen35Family
 
 if TYPE_CHECKING:
+    import torch
+
     from ...state import _State
+    from ..base import Mixture
 
 
 class Qwen35MoeFamily(Qwen35Family):
@@ -62,3 +66,6 @@ class Qwen35MoeFamily(Qwen35Family):
 
     def finish_host_layer(self, sm: _State, layer: Any, i: int, base: str | None = None) -> None:
         install_router(layer.mlp, (f"{sm.prefix}layers.{i}." if base is None else base) + "mlp.gate.weight")
+
+    def mixture(self, mlp: torch.nn.Module) -> Mixture | None:
+        return mixture(mlp)

@@ -16,8 +16,10 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from ....kinds import RouteMode
 from ...fixed_rows import fixed_rows
-from ...host import _HostLinear, compute_fp32
+from ...host import _Experts, _HostLinear, compute_fp32
+from ..base import Mixture
 from . import bind_forward
 
 
@@ -75,6 +77,24 @@ def _fixed_forward(self: Any, hidden_states: torch.Tensor) -> tuple[torch.Tensor
     if _normalizes(self):
         router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
     return router_logits, router_top_value.to(router_logits.dtype), router_indices
+
+
+def mixture(mlp: torch.nn.Module) -> Mixture | None:
+    """a Qwen mixture block (`gate`, `experts`, a `shared_expert` behind its `shared_expert_gate` where it has one) as
+    the GPU routes it: the router's matrix through its host linear (`Qwen4Router`), or the reference's float32 tensor
+    where it was kept as stored, renormalized where the router renormalizes; None for a dense block"""
+    ex = getattr(mlp, "experts", None)
+    if not isinstance(ex, _Experts):
+        return None
+    gate: Any = getattr(mlp, "gate", None)
+    if isinstance(gate, Qwen4Router):
+        w, lin, k, norm = gate.lin.weight, gate.lin, gate.top_k, gate.norm_topk_prob
+    else:
+        w, lin, k, norm = gate.weight, None, int(gate.top_k), _normalizes(gate)
+    sg = getattr(mlp, "shared_expert_gate", None)
+    mode = RouteMode.SOFTMAX_ALL_NORM if norm else RouteMode.SOFTMAX_ALL
+    shared = getattr(mlp, "shared_expert", None)
+    return Mixture(w, lin, int(k), mode, ex, shared, sg if isinstance(sg, _HostLinear) else None)
 
 
 def install(mlp: Any, key: str) -> None:

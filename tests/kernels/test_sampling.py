@@ -8,6 +8,7 @@ import math
 from collections import Counter
 from collections.abc import Callable, Sequence
 
+import numpy as np
 import pytest
 import torch
 
@@ -96,7 +97,7 @@ def test_the_draws_follow_the_distribution() -> None:
     mx = mlx_core()
     if mx is not None:
         xm = mx.array(x.numpy())
-        ids = s.pick_mx(mx.repeat(xm, n, axis=0), [s.key_for(i) for i in range(n)]).tolist()
+        ids = np.asarray(s.pick_mx(mx.repeat(xm, n, axis=0), [s.key_for(i) for i in range(n)])).tolist()
         cm = Counter(ids)
         for t, want in enumerate(p.tolist()):
             assert abs(cm[t] / n - want) < 0.02, (t, cm[t] / n, want)
@@ -163,7 +164,7 @@ def test_the_mlx_kernel_picks_as_the_ops_do() -> None:
     ids = s.pick_mx(
         mx.repeat(mx.array(torch.log(p).numpy())[None], 20000, axis=0), [s.key_for(i) for i in range(20000)]
     )
-    c = Counter(ids.tolist())
+    c = Counter(np.asarray(ids).tolist())
     for t, want in enumerate(p.tolist()):
         assert abs(c[t] / 20000 - want) < 0.02, (t, c[t] / 20000, want)
 

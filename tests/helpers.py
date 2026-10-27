@@ -30,10 +30,11 @@ from btb.kinds import Json, Parents, Quant, TokenRows, Tokens
 from btb.sampling import Sampling
 
 if TYPE_CHECKING:
+    import mlx.core as mx_
     from pytest import MonkeyPatch
     from transformers.cache_utils import DynamicCache
 
-    from btb.engine.experts import RecipePart, _ExpertStore
+    from btb.engine.experts import ExpertKey, RecipePart, SlotId, _ExpertStore
     from btb.engine.model import StreamedTextModel
     from btb.engine.native import _Cuda
     from btb.serve import Message, ModelRegistry, Server
@@ -278,6 +279,15 @@ def tree_next(sm: StreamedTextModel, cache: DynamicCache) -> torch.Tensor:
     return forward_logits(sm, [[CHUNK[PATH[-1]]]], cache)[0, -1]
 
 
+def mlx_keys(cache: DynamicCache, i: int) -> mx_.array:
+    """layer i's MLX K buffer [B, Hk, cap, d]: an MLX pass's attention rows (`GrowLayer.mx_bufs`)"""
+    from btb.engine.cache import GrowLayer
+
+    cl = cache.layers[i]
+    assert isinstance(cl, GrowLayer), f"layer {i} is a {type(cl).__name__}, not an MLX layer"
+    return cl.mx_bufs()[0]
+
+
 # --- comparisons ---------------------------------------------------------------------------------------------
 
 
@@ -472,6 +482,7 @@ class FakeRoute:
         n: int,
         dst: torch.Tensor,
         priority: int = 0,
+        *,
         key: object = None,
         on_done: Any = None,
         chunk: int = 0,
@@ -496,6 +507,15 @@ class FakeRoute:
         """the first `parts` reads of `key` taken by a reader: in flight, a withdrawal leaves them to land"""
         mine = [i for i, r in enumerate(self.reads) if r["key"] == key and not r["future"].done()]
         self.started.update(mine[:parts])
+
+    def disk_promote(self, key: object, priority: int) -> int:
+        mine = [
+            r for i, r in enumerate(self.reads) if r["key"] == key and not r["future"].done() and i not in self.started
+        ]
+        raised = [r for r in mine if priority < r["priority"]]
+        for r in raised:
+            r["priority"] = priority
+        return len(raised)
 
     def disk_drop(self, key: object, whole: bool = False) -> int:
         mine = [i for i, r in enumerate(self.reads) if r["key"] == key and not r["future"].done()]
@@ -603,13 +623,13 @@ def expert_store(
     return st, sm
 
 
-def seat(st: Any, key: tuple[int, int]) -> int:
+def seat(st: _ExpertStore, key: ExpertKey) -> SlotId:
     """a slot of the store's made `key`'s seat on the line through the store's own transitions (`_seat_for`,
     `_resident`): a test's stand-in for an expert read and landed, its slot's record kept true"""
     s = st._seat_for(set())
     assert s is not None, "the store has no seat to give"
     st._resident(s, key)
-    return int(s)
+    return s
 
 
 def bare_registry(device: str = "cuda:0", budget: int = 1 << 60) -> ModelRegistry:

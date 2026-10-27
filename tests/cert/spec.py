@@ -20,6 +20,7 @@ from enum import StrEnum
 from typing import Any
 
 from btb.kinds import (
+    MEGA_STORED,
     PROPOSER_TAG,
     QUANT_KIND,
     STORED_CLASSES,
@@ -397,15 +398,17 @@ def fused_step(kind: FamilyKind) -> bool:
     return (Cap.KERNEL_LAYOUT in fl or Cap.SANDWICH in fl) and rope_dim(kind) == head_dim(kind)
 
 
-def mlx_compute_tag(kind: FamilyKind, *, fused: bool) -> PassTag:
-    """the MLX compute tag a step-path pass must show, by the engine's own order (`Family.mlx_path`): a MoE family -
-    a hybrid one too - the per-op host path, a hybrid family the DeltaNet forward, and the rest the step - fused
-    where the layout and the bf16 state allow it."""
+def mlx_compute_tag(kind: FamilyKind, storage: Storage, *, fused: bool) -> PassTag:
+    """the MLX compute tag a step-path pass must show, by the engine's own order (`Family.mlx_path`,
+    `_mlx_mixtures_ok`): a hybrid family the DeltaNet forward - a mixture's too, its picks on the GPU, unless its
+    experts are FP8 or MXFP4 (no gather multiplies those yet) - a dense mixture the per-op host path, and the rest
+    the step, fused where the layout and the bf16 state allow it."""
     fl = core.flags(kind)
-    if Cap.MOE in fl:
-        return PassTag.MLX_PEROP  # its experts are picked on the host between layers: no fused step, no hybrid graph
     if Cap.HYBRID in fl:
-        return PassTag.MLX_HYBRID
+        perop = Cap.MOE in fl and (storage is Storage.SAFE_FP8 or quant_class(storage) is QuantClass.MXFP4)
+        return PassTag.MLX_PEROP if perop else PassTag.MLX_HYBRID
+    if Cap.MOE in fl:
+        return PassTag.MLX_PEROP  # its experts are picked on the host between layers: no fused step
     return PassTag.MLX_STEP_FUSED if fused and fused_step(kind) else PassTag.MLX_STEP_UNFUSED
 
 
@@ -443,8 +446,9 @@ def storage_tag(storage: Storage, hw: Hardware) -> PassTag | None:
 
 # the head widths the card's paged attention kernels are built for (btb/engine/prefix.py CARD_HEAD_DIMS)
 CARD_HEAD_DIMS = (64, 128, 256)
-# the megakernel's head multiple (btb/mlx/mega.py: `self.hd % 64`), which test_manifest holds against its source
-MEGA_HEAD_MULTIPLE = 64
+# aluminum's head sizes (btb/mlx/aluminum.py HEADS): the megakernel's head gate (mega/model.py `MegaPass`) and the
+# engine's MLX attention kernels' (mlx_forward.ATTN_KERNEL_HEADS), which test_manifest holds against their source
+ALUMINUM_HEADS = (64, 96, 128, 256)
 
 
 class MegaRefusal(StrEnum):
@@ -457,57 +461,47 @@ class MegaRefusal(StrEnum):
 
 def mega_refusal(kind: FamilyKind, storage: Storage, packed: bool = True) -> MegaRefusal | None:
     """why the megakernel cannot take this family's fixture in this storage, by the engine's own gates, in their
-    order: the family's block (`Family.mega`: the kernel layout, not the sandwich's), the weights it reads out of slot
-    buffers (a GGUF's quant blocks bound as stored under `packed`, `mlx_state.affine`, and the 12-bit store's packed
-    weights fall to the step; blocks dequantized on load are bf16 slots it reads), then the head width"""
+    order: the family's block (`Family.mega`: the plain dense block, the sandwich one, or the hybrid's DeltaNet and
+    gated attention layers without a mixture), the weights it reads out of slot buffers (a GGUF's quant blocks bound as
+    stored under `packed` read as stored where every type of the storage is one the kernel multiplies,
+    `kinds.MEGA_STORED`; the 12-bit store's packed weights fall to the step; blocks dequantized on load are bf16 slots
+    it reads), then the head width"""
     fl = core.flags(kind)
-    if Cap.KERNEL_LAYOUT not in fl or Cap.SANDWICH in fl:
+    if not (Cap.DENSE in fl or Cap.SANDWICH in fl or (Cap.HYBRID in fl and Cap.MOE not in fl)):
         return MegaRefusal.LAYOUT
     qc = quant_class(storage)
-    if STORAGE[storage].container is Container.PACK12 or (packed and qc not in (None, QuantClass.FLOAT)):
+    stored = packed and qc not in (None, QuantClass.FLOAT)
+    if STORAGE[storage].container is Container.PACK12 or (stored and not MEGA_STORED >= set(STORAGE[storage].quants)):
         return MegaRefusal.STORAGE
     hd = head_dim(kind)
-    if hd is None or hd % MEGA_HEAD_MULTIPLE:
+    if hd is None or hd not in ALUMINUM_HEADS:
         return MegaRefusal.SHAPE
     return None
 
 
-def mega_serves(kind: FamilyKind, storage: Storage, knobs: dict[str, object] | None = None) -> bool:
-    """whether MLX's megakernel takes a load's passes (`_mega_serves`): its knob on (`mlx_mega`, on by default), a
-    bf16 state, and a family, storage and fixture it takes (`gguf_packed`, on by default, keeping a GGUF's blocks)"""
-    k = knobs or {}
-    packed = bool(k.get("gguf_packed", 1))
-    return bool(k.get("mlx_mega", 1)) and not k.get("fp32") and mega_refusal(kind, storage, packed) is None
-
-
-def paged(
-    kind: FamilyKind, hw: Hardware, knobs: dict[str, object] | None = None, storage: Storage = Storage.SAFE_BF16
-) -> bool:
+def paged(kind: FamilyKind, hw: Hardware, knobs: dict[str, object] | None = None) -> bool:
     """whether the prefix cache serves the family on this hardware, with these load options and this storage - its
     attention reading every one-sequence cache through the pages - by the engine's own rule (`PrefixCache.why_not`):
-    the host's tier, MLX's (not where its megakernel serves, which reads arenas of its own, nor int8 rows) and the
-    card's (heads its kernels take, bf16 compute: `fp32` keeps the card's layers wider than its kernels read), a
-    hybrid's recurrent layers resumed from its snapshots on each; not a family's own layer (Qwen4) or its own attention
-    module (gpt-oss)"""
+    the host's tier, MLX's (its step and its megakernel alike, not int8 rows) and the card's (heads its kernels take,
+    bf16 compute: `fp32` keeps the card's layers wider than its kernels read), a hybrid's recurrent layers resumed from
+    its snapshots on each; not a family's own layer (Qwen4) or its own attention module (gpt-oss)"""
     fl = core.flags(kind)
     k = knobs or {}
     if hw is Hardware.CUDA:
         hd = head_dim(kind)
         tier = not k.get("fp32") and (hd is None or hd in CARD_HEAD_DIMS)
     elif hw is Hardware.MLX:
-        tier = not k.get("kv_bits") and not mega_serves(kind, storage, k)
+        tier = not k.get("kv_bits")
     else:
         tier = hw is Hardware.CPU
     return tier and Cap.OWN not in fl and Cap.FAST in fl
 
 
-def kv_tag(
-    kind: FamilyKind, hw: Hardware, knobs: dict[str, object] | None = None, storage: Storage = Storage.SAFE_BF16
-) -> PassTag:
+def kv_tag(kind: FamilyKind, hw: Hardware, knobs: dict[str, object] | None = None) -> PassTag:
     """the reader a cell's attention must take its cache rows through: the engine's pool of pages where the prefix
     cache serves the family there (`paged`), else each conversation's own contiguous buffers - the line that flips
     per tier as each lands, so a receipt banked on the old reader stops proving the cell"""
-    return PassTag.KV_PAGED if paged(kind, hw, knobs, storage) else PassTag.KV_CONTIGUOUS
+    return PassTag.KV_PAGED if paged(kind, hw, knobs) else PassTag.KV_CONTIGUOUS
 
 
 def expert_tag(kind: FamilyKind, storage: Storage, hw: Hardware, packed: bool) -> PassTag | None:
@@ -579,7 +573,7 @@ class DeviceSubpath:
         return frozenset(
             {
                 self.expect(kind, storage, quant),
-                kv_tag(kind, self.hardware, self.knobs, storage),
+                kv_tag(kind, self.hardware, self.knobs),
                 *(t for t in extra if t is not None),
             }
         )
@@ -631,7 +625,7 @@ DEVICE_SUBPATHS: tuple[DeviceSubpath, ...] = (
     DeviceSubpath(
         "mlx-step",
         Hardware.MLX,
-        lambda k, s, q: mlx_compute_tag(k, fused=True),
+        lambda k, s, q: mlx_compute_tag(k, s, fused=True),
         {"device": "mlx", "mlx_mega": 0},
         "the per-token graph, megakernel off",
     ),
@@ -662,14 +656,14 @@ DEVICE_SUBPATHS: tuple[DeviceSubpath, ...] = (
     DeviceSubpath(
         "mlx-kvbits",
         Hardware.MLX,
-        lambda k, s, q: mlx_compute_tag(k, fused=True),
+        lambda k, s, q: mlx_compute_tag(k, s, fused=True),
         {"device": "mlx", "mlx_mega": 0, "kv_bits": 8},
         "int8 KV rows",
     ),
     DeviceSubpath(
         "mlx-fp32",
         Hardware.MLX,
-        lambda k, s, q: mlx_compute_tag(k, fused=False),
+        lambda k, s, q: mlx_compute_tag(k, s, fused=False),
         {"device": "mlx", "fp32": 1},
         "fp32 compute: the fused kernels take a bf16 state, so the step runs unfused",
     ),
@@ -811,9 +805,11 @@ SURFACE_SUBPATHS: dict[Surface, tuple[str, ...]] = {
 
 def rows_tag(kind: FamilyKind, dev: DeviceSubpath) -> PassTag:
     """the path a fork's or a batch's rows must show, by the engine's own gates: the MLX batched step over a flat
-    buffer for a dense family on MLX (`_mlx_batch_ok`), the card graph's rows pass on a sub-path that runs the card
-    graph for a family the card's kernels take (`_card_rows_ok`), the torch pass over joined layers elsewhere"""
-    if dev.hardware is Hardware.MLX and Cap.DENSE in core.flags(kind):
+    buffer on MLX for a dense family or a hybrid whose step is the DeltaNet forward (`_mlx_rows_ok`), the card graph's
+    rows pass on a sub-path that runs the card graph for a family the card's kernels take (`_card_rows_ok`), the torch
+    pass over joined layers elsewhere"""
+    hybrid = mlx_compute_tag(kind, Storage.SAFE_BF16, fused=True) is PassTag.MLX_HYBRID
+    if dev.hardware is Hardware.MLX and (Cap.DENSE in core.flags(kind) or hybrid):
         return PassTag.ROWS_FLAT
     if dev.card_graph and card_rows(kind):
         return PassTag.ROWS_CARD

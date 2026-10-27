@@ -5,7 +5,7 @@ window on alternate layers, which sdpa cannot express; and the workspace a prefi
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
@@ -14,6 +14,13 @@ from .... import mlx as mlxdev
 from ...cache import GrowLayer
 from ...device import Where, where
 from ...fixed_rows import KeyRows
+
+if TYPE_CHECKING:
+    import mlx.core as mx_
+
+    from ....kinds import Parents
+    from ...cache import KvScales
+    from ...model import StreamedTextModel
 
 
 class ScoresWorkspace:
@@ -67,49 +74,52 @@ def attention_sinks(
     **kw: Any,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """gpt-oss's attention: a sink logit per query head in the softmax's denominator and, on alternate layers,
-    a `sliding_window`. Over an MLX cache the nodes of a speculative pass (and every decode row once
-    speculation is on) run through the node kernel, the rest through MLX's fused attention; elsewhere the
-    reference's arithmetic without its copies. Returns what the reference returns."""
+    a `sliding_window`. Over an MLX cache a decode row, the nodes of a speculative pass and a prefill chunk run
+    through aluminum (every row the one-row step's bits) at the head sizes it takes, the rest through MLX's fused
+    attention; elsewhere the reference's arithmetic without its copies. Returns what the reference returns."""
     B, Hq, T, d = (int(v) for v in query.shape)
     Hk = int(key.shape[1])
     g = Hq // Hk
     scale = float(d**-0.5 if scaling is None else scaling)
     win = int(sliding_window) if sliding_window else None
-    sm: Any = getattr(module, "_sm", None)
-    cl = None
+    # the engine the module's layer belongs to (btb's attribute on the module), None for a module run alone
+    sm: StreamedTextModel | None = getattr(module, "_sm", None)
+    # the MLX cache layer the pass attends over, where its rows are all MLX's
+    cl: GrowLayer | None = None
     if sm is not None and sm.mlx is not None and B == 1 and getattr(module, "layer_idx", None) is not None:
-        ctx = getattr(sm, "_attn_ctx", None)
-        cl = ctx.layers[module.layer_idx] if ctx is not None and module.layer_idx < len(ctx.layers) else None
-        if not (
-            isinstance(cl, GrowLayer)
-            and cl.shared
-            and cl._mx is not None
-            and cl._tk is None
-            and cl._tv is None
-            and int(cl._n) == int(key.shape[-2])
+        ctx = sm._attn_ctx
+        got = ctx.layers[module.layer_idx] if ctx is not None and module.layer_idx < len(ctx.layers) else None
+        if (
+            isinstance(got, GrowLayer)
+            and got.shared
+            and got._mx is not None
+            and got._tk is None
+            and got._tv is None
+            and int(got._n) == int(key.shape[-2])
             and s_aux is not None
         ):
-            cl = None
+            cl = got
     if cl is not None:
-        m = mlxdev.mx()
+        m = mlxdev.mx
         n = int(cl._n)
         past = n - T
         spec = bool(getattr(sm, "aq", False)) and past > 0
-        sinks = getattr(module, "_mx_sinks", None)
+        # the sinks as MLX's, made once (btb's attribute on the module)
+        sinks: mx_.array | None = getattr(module, "_mx_sinks", None)
         if sinks is None:
             sinks = mlxdev.to_mx(s_aux.detach().float().contiguous())
             m.eval(sinks)
             module._mx_sinks = sinks
-        K, V = cl._mx[0], cl._mx[1]
+        bufs = cl.mx_bufs()
+        K, V = bufs[0], bufs[1]
         kernel = (
-            d in (64, 128, 256)
+            d in mlxdev.ATTN_HEADS
             and g <= mlxdev.ATTN_MAXG
             and (K.dtype == m.bfloat16 or cl.bits)
             and getattr(sm, "mlx_attn_kernel", True)
-            and ((T > 1 and spec) or (T == 1 and (spec or n >= sm.mlx_attn_rows)))
         )
-        kq = {"ks": cl._mx[2], "vs": cl._mx[3]} if cl.bits else {}
-        parents = getattr(sm, "ap", None) if spec else None
+        kq: KvScales = {"ks": bufs[2], "vs": bufs[3]} if cl.bits else {}
+        parents: Parents | None = getattr(sm, "ap", None) if spec else None
         if parents is None or len(parents) != T:
             parents = list(range(-1, T - 1))
         if kernel:
@@ -118,8 +128,10 @@ def attention_sinks(
                 out = mlxdev.attn_decode(
                     q[0], K, V, n, scale, params=mlxdev.attn_params(n, window=win), sinks=sinks, **kq
                 )[None]
-            else:
+            elif spec:
                 out = mlxdev.attn_tree(q, K, V, past, list(parents), scale, sinks=sinks, window=win, **kq)
+            else:
+                out = mlxdev.attn_prefill(q, K, V, past, scale, window=win, sinks=sinks, **kq)
             return mlxdev.from_mx(out).to(query.dtype)[None], None
         qh = mlxdev.to_mx(query[0].contiguous())[None]
         if T == 1:
@@ -145,9 +157,9 @@ def attention_sinks(
                 # makes the prefill O(T*win)
                 start = max(0, past - win + 1) if win is not None else 0
                 Kv, Vv = cl.mx_kv(start, n)
-                p = past + m.arange(T, dtype=m.int32)[:, None]
-                j = start + m.arange(n - start, dtype=m.int32)[None]
-                mx_mask = (j <= p) if win is None else ((j <= p) & (j > p - win))
+                qp = past + m.arange(T, dtype=m.int32)[:, None]
+                kp = start + m.arange(n - start, dtype=m.int32)[None]
+                mx_mask = (kp <= qp) if win is None else ((kp <= qp) & (kp > qp - win))
         a = m.fast.scaled_dot_product_attention(
             qh.astype(Kv.dtype), Kv, Vv, scale=scale, mask=mx_mask, sinks=sinks.astype(Kv.dtype)
         )

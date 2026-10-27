@@ -58,7 +58,7 @@ def _held_rows(mp: pytest.MonkeyPatch, dr: Qwen4Drafter, n: int, on: list[int]) 
         def fed(toks: Any, h: torch.Tensor, pos0: int, *args: Any, **kw: Any) -> Any:
             # a draft of no width feeds nothing
             if name == "extend" or int(args[0]) > 0:
-                held = dr.cache.get_seq_length()
+                held = dr._kv().get_seq_length()
                 assert held == pos0, f"{name}: the drafter holds {held} rows, fed at {pos0}"
                 assert int(h.shape[1]) == len(toks), (name, int(h.shape[1]), len(toks))
                 T = n + max(0, len(on) - 1)
@@ -108,10 +108,10 @@ def test_the_drafter_reads_its_experts_through_the_store_and_its_speculation_is_
                     assert census["proposed"] > 0, f"{name}, {proposer}: nothing was drafted, so nothing verified"
                     assert census["mtp_steps"] > 0, f"{name}, {proposer}: the drafter never stepped"
                     # the tree's branches leave the drafter's cache as the root left it: the indexer's keys with K/V
-                    cl = dr.cache.layers[0]
-                    ik = indexer_keys(cl)
-                    assert ik is not None and ik.shape[0] == cl.keys.shape[0] == 1
-                    assert ik.shape[1] == cl.keys.shape[-2], f"{name}, {proposer}: indexer keys out of step"
+                    cl = dr._layer0()
+                    ik, keys = indexer_keys(cl), cl.keys
+                    assert ik is not None and keys is not None and ik.shape[0] == keys.shape[0] == 1
+                    assert ik.shape[1] == keys.shape[-2], f"{name}, {proposer}: indexer keys out of step"
                     # plain steps the pricer plans between drafting passes (its warm steps, a width that does not
                     # pay): the drafter still takes every committed row, at the next draft's root or, past
                     # PEND_ROWS of them, without drafting - its cache the one every pass drafting leaves
@@ -164,6 +164,19 @@ def test_the_drafter_reads_its_experts_through_the_store_and_its_speculation_is_
                 rows, off = int(c[4]), int(c[7])
                 assert (int(c[3]), rows) == (layer, picks.shape[0])
                 assert torch.equal(torch.from_numpy(prof.p[off : off + rows, : picks.shape[1]]).long(), picks.long())
+            # a drafter holding nothing that a resumed turn anchored at row 8, then prefilled afresh (a new decode):
+            # the prefill starts over at row 0, so a crop to its 6 rows keeps them all, K, V and the indexer's keys
+            toks = PROMPTS["short"]
+            h = torch.randn(1, len(toks), dr.S * dr.H, dtype=dr.cd)
+            dr.crop(0)
+            dr.extend(toks[1:5], h[:, :4], 8)
+            assert dr.first == 8
+            dr.prefill(toks[:7], h[:, :7])
+            dr.crop(6)
+            cl = dr._layer0()
+            ik = indexer_keys(cl)
+            assert cl.keys is not None and ik is not None
+            assert (dr._kv().get_seq_length(), ik.shape[1]) == (6, 6), "a fresh prefill kept a resumed turn's anchor"
         finally:
             sm.expert_trace = None
             sm.expert_profile = None

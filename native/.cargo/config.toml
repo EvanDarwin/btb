@@ -1,0 +1,5 @@
+# Every function on a 64-byte line. With one codegen unit and thin LTO a kernel's address follows the whole crate's
+# order; on a line of its own, its loops sit across the front end's fetch windows as its own code places them, so
+# code added anywhere else in the crate cannot move them (and with them, its speed).
+[build]
+rustflags = ["-C", "llvm-args=-align-all-functions=6"]

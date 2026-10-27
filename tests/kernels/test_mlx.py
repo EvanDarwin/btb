@@ -6,7 +6,7 @@ torch side's crops and gathers), and MLX's causal mask against the engine's. Ski
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, ParamSpec, TypeVar, cast
+from typing import TYPE_CHECKING, ParamSpec, TypeVar
 
 import numpy as np
 import torch
@@ -28,6 +28,9 @@ from tests.helpers import (
 if TYPE_CHECKING:
     import mlx.core as mx
 
+    from btb.mlx.attn import NodeMeta
+    from btb.mlx.backend import PackedEntry
+
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
@@ -48,19 +51,18 @@ def check_unpack() -> str:
     lo, hi4, tbl, esc_idx, esc_val = pack_bf16(t)
     pad = (-(lo.nbytes + hi4.nbytes)) % 4
     blob = np.concatenate([lo, hi4, np.zeros(pad, np.uint8), esc_idx.view(np.uint8), esc_val])
-    e = {
+    e: PackedEntry = {
         "lo": lo.nbytes,
         "hi4": hi4.nbytes,
         "pad": pad,
         "esc": int(esc_idx.size),
         "table": [int(x) for x in tbl],
         "n": t.numel(),
-        "shape": list(t.shape),
     }
     so = 64 * 7
     sh = mlxdev.Shared(so + blob.size + 128)
     sh.torch[so : so + blob.size] = torch.from_numpy(blob.copy())
-    w = mlxdev.Backend.weight_slot_packed(cast("mlxdev.Backend", None), sh, so, e, tuple(t.shape))
+    w = mlxdev.Backend.weight_slot_packed(sh, so, e, tuple(t.shape))
     back = mlxdev.from_mx(w.get())
     assert esc_idx.size > 0, "the fixture has no escapes"
     assert bool((back.view(torch.int16) == t.view(torch.int16)).all()), "GPU unpack is not bit-exact"
@@ -69,10 +71,11 @@ def check_unpack() -> str:
 
 def check_gemv() -> str:
     from btb import mlx as mlxdev
+    from btb.mlx.backend import Stat
 
     be = mlxdev.Backend.__new__(mlxdev.Backend)
     be.gemm_rows = 64
-    be.stat = {"linears": 0, "evals": 0, "s": 0.0}
+    be.stat = Stat(linears=0, evals=0, s=0.0, layers=0, layer_s=0.0)
     worst = 0.0
     torch.manual_seed(1)
     for rows, cols, b in [
@@ -159,6 +162,17 @@ def check_cache() -> str:
     mx.eval(K)
     assert cl.get_seq_length() == 7 and cl._tk is None
     assert bool((cl.keys == torch.cat([expect_k, k], -2)).all())
+    # a view held across an append keeps MLX from writing the buffer in place: the rows move, and a crop of the moved
+    # rows is still a crop (a finishing command buffer's hold moves them the same way, at random)
+    held = cl.keys
+    k1 = torch.randn(B, Hk, 1, d).bfloat16()
+    K, V = cl.mx_update(mlxdev.to_mx(k1), mlxdev.to_mx(k1))
+    mx.eval(K, V)
+    assert cl.keys.untyped_storage().data_ptr() != held.untyped_storage().data_ptr(), "the held view kept the rows"
+    del held
+    cl.keys = cl.keys[..., :7, :]
+    cl.values = cl.values[..., :7, :]
+    assert cl.get_seq_length() == 7 and cl._tk is None and cl._tv is None, "a crop of moved rows was not seen as one"
     # torch appends through the same buffer, and growth keeps the rows
     k2 = torch.randn(B, Hk, 4100, d).bfloat16()
     kk, _vv = cl.update(k2, k2)
@@ -223,17 +237,20 @@ def check_attn_kernel() -> str:
     import mlx.core as mx
 
     from btb import mlx as mlxdev
+    from btb.mlx import aluminum
 
     mx.random.seed(5)
-    worst = 0.0
-    # head_dim 128 (Qwen3, Llama), 256 (Qwen3.5) with four query heads per kv head, and gpt-oss: head_dim
-    # 64, eight query heads per kv head, per-head sinks and a 128-position sliding window on half its layers
-    for Hq, Hk, d in ((32, 8, 128), (16, 4, 256), (64, 8, 64)):
+    # the error by P's precision: float below head 256, bf16 at 256 (aluminum.bf16p); q is bf16 as the kernel takes it
+    worst = {False: 0.0, True: 0.0}
+    # head_dim 128 (Qwen3, Llama), 256 (Qwen3.5) with four query heads per kv head, 96 (Phi-3's, a kv head a query
+    # head), and gpt-oss: head_dim 64, eight query heads per kv head, per-head sinks and a 128-position sliding window
+    # on half its layers
+    for Hq, Hk, d in ((32, 8, 128), (16, 4, 256), (32, 32, 96), (64, 8, 64)):
         g = Hq // Hk
         for S, cap in ((7, 64), (73, 4096), (4096, 4500), (9000, 12288)):
             kb = (mx.random.normal((1, Hk, cap, d)) * 2).astype(mx.bfloat16)
             vb = mx.random.normal((1, Hk, cap, d)).astype(mx.bfloat16)
-            q = mx.random.normal((Hq, d))
+            q = mx.random.normal((Hq, d)).astype(mx.bfloat16).astype(mx.float32)
             arms: list[tuple[mx.array | None, int | None]] = [(None, None)]
             if d == 64:
                 sk = mx.random.normal((Hq,)) * 3
@@ -241,20 +258,25 @@ def check_attn_kernel() -> str:
             for sinks, window in arms:
                 ref = _attn_ref(q, kb, vb, S, 0.088, Hk, g, sinks, window)
                 out = mlxdev.attn_decode(q, kb, vb, S, 0.088, sinks=sinks, window=window)
-                worst = max(worst, float(mx.abs(out - ref).max() / mx.abs(ref).max()))
+                pb = aluminum.bf16p(d)
+                worst[pb] = max(worst[pb], float(mx.abs(out - ref).max() / mx.abs(ref).max()))
     Hq, Hk, d = 32, 8, 128
     S, cap = 4096, 4500
     kb = (mx.random.normal((1, Hk, cap, d)) * 2).astype(mx.bfloat16)
     vb = mx.random.normal((1, Hk, cap, d)).astype(mx.bfloat16)
     # three query heads per kv head (Phi-4-mini's shape)
-    q = mx.random.normal((24, d))
+    q = mx.random.normal((24, d)).astype(mx.bfloat16).astype(mx.float32)
     ref = mx.softmax((q.reshape(Hk, 3, d) @ kb[0, :, :S].astype(mx.float32).transpose(0, 2, 1)) * 0.088, axis=-1) @ vb[
         0, :, :S
     ].astype(mx.float32)
     out = mlxdev.attn_decode(q, kb, vb, S, 0.088)
-    worst = max(worst, float(mx.abs(out - ref.reshape(24, d)).max() / mx.abs(ref).max()))
-    assert worst < 1e-4, f"decode kernel rel err {worst:.2e}"
-    return f"decode kernel rel err {worst:.1e} (head_dim 64/128/256, sinks and a 128 window)"
+    worst[False] = max(worst[False], float(mx.abs(out - ref.reshape(24, d)).max() / mx.abs(ref).max()))
+    assert worst[False] < 1e-4, f"decode kernel rel err {worst[False]:.2e} (float P)"
+    assert worst[True] < 6e-3, f"decode kernel rel err {worst[True]:.2e} (P in bf16)"
+    return (
+        f"decode kernel rel err {worst[False]:.1e} (float P, heads 64/96/128), {worst[True]:.1e} (P in bf16, head 256);"
+        " sinks and a 128 window"
+    )
 
 
 def check_delta_tree() -> str:
@@ -318,13 +340,14 @@ def check_attn_tree() -> str:
 
     mx.random.seed(9)
     bad = 0
-    # a long prefix over two row splits at head_dim 128; a short prefix off every alignment (73 rows) at
-    # head_dim 256 with a tree whose branch nodes sit away from their path's rows in the cache; and gpt-oss
-    # (head_dim 64, eight query heads per kv head) with its sinks and a 128-position window over a 3000-row
-    # prefix, so that all but the last rows of the prefix are outside every node's window
+    # a long prefix over six segments at head_dim 128; a short prefix off every alignment (73 rows) at
+    # head_dim 256 with a tree whose branch nodes sit away from their path's rows in the cache; head_dim 96 over
+    # three segments; and gpt-oss (head_dim 64, eight query heads per kv head) with its sinks and a 128-position
+    # window over a 3000-row prefix, so that all but the last rows of the prefix are outside every node's window
     for Hq, Hk, d, past, parents, sink, win in (
         (32, 8, 128, 3000, [-1, 0, 0, 1, 2, 2, 4], False, None),
         (16, 4, 256, 73, [-1, 0, 0, 1, 1, 2, 3, 5], False, None),
+        (32, 32, 96, 1500, [-1, 0, 1, 1, 3, 0], False, None),
         (64, 8, 64, 3000, [-1, 0, 0, 1, 2, 2, 4, 6], True, 128),
         (64, 8, 64, 60, [-1, 0, 0, 1, 2, 2, 4, 6], True, 128),
     ):
@@ -352,8 +375,8 @@ def check_attn_tree() -> str:
             bad += int(not mx.array_equal(one, out[t]))
     assert bad == 0, f"{bad} nodes differ from the one-row decode"
     return (
-        "tree nodes bit-exact against one-row decodes (head_dim 128 over two splits; 256 off alignment; "
-        "gpt-oss with sinks and a 128 window, past 3000 and 60)"
+        "tree nodes bit-exact against one-row decodes (head_dim 128 over six segments; 256 off alignment; 96 over "
+        "three; gpt-oss with sinks and a 128 window, past 3000 and 60)"
     )
 
 
@@ -366,7 +389,6 @@ def check_attn_paged() -> str:
 
     from btb import mlx as mlxdev
     from btb.engine.kvpool import PAGE
-    from btb.mlx.attn import ATTN_PF_BLOCK
 
     mx.random.seed(13)
     rng = np.random.default_rng(13)
@@ -375,6 +397,8 @@ def check_attn_paged() -> str:
         (32, 8, 128, 3000, [-1, 0, 0, 1, 2, 2, 4]),
         (16, 4, 256, 73, [-1, 0, 0, 1, 1, 2, 3, 5]),
         (8, 2, 256, 1500, [-1, 0, 1, 2]),
+        (32, 32, 96, 900, [-1, 0, 0, 2]),
+        (64, 8, 64, 700, [-1, 0, 1, 1, 3]),
     ):
         T = len(parents)
         n = past + T
@@ -382,8 +406,7 @@ def check_attn_paged() -> str:
         pool = 2 * pages + 3
         order = rng.permutation(pool)[:pages]
         rows = (order[:, None] * PAGE + np.arange(PAGE)[None]).reshape(-1)[:n]
-        # the contiguous buffer padded to whole prefill blocks, so its last block starts where the paged one's does
-        cap = -(-n // ATTN_PF_BLOCK) * ATTN_PF_BLOCK + ATTN_PF_BLOCK
+        cap = n + 1
         kb = mx.zeros((1, Hk, cap, d), dtype=mx.bfloat16)
         vb = mx.zeros((1, Hk, cap, d), dtype=mx.bfloat16)
         kb[:, :, :n] = (mx.random.normal((1, Hk, n, d)) * 2).astype(mx.bfloat16)
@@ -408,28 +431,30 @@ def check_attn_paged() -> str:
                 mlxdev.attn_tree(qt, rk, rv, past, parents, 0.088, rmap=step, k2=kb[:, :, past:n], v2=vb[:, :, past:n]),
             ),
         ]
-        if d == 256:
-            qp = mx.random.normal((T, Hq, d)).astype(mx.bfloat16)
-            pairs.append(
-                (
-                    "prefill",
-                    mlxdev.attn_prefill(qp, kb, vb, past, d**-0.5, odt=mx.float32),
-                    mlxdev.attn_prefill(
-                        qp, rk, rv, past, d**-0.5, odt=mx.float32, rmap=step, k2=kb[:, :, past:n], v2=vb[:, :, past:n]
-                    ),
-                )
+        qp = mx.random.normal((T, Hq, d)).astype(mx.bfloat16)
+        pairs.append(
+            (
+                "prefill",
+                mlxdev.attn_prefill(qp, kb, vb, past, d**-0.5, odt=mx.float32),
+                mlxdev.attn_prefill(
+                    qp, rk, rv, past, d**-0.5, odt=mx.float32, rmap=step, k2=kb[:, :, past:n], v2=vb[:, :, past:n]
+                ),
             )
+        )
         for name, want, got in pairs:
             mx.eval(want, got)
             if not mx.array_equal(want, got):
                 bad.append((name, Hq, Hk, d, past, float(mx.max(mx.abs(want - got)))))
     assert not bad, f"paged reads differ from contiguous ones: {bad}"
-    return "decode, tree and prefill through a shuffled row map bit-exact against contiguous rows (heads 128, 256)"
+    return (
+        "decode, tree and prefill through a shuffled row map bit-exact against contiguous rows (heads 64, 96, 128, 256)"
+    )
 
 
 def check_attn_int8() -> str:
     """the node kernel over an int8 cache (a float32 scale per row): the decode against a float32 reference
-    over the dequantized rows, and a tree's nodes bit for bit as one-row decodes over the same int8 rows"""
+    over the rows as dequantized to bf16 (what the kernel reads, the prefill's rows of that cache), and a tree's
+    nodes bit for bit as one-row decodes over the same int8 rows"""
     import mlx.core as mx
 
     from btb import mlx as mlxdev
@@ -444,8 +469,9 @@ def check_attn_int8() -> str:
     mx.eval(kq, ks, vq, vs, kd, vd)
     err_q = float(mx.abs(kd - kb).max() / mx.abs(kb).max())
     assert err_q < 5e-3, f"int8 rows are off by {err_q:.2e} of the largest magnitude"
+    kd, vd = (mlxdev.kv_dequantize(x, s_).astype(mx.float32) for x, s_ in ((kq, ks), (vq, vs)))
     n = 3000
-    q = mx.random.normal((Hq, d))
+    q = mx.random.normal((Hq, d)).astype(mx.bfloat16).astype(mx.float32)
     mx.eval(q)
     out = mlxdev.attn_decode(q, kq, vq, n, 0.088, ks=ks, vs=vs)
     # the reference: softmax(q . K^T) V over the dequantized rows, per query head, float32
@@ -478,6 +504,87 @@ def check_attn_int8() -> str:
         bad += int(not mx.array_equal(one, tree[t]))
     assert bad == 0, f"{bad} tree nodes differ from the one-row decode over the int8 cache"
     return f"int8 cache: rows within {err_q:.1e}, decode rel err {err:.1e} vs float32, tree nodes bit-exact"
+
+
+def check_tree_tile() -> str:
+    """every tree kernel (`aluminum.tree` on each of `aluminum.tree_kernels`, which a tree's attention takes where
+    `tree_pick` picks it) bit for bit as the node kernel over the same inputs: trees of 1 to 40 nodes over pasts short
+    of a block, on and off segment edges, at every head size; int8 rows, windows with sinks (the nodes spanning more
+    segments than any one has), a step buffer (bf16 and int8), a row map, a batch slice and a flat buffer's stretch"""
+    import mlx.core as mx
+
+    from btb import mlx as mlxdev
+    from btb.mlx import aluminum
+
+    mx.random.seed(19)
+    rng = np.random.default_rng(19)
+    bad: list[str] = []
+    cells = 0
+
+    def same(
+        name: str,
+        q: mx.array,
+        k: mx.array,
+        v: mx.array,
+        meta: NodeMeta,
+        sinks: mx.array | None = None,
+        ks: mx.array | None = None,
+        vs: mx.array | None = None,
+        k2: mx.array | None = None,
+        v2: mx.array | None = None,
+        ks2: mx.array | None = None,
+        vs2: mx.array | None = None,
+        rmap: mx.array | None = None,
+    ) -> None:
+        nonlocal cells
+        meta_, path, splits = meta
+        want = aluminum.nodes(q, k, v, meta_, path, 0.088, splits, sinks, ks, vs, k2, v2, ks2, vs2, mx.bfloat16, rmap)
+        for pick in aluminum.tree_kernels(int(q.shape[-1])):
+            got = aluminum.tree(
+                q, k, v, meta_, path, 0.088, splits, sinks, ks, vs, k2, v2, ks2, vs2, mx.bfloat16, rmap, pick
+            )
+            mx.eval(want, got)
+            cells += 1
+            if not mx.array_equal(want, got):
+                bad.append(f"{name} ({pick.kind} {pick.rows} rows, {pick.nsg} simdgroups)")
+
+    for Hq, Hk, d in ((32, 8, 128), (64, 8, 64), (32, 8, 96), (16, 8, 256), (4, 1, 256)):
+        for past in (5, 511, 1500):
+            cap = past + 48
+            kb = (mx.random.normal((1, Hk, cap, d)) * 2).astype(mx.bfloat16)
+            vb = mx.random.normal((1, Hk, cap, d)).astype(mx.bfloat16)
+            for T in (1, 3, 9, 40):
+                parents = [-1] + [int(rng.integers(0, t)) for t in range(1, T)]
+                same(f"d {d} past {past} T {T}", mx.random.normal((T, Hq, d)), kb, vb, mlxdev.tree_meta(past, parents))
+            parents = [-1, 0, 0, 1, 2, 2, 4, 3, 1, 8, 9, 0]
+            T = len(parents)
+            q = mx.random.normal((T, Hq, d))
+            meta = mlxdev.tree_meta(past, parents)
+            kq, ks = mlxdev.kv_quantize(kb)
+            vq, vs = mlxdev.kv_quantize(vb)
+            same(f"int8 d {d} past {past}", q, kq, vq, meta, ks=ks, vs=vs)
+            sinks = mx.random.normal((Hq,)) * 3
+            for win in (128, 700):
+                same(f"window {win} d {d} past {past}", q, kb, vb, mlxdev.tree_meta(past, parents, window=win), sinks)
+            k2 = mx.random.normal((1, Hk, T, d)).astype(mx.bfloat16)
+            v2 = mx.random.normal((1, Hk, T, d)).astype(mx.bfloat16)
+            step = mlxdev.tree_meta(past, parents, seg=past)
+            same(f"step buffer d {d} past {past}", q, kb, vb, step, k2=k2, v2=v2)
+            k2q, k2s = mlxdev.kv_quantize(k2)
+            v2q, v2s = mlxdev.kv_quantize(v2)
+            same(f"int8 step buffer d {d} past {past}", q, kq, vq, step, None, ks, vs, k2q, v2q, k2s, v2s)
+            rmap = mx.array(rng.permutation(cap)[:past].astype(np.uint32))
+            same(f"row map d {d} past {past}", q, kb, vb, step, k2=k2, v2=v2, rmap=rmap)
+            kb3 = mx.random.normal((3, Hk, cap + 40, d)).astype(mx.bfloat16)
+            vb3 = mx.random.normal((3, Hk, cap + 40, d)).astype(mx.bfloat16)
+            same(f"slice d {d} past {past}", q, kb3, vb3, mlxdev.tree_meta(past, parents, batch=2))
+            flat = mlxdev.tree_meta(past, parents, batch=1, pbase=37, kbatch=0)
+            same(f"flat d {d} past {past}", q, kb3, vb3, flat)
+    assert not bad, f"a tree kernel differs from the node kernel: {bad}"
+    return (
+        f"{cells} tree passes on every tree kernel bit-exact against the node kernel (heads 64, 96, 128, 256; every "
+        "variant)"
+    )
 
 
 def check_kv_bits() -> str:
@@ -565,6 +672,39 @@ def check_gemv_rows() -> str:
                 bad.append((str(dt), t))
     assert not bad, f"a row's product depends on its company: {bad}"
     return "rows alone and in passes of 2-63 rows bit-exact (bf16, float32)"
+
+
+def check_steel_rows() -> str:
+    """a prefill's rows through the gemm are their one-row steps: the route's every width (the matvec's, steel's each
+    tile, partial tiles, a K of no whole BK steps, MLX's own gemm at short K) for each weight dtype, x in bf16 and
+    float32, bit for bit"""
+    import mlx.core as mx
+
+    from btb import mlx as mlxdev
+    from btb.mlx import steel
+    from btb.mlx.backend import Stat
+
+    be = mlxdev.Backend.__new__(mlxdev.Backend)
+    be.gemm_rows = 64
+    be.stat = Stat(linears=0, evals=0, s=0.0, layers=0, layer_s=0.0)
+    mx.random.seed(5)
+    widths = (2, 31, 32, 63, 64, 65, 127, 200, 256, 300)
+    # (1000, 2056) and (1536, 2560) take steel (K past max(M, N)), (4096, 1024) and (2048, 512) MLX's gemm
+    assert {steel.pick(t, r) for t in widths if t >= 32 for r in (1000, 1536)} == set(steel.TILES), "a tile unchecked"
+    bad = []
+    for rows, cols in ((1000, 2056), (1536, 2560), (4096, 1024), (2048, 512)):
+        for wdt in (mx.bfloat16, mx.float16, mx.float32):
+            w = mlxdev.Weight((mx.random.normal((rows, cols)) * 0.05).astype(wdt))
+            for dt in (mx.bfloat16, mx.float32):
+                X = mx.random.normal((max(widths), cols)).astype(dt)
+                one = mx.concatenate([be.matmul(X[i : i + 1], w) for i in range(max(widths))])
+                for t in widths:
+                    full = be.matmul(X[:t], w)
+                    mx.eval(full, one)
+                    if full.dtype != one.dtype or not mx.array_equal(full, one[:t]):
+                        bad.append((rows, cols, str(wdt), str(dt), t))
+    assert not bad, f"a prefill's row is not its one-row step: {bad}"
+    return f"rows of passes of {', '.join(map(str, widths))} rows are their one-row steps (bf16/f16/f32 weights)"
 
 
 _FP4 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
@@ -747,7 +887,6 @@ def check_gpt_oss() -> str:
             with torch.inference_mode():
                 sm = host_model(fx, device="mlx", dtype=torch.bfloat16)
                 speculation(sm, tree_budget=0, v_max=0, ngram_p=0.0, tree_read="step")
-                sm.mlx_attn_rows = 0
                 sm.mlx_attn_kernel = kern
                 n0 = calls["nodes"]
                 cache = sm.new_cache()
@@ -863,7 +1002,7 @@ def check_rope_rows() -> str:
     from btb import mlx as mlxdev
     from btb.mlx import Backend
 
-    m = mlxdev.mx()
+    m = mlxdev.mx
     m.random.seed(5)
     inv = 1.0 / (10000.0 ** (m.arange(0, 128, 2).astype(m.float32) / 128))  # a rotary module's inv_freq
     cases = []
@@ -872,7 +1011,7 @@ def check_rope_rows() -> str:
             B, H = 37, 4
             freqs = (1.0 / inv[: rd // 2]).astype(m.float32)
             x = m.random.normal((B, H, D)).astype(dt)
-            pos = [int(p) for p in m.random.randint(0, 40000, (B,)).tolist()]
+            pos = [int(p) for p in np.asarray(m.random.randint(0, 40000, (B,)))]
             out = mlxdev.rope_rows(x, rd, freqs, sc, pos)
             for b in range(B):
                 one = Backend.rope_fast(x[b][None, :, None, :], rd, freqs, sc, pos[b])[0, :, 0, :]
@@ -882,7 +1021,7 @@ def check_rope_rows() -> str:
     # q and k in one launch: the bits of rope_rows
     q = m.random.normal((37, 8, 128)).astype(m.bfloat16)
     k = m.random.normal((37, 2, 128)).astype(m.bfloat16)
-    pos = [int(p) for p in m.random.randint(0, 40000, (37,)).tolist()]
+    pos = [int(p) for p in np.asarray(m.random.randint(0, 40000, (37,)))]
     freqs = (1.0 / inv).astype(m.float32)
     oq, ok = mlxdev.rope_rows2(q, k, 128, freqs, 1.0, pos)
     m.eval(oq, ok)
@@ -902,7 +1041,7 @@ def check_attn_rows() -> str:
     int8; head_dim 128, four query heads per kv head)"""
     from btb import mlx as mlxdev
 
-    m = mlxdev.mx()
+    m = mlxdev.mx
     m.random.seed(7)
     B, Hq, Hk, D, cap = 6, 8, 2, 128, 700
     ns = [1, 64, 65, 300, 699, 128]
@@ -979,56 +1118,120 @@ def check_attn_rows() -> str:
             m.eval(one)
             assert m.array_equal(outn[t], one), f"forest node {t} (row {b}, token {p}) differs from the one-row decode"
             checked += 1
+    # the forest's prompts prefilled in one launch: its nodes' bits, each prompt's own prefill's from its offset
+    outp = mlxdev.attn_prefill_rows(qf, kf, vf, lens, pbases, 0.088, odt=m.float32)
+    m.eval(outp)
+    assert m.array_equal(outp, outn), "the forest's prefill differs from its nodes"
+    for b, L in enumerate(lens):
+        span = slice(pbases[b], pbases[b] + L)
+        one = mlxdev.attn_prefill(qf[span], kf, vf, 0, 0.088, odt=m.float32, pbase=pbases[b])
+        m.eval(one)
+        assert m.array_equal(one, outp[span]), f"prompt {b}'s prefill at its offset differs from the forest's"
+    kfq, kfs = mlxdev.kv_quantize(kf)
+    vfq, vfs = mlxdev.kv_quantize(vf)
+    outn8 = mlxdev.attn_nodes(qf, kfq, vfq, meta, path, 0.088, splits, ks=kfs, vs=vfs)
+    outp8 = mlxdev.attn_prefill_rows(qf, kfq, vfq, lens, pbases, 0.088, odt=m.float32, ks=kfs, vs=vfs)
+    m.eval(outn8, outp8)
+    assert m.array_equal(outp8, outn8), "the int8 forest's prefill differs from its nodes"
+    # a chunk of one slice of a batched buffer, as the slice alone
+    qc = m.random.normal((40, Hq, D)).astype(m.float32)
+    for b in (0, 4):
+        one = mlxdev.attn_prefill(qc, kb, vb, 600, 0.088, odt=m.float32, kbatch=b)
+        alone = mlxdev.attn_prefill(qc, kb[b : b + 1], vb[b : b + 1], 600, 0.088, odt=m.float32)
+        m.eval(one, alone)
+        assert m.array_equal(one, alone), f"a chunk of slice {b} differs from the slice alone"
+        one = mlxdev.attn_prefill(qc, kq, vq, 600, 0.088, odt=m.float32, kbatch=b, ks=ks, vs=vs)
+        alone = mlxdev.attn_prefill(
+            qc, kq[b : b + 1], vq[b : b + 1], 600, 0.088, odt=m.float32, ks=ks[b : b + 1], vs=vs[b : b + 1]
+        )
+        m.eval(one, alone)
+        assert m.array_equal(one, alone), f"an int8 chunk of slice {b} differs from the slice alone"
     return (
         f"{B} rows of {min(ns)}..{max(ns)} cache rows bit-exact against their one-row decodes, bf16 and int8, "
-        f"one buffer, two segments and the flat layout; {checked} forest nodes of {tot} bit-exact"
+        f"one buffer, two segments and the flat layout; {checked} forest nodes of {tot} bit-exact, the forest's "
+        "prefill its nodes' (bf16 and int8) and each prompt's own, a slice's chunk the slice's alone"
     )
 
 
 def check_attn_prefill() -> str:
-    """the fused prefill kernel at head size 256: random bf16 caches at several (past, T, Hk, g) against a float32
-    reference in plain ops (the error P's bf16 rounding, measured 3.1e-3 at most), and each of a few rows against
-    attn_nodes for that row alone (exact per row; the two differ by fold order only, so no bit-equality)"""
+    """the fused prefill kernel at head sizes 64, 96, 128 and 256: random bf16 caches at several (past, T, Hk, g,
+    window) against a float32 reference in plain ops (float P below 256; at 256 the error P's bf16 rounding, measured
+    3.1e-3 at most), each of a few rows bit for bit as the one-row decode computes it, and the chunk prefilled in
+    pieces bit for bit as in one"""
     from btb import mlx as mlxdev
+    from btb.mlx import aluminum
 
-    m = mlxdev.mx()
+    m = mlxdev.mx
     m.random.seed(11)
-    D = 256
-    scale = D**-0.5
-    worst = worst_node = 0.0
+    worst = {False: 0.0, True: 0.0}
+    bad: list[tuple[int, int, int, int | str]] = []  # (head, past, T, the row that differs or "pieces")
     cases = [
-        (0, 17, 2, 4),
-        (1, 40, 1, 8),
-        (100, 33, 2, 2),
-        (77, 100, 3, 1),
-        (513, 64, 4, 4),
-        (0, 4096, 2, 4),
-        (40000, 20, 1, 4),
+        (256, 0, 17, 2, 4, None),
+        (256, 1, 40, 1, 8, None),
+        (256, 100, 33, 2, 2, None),
+        (256, 77, 100, 3, 1, None),
+        (256, 513, 64, 4, 4, None),
+        (256, 0, 4096, 2, 4, None),
+        (256, 40000, 20, 1, 4, None),
+        (256, 900, 200, 2, 2, 512),
+        (128, 0, 700, 8, 2, None),
+        (128, 1500, 60, 4, 7, None),
+        (96, 0, 300, 4, 1, None),
+        (96, 1500, 60, 2, 4, 128),
+        (64, 0, 300, 8, 8, 128),
+        (64, 2000, 90, 8, 8, None),
     ]
-    for past, T, Hk, g in cases:
+    for D, past, T, Hk, g, win in cases:
+        scale = D**-0.5
         Hq = Hk * g
         n = past + T
         cap = max(n + 5, 64)
         kb = m.random.normal((1, Hk, cap, D)).astype(m.bfloat16)
         vb = m.random.normal((1, Hk, cap, D)).astype(m.bfloat16)
         q = m.random.normal((T, Hq, D)).astype(m.bfloat16)
-        out = mlxdev.attn_prefill(q, kb, vb, past, scale, odt=m.float32)
+        out = mlxdev.attn_prefill(q, kb, vb, past, scale, odt=m.float32, window=win)
         qf = q.astype(m.float32).transpose(1, 0, 2)
         kf = m.repeat(kb[0, :, :n].astype(m.float32), g, axis=0)
         vf = m.repeat(vb[0, :, :n].astype(m.float32), g, axis=0)
         s = (qf * scale) @ kf.transpose(0, 2, 1)
-        s = m.where(m.arange(n)[None, :] <= past + m.arange(T)[:, None], s, -m.inf)
+        j, p = m.arange(n)[None, :], past + m.arange(T)[:, None]
+        s = m.where((j <= p) & (j > p - win) if win else j <= p, s, -m.inf)
         ref = (m.softmax(s, axis=-1) @ vf).transpose(1, 0, 2)
-        m.eval(out, ref)
+        cut = T // 3 + 1
+        pieces = m.concatenate(
+            [
+                mlxdev.attn_prefill(q[:cut], kb, vb, past, scale, odt=m.float32, window=win),
+                mlxdev.attn_prefill(q[cut:], kb, vb, past + cut, scale, odt=m.float32, window=win),
+            ]
+        )
+        m.eval(out, ref, pieces)
         err = float(m.max(m.abs(out - ref)))
-        worst = max(worst, err)
-        assert err < 6e-3, f"past {past} T {T} Hk {Hk} g {g}: {err:.2e} from the float32 reference"
+        pb = aluminum.bf16p(D)
+        worst[pb] = max(worst[pb], err)
+        assert err < (6e-3 if pb else 1e-4), f"head {D} past {past} T {T} Hk {Hk} g {g}: {err:.2e} from the reference"
+        if not m.array_equal(pieces, out):
+            bad.append((D, past, T, "pieces"))
         for t in (0, T // 2, T - 1):
-            one = mlxdev.attn_decode(q[t].astype(m.float32), kb, vb, past + t + 1, scale)
+            one = mlxdev.attn_decode(q[t].astype(m.float32), kb, vb, past + t + 1, scale, window=win)
             m.eval(one)
-            worst_node = max(worst_node, float(m.max(m.abs(out[t] - one))))
+            if not m.array_equal(one, out[t]):
+                bad.append((D, past, T, t))
+        # over an int8 cache: the prefill over its dequantized rows, and its last row the int8 decode's
+        kq, ks = mlxdev.kv_quantize(kb)
+        vq, vs = mlxdev.kv_quantize(vb)
+        out8 = mlxdev.attn_prefill(q, kq, vq, past, scale, odt=m.float32, window=win, ks=ks, vs=vs)
+        kd, vd = mlxdev.kv_dequantize(kq, ks), mlxdev.kv_dequantize(vq, vs)
+        deq = mlxdev.attn_prefill(q, kd, vd, past, scale, odt=m.float32, window=win)
+        one8 = mlxdev.attn_decode(q[T - 1].astype(m.float32), kq, vq, n, scale, window=win, ks=ks, vs=vs)
+        m.eval(out8, deq, one8)
+        if not m.array_equal(out8, deq):
+            bad.append((D, past, T, "int8"))
+        if not m.array_equal(one8, out8[T - 1]):
+            bad.append((D, past, T, "int8 decode"))
+    assert not bad, f"rows differ from their decode or their chunking: {bad}"
     return (
-        f"{len(cases)} shapes: max {worst:.1e} from the float32 reference, {worst_node:.1e} from attn_nodes row by row"
+        f"{len(cases)} shapes: max {worst[False]:.1e} (float P) / {worst[True]:.1e} (P in bf16) from the float32"
+        " reference; rows bit-exact against the one-row decode and the chunk in pieces, bf16 and int8"
     )
 
 
@@ -1040,6 +1243,7 @@ def check_batch_rows() -> str:
     kernel's tile), through a left-padded batch as
     serve() sends one"""
     from btb.engine import StreamedTextModel
+    from btb.engine.generate import as_rows
 
     fx = fixture("tiny_qwen3")
     native_library()
@@ -1053,11 +1257,11 @@ def check_batch_rows() -> str:
                 torch.randint(0, 256, (int(torch.randint(3, 13, (1,), generator=g)),), generator=g).tolist()
                 for _ in range(B)
             ]
-            single = [sm.generate_greedy(torch.tensor([r]), 10) for r in rows]
+            single = [sm.generate_greedy(r, 10) for r in rows]
             ids, mask = StreamedTextModel.pad_left(rows, 0)
-            batched = sm.generate_greedy(ids, 10, attention_mask=mask)
+            batched = as_rows(sm.generate_greedy(ids, 10, attention_mask=mask))
             assert len(batched) == B
-            bad = [b for b in range(B) if list(batched[b]) != list(single[b])]
+            bad = [b for b in range(B) if batched[b] != single[b]]
             assert not bad, (
                 f"B={B}: rows {bad} differ from their single decodes: {[(batched[b], single[b]) for b in bad[:2]]}"
             )
@@ -1074,6 +1278,7 @@ def check_sampled_rows() -> str:
     itself, then a reversed one), a batch of rows gives each row's own single sampled decode, and the sample
     is not the greedy answer"""
     from btb.engine import StreamedTextModel
+    from btb.engine.generate import as_rows
     from btb.sampling import Sampling
 
     fx = fixture("tiny_qwen3")
@@ -1084,9 +1289,9 @@ def check_sampled_rows() -> str:
         sm = host_model(fx, device="mlx", dtype=torch.bfloat16)
         speculation(sm, tree_budget=0, v_max=4, ngram_p=0.9, tree_min_prob=0.0)
         row = torch.randint(0, 256, (12,), generator=g).tolist()
-        plain = list(sm.generate_greedy(torch.tensor([row]), 24, sampling=s9))
-        assert plain != list(sm.generate_greedy(torch.tensor([row]), 24)), "the sample is the greedy answer"
-        assert plain == list(sm.generate_greedy(torch.tensor([row]), 24, sampling=s9)), "a seed repeats"
+        plain = sm.generate_greedy(row, 24, sampling=s9)
+        assert plain != sm.generate_greedy(row, 24), "the sample is the greedy answer"
+        assert plain == sm.generate_greedy(row, 24, sampling=s9), "a seed repeats"
         wrong = plain[:6] + [(t + 1) % 256 for t in plain[6:]]  # every draft past the prefix another token
         for tag, span in (("answer", plain), ("wrong", wrong)):
             spec, census = sm.generate_speculative(
@@ -1098,10 +1303,10 @@ def check_sampled_rows() -> str:
             torch.randint(0, 256, (int(torch.randint(3, 13, (1,), generator=g)),), generator=g).tolist()
             for _ in range(4)
         ]
-        single = [list(sm.generate_greedy(torch.tensor([r]), 10, sampling=s9)) for r in rows]
+        single = [sm.generate_greedy(r, 10, sampling=s9) for r in rows]
         ids, mask = StreamedTextModel.pad_left(rows, 0)
-        batched = sm.generate_greedy(ids, 10, attention_mask=mask, sampling=s9)
-        bad = [b for b in range(4) if list(batched[b]) != single[b]]
+        batched = as_rows(sm.generate_greedy(ids, 10, attention_mask=mask, sampling=s9))
+        bad = [b for b in range(4) if batched[b] != single[b]]
         assert not bad, f"rows {bad} differ from their single sampled decodes: {[(batched[b], single[b]) for b in bad]}"
         sm.close()
     return "sampled: pipelined == speculative under one seed, 4 batched rows == their single decodes"
@@ -1168,6 +1373,7 @@ def main() -> int:
         check_unpack,
         check_gemv,
         check_gemv_rows,
+        check_steel_rows,
         check_rope,
         check_rope_nodes,
         check_cache,
@@ -1176,6 +1382,7 @@ def main() -> int:
         check_attn_tree,
         check_attn_paged,
         check_attn_int8,
+        check_tree_tile,
         check_delta_tree,
         check_mxfp4_table,
         check_mxfp4_gemv,

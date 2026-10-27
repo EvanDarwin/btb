@@ -20,7 +20,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from .hf import is_gguf
-from .kinds import Log, stored_quants
+from .kinds import Log, Quant, pooled_layout, stored_quants
+from .metal import paged
 
 if TYPE_CHECKING:
     from .mlx import Shared
@@ -120,27 +121,30 @@ def _headers(model_dir: str) -> dict[str, tuple[str, list[int], int]]:
 
 def _gguf_sizes(path: str, packed: bool) -> list[int]:
     """`sizes_for` of a GGUF file off its tensor list (llama.cpp's names: `token_embd`, `output`, `blk.N.*`): the
-    2-D tensors as bf16, less those a type's own gemv multiplies as stored when `packed` (kinds.stored_quants, a
-    matrix of whole blocks)"""
+    head, then a layer's stored weights' streams (`packed`: kinds.stored_quants, a matrix of whole blocks, laid out as
+    the MLX binding's `_bind_gguf_pooled` lays them, `kinds.pooled_layout`) and its other 2-D tensors as bf16"""
     import gguf
 
-    stored = {q.value for q in stored_quants()}
+    stored = {q.value: q for q in stored_quants()}
     al = lambda nb: (nb + ALIGN - 1) // ALIGN * ALIGN
-    per: dict[int, int] = {}
+    per: dict[int, tuple[list[tuple[Quant, int]], list[int]]] = {}  # a layer's stored weights, its bf16 bytes
     head = 0
     for t in gguf.GGUFReader(path).tensors:
-        kind = t.tensor_type.name
-        if len(t.shape) != 2 or (
-            packed and kind in stored and int(t.shape[0]) % gguf.GGML_QUANT_SIZES[t.tensor_type][0] == 0
-        ):
+        if len(t.shape) != 2:
             continue
-        nb = 2 * int(t.n_elements)
+        whole = int(t.shape[0]) % gguf.GGML_QUANT_SIZES[t.tensor_type][0] == 0
+        q = stored.get(t.tensor_type.name) if packed and whole else None
+        nb = pooled_layout([(q, int(t.n_bytes))])[1] if q is not None else 2 * int(t.n_elements)
         if t.name == "output.weight" or (t.name == "token_embd.weight" and not head):
             head = al(nb)
         elif t.name.startswith("blk."):
-            i = int(t.name.split(".")[1])
-            per[i] = per.get(i, 0) + al(nb)
-    return [head] + [per[i] for i in sorted(per)] if per else []
+            got = per.setdefault(int(t.name.split(".")[1]), ([], [0]))
+            if q is not None:
+                got[0].append((q, int(t.n_bytes)))
+            else:
+                got[1][0] += al(nb)
+    sizes = [n for i in sorted(per) for n in (pooled_layout(per[i][0])[1], per[i][1][0]) if n]
+    return [head] + [al(n) for n in sizes] if per else []
 
 
 def sizes_for(model_dir: str, gguf_packed: bool = True) -> list[int]:
@@ -215,7 +219,8 @@ class Pool:
             # ~0.25 s instead of ~0.9 on one, so a short window hides them
             streams = [mx.new_stream(mx.cpu) for _ in range(min(4, len(cuts)))]
             self.streams.extend(streams)
-            xs = [mx.zeros((nb,), dtype=mx.uint8, stream=streams[i % len(streams)]) for i, nb in enumerate(cuts)]
+            # whole pages each, which btb.metal can alias
+            xs = [mx.zeros((paged(nb),), dtype=mx.uint8, stream=streams[i % len(streams)]) for i, nb in enumerate(cuts)]
             mx.eval(*xs)
             for x in xs:
                 v = np.array(x, copy=False)

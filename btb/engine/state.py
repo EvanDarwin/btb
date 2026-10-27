@@ -10,7 +10,7 @@ import threading
 import weakref
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, ParamSpec, TypeVar, overload
 
 import torch
 
@@ -60,30 +60,34 @@ if TYPE_CHECKING:
     from concurrent.futures import ThreadPoolExecutor
     from types import ModuleType
 
+    import mlx.core as mx_
+
     from ..draft import Spans
     from ..fp8 import F8Weight
     from ..gguf import GGUFModel
     from ..kinds import Json, Log, NodePath, Parents, TokenRows, Tokens
     from ..mlx import Backend, Shared
     from ..mlx.mega import MegaPass
-    from ..sampling import Sampling
+    from ..sampling import Pick, Sampling
     from ..session import Anchor, Session
     from .cache import KvCache
     from .device import Device, DeviceSpec
     from .drafter import MTPDrafter
     from .experts import ExpertProfile, _ExpertStore
     from .families import Family
-    from .generate import LinLayer, LinSnap
-    from .hooks import Hooks
+    from .forward import PassIds, PassRope
+    from .generate import GreedyOut, LinLayer, LinSnap
+    from .hooks import Hooks, OnToken
     from .host import _HostLinear
     from .memory import RamPolicyState, Room, VramPolicyState
-    from .mlx_forward import MlxState
+    from .mlx_forward import Forest, MlxOut, MlxState, OnLayer, Positions
     from .model import StreamedTextModel
     from .paged import PagedCache
     from .scheduler import BatchScheduler, Plan
     from .scratch import Scratch
     from .spec_cost import SpecCost
     from .stored import CardStored
+    from .text import GenerateStats
     from .tiers import ColdRing
 
 
@@ -248,13 +252,12 @@ class _State:
     # -- MLX --
     mlx: Backend | None
     mlx_attn_kernel: bool
-    mlx_attn_prefill: bool
-    mlx_attn_rows: int
     mlx_state: MlxState
-    _mega: MegaPass | None
+    _mega: MegaPass | None = None  # built at load where the engine takes it (`_build_mega`)
+    _mega_wanted: bool  # the megakernel asked for at load (`mlx_mega` on MLX), built whenever the engine can take it
     _mlx_attn_slope: list[tuple[int, float]] | None
     _mlx_cost: dict[int, float]
-    _mlx_pool: ThreadPoolExecutor
+    _mlx_pool: ThreadPoolExecutor | None = None  # the direct reader's threads, made by the first read
 
     # -- the text layer --
     _tokenizer: Any
@@ -591,79 +594,134 @@ class _State:
         raise NotImplementedError
 
     # -- mlx_forward.py --
-    def _bind_mlx_resident(self, layer: Any, checkpoint: bool = True) -> Any:
+    def _bind_mlx_resident(self, layer: torch.nn.Module, checkpoint: bool = True) -> int:
         raise NotImplementedError
 
-    def _forward_mega(self, ids: Any, cache: Any, T: int, pick: Any = None) -> torch.Tensor:
+    def _forward_mega(
+        self, ids: Tokens, cache: KvCache, T: int, pick: Pick | None = None, on_layer: OnLayer | None = None
+    ) -> torch.Tensor:
         raise NotImplementedError
 
+    def _build_mega(self) -> None:
+        raise NotImplementedError
+
+    @overload
     def _forward_mlx(
         self,
-        h: Any,
-        pe: Any,
-        cache: Any,
-        on_layer: Any,
+        h: torch.Tensor | None,
+        pe: PassRope | None,
+        cache: KvCache | None,
+        on_layer: OnLayer | None,
         last_only: bool,
         head: bool,
         n_layers: int,
-        hm: Any = None,
+        hm: mx_.array | None = ...,
+        lazy: Literal[False] = ...,
+        rows: Sequence[int] | None = ...,
+        forest: Forest | None = ...,
+        pick: Pick | None = ...,
+    ) -> torch.Tensor | None: ...
+
+    @overload
+    def _forward_mlx(
+        self,
+        h: torch.Tensor | None,
+        pe: PassRope | None,
+        cache: KvCache | None,
+        on_layer: OnLayer | None,
+        last_only: bool,
+        head: bool,
+        n_layers: int,
+        hm: mx_.array | None = ...,
+        lazy: bool = ...,
+        rows: Sequence[int] | None = ...,
+        forest: Forest | None = ...,
+        pick: Pick | None = ...,
+    ) -> MlxOut: ...
+
+    def _forward_mlx(
+        self,
+        h: torch.Tensor | None,
+        pe: PassRope | None,
+        cache: KvCache | None,
+        on_layer: OnLayer | None,
+        last_only: bool,
+        head: bool,
+        n_layers: int,
+        hm: mx_.array | None = None,
         lazy: bool = False,
         rows: Sequence[int] | None = None,
-        forest: dict[str, Any] | None = None,
-        pick: Any = None,
-    ) -> Any:
+        forest: Forest | None = None,
+        pick: Pick | None = None,
+    ) -> MlxOut:
         raise NotImplementedError
 
     def _generate_greedy_mlx(
         self,
         ids: torch.Tensor,
         max_new: int,
-        eos: Any,
-        on_token: Callable[[int], Any] | None,
+        eos: set[int],
+        on_token: OnToken | None,
         t0: float,
         session: Session | None = None,
-        sampling: Any = None,
-    ) -> tuple[list[int], Json]:
+        sampling: Sampling | None = None,
+    ) -> tuple[list[int], GenerateStats]:
         raise NotImplementedError
 
     def _generate_greedy_mlx_batch(
         self,
         ids: torch.Tensor,
         max_new: int,
-        eos: Any,
+        eos: set[int],
         attention_mask: torch.Tensor | None,
         t0: float,
-        sampling: Any = None,
+        sampling: Sampling | None = None,
     ) -> list[list[int]]:
         raise NotImplementedError
 
-    def _mega_ok(self, cache: Any, T: int, on_layer: Any, head: bool, pick: Any, positions: Any) -> bool:
-        raise NotImplementedError
-
-    def _mlx_batch_ok(self, B: int, on_layer: Any, prefill_only: bool) -> bool:
-        raise NotImplementedError
-
-    def _mlx_embed(self) -> Any:
-        raise NotImplementedError
-
-    def _mlx_embed_rows(self, tok: Any) -> Any:
-        raise NotImplementedError
-
-    def _mlx_flush_states(self, cache: Any) -> None:
-        raise NotImplementedError
-
-    def _mlx_fuse(self, layer: Any) -> None:
-        raise NotImplementedError
-
-    def _mlx_greedy_ok(self, B: int, attention_mask: torch.Tensor | None, on_layer: Any, prefill_only: bool) -> bool:
-        raise NotImplementedError
-
-    def _mlx_ok(
-        self, cache: Any, B: int, T: int, am: torch.Tensor | None, positions: torch.Tensor | None, n_layers: int
+    def _mega_ok(
+        self,
+        cache: KvCache | None,
+        T: int,
+        on_layer: OnLayer | None,
+        head: bool,
+        pick: Pick | None,
+        positions: Positions | None,
     ) -> bool:
         raise NotImplementedError
 
-    def _mlx_tree_able(self, cache: Any) -> bool:
+    def _mlx_act(self) -> Callable[[mx_.array], mx_.array] | None:
+        raise NotImplementedError
+
+    def _mlx_batch_ok(self, B: int, on_layer: OnLayer | None, prefill_only: bool) -> bool:
+        raise NotImplementedError
+
+    def _mlx_rows_ok(self, B: int) -> bool:
+        raise NotImplementedError
+
+    def _mlx_embed(self) -> mx_.array:
+        raise NotImplementedError
+
+    def _mlx_embed_rows(self, tok: mx_.array) -> mx_.array:
+        raise NotImplementedError
+
+    def _mlx_flush_states(self, cache: KvCache) -> None:
+        raise NotImplementedError
+
+    def _mlx_fuse(self, layer: torch.nn.Module) -> None:
+        raise NotImplementedError
+
+    def _mlx_greedy_ok(
+        self, B: int, attention_mask: torch.Tensor | None, on_layer: OnLayer | None, prefill_only: bool
+    ) -> bool:
+        raise NotImplementedError
+
+    def _mlx_ok(
+        self, cache: KvCache | None, B: int, T: int, am: torch.Tensor | None, positions: Positions | None, n_layers: int
+    ) -> bool:
+        raise NotImplementedError
+
+    def _mlx_tree_able(self, cache: KvCache) -> bool:
         raise NotImplementedError
 
     def _shared_ahead(self, nbytes: int) -> tuple[Shared, int]:
@@ -688,26 +746,53 @@ class _State:
     def _prefill(
         self,
         ids: torch.Tensor,
-        cache: Any,
-        on_layer: Any = None,
+        cache: KvCache | None,
+        on_layer: OnLayer | None = None,
         attention_mask: torch.Tensor | None = None,
         last_only: bool = True,
-    ) -> Any:
+    ) -> torch.Tensor:
         raise NotImplementedError
 
-    @torch.inference_mode()
+    @overload
     def forward(
         self,
-        ids: Any,
-        cache: Any = None,
-        on_layer: Callable[[int, torch.Tensor], Any] | None = None,
+        ids: PassIds,
+        cache: KvCache | None = ...,
+        on_layer: OnLayer | None = ...,
+        last_only: bool = ...,
+        stop_after: None = ...,
+        attention_mask: torch.Tensor | None = ...,
+        positions: Positions | None = ...,
+        head: bool = ...,
+        pick: bool | Pick | None = ...,
+    ) -> torch.Tensor: ...
+
+    @overload
+    def forward(
+        self,
+        ids: PassIds,
+        cache: KvCache | None = ...,
+        on_layer: OnLayer | None = ...,
+        last_only: bool = ...,
+        stop_after: int | None = ...,
+        attention_mask: torch.Tensor | None = ...,
+        positions: Positions | None = ...,
+        head: bool = ...,
+        pick: bool | Pick | None = ...,
+    ) -> torch.Tensor | None: ...
+
+    def forward(
+        self,
+        ids: PassIds,
+        cache: KvCache | None = None,
+        on_layer: OnLayer | None = None,
         last_only: bool = True,
         stop_after: int | None = None,
         attention_mask: torch.Tensor | None = None,
-        positions: Any = None,
+        positions: Positions | None = None,
         head: bool = True,
-        pick: Any = None,
-    ) -> Any:
+        pick: bool | Pick | None = None,
+    ) -> torch.Tensor | None:
         raise NotImplementedError
 
     @staticmethod
@@ -716,7 +801,7 @@ class _State:
 
     # -- generate.py --
     @staticmethod
-    def _lin(cl: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    def _lin(cl: LinLayer) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
     @staticmethod
@@ -730,19 +815,80 @@ class _State:
     def _lin_restore(cl: LinLayer, snap: LinSnap, dev: torch.device | None = None) -> None:
         raise NotImplementedError
 
+    @overload
+    def generate_greedy(
+        self,
+        ids: torch.Tensor | Tokens | TokenRows,
+        max_new: int,
+        eos_ids: Tokens = ...,
+        on_token: OnToken | None = ...,
+        attention_mask: torch.Tensor | None = ...,
+        on_layer: OnLayer | None = ...,
+        prefill_only: bool = ...,
+        *,
+        session: Session,
+        sampling: Sampling | None = ...,
+        hooks: Hooks | None = ...,
+    ) -> tuple[list[int], GenerateStats]: ...
+
+    @overload
+    def generate_greedy(
+        self,
+        ids: Tokens,
+        max_new: int,
+        eos_ids: Tokens = ...,
+        on_token: OnToken | None = ...,
+        attention_mask: torch.Tensor | None = ...,
+        on_layer: OnLayer | None = ...,
+        prefill_only: bool = ...,
+        session: None = ...,
+        sampling: Sampling | None = ...,
+        hooks: Hooks | None = ...,
+    ) -> list[int]: ...
+
+    @overload
+    def generate_greedy(
+        self,
+        ids: torch.Tensor | TokenRows,
+        max_new: int,
+        eos_ids: Tokens = ...,
+        on_token: OnToken | None = ...,
+        attention_mask: torch.Tensor | None = ...,
+        on_layer: OnLayer | None = ...,
+        prefill_only: bool = ...,
+        session: None = ...,
+        sampling: Sampling | None = ...,
+        hooks: Hooks | None = ...,
+    ) -> list[int] | list[list[int]]: ...
+
+    @overload
+    def generate_greedy(
+        self,
+        ids: torch.Tensor | Tokens | TokenRows,
+        max_new: int,
+        eos_ids: Tokens = ...,
+        on_token: OnToken | None = ...,
+        attention_mask: torch.Tensor | None = ...,
+        on_layer: OnLayer | None = ...,
+        prefill_only: bool = ...,
+        session: Session | None = ...,
+        sampling: Sampling | None = ...,
+        hooks: Hooks | None = ...,
+    ) -> GreedyOut: ...
+
     def generate_greedy(
         self,
         ids: torch.Tensor | Tokens | TokenRows,
         max_new: int,
         eos_ids: Tokens = (),
-        on_token: Callable[[int], Any] | None = None,
+        on_token: OnToken | None = None,
         attention_mask: torch.Tensor | None = None,
-        on_layer: Any = None,
+        on_layer: OnLayer | None = None,
         prefill_only: bool = False,
-        session: Any = None,
-        sampling: Any = None,
+        session: Session | None = None,
+        sampling: Sampling | None = None,
         hooks: Hooks | None = None,
-    ) -> Any:
+    ) -> GreedyOut:
         raise NotImplementedError
 
     def generate_speculative(
@@ -753,13 +899,13 @@ class _State:
         v_max: int = 8,
         n_min: int = 2,
         n_max: int = 4,
-        on_token: Callable[[int], Any] | None = None,
+        on_token: OnToken | None = None,
         proposer: Proposer | str = Proposer.NGRAM,
         spans: Spans = (),
         session: Session | None = None,
-        sampling: Any = None,
+        sampling: Sampling | None = None,
         hooks: Hooks | None = None,
-    ) -> tuple[list[int], Json]:
+    ) -> tuple[list[int], GenerateStats]:
         raise NotImplementedError
 
     def serve(
@@ -768,33 +914,33 @@ class _State:
         max_new: int,
         eos_ids: Tokens = (),
         pad_id: int | None = None,
-        sampling: Any = None,
+        sampling: Sampling | None = None,
         hooks: Hooks | None = None,
     ) -> list[list[int]]:
         raise NotImplementedError
 
     @staticmethod
-    def _lin_set(cl: Any, conv: torch.Tensor, rec: torch.Tensor) -> None:
+    def _lin_set(cl: LinLayer, conv: torch.Tensor, rec: torch.Tensor) -> None:
         raise NotImplementedError
 
     def _session_prefill(
-        self, ids: torch.Tensor, cache: Any, reuse: int, session: Session | None, on_layer: Any = None
-    ) -> tuple[Any, Any]:
+        self, ids: torch.Tensor, cache: KvCache, reuse: int, session: Session | None, on_layer: OnLayer | None = None
+    ) -> tuple[torch.Tensor, list[Anchor] | None]:
         raise NotImplementedError
 
-    def _anchor(self, cache: Any, at: int, logits: Any, h_last: torch.Tensor | None) -> Anchor:
+    def _anchor(self, cache: KvCache, at: int, logits: torch.Tensor, h_last: torch.Tensor | None) -> Anchor:
         raise NotImplementedError
 
     def _prefill_at_blocks(
         self,
         ids: torch.Tensor,
-        cache: Any,
+        cache: PagedCache,
         reuse: int,
         tail: int,
-        hook: Any,
-        snap: Callable[[int, Any], Anchor],
+        hook: OnLayer | None,
+        snap: Callable[[int, torch.Tensor], Anchor],
         last_only: bool = True,
-    ) -> tuple[Any, list[Anchor]]:
+    ) -> tuple[torch.Tensor, list[Anchor]]:
         raise NotImplementedError
 
     # -- families/__init__.py --
@@ -812,11 +958,11 @@ class _State:
     def embed(self, ids: Any) -> torch.Tensor:
         raise NotImplementedError
 
-    def new_cache(self, max_len: int | None = None) -> Any:
+    def new_cache(self, max_len: int | None = None) -> KvCache:
         raise NotImplementedError
 
     # -- text.py --
-    def _decode_cache(self, max_len: int | None = None) -> Any:
+    def _decode_cache(self, max_len: int | None = None) -> KvCache:
         raise NotImplementedError
 
     # -- memory.py --

@@ -288,14 +288,14 @@ def test_mlx_quant_matvec(benchmark: object, q: Quant, t: int) -> None:
     """every type a linear multiplies as stored, on its own Metal kernel over its blocks"""
     from btb.mlx.backend import stored_matvec, stored_streams
 
-    m = mlxdev.mx()
+    m = mlxdev.mx
     s = stored_streams(q, stored_blocks(q, OP_WIDTH, OP_WIDTH, 0))
     x = m.random.normal((t, OP_WIDTH)).astype(m.bfloat16)
     m.eval(*s, x)
     benchmark.group = "mlx-quant"  # type: ignore[attr-defined]
 
-    def run() -> object:
-        return m.eval(stored_matvec(q, s, x, OP_WIDTH, OP_WIDTH))  # eval forces the lazy kernel to actually run
+    def run() -> None:
+        m.eval(stored_matvec(q, s, x, OP_WIDTH, OP_WIDTH))  # eval forces the lazy kernel to actually run
 
     run()  # warm
     benchmark(run)  # type: ignore[operator]
@@ -307,7 +307,7 @@ def test_mlx_quant_matvec(benchmark: object, q: Quant, t: int) -> None:
 def test_mlx_attn_decode(benchmark: object, n: int) -> None:
     from btb.mlx.attn import attn_decode
 
-    m = mlxdev.mx()
+    m = mlxdev.mx
     hq, hk, d = 32, 8, 128
     # the K/V cache layout the kernel reads: [1, Hk, cap, d] bf16, `n` rows live; q is [Hq, d] float32
     q = m.random.normal((hq, d)).astype(m.float32)
@@ -317,8 +317,8 @@ def test_mlx_attn_decode(benchmark: object, n: int) -> None:
     scale = float(d**-0.5)
     benchmark.group = "mlx-attn"  # type: ignore[attr-defined]
 
-    def run() -> object:
-        return m.eval(attn_decode(q, kb, vb, n, scale))
+    def run() -> None:
+        m.eval(attn_decode(q, kb, vb, n, scale))
 
     run()
     benchmark(run)  # type: ignore[operator]

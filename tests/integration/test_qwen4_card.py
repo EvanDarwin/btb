@@ -438,7 +438,7 @@ def test_the_program_declines_a_model_at_other_shapes() -> None:
 def test_experts_seated_on_the_card_change_no_bit(card: StreamedTextModel) -> None:
     """experts seated on the card (the store's VRAM seats) multiply as the host does (`_Experts._seated`): the
     program's steps and verify pass read the same bits with them as without"""
-    from btb.engine.experts import VramSeats
+    from btb.engine.experts import VramSeats, bf16_shapes
 
     sm = card
     store = sm.expert_store
@@ -454,7 +454,7 @@ def test_experts_seated_on_the_card_change_no_bit(card: StreamedTextModel) -> No
 
     with torch.inference_mode():
         base = run()
-        gu_n, gu_shape, dn_shape = store.shapes
+        gu_n, gu_shape, dn_shape = bf16_shapes(store.shapes)
         store.vram = VramSeats(
             64, store._held(store.per), (store._held(gu_n), gu_shape, dn_shape), sm.dev, min_rides=1, per_pass=64
         )

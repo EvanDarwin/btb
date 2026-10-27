@@ -115,8 +115,14 @@ class Op:
 # new launcher or a new `btb_*` kernel that no family covers is a reported gap - the table cannot fall behind.
 OPS: tuple[Op, ...] = (
     Op("rope", "attn", ("btb_rope_rows", "btb_rope_rows2"), "kernels/test_mlx.py"),
-    Op("attn_decode", "attn", ("btb_attn_nodes_***_d*_g*_n*", "btb_attn_fold"), "kernels/test_mlx.py"),
-    Op("attn_prefill", "attn", ("btb_attn_prefill_d256_g**",), "kernels/test_mlx.py"),
+    Op("attn_decode", "aluminum", ("btb_aluminum_decode_**_d*_g*", "btb_aluminum_fold_d**"), "kernels/test_mlx.py"),
+    Op(
+        "attn_tree",
+        "aluminum",
+        ("btb_aluminum_tree_*_r*_d*_g*", "btb_aluminum_phased_*_r*_n*_d256_g*"),
+        "kernels/test_mlx.py",
+    ),
+    Op("attn_prefill", "aluminum", ("btb_aluminum_prefill_*_d****",), "kernels/test_mlx.py"),
     Op("delta", "delta", ("btb_delta_recurrent*", "btb_delta_tree"), "kernels/test_mlx.py"),
     Op(
         "fused_dense",
@@ -126,6 +132,8 @@ OPS: tuple[Op, ...] = (
     ),
     Op("p12_unpack", "gemv", ("btb_unpack_p12",), "kernels/test_mlx.py"),
     Op("gemm_bf16", "gemv", ("btb_gemm_rows_x*_s*",), "kernels/test_mlx.py"),
+    Op("gemm_steel", "steel", ("btb_steel_*_*_*_*_*",), "kernels/test_mlx.py"),
+    Op("gemm_steel_chain", "steel", ("btb_steel_chain_*_*_*_*_*",), "kernels/test_gguf.py"),
     Op("gemv_mxfp4", "gemv", ("btb_gemv_mxfp4**_x*", "btb_mxfp4_dequant"), "kernels/test_mxfp4.py"),
     Op(
         "kquant_q45",
@@ -165,7 +173,7 @@ OPS: tuple[Op, ...] = (
     Op(
         "q6k",
         "q6k",
-        ("btb_q6k_mv_*_*", "btb_q6k_gather_*", "btb_q6k_dequant"),
+        ("btb_q6k_mv_*_*", "btb_q6k_dequant"),
         "kernels/test_gguf.py",
         funcs=("matvec_q6k", "dequant_q6k"),
     ),
@@ -206,14 +214,37 @@ OPS: tuple[Op, ...] = (
         funcs=("repack_lattice", "matvec_lattice", "dequant_lattice"),
     ),
     Op("kv", "kv", ("btb_kv_store", "btb_kv_scatter"), "kernels/test_kv.py"),
-    Op("mega", "mega", ("btb_mega_*_*_*_*",), "kernels/test_mega.py"),
+    Op(
+        "moe",
+        "moe",
+        (
+            "btb_moe_route",
+            "btb_moe_combine",
+            "btb_moe_silu_apart",
+            "btb_moe_gather_*_x*_*_*_*_*_*_*",
+        ),
+        "kernels/test_moe.py",
+    ),
+    Op(
+        "mega",
+        "mega.kernel",
+        ("btb_mega_*", "btb_mega_mv_*_*_*_*_*_*", "btb_mega_head_*_*_*"),
+        "kernels/test_mega.py",
+    ),
     Op("sample", "sample", ("btb_sample_pick", "btb_sample_verify"), "kernels/test_sampling.py"),
     Op(
         "binder",
         "backend",
         (),
         "kernels/test_gguf.py",
-        funcs=("weight_slot", "weight_fused", "weight_slot_packed", "weight_stored", "weight_stored_slot"),
+        funcs=(
+            "weight_slot",
+            "weight_fused",
+            "weight_slot_packed",
+            "weight_stored",
+            "weight_stored_pool",
+            "weight_stored_slot",
+        ),
         note="binder methods build Weight objects; the matvec/dequant families carry the kernel parity",
     ),
 )
@@ -227,13 +258,16 @@ _WILDCARD_RE = re.compile(r"^btb_\*")  # a template that names no kind: it would
 
 
 def _mlx_modules() -> list[tuple[str, str]]:
-    """(module stem, source text) for each btb/mlx/*.py, so a new module is parsed with no list to edit."""
+    """(module, source text) for each module under btb/mlx, a subpackage's dotted (`mega.kernel`), so a new module
+    is parsed with no list to edit."""
     out = []
-    for fn in sorted(os.listdir(MLX_DIR)):
-        if fn.endswith(".py") and fn != "__init__.py":
-            with open(os.path.join(MLX_DIR, fn), encoding="utf-8") as f:
-                out.append((fn[:-3], f.read()))
-    return out
+    for root, _dirs, files in os.walk(MLX_DIR):
+        for fn in files:
+            if fn.endswith(".py") and fn != "__init__.py":
+                rel = os.path.relpath(os.path.join(root, fn), MLX_DIR)[:-3]
+                with open(os.path.join(root, fn), encoding="utf-8") as f:
+                    out.append((rel.replace(os.sep, "."), f.read()))
+    return sorted(out)
 
 
 def source_funcs() -> set[tuple[str, str]]:

@@ -8,15 +8,40 @@ overrides nothing runs as."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Self, TypedDict, cast
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol, Self, TypedDict, cast
 
 import torch
 
-from ...kinds import CAPS, FAMILY_NAMES, Cap, FamilyKind, LayerKind, PassTag
+from ...kinds import CAPS, FAMILY_NAMES, Cap, FamilyKind, LayerKind, PassTag, RouteMode
 
 if TYPE_CHECKING:
+    from ...mlx.mega import Block
     from ..drafter import MTPDrafter
+    from ..host import _Experts, _HostLinear
     from ..state import _State
+
+
+class GatedMlp(Protocol):
+    """a dense gated MLP of host linears (a mixture's shared expert)"""
+
+    gate_proj: _HostLinear
+    up_proj: _HostLinear
+    down_proj: _HostLinear
+
+
+class Mixture(NamedTuple):
+    """a mixture block as the GPU runs it (mlx_forward.py `_mlx_mixture`): its router's matrix [E, H] as the host holds
+    it, the host linear over it where it is one (its MLX weight bound with the layer; a router kept in float32 as
+    stored is the reference's tensor), the picks a row and how their weights come off the logits, the experts (the
+    store's), and the shared expert's MLP and its gate where the block has one"""
+
+    router: torch.Tensor
+    router_lin: _HostLinear | None
+    top_k: int
+    mode: RouteMode
+    experts: _Experts
+    shared: GatedMlp | None
+    shared_gate: _HostLinear | None
 
 
 class Flags(TypedDict):
@@ -134,18 +159,43 @@ class Family:
 
     @property
     def mega(self) -> bool:
-        """the MLX megakernel is written for the family's block: the kernel layout, not the sandwich's norm order
-        (mlx/mega.py; `_mega_ok` checks the cache, the storage and the pass after)"""
-        return self.kernel_layout and not self.sandwich
+        """the family's layers are composed for the MLX megakernel (`mega_layer`): the plain pre-norm block and the
+        sandwich block here, a family whose block differs composing its own (`_mega_ok` checks the cache, the storage
+        and the pass after)"""
+        return self.dense or self.sandwich
+
+    def mega_layer(self, b: Block, i: int) -> None:
+        """layer `i` of a megakernel pass, composed from the kernel's parts (btb/mlx/mega): the plain pre-norm block,
+        or the sandwich block (each sub-block's output normed before its add, the MLP's input normed on its own); q/k/v
+        one matvec and gate/up another (adjacent slots, or the module's fused projections)"""
+        if self.sandwich:
+            sw = b.sandwich(i)
+            at, mlp = sw.self_attn, sw.mlp
+            x = b.norm(sw.input_layernorm)
+            b.add_normed(b.linear(b.attention(i, b.linear(x, b.qkv(at)), at), at.o_proj), sw.post_attention_layernorm)
+            x2 = b.norm(sw.pre_feedforward_layernorm)
+            b.add_normed(b.linear(b.gated(b.linear(x2, b.gate_up(mlp))), mlp.down_proj), sw.post_feedforward_layernorm)
+            return
+        layer = b.dense(i)
+        at, mlp = layer.self_attn, layer.mlp
+        x = b.norm(layer.input_layernorm)
+        b.add(b.linear(b.attention(i, b.linear(x, b.qkv(at)), at), at.o_proj))
+        x2 = b.norm(layer.post_attention_layernorm)
+        b.add(b.linear(b.gated(b.linear(x2, b.gate_up(mlp))), mlp.down_proj))
+
+    def mixture(self, mlp: torch.nn.Module) -> Mixture | None:
+        """layer's MLP `mlp` as a mixture the GPU routes (`Mixture`), None for a dense block: the plain block has
+        none"""
+        return None
 
     @property
     def mlx_path(self) -> PassTag:
         """the MLX forward the family's layers take: the per-token graph (a dense or sandwich block), the hybrid's
-        DeltaNet forward (its MLP a dense one in the graph), or else each host layer's linears through the per-op path
-        (a mixture's, a hybrid one's too: its experts are picked on the host between layers)"""
+        DeltaNet forward (its MLP a dense one in the graph, or a mixture the GPU routes), or else each host layer's
+        linears through the per-op path (a dense mixture's: its experts are picked on the host between layers)"""
         if self.dense or self.sandwich:
             return PassTag.MLX_STEP
-        if self.hybrid and not self.moe:
+        if self.hybrid:
             return PassTag.MLX_HYBRID
         return PassTag.MLX_PEROP
 

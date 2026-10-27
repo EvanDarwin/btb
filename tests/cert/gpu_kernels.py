@@ -43,8 +43,8 @@ CATEGORIES: tuple[tuple[str, str], ...] = (
     ("Matrix-vector: 12-bit", r"p12"),
     # a templated type (`<kind>`), or a stored type's own kernels by its key (`btb_gemv_q4k_bf16`)
     ("Matrix-vector: GGUF quants", "|".join(["<kind>", *(f"_{quant_key(q)}_" for q in stored_quants())])),
-    ("Matrix-matrix: bf16", r"gemm_(mma|f32)"),
-    ("Attention", r"attn"),
+    ("Matrix-matrix: bf16", r"gemm_(mma|f32)|steel"),
+    ("Attention", r"attn|aluminum"),
     ("Tensor-core self-check", r"mma_roles"),
     ("Sparse attention indexer", r"qsa_"),
     ("Norm and RoPE", r"norm|rope|sandwich"),

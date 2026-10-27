@@ -15,6 +15,7 @@ from ..base import Family, _flags
 from .drafter import FC, LAYER, NORM, NORM_E, NORM_H, Qwen35Drafter
 
 if TYPE_CHECKING:
+    from ....mlx.mega import Block
     from ...drafter import MTPDrafter
     from ...state import _State
 
@@ -46,6 +47,30 @@ class Qwen35Family(Family):
         if sm.mlx is not None:
             # the DeltaNet's convolution as shifted multiply-adds, not F.conv1d at its cost on the CPU build
             self.mod.causal_conv1d_fn = fast_causal_conv1d
+
+    @property
+    def mega(self) -> bool:
+        # the hybrid block composed below; a mixture's MLP (Qwen3.5-MoE's) is not in the megakernel
+        return not self.moe
+
+    def mega_layer(self, b: Block, i: int) -> None:
+        # a DeltaNet layer or a gated attention one (its output times the sigmoid of the gate beside each q head), each
+        # pre-normed, then the dense MLP
+        if b.mp.linear[i]:
+            dl = b.deltanet(i)
+            la = dl.linear_attn
+            x = b.norm(dl.input_layernorm)
+            b.add(b.linear(b.delta(i, b.linear(x, b.delta_in(la)), la), la.out_proj))
+            post, mlp = dl.post_attention_layernorm, dl.mlp
+        else:
+            layer = b.dense(i)
+            at = layer.self_attn
+            x = b.norm(layer.input_layernorm)
+            qkv = b.linear(x, b.qkv(at))
+            b.add(b.linear(b.gate(b.attention(i, qkv, at), qkv), at.o_proj))
+            post, mlp = layer.post_attention_layernorm, layer.mlp
+        x2 = b.norm(post)
+        b.add(b.linear(b.gated(b.linear(x2, b.gate_up(mlp))), mlp.down_proj))
 
     def drafter_cls(self) -> type[MTPDrafter] | None:
         return Qwen35Drafter

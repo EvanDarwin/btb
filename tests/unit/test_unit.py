@@ -625,10 +625,12 @@ def test_the_shared_drafter_leaves_its_steps_to_each_family() -> None:
     """btb/engine/drafter.py's base: no MLX graph of its own, and the step and the MLX graph's parts each family's
     drafter supplies - asked of the base, they refuse"""
     from btb import mlx_available
+    from btb.engine import StreamedTextModel
     from btb.engine.drafter import MTPDrafter
     from btb.sampling import Sampling
 
-    dr = MTPDrafter(types.SimpleNamespace(dev=torch.device("cpu")))
+    # an engine with nothing loaded: the base refuses each step before it would read the engine
+    dr = MTPDrafter(StreamedTextModel.__new__(StreamedTextModel), dev=torch.device("cpu"))
     assert not dr._mlx_ready() and not dr._tree_kernel()
     calls: list[Callable[[], object]] = [
         lambda: dr._pass(torch.zeros(1, 1, dtype=torch.long), torch.zeros(1, 1, 4), 0, True),
@@ -735,14 +737,16 @@ def test_the_family_table_and_the_plain_blocks_answers() -> None:
     assert Family(kind=FamilyKind.QWEN3, kernel_layout=True).fused_step
     assert Family(kind=FamilyKind.QWEN3, sandwich=True, own=True).fused_step
     assert not Family(kind=FamilyKind.QWEN3, sandwich=True, own=True).card_graph
-    assert Family(kind=FamilyKind.QWEN3, kernel_layout=True).mega
-    assert not Family(kind=FamilyKind.QWEN3, kernel_layout=True, sandwich=True).mega
+    assert Family(kind=FamilyKind.QWEN3, dense=True).mega and Family(kind=FamilyKind.QWEN3, sandwich=True).mega
+    assert not Family(kind=FamilyKind.QWEN3, kernel_layout=True).mega
     from btb.kinds import PassTag
 
     assert Family(kind=FamilyKind.QWEN3, dense=True).mlx_path is PassTag.MLX_STEP
     assert Family(kind=FamilyKind.QWEN3, sandwich=True).mlx_path is PassTag.MLX_STEP
     assert Family(kind=FamilyKind.QWEN3, hybrid=True).mlx_path is PassTag.MLX_HYBRID
-    assert base.mlx_path is PassTag.MLX_PEROP, "a mixture's layers: the per-op path"
+    assert Family(kind=FamilyKind.QWEN3, hybrid=True, moe=True).mlx_path is PassTag.MLX_HYBRID, "a hybrid mixture"
+    assert base.mlx_path is PassTag.MLX_PEROP, "a dense mixture's layers: the per-op path"
+    assert base.mixture(torch.nn.Module()) is None
     assert base.drafter_cls() is None and base.open_sweep(None, 1, 1, 1) is False  # type: ignore[arg-type]
     assert base.verify_exact(None, None)  # type: ignore[arg-type]
     assert base.dense_key("model.layers.0.self_attn.q_proj.weight")
@@ -1375,6 +1379,16 @@ def test_the_package_root_and_the_cli_stay_torch_free() -> None:
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=ROOT, check=True)
     assert out.stdout.strip() == "False", out.stdout + out.stderr
+
+
+def test_the_engine_imports_without_posix_modules() -> None:
+    """the engine loads where `resource` does not exist (Windows): the memory pool reads the page size through the
+    Metal module, which reached for the POSIX-only module at import and failed every Windows load"""
+    import subprocess
+
+    code = "import sys; sys.modules['resource'] = None; import btb.pool, btb.metal, btb.engine.model"
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=ROOT)
+    assert out.returncode == 0, out.stderr
 
 
 def test_the_host_memory_a_call_frees_goes_back_to_the_machine() -> None:

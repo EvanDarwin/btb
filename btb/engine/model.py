@@ -10,7 +10,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from typing import Any, Concatenate, ParamSpec, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, Protocol, TypeVar
 
 import torch
 
@@ -45,6 +45,10 @@ from .scheduler import BatchScheduler, _size
 from .scratch import Scratch
 from .text import _TextMixin
 from .tiers import ColdRing, _TiersMixin
+
+if TYPE_CHECKING:
+    from ..mlx import Backend
+    from .cache import Arena, KvCache
 
 
 class _Closes(Protocol):
@@ -99,7 +103,7 @@ class StreamedTextModel(
     _NGramRows = _NGramRows
     _ExpertStore = _ExpertStore
     MTPDrafter = MTPDrafter
-    mlx: Any = None
+    mlx: Backend | None = None
     gemm_rows = Native.gemm_rows
 
     @classmethod
@@ -161,20 +165,15 @@ class StreamedTextModel(
         self.mem_start = _pool.MEM_START if _pool.MEM_START is not None else host_free_bytes() + _pool.POOL.free_bytes()
         self.mlx_layers = set()
         # the attention cache's rows as int8 with a scale each (the MLX device; `GrowLayer(bits=)`): half the
-        # bytes of bf16, so every attention row goes through the node kernel that reads them as they are
+        # bytes of bf16, every attention row read through aluminum as its bf16 dequantization
         self.kv_bits = int(kv_bits) if kv_bits else None
         if self.kv_bits not in (None, 8):
             raise ValueError(f"[stream] kv_bits must be 8 or unset, got {kv_bits}")
-        self.mlx_attn_rows = 0 if self.kv_bits else 8192
-        # a prefill chunk's attention at head size 256 through the engine's fused prefill kernel instead of MLX's
-        # fallback (its fused attention takes 64, 80 and 128): in situ at a 40k position the attention runs 1.2x
-        # faster and the chunk 1.08-1.16x, the same math
-        self.mlx_attn_prefill = True
         devname = DeviceName.parse(device) or DeviceName(DeviceKind.CPU)
         if devname.kind is DeviceKind.MLX:
             if not mlxdev.available():
                 raise RuntimeError("[mlx] MLX is not available in this Python (pip install mlx; Apple silicon only)")
-            self.mlx = Native.mlx = mlxdev.Backend(self, gemm_rows=Native.gemm_rows, log=log)
+            self.mlx = Native.mlx = mlxdev.Backend(gemm_rows=Native.gemm_rows, log=log)
             self.holdings.own(Stage.VIEWS, "the MLX tier", self._mlx_teardown)
             self.mlx_layers = (
                 {int(x) for x in mlx_layers}
@@ -370,6 +369,7 @@ class StreamedTextModel(
         self.cold = {int(x) for x in cold_layers} - set(self.resident)
         self.cold_slots = int(cold_slots)
         self._mega = None
+        self._mega_wanted = False
         self._mlx_attn_slope = None
         self.cold_chunk = int(cold_chunk_mb) << 20
         self.cold_ring = ColdRing()
@@ -577,8 +577,9 @@ class StreamedTextModel(
             if hh.quant is not None:
                 rows = hh.quant.rows(ids)
             else:
-                assert self.mlx is not None  # a stored head is the native kernels' or MLX's
-                tok = mlxdev.mx().array(ids.reshape(-1).to(torch.int32).cpu().numpy())
+                # a stored head is the native kernels' or MLX's
+                assert self.mlx is not None and hh.mx is not None
+                tok = mlxdev.mx.array(ids.reshape(-1).to(torch.int32).cpu().numpy())
                 rows = mlxdev.from_mx(self.mlx.gather_rows(hh.mx, tok))
             return rows.view(*ids.shape, rows.shape[-1]).to(self.dev)
         rows = self.embed_table[ids.reshape(-1).cpu()]
@@ -634,6 +635,8 @@ class StreamedTextModel(
         Returns the widths timed; 0 where the host does not hold every layer."""
         if self.dev.type != DeviceKind.CPU or self.cold or self.mlx is not None:
             return 0
+        from transformers.cache_utils import DynamicLayer
+
         t_max = int(t_max or self._spec_full())
         t_max = max(1, min(t_max, 16))
         ids_t = torch.as_tensor(list(ids), dtype=torch.long).view(1, -1)
@@ -656,7 +659,12 @@ class StreamedTextModel(
                 for cl in cache.layers:
                     if isinstance(cl, GrowLayer) and cl.get_seq_length() > base:
                         cl.crop(base)
-                    elif getattr(cl, "keys", None) is not None and cl.keys.shape[-2] > base:
+                    elif (
+                        isinstance(cl, DynamicLayer)
+                        and cl.keys is not None
+                        and cl.values is not None
+                        and cl.keys.shape[-2] > base
+                    ):
                         cl.keys = cl.keys[..., :base, :]
                         cl.values = cl.values[..., :base, :]
                         if hasattr(cl, "cumulative_length"):
@@ -768,7 +776,7 @@ class StreamedTextModel(
         store = getattr(self, "expert_store", None)
         if store is not None:
             store.pool.shutdown(wait=True)
-        pool = getattr(self, "_mlx_pool", None)
+        pool = self._mlx_pool
         if pool is not None:
             pool.shutdown(wait=True)
 
@@ -790,7 +798,7 @@ class StreamedTextModel(
         self.cold_ring.slots, self.cold_ring.shared = [], None
         st = self.mlx_state
         st.weights = {}
-        st.embed_w = st.embed_lin = st.rope_cache = st.ahead = None
+        st.embed_w = st.embed_lin = st.rope_cache = st.rope_dual = st.ahead = None
         if self.mlx is not None:
             self.mlx.close()
 
@@ -846,7 +854,7 @@ class StreamedTextModel(
         span = self._reach()
         return bool(self.fam.flat_cache) or bool(win and span and int(win) >= span)
 
-    def new_cache(self, max_len: int | None = None) -> Any:
+    def new_cache(self, max_len: int | None = None) -> KvCache:
         from transformers.cache_utils import DynamicCache, DynamicIndexedLayer, DynamicLayer
 
         cache = DynamicCache(config=self.cfg)
@@ -860,23 +868,25 @@ class StreamedTextModel(
         # allocated; 0 where neither is known, and the size check stands alone
         bound = int(max_len) if max_len else span
         sched = getattr(self, "scheduler", None)
-        # the megakernel's arena: every layer's K and V as views of one shared array, `cap` rows a head (a layer
-        # a session grows past it takes a buffer of its own and the pass leaves the megakernel)
-        arena = None
-        mg = getattr(self, "_mega", None)
+        # the megakernel's arena: every attention layer's K and V as views of one shared array, `cap` rows a head (a
+        # layer a session grows past it takes a buffer of its own and the pass leaves the megakernel); a hybrid's
+        # DeltaNet layers keep their states where the step keeps them
+        arena: dict[int, Arena] | None = None
+        mg = self._mega
         # the arena and its megakernel are bf16-only (`per` counts two bytes a row, and `_mega_ok` refuses any
         # other compute dtype); an fp32 pass would store float32 into these bf16-sized slots, so it keeps its own
         # per-layer buffers instead
         bf16_compute = self.compute_dtype in (None, torch.bfloat16)
-        if mg is not None and bf16_compute and self.mlx is not None and not self.kv_bits and not flat:
+        if mg is not None and bf16_compute and self.mlx is not None and not self.kv_bits:
             from .. import mlx as mlxdev
             from ..mlx.attn import ATTN_BLOCK
 
             cap = min(int(max_len) if max_len else (span or 4096), mg.SPL * ATTN_BLOCK)
             per = mg.Hk * cap * mg.hd * 2
-            sh = mlxdev.Shared(2 * self.L * per)
-            setattr(cache, "_mega_arena", sh)  # noqa: B010  not a DynamicCache slot: the arena pinned to the cache's lifetime
-            arena = [(sh.mx, (2 * i) * per, (2 * i + 1) * per, cap) for i in range(self.L)]
+            att = [i for i in range(self.L) if not mg.linear[i]]
+            # the arena's pages, held by the layers that view them (each one's `arena`) and let go with the last
+            whole = mlxdev.Shared(2 * len(att) * per).whole
+            arena = {i: (whole, (2 * j) * per, (2 * j + 1) * per, cap) for j, i in enumerate(att)}
         # a bf16 card engine keeps every layer's rows in bf16, a host layer's too (`host_kv_dtype`)
         kv_dtype = torch.bfloat16 if self.host_kv_dtype() == torch.bfloat16 else None
         for i, layer in enumerate(cache.layers):
@@ -887,7 +897,7 @@ class StreamedTextModel(
                     cap_hint=int(max_len or 0),
                     grant=None if sched is None else sched.grant,
                     bound=bound,
-                    arena=arena[i] if arena is not None else None,
+                    arena=arena.get(i) if arena is not None else None,
                     kv_dtype=kv_dtype,
                 )
             elif type(layer) is DynamicIndexedLayer and sched is not None:

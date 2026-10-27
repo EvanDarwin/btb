@@ -16,15 +16,22 @@ from __future__ import annotations
 
 import math
 import weakref
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import torch
 import torch.nn.functional as F
 
+from ...cache import delta_layer
 from ...forward import chain_of, path_of
 from ...native import Native
 from . import bind_forward
 from .rows import each
+
+if TYPE_CHECKING:
+    import mlx.core as mx_
+
+    from ...cache import KvCache
+    from ...model import StreamedTextModel
 
 
 def _slots(parents: list[int]) -> tuple[list[int], list[bool]]:
@@ -129,23 +136,33 @@ def _delta_forward(
     return self.out_proj(torch.stack(cores).view(B, T, -1).to(x.dtype))
 
 
-def _on_mlx(sm: Any, i: int) -> bool:
-    return sm is not None and getattr(sm, "mlx", None) is not None and i in sm.mlx_layers
+def _on_mlx(sm: StreamedTextModel | None, i: int) -> bool:
+    return sm is not None and sm.mlx is not None and i in sm.mlx_layers
 
 
-def _mlx_feed(sm: Any, la: Any, x: torch.Tensor, cache: Any) -> torch.Tensor:
+def _mlx_feed(sm: StreamedTextModel, la: Any, x: torch.Tensor, cache: KvCache) -> torch.Tensor:
     """A pass of several positions on the MLX tier: the conv and the exact recurrent rule over them all in one
     dispatch in float32 (the hybrid family's `delta_prefill`) instead of the module's chunked rule in torch, the
     states left through the cache's own setters as the module leaves them"""
     from .... import mlx as mlxdev
+    from ...generate import lin_layer
 
-    m = mlxdev.mx()
+    m = mlxdev.mx
     T = int(x.shape[1])
-    cl = cache.layers[int(la.layer_idx)]
+    cl = delta_layer(cache, int(la.layer_idx))
     c = _consts(la, x.device)
-    mx_c = c.get("mx")
+    # the operands as MLX's, made with the layer's own (`_consts`)
+    mx_c: _MxOperands | None = c.get("mx")
     if mx_c is None:
-        mx_c = c["mx"] = {k: None if c[k] is None else mlxdev.to_mx(c[k]) for k in _OPERANDS}
+        to = mlxdev.to_mx
+        mx_c = {
+            "conv_w": to(c["conv_w"]),
+            "conv_b": None if c["conv_b"] is None else to(c["conv_b"]),
+            "a_log": to(c["a_log"]),
+            "dt_bias": to(c["dt_bias"]),
+            "norm_w": to(c["norm_w"]),
+        }
+        c["mx"] = mx_c
     mixed, z, b, a = (
         mlxdev.to_mx(p(x)[0].float().contiguous()) for p in (la.in_proj_qkv, la.in_proj_z, la.in_proj_b, la.in_proj_a)
     )
@@ -153,7 +170,7 @@ def _mlx_feed(sm: Any, la: Any, x: torch.Tensor, cache: Any) -> torch.Tensor:
     K = int(c["conv_w"].shape[1])
     live = cache.has_previous_state(int(la.layer_idx), state_idx=0)
     if live:
-        conv, rec = sm._lin(cl)
+        conv, rec = sm._lin(lin_layer(cl))
         conv_prev, state0 = mlxdev.to_mx(conv[0].float().contiguous()), mlxdev.to_mx(rec[0].float().contiguous())
     else:
         conv_prev, state0 = m.zeros((int(c["conv_w"].shape[0]), K - 1), dtype=m.float32), None
@@ -178,6 +195,7 @@ def _mlx_feed(sm: Any, la: Any, x: torch.Tensor, cache: Any) -> torch.Tensor:
         mode=sm.mlx_state.delta_mode,
         sigmoid_gate=c["gate"] == 1,
     )
+    assert rec_new is not None  # a prefill not in place hands its state back
     m.eval(core, conv_new, rec_new)
     if live:  # into the layer's own tensors, as the module's path writes them
         conv[0].copy_(mlxdev.from_mx(conv_new))
@@ -189,6 +207,16 @@ def _mlx_feed(sm: Any, la: Any, x: torch.Tensor, cache: Any) -> torch.Tensor:
 
 
 _OPERANDS = ("conv_w", "conv_b", "a_log", "dt_bias", "norm_w")
+
+
+class _MxOperands(TypedDict):
+    """`_OPERANDS` as MLX arrays, for the MLX prefill (`_mlx_feed`)"""
+
+    conv_w: mx_.array
+    conv_b: mx_.array | None
+    a_log: mx_.array
+    dt_bias: mx_.array
+    norm_w: mx_.array
 
 
 def _kept(sm: Any, la: Any, i: int, c: dict[str, Any]) -> dict[str, Any]:

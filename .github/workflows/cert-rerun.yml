@@ -1,0 +1,55 @@
+# A cert receipt pasted into a PR comment after the PR's cert run (a GPU box's, a Mac's): that run's `report` job
+# re-run, and the `comment` after it, which collect the PR's comments afresh over the run's own `prep` for the
+# commit - minutes, none of the other CI. This workflow checks out nothing and runs no repo code: issue_comment runs
+# in the base repository's context, so the re-run executes in the PR run's own, read-only one.
+name: cert-rerun
+
+on:
+  issue_comment:
+    types: [created, edited]
+
+permissions: {}
+
+jobs:
+  rerun:
+    # a PR's comment that carries a receipt block, by the PR's author or a maintainer - the comments
+    # tests/cert/receipt.py `collect` takes. The bot's own comments start nothing: an event the workflow token makes
+    # runs no workflow
+    if: >-
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, 'btb-receipt') &&
+      (github.event.comment.user.login == github.event.issue.user.login ||
+       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      pull-requests: read
+    concurrency:
+      group: cert-rerun-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.issue.number }}
+        run: |
+          sha=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
+          run=$(gh api "repos/$REPO/actions/workflows/cert.yml/runs?event=pull_request&head_sha=$sha&per_page=1" \
+            --jq '.workflow_runs[0].id // empty')
+          if [ -z "$run" ]; then
+            echo "no cert run for $sha yet: its run collects the receipt"
+            exit 0
+          fi
+          # a run still going may have fetched the comments before this one: let it finish, then re-run its report
+          for _ in $(seq 60); do
+            [ "$(gh api "repos/$REPO/actions/runs/$run" --jq .status)" = completed ] && break
+            sleep 30
+          done
+          job=$(gh api "repos/$REPO/actions/runs/$run/jobs" --jq '.jobs[] | select(.name == "report") | .id' | head -n1)
+          if [ -n "$job" ] && gh api -X POST "repos/$REPO/actions/jobs/$job/rerun" >/dev/null; then
+            echo "re-ran the report of cert run $run for $sha"
+          else
+            # no report job to re-run alone (a run before the split, or one cancelled before it): the whole run
+            gh api -X POST "repos/$REPO/actions/runs/$run/rerun" >/dev/null
+            echo "re-ran cert run $run for $sha whole"
+          fi

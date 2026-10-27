@@ -25,10 +25,10 @@ from .cache import (
     CardRowsLayer,
     ForkIndexedLayer,
     ForkLayer,
-    GraphStates,
     GrowLayer,
     _DynamicLayer,
     attention_rows,
+    has_graph_states,
     indexer_keys,
     linear_layer,
     mark_forked,
@@ -112,12 +112,12 @@ class _Rows:
         self.mode = "fork"
 
     def _rows_ok(self, sessions: Sequence[Session], B: int) -> bool:
-        """the MLX batched decode takes these rows: a dense family, every attention layer an MLX buffer or a paged
-        layer in the pool's MLX regions"""
+        """the MLX batched step takes these rows (`_mlx_rows_ok`): every attention layer an MLX buffer or a paged layer
+        in the pool's MLX regions"""
         eng = self.eng
         return bool(
-            getattr(eng, "mlx", None) is not None
-            and eng._mlx_batch_ok(max(2, B), None, False)
+            eng.mlx is not None
+            and eng._mlx_rows_ok(max(2, B))
             and all(
                 (isinstance(cl, GrowLayer) and cl.shared and cl._mx is not None) or _mlx_paged(cl) is not None
                 for s in sessions
@@ -160,8 +160,10 @@ class _Rows:
                 setattr(cl, name, dict(val))
         cl.conv_states = {k: rows([p.conv_states[k] for p in lins]) for k in lins[0].conv_states}
         cl.recurrent_states = {k: rows([p.recurrent_states[k] for p in lins]) for k in lins[0].recurrent_states}
-        if isinstance(cl, GraphStates):
+        if has_graph_states(cl):
+            # the MLX step's states are the first layer's, not the new ones the rows made
             cl._mx_pending = cl._mx_prev = None
+            cl._mx_states = None
         return cl
 
     # -- the rows --
@@ -324,18 +326,19 @@ class _Rows:
 
         on_layer = keep if taps else None
         if self.mode == "rows":
-            m = mlxdev.mx()
+            m = mlxdev.mx
             hm = eng._mlx_embed_rows(m.array(toks, dtype=m.int32))
             if eng.compute_dtype is not None and eng.compute_dtype != torch.bfloat16:
                 hm = hm.astype(m.float32)
-            ns = [int(p) for p in self._rows_layers()[0]._ns]
+            ns = [int(p) for p in self._rows_layers()[0]._row_lens()]
             # a tapped pass is evaluated in place, its layers' outputs read with it; else the logits come lazily
-            lg = eng._forward_mlx(None, None, cache, on_layer, False, True, eng.L, hm=hm, lazy=not taps, rows=ns)
-            if isinstance(lg, torch.Tensor):
-                return lg.reshape(B, -1).float().cpu(), seen
-            lg = lg.astype(m.float32)
-            m.eval(lg)
-            return mlxdev.from_mx(lg).clone(), seen
+            got = eng._forward_mlx(None, None, cache, on_layer, False, True, eng.L, hm=hm, lazy=not taps, rows=ns)
+            if isinstance(got, torch.Tensor):
+                return got.reshape(B, -1).float().cpu(), seen
+            assert got is not None  # a whole pass with the head returns its logits
+            lgm = got.astype(m.float32)
+            m.eval(lgm)
+            return mlxdev.from_mx(lgm).clone(), seen
         ids = torch.tensor(toks, dtype=torch.long).view(-1, 1)
         am = None
         if self._am is not None:
@@ -465,15 +468,16 @@ class _Rows:
             self.eng._card_rows_select(cache, slots)
             self._lens = [self._lens[b] for b in slots]
         elif self.mode == "rows":
-            m = mlxdev.mx()
+            m = mlxdev.mx
             idx = m.array(slots, dtype=m.int32)
             for gl in self._rows_layers():
                 if gl._mx2 is not None:
                     gl._mx2 = [m.take(x, idx, axis=0) for x in gl._mx2]
                     m.eval(*gl._mx2)
-                gl._ns = [gl._ns[b] for b in slots]
+                ns, offs = gl._row_lens(), gl._flat_offs()
+                gl._ns = [ns[b] for b in slots]
                 gl._seg = [gl._seg[b] for b in slots] if gl._seg is not None else None
-                gl._offs = [gl._offs[b] for b in slots]
+                gl._offs = [offs[b] for b in slots]
                 gl._rows_total = len(slots)
                 gl._n = max(gl._ns) if gl._ns else 0
         else:
@@ -507,7 +511,7 @@ class _Rows:
                     out.kv[i] = kv
             elif isinstance(cl, GrowLayer) and self.mode == "rows":
                 if cl._mx2 is not None and cl._t:
-                    m = mlxdev.mx()
+                    m = mlxdev.mx
                     parts = [m.contiguous(x[b : b + 1, :, : cl._t]) for x in cl._mx2]
                     m.eval(*parts)
                     out.kv[i] = parts
@@ -550,7 +554,7 @@ class _Rows:
                     else:
                         k, v = kv[0], kv[1]
                     pl.mx_update(k, v)
-                    mlxdev.mx().eval(*[x for x in pl._mx if x is not None])
+                    mlxdev.mx.eval(*pl.mx_bufs())
                 elif isinstance(pl, PagedLayer):
                     # the row's own rows onto the session's table, in pages of its own
                     pl.append(kv[0], kv[1])
@@ -677,7 +681,7 @@ class Branches(_Rows):
         cl.lazy_initialization(empty, empty)
         cl.batch_rows(B, dec_cap=256, lens=[P] * B)
         cl._offs = [0] * B
-        cl._mx = list(pl._mx)
+        cl._mx = list(pl.mx_bufs())
         cl._shape, cl._b, cl._ptr = pl._shape, 1, pl._ptr
         cl._ns = [P] * B
         cl.select_row(None)
@@ -872,7 +876,7 @@ class Batch(_Rows):
     def _flat(pls: list[CacheLayer], lens: list[int]) -> GrowLayer:
         """the MLX batched layer: the sessions' rows end to end in one flat buffer, a copy - a paged session's
         gathered out of the pool's MLX regions through its row map"""
-        m = mlxdev.mx()
+        m = mlxdev.mx
         srcs: list[list[mx_.array]] = []
         for pl in pls:
             paged = _mlx_paged(pl)
@@ -882,7 +886,7 @@ class Batch(_Rows):
             else:
                 assert isinstance(pl, GrowLayer)
                 pl._apply_overrides()
-                srcs.append(list(pl._mx))
+                srcs.append(list(pl.mx_bufs()))
         p0, k0 = pls[0], srcs[0][0]
         bits = p0.bits if isinstance(p0, GrowLayer) else None
         dt = p0.dtype if isinstance(p0, GrowLayer) else mlxdev.torch_dtype(k0.dtype)
@@ -891,10 +895,11 @@ class Batch(_Rows):
         cl.lazy_initialization(empty, empty)
         cl.batch_rows(len(pls), dec_cap=256, lens=lens)
         cl._ensure_flat(int(k0.shape[1]), int(k0.shape[-1]), dt)
-        for src, off, n in zip(srcs, cl._offs, lens):
-            for dst, s in zip(cl._mx, src):
+        bufs = cl.mx_bufs()
+        for src, off, n in zip(srcs, cl._flat_offs(), lens):
+            for dst, s in zip(bufs, src):
                 dst[0:1, :, off : off + n] = s[0:1, :, :n]
-        m.eval(*cl._mx)
+        m.eval(*bufs)
         cl._ns = list(lens)
         cl.select_row(None)
         return cl
@@ -971,7 +976,7 @@ def _page_rows(pl: PagedLayer) -> tuple[mx_.array, mx_.array, mx_.array]:
     no empty input)"""
     import numpy as np
 
-    m = mlxdev.mx()
+    m = mlxdev.mx
     k, v = pl.pool.host.mx_view(pl.i)
     rows = pl.table.rows()[: pl.n].numpy().astype(np.uint32)
     return k, v, m.array(rows if len(rows) else np.zeros(1, np.uint32))

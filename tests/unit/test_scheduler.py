@@ -24,11 +24,13 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 import torch
 from pytest import MonkeyPatch
+from transformers.cache_utils import DynamicCache, DynamicLayer
 
 from btb.engine import BatchScheduler
 from btb.engine import device as device_mod
 from btb.engine import memory as memory_mod
 from btb.engine.device import Device, Where
+from btb.engine.experts import NO_GRAPH, Expert, SlotId
 from btb.engine.families import Family
 from btb.engine.forward import _ForwardMixin
 from btb.engine.generate import _GenerateMixin
@@ -53,7 +55,10 @@ from tests.helpers import (
 )
 
 if TYPE_CHECKING:
+    from btb.engine.cache import KvCache
     from btb.engine.experts import _ExpertStore
+    from btb.engine.host import ExpertDown, ExpertGateUp
+    from btb.engine.mlx_forward import OnLayer
     from btb.serve import Engine
 
 TOTAL_VRAM = 12 * GB
@@ -119,12 +124,15 @@ def toy_tokens(prompt: Sequence[int], n: int) -> list[int]:
     return [int((s * 7919 * (k + 1) + 13) % V) for k in range(n)]
 
 
-class _StubCache:
+class _StubCache(DynamicCache):
+    """the toy forward's cache: the rows it decodes and its step, one layer that holds no keys"""
+
     def __init__(self, max_len: int | None = None) -> None:
+        super().__init__()
         self.max_len = max_len
         self.step = 0
         self.rows: list[list[int]] = []
-        self.layers = [types.SimpleNamespace(keys=None, values=None)]
+        self.layers = [DynamicLayer()]
 
 
 class _StubEngine(_GenerateMixin):
@@ -191,11 +199,12 @@ class _StubEngine(_GenerateMixin):
     def _prefill(
         self,
         ids: torch.Tensor,
-        cache: Any,
-        on_layer: Any = None,
+        cache: KvCache | None,
+        on_layer: OnLayer | None = None,
         attention_mask: torch.Tensor | None = None,
         last_only: bool = True,
     ) -> torch.Tensor:
+        assert isinstance(cache, _StubCache)  # the stub's own (`new_cache`)
         ids = torch.as_tensor(ids, dtype=torch.long)
         B, T = int(ids.shape[0]), int(ids.shape[1])
         rows = []
@@ -220,12 +229,13 @@ class _StubEngine(_GenerateMixin):
     def forward(  # type: ignore[override]
         self,
         ids: torch.Tensor | Tokens | TokenRows,
-        cache: Any = None,
+        cache: KvCache | None = None,
         on_layer: Callable[[int, torch.Tensor], object] | None = None,
         last_only: bool = True,
         attention_mask: torch.Tensor | None = None,
         **k: object,
     ) -> torch.Tensor:
+        assert isinstance(cache, _StubCache)  # the stub's own (`new_cache`)
         ids = torch.as_tensor(ids, dtype=torch.long)
         assert int(ids.shape[0]) == len(cache.rows), "the batch never resizes mid-decode"
         cache.step += 1
@@ -1896,7 +1906,7 @@ def test_store_does_not_thrash_at_the_reserve(monkeypatch: MonkeyPatch) -> None:
     grown = st.live()
     # every slot in use, the oldest first
     for i in range(grown):
-        seat(st, (0, i))
+        seat(st, (0, Expert(i)))
     st.max_call = 1
     # the machine takes memory: free RAM dips under the reserve
     state["free"] = st.reserve - slot_size(st)
@@ -1922,7 +1932,7 @@ def test_store_release_holds_the_floor_for_the_largest_call(monkeypatch: MonkeyP
         assert st._grow(1) > 0
     n = st.live()
     for i in range(n):
-        seat(st, (0, i))
+        seat(st, (0, Expert(i)))
     st.max_call = n - 1  # freeing any block would leave fewer slots than the largest call served
     state["free"] = st.reserve - slot_size(st)
     assert st.release() == 0, "the store holds rather than fall below what a call needs"
@@ -1986,6 +1996,31 @@ def test_route_queues_the_same_bytes_once_and_raises_their_priority(monkeypatch:
     t = s._disk_take(st)
     assert t is not None and t[0]["priority"] == s.DISK_DEMAND
     assert s._disk_take(st) is None, "the stale entry of the raised request is skipped"
+
+
+def test_route_raises_a_keys_queued_reads_and_leaves_the_rest(monkeypatch: MonkeyPatch) -> None:
+    """`disk_promote` raises every queued read of one key (a call now waits on a sweep's reads): served ahead of the
+    sweep behind it, each once; a key's read already higher is left as it is"""
+    reads: list[tuple[str, int, int]] = []
+    s, st = _route(monkeypatch, reads)
+    st["workers"] = [None]
+    dst = torch.empty(8, dtype=torch.uint8)
+    s.disk_read("a.st", 0, 8, dst, s.DISK_SWEEP, key=(0, 1))
+    s.disk_read("a.st", 4096, 8, dst, s.DISK_SWEEP, key=(0, 2))
+    s.disk_read("b.st", 0, 8, dst, s.DISK_SWEEP, key=(0, 2))
+    s.disk_read("c.st", 0, 8, dst, s.DISK_DEMAND, key=(0, 3))
+    assert s.disk_promote((0, 2), s.DISK_DEMAND) == 2
+    assert s.disk_promote((0, 3), s.DISK_AHEAD) == 0, "a read already ahead of the asked priority stays"
+    order = []
+    while (t := s._disk_take(st)) is not None:
+        order.append((t[0]["path"], t[0]["off"], t[0]["priority"]))
+        st["inflight_demand"] = st["inflight_ahead"] = 0
+    assert order == [
+        ("a.st", 4096, s.DISK_DEMAND),
+        ("b.st", 0, s.DISK_DEMAND),
+        ("c.st", 0, s.DISK_DEMAND),
+        ("a.st", 0, s.DISK_SWEEP),
+    ]
 
 
 def test_route_drops_a_lapsed_prediction_before_it_is_issued(monkeypatch: MonkeyPatch) -> None:
@@ -2545,13 +2580,19 @@ def _store_with_routers(
     return st, route, sm
 
 
+def _tensor(part: ExpertGateUp | ExpertDown) -> torch.Tensor:
+    """an expert's part as a bf16 store's view hands it over: a tensor"""
+    assert isinstance(part, torch.Tensor), type(part)
+    return part
+
+
 def test_lookahead_reads_the_next_layers_top_picks_that_are_not_resident(monkeypatch: MonkeyPatch) -> None:
     st, route, _sm = _store_with_routers(monkeypatch, lookahead=(2, 1))
     _sm.lookahead_rows = (2, 1)
     h = torch.ones(1, 4)
     # expert 7 of layer 1 is resident already: it is not read again
     st._grow(1)
-    seat(st, (1, 7))
+    seat(st, (1, Expert(7)))
     n = st.lookahead(0, h)
     assert n == 2, "layer 1's top-2 less the resident one, and layer 2's top-1"
     keys = [r["key"] for r in route.reads]
@@ -2589,9 +2630,58 @@ def test_lookahead_hit_still_in_flight_is_waited_for_not_read_again(monkeypatch:
     assert len(route.reads) == n_reads, "no demand read for an expert already on its way"
     assert ready == {} and len(pending) == 1 and pending[0][0] == 7
     assert not pending[0][1].done()
+    mine = [r["priority"] for r in route.reads if r["key"] == (1, Expert(7))]
+    assert mine and all(p == route.DISK_DEMAND for p in mine), "a call waits on the prediction: its reads demand's now"
     route.land((1, 7))
     pending[0][1].result()
     assert pending[0][1].done()
+
+
+def test_a_decode_call_raises_the_fills_reads_it_waits_on(monkeypatch: MonkeyPatch) -> None:
+    """a store with a seat for every expert fills a layer at the sweep's priority, none waited for; a decode call
+    over a few of them waits on those reads, which are raised to a layer waiting now, the rest left to the sweep"""
+    route = FakeRoute()
+    st, _sm = expert_store(monkeypatch, route, n_layers=2, n_experts=8, lookahead=())
+    st.holds_all, st.ring_n = True, 0
+    assert st.fill(0, "b.", settled=NO_GRAPH) == 8
+    assert {r["priority"] for r in route.reads} == {route.DISK_SWEEP}
+    n_reads = len(route.reads)
+    _ready, pending = st.call(0, "b.", [Expert(2), Expert(5)], keep=True).whole(settled=NO_GRAPH)
+    assert len(route.reads) == n_reads, "no read again for experts the fill has on their way"
+    assert sorted(int(e) for e, _f, _s in pending) == [2, 5]
+    by: dict[object, set[int]] = {}
+    for r in route.reads:
+        by.setdefault(r["key"], set()).add(r["priority"])
+    for key, pris in by.items():
+        want = route.DISK_DEMAND if key in ((0, Expert(2)), (0, Expert(5))) else route.DISK_SWEEP
+        assert pris == {want}, f"{key}: {pris}"
+
+
+def test_a_shed_store_fills_no_layer_by_unseating_its_residents(monkeypatch: MonkeyPatch) -> None:
+    """a store with a seat for every expert, shed below a layer's (the machine took RAM back) and refused growth,
+    fills a layer only into seats it has free: decode calls over a resident expert read nothing, call after call,
+    where the fill once unseated the layer's residents to read the rest and each call waited on those reads"""
+    route = FakeRoute()
+    st, _sm = expert_store(monkeypatch, route, n_layers=2, n_experts=8, lookahead=())
+    st.holds_all, st.ring_n = True, 0
+    assert st.per is not None
+    st.block_max = 4 * st.per
+    st._grow(4)
+    st._grow(4)
+    assert st.fill(0, "b.", settled=NO_GRAPH) == 8
+    for e in range(8):
+        route.land((0, Expert(e)))
+    st._release_block(next(iter(st.blocks)))
+    # the host down to the store's margin: no growth (it keeps two slots above it), no further shedding
+    monkeypatch.setattr(st, "_host_free", lambda: int(st.margin))
+    kept = [Expert(e) for e in range(8) if st.res.peek((0, Expert(e))) is not None]
+    assert len(kept) == 4
+    n_reads = len(route.reads)
+    for _ in range(3):
+        assert st.fill(0, "b.", settled=NO_GRAPH) == 0
+        ready, pending = st.call(0, "b.", [kept[0]], keep=True).whole(settled=NO_GRAPH)
+        assert set(ready) == {kept[0]} and not pending, "a resident expert waited on the fill's reads"
+    assert len(route.reads) == n_reads, "the fill read the layer again into seats its residents held"
 
 
 def test_ring_wraps_over_landed_predictions_and_holds_at_in_flight_ones(monkeypatch: MonkeyPatch) -> None:
@@ -2621,7 +2711,7 @@ def test_a_store_below_a_calls_experts_serves_it_in_waves(monkeypatch: MonkeyPat
     call = st.call(0, "layers.0.mlp.experts.", ids, rows=4)
     while not call.done:
         rest = list(call.rest)
-        ready, pending = call.wave()
+        ready, pending = call.wave(settled=NO_GRAPH)
         wave = sorted([*ready, *(e for e, _f, _s in pending)])
         assert wave == rest[: len(wave)] and wave, f"a wave is a prefix of what is left: {wave} of {rest}"
         assert len({s for _e, _f, s in pending} | set(st.last_slots.values())) <= 3
@@ -2648,7 +2738,7 @@ def test_a_cold_store_on_a_tight_machine_serves_a_call_in_waves(monkeypatch: Mon
     call = st.call(0, "layers.0.mlp.experts.", ids, rows=4096)
     while not call.done:
         rest = list(call.rest)
-        ready, pending = call.wave()
+        ready, pending = call.wave(settled=NO_GRAPH)
         wave = sorted([*ready, *(e for e, _f, _s in pending)])
         assert wave == rest[: len(wave)] and wave, f"a wave is a prefix of what is left: {wave} of {rest}"
         assert st.live() <= room
@@ -2682,7 +2772,7 @@ def test_residents_whose_block_goes_back_are_read_again_in_the_calls_order(monke
     def release(want: int = 1) -> Any:
         calls[0] += 1
         if calls[0] == 1:  # the first wave's start: the block 0 and 1 sit in goes back
-            st._release_block(st.slots[dict(st.res.items())[(0, 0)]].block)
+            st._release_block(st.slots[dict(st.res.items())[(0, Expert(0))]].block)
             return 0
         return real(want)
 
@@ -2692,7 +2782,7 @@ def test_residents_whose_block_goes_back_are_read_again_in_the_calls_order(monke
     call = st.call(0, base, ids, rows=64)
     while not call.done:
         rest = list(call.rest)
-        ready, pending = call.wave()
+        ready, pending = call.wave(settled=NO_GRAPH)
         wave = sorted([*ready, *(e for e, _f, _s in pending)])
         assert wave == rest[: len(wave)] and wave, f"a wave is a prefix of what is left: {wave} of {rest}"
         read = {r["key"][1] for r in route.reads if r["key"][0] == 0}
@@ -2748,7 +2838,7 @@ def test_the_lookahead_gives_a_call_no_slot_still_being_written(monkeypatch: Mon
     st, route, _sm = _store_with_routers(monkeypatch, lookahead=(2, 0), ring_n=2)
     assert st.lookahead(0, torch.ones(1, 4)) == 2  # (1, 7), (1, 6) in the ring
     route.start((1, 7), parts=1)
-    s7 = st.ahead[(1, 7)]
+    s7 = st.ahead[(1, Expert(7))]
     got = st._ring_take()
     assert got is not None and got != s7, "the slot being written was given away"
     assert (1, 7) in st.ahead and not any(
@@ -2790,32 +2880,34 @@ def test_a_call_with_no_seat_left_takes_one_back_from_the_lookahead(monkeypatch:
 def test_riders_store_line_bumps_the_oldest_and_a_ride_renews() -> None:
     from btb.engine.experts import Riders
 
+    a, b, c = (0, Expert(0)), (0, Expert(1)), (0, Expert(2))
     r = Riders(lambda: 3)
-    r.admit("a", 1)
-    r.admit("b", 2)
-    r.admit("c", 3)
-    assert r.get("a") == 1, "a ride renews the seat"
-    assert r.victim() == ("b", 2), "the oldest ride gives up its seat"
-    assert "b" not in r and len(r) == 2
-    assert r.victim(skip={3}) == ("a", 1), "a seat in `skip` is passed over"
+    r.admit(a, SlotId(1))
+    r.admit(b, SlotId(2))
+    r.admit(c, SlotId(3))
+    assert r.get(a) == 1, "a ride renews the seat"
+    assert r.victim() == (b, 2), "the oldest ride gives up its seat"
+    assert b not in r and len(r) == 2
+    assert r.victim(skip={SlotId(3)}) == (a, 1), "a seat in `skip` is passed over"
     assert r.oldest_slot() == 3
 
 
 def test_bus_pass_regulars_outlast_day_riders_and_ghosts_move_the_split() -> None:
     from btb.engine.experts import BusPass
 
+    a, b, c = (0, Expert(0)), (0, Expert(1)), (0, Expert(2))
     r = BusPass(lambda: 2)
-    r.admit("a", 1)
-    assert r.get("a") == 1 and "a" in r.t2, "a second ride makes a regular"
-    r.admit("b", 2)
-    assert r.victim() == ("b", 2), "the day rider goes before the regular"
-    assert "b" in r.b1, "and is remembered as a ghost"
-    r.admit("b", 2)
-    assert "b" in r.t2 and r.p >= 1, "the ghost's return seats it as a regular and grows the day riders' share"
-    r.admit("c", 3)
-    assert r.victim() == ("a", 1), "the split moved to the day riders: the oldest regular gives way, not the day rider"
-    assert "a" in r.b2, "and is remembered as a regular ghost"
-    assert r.pop("b") == 2 and "b" not in r and "b" not in r.b1 and "b" not in r.b2, "a pop leaves no ghost"
+    r.admit(a, SlotId(1))
+    assert r.get(a) == 1 and a in r.t2, "a second ride makes a regular"
+    r.admit(b, SlotId(2))
+    assert r.victim() == (b, 2), "the day rider goes before the regular"
+    assert b in r.b1, "and is remembered as a ghost"
+    r.admit(b, SlotId(2))
+    assert b in r.t2 and r.p >= 1, "the ghost's return seats it as a regular and grows the day riders' share"
+    r.admit(c, SlotId(3))
+    assert r.victim() == (a, 1), "the split moved to the day riders: the oldest regular gives way, not the day rider"
+    assert a in r.b2, "and is remembered as a regular ghost"
+    assert r.pop(b) == 2 and b not in r and b not in r.b1 and b not in r.b2, "a pop leaves no ghost"
 
 
 def test_landed_yields_experts_as_their_reads_complete(monkeypatch: MonkeyPatch) -> None:
@@ -2826,7 +2918,7 @@ def test_landed_yields_experts_as_their_reads_complete(monkeypatch: MonkeyPatch)
 
     st, _route, _sm = _store_with_routers(monkeypatch)
     fa, fb, fc = Future[float](), Future[float](), Future[float]()
-    pending = [(1, Parts([fa]), 11), (2, Parts([fb]), 12), (3, Parts([fc]), 13)]
+    pending = [(Expert(e), Parts([f]), SlotId(10 + e)) for e, f in ((1, fa), (2, fb), (3, fc))]
 
     def later() -> None:
         _time.sleep(0.02)
@@ -2900,8 +2992,8 @@ def test_padded_slots_read_the_aligned_span_straight_in_and_the_views_find_the_b
     st._sizes_of = {"gu.st": GB, "dn.st": GB}
     monkeypatch.setattr(st, "_recipe", lambda layer, base: parts)
     assert st._grow(1) > 0
-    s = seat(st, (0, 1))
-    st._submit(route, parts, 1, s, 0, route.DISK_DEMAND)
+    s = seat(st, (0, Expert(1)))
+    st._submit(route, parts, Expert(1), s, 0, route.DISK_DEMAND)
     r0, r1 = route.reads[-2], route.reads[-1]
     for r in (r0, r1):
         assert r["off"] % 4096 == 0 and r["n"] % 4096 == 0, "the span read is sector-aligned"
@@ -2913,17 +3005,16 @@ def test_padded_slots_read_the_aligned_span_straight_in_and_the_views_find_the_b
     # the bytes the drive would write: a pattern at the expert's place inside the span
     r0["dst"].fill_(0)
     r0["dst"][delta0 : delta0 + per // 2] = torch.arange(per // 2, dtype=torch.int64).to(torch.uint8)
-    gu, _dn = st._views(s)
+    gu = _tensor(st._views(s)[0])
     want = torch.arange(per // 2, dtype=torch.int64).to(torch.uint8)
     assert torch.equal(gu.reshape(-1).view(torch.uint8), want), "the view is the expert's own bytes, not the slack"
     # a span that would run past the file's end is cut at it (the reader bounces that one)
     st._sizes_of["dn.st"] = 4096 * 3 + 500 + per // 2 + 100
-    st._submit(route, parts, 0, s, 0, route.DISK_DEMAND)
+    st._submit(route, parts, Expert(0), s, 0, route.DISK_DEMAND)
     r = route.reads[-1]
     assert r["off"] + r["n"] == st._sizes_of["dn.st"] and r["n"] % 4096 != 0
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 def test_vram_seats_hold_the_most_ridden_experts_and_serve_them_from_the_card(monkeypatch: MonkeyPatch) -> None:
     from btb.engine.experts import VramSeats
@@ -2932,28 +3023,30 @@ def test_vram_seats_hold_the_most_ridden_experts_and_serve_them_from_the_card(mo
     per = slot_size(st)
     st.vram = VramSeats(2, per, st.shapes, torch.device("cuda"), min_rides=3, per_pass=1)
     assert st._grow(1) > 0
-    s = seat(st, (0, 5))
+    five, six, seven = (0, Expert(5)), (1, Expert(6)), (1, Expert(7))
+    s = seat(st, five)
     st._region(s).fill_(7)
     for _ in range(2):
         ready, _pending = st.get(0, "layers.0.mlp.experts.", [5])
-        assert ready[5][0].device.type == "cpu", "not yet ridden enough for a seat"
+        assert _tensor(ready[Expert(5)][0]).device.type == "cpu", "not yet ridden enough for a seat"
     ready, _pending = st.get(0, "layers.0.mlp.experts.", [5])
-    assert st.rides[(0, 5)] == 3 and (0, 5) in st.vram, "the third ride earns the seat"
-    assert ready[5][0].device.type == "cpu", "the ride that earned it is still served from RAM"
+    assert st.rides[five] == 3 and five in st.vram, "the third ride earns the seat"
+    assert _tensor(ready[Expert(5)][0]).device.type == "cpu", "the ride that earned it is still served from RAM"
     # a second rider, a third, at layer 1: one promotion a pass (a pass turns at layer 0), the seats by last ride
-    for e in (6, 7):
-        seat(st, (1, e))  # through the store's own transitions: its slot table checks after every wave
-        st.rides[(1, e)] = 5
+    for key in (six, seven):
+        seat(st, key)  # through the store's own transitions: its slot table checks after every wave
+        st.rides[key] = 5
     st.get(1, "layers.1.mlp.experts.", [6])
-    assert (1, 6) not in st.vram, "the pass's one promotion was spent on 5"
+    assert six not in st.vram, "the pass's one promotion was spent on 5"
     ready, _pending = st.get(0, "layers.0.mlp.experts.", [5])
-    assert ready[5][0].device.type == "cuda" and int(ready[5][0].view(torch.uint8)[0]) == 7, "then from the card"
+    gu = _tensor(ready[Expert(5)][0])
+    assert gu.device.type == "cuda" and int(gu.view(torch.uint8)[0]) == 7, "then from the card"
     assert st.stat["hit"] == 5
     st.get(1, "layers.1.mlp.experts.", [6])
-    assert (1, 6) in st.vram, "the next pass's promotion"
+    assert six in st.vram, "the next pass's promotion"
     st.get(0, "layers.0.mlp.experts.", [])
     st.get(1, "layers.1.mlp.experts.", [7])
-    assert (1, 7) in st.vram and (0, 5) not in st.vram, "the least recently ridden seat was given up"
+    assert seven in st.vram and five not in st.vram, "the least recently ridden seat was given up"
     assert st.lookahead(0, torch.ones(1, 4)) == 0 or all(k not in st.vram for k in st.ahead)
 
 
@@ -2973,7 +3066,7 @@ def test_a_seated_expert_serves_a_multi_row_call_from_the_card(monkeypatch: Monk
     assert st._grow(2) > 0
     torch.manual_seed(3)
     for e in (5, 6):
-        s = seat(st, (0, e))
+        s = seat(st, (0, Expert(e)))
         st._region(s).view(torch.bfloat16).copy_((torch.randn(st.per // 2) * 0.2).bfloat16())
     st.vram = VramSeats(2, st.per, st.shapes, torch.device("cuda"), min_rides=1, per_pass=4)
     sm.expert_store = st
@@ -2984,7 +3077,7 @@ def test_a_seated_expert_serves_a_multi_row_call_from_the_card(monkeypatch: Monk
     top = torch.tensor([[5, 6], [6, 5]], device="cuda")
     w = torch.tensor([[0.7, 0.3], [0.4, 0.6]], dtype=torch.bfloat16, device="cuda")
     y0 = mod(x, top, w)
-    assert (0, 5) in st.vram and (0, 6) in st.vram, "the first ride earned the seats"
+    assert (0, Expert(5)) in st.vram and (0, Expert(6)) in st.vram, "the first ride earned the seats"
     y1 = mod(x, top, w)
     assert y1.shape == x.shape
     from btb.engine.native import Native
@@ -3499,6 +3592,7 @@ class _RamEngine(_MemoryMixin):
         self.lines: list[str] = []
         self.cold_ring = None
         self.rebound: list[int] = []
+        self.mega_builds = 0  # the megakernel rebuilt over the weights where a regrow put them
 
     def log(self, *a: object, **k: object) -> None:
         self.lines.append(" ".join(str(x) for x in a))
@@ -3511,6 +3605,9 @@ class _RamEngine(_MemoryMixin):
 
     def _rebind_warm(self, i: int) -> None:
         self.rebound.append(i)
+
+    def _build_mega(self) -> None:
+        self.mega_builds += 1
 
     def _layer_bytes_stored(self, i: int, packed: bool = False) -> int:
         return self.stored_bytes
@@ -3603,6 +3700,7 @@ def test_the_ram_policy_regrows_after_clean_readings_with_room(monkeypatch: Monk
     e.ram_policy()  # fifth clean reading
     assert e.cold == set() and e.rebound == [2] and e.device.did[-1] == "ram-regrow" and e.ram_state.shed == []
     assert "[ram] REGROW layer 2" in e.lines[-1]
+    assert e.mega_builds == 1, "every layer back in RAM: the megakernel rebuilt over them"
 
 
 # --- the serve registry frees the card ---------------------------------------------------------------------
@@ -3792,24 +3890,27 @@ def test_the_lines_demote_pop_and_name_their_oldest_seat() -> None:
     bumps nobody. A regular demoted goes before the other regulars."""
     from btb.engine.experts import BusPass, Riders
 
+    a, b, c, nobody, x, y = ((0, Expert(e)) for e in range(6))
     for cls in (Riders, BusPass):
         line = cls(lambda: 8)
         assert line.oldest_slot() is None, cls.__name__
-        for key, s in (("a", 0), ("b", 1), ("c", 2)):
-            line.admit(key, s)
-        line.demote("c")
-        line.demote("nobody")  # not seated: nothing moves
+        for key, s in ((a, 0), (b, 1), (c, 2)):
+            line.admit(key, SlotId(s))
+        line.demote(c)
+        line.demote(nobody)  # not seated: nothing moves
         assert line.oldest_slot() == 2, cls.__name__
-        assert dict(line.items()) == {"a": 0, "b": 1, "c": 2}, cls.__name__
-        assert line.pop("b") == 1 and "b" not in line and line.pop("b") is None, cls.__name__
-        assert line.victim(skip={0, 2}) is None, f"{cls.__name__}: every seat the call's own, yet one was bumped"
-        assert line.victim() == ("c", 2), cls.__name__
+        assert dict(line.items()) == {a: 0, b: 1, c: 2}, cls.__name__
+        assert line.pop(b) == 1 and b not in line and line.pop(b) is None, cls.__name__
+        assert line.victim(skip={SlotId(0), SlotId(2)}) is None, (
+            f"{cls.__name__}: every seat the call's own, yet one was bumped"
+        )
+        assert line.victim() == (c, 2), cls.__name__
     bp = BusPass(lambda: 8)
-    for key, s in (("x", 5), ("y", 6)):
-        bp.admit(key, s)
+    for key, s in ((x, 5), (y, 6)):
+        bp.admit(key, SlotId(s))
         assert bp.get(key) == s  # a second ride: a regular
-    bp.demote("y")
-    assert bp.oldest_slot() == 6 and bp.victim() == ("y", 6), "the demoted regular goes first"
+    bp.demote(y)
+    assert bp.oldest_slot() == 6 and bp.victim() == (y, 6), "the demoted regular goes first"
 
 
 def test_the_slot_tables_check_names_each_broken_invariant(monkeypatch: MonkeyPatch) -> None:
@@ -3823,7 +3924,7 @@ def test_the_slot_tables_check_names_each_broken_invariant(monkeypatch: MonkeyPa
     for e, _f, _s in pending:
         route.land((0, e))
     st.check()
-    seat0, seat1 = st.ahead[(1, 7)], dict(st.res.items())[(0, 0)]
+    seat0, seat1 = st.ahead[(1, Expert(7))], dict(st.res.items())[(0, Expert(0))]
     free = st.free[0]
 
     def refused(match: str) -> None:
@@ -3842,15 +3943,15 @@ def test_the_slot_tables_check_names_each_broken_invariant(monkeypatch: MonkeyPa
     st.ring[free] = None
     refused(f"slot {free} is free but in the ring")
     del st.ring[free]
-    st.ahead[(1, 6)], was = seat1, st.ahead[(1, 6)]
+    st.ahead[(1, Expert(6))], was = seat1, st.ahead[(1, Expert(6))]
     refused(r"prediction \(1, 6\) names slot \d+, which is resident for \(0, 0\)")
-    st.ahead[(1, 6)] = was
-    st.res.admit((0, 5), seat0)
+    st.ahead[(1, Expert(6))] = was
+    st.res.admit((0, Expert(5)), seat0)
     refused(r"line seat \(0, 5\) names slot \d+, which is predicted for \(1, 7\)")
-    st.res.pop((0, 5))
-    st.res.pop((0, 0))
+    st.res.pop((0, Expert(5)))
+    st.res.pop((0, Expert(0)))
     refused(r"2 predicted slots for 2 predictions, 2 resident for 1 seats on the line")
-    st.res.admit((0, 0), seat1)
+    st.res.admit((0, Expert(0)), seat1)
     st.check()
 
 
@@ -3879,8 +3980,8 @@ def test_a_seat_given_up_is_profiled_to_the_call_or_to_the_machine(monkeypatch: 
     st.block_max = 2 * slot_size(st)
     assert st._grow(2) == 2
     st.n_slots = st.live()
-    for e in (0, 1, 2):
-        _ready, pending = st.get(0, "layers.0.mlp.experts.", [e])
+    for ask in (0, 1, 2):
+        _ready, pending = st.get(0, "layers.0.mlp.experts.", [ask])
         for pe, _f, _s in pending:
             route.land((0, pe))
     ev = prof.a[: prof.n]
@@ -3931,7 +4032,7 @@ def test_a_ring_slot_the_call_holds_is_never_taken_back(monkeypatch: MonkeyPatch
     assert st._ring_take(skip={held}) == other
     assert held in st.ring and other not in st.ring and other_key not in st.ahead
     assert st.stat["ahead_dropped"] == 1
-    st._resident(other, (0, 3))  # the call seats its expert there
+    st._resident(other, (0, Expert(3)))  # the call seats its expert there
     st.check()
 
 
@@ -3963,13 +4064,13 @@ def test_a_call_the_store_cannot_seat_is_refused_whole_or_at_its_first_expert(mo
     assert st._grow(3) == 3
     st.n_slots = st.live()
     with pytest.raises(RuntimeError, match="one call needs 5 experts and the store seats 3 of them"):
-        st.call(0, "layers.0.mlp.experts.", [0, 1, 2, 3, 4], rows=4).whole()
+        st.call(0, "layers.0.mlp.experts.", [0, 1, 2, 3, 4], rows=4).whole(settled=NO_GRAPH)
     empty, _sm2 = expert_store(monkeypatch, FakeRoute(), n_layers=2, n_experts=8)
     empty.n_slots = 0
     with pytest.raises(RuntimeError, match="one call needs 2 experts and the store seats 0 of them"):
-        empty.call(0, "layers.0.mlp.experts.", [0, 1], rows=4).wave()
+        empty.call(0, "layers.0.mlp.experts.", [0, 1], rows=4).wave(settled=NO_GRAPH)
     done = st.call(1, "layers.1.mlp.experts.", [], rows=1)
-    assert done.done and done.wave() == ({}, []), "a call with nothing left seats nothing"
+    assert done.done and done.wave(settled=NO_GRAPH) == ({}, []), "a call with nothing left seats nothing"
 
 
 def _layered_store(tmp_path: Path, experts_at: Sequence[int]) -> _ExpertStore:
@@ -4024,6 +4125,7 @@ def test_a_model_whose_first_layer_is_dense_starts_its_pass_at_the_first_with_ex
     assert form == ((torch.Size([16, 16]), torch.bfloat16), (torch.Size([16, 8]), torch.bfloat16))
     assert st._first_layer() == 1
     prof = st.sm.expert_profile
+    assert prof is not None
     st.call(1, "layers.1.mlp.experts.", [0])
     st.call(1, "layers.1.mlp.experts.", [2])
     assert prof.step == 2, "every call at the first layer with experts starts a pass"
@@ -4052,6 +4154,7 @@ def test_an_fp8_scale_left_off_its_alignment_reads_the_same_scales(monkeypatch: 
     """an FP8 expert's scale grid sitting a byte off its float32 alignment in the slot (where a direct read's
     padding would leave a misaligned file's bytes): the view reads it through an aligned copy, the same values"""
     from btb.engine.experts import _ExpertStore
+    from btb.fp8 import F8Weight
 
     st, _sm = expert_store(monkeypatch, FakeRoute(), n_layers=1, n_experts=4)
     st.mx, st.f8, st.f8_sdt = False, True, torch.float32
@@ -4068,6 +4171,7 @@ def test_an_fp8_scale_left_off_its_alignment_reads_the_same_scales(monkeypatch: 
         at = st.part_at[p] + 1
         region[at : at + w.numel() * 4] = w.reshape(-1).view(torch.uint8)
     gu, dn = st._views(s)
+    assert isinstance(gu, F8Weight) and isinstance(dn, F8Weight), (type(gu), type(dn))
     assert torch.equal(gu.scales, want_gu) and torch.equal(dn.scales, want_dn)
     assert gu.shape == (32, 16) and dn.shape == (16, 16)
 
@@ -4100,13 +4204,15 @@ def test_a_store_without_a_route_reads_on_its_own_readers_and_holds_a_wide_exper
     assert not ready and [e for e, _f, _s in pending] == [1, 3]
     got = st.wait(pending)
     for e in (1, 3):
-        assert torch.equal(got[e][0], parts["gu0"][e]) and torch.equal(got[e][1], parts["dn0"][e]), e
+        gu, dn = got[Expert(e)]
+        assert torch.equal(_tensor(gu), parts["gu0"][e]) and torch.equal(_tensor(dn), parts["dn0"][e]), e
     _ready, pending = st.get(0, base, [2])
     pending[0][1].result()  # landed; nobody has collected it
-    assert not st.slots[pending[0][2]].bf16
+    assert not st.slots[pending[0][2]].formed
     ready, again = st.get(0, base, [2])
-    assert not again and torch.equal(ready[2][0], parts["gu0"][2]) and torch.equal(ready[2][1], parts["dn0"][2])
-    assert st.slots[pending[0][2]].bf16, "the hit rewrote its expert as bf16"
+    gu, dn = ready[Expert(2)]
+    assert not again and torch.equal(_tensor(gu), parts["gu0"][2]) and torch.equal(_tensor(dn), parts["dn0"][2])
+    assert st.slots[pending[0][2]].formed, "the hit rewrote its expert as bf16"
     st.close()
 
 

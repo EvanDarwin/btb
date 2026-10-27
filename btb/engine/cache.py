@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import weakref
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast
 
 import torch
 
@@ -14,15 +14,26 @@ from .. import mlx as mlxdev
 from .device import DeviceSpec, Where, where
 
 if TYPE_CHECKING:
+    from typing import TypeIs
+
     import mlx.core as mx_
-    from transformers.cache_utils import CacheLayerMixin, DynamicCache, LinearAttentionCacheLayerMixin
+    from transformers.cache_utils import (
+        CacheLayerMixin,
+        DynamicCache,
+        LinearAttentionCacheLayerMixin,
+        LinearAttentionLayer,
+    )
     from transformers.cache_utils import DynamicIndexedLayer as _DynamicIndexedLayer
     from transformers.cache_utils import DynamicLayer as _DynamicLayer
+
+    from ..mlx.core import SharedTensor
 
     # a sequence's cache: transformers' DynamicCache over the engine's layers (GrowLayer, a fork's, a hybrid's)
     KvCache = DynamicCache
     # one layer of it: an attention layer's rows, or a linear-attention layer's recurrent states
     CacheLayer = CacheLayerMixin | LinearAttentionCacheLayerMixin
+    # a layer's place in the megakernel's arena: the shared byte array, its K and V byte offsets, its rows a head
+    Arena = tuple[mx_.array, int, int, int]
 else:
     # transformers is imported by name here and not at the top: the engine package is imported for its
     # discovery and planning too, where transformers' import time is not wanted
@@ -36,6 +47,17 @@ def linear_layer(cl: CacheLayer) -> LinearAttentionCacheLayerMixin:
 
     if not isinstance(cl, LinearAttentionCacheLayerMixin):
         raise TypeError(f"a linear-attention layer's states were asked of a {type(cl).__name__}")
+    return cl
+
+
+def delta_layer(cache: KvCache, i: int) -> LinearAttentionLayer:
+    """layer i of `cache` as the DeltaNet layer transformers makes, whose setters take the conv's width; a TypeError
+    for any other"""
+    from transformers.cache_utils import LinearAttentionLayer
+
+    cl = cache.layers[i]
+    if not isinstance(cl, LinearAttentionLayer):
+        raise TypeError(f"layer {i} was asked for its DeltaNet states, its cache layer a {type(cl).__name__}")
     return cl
 
 
@@ -73,13 +95,46 @@ def indexer_keys(cl: CacheLayer) -> torch.Tensor | None:
     return cl.indexer_keys if isinstance(cl, DynamicIndexedLayer) else None
 
 
-@runtime_checkable
 class GraphStates(Protocol):
-    """a linear layer whose states the pipelined MLX decode carries in its graph between steps (btb's attributes
-    on transformers' layer): this step's (conv, recurrent) pair and the step before's"""
+    """a linear layer whose states the MLX step adopted (btb's attributes on transformers' layer, `adopt_states`): the
+    pair moved into MLX memory, kept while the layer holds those very tensors; the pipelined decode's (conv,
+    recurrent) pair in its graph between steps, and the step before's"""
 
+    _mx_states: tuple[SharedTensor, SharedTensor] | None
     _mx_pending: tuple[mx_.array, mx_.array] | None
     _mx_prev: tuple[mx_.array, mx_.array] | None
+
+
+def has_graph_states(cl: object) -> TypeIs[GraphStates]:
+    """`cl` carries every `GraphStates` attribute: `adopt_states` sets them together"""
+    return hasattr(cl, "_mx_states")
+
+
+def adopt_states(cl: object, states: tuple[SharedTensor, SharedTensor]) -> GraphStates:
+    """`cl` holding `states`, its `GraphStates` attributes made on its first adoption"""
+    if not has_graph_states(cl):
+        vars(cl).update(_mx_states=None, _mx_pending=None, _mx_prev=None)
+        assert has_graph_states(cl)
+    cl._mx_states = states
+    return cl
+
+
+class KvScales(TypedDict, total=False):
+    """an int8 layer's scales beside its rows, as the attention kernels take them; none for a bf16 layer"""
+
+    ks: mx_.array
+    vs: mx_.array
+
+
+class RowBufs(KvScales, total=False):
+    """a batched step's buffers beyond the prefill's (`attn_rows`): the step buffer's rows, its scales for an int8
+    layer, and each row's boundary between the two"""
+
+    segs: list[int] | None
+    k2: mx_.array
+    v2: mx_.array
+    ks2: mx_.array
+    vs2: mx_.array
 
 
 # the caches a fork or a batch built (`forked`), held weakly
@@ -99,21 +154,22 @@ class GrowLayer(_DynamicLayer):
     next append."""
 
     # the buffers and their bookkeeping, None until the first append (their shapes come with the first rows)
-    _mx: Any
+    _mx: list[mx_.array] | None  # MLX's [B, Hk, cap, d] K and V, an int8 layer's [B, Hk, cap] scales after them
     _an: int | None  # the front-row count when the buffer is the card's arena, else None
-    _mx2: Any
-    _shape: Any
+    _mx2: list[mx_.array] | None  # the step buffer, laid out as `_mx`
+    _shape: tuple[int, ...] | None  # the buffers' [B, Hk, cap, d]
     _keys_t: Any
     _values_t: Any
     _tk: Any
     _tv: Any
     _buf: Any
-    _tmp: Any
-    _ptr: Any
-    _ns: Any
-    _seg: Any
-    _offs: Any
-    _row: Any
+    _tmp: list[torch.Tensor | None]
+    _ptr: tuple[int, int]
+    _vptr: list[tuple[int, int]]
+    _ns: list[int] | None
+    _seg: list[int] | None
+    _offs: list[int] | None
+    _row: int | None
     _n: int
     _b: int
     _t: int
@@ -122,6 +178,7 @@ class GrowLayer(_DynamicLayer):
     _flat_len: int
     _rows_total: int
     _rmap: mx_.array | None
+    _in_arena: bool  # `_mx` are views of the arena's stretch (`_ensure`)
 
     def __init__(
         self,
@@ -130,7 +187,7 @@ class GrowLayer(_DynamicLayer):
         cap_hint: int = 0,
         grant: Callable[..., None] | None = None,
         bound: int = 0,
-        arena: tuple[Any, int, int, int] | None = None,
+        arena: Arena | None = None,
         kv_dtype: torch.dtype | None = None,
     ) -> None:
         # `grant` is the scheduler's gate (BatchScheduler.grant), asked on the growth branch alone - never per
@@ -150,6 +207,7 @@ class GrowLayer(_DynamicLayer):
         # (buffer, K offset, V offset, rows a head): the layer's K and V are views of one shared array (the
         # megakernel's arena), written in place by kernels (`btb.mlx.kv`)
         self.arena = arena
+        self._in_arena = False
         # a batched cache (the MLX device): `_ns[b]` is row b's own length, `_row` the row a single-sequence
         # forward is writing (its prefill), `_rows_total` the batch the buffer is sized for
         self._ns = None
@@ -178,6 +236,10 @@ class GrowLayer(_DynamicLayer):
         self._tk = None
         self._tv = None
         self._ptr = (0, 0)
+        # each buffer's latest torch view: (the allocation it was taken under, its storage). A slice update MLX cannot
+        # make in place (the buffer still referenced, a finishing command buffer's hold among them) moves the rows,
+        # so a crop is matched against the storage the view saw, while that allocation is current
+        self._vptr = [(0, 0), (0, 0)]
         self._tmp = [None, None]
         self._shape = None
         self._b = 0
@@ -274,64 +336,91 @@ class GrowLayer(_DynamicLayer):
             return int(self._tk.shape[-2]) if self._tk is not None else int(self._n)
         return super().get_seq_length()
 
+    def mx_bufs(self) -> list[mx_.array]:
+        """the MLX buffers (`_mx`); a RuntimeError before an append has made them"""
+        if self._mx is None:
+            raise RuntimeError("[cache] a shared layer's MLX buffers were read before its first append")
+        return self._mx
+
+    def _dims(self) -> tuple[int, ...]:
+        """the MLX buffers' [B, Hk, cap, d], made with them (`mx_bufs`)"""
+        if self._shape is None:
+            raise RuntimeError("[cache] a shared layer's buffer shape was read before its first append")
+        return self._shape
+
+    def _flat_offs(self) -> list[int]:
+        """each row's offset into a flat batched buffer (`batch_rows` with `lens`)"""
+        if self._offs is None:
+            raise RuntimeError("[cache] a flat buffer's row offsets were read off a layer that is not flat")
+        return self._offs
+
+    def _row_lens(self) -> list[int]:
+        """each row's own length in a batched cache (`batch_rows`)"""
+        if self._ns is None:
+            raise RuntimeError("[cache] a batched cache's row lengths were read off a layer that is not batched")
+        return self._ns
+
     def _view(self, which: int) -> torch.Tensor:
+        bufs = self.mx_bufs()
         if self.bits:
             # the live rows dequantized to bf16, a copy; kept so that a prefix of it handed back through the
             # setter is recognized as a crop and not written back
             t = mlxdev.from_mx(
-                mlxdev.kv_dequantize(
-                    self._mx[which][: self._b, :, : self._n], self._mx[2 + which][: self._b, :, : self._n]
-                )
+                mlxdev.kv_dequantize(bufs[which][: self._b, :, : self._n], bufs[2 + which][: self._b, :, : self._n])
             )
             self._tmp[which] = t
             return t
-        return mlxdev.from_mx(self._mx[which])[: self._b]
+        t = mlxdev.from_mx(bufs[which])
+        self._vptr[which] = (int(self._ptr[which]), t.untyped_storage().data_ptr())
+        return t[: self._b]
 
     def mx_kv(self, start: int, n: int, row: int = 0) -> tuple[mx_.array, mx_.array]:
         """the cache rows [start, n) of every head of batch row `row` as bf16 MLX arrays (K, V): views for a
         bf16 layer, a dequantized copy for an int8 one, a gathered copy over a paged session's rows"""
+        bufs = self.mx_bufs()
         if self._rmap is not None:
-            m = mlxdev.mx()
+            m = mlxdev.mx
             idx = self._rmap[int(start) : int(n)]
-            return m.take(self._mx[0], idx, axis=2), m.take(self._mx[1], idx, axis=2)
+            return m.take(bufs[0], idx, axis=2), m.take(bufs[1], idx, axis=2)
         if self._flat:
             # the row's rows are a stretch of the one flat buffer
-            off = int(self._offs[int(row)])
+            off = int(self._flat_offs()[int(row)])
             r, start, n = slice(0, 1), off + int(start), off + int(n)
         else:
             r = slice(int(row), int(row) + 1)
         if self.bits:
             return (
-                mlxdev.kv_dequantize(self._mx[0][r, :, start:n], self._mx[2][r, :, start:n]),
-                mlxdev.kv_dequantize(self._mx[1][r, :, start:n], self._mx[3][r, :, start:n]),
+                mlxdev.kv_dequantize(bufs[0][r, :, start:n], bufs[2][r, :, start:n]),
+                mlxdev.kv_dequantize(bufs[1][r, :, start:n], bufs[3][r, :, start:n]),
             )
-        return self._mx[0][r, :, start:n], self._mx[1][r, :, start:n]
+        return bufs[0][r, :, start:n], bufs[1][r, :, start:n]
 
     def _store(self, which: int, n0: int, a: mx_.array, row: int | None = None) -> None:
         """rows n0.. of buffer `which` from an MLX [B, Hk, T, d] array (into batch row `row` when given, at
         the row's offset of a flat buffer), quantized for an int8 layer"""
+        bufs = self.mx_bufs()
         B, T = int(a.shape[0]), int(a.shape[2])
         if self._flat:
             if row is not None:
-                n0 = int(n0) + int(self._offs[int(row)])
+                n0 = int(n0) + int(self._flat_offs()[int(row)])
             r = slice(0, 1)
         else:
             r = slice(0, B) if row is None else slice(int(row), int(row) + 1)
         if self.bits:
             q, s = mlxdev.kv_quantize(a)
-            self._mx[which][r, :, n0 : n0 + T, :] = q
-            self._mx[2 + which][r, :, n0 : n0 + T] = s
+            bufs[which][r, :, n0 : n0 + T, :] = q
+            bufs[2 + which][r, :, n0 : n0 + T] = s
             return
-        if self._mx[which].dtype != a.dtype:
-            a = a.astype(self._mx[which].dtype)
+        if bufs[which].dtype != a.dtype:
+            a = a.astype(bufs[which].dtype)
         if self.arena is not None:
             # in place, evaluated now: the rows have no graph dependency to order them before their readers
-            mlxdev.mx().eval(mlxdev.kv_store(self._mx[which], a[0], int(n0)))
+            mlxdev.mx.eval(mlxdev.kv_store(bufs[which], a[0], int(n0)))
             return
-        self._mx[which][r, :, n0 : n0 + T, :] = a
+        bufs[which][r, :, n0 : n0 + T, :] = a
 
     # -- a batched cache: B rows, each at its own length --
-    def batch_rows(self, B: int, dec_cap: int = 0, lens: Any = None) -> None:
+    def batch_rows(self, B: int, dec_cap: int = 0, lens: Sequence[int] | None = None) -> None:
         """Size the layer for B rows at their own lengths. `dec_cap`: the decode steps go to a step buffer where
         step t is slot t for every row; `lens`: the prompts share one flat buffer, row b's from its offset."""
         self._ns = [0] * int(B)
@@ -346,7 +435,7 @@ class GrowLayer(_DynamicLayer):
         self._flat = lens is not None
         self._offs = None
         self._flat_len = 0
-        if self._flat:
+        if lens is not None:
             offs, tot = [], 0
             for L in lens:
                 offs.append(tot)
@@ -358,7 +447,7 @@ class GrowLayer(_DynamicLayer):
 
     def _ensure_flat(self, Hk: int, d: int, dtype: torch.dtype) -> None:
         """the flat buffer of a batched cache, allocated on its first write (the rows' total length is known)"""
-        m = mlxdev.mx()
+        m = mlxdev.mx
         if self._mx is not None:
             return
         mdt = m.int8 if self.bits else mlxdev._dtypes()[dtype]
@@ -398,7 +487,7 @@ class GrowLayer(_DynamicLayer):
     def mx_update_rows(self, k: mx_.array, v: mx_.array) -> None:
         """One decode step for every row: `k`/`v` [B, Hk, 1, d] into the step buffer's slot t (one write per
         buffer), else each row at its own length by scatter. Every length grows by one."""
-        m = mlxdev.mx()
+        m = mlxdev.mx
         dt = mlxdev.torch_dtype(k.dtype)
         if not self.is_initialized:
             empty = torch.empty(0, dtype=dt)
@@ -406,7 +495,7 @@ class GrowLayer(_DynamicLayer):
         B, Hk, T, d = (int(x) for x in k.shape)
         if self._dec_cap:
             if self._mx2 is None:
-                mdt = m.int8 if self.bits else self._mx[0].dtype
+                mdt = m.int8 if self.bits else self.mx_bufs()[0].dtype
                 cap2 = max(self._dec_cap, T)
                 self._mx2 = [m.zeros((B, Hk, cap2, d), dtype=mdt), m.zeros((B, Hk, cap2, d), dtype=mdt)]
                 if self.bits:
@@ -435,36 +524,37 @@ class GrowLayer(_DynamicLayer):
                 self._mx2[0][:, :, t : t + T, :] = k
                 self._mx2[1][:, :, t : t + T, :] = v
             self._t = t + T
-            self._ns = [n + T for n in self._ns]
+            self._ns = [n + T for n in self._row_lens()]
             self._n = max(self._ns)
             return
-        self._ensure(B, Hk, max(self._ns) + T, d, dt)
+        self._ensure(B, Hk, max(self._row_lens()) + T, d, dt)
         self._apply_overrides()
-        ns = m.array(self._ns, dtype=m.uint32)
+        bufs = self.mx_bufs()
+        ns = m.array(self._row_lens(), dtype=m.uint32)
         idx = ns.reshape(B, 1, 1, 1) * m.ones((B, Hk, T, d), dtype=m.uint32)
         if self.bits:
             qk, sk = mlxdev.kv_quantize(k)
             qv, sv = mlxdev.kv_quantize(v)
             sidx = ns.reshape(B, 1, 1) * m.ones((B, Hk, T), dtype=m.uint32)
-            self._mx[0] = m.put_along_axis(self._mx[0], idx, qk, axis=2)
-            self._mx[1] = m.put_along_axis(self._mx[1], idx, qv, axis=2)
-            self._mx[2] = m.put_along_axis(self._mx[2], sidx, sk, axis=2)
-            self._mx[3] = m.put_along_axis(self._mx[3], sidx, sv, axis=2)
+            bufs[0] = m.put_along_axis(bufs[0], idx, qk, axis=2)
+            bufs[1] = m.put_along_axis(bufs[1], idx, qv, axis=2)
+            bufs[2] = m.put_along_axis(bufs[2], sidx, sk, axis=2)
+            bufs[3] = m.put_along_axis(bufs[3], sidx, sv, axis=2)
         else:
-            if self._mx[0].dtype != k.dtype:
-                k, v = k.astype(self._mx[0].dtype), v.astype(self._mx[0].dtype)
-            self._mx[0] = m.put_along_axis(self._mx[0], idx, k, axis=2)
-            self._mx[1] = m.put_along_axis(self._mx[1], idx, v, axis=2)
-        self._ns = [n + T for n in self._ns]
+            if bufs[0].dtype != k.dtype:
+                k, v = k.astype(bufs[0].dtype), v.astype(bufs[0].dtype)
+            bufs[0] = m.put_along_axis(bufs[0], idx, k, axis=2)
+            bufs[1] = m.put_along_axis(bufs[1], idx, v, axis=2)
+        self._ns = [n + T for n in self._row_lens()]
         self._n = max(self._ns)
 
     def mx_kv_row(self, b: int) -> tuple[mx_.array, mx_.array]:
         """row b's live rows as bf16 (K, V) [1, Hk, n_b, d]: its prefill slice, and its decode steps from
         the step buffer when the cache has one (a copy then)"""
-        m = mlxdev.mx()
+        m = mlxdev.mx
         if self._mx2 is None or self._seg is None:
-            return self.mx_kv(0, int(self._ns[b]), row=b)
-        s, t = int(self._seg[b]), int(self._ns[b]) - int(self._seg[b])
+            return self.mx_kv(0, int(self._row_lens()[b]), row=b)
+        s, t = int(self._seg[b]), int(self._row_lens()[b]) - int(self._seg[b])
         K0, V0 = self.mx_kv(0, s, row=b)
         if self.bits:
             K1 = mlxdev.kv_dequantize(self._mx2[0][b : b + 1, :, :t], self._mx2[2][b : b + 1, :, :t])
@@ -473,7 +563,7 @@ class GrowLayer(_DynamicLayer):
             K1, V1 = self._mx2[0][b : b + 1, :, :t], self._mx2[1][b : b + 1, :, :t]
         return m.concatenate([K0, K1], axis=2), m.concatenate([V0, V1], axis=2)
 
-    def mx_advance(self, T: int, Hk: int, d: int, dtype: Any) -> None:
+    def mx_advance(self, T: int, Hk: int, d: int, dtype: torch.dtype) -> None:
         """T rows appended by the megakernel: the buffers exist and the length moves"""
         if not self.is_initialized:
             import torch
@@ -497,18 +587,19 @@ class GrowLayer(_DynamicLayer):
             k, v = self.keys, self.values
             self._set_rows(k[..., :n, :], v[..., :n, :])
 
-    def gather(self, keep: Sequence[int], base: int = 0, lazy: bool = False) -> list[Any]:
+    def gather(self, keep: Sequence[int], base: int = 0, lazy: bool = False) -> list[mx_.array]:
         """The rows `keep` become the cache: gathered on the GPU and written back, an int8 layer's scales with
         them. The first `base` rows are left in place; only the rows past them move. An arena layer's write is
         one kernel whose flag `lazy` hands back for the caller to evaluate with the other layers'."""
-        m = mlxdev.mx()
+        m = mlxdev.mx
         keep = list(keep)
         n = len(keep)
         if base >= n or keep[base:] == list(range(base, n)):
             self.crop(n)
             return []
+        bufs = self.mx_bufs()
         if self.arena is not None:
-            flags = [mlxdev.kv_gather(x, keep[base:], base) for x in self._mx[:2]]
+            flags = [mlxdev.kv_gather(x, keep[base:], base) for x in bufs[:2]]
             self._tk = self._tv = None
             self._n = n
             if lazy:
@@ -516,7 +607,6 @@ class GrowLayer(_DynamicLayer):
             m.eval(*flags)
             return []
         idx = m.array(keep[base:], dtype=m.int32)
-        bufs = [x for x in self._mx if x is not None]
         parts = [m.take(x[: self._b], idx, axis=2) for x in bufs]
         m.eval(*parts)
         for x, p in zip(bufs, parts):
@@ -553,19 +643,23 @@ class GrowLayer(_DynamicLayer):
             self._tv = t
 
     def _mx_base(self, which: int) -> int:
-        """the storage torch's view of a shared buffer lives in (an int8 layer's: its last dequantized copy)"""
+        """the storage torch's view of a shared buffer lives in: the latest view's under the current allocation, else
+        the allocation's (an int8 layer's: its last dequantized copy)"""
+        tmp = self._tmp[which]
         if self.bits:
-            return self._tmp[which].untyped_storage().data_ptr() if self._tmp[which] is not None else -1
-        return int(self._ptr[which])
+            return tmp.untyped_storage().data_ptr() if tmp is not None else -1
+        alloc, seen = self._vptr[which]
+        return seen if alloc == int(self._ptr[which]) else int(self._ptr[which])
 
     def _mx_prefix(self, which: int, t: torch.Tensor) -> bool:
         """`t` is the first rows of torch's view of a shared buffer, strides and all"""
-        rows = self._tmp[which].shape[-2] if self.bits and self._tmp[which] is not None else self._shape[2]
-        d = self._shape[-1]
+        shape, tmp = self._dims(), self._tmp[which]
+        rows = tmp.shape[-2] if self.bits and tmp is not None else shape[2]
+        d = shape[-1]
         return bool(
             t.untyped_storage().data_ptr() == self._mx_base(which)
             and t.storage_offset() == 0
-            and tuple(t.shape[:2]) == (self._b, self._shape[1])
+            and tuple(t.shape[:2]) == (self._b, shape[1])
             and int(t.shape[-1]) == d
             and tuple(t.stride()[1:]) == (int(rows) * d, d, 1)
         )
@@ -612,13 +706,15 @@ class GrowLayer(_DynamicLayer):
             return 0
         need = self.get_seq_length() + T if self.is_initialized else T
         if self.shared:
-            same = self._mx is not None and self._shape[1] == Hk and self._shape[-1] == d
-            have = int(self._shape[2]) if same else 0
-            if same and self._shape[0] >= B and have >= need:
+            # the buffer's shape where its heads and width are these rows' (the buffer kept), else None
+            shape = self._shape if self._mx is not None else None
+            same = shape if shape is not None and shape[1] == Hk and shape[-1] == d else None
+            have = int(same[2]) if same is not None else 0
+            if same is not None and same[0] >= B and have >= need:
                 return 0
             if self.arena is not None and B == 1 and not self.bits and need <= self.arena[3]:
                 return 0
-            Bc = max(B, int(self._shape[0]) if same else 0)
+            Bc = max(B, int(same[0]) if same is not None else 0)
             row = d * (1 if self.bits else dtype.itemsize) + (4 if self.bits else 0)
             return 2 * Bc * Hk * self._mx_cap(need, have) * row
         buf = self._buf
@@ -629,30 +725,35 @@ class GrowLayer(_DynamicLayer):
         return 2 * B * Hk * self._torch_cap(need, have) * d * dtype.itemsize
 
     def _ensure(self, B: int, Hk: int, need: int, d: int, dtype: torch.dtype) -> None:
-        m = mlxdev.mx()
+        m = mlxdev.mx
         mdt = m.int8 if self.bits else mlxdev._dtypes()[dtype]
         old = self._mx
         if old is not None and self._n and old[0].dtype != mdt:
             # a new buffer starts empty: rows of another dtype would drop the ones held
             raise RuntimeError(f"[cache] rows of {mdt} for a layer holding {self._n} rows of {old[0].dtype}")
-        same = old is not None and self._shape[1] == Hk and self._shape[-1] == d and old[0].dtype == mdt
-        if same and self._shape[0] >= B and self._shape[2] >= need:
+        # the old buffer's shape where its heads, width and dtype are these rows' (its rows kept), else None
+        shape = self._shape
+        same = (
+            shape
+            if old is not None and shape is not None and shape[1] == Hk and shape[-1] == d and old[0].dtype == mdt
+            else None
+        )
+        if same is not None and same[0] >= B and same[2] >= need:
             # the buffer holds the largest batch seen; a smaller batch uses its first rows
             self._b = B
             return
         # rows grow by the usual step; a batch change alone keeps the row capacity (the drafter's tree steps
         # switch batch sizes several times a pass: growing the rows on each switch ran away to gigabytes)
-        have = self._shape[2] if same else 0
+        have = same[2] if same is not None else 0
         cap = self._mx_cap(need, have)
-        Bc = max(B, self._shape[0] if same else 0)
+        Bc = max(B, same[0] if same is not None else 0)
         if self.arena is not None and (Bc != 1 or self.bits or need > self.arena[3]):
             # past the arena: a buffer of the layer's own, the rows copied below; the pass leaves the megakernel
             self.arena = None
             self._in_arena = False
-            same = same and old is not None
         if self.arena is not None:
             buf, ok, ov, acap = self.arena
-            if old is None or not getattr(self, "_in_arena", False):
+            if old is None or not self._in_arena:
                 # the views of the arena's stretch; rows a buffer of the layer's own held move in
                 nb = Hk * acap * d * 2
                 kb = buf[ok : ok + nb].view(mdt).reshape(1, Hk, acap, d)
@@ -684,16 +785,16 @@ class GrowLayer(_DynamicLayer):
                 cap=cap,
                 bound=self._grant_bound() or None,
                 # the buffer this one replaces, let go once its rows are copied over
-                held=2 * int(self._shape[0]) * Hk * have * row if same else 0,
+                held=2 * int(same[0]) * Hk * have * row if same is not None else 0,
             )
         kb = m.zeros((Bc, Hk, cap, d), dtype=mdt)
         vb = m.zeros((Bc, Hk, cap, d), dtype=mdt)
         arrays = [kb, vb]
         if self.bits:
             arrays += [m.ones((Bc, Hk, cap), dtype=m.float32), m.ones((Bc, Hk, cap), dtype=m.float32)]
-        n = self._n if same else 0
-        if n:
-            ob = self._shape[0]
+        n = self._n if same is not None else 0
+        if n and old is not None and same is not None:  # `same` is set only over an old buffer
+            ob = same[0]
             kb[:ob, :, :n, :] = old[0][..., :n, :].astype(mdt)
             vb[:ob, :, :n, :] = old[1][..., :n, :].astype(mdt)
             if self.bits:
@@ -727,6 +828,33 @@ class GrowLayer(_DynamicLayer):
         self._n = n
         self._tk = self._tv = None
 
+    def in_arena(self, need: int, B: int = 1) -> bool:
+        """whether a pass of B rows reaching `need` cache rows writes them into the megakernel's arena (`arena_rows`):
+        not a batch, int8 rows, a session's row map, or past the arena's capacity (`mx_update` then leaves it)"""
+        if self.arena is None or self.bits or self._flat or self._row is not None or self._rmap is not None:
+            return False
+        return B == 1 and need <= self.arena[3]
+
+    def arena_rows(self, k: mx_.array, v: mx_.array) -> tuple[mx_.array, mx_.array, int] | None:
+        """A pass's rows `k`/`v` [1, Hk, T, d] given their place in the megakernel's arena, unwritten: the arena's K and
+        V views [1, Hk, cap, d] and the rows before them, the T counted; the caller writes them with the pass. None
+        where the pass does not write into the arena (`in_arena`)"""
+        B, Hk, T, d = (int(x) for x in k.shape)
+        n = self.get_seq_length()
+        if not self.in_arena(n + T, B):
+            return None
+        dt = mlxdev.torch_dtype(k.dtype)
+        if not self.is_initialized:
+            empty = torch.empty(0, dtype=dt)
+            self.lazy_initialization(empty, empty)
+            n = self.get_seq_length()
+        self._ensure(B, Hk, n + T, d, dt)
+        assert self.arena is not None, "[cache] `in_arena` admitted a pass `_ensure` took out of the arena"
+        self._apply_overrides()
+        self._n = n + T
+        bufs = self.mx_bufs()
+        return bufs[0], bufs[1], n
+
     def mx_update(self, k: mx_.array, v: mx_.array) -> tuple[mx_.array, mx_.array]:
         """The MLX device's append: `k`/`v` MLX arrays [B, Hk, T, d]; returns the used prefixes as lazy views,
         the append itself in place at the next eval."""
@@ -747,7 +875,7 @@ class GrowLayer(_DynamicLayer):
             # own length, and the prefix handed back is that row's
             self._store(0, n, k, row=row)
             self._store(1, n, v, row=row)
-            self._ns[row] = self._n = n + T
+            self._row_lens()[row] = self._n = n + T
             return self.mx_kv(0, n + T, row=row)
         if self.bits:
             # quantized on the way in; the used prefix comes back dequantized (a prefill's attention reads it;
@@ -756,22 +884,23 @@ class GrowLayer(_DynamicLayer):
             self._store(1, n, v)
             self._n = n + T
             return self.mx_kv(0, self._n)
-        if self._mx[0].dtype != k.dtype:
-            k, v = k.astype(self._mx[0].dtype), v.astype(self._mx[0].dtype)
+        bufs = self.mx_bufs()
+        if bufs[0].dtype != k.dtype:
+            k, v = k.astype(bufs[0].dtype), v.astype(bufs[0].dtype)
         if self.arena is not None:
             # in place through the arena's kernel: a slice assignment would rebind the layer to a copy
             self._store(0, n, k)
             self._store(1, n, v)
             self._n = n + T
             return self.mx_kv(0, self._n)
-        if self._shape[0] == B:
-            self._mx[0][..., n : n + T, :] = k
-            self._mx[1][..., n : n + T, :] = v
+        if self._dims()[0] == B:
+            bufs[0][..., n : n + T, :] = k
+            bufs[1][..., n : n + T, :] = v
         else:
-            self._mx[0][:B, :, n : n + T, :] = k
-            self._mx[1][:B, :, n : n + T, :] = v
+            bufs[0][:B, :, n : n + T, :] = k
+            bufs[1][:B, :, n : n + T, :] = v
         self._n = n + T
-        return self._mx[0][:B, :, : self._n, :], self._mx[1][:B, :, : self._n, :]
+        return bufs[0][:B, :, : self._n, :], bufs[1][:B, :, : self._n, :]
 
     def attach(self, kb: torch.Tensor, vb: torch.Tensor) -> None:
         """The layer's rows move into `(kb, vb)` - a [B, Hk, cap, d] pair the engine owns (the card's arena) -

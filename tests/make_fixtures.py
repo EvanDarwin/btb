@@ -1233,6 +1233,8 @@ def bank_dense(tag: str, base_dir: str, pack_dir: str, out: str) -> None:
     import torch
     from transformers import AutoModelForCausalLM
 
+    from btb.engine.cache import attention_rows
+
     prompt = PROMPT_DENSE
     with torch.inference_mode():
         ref = AutoModelForCausalLM.from_pretrained(base_dir, dtype=torch.float32).eval()
@@ -1247,7 +1249,7 @@ def bank_dense(tag: str, base_dir: str, pack_dir: str, out: str) -> None:
             lg0 = forward_logits(sm, prompt, cache)[0, -1]
             lg, _ = tree_pass(sm, cache)
             nxt = tree_next(sm, cache)
-            keys = {i: (cache.layers[i].keys.clone(), cache.layers[i].values.clone()) for i in range(sm.L)}
+            keys = {i: tuple(t.clone() for t in attention_rows(cache.layers[i])) for i in range(sm.L)}
             speculation(sm, tree_budget=0, tree_min_prob=0.0, ngram_p=0.0, tree_read="step")
             g = sm.generate_greedy(prompt, 10)
             s = sm.generate_speculative(prompt, 10, proposer="ngram", v_max=4)[0]
@@ -1267,6 +1269,8 @@ def bank_q35(base_dir: str, out: str) -> None:
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM
 
+    from btb.engine.generate import lin_layer
+
     full = AutoConfig.from_pretrained(base_dir)
     cfg = getattr(full, "text_config", full)
     lin = [i for i, t in enumerate(cfg.layer_types) if t == "linear_attention"]
@@ -1281,7 +1285,7 @@ def bank_q35(base_dir: str, out: str) -> None:
         cache = sm.new_cache()
         forward_logits(sm, PROMPT_Q35, cache)
         lg, _ = tree_pass(sm, cache)
-        states = {i: tuple(x.clone() for x in StreamedTextModel._lin(cache.layers[i])) for i in lin}
+        states = {i: tuple(x.clone() for x in StreamedTextModel._lin(lin_layer(cache.layers[i]))) for i in lin}
         nxt = tree_next(sm, cache)
         speculation(sm, tree_budget=8, tree_min_prob=0.0, ngram_p=0.9, tree_read="step")
         g = sm.generate_greedy(PROMPT_Q35, 10)

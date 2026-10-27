@@ -9,11 +9,13 @@ import ctypes
 import math
 import os
 import sys
+import time
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import torch
 
+from .. import trace
 from ..kinds import (
     CARD_ROWS,
     QUANT_KIND,
@@ -1285,7 +1287,11 @@ class _Cuda(card_launch.CardLaunch):
         with open(fatbin_path, "rb") as fh:
             image = fh.read()
         self.module: ctypes.c_void_p | None = ctypes.c_void_p()
+        t0 = time.perf_counter()
+        # the driver compiles the image's PTX here where it carries no code for this card
         self._call("cuModuleLoadData", ctypes.byref(self.module), ctypes.c_char_p(image))
+        ms = 1e3 * (time.perf_counter() - t0)
+        trace.event("cuda: the kernels' module (%d KB) loaded in %.0f ms", len(image) // 1024, ms)
         del image
         self.fn: dict[str, ctypes.c_void_p] = {}
         for k in self.KERNELS:

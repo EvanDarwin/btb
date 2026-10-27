@@ -6,26 +6,33 @@ kept tokens; temperature 0 is the plain argmax. No sort, no gather: a few passes
 from __future__ import annotations
 
 import threading
-from typing import Any
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
-from .core import mx
+from .core import metal_kernel, mx
+
+if TYPE_CHECKING:
+    import mlx.core as mx_
+
+    from .core import MetalKernel
 
 BINS = 2048  # a radix level: 11 bits, three levels resolve a float's 32 ordered bits (11 + 11 + 10)
 THREADS = 1024  # a row's threadgroup: the passes over the row are latency bound, so the widest group
 MASS_SCALE = 1073741824.0  # a token's mass exp(s - max) in fixed point, 2^30 a unit (the sums in 64 bits)
 
 _lock = threading.Lock()
-_kernel: Any = None
-_verify_kernel: Any = None
-_consts: dict[tuple[int, int, float, float], tuple[Any, Any]] = {}
-_nodep: Any = None
+_kernel: MetalKernel | None = None
+_verify_kernel: MetalKernel | None = None
+_consts: dict[tuple[int, int, float, float], tuple[mx_.array, mx_.array]] = {}
+_nodep: mx_.array | None = None
 
 
-def _dep(m: Any) -> Any:
+def _dep() -> mx_.array:
+    """the input a pick with nothing to follow takes in `after`'s place"""
     global _nodep
     if _nodep is None:
-        _nodep = m.zeros((1,), dtype=m.uint32)
-        m.eval(_nodep)
+        _nodep = mx.zeros((1,), dtype=mx.uint32)
+        mx.eval(_nodep)
     return _nodep
 
 
@@ -390,12 +397,11 @@ def _fill(src: str) -> str:
     )
 
 
-def _get() -> Any:
+def _get() -> MetalKernel:
     global _kernel
-    m = mx()
     with _lock:
         if _kernel is None:
-            _kernel = m.fast.metal_kernel(
+            _kernel = metal_kernel(
                 name="btb_sample_pick",
                 input_names=["x", "keys", "cfg", "fp", "dep"],
                 output_names=["out"],
@@ -405,12 +411,11 @@ def _get() -> Any:
     return _kernel
 
 
-def _get_verify() -> Any:
+def _get_verify() -> MetalKernel:
     global _verify_kernel
-    m = mx()
     with _lock:
         if _verify_kernel is None:
-            _verify_kernel = m.fast.metal_kernel(
+            _verify_kernel = metal_kernel(
                 name="btb_sample_verify",
                 input_names=["x", "q", "kids", "hasq", "keys", "cfg", "fp", "dep"],
                 output_names=["out"],
@@ -420,12 +425,19 @@ def _get_verify() -> Any:
     return _verify_kernel
 
 
-def pick(x: Any, keys: Any, temperature: float, top_k: int, top_p: float, after: Any = None) -> Any:
+def pick(
+    x: mx_.array,
+    keys: Sequence[int],
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    after: mx_.array | None = None,
+) -> mx_.array:
     """The picked token of every row of `x` [R, V] (float32, lazy) under one noise key a row (`keys` [R] ints):
     the argmax at temperature 0, else the draw; [R] uint32, lazily. `after`: an array the pick must follow (the
     output of a kernel that wrote `x` in place), else nothing."""
-    m = mx()
-    dep = after if after is not None else _dep(m)
+    m = mx
+    dep = after if after is not None else _dep()
     R = int(x.shape[0])
     sampled = temperature > 0.0
     mode = (1 if sampled else 0) | (2 if sampled and top_k > 0 else 0) | (4 if sampled and top_p < 1.0 else 0)
@@ -448,12 +460,20 @@ def pick(x: Any, keys: Any, temperature: float, top_k: int, top_p: float, after:
 
 
 def verify(
-    x: Any, q: Any, kids: Any, hasq: Any, keys: Any, temperature: float, top_k: int, top_p: float, after: Any = None
-) -> Any:
+    x: mx_.array,
+    q: mx_.array,
+    kids: mx_.array,
+    hasq: mx_.array,
+    keys: Sequence[int],
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    after: mx_.array | None = None,
+) -> mx_.array:
     """The verify pass's outcomes: `x` [T, V] the nodes' logits, `q` [T, Vd] the drafter's distribution at each
     node (its children drawn from it), `kids` [T, C] int32 the children in draw order (-1 padding), `hasq` [T]
     (0: the row's drafts are point masses), one key a row; [T] uint32 packed (slot + 1) << 24 | token, lazily."""
-    m = mx()
+    m = mx
     T, C = int(kids.shape[0]), int(kids.shape[1])
     Vd = int(q.shape[1])
     if C > MAXC:
@@ -469,7 +489,7 @@ def verify(
             m.array(kk, dtype=m.uint32),
             m.array([int(top_k), mode, C, Vd], dtype=m.uint32),
             m.array([1.0 / temperature, float(top_p)], dtype=m.float32),
-            after if after is not None else _dep(m),
+            after if after is not None else _dep(),
         ],
         grid=(T * THREADS, 1, 1),
         threadgroup=(THREADS, 1, 1),

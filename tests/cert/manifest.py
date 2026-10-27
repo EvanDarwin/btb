@@ -17,8 +17,8 @@ covered:
     python -m tests.cert.manifest --strict     # --check, and also nonzero if a real-model target is not cached
 
 Receipts are not committed: `$BTB_CERT_RECEIPTS` (else tests/cert/receipts) is the directory CI fills from the
-PR body's ```json btb-receipt block and its own artifacts, so the same command reads one machine's proof locally
-and the union of every machine's in CI.
+receipts pasted into the PR (tests/cert/receipt.py `collect`) and its own artifacts, so the same command reads one
+machine's proof locally and the union of every machine's in CI.
 
 The `--missing` output is a to-do an agent can act on (a future skill wraps it): each line names a gap kind, the
 count and families, what is absent, and how to close it. The taxonomy is `Missing` + `MISSING`, one place."""
@@ -43,10 +43,10 @@ FIXTURES = spec.FIXTURES
 GGUF_DIR = spec.GGUF_DIR
 
 # the shapes the card's step-graph kernels are written for (btb/engine/cuda.py:295: a lane holds D/32 dims of a
-# head) and the heads the engine sends to its MLX attention kernels (mlx_forward.ATTN_KERNEL_HEADS). Neither is
-# reachable from a torch-free module, so test_manifest holds each against the source it is quoted from.
+# head) and the heads the engine sends to its MLX attention kernels (mlx_forward.ATTN_KERNEL_HEADS, aluminum's).
+# Neither is reachable from a torch-free module, so test_manifest holds each against the source it is quoted from.
 CARD_HEAD_DIMS: tuple[int, ...] = (64, 128, 256)
-MLX_ATTN_HEAD_DIMS: tuple[int, ...] = (128, 256)
+MLX_ATTN_HEAD_DIMS: tuple[int, ...] = spec.ALUMINUM_HEADS
 # a family that brings its own layer (Qwen4) verifies a speculative pass exactly through btb's own kernels for the
 # layers that carry state - the host's node steps, the card's DeltaNet node kernel - and the rest row-invariant
 # wherever it runs: on a card the card program, or where it declines (a float32 compute, a fixture shaped below its
@@ -83,7 +83,6 @@ class Missing(StrEnum):
     ROCM_BACKEND = "rocm-backend"
     QUANT_FIXTURE = "quant-fixture"
     NO_FIXTURE = "no-fixture"
-    PREFIX_CACHE = "prefix-cache"
     PREFIX_FAMILY = "prefix-family"
     PREFIX_WIDE = "prefix-wide"
     PREFIX_INVARIANCE = "prefix-invariance"
@@ -99,24 +98,25 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "tiny GGUF fixture (tests/make_fixtures.py) so the storage cells can bind",
     ),
     Missing.MEGAKERNEL: (
-        "the fused MLX megakernel is not written for this family: it takes the dense kernel layout alone "
-        "(mlx_forward.py:1320 refuses a sandwich family), so a MoE family runs the per-op host path "
-        "(MLX_PEROP), a hybrid family the DeltaNet forward (MLX_HYBRID), and the rest the step path "
-        "(MLX_STEP_FUSED for a sandwich layout, MLX_STEP_UNFUSED without one)",
+        "the fused MLX megakernel is not written for this family: it composes the plain pre-norm block, the sandwich "
+        "block and a hybrid's DeltaNet and gated attention layers (`Family.mega`, `mega_layer`), so a mixture's "
+        "layers take the step (a hybrid's MLX_HYBRID, a dense one's the per-op host path, MLX_PEROP) and a family "
+        "that brings its own layer its own",
         "implement the megakernel for this family's layout, or record it as a DNR if the architecture genuinely "
         "precludes a dense fused kernel",
     ),
     Missing.MEGA_STORAGE: (
         "the megakernel refuses this storage: it reads weights out of slot buffers, so as-stored quant blocks "
-        "(mlx_forward.py:1320, `self.mlx_state.affine`) and the 12-bit store's packed weights (mega.py:609, "
-        "'a weight outside a slot buffer') both fall to the step path",
+        "(mlx_forward.py `_mega_serves`, `self.mlx_state.affine`) and the 12-bit store's packed weights "
+        "(mlx/mega/model.py `MegaPass._ref`, 'a weight outside a slot buffer') both fall to the step path",
         "teach the megakernel to read packed weights, or record the refusal as a DNR once it is provably "
         "permanent - until then the cell is a real path the cert cannot certify",
     ),
     Missing.MEGA_SHAPE: (
-        "the megakernel takes a head of 64k dims (mega.py:599, `self.hd % 64`); this family's tiny fixture has "
-        "another head width, so it never builds here and any cell asserting it would be certified by the step path",
-        "widen the fixture's head to a multiple of 64 in tests/make_fixtures.py and rebank it",
+        "the megakernel takes a head of 32k dims, 256 at most (mlx/mega/model.py `MegaPass`); this family's tiny "
+        "fixture has another head width, so it never builds here and any cell asserting it would be certified by the "
+        "step path",
+        "make the fixture's head a multiple of 32 up to 256 in tests/make_fixtures.py and rebank it",
     ),
     Missing.CARD_GRAPH_FAMILY: (
         "the captured card step graph is not written for this family (cuda.py:284 takes the kernel layout or "
@@ -131,8 +131,9 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "widen the fixture's head to one the kernels take in tests/make_fixtures.py and rebank it",
     ),
     Missing.MLX_ATTN_FAMILY: (
-        "the engine's MLX attention kernels are not on this family's path: a mixture of experts runs its layers "
-        "through the per-op host path (PassTag.MLX_PEROP), whose attention is transformers' own",
+        "the engine's MLX attention kernels are not on this family's path: a dense mixture of experts, or one whose "
+        "experts are FP8 or MXFP4, runs its layers through the per-op host path (PassTag.MLX_PEROP), whose attention "
+        "is transformers' own",
         "route the family's MLX attention through `_mlx_attend` (a fused MoE step), or leave it certified under "
         "the per-op path it really runs",
     ),
@@ -200,15 +201,6 @@ MISSING: dict[Missing, tuple[str, str]] = {
         "this family is served but has no tiny fixture for this storage at all",
         "add the family's fixture stem to spec.FIXTURE_STEM and generate the twin in tests/make_fixtures.py",
     ),
-    Missing.PREFIX_CACHE: (
-        "MLX's megakernel reads each conversation's own arena, not the pool's pages, so where it serves an engine's "
-        "passes the prefix cache stands aside for it (btb/engine/prefix.py `why_not`): its sessions keep one "
-        "conversation's cache each and drop it whole for a prompt that shares nothing with it, so a conversation's "
-        "next turn after another request is prefilled again from its first token, and a prefix two conversations "
-        "share is computed and held once each",
-        "have the megakernel read the pool's regions through the conversation's row map, as the per-token graph's "
-        "kernels do (mlx_forward.py `_mlx_attend_paged`), then take its refusal out of `why_not` and spec.paged",
-    ),
     Missing.PREFIX_WIDE: (
         "the card's paged attention kernels read bf16 rows with heads of 64, 128 or 256 dims, and this sub-path's "
         "card layers compute wider (`fp32`), so the prefix cache does not serve it (btb/engine/prefix.py "
@@ -249,7 +241,7 @@ TITLE: dict[Missing, tuple[str, str]] = {
     Missing.MEGA_STORAGE: ("MLX megakernel refuses this storage", "Teach it packed weights, or mark it did-not-run"),
     Missing.MEGA_SHAPE: (
         "Fixture's head width doesn't fit the megakernel",
-        "Widen the fixture's head to a multiple of 64",
+        "Make the fixture's head a multiple of 32, up to 256",
     ),
     Missing.CARD_GRAPH_FAMILY: ("Card step graph not written for this family", "Write its card kernels"),
     Missing.CARD_GRAPH_SHAPE: (
@@ -276,10 +268,6 @@ TITLE: dict[Missing, tuple[str, str]] = {
         "Write the missing fixtures in tests/make_fixtures.py",
     ),
     Missing.NO_FIXTURE: ("No fixture for this storage", "Add the fixture to spec.FIXTURE_STEM and generate it"),
-    Missing.PREFIX_CACHE: (
-        "MLX megakernel reads its own arena, not the pages",
-        "Have the megakernel read the pages through the row map",
-    ),
     Missing.PREFIX_WIDE: ("Prefix cache doesn't serve fp32 card layers", "Give the paged attention a float32 form"),
     Missing.PREFIX_INVARIANCE: (
         "Prompt rows differ from decode rows here",
@@ -567,10 +555,10 @@ def _card_graph_gap(kind: FamilyKind) -> Missing | None:
     return None if spec.head_dim(kind) in CARD_HEAD_DIMS else Missing.CARD_GRAPH_SHAPE
 
 
-def _mlx_attn_gap(kind: FamilyKind) -> Missing | None:
-    """why the engine's MLX attention kernels cannot engage: a family whose MLX layers never reach
-    `_mlx_attend`, then the fixture's head width."""
-    if Cap.MOE in core.flags(kind):
+def _mlx_attn_gap(kind: FamilyKind, storage: spec.Storage) -> Missing | None:
+    """why the engine's MLX attention kernels cannot engage: a family whose MLX layers in this storage never reach
+    `_mlx_attend` (the per-op host path's, `spec.mlx_compute_tag`), then the fixture's head width."""
+    if spec.mlx_compute_tag(kind, storage, fused=True) is PassTag.MLX_PEROP:
         return Missing.MLX_ATTN_FAMILY
     return None if spec.head_dim(kind) in MLX_ATTN_HEAD_DIMS else Missing.MLX_ATTN_SHAPE
 
@@ -584,7 +572,7 @@ def subpath_gap(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath
     if dev.key == "mlx-mega":
         return _mega_gap(kind, storage)
     if dev.key == "mlx-attn-kernel":
-        return _mlx_attn_gap(kind)
+        return _mlx_attn_gap(kind, storage)
     if dev.key == "cuda-graph":
         return _card_graph_gap(kind)
     return None
@@ -593,8 +581,8 @@ def subpath_gap(kind: FamilyKind, storage: spec.Storage, dev: spec.DeviceSubpath
 def prefix_gap(kind: FamilyKind, dev: spec.DeviceSubpath) -> Missing | None:
     """why the prefix axis's conversations cannot hold on this family and sub-path, in the order the engine hits
     it: a sub-path that does not engage at all (its own gap), then the engine's own reasons (`PrefixCache.why_not`,
-    whose rule `spec.paged` is): a family's own attention, MLX's megakernel where it serves, then the card's own
-    conditions (its kernels' widths). Served on the card, a hit equals its cold decode where every layer runs the card
+    whose rule `spec.paged` is): a family's own attention, then the card's own conditions (its kernels' widths; MLX's
+    step and megakernel both read the pages). Served on the card, a hit equals its cold decode where every layer runs the card
     graph's kernels, whose prefill makes each row as the step does; elsewhere on the card it cannot yet
     (`PREFIX_INVARIANCE`), a hybrid's resumed from the snapshots its prefill kept among them"""
     refused = subpath_gap(kind, spec.Storage.SAFE_BF16, dev)
@@ -606,8 +594,8 @@ def prefix_gap(kind: FamilyKind, dev: spec.DeviceSubpath) -> Missing | None:
         return Missing.PREFIX_INVARIANCE
     if not spec.paged(kind, spec.Hardware.CPU):
         return Missing.PREFIX_FAMILY
-    # served on the host, so the sub-path's own conditions refuse it: MLX's megakernel, the card's widths
-    return Missing.PREFIX_CACHE if dev.hardware is spec.Hardware.MLX else Missing.PREFIX_WIDE
+    # served on the host, so the sub-path's own conditions refuse it: the card's widths
+    return Missing.PREFIX_WIDE
 
 
 def shape_gap(surface: spec.Surface, kind: FamilyKind, dev: spec.DeviceSubpath) -> Missing | None:
@@ -978,13 +966,13 @@ def summary_line() -> str:
 
 
 def _claimed_note() -> str:
-    """the ids whose only evidence is a receipt pasted into the PR body - a claim CI cannot verify - named in the
-    PROOF line so a reviewer sees what a cert run verified and what is merely asserted."""
+    """the ids whose only evidence is a receipt pasted into the PR (its body or a comment) - a claim CI cannot
+    verify - named in the PROOF line so a reviewer sees what a cert run verified and what is merely asserted."""
     src = receipt.by_source()
-    claimed = src.get("pr-body", set()) - src.get("run", set())
+    claimed = set[str]().union(*(ids for s, ids in src.items() if s != "run")) - src.get("run", set())
     if not claimed:
         return ""
-    return f"; {len(claimed)} of them CLAIMED in the PR body only (pasted, unverified by CI - the reviewer judges)"
+    return f"; {len(claimed)} of them CLAIMED in the PR only (pasted, unverified by CI - the reviewer judges)"
 
 
 def report() -> int:

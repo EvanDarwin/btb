@@ -5,9 +5,9 @@ the MoE router and experts, and the n-gram proposer's row table."""
 from __future__ import annotations
 
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Container, MutableMapping, Sequence, Set
 from itertools import accumulate
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, NamedTuple, Protocol, TypeGuard, TypeVar
 
 import torch
 
@@ -16,7 +16,7 @@ from .. import mlx as mlxdev
 from ..fp8 import F8Weight
 from ..gguf import QuantWeight
 from ..kinds import PassTag, Quant, quant_tag
-from ..mxfp4 import BLOCK, GateUp, MxWeight
+from ..mxfp4 import BLOCK, GateUp, MxWeight, stored_mxfp4
 from ..mxfp4_torch import dequant_blocks
 from ..options import Device
 from .native import Native
@@ -24,20 +24,77 @@ from .pack import unpack_bf16
 from .scheduler import MemoryGrantError
 
 if TYPE_CHECKING:
-    from ..mlx.backend import Backend, Weight
-    from .experts import StoreCall
+    import mlx.core as mx_
+
+    from ..gguf import GGUFModel
+    from ..mlx.backend import Backend, ExpertOut, ExpertWeights, Mxfp4Pair, Weight
+    from .experts import Expert, ExpertViews, LayerDepot, Pending, StoreCall, _ExpertStore
+    from .native import QuantGemv, _Cuda
     from .scratch import Scratch
+    from .state import _State
 
 # one expert's gate_up as its form multiplies it - bf16 [2I, H], MXFP4's blocks, FP8's bytes and grid, a GGUF's
 # stored gate and up - and its down
 ExpertGateUp = torch.Tensor | MxWeight | F8Weight | GateUp
 ExpertDown = torch.Tensor | MxWeight | F8Weight | QuantWeight
+ExpertWeight = ExpertGateUp | ExpertDown
+# a weight a card seat holds (`VramSeats`, `LayerDepot`): bf16, or MXFP4 in the checkpoint's layout
+CardWeight = torch.Tensor | MxWeight
+W = TypeVar("W", bound=ExpertWeight)
 # a layer's experts held whole (`_Experts._tables`): the checkpoint's bf16 tensor [E, ...] taken an expert at a time,
 # or a stored form's weights, one an expert
 GateUpTable = torch.Tensor | Sequence[ExpertGateUp]
 DownTable = torch.Tensor | Sequence[ExpertDown]
-# one expert as the MLX step multiplies it: gate_up one weight, or a GGUF's stored (gate, up); and down
-MxExpert = tuple["Weight | tuple[Weight, Weight]", "Weight"]
+# (gate_up [2I, H], down [H, I]) as [rows, cols]
+ExpertShapes = tuple[tuple[int, int], tuple[int, int]]
+# a grouped matvec, ys[i] = xs[i] . ws[i]^T, over the matrices of a layer's one form (`_Experts._group`)
+GroupGemv = Callable[[Sequence[ExpertWeight], Sequence[torch.Tensor], Sequence[torch.Tensor]], None]
+# a family's activation, and gpt-oss's gate over gate_up with its alpha and limit (`_Experts.gpt_oss_gate`)
+TorchAct = Callable[[torch.Tensor], torch.Tensor]
+ExpertGate = Callable[[torch.Tensor, float, float], torch.Tensor]
+# a matrix in the 12-bit packed format (btb/pack12.py): its low bytes, the high nibbles' codes and their table, the
+# escapes' indices and high bytes, and how many escapes there are
+Packed12 = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]
+
+
+class ExpertsHost(Protocol):
+    """What a MoE layer's experts read of the engine (`_State`'s attributes), which a test's stub engine stands in
+    for. What a stub may leave out they read with a default (`getattr`): the GGUF at construction, the stored-experts
+    flag, the scratch, the prefill's depot and sweep, the grouped-experts switch, the probe and the profile."""
+
+    @property
+    def gguf(self) -> GGUFModel | None: ...
+    @property
+    def weight_map(self) -> Container[str]: ...
+    @property
+    def mlx(self) -> Backend | None: ...
+    @property
+    def mlx_layers(self) -> Container[int]: ...
+    @property
+    def expert_store(self) -> _ExpertStore | None: ...
+    @property
+    def expert_stat(self) -> MutableMapping[str, float]: ...
+    @property
+    def expert_trace(self) -> list[tuple[int, torch.Tensor]] | None: ...
+    def _tag(self, *tags: PassTag) -> None: ...
+    def _get(self, key: str) -> torch.Tensor: ...
+    def _f8_weights(self, key: str) -> list[F8Weight]: ...
+    def _mlx_act(self) -> Callable[[mx_.array], mx_.array] | None: ...
+
+
+def all_of(ws: Sequence[ExpertWeight], form: type[W]) -> TypeGuard[Sequence[W]]:
+    """whether every matrix of `ws` is of `form`: a layer's experts are all stored one way"""
+    return all(isinstance(w, form) for w in ws)
+
+
+def quant_group(gq: QuantGemv) -> GroupGemv:
+    """the GGUF types' grouped matvec (`QuantGemv.group`) as a layer's `GroupGemv`"""
+
+    def group(ws: Sequence[ExpertWeight], xs: Sequence[torch.Tensor], ys: Sequence[torch.Tensor]) -> None:
+        assert all_of(ws, QuantWeight)  # a stored type's layer: its experts' matrices are its types' blocks
+        gq.group(ws, xs, ys)
+
+    return group
 
 
 def copy_bytes(dst: torch.Tensor, t: torch.Tensor) -> None:
@@ -61,8 +118,8 @@ class _HostLinear(torch.nn.Module):
     bias: torch.Tensor | None
     f8: F8Weight | None
     key: str | None
-    mx: Any
-    packed: tuple[Any, ...] | None
+    mx: Weight | None  # the weight on MLX's GPU, where the layer runs there
+    packed: Packed12 | None
     quant: QuantWeight | None
     scratch: Scratch | None
     weight: torch.Tensor
@@ -184,7 +241,7 @@ class _Router(torch.nn.Module):
         self.lin = lin
         self.top_k = int(top_k)
 
-    def forward(self, hidden_states: torch.Tensor) -> Any:
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         logits = self.lin(hidden_states.float())
         top, idx = torch.topk(logits, self.top_k, dim=-1)
         scores = torch.softmax(top, dim=-1)
@@ -215,21 +272,39 @@ def compute_fp32(module: torch.nn.Module) -> None:
     object.__setattr__(module, "forward", forward)
 
 
-def widen_scratch(store: Any, n: int, inter: int, hidden: int) -> int:
+class ExpertForm(NamedTuple):
+    """how a model's experts are held and multiplied, read off the model (the store's and the pricing's alike):
+    MXFP4 blocks as stored, FP8 bytes and scale grids, a GGUF's file blocks (ggml's layout, MXFP4 or another stored
+    type); none of them, bf16"""
+
+    mx: bool
+    f8: bool
+    ggml: bool
+
+
+def expert_form(mxfp4: bool, gg: GGUFModel | None, fp8: bool, stored_experts: bool) -> ExpertForm:
+    """the experts' form of a family whose experts are `mxfp4` in its checkpoints, loaded from GGUF `gg` (or none),
+    with an FP8 checkpoint's experts (`fp8`) and a GGUF's kept as stored (`stored_experts`)"""
+    mx = stored_mxfp4(mxfp4, gg)
+    return ExpertForm(mx, bool(fp8), gg is not None and (mx or bool(stored_experts)))
+
+
+def widen_scratch(form: ExpertForm, n: int, inter: int, hidden: int) -> int:
     """the card memory a grouped call's widening holds at its peak, `n` experts at a time (`_card_grouped`), each
     expert gate_up [2 * `inter`, `hidden`] and down [`hidden`, `inter`], gate_up's, then down's beside gate_up's
     bf16: MXFP4's bf16 alone where the card's kernel widens it from the depot's bytes (`mx4_widen`), 2 bytes a
     weight, else torch's gathered bytes, their int32 lookup index, the value pairs and the bf16 out, 4.5; FP8's bytes
-    widened to float32, scaled and made bf16, 11 bytes a weight; 0 for bf16 experts, multiplied as they sit"""
-    if store is None or getattr(store, "ggml", False) or not (store.mx or store.f8):
+    widened to float32, scaled and made bf16, 11 bytes a weight; 0 for bf16 experts, multiplied as they sit. Priced
+    off the experts' form, with a store or without one (`expert_cache_gb=0` holds them whole)"""
+    if form.ggml or not (form.mx or form.f8):
         return 0
-    per = (2.0 if Native.card_kernels() is not None else 4.5) if store.mx else 11.0
+    per = (2.0 if Native.card_kernels() is not None else 4.5) if form.mx else 11.0
     gu = dn = inter * hidden
     gu *= 2
     return int(n * max(per * gu, 2 * gu + per * dn))
 
 
-def stored_parts(gu: Any, dn: Any) -> tuple[torch.Tensor, ...] | None:
+def stored_parts(gu: ExpertGateUp, dn: ExpertDown) -> tuple[torch.Tensor, ...] | None:
     """an expert's bytes as the store holds them, for the card: bf16 (gate_up, down), MXFP4 in the checkpoint's
     layout (gate_up's blocks and scales, down's blocks and scales), or FP8 (gate_up's e4m3 bytes and scale grid,
     down's); None for a form the card path does not take (ggml's MXFP4) or an expert already on the card"""
@@ -251,31 +326,43 @@ def stored_parts(gu: Any, dn: Any) -> tuple[torch.Tensor, ...] | None:
     return parts if all(p.device.type == "cpu" for p in parts) else None
 
 
-def on_card_device(w: Any) -> torch.device | None:
+def on_card_device(w: ExpertWeight) -> torch.device | None:
     """the card an expert's weight is seated on - a bf16 tensor there, or an MxWeight whose blocks are - else None"""
     t = w.blocks if isinstance(w, MxWeight) else w
     return t.device if isinstance(t, torch.Tensor) and t.device.type != "cpu" else None
 
 
-def lane16(kern: Any, w: Any, x: torch.Tensor) -> torch.Tensor:
+def card_seat(w: ExpertWeight) -> CardWeight:
+    """`w` of an expert seated on the card (`on_card_device`), as its seat holds it"""
+    assert isinstance(w, torch.Tensor | MxWeight)  # the seats hold bf16 or MXFP4 alone (`VramSeats`, `LayerDepot`)
+    return w
+
+
+def lane16(kern: _Cuda, w: CardWeight, x: torch.Tensor) -> torch.Tensor:
     """the host's gemv on the card over `x` [n, C] float32 there: `w` bf16 (`gemv_lane16`) or MXFP4 in the
     checkpoint's layout (`gemv_lane16_mx4`), [n, R] float32 on the card. The kernels' widths are 1..32 rows: a longer
     call goes 32 rows at a time, each row's value its own whatever travels with it"""
     dev = on_card_device(w)
     R = int(w.shape[0])
-    gemv = kern.gemv_lane16_mx4 if isinstance(w, MxWeight) else kern.gemv_lane16
+
+    def gemv(xs: torch.Tensor, ys: torch.Tensor) -> None:
+        if isinstance(w, MxWeight):
+            kern.gemv_lane16_mx4(w, xs, ys)
+        else:
+            kern.gemv_lane16(w, xs, ys)
+
     n = int(x.shape[0])
     y = torch.empty(n, R, dtype=torch.float32, device=dev)
     for a in range(0, n, 32):
         m = min(32, n - a)
         M = next(r for r in kern.GEMV_ROWS if r >= m)
         if M == m and a == 0 and n == m and x.is_contiguous():
-            gemv(w, x, y)
+            gemv(x, y)
             continue
         xin = torch.zeros(M, int(x.shape[1]), dtype=torch.float32, device=dev)
         xin[:m].copy_(x[a : a + m])
         yo = torch.empty(M, R, dtype=torch.float32, device=dev)
-        gemv(w, xin, yo)
+        gemv(xin, yo)
         y[a : a + m].copy_(yo[:m])
     return y
 
@@ -310,16 +397,16 @@ PIECES: dict[str, tuple[str, ...]] = {
 class _Experts(torch.nn.Module):
     # MXFP4 or FP8 experts widened on the card at a time in a grouped call: gpt-oss-120b's are 50 MB a piece widened
     WIDEN_BATCH = 16
-    sm: Any
-    _mx_bias: Any
-    act_fn: Any
+    sm: ExpertsHost
+    _mx_bias: tuple[mx_.array, mx_.array] | None = None  # the bias tables on MLX (`_mx_biases`)
+    act_fn: TorchAct | None  # None where `gate` is the layer's whole middle (gpt-oss's)
     alpha: float
     base: str
     down: DownTable | None
-    down_proj_bias: Any
-    gate: Any
+    down_proj_bias: torch.Tensor  # [E, H], and gate_up's [E, 2I]: set where the layer is `biased`
+    gate: ExpertGate | None
     gate_up: GateUpTable | None
-    gate_up_proj_bias: Any
+    gate_up_proj_bias: torch.Tensor
     layer: int
     limit: float
     mx: bool
@@ -328,14 +415,14 @@ class _Experts(torch.nn.Module):
 
     def __init__(
         self,
-        sm: Any,
+        sm: ExpertsHost,
         base: str,
         num_experts: int,
-        act_fn: Any,
+        act_fn: TorchAct | None,
         layer: int = -1,
         mx: bool = False,
         f8: bool = False,
-        gate: Any = None,
+        gate: ExpertGate | None = None,
         biases: bool = False,
         alpha: float = 1.702,
         limit: float = 7.0,
@@ -367,6 +454,7 @@ class _Experts(torch.nn.Module):
             if self.ggml:
                 # the file's tensors as they are, one weight per expert (the store does this from its slots)
                 gg, E, i = self.sm.gguf, self.num_experts, self.layer
+                assert gg is not None  # `ggml` experts are a GGUF's
 
                 def mats(k: str) -> list[MxWeight | QuantWeight]:
                     t = gg.tensors[f"blk.{i}.ffn_{k}_exps.weight"]
@@ -379,7 +467,7 @@ class _Experts(torch.nn.Module):
                 self.gate_up = [GateUp(g, u) for g, u in zip(mats("gate"), mats("up"), strict=True)]
                 self.down = mats("down")
             elif self.mx:
-                parts = {}
+                parts: dict[str, list[MxWeight]] = {}
                 for n in ("gate_up_proj", "down_proj"):
                     b = self.sm._get(self.base + n + "_blocks")
                     s = self.sm._get(self.base + n + "_scales")
@@ -411,10 +499,11 @@ class _Experts(torch.nn.Module):
             out.append(F8Weight(torch.cat([w.w for w in ws]), torch.cat([w.scales for w in ws]), rows, ws[0].shape[1]))
         return out
 
-    def _act(self, gate_up: torch.Tensor, rows: Any = None) -> torch.Tensor:
+    def _act(self, gate_up: torch.Tensor, rows: Expert | torch.Tensor | None = None) -> torch.Tensor:
         """The expert's middle: `gate_up` [n, 2 * intermediate] to [n, intermediate]; `rows` names the expert behind
         each row when there is a bias to add."""
         if self.biased:
+            assert rows is not None  # a None would index the bias table as a new axis, every expert's added
             gate_up = gate_up + self._bias(self.gate_up_proj_bias, rows, gate_up)
         return self.gate(gate_up, self.alpha, self.limit) if self.gate is not None else self._silu_gate(gate_up)
 
@@ -423,7 +512,7 @@ class _Experts(torch.nn.Module):
         halves, the other families concatenate them"""
         return GateUp.interleave(gate, up) if self.gate is not None else torch.cat([gate, up], dim=-1)
 
-    def _down(self, y: torch.Tensor, e: int, dt: torch.dtype) -> torch.Tensor:
+    def _down(self, y: torch.Tensor, e: Expert, dt: torch.dtype) -> torch.Tensor:
         """expert `e`'s down product `y` (float32, from the matvec) as the row's dtype, its bias added after the
         rounding - as the per-expert loop and transformers' GptOssExperts add it (the bf16 product, then the bf16
         bias) - so a one-row pass's row is a many-row pass's bit for bit"""
@@ -431,12 +520,13 @@ class _Experts(torch.nn.Module):
         return o + self._bias(self.down_proj_bias, e, o) if self.biased else o
 
     @staticmethod
-    def _bias(param: Any, rows: Any, like: torch.Tensor) -> torch.Tensor:
+    def _bias(param: torch.Tensor, rows: Expert | torch.Tensor, like: torch.Tensor) -> torch.Tensor:
         # the layer may sit on the card while the experts are multiplied on the CPU, and a resident
         # layer keeps its biases in the checkpoint's bf16 where a host layer widens them
         return param[rows].to(like.device, like.dtype)
 
     def _silu_gate(self, gate_up: torch.Tensor) -> torch.Tensor:
+        assert self.act_fn is not None  # a layer without its own `gate` carries the family's activation
         gate, up = gate_up.chunk(2, dim=-1)
         return self.act_fn(gate) * up
 
@@ -449,18 +539,20 @@ class _Experts(torch.nn.Module):
         up = up.clamp(min=-limit, max=limit)
         return (up + 1) * (gate * torch.sigmoid(gate * alpha))
 
-    def _group(self) -> Any:
+    def _group(self) -> GroupGemv | None:
         """the grouped matvec for this layer's storage, None without the native library (`_linear` widens then)"""
         if self.ggml and not self.mx:
             gq = Native.gemv_quant
-            return gq.group if gq is not None else None
+            return quant_group(gq) if gq is not None else None
         if self.ggml:
             return Native.gemv_mx4_ggml_group
         if self.f8:
             return Native.gemv_fp8_group
         return Native.gemv_mx4_group if self.mx else Native.gemv_group
 
-    def _gate_up_rows(self, gemv_group: Any, ws: Any, xf: torch.Tensor, pos: Any, gu_buf: torch.Tensor) -> None:
+    def _gate_up_rows(
+        self, gemv_group: GroupGemv, ws: Sequence[ExpertViews], xf: torch.Tensor, pos: list[int], gu_buf: torch.Tensor
+    ) -> None:
         """`gu_buf[i] = gate_up_e x` for the experts at `pos`: one matvec each, or a GGUF's gate and up matvecs
         joined into the checkpoint's [2I] order"""
         if not self.ggml:
@@ -468,8 +560,10 @@ class _Experts(torch.nn.Module):
             return
         n, half = len(pos), gu_buf.shape[1] // 2
         tg, tu = torch.empty(n, half, dtype=torch.float32), torch.empty(n, half, dtype=torch.float32)
+        gus = [w[0] for w in ws]
+        assert all_of(gus, GateUp)  # a GGUF's gate_up is its gate and up apart
         gemv_group(
-            [w[0].gate for w in ws] + [w[0].up for w in ws],
+            [g.gate for g in gus] + [g.up for g in gus],
             [xf] * (2 * n),
             [tg[j : j + 1] for j in range(n)] + [tu[j : j + 1] for j in range(n)],
         )
@@ -479,9 +573,9 @@ class _Experts(torch.nn.Module):
     def _seated(
         self,
         xs: list[torch.Tensor],
-        pairs: list[tuple[Any, Any]],
+        pairs: Sequence[ExpertViews],
         dt: torch.dtype,
-        es: list[int] | None = None,
+        es: list[Expert],
     ) -> list[torch.Tensor]:
         """Experts seated on the card (`pairs` of gate_up and down there: bf16, or MXFP4 as stored), each over its
         own rows `xs[j]` [n, H], computed as the host computes them: gate_up and down through the host's gemv on the
@@ -492,28 +586,29 @@ class _Experts(torch.nn.Module):
         MXFP4 ones are made only where the kernels are)."""
         kern = Native.card_kernels()
         dev = on_card_device(pairs[0][0])
-        rows = es if es is not None else [None] * len(pairs)
+        seats = [(card_seat(gu), card_seat(dn)) for gu, dn in pairs]
         with torch.no_grad():
             if kern is None:
                 outs = []
-                for x, (w_gu, w_dn), e in zip(xs, pairs, rows, strict=True):
+                for x, (w_gu, w_dn), e in zip(xs, seats, es, strict=True):
+                    assert isinstance(w_gu, torch.Tensor) and isinstance(w_dn, torch.Tensor)  # no kernels: bf16 seats
                     xc = x.to(dev).float()
                     hmid = self._act(torch.nn.functional.linear(xc, w_gu.float()).to(dt), e)
                     outs.append(torch.nn.functional.linear(hmid.float(), w_dn.float()).cpu())
                 return outs
-            gus = [lane16(kern, w_gu, x.to(dev).float()) for x, (w_gu, _dn) in zip(xs, pairs, strict=True)]
-            mids = [self._act(g.cpu().to(dt), e).float() for g, e in zip(gus, rows, strict=True)]
-            return [lane16(kern, w_dn, h.to(dev)).cpu() for h, (_gu, w_dn) in zip(mids, pairs, strict=True)]
+            gus = [lane16(kern, w_gu, x.to(dev).float()) for x, (w_gu, _dn) in zip(xs, seats, strict=True)]
+            mids = [self._act(g.cpu().to(dt), e).float() for g, e in zip(gus, es, strict=True)]
+            return [lane16(kern, w_dn, h.to(dev)).cpu() for h, (_gu, w_dn) in zip(mids, seats, strict=True)]
 
     def _one_row(
         self,
         x: torch.Tensor,
         w_top: torch.Tensor,
         top_k_index: torch.Tensor,
-        hit: Any,
-        views: Any,
-        pending: Any,
-        store: Any,
+        hit: list[Expert],
+        views: dict[Expert, ExpertViews],
+        pending: list[Pending],
+        store: _ExpertStore | None,
         final: torch.Tensor,
         x_card: torch.Tensor | None = None,
     ) -> None:
@@ -524,10 +619,13 @@ class _Experts(torch.nn.Module):
             self.sm._tag(PassTag.EXPERT_FP8_ASSTORED)  # `_group()` is the FP8 matvec over the stored bytes
         k = len(hit)
         xf = x.float().contiguous()
-        slot = {e: top_k_index[0].tolist().index(e) for e in hit}
+        pick = {e: top_k_index[0].tolist().index(e) for e in hit}
         weights = w_top[0]
-        first = next(iter(views.values())) if views else store._views(pending[0][2])
+        # the experts still landing are the store's: without one, every expert is in hand
+        landing = store if store is not None and pending else None
+        first = landing._views(pending[0][2]) if landing is not None and not views else next(iter(views.values()))
         gemv_group = self._group()
+        assert gemv_group is not None  # `forward` takes this path only where the library has the layer's matvec
         gu_buf = torch.empty(k, first[0].shape[0], dtype=torch.float32)
         dn_buf = torch.empty(k, first[1].shape[0], dtype=torch.float32)
         out = torch.empty(k, first[1].shape[0], dtype=dt)
@@ -537,9 +635,9 @@ class _Experts(torch.nn.Module):
             xc = (x if x_card is None else x_card).reshape(1, -1)
             back = self._seated([xc] * len(card), [views[hit[i]] for i in card], dt, [hit[i] for i in card])
             for r, i in enumerate(card):
-                out[i] = self._down(back[r][0], hit[i], dt) * weights[slot[hit[i]]]
+                out[i] = self._down(back[r][0], hit[i], dt) * weights[pick[hit[i]]]
 
-        def stage(pos: Any, ws: Any) -> None:
+        def stage(pos: list[int], ws: list[ExpertViews]) -> None:
             if not pos:
                 return
             self._gate_up_rows(gemv_group, ws, xf, pos, gu_buf)
@@ -547,23 +645,19 @@ class _Experts(torch.nn.Module):
             h = self._act(gu_buf[pos].to(dt), rows).float().contiguous()
             gemv_group([w[1] for w in ws], [h[j : j + 1] for j in range(len(pos))], [dn_buf[i : i + 1] for i in pos])
             for _j, i in enumerate(pos):
-                out[i] = self._down(dn_buf[i], hit[i], dt) * weights[slot[hit[i]]]
+                out[i] = self._down(dn_buf[i], hit[i], dt) * weights[pick[hit[i]]]
 
         ready = [i for i, e in enumerate(hit) if e in views and i not in card]
         stage(ready, [views[hit[i]] for i in ready])
         # the misses as they land: what has arrived is computed while the rest is still on its way. The bf16
         # group kernel gives each task the same bits whatever shares its group; the MXFP4 one does not, so its
         # late experts go as the one group they always were, or the timing of the drive would reach the bits
-        if self.mx:
-            late = [
-                (hit.index(e), store._views(s))
-                for batch in (store.landed(pending) if pending else ())
-                for e, _f, s in batch
-            ]
+        if landing is not None and self.mx:
+            late = [(hit.index(e), landing._views(s)) for batch in landing.landed(pending) for e, _f, s in batch]
             stage([i for i, _ in late], [w for _, w in late])
-        else:
-            for batch in store.landed(pending) if pending else ():
-                late = [(hit.index(e), store._views(s)) for e, _f, s in batch]
+        elif landing is not None:
+            for batch in landing.landed(pending):
+                late = [(hit.index(e), landing._views(s)) for e, _f, s in batch]
                 stage([i for i, _ in late], [w for _, w in late])
         for i in range(k):
             final[0] += out[i]
@@ -572,33 +666,35 @@ class _Experts(torch.nn.Module):
         self,
         x: torch.Tensor,
         w_top: torch.Tensor,
-        expert_mask: Any,
-        hit: Any,
-        views: Any,
-        pending: Any,
-        store: Any,
+        expert_mask: torch.Tensor,
+        hit: list[Expert],
+        views: dict[Expert, ExpertViews],
+        pending: list[Pending],
+        store: _ExpertStore | None,
         final: torch.Tensor,
     ) -> None:
         # every active expert's two matmuls in one MLX graph over the store's slots (or copies of the
         # checkpoint's tables when there is no store), summed in expert order; one eval per layer
-        be = self.sm.mlx
+        be: Backend | None = self.sm.mlx
+        assert be is not None  # the experts run on MLX only with the backend up (`use_mlx`)
         tables = self._tables() if store is None else None
 
-        def rows(e: int) -> Any:
+        def rows(e: int) -> tuple[list[int], list[float]]:
             top_k_pos, token_idx = torch.where(expert_mask[e])
             return token_idx.tolist(), w_top[token_idx, top_k_pos].float().tolist()
 
         if self.mx:
             # MXFP4 experts through the GPU's matvec, each expert its own graph queued as its bytes land, the outputs
             # summed in expert order at the end whichever were ready first
+            assert store is not None  # MXFP4 experts are read into the store, never held whole
             self.sm._tag(PassTag.EXPERT_MXFP4_ASSTORED)  # the store's blocks as stored, never widened
             bg, bd = self._mx_biases() if self.biased else (None, None)
             act = None if self.gate is not None else self.sm._mlx_act()  # gpt-oss's clamped GLU, else the family's
             shp = store.mx_shapes()
             xm = mlxdev.to_mx(x)
-            parts = {}
+            parts: dict[Expert, ExpertOut] = {}
 
-            def part(e: int, pair: Any) -> None:
+            def part(e: Expert, pair: Mxfp4Pair) -> None:
                 ti, wts = rows(e)
                 parts[e] = be.expert_mx(
                     xm, ti, wts, pair, e, shp[0], shp[1], bg, bd, self.alpha, self.limit, ggml=store.ggml, act=act
@@ -606,32 +702,34 @@ class _Experts(torch.nn.Module):
 
             for e in hit:
                 if e in views:
-                    part(e, store._views_mx(store.last_slots[e]))
+                    part(e, store._views_mxfp4(store.last_slots[e]))
             for batch in store.landed(pending):
                 for e, _f, s in batch:
-                    part(e, store._views_mx(s))
+                    part(e, store._views_mxfp4(s))
             out = be.experts_mx_sum(xm, [parts[e] for e in sorted(parts)])
             final += out.to(final.dtype)
             return
-        hits = []
+        hits: list[tuple[Expert, list[int], list[float], ExpertWeights]] = []
         for e in hit:
             if e in views:
-                hits.append(
-                    (
-                        e,
-                        *rows(e),
-                        store._views_mx(store.last_slots[e]) if tables is None else self._mlx_table(be, tables, e),
-                    )
-                )
-        for batch in store.landed(pending) if pending else ():
-            for e, _f, s in batch:
-                hits.append((e, *rows(e), store._views_mx(s)))
+                if store is not None:
+                    pair = store._views_mx(store.last_slots[e])
+                else:
+                    assert tables is not None  # held whole where there is no store
+                    pair = self._mlx_table(be, tables, e)
+                hits.append((e, *rows(e), pair))
+        if store is not None and pending:
+            for batch in store.landed(pending):
+                for e, _f, s in batch:
+                    hits.append((e, *rows(e), store._views_mx(s)))
         hits.sort(key=lambda t: t[0])
-        out = be.experts(x, [(ti, w, pair) for _, ti, w, pair in hits], self.sm._mlx_act())
+        act_fn = self.sm._mlx_act()
+        assert act_fn is not None  # `use_mlx` takes the experts to MLX only with the family's activation there
+        out = be.experts(x, [(ti, w, pair) for _, ti, w, pair in hits], act_fn)
         final += out.to(final.dtype)
 
     @staticmethod
-    def _mlx_table(be: Backend, tables: tuple[GateUpTable, DownTable], e: int) -> MxExpert:
+    def _mlx_table(be: Backend, tables: tuple[GateUpTable, DownTable], e: int) -> ExpertWeights:
         """expert `e` of the whole tables as the MLX step takes it: bf16 weights, or a GGUF's stored (gate, up), down"""
         gu, dn = tables[0][e], tables[1][e]
         if isinstance(dn, QuantWeight):
@@ -641,19 +739,19 @@ class _Experts(torch.nn.Module):
         assert isinstance(gu, torch.Tensor) and isinstance(dn, torch.Tensor)  # bf16, an expert's slice of the stack
         return be.weight(gu), be.weight(dn)
 
-    def _mx_biases(self) -> Any:
+    def _mx_biases(self) -> tuple[mx_.array, mx_.array]:
         """the two per-expert bias tables as float32 MLX arrays, made once per layer"""
-        b = getattr(self, "_mx_bias", None)
+        b = self._mx_bias
         if b is None:
             b = (
                 mlxdev.to_mx(self.gate_up_proj_bias.data.detach().float().contiguous()),
                 mlxdev.to_mx(self.down_proj_bias.data.detach().float().contiguous()),
             )
-            mlxdev.mx().eval(*b)
+            mlxdev.mx.eval(*b)
             self._mx_bias = b
         return b
 
-    def _linear(self, x: torch.Tensor, w: Any) -> torch.Tensor:
+    def _linear(self, x: torch.Tensor, w: ExpertWeight) -> torch.Tensor:
         if isinstance(w, GateUp):
             return self._join(self._linear(x, w.gate), self._linear(x, w.up))
         if isinstance(w, MxWeight):
@@ -691,7 +789,7 @@ class _Experts(torch.nn.Module):
             return torch.nn.functional.linear(x.float(), w.float()).to(x.dtype)
         return torch.nn.functional.linear(x, w.to(x.device, non_blocking=True).to(x.dtype))
 
-    def _depot_for(self, x: torch.Tensor, on_host: bool) -> Any:
+    def _depot_for(self, x: torch.Tensor, on_host: bool) -> LayerDepot | None:
         """the depot of a layer-by-layer prefill on the card, where this call's rows are on the card"""
         return getattr(self.sm, "_depot", None) if (not on_host and x.device.type == "cuda") else None
 
@@ -711,13 +809,13 @@ class _Experts(torch.nn.Module):
         x: torch.Tensor,
         w_top: torch.Tensor,
         top_k_index: torch.Tensor,
-        hit: Any,
-        views: Any,
-        pending: Any,
-        store: Any,
-        depot: Any,
+        hit: list[Expert],
+        views: dict[Expert, ExpertViews],
+        pending: list[Pending],
+        store: _ExpertStore | None,
+        depot: LayerDepot,
         final: torch.Tensor,
-        seated: set[int] | None = None,
+        seated: Set[Expert] | None = None,
         buf: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """A call's experts on the card as grouped matmuls over the depot's stacked slots, a wave at a time: the
@@ -750,8 +848,10 @@ class _Experts(torch.nn.Module):
         if buf is None:
             buf = torch.zeros(T, k, x.shape[-1], dtype=final.dtype, device=x.device)
         places = buf
+        # the widened forms' [rows, cols], off the store's layout or, with no store, the tables held whole
+        shapes = self._shapes(store) if self.mx or self.f8 else None
 
-        def on_card(e: int, w_gu: Any, w_dn: Any) -> None:
+        def on_card(e: Expert, w_gu: ExpertGateUp, w_dn: ExpertDown) -> None:
             """expert `e` from weights already on the card, as `_loop` multiplies it, into its rows' places"""
             a, n = offs[e], counts[e]
             rows, poss = row_s[a : a + n], pos_s[a : a + n]
@@ -760,17 +860,22 @@ class _Experts(torch.nn.Module):
                 h = h + self._bias(self.down_proj_bias, e, h)
             places[rows, ranks[rows, poss]] = (h * w_top[rows, poss, None]).to(places.dtype)
 
-        def wave(items: list[tuple[int, Any, Any]]) -> None:
+        def wave(items: list[tuple[Expert, ExpertGateUp | None, ExpertDown | None]]) -> None:
+            # an item without weights is seated on the card by an earlier chunk: its place is its seat
             for e, gu, dn in items:
-                if gu is not None and stored_parts(gu, dn) is None:
+                if gu is not None and dn is not None and stored_parts(gu, dn) is None:
                     on_card(e, gu, dn)
-            items = [it for it in items if it[1] is None or stored_parts(it[1], it[2]) is not None]
+            items = [
+                (e, gu, dn)
+                for e, gu, dn in items
+                if gu is None or (dn is not None and stored_parts(gu, dn) is not None)
+            ]
             while items:
                 slots = depot.place(self.layer, items)
                 if not any(sl is not None for sl in slots):
                     raise RuntimeError(f"[experts] layer {self.layer}: no expert of the wave has a place on the card")
                 # one grouped matmul a block the wave touched, its experts in their rows' order there
-                by_block: dict[int, list[tuple[int, int]]] = {}
+                by_block: dict[int, list[tuple[int, Expert]]] = {}
                 for (e, _gu, _dn), sl in zip(items, slots, strict=True):
                     if sl is not None:
                         b, row = depot.where[sl]
@@ -784,10 +889,10 @@ class _Experts(torch.nn.Module):
                         multiply(depot.blocks[b], local)
                 items = [it for it, sl in zip(items, slots, strict=True) if sl is None]
 
-        def multiply(stacks: list[torch.Tensor], placed: list[tuple[int, int]]) -> None:
+        def multiply(stacks: list[torch.Tensor], placed: list[tuple[int, Expert]]) -> None:
             """the grouped products of `placed` (row, expert) of one block's `stacks`, in row order, into their
             rows' places"""
-            if self.mx or self.f8:
+            if shapes is not None:
                 # the batch's bytes widened: one group an expert, in the batch's order
                 idx = torch.tensor([sl for sl, _e in placed], dtype=torch.int32, device=x.device)
                 n = len(placed)
@@ -796,7 +901,7 @@ class _Experts(torch.nn.Module):
                     # straight from the depot's stacks in one pass, no gathered copy of the bytes
                     gu_w, dn_w = (
                         kern.mx4_widen(stacks[2 * i], stacks[2 * i + 1], idx).view(n, rows, cols)
-                        for i, (rows, cols) in enumerate(store.mx_shapes())
+                        for i, (rows, cols) in enumerate(shapes)
                     )
                 elif self.mx:
                     gu_w, dn_w = (
@@ -804,7 +909,7 @@ class _Experts(torch.nn.Module):
                             stacks[2 * i].index_select(0, idx).view(n, rows, cols // 32, 16),
                             stacks[2 * i + 1].index_select(0, idx).view(n, rows, cols // 32),
                         ).reshape(n, rows, cols)
-                        for i, (rows, cols) in enumerate(store.mx_shapes())
+                        for i, (rows, cols) in enumerate(shapes)
                     )
                 else:
                     gu_w, dn_w = (
@@ -812,7 +917,7 @@ class _Experts(torch.nn.Module):
                             stacks[2 * i].index_select(0, idx).view(n, rows, cols),
                             stacks[2 * i + 1].index_select(0, idx),
                         )
-                        for i, (rows, cols) in enumerate(store.f8_shapes())
+                        for i, (rows, cols) in enumerate(shapes)
                     )
                 per = [counts[e] for _sl, e in placed]
             else:
@@ -839,10 +944,20 @@ class _Experts(torch.nn.Module):
         # the experts seated on the card by an earlier chunk (no bytes in RAM: `place` finds their seats) and
         # those in RAM, then each batch as it lands
         wave([(e, *views[e]) if e in views else (e, None, None) for e in hit if e in views or e in (seated or ())])
-        for batch in store.landed(pending) if pending else ():
-            wave([(e, *store._views(s)) for e, _f, s in batch])
+        if store is not None and pending:
+            for batch in store.landed(pending):
+                wave([(e, *store._views(s)) for e, _f, s in batch])
         depot.settle()
         return places
+
+    def _shapes(self, store: _ExpertStore | None) -> ExpertShapes:
+        """an MXFP4 or FP8 layer's (gate_up, down) as [rows, cols]: the store's, or with no store the tables', whose
+        weights carry their own"""
+        if store is not None:
+            return store.mx_shapes() if self.mx else store.f8_shapes()
+        gu, dn = self._tables()
+        g0, d0 = gu[0], dn[0]
+        return (int(g0.shape[0]), int(g0.shape[1])), (int(d0.shape[0]), int(d0.shape[1]))
 
     def _waves(
         self,
@@ -851,13 +966,13 @@ class _Experts(torch.nn.Module):
         top_k_index: torch.Tensor,
         expert_mask: torch.Tensor,
         hidden_states: torch.Tensor,
-        now: list[int],
-        views: Any,
-        pending: Any,
+        now: list[Expert],
+        views: dict[Expert, ExpertViews],
+        pending: list[Pending],
         call: StoreCall | None,
-        store: Any,
+        store: _ExpertStore | None,
         final: torch.Tensor,
-        seated: set[int] | None = None,
+        seated: Set[Expert] | None = None,
         x_card: torch.Tensor | None = None,
     ) -> None:
         """A call of many rows over its experts, in the waves the store serves it (`StoreCall.wave`): each wave's experts
@@ -876,30 +991,47 @@ class _Experts(torch.nn.Module):
             if grouped is None:
                 # the depot takes this form at all (its scratch slots, where the ledger has them): the loop where it
                 # cannot - the form read off an expert in RAM, or off the first one still coming from the drive
+                landing = store if store is not None and pending else None
                 grouped = bool(
                     depot is not None
                     and self._grouped_ok(x)
                     and all(stored_parts(*v) is not None for v in views.values())
-                    and (bool(views) or bool(pending))
+                    and (bool(views) or landing is not None)
                     and depot.takes(
-                        stored_parts(*(next(iter(views.values())) if views else store._views(pending[0][2])))
+                        stored_parts(
+                            *(
+                                landing._views(pending[0][2])
+                                if landing is not None and not views
+                                else next(iter(views.values()))
+                            )
+                        )
                     )
                 )
             if grouped:
+                assert depot is not None  # a grouped call is the depot's, the first wave's test above or `seated`'s
                 buf = self._card_grouped(x, w_top, top_k_index, now, views, pending, store, depot, final, seated, buf)
                 seated = None  # placed with the first wave
             else:
                 self._loop(x, w_top, top_k_index, expert_mask, hidden_states, now, views, pending, store, final, x_card)
+            if store is not None and store.pin and x.device.type == "cuda":
+                # the wave's copies out of the slots, queued on the card (the loop's on its stream, the depot's
+                # uploads on the depot's): from pinned slots they are the card's to finish, so a seat waits for them;
+                # a pageable slot's copy is staged before it returns, and the depot's staged uploads read its own
+                for stream in (torch.cuda.current_stream(x.device), *((depot.copy,) if depot is not None else ())):
+                    done = torch.cuda.Event()
+                    done.record(stream)
+                    store.card_read(done)
             if call is None or call.done:
                 if buf is not None:
                     # each row's contributions in ascending expert order, from zero, one add at a time
                     for j in range(int(buf.shape[1])):
                         final.add_(buf[:, j])
                 return
-            # this wave's experts are done with (the depot's copies out of their slots landed): the store may seat
-            # the next wave in their slots
+            # this wave's experts are done with once the card's copies out of their slots land: then the store may
+            # seat the next wave in their slots
             asked = list(call.rest)
-            views, pending = call.wave()
+            assert store is not None  # a call is the store's
+            views, pending = call.wave(settled=store.settle_reads())
             left = set(call.rest)
             now = [e for e in asked if e not in left]
 
@@ -910,10 +1042,10 @@ class _Experts(torch.nn.Module):
         top_k_index: torch.Tensor,
         expert_mask: torch.Tensor,
         hidden_states: torch.Tensor,
-        hit: list[int],
-        views: Any,
-        pending: Any,
-        store: Any,
+        hit: list[Expert],
+        views: dict[Expert, ExpertViews],
+        pending: list[Pending],
+        store: _ExpertStore | None,
         final: torch.Tensor,
         x_card: torch.Tensor | None = None,
     ) -> None:
@@ -921,14 +1053,14 @@ class _Experts(torch.nn.Module):
         ascending expert order; `x_card` the rows where they are on the card too (a seated expert reads them there)"""
         dev = hidden_states.device
         on_host = x.device.type == "cpu" and dev.type != "cpu"
-        contrib = {}
+        contrib: dict[Expert, tuple[torch.Tensor, torch.Tensor]] = {}
         # a prefill sweeping this layer's chunks on the card: the layer's experts cross the bus once for them all
         depot = self._depot_for(x, on_host)
         # rows on the card: every expert's rows found by one sort there, not a host lookup and a copy an expert,
         # each of which waited for the card to finish what was queued before it
         groups = group_picks(top_k_index, self.num_experts) if x.device.type != "cpu" else None
 
-        def run(e: int, w_gu: Any, w_dn: Any) -> None:
+        def run(e: Expert, w_gu: ExpertGateUp, w_dn: ExpertDown) -> None:
             if groups is not None:
                 pos_s, row_s, offs, counts = groups
                 a, n = offs[e], counts[e]
@@ -957,9 +1089,10 @@ class _Experts(torch.nn.Module):
         for e in hit:
             if e in views:
                 run(e, *views[e])
-        for batch in store.landed(pending) if pending else ():
-            for e, _f, s in batch:
-                run(e, *store._views(s))
+        if store is not None and pending:
+            for batch in store.landed(pending):
+                for e, _f, s in batch:
+                    run(e, *store._views(s))
         if depot is not None:
             depot.settle()
         for e in hit:
@@ -976,6 +1109,8 @@ class _Experts(torch.nn.Module):
         """the call's routed experts over its rows: [T, H] in the rows' dtype, summed in ascending expert order.
         `x_card`: the rows on the card too, where the caller holds them there (a card program's) - an expert seated
         on the card reads them there"""
+        from .experts import Expert  # experts.py imports this module
+
         t0 = time.perf_counter()
         dev = hidden_states.device
         probe = getattr(self.sm, "expert_probe", None)
@@ -1003,9 +1138,12 @@ class _Experts(torch.nn.Module):
         with torch.no_grad():
             expert_mask = torch.nn.functional.one_hot(top_host, num_classes=self.num_experts).permute(2, 1, 0)
             expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-        hit = [int(e[0]) for e in expert_hit]
+        hit = [Expert(int(e[0])) for e in expert_hit]
         store = self.sm.expert_store
-        pending = []
+        views: dict[Expert, ExpertViews]
+        pending: list[Pending] = []
+        call: StoreCall | None
+        seated: set[Expert]
         w0 = 0.0
         keep = True
         # FP8 experts have no MLX matvec: they stay on the host's FP8 kernels
@@ -1038,7 +1176,8 @@ class _Experts(torch.nn.Module):
             # for the rest - held in RAM chunk after chunk too, a store below the layer's experts read the whole layer
             # from the drive again every chunk. Only where the grouped path is certain (the loop needs every view)
             depot = self._depot_for(x, on_host) if not (use_mlx or grouped) and self._grouped_ok(x) else None
-            seated = depot.seated(self.layer) & set(hit) if depot is not None else set()
+            on_card = depot.seated(self.layer) if depot is not None else set()
+            seated = {e for e in hit if e in on_card}
             ask = [e for e in hit if e not in seated] if seated else hit
             call = store.call(self.layer, self.base, ask, keep=keep, rows=int(hidden_states.shape[0]))
             if store.types:
@@ -1047,13 +1186,16 @@ class _Experts(torch.nn.Module):
             elif store.widened:
                 self.sm._tag(PassTag.EXPERT_QUANT_DEQUANT)
             # the MLX and one-row paths multiply the call's experts together: all of them seated at once, or the call
-            # refused; the rest in the waves the store can seat
-            views, pending = call.whole() if (use_mlx or grouped) else call.wave()
+            # refused; the rest in the waves the store can seat. The host's kernels and the per-op MLX calls finish
+            # their own work; the card's copies out of the slots are waited for (`settle_reads`)
+            settled = store.settle_reads()
+            views, pending = call.whole(settled=settled) if (use_mlx or grouped) else call.wave(settled=settled)
             if getattr(self.sm, "_sweep_ahead", False) and store.sweep_layer != self.layer:
                 # a layer-by-layer prefill at this layer's first chunk: its reads are queued, and the next layer's
                 # experts are read ahead behind them while this layer's chunks compute
                 store.sweep_layer = self.layer
                 store.lookahead(self.layer, hidden_states, sweep=len(hit))
+            assert store.per is not None  # sized by the call's recipe
             per_expert = store.per
             w0 = store.stat["wait_s"]
         else:
@@ -1108,17 +1250,17 @@ class _Experts(torch.nn.Module):
 
 
 class _NGramRows(torch.nn.Module):
-    sm: Any
+    sm: _State
     base: str
-    dim: Any
+    dim: int  # a row's width, and `rows` each shard's rows: read off the first shard by `_open`
     f8: list[F8Weight] | None
     out_dtype: torch.dtype
     parts: int
-    rows: Any
-    shards: Any
+    rows: int
+    shards: list[torch.Tensor] | None
     weight: torch.Tensor
 
-    def __init__(self, sm: Any, base: str, parts: Any, out_dtype: torch.dtype) -> None:
+    def __init__(self, sm: _State, base: str, parts: int, out_dtype: torch.dtype) -> None:
         super().__init__()
         object.__setattr__(self, "sm", sm)
         self.base = base
@@ -1128,7 +1270,7 @@ class _NGramRows(torch.nn.Module):
         self.f8 = None
         self.weight = torch.zeros(0)
 
-    def _open(self) -> Any:
+    def _open(self) -> list[torch.Tensor]:
         if self.shards is None:
             keys = [self.base + f"shard_{k}.weight" for k in range(self.parts)]
             # an FP8 table with one scale (`FP8Embedding`, too big to widen) stays e4m3: the rows a lookup gathers

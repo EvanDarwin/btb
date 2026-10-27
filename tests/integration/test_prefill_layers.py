@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 import torch
+from transformers.cache_utils import DynamicLayer
 
 from btb.engine import StreamedTextModel
 from tests.helpers import NO_LOG, fixture, layer_count, need_cuda, receipts
@@ -68,8 +69,9 @@ def _prefill(layers: bool, ids: list[int], **kw: Any) -> tuple[torch.Tensor, dic
             away = [
                 i
                 for i in sm.host
-                if isinstance(getattr(cache.layers[i], "keys", None), torch.Tensor)
-                and cache.layers[i].keys.device.type != "cpu"
+                if isinstance(cl := cache.layers[i], DynamicLayer)
+                and cl.keys is not None
+                and cl.keys.device.type != "cpu"
             ]
             assert not away, f"host layers {away}: their rows left on the card past the prefill"
             got = {name: t.detach().float().cpu().clone() for name, t in _tensors(cache)}
