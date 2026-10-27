@@ -205,6 +205,7 @@ class Qwen4Drafter(MTPDrafter):
         cache = DynamicCache(config=self.mcfg)
         cache.layers[0] = GrantedIndexedLayer(self.sm.scheduler.grant, "drafter", "Qwen4's drafter: its layer's cache")
         self.cache = cache
+        self.first = None
 
     def _rope(self, n: int, B: int, like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """the rope of positions [0, n) - the indexer pools its key blocks at their own positions - for `B` rows
