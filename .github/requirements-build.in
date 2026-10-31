@@ -1,4 +1,4 @@
 # the wheel and sdist build tooling: pyproject.toml [build-system] requires plus PyPA build itself
 build
-setuptools>=77
+setuptools>=84.1.0
 setuptools-scm>=8
